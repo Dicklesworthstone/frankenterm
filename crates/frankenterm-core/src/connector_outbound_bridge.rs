@@ -1,0 +1,4534 @@
+//! Outbound connector bridge: FrankenTerm events → connector actions.
+//!
+//! Routes mux/orchestration/policy events into connector-triggered actions
+//! (notifications, ticketing, incident workflows, etc.) with policy-governed
+//! deduplication, correlation, and sandbox enforcement.
+//!
+//! Key concerns:
+//! - Event → action routing via configurable rules (pattern matching on event type/source)
+//! - Deduplication via correlation IDs (bounded LRU cache, same as inbound bridge)
+//! - Policy gate before action dispatch (fail-closed)
+//! - Sandbox capability check before connector invocation
+//! - Structured telemetry for end-to-end correlation
+//!
+//! Part of ft-3681t.5.6.
+
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+use crate::connector_credential_broker::{CredentialScope, CredentialSensitivity};
+use crate::connector_data_classification::IngestionDecision;
+use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
+use crate::connector_governor::GovernorVerdict;
+use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
+use crate::connector_reliability::ConnectorErrorKind;
+use crate::policy::{
+    ActionKind as PolicyActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine,
+    PolicyInput, PolicySurface,
+};
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for the outbound connector bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorOutboundBridgeConfig {
+    /// Maximum dedup cache entries before oldest are evicted.
+    #[serde(default = "default_dedup_capacity")]
+    pub dedup_capacity: usize,
+    /// Time-to-live for dedup entries (seconds).
+    #[serde(default = "default_dedup_ttl_secs")]
+    pub dedup_ttl_secs: u64,
+    /// Maximum pending actions in the dispatch queue before backpressure.
+    #[serde(default = "default_dispatch_queue_capacity")]
+    pub dispatch_queue_capacity: usize,
+    /// Maximum dispatch history entries retained for audit.
+    #[serde(default = "default_dispatch_history_capacity")]
+    pub dispatch_history_capacity: usize,
+    /// Whether to reject events with no matching routing rules (fail-closed).
+    #[serde(default)]
+    pub reject_unmatched_events: bool,
+    /// Whether to enforce sandbox capability checks before dispatch.
+    #[serde(default = "default_enforce_sandbox")]
+    pub enforce_sandbox: bool,
+    /// Per-connector reliability/governor enforcement override.
+    ///
+    /// Missing connectors are enforced; set an entry to `false` only for an
+    /// explicit, connector-scoped diagnostic rollout.
+    #[serde(default)]
+    pub enforce_connector_admission: HashMap<String, bool>,
+}
+
+fn default_dedup_capacity() -> usize {
+    4096
+}
+
+fn default_dedup_ttl_secs() -> u64 {
+    300
+}
+
+fn default_dispatch_queue_capacity() -> usize {
+    1024
+}
+
+fn default_dispatch_history_capacity() -> usize {
+    256
+}
+
+fn default_enforce_sandbox() -> bool {
+    true
+}
+
+impl Default for ConnectorOutboundBridgeConfig {
+    fn default() -> Self {
+        Self {
+            dedup_capacity: default_dedup_capacity(),
+            dedup_ttl_secs: default_dedup_ttl_secs(),
+            dispatch_queue_capacity: default_dispatch_queue_capacity(),
+            dispatch_history_capacity: default_dispatch_history_capacity(),
+            reject_unmatched_events: false,
+            enforce_sandbox: default_enforce_sandbox(),
+            enforce_connector_admission: HashMap::new(),
+        }
+    }
+}
+
+// =============================================================================
+// Event source types
+// =============================================================================
+
+/// Source classification for events entering the outbound bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundEventSource {
+    /// Pattern detection (trigger rule matched in a pane).
+    PatternDetected,
+    /// Pane lifecycle (discovered, disappeared).
+    PaneLifecycle,
+    /// Workflow lifecycle (started, step, completed).
+    WorkflowLifecycle,
+    /// User-initiated event (e.g., ft robot command).
+    UserAction,
+    /// Policy decision (approval/denial escalation).
+    PolicyDecision,
+    /// Health/metrics threshold crossed.
+    HealthAlert,
+    /// Custom/plugin-defined event source.
+    Custom,
+}
+
+impl OutboundEventSource {
+    /// Stable string label for rule matching and correlation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PatternDetected => "pattern_detected",
+            Self::PaneLifecycle => "pane_lifecycle",
+            Self::WorkflowLifecycle => "workflow_lifecycle",
+            Self::UserAction => "user_action",
+            Self::PolicyDecision => "policy_decision",
+            Self::HealthAlert => "health_alert",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+impl std::fmt::Display for OutboundEventSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// =============================================================================
+// Outbound action types
+// =============================================================================
+
+/// Kind of action to dispatch to a connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorActionKind {
+    /// Send a notification (Slack message, email, webhook POST).
+    Notify,
+    /// Create or update an external ticket (Jira, Linear, GitHub issue).
+    Ticket,
+    /// Trigger an external workflow/pipeline (CI/CD, runbook).
+    TriggerWorkflow,
+    /// Log/audit event to external sink (Datadog, Splunk).
+    AuditLog,
+    /// Invoke a generic connector action (custom RPC).
+    Invoke,
+    /// Revoke/rotate a credential via secret provider.
+    CredentialAction,
+}
+
+impl ConnectorActionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::Ticket => "ticket",
+            Self::TriggerWorkflow => "trigger_workflow",
+            Self::AuditLog => "audit_log",
+            Self::Invoke => "invoke",
+            Self::CredentialAction => "credential_action",
+        }
+    }
+
+    /// Map action kind to the required connector capability.
+    #[must_use]
+    pub const fn required_capability(self) -> ConnectorCapability {
+        match self {
+            Self::Notify | Self::AuditLog => ConnectorCapability::NetworkEgress,
+            Self::Ticket | Self::TriggerWorkflow => ConnectorCapability::Invoke,
+            Self::Invoke => ConnectorCapability::Invoke,
+            Self::CredentialAction => ConnectorCapability::SecretBroker,
+        }
+    }
+
+    /// Map connector actions into the unified policy action space.
+    #[must_use]
+    pub const fn policy_action(self) -> PolicyActionKind {
+        match self {
+            Self::Notify => PolicyActionKind::ConnectorNotify,
+            Self::Ticket => PolicyActionKind::ConnectorTicket,
+            Self::TriggerWorkflow => PolicyActionKind::ConnectorTriggerWorkflow,
+            Self::AuditLog => PolicyActionKind::ConnectorAuditLog,
+            Self::Invoke => PolicyActionKind::ConnectorInvoke,
+            Self::CredentialAction => PolicyActionKind::ConnectorCredentialAction,
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorActionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn parse_connector_capability(value: &str) -> Option<ConnectorCapability> {
+    match value.trim() {
+        "invoke" => Some(ConnectorCapability::Invoke),
+        "read_state" => Some(ConnectorCapability::ReadState),
+        "stream_events" => Some(ConnectorCapability::StreamEvents),
+        "filesystem_read" | "fs_read" => Some(ConnectorCapability::FilesystemRead),
+        "filesystem_write" | "fs_write" => Some(ConnectorCapability::FilesystemWrite),
+        "network_egress" | "network" => Some(ConnectorCapability::NetworkEgress),
+        "secret_broker" => Some(ConnectorCapability::SecretBroker),
+        "process_exec" | "exec" => Some(ConnectorCapability::ProcessExec),
+        _ => None,
+    }
+}
+
+fn payload_string<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn payload_declared_capability(payload: &Value) -> Option<ConnectorCapability> {
+    payload_string(
+        payload,
+        &["capability", "required_capability", "sandbox_capability"],
+    )
+    .and_then(parse_connector_capability)
+}
+
+fn payload_declares_exec(payload: &Value) -> bool {
+    payload.get("argv").is_some()
+        || payload_string(payload, &["exec_command", "program", "binary"]).is_some()
+}
+
+fn sandbox_capability_for_payload(
+    action_kind: ConnectorActionKind,
+    payload: &Value,
+) -> ConnectorCapability {
+    payload_declared_capability(payload).unwrap_or_else(|| {
+        if action_kind == ConnectorActionKind::Invoke && payload_declares_exec(payload) {
+            ConnectorCapability::ProcessExec
+        } else {
+            action_kind.required_capability()
+        }
+    })
+}
+
+fn normalize_network_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let authority = if let Some((_, remainder)) = value.split_once("://") {
+        remainder.split(['/', '?', '#']).next().unwrap_or(remainder)
+    } else {
+        value.split(['/', '?', '#']).next().unwrap_or(value)
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority).trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        host
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    }
+    .trim()
+    .trim_end_matches('.');
+
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn payload_network_target(payload: &Value) -> Option<String> {
+    payload_string(
+        payload,
+        &[
+            "host",
+            "hostname",
+            "network_host",
+            "target_host",
+            "url",
+            "uri",
+            "endpoint",
+            "target",
+        ],
+    )
+    .and_then(normalize_network_host)
+}
+
+fn payload_filesystem_target(payload: &Value) -> Option<String> {
+    payload_string(
+        payload,
+        &[
+            "path",
+            "file",
+            "file_path",
+            "filepath",
+            "directory",
+            "dir",
+            "source_path",
+            "destination_path",
+            "target_path",
+            "read_path",
+            "write_path",
+        ],
+    )
+    .map(ToOwned::to_owned)
+}
+
+fn payload_exec_target(payload: &Value) -> Option<String> {
+    if let Some(argv0) = payload
+        .get("argv")
+        .and_then(Value::as_array)
+        .and_then(|argv| argv.first())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(argv0.to_string());
+    }
+
+    payload_string(
+        payload,
+        &[
+            "command",
+            "cmd",
+            "exec",
+            "exec_command",
+            "program",
+            "binary",
+        ],
+    )
+    .map(ToOwned::to_owned)
+}
+
+fn sandbox_target_for_payload(capability: ConnectorCapability, payload: &Value) -> Option<String> {
+    match capability {
+        ConnectorCapability::FilesystemRead | ConnectorCapability::FilesystemWrite => {
+            payload_filesystem_target(payload)
+        }
+        ConnectorCapability::NetworkEgress => payload_network_target(payload),
+        ConnectorCapability::ProcessExec => payload_exec_target(payload),
+        ConnectorCapability::Invoke
+        | ConnectorCapability::ReadState
+        | ConnectorCapability::StreamEvents
+        | ConnectorCapability::SecretBroker => None,
+    }
+}
+
+// =============================================================================
+// Outbound event (bridge input)
+// =============================================================================
+
+/// An event entering the outbound bridge for potential connector dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundEvent {
+    /// Source classification.
+    pub source: OutboundEventSource,
+    /// Stable event type key (e.g., "pattern.ci_failure", "pane.disappeared").
+    pub event_type: String,
+    /// Opaque correlation ID for deduplication and tracing.
+    pub correlation_id: Option<String>,
+    /// Timestamp at source (millis since epoch).
+    pub timestamp_ms: u64,
+    /// Pane ID (if event is pane-scoped).
+    pub pane_id: Option<u64>,
+    /// Workflow ID (if event is workflow-scoped).
+    pub workflow_id: Option<String>,
+    /// Structured payload from the event.
+    pub payload: serde_json::Value,
+    /// Severity hint for routing priority.
+    pub severity: OutboundSeverity,
+}
+
+/// Severity levels for outbound events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundSeverity {
+    #[default]
+    Info,
+    Warning,
+    Critical,
+}
+
+impl OutboundEvent {
+    /// Create a new outbound event.
+    #[must_use]
+    pub fn new(
+        source: OutboundEventSource,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        let now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
+        Self {
+            source,
+            event_type: event_type.into(),
+            correlation_id: None,
+            timestamp_ms: now_ms,
+            pane_id: None,
+            workflow_id: None,
+            payload,
+            severity: OutboundSeverity::default(),
+        }
+    }
+
+    /// Set the correlation ID.
+    #[must_use]
+    pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    /// Set the pane ID.
+    #[must_use]
+    pub fn with_pane_id(mut self, pane_id: u64) -> Self {
+        self.pane_id = Some(pane_id);
+        self
+    }
+
+    /// Set the workflow ID.
+    #[must_use]
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.workflow_id = Some(workflow_id.into());
+        self
+    }
+
+    /// Set the timestamp.
+    #[must_use]
+    pub fn with_timestamp_ms(mut self, ts: u64) -> Self {
+        self.timestamp_ms = ts;
+        self
+    }
+
+    /// Set the severity.
+    #[must_use]
+    pub fn with_severity(mut self, severity: OutboundSeverity) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    /// Convert a runtime [`crate::events::Event`] into an outbound connector
+    /// event when that runtime event is meaningful for external dispatch.
+    ///
+    /// High-volume segment-capture events intentionally return `None`; routing
+    /// every captured chunk through connector rules would make the outbound
+    /// bridge part of the hot ingest path. Pattern, lifecycle, workflow,
+    /// user-var, gap, and mission audit events retain enough structure for
+    /// connector routing while preserving the existing EventBus redaction
+    /// boundary.
+    #[must_use]
+    pub fn from_runtime_event(event: &crate::events::Event, now_ms: u64) -> Option<Self> {
+        match event {
+            crate::events::Event::SegmentCaptured { .. } => None,
+            crate::events::Event::GapDetected {
+                pane_id,
+                seq_before,
+                seq_after,
+                reason,
+                detected_at_ms,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::HealthAlert,
+                    "capture.gap_detected",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "seq_before": seq_before,
+                        "seq_after": seq_after,
+                        "reason": reason,
+                        "detected_at_ms": detected_at_ms,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("gap:{pane_id}:{seq_before}:{seq_after}"))
+                .with_severity(OutboundSeverity::Warning),
+            ),
+            crate::events::Event::PatternDetected {
+                pane_id,
+                pane_uuid,
+                detection,
+                event_id,
+            } => {
+                let correlation_id = event_id.map_or_else(
+                    || format!("pattern:{pane_id}:{}:{now_ms}", detection.rule_id),
+                    |id| format!("event:{id}"),
+                );
+                Some(
+                    Self::new(
+                        OutboundEventSource::PatternDetected,
+                        format!("pattern.{}", detection.event_type),
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "pane_uuid": pane_uuid,
+                            "event_id": event_id,
+                            "rule_id": detection.rule_id,
+                            "agent_type": detection.agent_type.to_string(),
+                            "event_type": detection.event_type,
+                            "confidence": detection.confidence,
+                            "extracted": detection.extracted,
+                            "matched_text": detection.matched_text,
+                        }),
+                    )
+                    .with_timestamp_ms(now_ms)
+                    .with_pane_id(*pane_id)
+                    .with_correlation_id(correlation_id)
+                    .with_severity(outbound_severity_from_detection(detection.severity)),
+                )
+            }
+            crate::events::Event::PaneDiscovered {
+                pane_id,
+                domain,
+                title,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::PaneLifecycle,
+                    "pane.discovered",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "domain": domain,
+                        "title": title,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("pane:{pane_id}:discovered:{now_ms}")),
+            ),
+            crate::events::Event::PaneDisappeared { pane_id } => Some(
+                Self::new(
+                    OutboundEventSource::PaneLifecycle,
+                    "pane.disappeared",
+                    serde_json::json!({ "pane_id": pane_id }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("pane:{pane_id}:disappeared:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowStarted {
+                workflow_id,
+                workflow_name,
+                pane_id,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.started",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "workflow_name": workflow_name,
+                        "pane_id": pane_id,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:started:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowStep {
+                workflow_id,
+                step_name,
+                result,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.step",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "step_name": step_name,
+                        "result": result,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:step:{step_name}:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowCompleted {
+                workflow_id,
+                success,
+                reason,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.completed",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "success": success,
+                        "reason": reason,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:completed:{now_ms}"))
+                .with_severity(if *success {
+                    OutboundSeverity::Info
+                } else {
+                    OutboundSeverity::Warning
+                }),
+            ),
+            crate::events::Event::UserVarReceived {
+                pane_id,
+                name,
+                payload,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::UserAction,
+                    "user_var.received",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "name": name,
+                        "payload": payload,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("user_var:{pane_id}:{name}:{now_ms}")),
+            ),
+            #[cfg(feature = "subprocess-bridge")]
+            crate::events::Event::MissionAudit { event } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "mission.audit",
+                    serde_json::to_value(event).unwrap_or_else(|_| serde_json::Value::Null),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_correlation_id(format!("mission:audit:{now_ms}")),
+            ),
+        }
+    }
+}
+
+fn outbound_severity_from_detection(severity: crate::patterns::Severity) -> OutboundSeverity {
+    match severity {
+        crate::patterns::Severity::Info => OutboundSeverity::Info,
+        crate::patterns::Severity::Warning => OutboundSeverity::Warning,
+        crate::patterns::Severity::Critical => OutboundSeverity::Critical,
+    }
+}
+
+// =============================================================================
+// Connector action (bridge output)
+// =============================================================================
+
+/// A concrete action to dispatch to a target connector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorAction {
+    /// Target connector identifier (e.g., "slack", "github", "datadog").
+    pub target_connector: String,
+    /// Kind of action.
+    pub action_kind: ConnectorActionKind,
+    /// Correlation ID linking back to the source event.
+    pub correlation_id: String,
+    /// Action parameters (connector-specific).
+    pub params: serde_json::Value,
+    /// Timestamp when the action was created.
+    pub created_at_ms: u64,
+}
+
+impl ConnectorAction {
+    /// Capability the host runtime must authorize for this concrete action.
+    #[must_use]
+    pub fn dispatch_capability(&self) -> ConnectorCapability {
+        sandbox_capability_for_payload(self.action_kind, &self.params)
+    }
+
+    /// Destination target used by capability allow-lists, when the payload carries one.
+    #[must_use]
+    pub fn sandbox_target(&self) -> Option<String> {
+        sandbox_target_for_payload(self.dispatch_capability(), &self.params)
+    }
+}
+
+/// Supported credential-broker operations for connector actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorCredentialOperation {
+    Lease,
+    Rotate,
+    RevokeLease,
+    RevokeCredential,
+}
+
+/// Typed payload for connector credential actions.
+///
+/// br-ft-2jz47: callers MUST construct via [`Self::from_payload`], which
+/// runs [`Self::validate`] and guarantees `scope.is_some()` for any
+/// operation reaching [`Self::policy_scope`]. Direct struct-literal
+/// construction (e.g., `ConnectorCredentialActionRequest { scope: None,
+/// .. }`) bypasses the validator and would violate the policy_scope
+/// invariant. The fields are `pub` for serde Deserialize compatibility,
+/// not as a public construction contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectorCredentialActionRequest {
+    pub operation: ConnectorCredentialOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CredentialScope>,
+    #[serde(default = "default_connector_credential_sensitivity")]
+    pub sensitivity: CredentialSensitivity,
+}
+
+fn default_connector_credential_sensitivity() -> CredentialSensitivity {
+    CredentialSensitivity::Medium
+}
+
+impl ConnectorCredentialActionRequest {
+    fn from_payload(payload: &serde_json::Value) -> Result<Self, String> {
+        let request: Self = serde_json::from_value(payload.clone())
+            .map_err(|err| format!("invalid credential action payload: {err}"))?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self.operation {
+            ConnectorCredentialOperation::Lease
+            | ConnectorCredentialOperation::Rotate
+            | ConnectorCredentialOperation::RevokeCredential => {
+                if self.credential_id.as_deref().is_none_or(str::is_empty) {
+                    return Err("credential_id is required".to_string());
+                }
+            }
+            ConnectorCredentialOperation::RevokeLease => {
+                if self.lease_id.as_deref().is_none_or(str::is_empty) {
+                    return Err("lease_id is required".to_string());
+                }
+            }
+        }
+
+        let Some(scope) = &self.scope else {
+            return Err("scope is required".to_string());
+        };
+        if scope.provider.trim().is_empty() {
+            return Err("scope.provider must not be empty".to_string());
+        }
+        if scope.resource.trim().is_empty() {
+            return Err("scope.resource must not be empty".to_string());
+        }
+        if scope.operations.is_empty() || scope.operations.iter().any(|op| op.trim().is_empty()) {
+            return Err(
+                "scope.operations must contain at least one non-empty operation".to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Invariant: `self.scope.is_some()` after construction via
+    /// [`Self::from_payload`] (which runs [`Self::validate`]). Direct
+    /// struct-literal construction would bypass the validator and panic
+    /// here — see the type-level br-ft-2jz47 doc-block.
+    fn policy_scope(&self) -> &CredentialScope {
+        self.scope
+            .as_ref()
+            .expect("validated credential action request must contain scope")
+    }
+
+    fn summary(&self, connector_id: &str) -> String {
+        let scope = self.policy_scope();
+        let target = self
+            .credential_id
+            .as_deref()
+            .or(self.lease_id.as_deref())
+            .unwrap_or("unknown");
+        format!(
+            "connector {connector_id} credential {} for {}:{} ({}) target={target}",
+            match self.operation {
+                ConnectorCredentialOperation::Lease => "lease",
+                ConnectorCredentialOperation::Rotate => "rotate",
+                ConnectorCredentialOperation::RevokeLease => "revoke_lease",
+                ConnectorCredentialOperation::RevokeCredential => "revoke_credential",
+            },
+            scope.provider,
+            scope.resource,
+            self.sensitivity,
+        )
+    }
+}
+
+/// Sanitized broker-prepared payload forwarded to connector execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedConnectorCredentialAction {
+    pub operation: ConnectorCredentialOperation,
+    pub connector_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    pub scope: CredentialScope,
+    pub sensitivity: CredentialSensitivity,
+    pub broker_checked_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_lease_expires_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_credential_version: Option<u32>,
+}
+
+// =============================================================================
+// Routing rules
+// =============================================================================
+
+/// A routing rule that maps events to connector actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundRoutingRule {
+    /// Unique rule identifier.
+    pub rule_id: String,
+    /// Event source filter (matches all if None).
+    pub source_filter: Option<OutboundEventSource>,
+    /// Event type prefix filter (matches all if None).
+    /// Supports prefix matching: "pattern." matches "pattern.ci_failure".
+    pub event_type_prefix: Option<String>,
+    /// Minimum severity required to trigger this rule.
+    pub min_severity: Option<OutboundSeverity>,
+    /// Target connector for the action.
+    pub target_connector: String,
+    /// Kind of action to dispatch.
+    pub action_kind: ConnectorActionKind,
+    /// Whether this rule is enabled.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Priority (lower = higher priority). Used for ordering when multiple rules match.
+    #[serde(default)]
+    pub priority: u32,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl OutboundRoutingRule {
+    /// Check if this rule matches the given event.
+    #[must_use]
+    pub fn matches(&self, event: &OutboundEvent) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(source) = self.source_filter {
+            if event.source != source {
+                return false;
+            }
+        }
+        if let Some(ref prefix) = self.event_type_prefix {
+            if !event.event_type.starts_with(prefix) {
+                return false;
+            }
+        }
+        if let Some(min_sev) = self.min_severity {
+            if severity_rank(event.severity) < severity_rank(min_sev) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Numeric rank for severity comparison.
+fn severity_rank(s: OutboundSeverity) -> u8 {
+    match s {
+        OutboundSeverity::Info => 0,
+        OutboundSeverity::Warning => 1,
+        OutboundSeverity::Critical => 2,
+    }
+}
+
+fn circuit_state_reason_code(state: crate::circuit_breaker::CircuitStateKind) -> &'static str {
+    match state {
+        crate::circuit_breaker::CircuitStateKind::Closed => "circuit_closed",
+        crate::circuit_breaker::CircuitStateKind::Open => "circuit_open",
+        crate::circuit_breaker::CircuitStateKind::HalfOpen => "circuit_half_open",
+    }
+}
+
+// =============================================================================
+// Dispatch result
+// =============================================================================
+
+/// Outcome of processing a single event through the outbound bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundDispatchResult {
+    /// Correlation ID for the event.
+    pub correlation_id: String,
+    /// Whether the event was deduplicated (skipped).
+    pub deduplicated: bool,
+    /// Actions that were dispatched (or queued for dispatch).
+    pub actions_dispatched: Vec<DispatchedAction>,
+    /// Actions that were blocked by policy, sandbox, reliability, governor, or queue gates.
+    pub actions_blocked: Vec<BlockedAction>,
+}
+
+/// Record of a successfully dispatched action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchedAction {
+    pub rule_id: String,
+    pub target_connector: String,
+    pub action_kind: ConnectorActionKind,
+    pub correlation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<PolicyDecision>,
+}
+
+/// Record of a blocked action with reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedAction {
+    pub rule_id: String,
+    pub target_connector: String,
+    pub action_kind: ConnectorActionKind,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial: Option<ConnectorDispatchDenialEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<PolicyDecision>,
+}
+
+/// Machine-readable connector dispatch denial payload.
+///
+/// The human `reason` string remains useful for logs, while this envelope gives
+/// robot/MCP clients a stable code path for policy, sandbox, reliability,
+/// governor, and queue denials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorDispatchDenialEnvelope {
+    pub error_code: String,
+    pub reason_code: String,
+    pub rule_id: String,
+    pub connector_id: String,
+    pub action_kind: ConnectorActionKind,
+    pub at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ConnectorDispatchDenialEnvelope {
+    #[must_use]
+    pub fn new(
+        error_code: impl Into<String>,
+        reason_code: impl Into<String>,
+        rule_id: &str,
+        connector_id: &str,
+        action_kind: ConnectorActionKind,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            error_code: error_code.into(),
+            reason_code: reason_code.into(),
+            rule_id: rule_id.to_string(),
+            connector_id: connector_id.to_string(),
+            action_kind,
+            at_ms,
+            verdict: None,
+            delay_ms: None,
+            detail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_verdict(mut self, verdict: impl Into<String>) -> Self {
+        self.verdict = Some(verdict.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.delay_ms = Some(delay_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+/// Errors from the outbound connector bridge.
+#[derive(Debug, Error)]
+pub enum OutboundBridgeError {
+    #[error("duplicate event (correlation_id={0})")]
+    DuplicateEvent(String),
+    #[error("no matching routing rules for event type: {0}")]
+    NoMatchingRules(String),
+    #[error("dispatch queue full (capacity={0})")]
+    DispatchQueueFull(usize),
+    #[error("sandbox violation: {capability} denied for connector {connector} (reason: {reason})")]
+    SandboxViolation {
+        connector: String,
+        capability: String,
+        reason: String,
+    },
+    #[error("all matched rules blocked by policy")]
+    AllRulesBlocked,
+}
+
+// =============================================================================
+// Deduplicator (reuses pattern from inbound bridge)
+// =============================================================================
+
+/// Entry in the dedup cache.
+#[derive(Debug, Clone)]
+struct DedupEntry {
+    correlation_id: String,
+    inserted_at_ms: u64,
+}
+
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Bounded, TTL-aware deduplicator for outbound events.
+#[derive(Debug)]
+pub struct OutboundDeduplicator {
+    entries: VecDeque<DedupEntry>,
+    capacity: usize,
+    ttl_ms: u64,
+}
+
+impl OutboundDeduplicator {
+    /// Create a new deduplicator.
+    #[must_use]
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity.min(4096)),
+            capacity,
+            ttl_ms: duration_ms_saturating(ttl),
+        }
+    }
+
+    /// Check if a correlation_id is new (not seen within TTL).
+    /// If new, records it and returns `true`.
+    /// If duplicate, returns `false`.
+    pub fn check_and_record(&mut self, correlation_id: &str, now_ms: u64) -> bool {
+        if correlation_id.trim().is_empty() {
+            return true;
+        }
+
+        // [ft-zu8g3] Zero-capacity short-circuit. Without this guard,
+        // the `len >= 0` check below evaluates as always-true and the
+        // cache degrades to a 1-slot replacer (pop_front on empty is
+        // a no-op, push_back still succeeds, next alternating id
+        // pops-and-replaces). Silently destroys dedup semantics.
+        // Mirrors the canonical SignalDeduplicator fix at
+        // connector_inbound_bridge.rs:351 (ft-bx4le) and the
+        // EventDeduplicator fix at events.rs:843 (ft-61kg4). Outbound
+        // treats 0 as "bypass dedup" (every correlation_id is new)
+        // because its dedup surface SUPPRESSES routing — bypassing
+        // is the closest behavior to "no cache."
+        if self.capacity == 0 {
+            return true;
+        }
+
+        self.evict_expired(now_ms);
+
+        if self
+            .entries
+            .iter()
+            .any(|e| e.correlation_id == correlation_id)
+        {
+            return false;
+        }
+
+        if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+
+        self.entries.push_back(DedupEntry {
+            correlation_id: correlation_id.to_string(),
+            inserted_at_ms: now_ms,
+        });
+        true
+    }
+
+    fn evict_expired(&mut self, now_ms: u64) {
+        while let Some(front) = self.entries.front() {
+            if now_ms.saturating_sub(front.inserted_at_ms) > self.ttl_ms {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Number of entries currently tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the dedup cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Telemetry counters for the outbound bridge.
+#[derive(Debug, Default)]
+pub struct OutboundBridgeTelemetry {
+    pub events_received: u64,
+    pub events_routed: u64,
+    pub events_deduplicated: u64,
+    pub events_unmatched: u64,
+    pub actions_dispatched: u64,
+    pub actions_blocked_policy: u64,
+    pub actions_blocked_sandbox: u64,
+    pub actions_blocked_governor: u64,
+    /// Actions the governor returned `Throttle` for (allowed-after-delay).
+    /// Kept distinct from `actions_blocked_governor` (hard rejections) so
+    /// pacing is not conflated with denials (ft-7h5da.5.15).
+    pub actions_throttled: u64,
+    pub actions_blocked_reliability: u64,
+    /// Actions dropped by the data-classification gate (Reject/Quarantine
+    /// ingestion decisions on the operator-configured classifier; ft-cdxrr).
+    pub actions_blocked_classification: u64,
+    pub dispatch_queue_overflows: u64,
+}
+
+/// Serializable telemetry snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboundBridgeTelemetrySnapshot {
+    pub events_received: u64,
+    pub events_routed: u64,
+    pub events_deduplicated: u64,
+    pub events_unmatched: u64,
+    pub actions_dispatched: u64,
+    pub actions_blocked_policy: u64,
+    pub actions_blocked_sandbox: u64,
+    pub actions_blocked_governor: u64,
+    /// `Throttle` verdicts (allowed-after-delay), distinct from hard
+    /// rejections (ft-7h5da.5.15). `#[serde(default)]` keeps older persisted
+    /// snapshots (without this field) loadable.
+    #[serde(default)]
+    pub actions_throttled: u64,
+    pub actions_blocked_reliability: u64,
+    /// Actions dropped by the data-classification gate (ft-cdxrr).
+    /// `#[serde(default)]` keeps older persisted snapshots loadable.
+    #[serde(default)]
+    pub actions_blocked_classification: u64,
+    pub dispatch_queue_overflows: u64,
+}
+
+impl OutboundBridgeTelemetry {
+    /// Take a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> OutboundBridgeTelemetrySnapshot {
+        OutboundBridgeTelemetrySnapshot {
+            events_received: self.events_received,
+            events_routed: self.events_routed,
+            events_deduplicated: self.events_deduplicated,
+            events_unmatched: self.events_unmatched,
+            actions_dispatched: self.actions_dispatched,
+            actions_blocked_policy: self.actions_blocked_policy,
+            actions_blocked_sandbox: self.actions_blocked_sandbox,
+            actions_blocked_governor: self.actions_blocked_governor,
+            actions_throttled: self.actions_throttled,
+            actions_blocked_reliability: self.actions_blocked_reliability,
+            actions_blocked_classification: self.actions_blocked_classification,
+            dispatch_queue_overflows: self.dispatch_queue_overflows,
+        }
+    }
+}
+
+// =============================================================================
+// Dispatch history
+// =============================================================================
+
+/// Record of a dispatch outcome for audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchHistoryEntry {
+    pub correlation_id: String,
+    pub event_type: String,
+    pub timestamp_ms: u64,
+    pub actions: Vec<DispatchedAction>,
+    pub blocked: Vec<BlockedAction>,
+}
+
+// =============================================================================
+// Sandbox checker
+// =============================================================================
+
+/// Lightweight sandbox capability checker for outbound actions.
+///
+/// Validates that the target connector has the required capability
+/// before allowing an action to be dispatched.
+pub struct OutboundSandboxChecker {
+    /// Per-connector sandbox zones. Key: connector name.
+    zones: HashMap<String, ConnectorSandboxZone>,
+    /// Default zone for connectors without explicit configuration.
+    default_zone: ConnectorSandboxZone,
+}
+
+impl OutboundSandboxChecker {
+    /// Create a new sandbox checker with the default zone.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            zones: HashMap::new(),
+            default_zone: ConnectorSandboxZone::default(),
+        }
+    }
+
+    /// Register a sandbox zone for a specific connector.
+    pub fn register_zone(&mut self, connector: impl Into<String>, zone: ConnectorSandboxZone) {
+        self.zones.insert(connector.into(), zone);
+    }
+
+    /// Set the default zone for unregistered connectors.
+    pub fn set_default_zone(&mut self, zone: ConnectorSandboxZone) {
+        self.default_zone = zone;
+    }
+
+    fn capability_has_target_scope(
+        zone: &ConnectorSandboxZone,
+        capability: ConnectorCapability,
+    ) -> bool {
+        match capability {
+            ConnectorCapability::FilesystemRead => {
+                !zone.capability_envelope.filesystem_read_prefixes.is_empty()
+            }
+            ConnectorCapability::FilesystemWrite => !zone
+                .capability_envelope
+                .filesystem_write_prefixes
+                .is_empty(),
+            ConnectorCapability::NetworkEgress => {
+                !zone.capability_envelope.network_allow_hosts.is_empty()
+            }
+            ConnectorCapability::ProcessExec => {
+                !zone.capability_envelope.allowed_exec_commands.is_empty()
+            }
+            ConnectorCapability::Invoke
+            | ConnectorCapability::ReadState
+            | ConnectorCapability::StreamEvents
+            | ConnectorCapability::SecretBroker => false,
+        }
+    }
+
+    /// Check if a connector has the required capability and target allowance.
+    #[must_use]
+    pub fn check_capability(
+        &self,
+        connector: &str,
+        capability: ConnectorCapability,
+        target: Option<&str>,
+    ) -> SandboxCheckResult {
+        let zone = self.zones.get(connector).unwrap_or(&self.default_zone);
+        if !zone.capability_envelope.allows_capability(capability) {
+            if !zone.fail_closed {
+                return SandboxCheckResult::Allowed;
+            }
+            SandboxCheckResult::Denied {
+                zone_id: zone.zone_id.clone(),
+                reason: format!("sandbox.denied.capability.{}", capability.as_str()),
+            }
+        } else if Self::capability_has_target_scope(zone, capability)
+            && !zone.capability_envelope.allows_target(capability, target)
+        {
+            if !zone.fail_closed {
+                return SandboxCheckResult::Allowed;
+            }
+            SandboxCheckResult::Denied {
+                zone_id: zone.zone_id.clone(),
+                reason: format!("sandbox.denied.target.{}", capability.as_str()),
+            }
+        } else {
+            SandboxCheckResult::Allowed
+        }
+    }
+}
+
+impl Default for OutboundSandboxChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of a sandbox capability check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxCheckResult {
+    Allowed,
+    Denied { zone_id: String, reason: String },
+}
+
+// =============================================================================
+// Bridge
+// =============================================================================
+
+/// Outbound connector bridge.
+///
+/// Routes FrankenTerm events into connector actions via configurable
+/// routing rules, with deduplication, policy gates, and sandbox enforcement.
+pub struct ConnectorOutboundBridge {
+    config: ConnectorOutboundBridgeConfig,
+    rules: Vec<OutboundRoutingRule>,
+    deduplicator: OutboundDeduplicator,
+    policy: PolicyEngine,
+    sandbox: OutboundSandboxChecker,
+    dispatch_queue: VecDeque<ConnectorAction>,
+    dispatch_history: VecDeque<DispatchHistoryEntry>,
+    telemetry: OutboundBridgeTelemetry,
+}
+
+impl ConnectorOutboundBridge {
+    /// Create a new outbound bridge.
+    #[must_use]
+    pub fn new(config: ConnectorOutboundBridgeConfig) -> Self {
+        let dedup_ttl = Duration::from_secs(config.dedup_ttl_secs);
+        Self {
+            deduplicator: OutboundDeduplicator::new(config.dedup_capacity, dedup_ttl),
+            dispatch_queue: VecDeque::with_capacity(config.dispatch_queue_capacity.min(4096)),
+            dispatch_history: VecDeque::with_capacity(config.dispatch_history_capacity.min(1024)),
+            config,
+            rules: Vec::new(),
+            policy: PolicyEngine::permissive(),
+            sandbox: OutboundSandboxChecker::new(),
+            telemetry: OutboundBridgeTelemetry::default(),
+        }
+    }
+
+    /// Add a routing rule.
+    pub fn add_rule(&mut self, rule: OutboundRoutingRule) {
+        self.rules.push(rule);
+        self.rules.sort_by_key(|r| r.priority);
+    }
+
+    /// Replace the policy engine used for connector dispatch decisions.
+    pub fn set_policy_engine(&mut self, policy: PolicyEngine) {
+        self.policy = policy;
+    }
+
+    /// Inspect the current policy engine.
+    #[must_use]
+    pub fn policy_engine(&self) -> &PolicyEngine {
+        &self.policy
+    }
+
+    /// Mutate the current policy engine in place.
+    pub fn policy_engine_mut(&mut self) -> &mut PolicyEngine {
+        &mut self.policy
+    }
+
+    /// Register a sandbox zone for a connector.
+    pub fn register_sandbox_zone(
+        &mut self,
+        connector: impl Into<String>,
+        zone: ConnectorSandboxZone,
+    ) {
+        self.sandbox.register_zone(connector, zone);
+    }
+
+    /// Enable or disable reliability/governor enforcement for a connector.
+    pub fn set_connector_admission_enforced(
+        &mut self,
+        connector: impl Into<String>,
+        enforce: bool,
+    ) {
+        self.config
+            .enforce_connector_admission
+            .insert(connector.into(), enforce);
+    }
+
+    fn connector_admission_enforced(&self, connector: &str) -> bool {
+        self.config
+            .enforce_connector_admission
+            .get(connector)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    fn policy_actor_for_event(event: &OutboundEvent) -> ActorKind {
+        match event.source {
+            OutboundEventSource::UserAction => ActorKind::Robot,
+            OutboundEventSource::PatternDetected
+            | OutboundEventSource::PaneLifecycle
+            | OutboundEventSource::WorkflowLifecycle
+            | OutboundEventSource::PolicyDecision
+            | OutboundEventSource::HealthAlert
+            | OutboundEventSource::Custom => ActorKind::Workflow,
+        }
+    }
+
+    fn build_policy_input(
+        event: &OutboundEvent,
+        rule: &OutboundRoutingRule,
+        credential_request: Option<&ConnectorCredentialActionRequest>,
+    ) -> PolicyInput {
+        let summary = credential_request.map_or_else(
+            || {
+                format!(
+                    "connector {} {} for event {} ({})",
+                    rule.target_connector,
+                    rule.action_kind.as_str(),
+                    event.event_type,
+                    event.source.as_str()
+                )
+            },
+            |request| request.summary(&rule.target_connector),
+        );
+
+        let mut input = PolicyInput::new(
+            rule.action_kind.policy_action(),
+            Self::policy_actor_for_event(event),
+        )
+        .with_surface(PolicySurface::Connector)
+        .with_capabilities(PaneCapabilities::prompt())
+        .with_text_summary(summary)
+        .with_domain(rule.target_connector.clone());
+
+        if let Some(pane_id) = event.pane_id {
+            input = input.with_pane(pane_id);
+        }
+
+        if let Some(workflow_id) = &event.workflow_id {
+            input = input.with_workflow(workflow_id.clone());
+        }
+
+        input
+    }
+
+    fn prepare_credential_action(
+        &mut self,
+        connector_id: &str,
+        request: &ConnectorCredentialActionRequest,
+        now_ms: u64,
+    ) -> Result<PreparedConnectorCredentialAction, String> {
+        match request.operation {
+            ConnectorCredentialOperation::Lease => {
+                let credential_id = request
+                    .credential_id
+                    .as_deref()
+                    .ok_or_else(|| "credential_id is required".to_string())?;
+                let lease = self
+                    .policy
+                    .credential_broker_mut()
+                    .request_lease(
+                        connector_id,
+                        credential_id,
+                        request.policy_scope().clone(),
+                        now_ms,
+                    )
+                    .map_err(|err| err.to_string())?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(lease.credential_id().to_string()),
+                    lease_id: None,
+                    scope: lease.granted_scope().clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: Some(lease.lease_id().to_string()),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms()),
+                    broker_credential_version: Some(lease.credential_version()),
+                })
+            }
+            ConnectorCredentialOperation::Rotate
+            | ConnectorCredentialOperation::RevokeCredential => {
+                let credential_id = request
+                    .credential_id
+                    .as_deref()
+                    .ok_or_else(|| "credential_id is required".to_string())?;
+                let credential = self
+                    .policy
+                    .credential_broker()
+                    .get_credential(credential_id)
+                    .ok_or_else(|| format!("credential not found: {credential_id}"))?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(credential_id.to_string()),
+                    lease_id: None,
+                    scope: request.policy_scope().clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: None,
+                    broker_lease_expires_at_ms: None,
+                    broker_credential_version: Some(credential.version),
+                })
+            }
+            ConnectorCredentialOperation::RevokeLease => {
+                let lease_id = request
+                    .lease_id
+                    .as_deref()
+                    .ok_or_else(|| "lease_id is required".to_string())?;
+                let lease = self
+                    .policy
+                    .credential_broker()
+                    .active_leases_for_connector(connector_id)
+                    .into_iter()
+                    .find(|lease| lease.lease_id() == lease_id)
+                    .ok_or_else(|| {
+                        format!("active lease not found for connector {connector_id}: {lease_id}")
+                    })?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(lease.credential_id().to_string()),
+                    lease_id: Some(lease_id.to_string()),
+                    scope: request.policy_scope().clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: Some(lease.lease_id().to_string()),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms()),
+                    broker_credential_version: Some(lease.credential_version()),
+                })
+            }
+        }
+    }
+
+    /// Process an event through the outbound bridge.
+    ///
+    /// Steps:
+    /// 1. Deduplication check (if correlation_id present)
+    /// 2. Match event against routing rules
+    /// 3. For each matched rule:
+    ///    a. Unified policy authorization on the connector surface
+    ///    b. Sandbox capability check
+    ///    c. Build connector action
+    ///    d. Enqueue for dispatch
+    /// 4. Record history and telemetry
+    pub fn process_event(
+        &mut self,
+        event: &OutboundEvent,
+    ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
+        self.process_event_for_rule(event, None)
+    }
+
+    /// Evaluate a single configured route with its actual operation payload.
+    /// The durable transport supplies the route identity; event data cannot
+    /// select another route or borrow its policy/classification decision.
+    pub(crate) fn process_event_for_rule(
+        &mut self,
+        event: &OutboundEvent,
+        rule_id: Option<&str>,
+    ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
+        self.telemetry.events_received = self.telemetry.events_received.saturating_add(1);
+
+        // Generate or use an explicit non-blank correlation ID.
+        let explicit_correlation_id = event
+            .correlation_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
+        let correlation_id = explicit_correlation_id.map_or_else(
+            || {
+                format!(
+                    "out-{}-{}-{}",
+                    event.source.as_str(),
+                    event.timestamp_ms,
+                    event.pane_id.unwrap_or(0)
+                )
+            },
+            str::to_string,
+        );
+
+        // 1. Deduplication
+        //
+        // [ft-ptjlp] Dedup bookkeeping uses the LOCAL receive clock,
+        // NOT `event.timestamp_ms`. OutboundEvent is Serialize +
+        // Deserialize with a pub `timestamp_ms` field documented as
+        // "Timestamp at source" — any deserialized or replayed event
+        // carries an attacker-controllable value. Feeding that into
+        // `check_and_record` lets a replay with `timestamp_ms =
+        // ttl_ms + 1` trigger `evict_expired`, pop the live entry,
+        // and the replay is treated as new — re-firing every matched
+        // routing rule's downstream connector action (Slack/JIRA/
+        // webhook/etc.). Same fix shape as ft-dijpe (inbound bridge,
+        // commit 0716e112). SystemTime::now() keeps the dedup clock
+        // under local control.
+        let dedup_now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
+        if explicit_correlation_id.is_some()
+            && !self
+                .deduplicator
+                .check_and_record(&correlation_id, dedup_now_ms)
+        {
+            self.telemetry.events_deduplicated =
+                self.telemetry.events_deduplicated.saturating_add(1);
+            debug!(
+                correlation_id = %correlation_id,
+                source = %event.source,
+                event_type = %event.event_type,
+                "outbound event deduplicated"
+            );
+            return Ok(OutboundDispatchResult {
+                correlation_id,
+                deduplicated: true,
+                actions_dispatched: vec![],
+                actions_blocked: vec![],
+            });
+        }
+
+        // 2. Match routing rules
+        let matched_rules: Vec<OutboundRoutingRule> = self
+            .rules
+            .iter()
+            .filter(|r| rule_id.is_none_or(|id| r.rule_id == id) && r.matches(event))
+            .cloned()
+            .collect();
+
+        if matched_rules.is_empty() {
+            self.telemetry.events_unmatched = self.telemetry.events_unmatched.saturating_add(1);
+            if self.config.reject_unmatched_events {
+                warn!(
+                    event_type = %event.event_type,
+                    source = %event.source,
+                    "outbound event has no matching rules (rejected)"
+                );
+                return Err(OutboundBridgeError::NoMatchingRules(
+                    event.event_type.clone(),
+                ));
+            }
+            debug!(
+                event_type = %event.event_type,
+                source = %event.source,
+                "outbound event has no matching rules (ignored)"
+            );
+            return Ok(OutboundDispatchResult {
+                correlation_id,
+                deduplicated: false,
+                actions_dispatched: vec![],
+                actions_blocked: vec![],
+            });
+        }
+
+        // 3. Process each matched rule
+        let mut dispatched = Vec::new();
+        let mut blocked = Vec::new();
+        let now_ms = event.timestamp_ms;
+
+        for rule in &matched_rules {
+            let credential_request = if rule.action_kind == ConnectorActionKind::CredentialAction {
+                match ConnectorCredentialActionRequest::from_payload(&event.payload) {
+                    Ok(request) => Some(request),
+                    Err(reason) => {
+                        self.telemetry.actions_blocked_policy =
+                            self.telemetry.actions_blocked_policy.saturating_add(1);
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!("credential_action: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.credential_denied",
+                                    "credential_action_invalid",
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(reason),
+                            ),
+                            policy_decision: None,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let policy_input = Self::build_policy_input(event, rule, credential_request.as_ref());
+            let policy_decision = if let Some(request) = credential_request.as_ref() {
+                self.policy.authorize_connector_credential_action(
+                    &policy_input,
+                    request.policy_scope(),
+                    request.sensitivity,
+                )
+            } else {
+                self.policy.authorize(&policy_input)
+            };
+            if !policy_decision.is_allowed() {
+                self.telemetry.actions_blocked_policy =
+                    self.telemetry.actions_blocked_policy.saturating_add(1);
+                let decision_kind = policy_decision.as_str();
+                let policy_rule_id = policy_decision.rule_id().unwrap_or("policy.unknown");
+                let reason = policy_decision
+                    .reason()
+                    .unwrap_or("connector action blocked by policy")
+                    .to_string();
+                warn!(
+                    rule_id = %rule.rule_id,
+                    connector = %rule.target_connector,
+                    action = %rule.action_kind,
+                    decision = %decision_kind,
+                    policy_rule_id = policy_rule_id,
+                    "outbound action blocked by policy"
+                );
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: format!("policy({decision_kind}): {reason}"),
+                    denial: Some(
+                        ConnectorDispatchDenialEnvelope::new(
+                            "connector.policy_denied",
+                            policy_rule_id,
+                            &rule.rule_id,
+                            &rule.target_connector,
+                            rule.action_kind,
+                            now_ms,
+                        )
+                        .with_verdict(decision_kind)
+                        .with_detail(reason),
+                    ),
+                    policy_decision: Some(policy_decision),
+                });
+                continue;
+            }
+
+            let required_cap = sandbox_capability_for_payload(rule.action_kind, &event.payload);
+            let sandbox_target = sandbox_target_for_payload(required_cap, &event.payload);
+
+            // 3b. Sandbox check
+            if self.config.enforce_sandbox {
+                match self.sandbox.check_capability(
+                    &rule.target_connector,
+                    required_cap,
+                    sandbox_target.as_deref(),
+                ) {
+                    SandboxCheckResult::Allowed => {}
+                    SandboxCheckResult::Denied { zone_id, reason } => {
+                        self.telemetry.actions_blocked_sandbox =
+                            self.telemetry.actions_blocked_sandbox.saturating_add(1);
+                        warn!(
+                            rule_id = %rule.rule_id,
+                            connector = %rule.target_connector,
+                            capability = %required_cap.as_str(),
+                            target = ?sandbox_target,
+                            zone_id = %zone_id,
+                            "outbound action blocked by sandbox"
+                        );
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!("sandbox: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.sandbox_denied",
+                                    &reason,
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(match sandbox_target
+                                    .as_deref()
+                                {
+                                    Some(target) => format!("zone_id={zone_id},target={target}"),
+                                    None => format!("zone_id={zone_id},target=<missing>"),
+                                }),
+                            ),
+                            policy_decision: Some(policy_decision.clone()),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // 3c. Build action
+            let params = if let Some(request) = credential_request.as_ref() {
+                match self.prepare_credential_action(&rule.target_connector, request, now_ms) {
+                    Ok(prepared) => serde_json::to_value(&prepared).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "operation": "invalid",
+                            "connector_id": rule.target_connector,
+                            "broker_checked_at_ms": now_ms,
+                        })
+                    }),
+                    Err(reason) => {
+                        self.telemetry.actions_blocked_policy =
+                            self.telemetry.actions_blocked_policy.saturating_add(1);
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!("credential_broker: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.credential_denied",
+                                    "credential_broker_denied",
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(reason),
+                            ),
+                            policy_decision: Some(policy_decision.clone()),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                event.payload.clone()
+            };
+            let mut action = ConnectorAction {
+                target_connector: rule.target_connector.clone(),
+                action_kind: rule.action_kind,
+                correlation_id: correlation_id.clone(),
+                params,
+                created_at_ms: now_ms,
+            };
+
+            // 3c.5 Data-classification gate (ft-cdxrr).
+            //
+            // The operator-configured data classifier (`PolicyEngine.data_classifier`,
+            // built from `[...].data_classifier` TOML) was built but never consulted
+            // on the dispatch path, so classification policies — drop prohibited
+            // data, redact sensitive fields — were silent no-ops outbound. Enforce
+            // them here, before the action reaches the dispatch queue: classify the
+            // action payload, then drop on Reject/Quarantine and redact the params
+            // in place on AcceptRedacted. Connectors with no matching classification
+            // policy are unaffected (the classifier has nothing configured for them),
+            // so this only takes effect where an operator actually configured one —
+            // and any classification error falls through unchanged rather than
+            // fabricating a denial.
+            let classification: Option<(IngestionDecision, Option<serde_json::Value>)> = {
+                let classifier = self.policy.data_classifier_mut();
+                if classifier.find_policy(&action.target_connector).is_some() {
+                    let canonical = CanonicalConnectorEvent::new(
+                        EventDirection::Outbound,
+                        action.target_connector.clone(),
+                        event.event_type.clone(),
+                        action.params.clone(),
+                    )
+                    .with_correlation_id(correlation_id.clone())
+                    .with_timestamp_ms(now_ms)
+                    .with_action(event.source, action.action_kind);
+                    match classifier.classify_event(&canonical) {
+                        Ok(classified_event) => {
+                            let decision = match classifier.find_policy(&action.target_connector) {
+                                Some(policy) => {
+                                    classifier.ingestion_decision(&classified_event, policy)
+                                }
+                                None => IngestionDecision::Accept,
+                            };
+                            if matches!(decision, IngestionDecision::AcceptRedacted) {
+                                let redacted = classifier.redact_event_with_decision(
+                                    &canonical,
+                                    &classified_event,
+                                    decision.clone(),
+                                );
+                                Some((decision, Some(redacted.event.payload)))
+                            } else {
+                                Some((decision, None))
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            match classification {
+                None
+                | Some((IngestionDecision::Accept | IngestionDecision::AcceptRedacted, None)) => {}
+                Some((IngestionDecision::Accept, Some(_))) => {}
+                Some((IngestionDecision::AcceptRedacted, Some(redacted_payload))) => {
+                    action.params = redacted_payload;
+                }
+                Some((
+                    decision @ (IngestionDecision::Reject { .. }
+                    | IngestionDecision::Quarantine { .. }),
+                    _,
+                )) => {
+                    let (reason_code, reason_text) = match &decision {
+                        IngestionDecision::Reject { reason } => {
+                            ("classification_rejected", reason.clone())
+                        }
+                        IngestionDecision::Quarantine { reason } => {
+                            ("classification_quarantined", reason.clone())
+                        }
+                        _ => unreachable!("guarded by the match arm pattern"),
+                    };
+                    self.telemetry.actions_blocked_classification = self
+                        .telemetry
+                        .actions_blocked_classification
+                        .saturating_add(1);
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        decision = %decision,
+                        "outbound action blocked by data-classification gate"
+                    );
+                    blocked.push(BlockedAction {
+                        rule_id: rule.rule_id.clone(),
+                        target_connector: rule.target_connector.clone(),
+                        action_kind: rule.action_kind,
+                        reason: format!("classification({decision})"),
+                        denial: Some(
+                            ConnectorDispatchDenialEnvelope::new(
+                                "connector.classification_denied",
+                                reason_code,
+                                &rule.rule_id,
+                                &rule.target_connector,
+                                rule.action_kind,
+                                now_ms,
+                            )
+                            .with_detail(reason_text),
+                        ),
+                        policy_decision: Some(policy_decision.clone()),
+                    });
+                    continue;
+                }
+            }
+
+            let admission_enforced = self.connector_admission_enforced(&action.target_connector);
+
+            // 3d. Reliability + governor admission checks. These must run
+            // before an action is visible to the production dispatch queue.
+            let reliability_block = {
+                let controller = self
+                    .policy
+                    .reliability_registry_mut()
+                    .get_or_create(&action.target_connector);
+                if controller.allow_operation() {
+                    None
+                } else {
+                    Some(controller.circuit_status())
+                }
+            };
+            if let Some(status) = reliability_block {
+                warn!(
+                    rule_id = %rule.rule_id,
+                    connector = %rule.target_connector,
+                    action = %rule.action_kind,
+                    circuit_state = ?status.state,
+                    enforced = admission_enforced,
+                    "outbound action denied by connector reliability gate"
+                );
+                if !admission_enforced {
+                    debug!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        circuit_state = ?status.state,
+                        "connector reliability denial observed in log-only mode"
+                    );
+                } else {
+                    self.telemetry.actions_blocked_reliability =
+                        self.telemetry.actions_blocked_reliability.saturating_add(1);
+                    blocked.push(BlockedAction {
+                        rule_id: rule.rule_id.clone(),
+                        target_connector: rule.target_connector.clone(),
+                        action_kind: rule.action_kind,
+                        reason: format!(
+                            "reliability(circuit={:?}, consecutive_failures={}, cooldown_remaining_ms={:?})",
+                            status.state, status.consecutive_failures, status.cooldown_remaining_ms
+                        ),
+                        denial: Some(
+                            ConnectorDispatchDenialEnvelope::new(
+                                "connector.reliability_denied",
+                                circuit_state_reason_code(status.state),
+                                &rule.rule_id,
+                                &rule.target_connector,
+                                rule.action_kind,
+                                now_ms,
+                            )
+                            .with_detail(format!(
+                                "consecutive_failures={},cooldown_remaining_ms={:?}",
+                                status.consecutive_failures, status.cooldown_remaining_ms
+                            )),
+                        ),
+                        policy_decision: Some(policy_decision.clone()),
+                    });
+                    continue;
+                }
+            }
+
+            let queue_depth = self.dispatch_queue.len();
+            let governor_decision = {
+                let governor = self.policy.connector_governor_mut();
+                governor.update_queue_depth(queue_depth);
+                governor.evaluate(&action, now_ms)
+            };
+            if !matches!(&governor_decision.verdict, GovernorVerdict::Allow) {
+                // ft-7h5da.5.15: a `Throttle` verdict is "allowed after a
+                // recommended delay", NOT a rejection — it must not be dropped
+                // the way the previous `!= Allow` gate did. Only `Reject` blocks;
+                // `Throttle` is counted distinctly (`actions_throttled`, so pacing
+                // is not conflated with hard denials in `actions_blocked_governor`)
+                // and falls through to the dispatch queue. The governor's
+                // `delay_ms` is advisory here: the dispatch queue is FIFO with no
+                // scheduler, so honoring it as a scheduled re-dispatch is a tracked
+                // follow-up; immediate enqueue still beats dropping the action, and
+                // the governor's queue-depth/rate tracking escalates to `Reject`
+                // under sustained pressure.
+                if matches!(&governor_decision.verdict, GovernorVerdict::Throttle) {
+                    self.telemetry.actions_throttled =
+                        self.telemetry.actions_throttled.saturating_add(1);
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        reason = %governor_decision.reason,
+                        delay_ms = governor_decision.delay_ms,
+                        enforced = admission_enforced,
+                        "outbound action throttled by connector governor; proceeding (delay advisory)"
+                    );
+                } else {
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        verdict = %governor_decision.verdict,
+                        reason = %governor_decision.reason,
+                        delay_ms = governor_decision.delay_ms,
+                        enforced = admission_enforced,
+                        "outbound action denied by connector governor"
+                    );
+                    if !admission_enforced {
+                        debug!(
+                            rule_id = %rule.rule_id,
+                            connector = %rule.target_connector,
+                            action = %rule.action_kind,
+                            verdict = %governor_decision.verdict,
+                            reason = %governor_decision.reason,
+                            delay_ms = governor_decision.delay_ms,
+                            "connector governor denial observed in log-only mode"
+                        );
+                    } else {
+                        self.telemetry.actions_blocked_governor =
+                            self.telemetry.actions_blocked_governor.saturating_add(1);
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!(
+                                "governor({}: {}, delay_ms={})",
+                                governor_decision.verdict,
+                                governor_decision.reason,
+                                governor_decision.delay_ms
+                            ),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.governor_denied",
+                                    governor_decision.reason.to_string(),
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_verdict(governor_decision.verdict.to_string())
+                                .with_delay_ms(governor_decision.delay_ms),
+                            ),
+                            policy_decision: Some(policy_decision.clone()),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // 3e. Enqueue
+            if self.config.dispatch_queue_capacity == 0 {
+                self.telemetry.dispatch_queue_overflows =
+                    self.telemetry.dispatch_queue_overflows.saturating_add(1);
+                warn!("outbound dispatch queue capacity is zero, blocking action");
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: "dispatch_queue_full(capacity=0)".to_string(),
+                    denial: Some(
+                        ConnectorDispatchDenialEnvelope::new(
+                            "connector.queue_denied",
+                            "dispatch_queue_full",
+                            &rule.rule_id,
+                            &rule.target_connector,
+                            rule.action_kind,
+                            now_ms,
+                        )
+                        .with_detail("capacity=0"),
+                    ),
+                    policy_decision: Some(policy_decision.clone()),
+                });
+                continue;
+            }
+            if self.dispatch_queue.len() >= self.config.dispatch_queue_capacity {
+                self.telemetry.dispatch_queue_overflows =
+                    self.telemetry.dispatch_queue_overflows.saturating_add(1);
+                warn!(
+                    capacity = self.config.dispatch_queue_capacity,
+                    "outbound dispatch queue full, dropping oldest"
+                );
+                self.dispatch_queue.pop_front();
+            }
+            self.dispatch_queue.push_back(action);
+            {
+                let governor = self.policy.connector_governor_mut();
+                governor.record_enqueue();
+                governor.update_queue_depth(self.dispatch_queue.len());
+            }
+
+            self.telemetry.actions_dispatched = self.telemetry.actions_dispatched.saturating_add(1);
+            dispatched.push(DispatchedAction {
+                rule_id: rule.rule_id.clone(),
+                target_connector: rule.target_connector.clone(),
+                action_kind: rule.action_kind,
+                correlation_id: correlation_id.clone(),
+                policy_decision: Some(policy_decision),
+            });
+
+            info!(
+                rule_id = %rule.rule_id,
+                connector = %rule.target_connector,
+                action = %rule.action_kind,
+                correlation_id = %correlation_id,
+                "outbound action dispatched"
+            );
+        }
+
+        self.telemetry.events_routed = self.telemetry.events_routed.saturating_add(1);
+
+        // 4. Record history
+        let entry = DispatchHistoryEntry {
+            correlation_id: correlation_id.clone(),
+            event_type: event.event_type.clone(),
+            timestamp_ms: now_ms,
+            actions: dispatched.clone(),
+            blocked: blocked.clone(),
+        };
+        if self.dispatch_history.len() >= self.config.dispatch_history_capacity {
+            self.dispatch_history.pop_front();
+        }
+        self.dispatch_history.push_back(entry);
+
+        Ok(OutboundDispatchResult {
+            correlation_id,
+            deduplicated: false,
+            actions_dispatched: dispatched,
+            actions_blocked: blocked,
+        })
+    }
+
+    /// Drain pending actions from the dispatch queue.
+    pub fn drain_actions(&mut self) -> Vec<ConnectorAction> {
+        let actions: Vec<ConnectorAction> = self.dispatch_queue.drain(..).collect();
+        {
+            let governor = self.policy.connector_governor_mut();
+            for _ in &actions {
+                governor.record_dequeue();
+            }
+            governor.update_queue_depth(self.dispatch_queue.len());
+        }
+        actions
+    }
+
+    /// Record successful completion of a connector action after the host
+    /// runtime has executed it.
+    ///
+    /// This is the feedback path for the production dispatch boundary: the
+    /// governor clears adaptive backoff and the reliability controller observes
+    /// the successful probe/result.
+    pub fn record_action_success(&mut self, action: &ConnectorAction, completed_at_ms: u64) {
+        self.policy.connector_governor_mut().record_outcome(
+            &action.target_connector,
+            true,
+            completed_at_ms,
+        );
+        self.policy
+            .reliability_registry_mut()
+            .get_or_create(&action.target_connector)
+            .record_success();
+    }
+
+    /// Record failed completion of a connector action after the host runtime
+    /// has executed it.
+    ///
+    /// Returns the dead-letter queue entry ID when the reliability controller
+    /// enqueues retryable failed work. Caller-initiated cancellation is not a
+    /// connector failure and therefore does not feed governor adaptive backoff.
+    pub fn record_action_failure(
+        &mut self,
+        action: &ConnectorAction,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        completed_at_ms: u64,
+    ) -> Option<u64> {
+        if error_kind != ConnectorErrorKind::Cancelled {
+            self.policy.connector_governor_mut().record_outcome(
+                &action.target_connector,
+                false,
+                completed_at_ms,
+            );
+        }
+        self.policy
+            .reliability_registry_mut()
+            .get_or_create(&action.target_connector)
+            .record_failure(action, error, error_kind, completed_at_ms)
+    }
+
+    /// Peek at the next pending action without removing it.
+    #[must_use]
+    pub fn peek_action(&self) -> Option<&ConnectorAction> {
+        self.dispatch_queue.front()
+    }
+
+    /// Number of pending actions in the dispatch queue.
+    #[must_use]
+    pub fn pending_action_count(&self) -> usize {
+        self.dispatch_queue.len()
+    }
+
+    /// Get a slice of dispatch history entries.
+    #[must_use]
+    pub fn dispatch_history(&self) -> &VecDeque<DispatchHistoryEntry> {
+        &self.dispatch_history
+    }
+
+    /// Take a telemetry snapshot.
+    #[must_use]
+    pub fn telemetry(&self) -> OutboundBridgeTelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
+    /// Number of routing rules registered.
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Get the current config.
+    #[must_use]
+    pub fn config(&self) -> &ConnectorOutboundBridgeConfig {
+        &self.config
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit_breaker::CircuitStateKind;
+    use crate::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch, PolicyRulesConfig};
+    use crate::connector_host_runtime::ConnectorCapabilityEnvelope;
+    use crate::connector_reliability::ConnectorErrorKind;
+    use crate::policy::{PolicyEngine, PolicySurface};
+
+    fn make_event(event_type: &str, source: OutboundEventSource) -> OutboundEvent {
+        OutboundEvent::new(source, event_type, serde_json::json!({"key": "value"}))
+            .with_timestamp_ms(1000)
+    }
+
+    fn make_rule(
+        rule_id: &str,
+        source: Option<OutboundEventSource>,
+        prefix: Option<&str>,
+        connector: &str,
+        kind: ConnectorActionKind,
+    ) -> OutboundRoutingRule {
+        OutboundRoutingRule {
+            rule_id: rule_id.to_string(),
+            source_filter: source,
+            event_type_prefix: prefix.map(String::from),
+            min_severity: None,
+            target_connector: connector.to_string(),
+            action_kind: kind,
+            enabled: true,
+            priority: 0,
+        }
+    }
+
+    fn permissive_zone() -> ConnectorSandboxZone {
+        ConnectorSandboxZone {
+            zone_id: "zone.permissive".to_string(),
+            fail_closed: true,
+            capability_envelope: ConnectorCapabilityEnvelope {
+                allowed_capabilities: vec![
+                    ConnectorCapability::Invoke,
+                    ConnectorCapability::NetworkEgress,
+                    ConnectorCapability::SecretBroker,
+                    ConnectorCapability::ReadState,
+                    ConnectorCapability::StreamEvents,
+                ],
+                filesystem_read_prefixes: vec![],
+                filesystem_write_prefixes: vec![],
+                network_allow_hosts: vec![],
+                allowed_exec_commands: vec![],
+            },
+        }
+    }
+
+    fn restrictive_zone() -> ConnectorSandboxZone {
+        ConnectorSandboxZone {
+            zone_id: "zone.restrictive".to_string(),
+            fail_closed: true,
+            capability_envelope: ConnectorCapabilityEnvelope {
+                allowed_capabilities: vec![ConnectorCapability::ReadState],
+                filesystem_read_prefixes: vec![],
+                filesystem_write_prefixes: vec![],
+                network_allow_hosts: vec![],
+                allowed_exec_commands: vec![],
+            },
+        }
+    }
+
+    fn network_scoped_zone(allowed_hosts: &[&str]) -> ConnectorSandboxZone {
+        ConnectorSandboxZone {
+            zone_id: "zone.network_scoped".to_string(),
+            fail_closed: true,
+            capability_envelope: ConnectorCapabilityEnvelope {
+                allowed_capabilities: vec![ConnectorCapability::NetworkEgress],
+                filesystem_read_prefixes: vec![],
+                filesystem_write_prefixes: vec![],
+                network_allow_hosts: allowed_hosts
+                    .iter()
+                    .map(|host| (*host).to_string())
+                    .collect(),
+                allowed_exec_commands: vec![],
+            },
+        }
+    }
+
+    // ---- Config defaults ----
+
+    #[test]
+    fn connector_outbound_bridge_config_defaults() {
+        let config = ConnectorOutboundBridgeConfig::default();
+        assert_eq!(config.dedup_capacity, 4096);
+        assert_eq!(config.dedup_ttl_secs, 300);
+        assert_eq!(config.dispatch_queue_capacity, 1024);
+        assert_eq!(config.dispatch_history_capacity, 256);
+        assert!(!config.reject_unmatched_events);
+        assert!(config.enforce_sandbox);
+        assert!(config.enforce_connector_admission.is_empty());
+        let bridge = ConnectorOutboundBridge::new(config);
+        assert!(
+            bridge.connector_admission_enforced("slack"),
+            "missing connector admission override must fail closed"
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_config_serde_roundtrip() {
+        let config = ConnectorOutboundBridgeConfig {
+            dedup_capacity: 2048,
+            dedup_ttl_secs: 600,
+            dispatch_queue_capacity: 512,
+            dispatch_history_capacity: 128,
+            reject_unmatched_events: true,
+            enforce_sandbox: false,
+            enforce_connector_admission: [("slack".to_string(), true)].into(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ConnectorOutboundBridgeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.dedup_capacity, 2048);
+        assert_eq!(deserialized.dedup_ttl_secs, 600);
+        assert!(deserialized.reject_unmatched_events);
+        assert!(!deserialized.enforce_sandbox);
+        assert_eq!(
+            deserialized
+                .enforce_connector_admission
+                .get("slack")
+                .copied(),
+            Some(true)
+        );
+    }
+
+    // ---- Event source ----
+
+    #[test]
+    fn connector_outbound_bridge_event_source_labels() {
+        assert_eq!(
+            OutboundEventSource::PatternDetected.as_str(),
+            "pattern_detected"
+        );
+        assert_eq!(
+            OutboundEventSource::PaneLifecycle.as_str(),
+            "pane_lifecycle"
+        );
+        assert_eq!(
+            OutboundEventSource::WorkflowLifecycle.as_str(),
+            "workflow_lifecycle"
+        );
+        assert_eq!(OutboundEventSource::UserAction.as_str(), "user_action");
+        assert_eq!(
+            OutboundEventSource::PolicyDecision.as_str(),
+            "policy_decision"
+        );
+        assert_eq!(OutboundEventSource::HealthAlert.as_str(), "health_alert");
+        assert_eq!(OutboundEventSource::Custom.as_str(), "custom");
+    }
+
+    #[test]
+    fn connector_outbound_bridge_event_source_display() {
+        assert_eq!(
+            format!("{}", OutboundEventSource::PatternDetected),
+            "pattern_detected"
+        );
+    }
+
+    // ---- Action kind ----
+
+    #[test]
+    fn connector_outbound_bridge_action_kind_labels() {
+        assert_eq!(ConnectorActionKind::Notify.as_str(), "notify");
+        assert_eq!(ConnectorActionKind::Ticket.as_str(), "ticket");
+        assert_eq!(
+            ConnectorActionKind::TriggerWorkflow.as_str(),
+            "trigger_workflow"
+        );
+        assert_eq!(ConnectorActionKind::AuditLog.as_str(), "audit_log");
+        assert_eq!(ConnectorActionKind::Invoke.as_str(), "invoke");
+        assert_eq!(
+            ConnectorActionKind::CredentialAction.as_str(),
+            "credential_action"
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_action_capability_mapping() {
+        assert_eq!(
+            ConnectorActionKind::Notify.required_capability(),
+            ConnectorCapability::NetworkEgress
+        );
+        assert_eq!(
+            ConnectorActionKind::Ticket.required_capability(),
+            ConnectorCapability::Invoke
+        );
+        assert_eq!(
+            ConnectorActionKind::CredentialAction.required_capability(),
+            ConnectorCapability::SecretBroker
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_action_policy_mapping() {
+        assert_eq!(
+            ConnectorActionKind::Notify.policy_action(),
+            PolicyActionKind::ConnectorNotify
+        );
+        assert_eq!(
+            ConnectorActionKind::Ticket.policy_action(),
+            PolicyActionKind::ConnectorTicket
+        );
+        assert_eq!(
+            ConnectorActionKind::TriggerWorkflow.policy_action(),
+            PolicyActionKind::ConnectorTriggerWorkflow
+        );
+        assert_eq!(
+            ConnectorActionKind::AuditLog.policy_action(),
+            PolicyActionKind::ConnectorAuditLog
+        );
+        assert_eq!(
+            ConnectorActionKind::Invoke.policy_action(),
+            PolicyActionKind::ConnectorInvoke
+        );
+        assert_eq!(
+            ConnectorActionKind::CredentialAction.policy_action(),
+            PolicyActionKind::ConnectorCredentialAction
+        );
+    }
+
+    // ---- Severity ranking ----
+
+    #[test]
+    fn connector_outbound_bridge_severity_ranking() {
+        assert!(severity_rank(OutboundSeverity::Info) < severity_rank(OutboundSeverity::Warning));
+        assert!(
+            severity_rank(OutboundSeverity::Warning) < severity_rank(OutboundSeverity::Critical)
+        );
+    }
+
+    // ---- Deduplicator ----
+
+    #[test]
+    fn connector_outbound_bridge_dedup_new_returns_true() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(300));
+        assert!(dedup.check_and_record("abc", 1000));
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_duplicate_returns_false() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(300));
+        assert!(dedup.check_and_record("abc", 1000));
+        assert!(!dedup.check_and_record("abc", 1500));
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_ignores_blank_correlation_id() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(300));
+
+        assert!(dedup.check_and_record("   ", 1000));
+        assert!(dedup.check_and_record("   ", 1500));
+        assert_eq!(dedup.len(), 0);
+        assert!(dedup.is_empty());
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_ttl_expiry() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(10));
+        assert!(dedup.check_and_record("abc", 1000));
+        // After TTL, same ID should be accepted again
+        assert!(dedup.check_and_record("abc", 1000 + 11_000));
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_unrepresentable_ttl_saturates() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::MAX);
+        assert!(dedup.check_and_record("abc", 1000));
+        assert!(
+            !dedup.check_and_record("abc", u64::MAX),
+            "Duration::MAX must not truncate into a short dedup window"
+        );
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_duration_millis_saturates() {
+        assert_eq!(duration_ms_saturating(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_capacity_eviction() {
+        let mut dedup = OutboundDeduplicator::new(3, Duration::from_secs(300));
+        assert!(dedup.check_and_record("a", 100));
+        assert!(dedup.check_and_record("b", 200));
+        assert!(dedup.check_and_record("c", 300));
+        // At capacity, oldest is evicted
+        assert!(dedup.check_and_record("d", 400));
+        assert_eq!(dedup.len(), 3);
+        // "a" was evicted, should be accepted again
+        assert!(dedup.check_and_record("a", 500));
+    }
+
+    // [ft-zu8g3] capacity=0 must mean "dedup disabled" (every id treated
+    // as new), not "1-slot ghost cache". Before the fix, alternating
+    // correlation_ids toggled into/out of the single entries slot —
+    // producing false for immediate repeats but true for every
+    // cross-id call. Parallel to ft-bx4le (SignalDeduplicator) and
+    // ft-61kg4 (EventDeduplicator).
+    #[test]
+    fn connector_outbound_bridge_dedup_zero_capacity_bypasses_dedup_ft_zu8g3() {
+        let mut dedup = OutboundDeduplicator::new(0, Duration::from_secs(300));
+
+        // Every call — including immediate repeats of the same id —
+        // must be treated as new (returns true). No state accumulation,
+        // no toggling.
+        for i in 0..5 {
+            assert!(
+                dedup.check_and_record("abc", 1000 + i),
+                "ft-zu8g3: repeat #{} of same id must still be new when capacity=0",
+                i
+            );
+        }
+        // Cross-id calls must also all be new.
+        assert!(dedup.check_and_record("xyz", 2000));
+        assert!(dedup.check_and_record("abc", 3000));
+        assert!(dedup.check_and_record("def", 4000));
+
+        // And no internal state grew — the entries deque stays empty,
+        // so the deduplicator is not a hidden 1-slot cache when a
+        // caller configures dedup_capacity=0.
+        assert_eq!(dedup.len(), 0);
+        assert!(dedup.is_empty());
+    }
+
+    // ---- Routing rule matching ----
+
+    #[test]
+    fn connector_outbound_bridge_rule_matches_all_when_no_filters() {
+        let rule = make_rule("r1", None, None, "slack", ConnectorActionKind::Notify);
+        let event = make_event("pattern.ci_failure", OutboundEventSource::PatternDetected);
+        assert!(rule.matches(&event));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_rule_filters_by_source() {
+        let rule = make_rule(
+            "r1",
+            Some(OutboundEventSource::WorkflowLifecycle),
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        );
+        let event = make_event("pattern.ci_failure", OutboundEventSource::PatternDetected);
+        assert!(!rule.matches(&event));
+
+        let workflow_event =
+            make_event("workflow.completed", OutboundEventSource::WorkflowLifecycle);
+        assert!(rule.matches(&workflow_event));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_rule_filters_by_event_type_prefix() {
+        let rule = make_rule(
+            "r1",
+            None,
+            Some("pattern."),
+            "slack",
+            ConnectorActionKind::Notify,
+        );
+        let matching = make_event("pattern.ci_failure", OutboundEventSource::PatternDetected);
+        assert!(rule.matches(&matching));
+
+        let non_matching = make_event("workflow.completed", OutboundEventSource::WorkflowLifecycle);
+        assert!(!rule.matches(&non_matching));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_rule_filters_by_severity() {
+        let mut rule = make_rule("r1", None, None, "pagerduty", ConnectorActionKind::Notify);
+        rule.min_severity = Some(OutboundSeverity::Critical);
+
+        let info_event = make_event("test", OutboundEventSource::Custom);
+        assert!(!rule.matches(&info_event));
+
+        let critical_event = make_event("test", OutboundEventSource::Custom)
+            .with_severity(OutboundSeverity::Critical);
+        assert!(rule.matches(&critical_event));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_disabled_rule_never_matches() {
+        let mut rule = make_rule("r1", None, None, "slack", ConnectorActionKind::Notify);
+        rule.enabled = false;
+        let event = make_event("anything", OutboundEventSource::Custom);
+        assert!(!rule.matches(&event));
+    }
+
+    // ---- Sandbox checker ----
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_allows_registered_capability() {
+        let mut checker = OutboundSandboxChecker::new();
+        checker.register_zone("slack", permissive_zone());
+        let result = checker.check_capability("slack", ConnectorCapability::NetworkEgress, None);
+        assert_eq!(result, SandboxCheckResult::Allowed);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_denies_missing_capability() {
+        let mut checker = OutboundSandboxChecker::new();
+        checker.register_zone("restricted", restrictive_zone());
+        let result = checker.check_capability("restricted", ConnectorCapability::Invoke, None);
+        assert!(matches!(result, SandboxCheckResult::Denied { .. }));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_uses_default_zone_for_unknown() {
+        let checker = OutboundSandboxChecker::new();
+        // Default zone allows Invoke, ReadState, StreamEvents
+        let result = checker.check_capability("unknown", ConnectorCapability::Invoke, None);
+        assert_eq!(result, SandboxCheckResult::Allowed);
+        // But denies capabilities not in default set
+        let result = checker.check_capability("unknown", ConnectorCapability::SecretBroker, None);
+        assert!(matches!(result, SandboxCheckResult::Denied { .. }));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_denies_non_allowlisted_network_target_ft_l0yxu() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("webhook", network_scoped_zone(&["api.allowed.test"]));
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "webhook",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "connector.notify",
+            serde_json::json!({"url": "https://evil.example.test/hook"}),
+        )
+        .with_timestamp_ms(1000);
+
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_dispatched.is_empty(),
+            "non-allowlisted network target must not be queued for dispatch"
+        );
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("sandbox.denied.target.network_egress"),
+            "sandbox denial should name the target allow-list failure"
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("sandbox block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.sandbox_denied");
+        assert_eq!(denial.reason_code, "sandbox.denied.target.network_egress");
+        assert_eq!(denial.connector_id, "webhook");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
+        assert_eq!(
+            denial.detail.as_deref(),
+            Some("zone_id=zone.network_scoped,target=evil.example.test")
+        );
+        assert_eq!(bridge.pending_action_count(), 0);
+        assert_eq!(bridge.telemetry().actions_blocked_sandbox, 1);
+    }
+
+    #[test]
+    fn outbound_event_from_runtime_pattern_detection_preserves_routing_fields() {
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: crate::patterns::Severity::Critical,
+            confidence: 0.99,
+            extracted: serde_json::json!({"kind": "usage"}),
+            matched_text: "[redacted]".to_string(),
+            span: (4, 13),
+        };
+        let event = crate::events::Event::PatternDetected {
+            pane_id: 42,
+            pane_uuid: Some("pane-uuid".to_string()),
+            detection,
+            event_id: Some(77),
+        };
+
+        let outbound = OutboundEvent::from_runtime_event(&event, 12_345)
+            .expect("pattern detections should be eligible for outbound routing");
+
+        assert_eq!(outbound.source, OutboundEventSource::PatternDetected);
+        assert_eq!(outbound.event_type, "pattern.usage.reached");
+        assert_eq!(outbound.correlation_id.as_deref(), Some("event:77"));
+        assert_eq!(outbound.timestamp_ms, 12_345);
+        assert_eq!(outbound.pane_id, Some(42));
+        assert_eq!(outbound.severity, OutboundSeverity::Critical);
+        assert_eq!(outbound.payload["rule_id"], "codex.usage.reached");
+        assert_eq!(outbound.payload["agent_type"], "codex");
+        assert_eq!(outbound.payload["matched_text"], "[redacted]");
+    }
+
+    // ---- Bridge integration ----
+
+    #[test]
+    fn connector_outbound_bridge_routes_event_to_matching_rule() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            Some(OutboundEventSource::PatternDetected),
+            Some("pattern."),
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("pattern.ci_failure", OutboundEventSource::PatternDetected);
+        let result = bridge.process_event(&event).unwrap();
+        assert!(!result.deduplicated);
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert_eq!(result.actions_dispatched[0].target_connector, "slack");
+        let decision = result.actions_dispatched[0]
+            .policy_decision
+            .as_ref()
+            .expect("allow policy trace should be preserved");
+        assert!(decision.is_allowed());
+        let context = decision
+            .context()
+            .expect("allow decision should include context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorNotify);
+        assert_eq!(result.actions_blocked.len(), 0);
+        assert_eq!(bridge.pending_action_count(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_deduplicates_same_correlation_id() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom).with_correlation_id("dedup-1");
+        let r1 = bridge.process_event(&event).unwrap();
+        assert!(!r1.deduplicated);
+        assert_eq!(r1.actions_dispatched.len(), 1);
+
+        let r2 = bridge.process_event(&event).unwrap();
+        assert!(r2.deduplicated);
+        assert_eq!(r2.actions_dispatched.len(), 0);
+    }
+
+    /// [ft-ptjlp] Mirror of bridge_dedup_ignores_attacker_controlled_signal_timestamp
+    /// (inbound bridge, ft-dijpe). An attacker or replay source that
+    /// claims `event.timestamp_ms = u64::MAX / 2` on the second copy
+    /// of a correlation_id must NOT bypass dedup. Pre-fix, the huge
+    /// claimed timestamp triggered `evict_expired(now=u64::MAX/2)` on
+    /// the outbound deduplicator, popped the live entry, and the
+    /// replay slipped through to re-fire every matched routing rule's
+    /// downstream connector action (Slack, JIRA, webhook). Post-fix,
+    /// the dedup clock comes from SystemTime::now() and both copies
+    /// land in the same real-time window, so the second is correctly
+    /// flagged `deduplicated=true`.
+    #[test]
+    fn connector_outbound_bridge_dedup_ignores_attacker_controlled_event_timestamp() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // First event: claims timestamp_ms = 0.
+        let first = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"key": "value"}),
+        )
+        .with_correlation_id("replay-target")
+        .with_timestamp_ms(0);
+        let r1 = bridge.process_event(&first).unwrap();
+        assert!(!r1.deduplicated, "first event is always new");
+        assert_eq!(r1.actions_dispatched.len(), 1);
+
+        // Second event: SAME correlation_id, claims a timestamp_ms far
+        // in the "future" — pre-fix would evict the live entry and
+        // bypass dedup. Post-fix the local clock wins.
+        let second = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"key": "value"}),
+        )
+        .with_correlation_id("replay-target")
+        .with_timestamp_ms(u64::MAX / 2);
+        let r2 = bridge.process_event(&second).unwrap();
+        assert!(
+            r2.deduplicated,
+            "replay with future timestamp_ms must still be flagged deduplicated \
+             (ft-ptjlp: dedup clock must not be attacker-controllable)"
+        );
+        assert_eq!(r2.actions_dispatched.len(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_no_dedup_without_correlation_id() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        // Without correlation_id, dedup is skipped — both should dispatch
+        let r1 = bridge.process_event(&event).unwrap();
+        assert!(!r1.deduplicated);
+        let r2 = bridge.process_event(&event).unwrap();
+        assert!(!r2.deduplicated);
+        assert_eq!(bridge.pending_action_count(), 2);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_no_dedup_with_blank_correlation_id() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom).with_correlation_id("   ");
+
+        let r1 = bridge.process_event(&event).unwrap();
+        let r2 = bridge.process_event(&event).unwrap();
+
+        assert!(!r1.deduplicated);
+        assert!(!r2.deduplicated);
+        assert_eq!(r1.actions_dispatched.len(), 1);
+        assert_eq!(r2.actions_dispatched.len(), 1);
+        assert_eq!(r1.correlation_id, "out-custom-1000-0");
+        assert_eq!(r2.correlation_id, "out-custom-1000-0");
+        assert_eq!(r1.actions_dispatched[0].correlation_id, r1.correlation_id);
+        assert_eq!(r2.actions_dispatched[0].correlation_id, r2.correlation_id);
+        assert_eq!(bridge.telemetry().events_deduplicated, 0);
+        assert_eq!(bridge.pending_action_count(), 2);
+
+        let actions = bridge.drain_actions();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].correlation_id, "out-custom-1000-0");
+        assert_eq!(actions[1].correlation_id, "out-custom-1000-0");
+    }
+
+    #[test]
+    fn connector_outbound_bridge_blocks_sandbox_violation() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("locked_down", restrictive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "locked_down",
+            ConnectorActionKind::Notify, // requires NetworkEgress
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(result.actions_blocked[0].reason.contains("sandbox"));
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("sandbox block should retain allow policy trace");
+        assert!(decision.is_allowed());
+        assert_eq!(
+            decision
+                .context()
+                .expect("allow context should be present")
+                .surface,
+            PolicySurface::Connector
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_open_circuit_blocks_dispatch_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        {
+            let controller = bridge
+                .policy_engine_mut()
+                .reliability_registry_mut()
+                .get_or_create("slack");
+            let failure_threshold = u64::from(
+                crate::connector_reliability::ConnectorCircuitConfig::default().failure_threshold,
+            );
+            for i in 0..failure_threshold {
+                controller.record_failure(
+                    &failed_action,
+                    "connector timed out",
+                    ConnectorErrorKind::Timeout,
+                    900 + i,
+                );
+            }
+            assert_eq!(controller.circuit_status().state, CircuitStateKind::Open);
+        }
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert_eq!(result.actions_blocked[0].target_connector, "slack");
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("reliability(circuit=Open")
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("reliability block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.reliability_denied");
+        assert_eq!(denial.reason_code, "circuit_open");
+        assert_eq!(denial.rule_id, "r1");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.actions_blocked_reliability, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_classification_rejects_prohibited_ft_cdxrr() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, DataSensitivity,
+        };
+
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Operator configures a classification policy for "slack" marking the
+        // `ssn` field prohibited and forbidding prohibited data. Before ft-cdxrr
+        // this classifier was never consulted on dispatch (silent no-op).
+        let policy = ClassificationPolicy {
+            policy_id: "slack-pii".to_string(),
+            connector_pattern: "slack".to_string(),
+            rules: vec![ClassificationRule::new(
+                "ssn-prohibited",
+                DataSensitivity::Prohibited,
+                vec!["ssn".to_string()],
+            )],
+            default_sensitivity: DataSensitivity::Internal,
+            scan_for_secrets: false,
+            max_payload_bytes: 1_048_576,
+            allow_prohibited: false,
+        };
+        bridge
+            .policy_engine_mut()
+            .data_classifier_mut()
+            .register_policy(policy);
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"ssn": "123-45-6789", "note": "hi"}),
+        )
+        .with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_dispatched.is_empty(),
+            "prohibited payload must not dispatch"
+        );
+        assert_eq!(result.actions_blocked.len(), 1);
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("classification block should emit a typed denial envelope");
+        assert_eq!(denial.error_code, "connector.classification_denied");
+        assert_eq!(denial.reason_code, "classification_rejected");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(bridge.telemetry().actions_blocked_classification, 1);
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_classification_redacts_restricted_ft_cdxrr() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, DataSensitivity,
+        };
+
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Restricted field -> AcceptRedacted: the action still dispatches but the
+        // sensitive field is masked in the enqueued params.
+        let policy = ClassificationPolicy {
+            policy_id: "slack-redact".to_string(),
+            connector_pattern: "slack".to_string(),
+            rules: vec![ClassificationRule::new(
+                "token-restricted",
+                DataSensitivity::Restricted,
+                vec!["api_token".to_string()],
+            )],
+            default_sensitivity: DataSensitivity::Internal,
+            scan_for_secrets: false,
+            max_payload_bytes: 1_048_576,
+            allow_prohibited: false,
+        };
+        bridge
+            .policy_engine_mut()
+            .data_classifier_mut()
+            .register_policy(policy);
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"api_token": "super-secret-value", "msg": "hello"}),
+        )
+        .with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_blocked.is_empty(),
+            "redacted action should still dispatch, not block"
+        );
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert_eq!(bridge.telemetry().actions_blocked_classification, 0);
+
+        let action = bridge.peek_action().expect("redacted action enqueued");
+        let token = action
+            .params
+            .get("api_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_ne!(
+            token, "super-secret-value",
+            "restricted field must be redacted in the dispatched params"
+        );
+        assert_eq!(
+            action.params.get("msg").and_then(serde_json::Value::as_str),
+            Some("hello"),
+            "non-sensitive field passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_blocks_dispatch_ft_x3211() {
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+
+        assert!(second_result.actions_dispatched.is_empty());
+        assert_eq!(second_result.actions_blocked.len(), 1);
+        assert!(
+            second_result.actions_blocked[0]
+                .reason
+                .contains("governor(reject: connector_quota_exhausted")
+        );
+        let denial = second_result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("governor block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.governor_denied");
+        assert_eq!(denial.reason_code, "connector_quota_exhausted");
+        assert_eq!(denial.rule_id, "r1");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
+        assert_eq!(denial.verdict.as_deref(), Some("reject"));
+        assert_eq!(denial.delay_ms, Some(0));
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 1);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_throttle_proceeds_not_dropped_ft_7h5da_5_15() {
+        // ft-7h5da.5.15: a governor `Throttle` verdict must DISPATCH the action
+        // (allowed-after-delay) and bump `actions_throttled`, NOT drop it as a
+        // hard rejection under `actions_blocked_governor`.
+        let mut safety = crate::config::SafetyConfig::default();
+        // Generous quota so only queue backpressure can fire a verdict.
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1000,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        // Tiny backpressure window: with max_queue_depth=2, a queue depth of 1
+        // is fraction 0.5 -> above the 0.4 throttle threshold but below the 0.95
+        // reject threshold -> Throttle.
+        safety.connector_governor.queue_backpressure =
+            crate::connector_governor::QueueBackpressureConfig {
+                max_queue_depth: 2,
+                throttle_threshold: 0.4,
+                reject_threshold: 0.95,
+            };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Event 1: empty queue (depth 0) -> Allow -> dispatched (queue depth 1).
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        // Event 2: queue depth 1 -> Throttle. Must still DISPATCH (proceed), not
+        // block, and must be counted under actions_throttled.
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+        assert_eq!(
+            second_result.actions_dispatched.len(),
+            1,
+            "a throttled action must still be dispatched (allowed-after-delay), not dropped"
+        );
+        assert!(
+            second_result.actions_blocked.is_empty(),
+            "a throttle must not be recorded as a blocked/denied action"
+        );
+
+        let tel = bridge.telemetry();
+        assert_eq!(
+            tel.actions_dispatched, 2,
+            "both actions proceeded to dispatch"
+        );
+        assert!(
+            tel.actions_throttled >= 1,
+            "the throttled action must increment actions_throttled"
+        );
+        assert_eq!(
+            tel.actions_blocked_governor, 0,
+            "throttle must not be conflated with hard governor rejections"
+        );
+    }
+
+    #[test]
+    fn outbound_telemetry_snapshot_round_trips_actions_throttled_ft_7h5da_5_15() {
+        let mut tel = OutboundBridgeTelemetry::default();
+        tel.actions_throttled = 3;
+        let snap = tel.snapshot();
+        assert_eq!(snap.actions_throttled, 3);
+        let json = serde_json::to_string(&snap).expect("serialize outbound telemetry snapshot");
+        let back: OutboundBridgeTelemetrySnapshot =
+            serde_json::from_str(&json).expect("deserialize outbound telemetry snapshot");
+        assert_eq!(back.actions_throttled, 3);
+    }
+
+    /// ft-7h5da.5.17: perfect e2e across the whole connector dispatch flow —
+    /// inbound bridge -> EventBus -> outbound-event conversion -> outbound bridge
+    /// -> governor consultation -> dispatch. Asserts a message traverses every
+    /// stage, that the governor IS consulted (it Allows the first action and
+    /// Throttles the second), and that a Throttle verdict is NOT silently dropped
+    /// (the action still dispatches and is counted under actions_throttled, never
+    /// actions_blocked_governor).
+    #[test]
+    fn connector_dispatch_e2e_inbound_governor_outbound_throttle_not_dropped_ft_7h5da_5_17() {
+        use crate::connector_inbound_bridge::{
+            ConnectorInboundBridge, ConnectorInboundBridgeConfig, ConnectorSignal,
+            ConnectorSignalKind,
+        };
+        use crate::events::{Event, EventBus};
+        use std::sync::Arc;
+
+        // ---- Stage 1: inbound bridge routes two connector signals onto the bus.
+        let bus = Arc::new(EventBus::new(64));
+        let mut detections = bus.subscribe_detections();
+        let mut inbound =
+            ConnectorInboundBridge::new(Arc::clone(&bus), ConnectorInboundBridgeConfig::default());
+
+        let sig1 = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({}),
+        )
+        .with_pane_id(7)
+        .with_sub_type("push")
+        .with_correlation_id("evt-1")
+        .with_timestamp_ms(1000);
+        let sig2 = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({}),
+        )
+        .with_pane_id(7)
+        .with_sub_type("push")
+        .with_correlation_id("evt-2")
+        .with_timestamp_ms(1001);
+
+        let r1 = inbound
+            .route_signal(&sig1)
+            .expect("inbound routes signal 1");
+        let r2 = inbound
+            .route_signal(&sig2)
+            .expect("inbound routes signal 2");
+        assert!(
+            r1.delivered_count > 0 && !r1.deduplicated,
+            "stage 1: signal 1 must be delivered to the bus"
+        );
+        assert!(
+            r2.delivered_count > 0 && !r2.deduplicated,
+            "stage 1: signal 2 must be delivered to the bus"
+        );
+
+        // ---- Stage 2: both publish Event::PatternDetected; read them off the bus.
+        let ev1 = match detections.try_recv() {
+            Some(Ok(e)) => e,
+            other => panic!("stage 2: expected detection event 1 on the bus, got {other:?}"),
+        };
+        let ev2 = match detections.try_recv() {
+            Some(Ok(e)) => e,
+            other => panic!("stage 2: expected detection event 2 on the bus, got {other:?}"),
+        };
+        assert!(matches!(ev1, Event::PatternDetected { .. }));
+        assert!(matches!(ev2, Event::PatternDetected { .. }));
+
+        // ---- Stage 2b: convert each runtime event into an outbound event.
+        // Different now_ms (plus the distinct inbound correlations) guarantee
+        // distinct outbound correlation ids, so the outbound bridge does not
+        // dedup the second action.
+        let out_ev1 = OutboundEvent::from_runtime_event(&ev1, 1000)
+            .expect("stage 2b: PatternDetected -> OutboundEvent (1)");
+        let out_ev2 = OutboundEvent::from_runtime_event(&ev2, 1001)
+            .expect("stage 2b: PatternDetected -> OutboundEvent (2)");
+
+        // ---- Stage 3: outbound bridge consults the governor on every dispatch.
+        let mut safety = crate::config::SafetyConfig::default();
+        // Generous quota so only queue backpressure produces a verdict.
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1000,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        // Tiny backpressure window: a queue depth of 1 is fraction 0.5 -> above
+        // the 0.4 throttle threshold but below the 0.95 reject threshold.
+        safety.connector_governor.queue_backpressure =
+            crate::connector_governor::QueueBackpressureConfig {
+                max_queue_depth: 2,
+                throttle_threshold: 0.4,
+                reject_threshold: 0.95,
+            };
+        let mut outbound = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        outbound.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        outbound.set_connector_admission_enforced("slack", true);
+        outbound.register_sandbox_zone("slack", permissive_zone());
+        // None/None filters: the rule matches the PatternDetected-derived event.
+        outbound.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // First event: governor Allow -> dispatched. Proves the message traversed
+        // inbound -> bus -> outbound AND that the governor was consulted and
+        // admitted it.
+        let d1 = outbound
+            .process_event(&out_ev1)
+            .expect("stage 3: dispatch 1");
+        assert_eq!(
+            d1.actions_dispatched.len(),
+            1,
+            "stage 3: inbound-originated action must traverse to dispatch (governor Allow)"
+        );
+
+        // Second event (queue depth 1): governor Throttle. The action must NOT be
+        // silently dropped — it still dispatches (allowed-after-delay) and is
+        // counted as a throttle, never as a hard rejection.
+        let d2 = outbound
+            .process_event(&out_ev2)
+            .expect("stage 3: dispatch 2");
+        assert_eq!(
+            d2.actions_dispatched.len(),
+            1,
+            "a throttled action must still be dispatched (no silent drop)"
+        );
+        assert!(
+            d2.actions_blocked.is_empty(),
+            "a throttle must not be recorded as a blocked/denied action"
+        );
+
+        let tel = outbound.telemetry();
+        assert_eq!(tel.actions_dispatched, 2, "both messages reached dispatch");
+        assert!(
+            tel.actions_throttled >= 1,
+            "the governor's Throttle verdict was consulted and honored (not dropped)"
+        );
+        assert_eq!(
+            tel.actions_blocked_governor, 0,
+            "a throttle must not be conflated with a hard governor rejection"
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_fail_closed_by_default_ft_x3211() {
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+
+        assert!(second_result.actions_dispatched.is_empty());
+        assert_eq!(second_result.actions_blocked.len(), 1);
+        assert!(
+            second_result.actions_blocked[0]
+                .reason
+                .contains("governor(reject: connector_quota_exhausted")
+        );
+        let denial = second_result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("default fail-closed governor block should emit typed denial");
+        assert_eq!(denial.error_code, "connector.governor_denied");
+        assert_eq!(denial.reason_code, "connector_quota_exhausted");
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_failure_feeds_governor_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        bridge.record_action_failure(
+            &failed_action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1000,
+        );
+        bridge.record_action_failure(
+            &failed_action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1100,
+        );
+
+        // The failure feedback must have activated governor adaptive backoff:
+        // at t=1200 the second failure's backoff window (1100 + 2000ms) is live.
+        let decision = bridge
+            .policy_engine_mut()
+            .connector_governor_mut()
+            .evaluate(&failed_action, 1200);
+        assert_eq!(decision.verdict, GovernorVerdict::Throttle);
+        assert_eq!(
+            decision.reason,
+            crate::connector_governor::GovernorReason::AdaptiveBackoff
+        );
+        assert!(decision.delay_ms > 0);
+
+        // ft-7h5da.5.15 contract: a Throttle verdict is advisory pacing, not a
+        // denial — the action still dispatches and is counted in
+        // actions_throttled rather than actions_blocked_governor.
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1200);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert!(result.actions_blocked.is_empty());
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_throttled, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_failure_feeds_reliability_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        let failure_threshold = u64::from(
+            crate::connector_reliability::ConnectorCircuitConfig::default().failure_threshold,
+        );
+        for completed_at_ms in 1000..1000 + failure_threshold {
+            bridge.record_action_failure(
+                &failed_action,
+                "connector timed out",
+                ConnectorErrorKind::Timeout,
+                completed_at_ms,
+            );
+        }
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1200);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("reliability(circuit=Open")
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("reliability block should emit typed denial");
+        assert_eq!(denial.error_code, "connector.reliability_denied");
+        assert_eq!(denial.reason_code, "circuit_open");
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.actions_blocked_reliability, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_success_clears_governor_backoff_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        bridge.record_action_failure(
+            &action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1000,
+        );
+        bridge.record_action_failure(
+            &action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1100,
+        );
+        bridge.record_action_success(&action, 5000);
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(5000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert!(result.actions_blocked.is_empty());
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_blocks_policy_deny() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.set_policy_engine(
+            PolicyEngine::permissive().with_policy_rules(PolicyRulesConfig {
+                enabled: true,
+                rules: vec![PolicyRule {
+                    id: "block.connector.notify".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["connector_notify".to_string()],
+                        actors: vec!["workflow".to_string()],
+                        surfaces: vec!["connector".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("notifications blocked".to_string()),
+                }],
+            }),
+        );
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom).with_pane_id(7);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(result.actions_blocked[0].reason.contains("policy(deny)"));
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("policy block should preserve denial");
+        assert!(decision.is_denied());
+        assert_eq!(
+            decision.rule_id(),
+            Some("config.rule.block.connector.notify")
+        );
+        let context = decision
+            .context()
+            .expect("policy deny should carry decision context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorNotify);
+        assert_eq!(context.pane_id, Some(7));
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_blocked_policy, 1);
+        assert_eq!(tel.actions_blocked_sandbox, 0);
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_blocks_policy_require_approval() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.set_policy_engine(
+            PolicyEngine::permissive().with_policy_rules(PolicyRulesConfig {
+                enabled: true,
+                rules: vec![PolicyRule {
+                    id: "approve.connector.workflow".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["connector_trigger_workflow".to_string()],
+                        actors: vec!["workflow".to_string()],
+                        surfaces: vec!["connector".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::RequireApproval,
+                    message: Some("workflow triggers require approval".to_string()),
+                }],
+            }),
+        );
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::TriggerWorkflow,
+        ));
+
+        let event =
+            make_event("test", OutboundEventSource::WorkflowLifecycle).with_workflow_id("wf-1");
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("policy(require_approval)")
+        );
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("approval block should preserve decision");
+        assert!(decision.requires_approval());
+        assert_eq!(
+            decision.rule_id(),
+            Some("config.rule.approve.connector.workflow")
+        );
+        let context = decision
+            .context()
+            .expect("approval decision should carry context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorTriggerWorkflow);
+        assert_eq!(context.workflow_id.as_deref(), Some("wf-1"));
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_blocked_policy, 1);
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_unmatched_event_ignored_by_default() {
+        let bridge_config = ConnectorOutboundBridgeConfig::default();
+        let mut bridge = ConnectorOutboundBridge::new(bridge_config);
+        // No rules added
+
+        let event = make_event("unknown.event", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert!(!result.deduplicated);
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_unmatched_event_rejected_when_configured() {
+        let config = ConnectorOutboundBridgeConfig {
+            reject_unmatched_events: true,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+
+        let event = make_event("unknown.event", OutboundEventSource::Custom);
+        let err = bridge.process_event(&event).unwrap_err();
+        assert!(matches!(err, OutboundBridgeError::NoMatchingRules(_)));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_multiple_rules_match() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.register_sandbox_zone("datadog", permissive_zone());
+
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "r2",
+            None,
+            None,
+            "datadog",
+            ConnectorActionKind::AuditLog,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 2);
+        assert_eq!(bridge.pending_action_count(), 2);
+    }
+
+    fn broker_ready_policy(max_sensitivity: CredentialSensitivity) -> PolicyEngine {
+        use crate::connector_credential_broker::{
+            CredentialAccessRule, CredentialKind, CredentialState, ManagedCredential,
+            SecretProviderConfig,
+        };
+
+        let config = crate::config::SafetyConfig {
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig {
+                enabled: true,
+                max_sensitivity,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut policy = PolicyEngine::from_safety_config(&config);
+        policy
+            .credential_broker_mut()
+            .register_provider(
+                SecretProviderConfig {
+                    provider_id: "vault-1".to_string(),
+                    display_name: "Vault".to_string(),
+                    provider_type: "vault".to_string(),
+                    max_concurrent_leases: 10,
+                    default_lease_ttl_ms: 60_000,
+                    supports_rotation: true,
+                    max_sensitivity: CredentialSensitivity::Critical,
+                },
+                1000,
+            )
+            .unwrap();
+        policy
+            .credential_broker_mut()
+            .register_credential(
+                ManagedCredential {
+                    credential_id: "cred-1".to_string(),
+                    provider_id: "vault-1".to_string(),
+                    kind: CredentialKind::ApiKey,
+                    sensitivity: CredentialSensitivity::Medium,
+                    state: CredentialState::Active,
+                    permitted_scopes: vec![CredentialScope::new(
+                        "slack",
+                        "channels/*",
+                        vec!["write".to_string()],
+                    )],
+                    version: 7,
+                    created_at_ms: 1000,
+                    expires_at_ms: 0,
+                    last_rotated_at_ms: 0,
+                    active_lease_count: 0,
+                },
+                1000,
+            )
+            .unwrap();
+        policy
+            .credential_broker_mut()
+            .add_access_rule(CredentialAccessRule {
+                rule_id: "allow-broker-slack".to_string(),
+                connector_pattern: "broker-slack".to_string(),
+                permitted_scope: CredentialScope::new(
+                    "slack",
+                    "channels/*",
+                    vec!["write".to_string()],
+                ),
+                max_sensitivity: CredentialSensitivity::High,
+                max_lease_ttl_ms: 30_000,
+                max_concurrent_leases: 4,
+            });
+        policy
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_leases_and_sanitizes_payload() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(broker_ready_policy(CredentialSensitivity::High));
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.lease",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "credential_id": "cred-1",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                },
+                "sensitivity": "medium"
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_blocked.len(), 0);
+        assert_eq!(result.actions_dispatched.len(), 1);
+
+        let action = bridge.peek_action().unwrap();
+        assert_eq!(action.target_connector, "broker-slack");
+        assert_eq!(action.action_kind, ConnectorActionKind::CredentialAction);
+        assert_eq!(action.params["operation"], "lease");
+        assert_eq!(action.params["connector_id"], "broker-slack");
+        assert_eq!(action.params["credential_id"], "cred-1");
+        assert_eq!(action.params["scope"]["provider"], "slack");
+        assert_eq!(action.params["scope"]["resource"], "channels/alerts");
+        assert_eq!(action.params["broker_credential_version"], 7);
+        assert_eq!(action.params["broker_lease_id"], "lease-1");
+        assert_eq!(action.params["broker_lease_expires_at_ms"], 35_000);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_rejects_invalid_payload() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.invalid",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                }
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("credential_id is required")
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_requires_approval_above_ceiling() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(broker_ready_policy(CredentialSensitivity::Low));
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.high",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "credential_id": "cred-1",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                },
+                "sensitivity": "high"
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("policy(require_approval)")
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_drain_actions() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        bridge.process_event(&event).unwrap();
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let actions = bridge.drain_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target_connector, "slack");
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dispatch_queue_overflow_drops_oldest() {
+        let config = ConnectorOutboundBridgeConfig {
+            dispatch_queue_capacity: 2,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        for i in 0..4 {
+            let event = make_event(&format!("event.{i}"), OutboundEventSource::Custom)
+                .with_timestamp_ms(1000 + i * 100);
+            bridge.process_event(&event).unwrap();
+        }
+        // Queue capacity is 2, so only latest 2 should remain
+        assert_eq!(bridge.pending_action_count(), 2);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.dispatch_queue_overflows, 2);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_zero_dispatch_capacity_blocks_without_retaining_action() {
+        let config = ConnectorOutboundBridgeConfig {
+            dispatch_queue_capacity: 0,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("event.zero", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert_eq!(
+            result.actions_blocked[0].reason,
+            "dispatch_queue_full(capacity=0)"
+        );
+        assert!(
+            result.actions_blocked[0]
+                .policy_decision
+                .as_ref()
+                .is_some_and(PolicyDecision::is_allowed)
+        );
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.dispatch_queue_overflows, 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dispatch_history_bounded() {
+        let config = ConnectorOutboundBridgeConfig {
+            dispatch_history_capacity: 3,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        for i in 0..5 {
+            let event = make_event(&format!("event.{i}"), OutboundEventSource::Custom)
+                .with_timestamp_ms(1000 + i * 100);
+            bridge.process_event(&event).unwrap();
+        }
+        assert_eq!(bridge.dispatch_history().len(), 3);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_telemetry_counters() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.register_sandbox_zone("locked", restrictive_zone());
+
+        bridge.add_rule(make_rule(
+            "r1",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "r2",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "locked",
+            ConnectorActionKind::Invoke, // requires Invoke cap, locked doesn't have it
+        ));
+
+        // First event: matches both rules, one dispatched, one blocked
+        let event1 = make_event("test", OutboundEventSource::PatternDetected);
+        bridge.process_event(&event1).unwrap();
+
+        // Unmatched event
+        let event2 = make_event("test", OutboundEventSource::WorkflowLifecycle);
+        bridge.process_event(&event2).unwrap();
+
+        // Duplicate
+        let event3 =
+            make_event("test", OutboundEventSource::PatternDetected).with_correlation_id("dup-1");
+        bridge.process_event(&event3).unwrap();
+        bridge.process_event(&event3).unwrap();
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.events_received, 4);
+        assert_eq!(tel.events_routed, 2); // event1 + first event3
+        assert_eq!(tel.events_unmatched, 1); // event2
+        assert_eq!(tel.events_deduplicated, 1); // second event3
+        assert_eq!(tel.actions_dispatched, 2); // slack from event1 + event3
+        assert_eq!(tel.actions_blocked_sandbox, 2); // locked from event1 + event3
+    }
+
+    #[test]
+    fn connector_outbound_bridge_telemetry_counters_saturate() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.register_sandbox_zone("locked", restrictive_zone());
+        bridge.add_rule(make_rule(
+            "dispatch",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "sandbox",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "locked",
+            ConnectorActionKind::Invoke,
+        ));
+        bridge.add_rule(make_rule(
+            "policy",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+        bridge.telemetry = OutboundBridgeTelemetry {
+            events_received: u64::MAX,
+            events_routed: u64::MAX,
+            events_deduplicated: u64::MAX,
+            events_unmatched: u64::MAX,
+            actions_dispatched: u64::MAX,
+            actions_blocked_policy: u64::MAX,
+            actions_blocked_sandbox: u64::MAX,
+            actions_blocked_governor: u64::MAX,
+            actions_blocked_reliability: u64::MAX,
+            actions_throttled: u64::MAX,
+            actions_blocked_classification: u64::MAX,
+            dispatch_queue_overflows: u64::MAX,
+        };
+
+        let event =
+            make_event("test", OutboundEventSource::PatternDetected).with_correlation_id("same");
+        bridge.process_event(&event).unwrap();
+        bridge.process_event(&event).unwrap();
+
+        let unmatched = make_event("test", OutboundEventSource::WorkflowLifecycle);
+        bridge.process_event(&unmatched).unwrap();
+
+        bridge.config.dispatch_queue_capacity = 0;
+        let overflow = make_event("test", OutboundEventSource::PatternDetected)
+            .with_correlation_id("overflow");
+        bridge.process_event(&overflow).unwrap();
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.events_received, u64::MAX);
+        assert_eq!(tel.events_routed, u64::MAX);
+        assert_eq!(tel.events_deduplicated, u64::MAX);
+        assert_eq!(tel.events_unmatched, u64::MAX);
+        assert_eq!(tel.actions_dispatched, u64::MAX);
+        assert_eq!(tel.actions_blocked_policy, u64::MAX);
+        assert_eq!(tel.actions_blocked_sandbox, u64::MAX);
+        assert_eq!(tel.actions_blocked_governor, u64::MAX);
+        assert_eq!(tel.actions_blocked_reliability, u64::MAX);
+        assert_eq!(tel.dispatch_queue_overflows, u64::MAX);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_telemetry_snapshot_serde_roundtrip() {
+        let snapshot = OutboundBridgeTelemetrySnapshot {
+            events_received: 10,
+            events_routed: 8,
+            events_deduplicated: 1,
+            events_unmatched: 1,
+            actions_dispatched: 7,
+            actions_blocked_policy: 0,
+            actions_blocked_sandbox: 1,
+            actions_blocked_governor: 2,
+            actions_blocked_reliability: 3,
+            actions_throttled: 4,
+            actions_blocked_classification: 5,
+            dispatch_queue_overflows: 0,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deserialized: OutboundBridgeTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, deserialized);
+    }
+
+    // ---- Event builder ----
+
+    #[test]
+    fn connector_outbound_bridge_event_builder() {
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.ci_failure",
+            serde_json::json!({"build_id": 123}),
+        )
+        .with_correlation_id("corr-123")
+        .with_pane_id(42)
+        .with_workflow_id("wf-1")
+        .with_timestamp_ms(5000)
+        .with_severity(OutboundSeverity::Critical);
+
+        assert_eq!(event.source, OutboundEventSource::PatternDetected);
+        assert_eq!(event.event_type, "pattern.ci_failure");
+        assert_eq!(event.correlation_id.as_deref(), Some("corr-123"));
+        assert_eq!(event.pane_id, Some(42));
+        assert_eq!(event.workflow_id.as_deref(), Some("wf-1"));
+        assert_eq!(event.timestamp_ms, 5000);
+        assert_eq!(event.severity, OutboundSeverity::Critical);
+    }
+
+    // ---- Rule priority ordering ----
+
+    #[test]
+    fn connector_outbound_bridge_rules_sorted_by_priority() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("a", permissive_zone());
+        bridge.register_sandbox_zone("b", permissive_zone());
+        bridge.register_sandbox_zone("c", permissive_zone());
+
+        let mut r1 = make_rule("r1", None, None, "a", ConnectorActionKind::Notify);
+        r1.priority = 10;
+        let mut r2 = make_rule("r2", None, None, "b", ConnectorActionKind::Notify);
+        r2.priority = 1;
+        let mut r3 = make_rule("r3", None, None, "c", ConnectorActionKind::Notify);
+        r3.priority = 5;
+
+        bridge.add_rule(r1);
+        bridge.add_rule(r2);
+        bridge.add_rule(r3);
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 3);
+        // Verify priority order
+        assert_eq!(result.actions_dispatched[0].target_connector, "b"); // priority 1
+        assert_eq!(result.actions_dispatched[1].target_connector, "c"); // priority 5
+        assert_eq!(result.actions_dispatched[2].target_connector, "a"); // priority 10
+    }
+
+    // ---- Sandbox bypass when enforcement disabled ----
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_bypass_when_disabled() {
+        let config = ConnectorOutboundBridgeConfig {
+            enforce_sandbox: false,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+        // No sandbox zones registered, but enforcement disabled
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "unknown_connector",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert_eq!(result.actions_blocked.len(), 0);
+    }
+
+    // ---- Action kind display ----
+
+    #[test]
+    fn connector_outbound_bridge_action_kind_display() {
+        assert_eq!(format!("{}", ConnectorActionKind::Notify), "notify");
+        assert_eq!(format!("{}", ConnectorActionKind::Ticket), "ticket");
+    }
+
+    // ---- Outbound severity default ----
+
+    #[test]
+    fn connector_outbound_bridge_severity_default_is_info() {
+        assert_eq!(OutboundSeverity::default(), OutboundSeverity::Info);
+    }
+
+    // ---- Mixed dispatched and blocked ----
+
+    #[test]
+    fn connector_outbound_bridge_mixed_dispatch_and_block() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("allowed", permissive_zone());
+        bridge.register_sandbox_zone("blocked", restrictive_zone());
+
+        bridge.add_rule(make_rule(
+            "r-ok",
+            None,
+            None,
+            "allowed",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "r-blocked",
+            None,
+            None,
+            "blocked",
+            ConnectorActionKind::TriggerWorkflow, // needs Invoke
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert_eq!(result.actions_dispatched[0].rule_id, "r-ok");
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert_eq!(result.actions_blocked[0].rule_id, "r-blocked");
+    }
+
+    // ---- Peek action ----
+
+    #[test]
+    fn connector_outbound_bridge_peek_action() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        assert!(bridge.peek_action().is_none());
+
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom);
+        bridge.process_event(&event).unwrap();
+        assert!(bridge.peek_action().is_some());
+        assert_eq!(bridge.peek_action().unwrap().target_connector, "slack");
+        // Peek doesn't consume
+        assert_eq!(bridge.pending_action_count(), 1);
+    }
+
+    // ---- Rule count ----
+
+    #[test]
+    fn connector_outbound_bridge_rule_count() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        assert_eq!(bridge.rule_count(), 0);
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "a",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "r2",
+            None,
+            None,
+            "b",
+            ConnectorActionKind::Ticket,
+        ));
+        assert_eq!(bridge.rule_count(), 2);
+    }
+
+    // ---- Auto-generated correlation ID ----
+
+    #[test]
+    fn connector_outbound_bridge_auto_correlation_id() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::PatternDetected).with_pane_id(42);
+        let result = bridge.process_event(&event).unwrap();
+        assert!(result.correlation_id.starts_with("out-pattern_detected-"));
+        assert!(result.correlation_id.contains("-42"));
+    }
+
+    // ---- OutboundEvent serde roundtrip ----
+
+    #[test]
+    fn connector_outbound_bridge_event_serde_roundtrip() {
+        let event = OutboundEvent::new(
+            OutboundEventSource::HealthAlert,
+            "health.cpu_high",
+            serde_json::json!({"cpu_percent": 95}),
+        )
+        .with_correlation_id("health-1")
+        .with_severity(OutboundSeverity::Warning);
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: OutboundEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.source, OutboundEventSource::HealthAlert);
+        assert_eq!(deserialized.event_type, "health.cpu_high");
+        assert_eq!(deserialized.severity, OutboundSeverity::Warning);
+    }
+
+    // ---- DispatchHistoryEntry serde roundtrip ----
+
+    #[test]
+    fn connector_outbound_bridge_history_entry_serde() {
+        let entry = DispatchHistoryEntry {
+            correlation_id: "corr-1".to_string(),
+            event_type: "test".to_string(),
+            timestamp_ms: 1000,
+            actions: vec![DispatchedAction {
+                rule_id: "r1".to_string(),
+                target_connector: "slack".to_string(),
+                action_kind: ConnectorActionKind::Notify,
+                correlation_id: "corr-1".to_string(),
+                policy_decision: None,
+            }],
+            blocked: vec![],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: DispatchHistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.correlation_id, "corr-1");
+        assert_eq!(deserialized.actions.len(), 1);
+    }
+
+    // ---- ConnectorAction serde roundtrip ----
+
+    #[test]
+    fn connector_outbound_bridge_action_serde() {
+        let action = ConnectorAction {
+            target_connector: "github".to_string(),
+            action_kind: ConnectorActionKind::Ticket,
+            correlation_id: "corr-abc".to_string(),
+            params: serde_json::json!({"title": "Bug fix needed"}),
+            created_at_ms: 1000,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let deserialized: ConnectorAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.target_connector, "github");
+        assert_eq!(deserialized.action_kind, ConnectorActionKind::Ticket);
+    }
+
+    // ---- Routing rule serde roundtrip ----
+
+    #[test]
+    fn connector_outbound_bridge_routing_rule_serde() {
+        let rule = OutboundRoutingRule {
+            rule_id: "r1".to_string(),
+            source_filter: Some(OutboundEventSource::PatternDetected),
+            event_type_prefix: Some("pattern.".to_string()),
+            min_severity: Some(OutboundSeverity::Warning),
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            enabled: true,
+            priority: 5,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: OutboundRoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.rule_id, "r1");
+        assert_eq!(deserialized.priority, 5);
+        assert_eq!(
+            deserialized.source_filter,
+            Some(OutboundEventSource::PatternDetected)
+        );
+    }
+}

@@ -1,0 +1,3 @@
+# Pdu::ErrorResponse(ErrorResponse { reason: "" }) encoded with serial=1.
+# tagged_len=3, serial=1, ident=0, body=empty string length
+03 01 00 00

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-test.json",
+  "title": "WA Robot Rules Test Response",
+  "description": "Schema for the data field when calling 'wa robot rules test <content>'. Tests pattern detection on input.",
+  "type": "object",
+  "required": ["text_length", "match_count", "matches"],
+  "properties": {
+    "text_length": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Length of input content tested"
+    },
+    "match_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of rule matches"
+    },
+    "matches": {
+      "type": "array",
+      "description": "All patterns that matched the input",
+      "items": {
+        "$ref": "#/$defs/rule_match_item"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "rule_match_item": {
+      "type": "object",
+      "description": "A pattern match result",
+      "required": ["rule_id", "start", "end", "matched_text"],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "description": "Full rule ID that matched"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Start byte offset of match"
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset of match"
+        },
+        "matched_text": {
+          "type": "string",
+          "description": "The text that matched"
+        },
+        "trace": {
+          "$ref": "#/$defs/rule_trace_info",
+          "description": "Optional debug trace for rule evaluation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "rule_trace_info": {
+      "type": "object",
+      "description": "Trace info for rule match debugging",
+      "required": ["anchors_checked", "regex_matched"],
+      "properties": {
+        "anchors_checked": {
+          "type": "boolean",
+          "description": "Whether anchor patterns were checked"
+        },
+        "regex_matched": {
+          "type": "boolean",
+          "description": "Whether regex pattern matched"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

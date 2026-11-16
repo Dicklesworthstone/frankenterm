@@ -1,0 +1,26 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "accounts": [
+      {
+        "account_id": "acc-primary",
+        "last_refreshed_at": 0,
+        "last_used_at": 1700000000050,
+        "name": "Primary",
+        "percent_remaining": 85.5,
+        "reset_at": "2026-03-01T00:00:00Z",
+        "service": "openai",
+        "tokens_limit": 10000,
+        "tokens_remaining": 8550,
+        "tokens_used": 1450
+      }
+    ],
+    "service": "openai",
+    "total": 1
+  },
+  "ok": true,
+  "tool": "wa.accounts"
+}

@@ -1,0 +1,40 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9003",
+    "description": "JSON input or output could not be parsed or serialized.",
+    "error": "JSON error: expected ident at line 1 column 2",
+    "hint": "Validate the JSON input and retry.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Check for trailing commas or invalid UTF-8."
+      ],
+      "commands": [
+        {
+          "command": "python -m json.tool < input.json",
+          "label": "Validate JSON",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Validate the JSON input and retry."
+    },
+    "title": "JSON serialization error"
+  },
+  "plain_lines": [
+    "Error: JSON serialization error",
+    "",
+    "JSON error: expected ident at line 1 column 2",
+    "",
+    "JSON input or output could not be parsed or serialized.",
+    "",
+    "Suggestions:",
+    "  • Validate the JSON input and retry.",
+    "  → Validate JSON: `python -m json.tool < input.json`",
+    "  • Check for trailing commas or invalid UTF-8.",
+    "",
+    "Error code: FT-9003",
+    "Run `ft why FT-9003` for more details."
+  ]
+}

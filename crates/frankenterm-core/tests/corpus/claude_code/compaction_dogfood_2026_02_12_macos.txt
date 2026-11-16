@@ -1,0 +1,1 @@
+Auto-compact: context compacted 12,345 tokens to 3,210

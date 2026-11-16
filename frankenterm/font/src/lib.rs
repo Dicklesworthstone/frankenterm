@@ -1,0 +1,2821 @@
+use crate::db::FontDatabase;
+use crate::locator::{new_locator, FontLocator};
+use crate::parser::ParsedFont;
+use crate::rasterizer::cache::{RasterCache, RasterKey};
+use crate::rasterizer::{new_rasterizer, FontRasterizer};
+use crate::shaper::{new_shaper, FontShaper, PresentationWidth};
+use anyhow::{Context, Error};
+use config::{
+    configuration, BoldBrightening, ConfigHandle, DisplayPixelGeometry, FontAttributes,
+    FontRasterizerSelection, FontStretch, FontStyle, FontWeight, TextStyle,
+};
+use frankenterm_toast_notification::ToastNotification;
+use rangeset::RangeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+use termwiz::cell::Presentation;
+use thiserror::Error;
+use wezterm_bidi::Direction;
+use wezterm_term::{CellAttributes, Intensity};
+
+mod hbwrap;
+
+pub mod db;
+pub mod ftwrap;
+pub mod locator;
+pub mod parser;
+pub mod rasterizer;
+pub mod shaper;
+pub mod units;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod fcwrap;
+
+pub use crate::rasterizer::RasterizedGlyph;
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+pub use crate::shaper::{
+    shaping_totals, FallbackIdx, FallbackWalkStats, FontMetrics, GlyphInfo, ShapingTotals,
+};
+
+#[derive(Debug, Error)]
+#[error("Font fallback recalculated")]
+pub struct ClearShapeCache {}
+
+static FONT_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+pub type LoadedFontId = usize;
+
+#[track_caller]
+fn next_unique_font_id(counter: &::std::sync::atomic::AtomicUsize) -> LoadedFontId {
+    let mut current = counter.load(::std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            panic!("loaded font id space exhausted; refusing to reuse a font identity");
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            ::std::sync::atomic::Ordering::Relaxed,
+            ::std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+pub fn alloc_font_id() -> LoadedFontId {
+    next_unique_font_id(&FONT_ID)
+}
+
+#[cfg(test)]
+mod font_id_tests {
+    use super::next_unique_font_id;
+
+    #[test]
+    fn font_id_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX - 1);
+
+        assert_eq!(next_unique_font_id(&counter), usize::MAX - 1);
+        assert_eq!(
+            counter.load(::std::sync::atomic::Ordering::Relaxed),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "loaded font id space exhausted; refusing to reuse a font identity")]
+    fn font_id_allocator_fails_closed_at_exhaustion() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let _ = next_unique_font_id(&counter);
+    }
+}
+
+#[cfg(test)]
+mod scale_font_tests {
+    use super::*;
+
+    fn fonts(dpi: usize) -> FontConfiguration {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, dpi).unwrap();
+        assert_eq!(
+            fonts.config().font_locator,
+            config::FontLocatorSelection::ConfigDirsOnly
+        );
+        fonts
+    }
+
+    struct CountedRasterizer {
+        calls: Rc<Cell<usize>>,
+        fail_first: bool,
+    }
+
+    impl FontRasterizer for CountedRasterizer {
+        fn rasterize_glyph(
+            &self,
+            glyph_pos: u32,
+            _size: f64,
+            _dpi: u32,
+        ) -> anyhow::Result<RasterizedGlyph> {
+            let calls = self.calls.get() + 1;
+            self.calls.set(calls);
+            if self.fail_first && calls == 1 {
+                anyhow::bail!("transient rasterization failure");
+            }
+            Ok(RasterizedGlyph {
+                data: vec![glyph_pos as u8, 2, 3, 255],
+                width: 1,
+                height: 1,
+                bearing_x: units::PixelLength::new(2.0),
+                bearing_y: units::PixelLength::new(3.0),
+                has_color: true,
+                is_scaled: true,
+            })
+        }
+    }
+
+    fn count_rasters(
+        font: &LoadedFont,
+        fallback: FallbackIdx,
+        fail_first: bool,
+    ) -> Rc<Cell<usize>> {
+        let calls = Rc::new(Cell::new(0));
+        font.rasterizers.borrow_mut().insert(
+            fallback,
+            Box::new(CountedRasterizer {
+                calls: Rc::clone(&calls),
+                fail_first,
+            }),
+        );
+        calls
+    }
+
+    #[test]
+    fn pane_consumers_rasterize_once_and_mutable_title_copy_cannot_poison_pixels() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let calls = count_rasters(&font, 0, false);
+        let source = font.rasterize_glyph(17, 0).unwrap();
+        for _ in 0..200 {
+            // The panes resolve the same loaded font but use independent
+            // GlyphCaches. They must reuse source pixels, not just a shaped run.
+            let pane_font = fonts.default_font().unwrap();
+            let raster = pane_font.rasterize_glyph(17, 0).unwrap();
+            assert!(Rc::ptr_eq(&source, &raster));
+            assert_eq!(raster.bearing_x, units::PixelLength::new(2.0));
+            assert_eq!(raster.bearing_y, units::PixelLength::new(3.0));
+        }
+        assert_eq!(calls.get(), 1);
+        let mut title = Rc::unwrap_or_clone(font.rasterize_glyph(17, 0).unwrap());
+        title.data.fill(0);
+        assert_eq!(font.rasterize_glyph(17, 0).unwrap().data, [17, 2, 3, 255]);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn shared_rasters_keep_fallbacks_and_scale_identities_separate() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let base_calls = count_rasters(&original, 0, false);
+        let fallback_calls = count_rasters(&original, 1, false);
+        let base = original.rasterize_glyph(17, 0).unwrap();
+        let fallback = original.rasterize_glyph(17, 1).unwrap();
+        assert!(!Rc::ptr_eq(&base, &fallback));
+        assert_eq!(base_calls.get(), 1);
+        assert_eq!(fallback_calls.get(), 1);
+
+        fonts.change_scaling(1.25, 96);
+        let scaled = fonts.default_font().unwrap();
+        assert_ne!(original.id(), scaled.id());
+        let scaled_calls = count_rasters(&scaled, 0, false);
+        let scaled_pixels = scaled.rasterize_glyph(17, 0).unwrap();
+        assert!(!Rc::ptr_eq(&base, &scaled_pixels));
+        assert_eq!(scaled_calls.get(), 1);
+        assert!(Rc::ptr_eq(&base, &original.rasterize_glyph(17, 0).unwrap()));
+        assert_eq!(base_calls.get(), 1);
+    }
+
+    #[test]
+    fn raster_errors_are_retryable_and_configuration_reload_retires_cached_pixels() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let calls = count_rasters(&font, 0, true);
+        assert!(font.rasterize_glyph(17, 0).is_err());
+        let recovered = font.rasterize_glyph(17, 0).unwrap();
+        assert!(Rc::ptr_eq(
+            &recovered,
+            &font.rasterize_glyph(17, 0).unwrap()
+        ));
+        assert_eq!(calls.get(), 2);
+
+        fonts.config_changed(&fonts.config()).unwrap();
+        // An externally held outgoing font is still valid. The configuration
+        // has nevertheless released the old bitmap cache, so this must miss.
+        let refreshed = font.rasterize_glyph(17, 0).unwrap();
+        assert!(!Rc::ptr_eq(&recovered, &refreshed));
+        assert_eq!(calls.get(), 3);
+        drop(fonts);
+        assert_eq!(font.rasterize_glyph(17, 0).unwrap().data, [17, 2, 3, 255]);
+        assert_eq!(
+            calls.get(),
+            4,
+            "a retired configuration has no hidden cache owner"
+        );
+    }
+
+    fn glyph_pixels(font: &LoadedFont, infos: &[GlyphInfo]) -> Vec<Rc<RasterizedGlyph>> {
+        infos
+            .iter()
+            .map(|info| font.rasterize_glyph(info.glyph_pos, info.font_idx).unwrap())
+            .collect()
+    }
+
+    fn assert_same_pixels(expected: &[Rc<RasterizedGlyph>], actual: &[Rc<RasterizedGlyph>]) {
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert_eq!(expected.data, actual.data);
+            assert_eq!(expected.width, actual.width);
+            assert_eq!(expected.height, actual.height);
+            assert_eq!(expected.bearing_x, actual.bearing_x);
+            assert_eq!(expected.bearing_y, actual.bearing_y);
+            assert_eq!(expected.has_color, actual.has_color);
+            assert_eq!(expected.is_scaled, actual.is_scaled);
+        }
+    }
+
+    fn bundled_fallback_fonts() -> FontConfiguration {
+        let fonts = fonts(96);
+        // Keep the real built-in database and resolver, without depending on
+        // which asset directories happen to exist beside the test executable.
+        *fonts.inner.font_dirs.borrow_mut() = Arc::new(FontDatabase::new());
+        fonts
+    }
+
+    fn fresh_scale_fonts(source: &FontConfiguration, scale: f64, dpi: usize) -> FontConfiguration {
+        let fresh = FontConfiguration::new(Some(source.config()), dpi).unwrap();
+        // Both configurations consult exactly the same immutable font inputs,
+        // including tie ordering among bundled Roboto variants in the database.
+        *fresh.inner.font_dirs.borrow_mut() = Arc::clone(&*source.inner.font_dirs.borrow());
+        *fresh.inner.built_in.borrow_mut() = Arc::clone(&*source.inner.built_in.borrow());
+        fresh.change_scaling(scale, dpi);
+        fresh
+    }
+
+    fn assert_same_handles(expected: &[ParsedFont], actual: &[ParsedFont]) {
+        assert_eq!(expected, actual);
+        for (expected, actual) in expected.iter().zip(actual) {
+            // ParsedFont equality alone only compares names and style. Check
+            // source and rendering attributes as well as the ordered faces.
+            assert_eq!(expected.handle, actual.handle);
+            assert_eq!(expected.pixel_sizes, actual.pixel_sizes);
+            assert_eq!(expected.scale, actual.scale);
+            assert_eq!(expected.synthesize_bold, actual.synthesize_bold);
+            assert_eq!(expected.synthesize_italic, actual.synthesize_italic);
+            assert_eq!(expected.synthesize_dim, actual.synthesize_dim);
+            assert_eq!(
+                expected.assume_emoji_presentation,
+                actual.assume_emoji_presentation
+            );
+            assert_eq!(expected.harfbuzz_features, actual.harfbuzz_features);
+            assert_eq!(expected.freetype_load_flags, actual.freetype_load_flags);
+            assert_eq!(expected.freetype_load_target, actual.freetype_load_target);
+            assert_eq!(
+                expected.freetype_render_target,
+                actual.freetype_render_target
+            );
+        }
+    }
+
+    fn discover_bundled_fallback(font: &LoadedFont) -> Vec<GlyphInfo> {
+        let (tx, rx) = channel();
+        let (resolving, _) = font
+            .shape_impl(
+                "ffi \u{460} e\u{301}",
+                move || {
+                    let _ = tx.send(());
+                },
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            resolving,
+            "the control must require real dynamic fallback discovery"
+        );
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let glyphs = font
+            .blocking_shape(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(glyphs.iter().any(|glyph| {
+            glyph.only_char == Some('\u{460}')
+                && glyph.font_idx >= font.configured_handle_count
+                && glyph.glyph_pos != 0
+        }));
+        glyphs
+    }
+
+    /// Shapes the fallback text on `font` after `fonts` resolved it for
+    /// another font (ft-yccm0.2.12): the outcome cache installs the known
+    /// face at once, with no resolver round trip and no locator query.
+    fn reuse_known_fallback(fonts: &FontConfiguration, font: &LoadedFont) -> Vec<GlyphInfo> {
+        let before = fonts.fallback_stats();
+        let error = font
+            .shape_impl(
+                "ffi \u{460} e\u{301}",
+                || panic!("a known fallback face must not need a resolve"),
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<ClearShapeCache>().is_some());
+        let glyphs = font
+            .blocking_shape(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(glyphs.iter().any(|glyph| {
+            glyph.only_char == Some('\u{460}')
+                && glyph.font_idx >= font.configured_handle_count
+                && glyph.glyph_pos != 0
+        }));
+        let after = fonts.fallback_stats();
+        assert_eq!(after.queried, before.queried, "no locator query");
+        assert!(after.found > before.found);
+        glyphs
+    }
+
+    #[test]
+    fn unseen_scale_seeds_real_fallback_before_first_shape_with_fresh_glyph_parity() {
+        let fonts = bundled_fallback_fonts();
+        let original = fonts.default_font().unwrap();
+        discover_bundled_fallback(&original);
+        let original_handles = original.clone_dynamic_fallback_handles();
+        assert!(!original_handles.is_empty());
+
+        for (scale, dpi) in [(1.25, 96), (1.5, 144), (1.75, 96)] {
+            fonts.change_scaling(scale, dpi);
+            let scaled = fonts.default_font().unwrap();
+            let fresh = fresh_scale_fonts(&fonts, scale, dpi);
+            let fresh_font = fresh.default_font().unwrap();
+            assert_ne!(original.id(), scaled.id());
+            assert_ne!(original.metrics(), scaled.metrics());
+            assert_eq!(scaled.metrics(), fresh_font.metrics());
+            assert_eq!(scaled.font_size, fresh_font.font_size);
+            assert_eq!(scaled.dpi, fresh_font.dpi);
+            assert_same_handles(
+                &fresh_font.clone_handles(),
+                &scaled.clone_handles()[..scaled.configured_handle_count],
+            );
+            assert_same_handles(&original_handles, &scaled.clone_dynamic_fallback_handles());
+            assert!(scaled.rasterizers.borrow().is_empty());
+            assert!(scaled.tried_glyphs.borrow().is_empty());
+            let (resolving, actual) = scaled
+                .shape_impl(
+                    "ffi \u{460} e\u{301}",
+                    || {},
+                    |_| {},
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )
+                .expect("pre-seeded fallbacks must not need a ClearShapeCache retry");
+            assert!(
+                !resolving,
+                "the first target-scale shape must need no resolver round trip"
+            );
+            assert!(scaled.tried_glyphs.borrow().is_empty());
+            let expected = discover_bundled_fallback(&fresh_font);
+            assert_eq!(actual, expected);
+            assert_same_pixels(
+                &glyph_pixels(&fresh_font, &expected),
+                &glyph_pixels(&scaled, &actual),
+            );
+        }
+    }
+
+    #[test]
+    fn available_only_shaping_preserves_real_glyphs_and_pixels() {
+        let fonts = bundled_fallback_fonts();
+        let font = fonts.default_font().unwrap();
+        let fresh = fresh_scale_fonts(&fonts, 1.0, 96);
+        let reference = fresh.default_font().unwrap();
+        for (text, presentation) in [
+            ("ffi e\u{301}", None),
+            ("A\u{fe0e}", None),
+            ("\u{1f680}\u{fe0f}", Some(Presentation::Emoji)),
+        ] {
+            for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+                let available = font
+                    .shape_if_available(text, presentation, direction, None, None)
+                    .unwrap()
+                    .expect("the bundled configured fonts cover this text");
+                let expected = reference
+                    .blocking_shape(text, presentation, direction, None, None)
+                    .unwrap();
+                assert_eq!(available, expected);
+                assert_same_pixels(
+                    &glyph_pixels(&reference, &expected),
+                    &glyph_pixels(&font, &available),
+                );
+            }
+        }
+        assert_eq!(fonts.fallback_stats(), FallbackStats::default());
+        assert!(font.tried_glyphs.borrow().is_empty());
+        assert!(lock_or_recover(&font.pending_fallback).is_empty());
+    }
+
+    #[test]
+    fn available_only_missing_glyph_preserves_discovery_and_pending_insertion() {
+        let fonts = bundled_fallback_fonts();
+        let font = fonts.default_font().unwrap();
+        let before = font.clone_handles();
+        assert!(font
+            .shape_if_available("\u{460}", None, Direction::LeftToRight, None, None)
+            .unwrap()
+            .is_none());
+        assert_eq!(fonts.fallback_stats(), FallbackStats::default());
+        assert!(font.tried_glyphs.borrow().is_empty());
+        assert!(lock_or_recover(&font.pending_fallback).is_empty());
+        assert_same_handles(&before, &font.clone_handles());
+        let expected = discover_bundled_fallback(&font);
+        let available = font
+            .shape_if_available(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(available, expected);
+
+        let fresh = fresh_scale_fonts(&fonts, 1.0, 96);
+        let pending_font = fresh.default_font().unwrap();
+        let pending = font.clone_dynamic_fallback_handles();
+        lock_or_recover(&pending_font.pending_fallback).extend(pending.clone());
+        assert!(pending_font
+            .shape_if_available("\u{460}", None, Direction::LeftToRight, None, None)
+            .unwrap()
+            .is_none());
+        assert_same_handles(&before, &pending_font.clone_handles());
+        assert_same_handles(&pending, &lock_or_recover(&pending_font.pending_fallback));
+        assert!(pending_font.tried_glyphs.borrow().is_empty());
+        assert_eq!(fresh.fallback_stats(), FallbackStats::default());
+        assert!(pending_font
+            .shape(
+                "\u{460}",
+                || {},
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .downcast_ref::<ClearShapeCache>()
+            .is_some());
+        let inserted = pending_font
+            .shape_if_available(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(inserted, expected);
+        assert_same_pixels(
+            &glyph_pixels(&font, &expected),
+            &glyph_pixels(&pending_font, &inserted),
+        );
+    }
+
+    #[test]
+    fn dynamic_fallback_seeding_respects_style_and_fresh_metric_resolution() {
+        let fonts = bundled_fallback_fonts();
+        discover_bundled_fallback(&fonts.default_font().unwrap());
+        let style = TextStyle {
+            foreground: None,
+            font: vec![FontAttributes::new("Roboto")],
+        };
+        let original_style = fonts.resolve_font(&style).unwrap();
+        fonts.change_scaling(1.25, 144);
+        let other_style = fonts.config().font.make_bold();
+        let other_font = fonts.resolve_font(&other_style).unwrap();
+        assert!(other_font.clone_dynamic_fallback_handles().is_empty());
+        // Another style reuses the configuration's discovery (ft-yccm0.2.12).
+        reuse_known_fallback(&fonts, &other_font);
+        let scaled = fonts.resolve_font(&style).unwrap();
+        let fresh = fresh_scale_fonts(&fonts, 1.25, 144);
+        let expected = fresh.resolve_font(&style).unwrap();
+        assert!(scaled.clone_dynamic_fallback_handles().is_empty());
+        assert_ne!(scaled.id(), original_style.id());
+        assert_eq!(scaled.metrics(), expected.metrics());
+        assert_eq!(scaled.font_size, expected.font_size);
+        assert_same_handles(&expected.clone_handles(), &scaled.clone_handles());
+        let shape = |font: &LoadedFont| {
+            font.blocking_shape("I ffi \u{460}", None, Direction::LeftToRight, None, None)
+                .unwrap()
+        };
+        let actual = shape(&scaled);
+        let wanted = shape(&expected);
+        assert_eq!(actual, wanted);
+        assert_same_pixels(
+            &glyph_pixels(&expected, &wanted),
+            &glyph_pixels(&scaled, &actual),
+        );
+    }
+
+    /// ft-yccm0.2.12: the outcome cache is a bounded LRU per generation.
+    #[test]
+    fn fallback_outcomes_are_a_bounded_lru_reset_by_generation() {
+        let mut outcomes = FallbackOutcomes::default();
+        let codepoint = |n: u32| char::from_u32(0x4e00 + n).unwrap();
+        let capacity = u32::try_from(FALLBACK_OUTCOME_CAPACITY).unwrap();
+        for n in 0..capacity {
+            outcomes.set(codepoint(n), FallbackOutcome::Missing);
+        }
+        // Using the oldest entry protects it from the next eviction.
+        assert_eq!(outcomes.get(codepoint(0)), Some(FallbackOutcome::Missing));
+        outcomes.set(codepoint(capacity), FallbackOutcome::Pending);
+        assert_eq!(outcomes.len(), FALLBACK_OUTCOME_CAPACITY);
+        assert_eq!(outcomes.get(codepoint(0)), Some(FallbackOutcome::Missing));
+        assert_eq!(outcomes.get(codepoint(1)), None, "least recently used");
+        assert_eq!(
+            outcomes.get(codepoint(capacity)),
+            Some(FallbackOutcome::Pending)
+        );
+        // Overwriting keeps one entry per codepoint.
+        outcomes.set(codepoint(0), FallbackOutcome::Pending);
+        assert_eq!(outcomes.len(), FALLBACK_OUTCOME_CAPACITY);
+        assert_eq!(outcomes.by_use.len(), outcomes.entries.len());
+
+        let fonts = bundled_fallback_fonts();
+        let faces = fonts.inner.built_in.borrow().list_available();
+        let first = outcomes.face_index(&faces[0]);
+        assert_eq!(first, Some(0));
+        assert_eq!(outcomes.face_index(&faces[0]), first, "faces dedupe");
+        outcomes.ensure_generation(outcomes.generation);
+        assert_eq!(outcomes.len(), FALLBACK_OUTCOME_CAPACITY);
+        outcomes.ensure_generation(outcomes.generation + 1);
+        assert_eq!(outcomes.len(), 0);
+        assert!(outcomes.faces.is_empty());
+
+        let mut tried = TriedGlyphs::default();
+        for n in 0..=u32::try_from(MAX_TRIED_GLYPHS).unwrap() {
+            tried.insert(codepoint(n));
+        }
+        assert_eq!(tried.len(), MAX_TRIED_GLYPHS);
+        assert!(!tried.contains(&codepoint(0)), "oldest forgotten");
+    }
+
+    /// ft-yccm0.2.12: a codepoint no font covers is resolved once per
+    /// configuration generation; every other style and scale is answered
+    /// from the outcome cache, and only a configuration change asks again.
+    #[test]
+    fn missing_codepoints_resolve_once_per_generation_for_every_font() {
+        let fonts = bundled_fallback_fonts();
+        // A noncharacter: no font maps it.
+        let text = "\u{2FFFE}";
+        let shape = |font: &LoadedFont| {
+            font.shape_impl(
+                text,
+                || {},
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let font = fonts.default_font().unwrap();
+        let notdef = font
+            .blocking_shape(text, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert_eq!(fonts.fallback_stats().queried, 1);
+        assert_eq!(fonts.fallback_resolves_in_flight(), 0);
+        let (resolving, again) = shape(&font);
+        assert!(!resolving);
+        assert_eq!(again, notdef, "the font remembers its own codepoints");
+
+        let bold = fonts
+            .resolve_font(&fonts.config().font.make_bold())
+            .unwrap();
+        let (resolving, _) = shape(&bold);
+        assert!(!resolving, "another style is answered from the cache");
+        fonts.change_scaling(1.5, 96);
+        let scaled = fonts.default_font().unwrap();
+        assert!(!Rc::ptr_eq(&scaled, &font));
+        let (resolving, scaled_notdef) = shape(&scaled);
+        assert!(!resolving, "another scale is answered from the cache");
+        assert_eq!(scaled_notdef.len(), notdef.len());
+        let stats = fonts.fallback_stats();
+        assert_eq!((stats.queried, stats.missing), (1, 2));
+
+        fonts.config_changed(&fonts.config()).unwrap();
+        *fonts.inner.font_dirs.borrow_mut() = Arc::new(FontDatabase::new());
+        let reloaded = fonts.default_font().unwrap();
+        let (resolving, _) = shape(&reloaded);
+        assert!(resolving, "a configuration change asks again");
+        assert_eq!(fonts.fallback_stats().queried, 2);
+    }
+
+    /// ft-yccm0.2.12: while another font resolves a codepoint, a font leaves
+    /// it alone without forgetting it, and installs the face once known.
+    #[test]
+    fn fonts_wait_for_pending_outcomes_then_install_the_found_face() {
+        let fonts = bundled_fallback_fonts();
+        let font = fonts.default_font().unwrap();
+        let face = fonts
+            .inner
+            .built_in
+            .borrow()
+            .list_available()
+            .into_iter()
+            .find(|face| {
+                let mut wanted = RangeSet::new();
+                wanted.add(0x460);
+                face.coverage_intersection(&wanted)
+                    .is_ok_and(|covered| !covered.is_empty())
+            })
+            .expect("a bundled face covers U+0460");
+        lock_or_recover(&fonts.inner.fallback_outcomes).set('\u{460}', FallbackOutcome::Pending);
+        let shape = || {
+            font.shape_impl(
+                "\u{460}",
+                || panic!("a pending codepoint is not resolved twice"),
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+        };
+        let (resolving, _) = shape().unwrap();
+        assert!(!resolving);
+        assert!(!font.tried_glyphs.borrow().contains(&'\u{460}'));
+        assert_eq!(fonts.fallback_stats().waiting, 1);
+
+        {
+            let mut outcomes = lock_or_recover(&fonts.inner.fallback_outcomes);
+            let index = outcomes.face_index(&face).unwrap();
+            outcomes.set('\u{460}', FallbackOutcome::Found(index));
+        }
+        assert!(shape()
+            .unwrap_err()
+            .downcast_ref::<ClearShapeCache>()
+            .is_some());
+        assert!(font.clone_handles().contains(&face));
+        let (resolving, glyphs) = shape().unwrap();
+        assert!(!resolving);
+        assert!(glyphs.iter().all(|glyph| glyph.glyph_pos != 0));
+        assert_eq!(fonts.fallback_stats().queried, 0);
+    }
+
+    /// ft-yccm0.2.12: a font's walk stats survive the shaper replacements
+    /// that fallback insertion makes, and text its primary face covers costs
+    /// one face shape.
+    #[test]
+    fn fallback_walk_stats_survive_fallback_insertion() {
+        let fonts = bundled_fallback_fonts();
+        let font = fonts.default_font().unwrap();
+        let before = font.fallback_walk_stats();
+        discover_bundled_fallback(&font);
+        let discovered = font.fallback_walk_stats();
+        assert!(
+            discovered.faces_shaped > before.faces_shaped,
+            "{discovered:?}"
+        );
+        font.blocking_shape("ffi", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert_eq!(
+            font.fallback_walk_stats().faces_shaped,
+            discovered.faces_shaped + 1
+        );
+    }
+
+    /// ft-yccm0.2.12: every configuration shares one resolver thread.
+    #[test]
+    fn resolver_threads_stay_bounded_across_configurations() {
+        let before = fallback_resolver_threads_spawned();
+        for n in 0..6_u32 {
+            let fonts = bundled_fallback_fonts();
+            let text = char::from_u32(0x2FFFE + 0x10000 * (n % 2))
+                .unwrap()
+                .to_string();
+            fonts
+                .default_font()
+                .unwrap()
+                .blocking_shape(&text, None, Direction::LeftToRight, None, None)
+                .unwrap();
+            assert_eq!(fonts.fallback_stats().queried, 1);
+        }
+        let after = fallback_resolver_threads_spawned();
+        assert!(after - before <= 1, "{before} -> {after}");
+        assert!(after <= 1, "{after} resolver threads in this process");
+    }
+
+    #[test]
+    fn config_reload_prevents_dynamic_fallback_inheritance() {
+        let fonts = bundled_fallback_fonts();
+        discover_bundled_fallback(&fonts.default_font().unwrap());
+        fonts.change_scaling(1.25, 96);
+        assert!(!fonts
+            .default_font()
+            .unwrap()
+            .clone_dynamic_fallback_handles()
+            .is_empty());
+        fonts.config_changed(&fonts.config()).unwrap();
+        *fonts.inner.font_dirs.borrow_mut() = Arc::new(FontDatabase::new());
+        let reloaded = fonts.default_font().unwrap();
+        assert!(reloaded.clone_dynamic_fallback_handles().is_empty());
+        discover_bundled_fallback(&reloaded);
+    }
+
+    #[test]
+    fn oversized_dynamic_tail_declines_inheritance_without_changing_owner_or_discovery() {
+        let fonts = bundled_fallback_fonts();
+        let original = fonts.default_font().unwrap();
+        let glyphs = discover_bundled_fallback(&original);
+        let pixels = glyph_pixels(&original, &glyphs);
+        let dynamic = original.clone_dynamic_fallback_handles();
+        assert!(!dynamic.is_empty());
+        assert!(dynamic.len() < MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES);
+
+        // Exercise exact chain cardinality with real bundled font handles and
+        // a real rebuilt shaper. Repeated faces make this resource-boundary
+        // fixture independent of the number of faces selected by the bundled
+        // resolver. Keep all originally discovered faces in their original order.
+        let mut handles = original.clone_handles();
+        handles.resize(
+            original.configured_handle_count + MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES,
+            dynamic[0].clone(),
+        );
+        *original.shaper.borrow_mut() = new_shaper(&fonts.config(), &handles).unwrap();
+        *original.handles.borrow_mut() = handles.clone();
+        assert_eq!(
+            original.clone_dynamic_fallback_handles().len(),
+            MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES
+        );
+        handles.push(dynamic[0].clone());
+        *original.shaper.borrow_mut() = new_shaper(&fonts.config(), &handles).unwrap();
+        *original.handles.borrow_mut() = handles.clone();
+        assert!(original.clone_dynamic_fallback_handles().is_empty());
+
+        fonts.change_scaling(1.25, 96);
+        let scaled = fonts.default_font().unwrap();
+        assert!(scaled.clone_dynamic_fallback_handles().is_empty());
+        // Without inherited faces, the outcome cache still answers the known
+        // codepoint (ft-yccm0.2.12).
+        reuse_known_fallback(&fonts, &scaled);
+        assert_same_handles(&handles, &original.clone_handles());
+        let shaped = original
+            .blocking_shape(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(shaped, glyphs);
+        assert_same_pixels(&pixels, &glyph_pixels(&original, &shaped));
+    }
+
+    #[test]
+    fn scale_restoration_preserves_fallback_order_and_leaves_late_results_with_owner() {
+        let fonts = bundled_fallback_fonts();
+        let original = fonts.default_font().unwrap();
+        let glyphs = discover_bundled_fallback(&original);
+        let pixels = glyph_pixels(&original, &glyphs);
+        let original_handles = original.clone_handles();
+        let late = fonts
+            .inner
+            .built_in
+            .borrow()
+            .list_available()
+            .into_iter()
+            .find(|handle| !original_handles.contains(handle))
+            .unwrap();
+        fonts.change_scaling(1.25, 96);
+        let scaled = fonts.default_font().unwrap();
+        assert_same_handles(&original_handles, &scaled.clone_handles());
+        lock_or_recover(&original.pending_fallback).push(late.clone());
+        assert!(lock_or_recover(&scaled.pending_fallback).is_empty());
+        assert_same_handles(&original_handles, &scaled.clone_handles());
+        fonts.change_scaling(1.0, 96);
+        let restored = fonts.default_font().unwrap();
+        assert!(Rc::ptr_eq(&restored, &original));
+        let shaped = restored
+            .blocking_shape(
+                "ffi \u{460} e\u{301}",
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut expected_handles = original_handles;
+        expected_handles.push(late);
+        assert_same_handles(&expected_handles, &restored.clone_handles());
+        assert_eq!(shaped, glyphs);
+        assert_same_pixels(&pixels, &glyph_pixels(&restored, &shaped));
+    }
+
+    #[test]
+    fn failed_fallback_insertion_retains_handles_shaper_and_pending_results() {
+        let fonts = bundled_fallback_fonts();
+        let font = fonts.default_font().unwrap();
+        let before = font.clone_handles();
+        let glyphs = font
+            .blocking_shape("ffi A", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let pixels = glyph_pixels(&font, &glyphs);
+        let fallback = fonts
+            .inner
+            .built_in
+            .borrow()
+            .list_available()
+            .into_iter()
+            .find(|handle| !before.contains(handle))
+            .unwrap();
+        drop(fonts);
+        assert!(font
+            .insert_fallback_handles(std::slice::from_ref(&fallback))
+            .is_err());
+        assert_same_handles(&before, &font.clone_handles());
+        lock_or_recover(&font.pending_fallback).extend([fallback.clone(), fallback]);
+        let pending = lock_or_recover(&font.pending_fallback).clone();
+        for _ in 0..2 {
+            let error = font
+                .shape(
+                    "ffi A",
+                    || {},
+                    |_| {},
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.root_cause().to_string(),
+                "font configuration retired before fallback insertion"
+            );
+            assert!(font.tried_glyphs.borrow().is_empty());
+            let shaped = font
+                .shape_if_available("ffi A", None, Direction::LeftToRight, None, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(shaped, glyphs);
+            assert_same_pixels(&pixels, &glyph_pixels(&font, &shaped));
+            assert_same_handles(&before, &font.clone_handles());
+            assert_same_handles(&pending, &lock_or_recover(&font.pending_fallback));
+        }
+    }
+
+    #[test]
+    fn pending_fallback_batch_preserves_real_insertion_and_late_shape_fences() {
+        let fonts = fonts(96);
+        let font = fonts.default_font().unwrap();
+        let fallback = font
+            .clone_handles()
+            .into_iter()
+            .find(|handle| handle.names().family == "Noto Color Emoji")
+            .expect("the test configuration includes the bundled emoji fallback");
+        let text = "🚀";
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        let fresh_font = fresh.default_font().unwrap();
+        let expected = fresh_font
+            .blocking_shape(
+                text,
+                Some(Presentation::Emoji),
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected_pixels = glyph_pixels(&fresh_font, &expected);
+
+        // Start with a real font chain lacking the emoji face. Publishing that
+        // face into pending_fallback models the resolver's actual handoff;
+        // neither a fake shaper nor a placeholder glyph can satisfy the oracle.
+        font.handles
+            .borrow_mut()
+            .retain(|handle| *handle != fallback);
+        *font.shaper.borrow_mut() = new_shaper(&fonts.config(), &font.handles.borrow()).unwrap();
+        lock_or_recover(&font.pending_fallback).extend([fallback.clone(), fallback.clone()]);
+        let shape = || {
+            font.shape(
+                text,
+                || panic!("bundled emoji must not need another fallback search"),
+                |_| {},
+                Some(Presentation::Emoji),
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+        };
+        let error = shape().expect_err("installing a real fallback must invalidate old shaping");
+        assert!(error.downcast_ref::<ClearShapeCache>().is_some());
+        assert_eq!(
+            font.clone_handles()
+                .iter()
+                .filter(|handle| **handle == fallback)
+                .count(),
+            1
+        );
+        let inserted = shape().unwrap();
+        assert!(inserted
+            .iter()
+            .any(|glyph| glyph.font_idx > 0 && glyph.glyph_pos != 0));
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&font, &inserted));
+
+        lock_or_recover(&font.pending_fallback).push(fallback);
+        assert_eq!(
+            shape().unwrap(),
+            inserted,
+            "duplicate discovery is not a new font insertion"
+        );
+
+        let late = FontDatabase::with_built_in()
+            .unwrap()
+            .list_available()
+            .into_iter()
+            .find(|handle| !font.handles.borrow().contains(handle))
+            .expect("a distinct bundled font for the late insertion control");
+        lock_or_recover(&font.pending_fallback).push(late);
+        assert!(shape()
+            .unwrap_err()
+            .downcast_ref::<ClearShapeCache>()
+            .is_some());
+        let after_late = shape().unwrap();
+        assert_eq!(after_late, inserted);
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&font, &after_late));
+    }
+
+    #[test]
+    fn returning_to_previous_scale_reuses_fonts_with_fresh_glyph_parity() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let text = "ffi != => e\u{301} W0123456789";
+        let expected = original
+            .blocking_shape(text, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let expected_pixels = glyph_pixels(&original, &expected);
+        fonts.change_scaling(1.25, 96);
+        let enlarged = fonts.default_font().unwrap();
+        assert_ne!(original.metrics(), enlarged.metrics());
+        fonts.change_scaling(1.0, 96);
+        let restored = fonts.default_font().unwrap();
+        assert!(
+            Rc::ptr_eq(&original, &restored),
+            "returning to the previous scale must retain the already loaded font faces"
+        );
+        assert_eq!(
+            restored
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap(),
+            expected
+        );
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        assert_eq!(restored.metrics(), fresh.default_font().unwrap().metrics());
+        assert_same_pixels(&expected_pixels, &glyph_pixels(&restored, &expected));
+        assert_same_pixels(
+            &expected_pixels,
+            &glyph_pixels(&fresh.default_font().unwrap(), &expected),
+        );
+        assert_eq!(
+            restored
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap(),
+            fresh
+                .default_font()
+                .unwrap()
+                .blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unchanged_scale_preserves_fonts_and_entity_zoom_ignores_terminal_scale() {
+        let fonts = fonts(96);
+        let original = fonts.default_font().unwrap();
+        let title = fonts.title_font().unwrap();
+        fonts.change_scaling(1.0, 96);
+        assert!(Rc::ptr_eq(&original, &fonts.default_font().unwrap()));
+        fonts.change_scaling(1.25, 96);
+        assert!(Rc::ptr_eq(&title, &fonts.title_font().unwrap()));
+    }
+
+    #[test]
+    fn dpi_change_refreshes_every_entity_font_against_fresh_metrics() {
+        let fonts = fonts(96);
+        let before = [
+            fonts.title_font().unwrap(),
+            fonts.command_palette_font().unwrap(),
+            fonts.char_select_font().unwrap(),
+            fonts.pane_select_font().unwrap(),
+        ];
+        fonts.change_scaling(1.0, 144);
+        let after = [
+            fonts.title_font().unwrap(),
+            fonts.command_palette_font().unwrap(),
+            fonts.char_select_font().unwrap(),
+            fonts.pane_select_font().unwrap(),
+        ];
+        let fresh = FontConfiguration::new(Some(fonts.config()), 144).unwrap();
+        let expected = [
+            fresh.title_font().unwrap(),
+            fresh.command_palette_font().unwrap(),
+            fresh.char_select_font().unwrap(),
+            fresh.pane_select_font().unwrap(),
+        ];
+        for ((before, after), expected) in before.iter().zip(&after).zip(&expected) {
+            assert!(!Rc::ptr_eq(before, after));
+            assert_ne!(before.metrics(), after.metrics());
+            assert_eq!(after.metrics(), expected.metrics());
+            assert_eq!(after.dpi, 144);
+        }
+    }
+
+    #[test]
+    fn configuration_reload_discards_active_and_previous_scale_fonts() {
+        let fonts = fonts(96);
+        let old_base = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.change_scaling(1.25, 96);
+        let old_zoom = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.config_changed(&fonts.config()).unwrap();
+        assert!(old_base.upgrade().is_none());
+        assert!(old_zoom.upgrade().is_none());
+        fonts.change_scaling(1.0, 96);
+        let fresh = FontConfiguration::new(Some(fonts.config()), 96).unwrap();
+        assert_eq!(
+            fonts.default_font().unwrap().metrics(),
+            fresh.default_font().unwrap().metrics()
+        );
+    }
+
+    #[test]
+    fn scale_history_retains_only_the_immediately_previous_set() {
+        let fonts = fonts(96);
+        let original = Rc::downgrade(&fonts.default_font().unwrap());
+        fonts.change_scaling(1.25, 96);
+        let zoom = Rc::downgrade(&fonts.default_font().unwrap());
+        assert!(original.upgrade().is_some());
+        fonts.change_scaling(1.5, 96);
+        let _current = fonts.default_font().unwrap();
+        assert!(original.upgrade().is_none());
+        assert!(zoom.upgrade().is_some());
+        fonts.change_scaling(1.75, 96);
+        assert!(zoom.upgrade().is_none());
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref LAST_WARNING: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+}
+
+pub struct LoadedFont {
+    rasterizers: RefCell<HashMap<FallbackIdx, Box<dyn FontRasterizer>>>,
+    /// The prefix selected from configuration at this font's final pixel size.
+    /// Only the append-only suffix contains dynamically discovered fallbacks.
+    configured_handle_count: usize,
+    handles: RefCell<Vec<ParsedFont>>,
+    shaper: RefCell<Box<dyn FontShaper>>,
+    metrics: FontMetrics,
+    pixel_geometry: DisplayPixelGeometry,
+    font_size: f64,
+    dpi: u32,
+    font_config: Weak<FontConfigInner>,
+    pending_fallback: Arc<Mutex<Vec<ParsedFont>>>,
+    text_style: TextStyle,
+    id: LoadedFontId,
+    /// Codepoints this font has already settled: handed to the resolver,
+    /// answered from the configuration's outcome cache, or known missing.
+    tried_glyphs: RefCell<TriedGlyphs>,
+    /// Fallback-walk stats of the shapers that fallback insertion replaced.
+    retired_walk_stats: Cell<FallbackWalkStats>,
+}
+
+/// Most codepoints one font remembers having settled (ft-yccm0.2.12). A
+/// forgotten codepoint is looked up in the configuration's outcome cache
+/// again, which is cheap, so the bound costs no extra resolution.
+const MAX_TRIED_GLYPHS: usize = 8192;
+
+/// A set of codepoints bounded at [`MAX_TRIED_GLYPHS`]; once full, the
+/// oldest entry is forgotten.
+#[derive(Default)]
+struct TriedGlyphs {
+    set: HashSet<char>,
+    order: VecDeque<char>,
+}
+
+impl TriedGlyphs {
+    fn contains(&self, c: &char) -> bool {
+        self.set.contains(c)
+    }
+
+    fn insert(&mut self, c: char) {
+        if self.set.insert(c) {
+            self.order.push_back(c);
+            while self.order.len() > MAX_TRIED_GLYPHS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.set.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+impl std::fmt::Debug for LoadedFont {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("LoadedFont")
+            .field("handles", &self.handles)
+            .field("metrics", &self.metrics)
+            .field("font_size", &self.font_size)
+            .field("dpi", &self.dpi)
+            .field("pending_fallback", &self.pending_fallback)
+            .field("text_style", &self.text_style)
+            .finish()
+    }
+}
+
+impl LoadedFont {
+    pub fn metrics(&self) -> FontMetrics {
+        self.metrics
+    }
+
+    pub fn style(&self) -> &TextStyle {
+        &self.text_style
+    }
+
+    pub fn id(&self) -> LoadedFontId {
+        self.id
+    }
+
+    fn insert_fallback_handles(&self, extra_handles: &[ParsedFont]) -> anyhow::Result<bool> {
+        if extra_handles.is_empty() {
+            return Ok(false);
+        }
+        let mut handles = self.handles.borrow().clone();
+        let prior_count = handles.len();
+        for h in extra_handles {
+            if !handles.contains(h) {
+                handles.push(h.clone());
+            }
+        }
+        if handles.len() == prior_count {
+            return Ok(false);
+        }
+
+        // A failed rebuild must leave the published indices and shaper paired.
+        // Existing rasterizers remain valid because all additions are at the end.
+        let font_config = self
+            .font_config
+            .upgrade()
+            .context("font configuration retired before fallback insertion")?;
+        let shaper = new_shaper(&font_config.config.borrow(), &handles)?;
+        log::trace!("revised fallback: {:#?}", handles);
+        *self.handles.borrow_mut() = handles;
+        let retired = std::mem::replace(&mut *self.shaper.borrow_mut(), shaper);
+        self.retired_walk_stats
+            .set(self.retired_walk_stats.get() + retired.walk_stats());
+        Ok(true)
+    }
+
+    /// What this font's fallback walks have done (ft-yccm0.2.12), across
+    /// every shaper it has had.
+    pub fn fallback_walk_stats(&self) -> FallbackWalkStats {
+        self.retired_walk_stats.get() + self.shaper.borrow().walk_stats()
+    }
+
+    fn clone_dynamic_fallback_handles(&self) -> Vec<ParsedFont> {
+        let handles = self.handles.borrow();
+        match handles.get(self.configured_handle_count..) {
+            Some(tail) if tail.len() <= MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES => tail.to_vec(),
+            // Keep unusual font chains on the ordinary discovery path rather
+            // than carrying an unlimited history through successive scales.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Shape with the currently installed font chain only. Optional glyph
+    /// warmup must not wait for discovery or consume a pending insertion that
+    /// requires the normal rendering path's ClearShapeCache notification.
+    ///
+    /// Returns None when another fallback is needed. This leaves pending and
+    /// tried-glyph state untouched; the ordinary shape path can still resolve
+    /// the missing glyphs. Existing face loading and shaping remain synchronous.
+    pub fn shape_if_available(
+        &self,
+        text: &str,
+        presentation: Option<Presentation>,
+        direction: Direction,
+        range: Option<Range<usize>>,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> anyhow::Result<Option<Vec<GlyphInfo>>> {
+        let mut no_glyphs = Vec::new();
+        let glyphs = self.shaper.borrow().shape(
+            text,
+            self.font_size,
+            self.dpi,
+            &mut no_glyphs,
+            presentation,
+            direction,
+            range,
+            presentation_width,
+        )?;
+        no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
+        Ok(no_glyphs.is_empty().then_some(glyphs))
+    }
+
+    pub fn blocking_shape(
+        &self,
+        text: &str,
+        presentation: Option<Presentation>,
+        direction: Direction,
+        range: Option<Range<usize>>,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> anyhow::Result<Vec<GlyphInfo>> {
+        loop {
+            let (tx, rx) = channel();
+
+            let (async_resolve, res) = match self.shape_impl(
+                text,
+                move || {
+                    let _ = tx.send(());
+                },
+                |_| {},
+                presentation,
+                direction,
+                range.clone(),
+                presentation_width,
+            ) {
+                Ok(tuple) => tuple,
+                Err(err) if err.downcast_ref::<ClearShapeCache>().is_some() => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if !async_resolve {
+                return Ok(res);
+            }
+            if rx.recv().is_err() {
+                return Ok(res);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn shape<F: FnOnce() + Send + 'static, FS: FnOnce(&mut Vec<char>)>(
+        &self,
+        text: &str,
+        completion: F,
+        filter_out_synthetic: FS,
+        presentation: Option<Presentation>,
+        direction: Direction,
+        range: Option<Range<usize>>,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> anyhow::Result<Vec<GlyphInfo>> {
+        let (_async_resolve, res) = self.shape_impl(
+            text,
+            completion,
+            filter_out_synthetic,
+            presentation,
+            direction,
+            range,
+            presentation_width,
+        )?;
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_impl<F: FnOnce() + Send + 'static, FS: FnOnce(&mut Vec<char>)>(
+        &self,
+        text: &str,
+        completion: F,
+        filter_out_synthetic: FS,
+        presentation: Option<Presentation>,
+        direction: Direction,
+        range: Option<Range<usize>>,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> anyhow::Result<(bool, Vec<GlyphInfo>)> {
+        let mut no_glyphs = vec![];
+
+        let mut pending_fallback = {
+            let mut pending = lock_or_recover(&self.pending_fallback);
+            if pending.is_empty() {
+                Vec::new()
+            } else {
+                pending.split_off(0)
+            }
+        };
+        if !pending_fallback.is_empty() {
+            match self.insert_fallback_handles(&pending_fallback) {
+                Ok(true) => return Err(ClearShapeCache {})?,
+                Ok(false) => {}
+                Err(err) => {
+                    // A transient rebuild failure must not consume the only
+                    // resolved handles. Preserve their order ahead of any
+                    // completion that arrived while building the shaper.
+                    let mut pending = lock_or_recover(&self.pending_fallback);
+                    pending_fallback.append(&mut pending);
+                    *pending = pending_fallback;
+                    // Do not publish old-chain placeholder shapes as a
+                    // successful paint after consuming its only notification.
+                    // The caller's bounded paint retry can attempt insertion
+                    // again without caching an incomplete result.
+                    return Err(err).context("installing resolved fallback fonts");
+                }
+            }
+        }
+
+        let result = self.shaper.borrow().shape(
+            text,
+            self.font_size,
+            self.dpi,
+            &mut no_glyphs,
+            presentation,
+            direction,
+            range,
+            presentation_width,
+        );
+
+        no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
+        filter_out_synthetic(&mut no_glyphs);
+        {
+            let tried_glyphs = self.tried_glyphs.borrow();
+            no_glyphs.retain(|c| !tried_glyphs.contains(c));
+        }
+        no_glyphs.sort();
+        no_glyphs.dedup();
+
+        let mut async_resolve = false;
+
+        if !no_glyphs.is_empty() {
+            if let Some(font_config) = self.font_config.upgrade() {
+                // Settle each missing codepoint from what this configuration
+                // already learned, for any style or scale (ft-yccm0.2.12):
+                // only codepoints nobody has asked about reach the resolver.
+                let plan = font_config.plan_fallback(&no_glyphs);
+                {
+                    let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+                    for &c in &plan.missing {
+                        tried_glyphs.insert(c);
+                    }
+                }
+                if !plan.faces.is_empty() {
+                    // A face discovered earlier covers these: install it now,
+                    // without a resolver round trip. An installation makes the
+                    // result above stale, exactly as a pending insert does, and
+                    // the retry plans any remaining codepoints against the
+                    // extended chain.
+                    let inserted = self
+                        .insert_fallback_handles(&plan.faces)
+                        .context("installing known fallback fonts")?;
+                    let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+                    for &c in &plan.found {
+                        tried_glyphs.insert(c);
+                    }
+                    drop(tried_glyphs);
+                    if inserted {
+                        return Err(ClearShapeCache {}.into());
+                    }
+                }
+                if !plan.unresolved.is_empty() {
+                    let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+                    for &c in &plan.unresolved {
+                        tried_glyphs.insert(c);
+                    }
+                    drop(tried_glyphs);
+                    font_config.schedule_fallback_resolve(
+                        plan.unresolved,
+                        &self.pending_fallback,
+                        completion,
+                    );
+                    async_resolve = true;
+                }
+            }
+        }
+
+        result.map(|r| (async_resolve, r))
+    }
+
+    pub fn metrics_for_idx(&self, font_idx: usize) -> anyhow::Result<FontMetrics> {
+        self.shaper
+            .borrow()
+            .metrics_for_idx(font_idx, self.font_size, self.dpi)
+    }
+
+    pub fn brightness_adjust(&self, font_idx: usize) -> f32 {
+        let synthesize_dim = self
+            .handles
+            .borrow()
+            .get(font_idx)
+            .map(|p| p.synthesize_dim)
+            .unwrap_or(false);
+        if synthesize_dim {
+            0.5
+        } else {
+            1.0
+        }
+    }
+
+    /// Returns immutable source pixels shared across the configuration's
+    /// pane-local atlas caches. Callers that tint/rewrite pixels must own a
+    /// copy. Layout offsets and atlas placement are deliberately not cached.
+    pub fn rasterize_glyph(
+        &self,
+        glyph_pos: u32,
+        fallback: FallbackIdx,
+    ) -> anyhow::Result<Rc<RasterizedGlyph>> {
+        let config = self.font_config.upgrade();
+        let key = RasterKey {
+            font: self.id,
+            fallback,
+            glyph: glyph_pos,
+        };
+        if let Some(config) = &config {
+            if let Some(glyph) = config.raster_cache.borrow_mut().get(key) {
+                return Ok(glyph);
+            }
+        }
+
+        let mut rasterizers = self.rasterizers.borrow_mut();
+        let glyph = if let Some(raster) = rasterizers.get(&fallback) {
+            raster.rasterize_glyph(glyph_pos, self.font_size, self.dpi)
+        } else {
+            let raster_selection = config
+                .as_ref()
+                .map_or(FontRasterizerSelection::default(), |c| {
+                    c.config.borrow().font_rasterizer
+                });
+            let raster = new_rasterizer(
+                raster_selection,
+                self.handles
+                    .borrow()
+                    .get(fallback)
+                    .context("fallback font index is unavailable")?,
+                self.pixel_geometry,
+            )?;
+            let result = raster.rasterize_glyph(glyph_pos, self.font_size, self.dpi);
+            rasterizers.insert(fallback, raster);
+            result
+        }?;
+        drop(rasterizers);
+        let glyph = Rc::new(glyph);
+        if let Some(config) = config {
+            config
+                .raster_cache
+                .borrow_mut()
+                .insert(key, Rc::clone(&glyph));
+        }
+        Ok(glyph)
+    }
+
+    pub fn clone_handles(&self) -> Vec<ParsedFont> {
+        self.handles.borrow().clone()
+    }
+}
+
+struct FallbackResolveInfo {
+    no_glyphs: Vec<char>,
+    pending: Arc<Mutex<Vec<ParsedFont>>>,
+    completion: Box<dyn FnOnce() + Send>,
+    font_dirs: Arc<FontDatabase>,
+    built_in: Arc<FontDatabase>,
+    locator: Arc<dyn FontLocator + Send + Sync>,
+    config: ConfigHandle,
+    /// Counted from scheduling until after `completion` has run.
+    in_flight: Arc<AtomicUsize>,
+    /// Where the outcome of every codepoint is recorded, for the
+    /// configuration generation this resolve was scheduled under.
+    outcomes: Arc<Mutex<FallbackOutcomes>>,
+    generation: usize,
+}
+
+/// Decrements the in-flight resolve count when a resolve finishes, after its
+/// completion callback (and on unwind).
+struct FallbackInFlight(Arc<AtomicUsize>);
+
+impl Drop for FallbackInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Most codepoints whose fallback outcome a font configuration remembers
+/// (ft-yccm0.2.12). A flood of distinct codepoints evicts the least recently
+/// used outcome instead of growing the cache; an evicted codepoint is simply
+/// resolved again if it reappears.
+const FALLBACK_OUTCOME_CAPACITY: usize = 8192;
+
+/// Most distinct discovered faces the outcome cache refers to. Outcomes for
+/// further faces are not cached and resolve again on demand.
+const MAX_FALLBACK_OUTCOME_FACES: usize = 64;
+
+/// What a font configuration learned about a codepoint its fonts lack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackOutcome {
+    /// Handed to the resolver; the outcome is not known yet.
+    Pending,
+    /// Covered by `FallbackOutcomes::faces[index]`.
+    Found(usize),
+    /// No locator, font directory or built-in face covers it.
+    Missing,
+}
+
+/// The outcome cache of one font configuration (ft-yccm0.2.12): what is
+/// known about codepoints missing from its fonts, shared by every font it
+/// loads (every style, scale and entity font) and filled in by the resolver
+/// thread. A bounded LRU keyed by codepoint, valid for one configuration
+/// generation: it is never cleared by painting, only by a configuration
+/// change.
+#[derive(Default)]
+struct FallbackOutcomes {
+    generation: usize,
+    /// Discovered faces, in discovery order.
+    faces: Vec<ParsedFont>,
+    /// Each codepoint's outcome and the tick of its last use.
+    entries: HashMap<char, (FallbackOutcome, u64)>,
+    /// Codepoints by last use, oldest first.
+    by_use: BTreeMap<u64, char>,
+    tick: u64,
+}
+
+impl FallbackOutcomes {
+    /// Forgets everything unless it was learned under `generation`.
+    fn ensure_generation(&mut self, generation: usize) {
+        if self.generation != generation {
+            *self = Self {
+                generation,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn touch(&mut self, c: char) -> u64 {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some((_, used)) = self.entries.get_mut(&c) {
+            self.by_use.remove(used);
+            *used = tick;
+        }
+        tick
+    }
+
+    /// The outcome of `c`, which becomes the most recently used.
+    fn get(&mut self, c: char) -> Option<FallbackOutcome> {
+        if !self.entries.contains_key(&c) {
+            return None;
+        }
+        let tick = self.touch(c);
+        self.by_use.insert(tick, c);
+        self.entries.get(&c).map(|(outcome, _)| *outcome)
+    }
+
+    fn set(&mut self, c: char, outcome: FallbackOutcome) {
+        let tick = self.touch(c);
+        self.entries.insert(c, (outcome, tick));
+        self.by_use.insert(tick, c);
+        while self.entries.len() > FALLBACK_OUTCOME_CAPACITY {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, c: char) {
+        if let Some((_, used)) = self.entries.remove(&c) {
+            self.by_use.remove(&used);
+        }
+    }
+
+    /// The index of `face`, registering it; `None` once the registry is full.
+    fn face_index(&mut self, face: &ParsedFont) -> Option<usize> {
+        if let Some(index) = self.faces.iter().position(|known| known == face) {
+            return Some(index);
+        }
+        if self.faces.len() >= MAX_FALLBACK_OUTCOME_FACES {
+            return None;
+        }
+        self.faces.push(face.clone());
+        Some(self.faces.len() - 1)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// How a font's missing codepoints split against its configuration's
+/// outcome cache.
+#[derive(Debug, Default)]
+struct FallbackPlan {
+    /// Codepoints a known face covers...
+    found: Vec<char>,
+    /// ...and those faces, in discovery order.
+    faces: Vec<ParsedFont>,
+    /// Codepoints no face covers.
+    missing: Vec<char>,
+    /// Codepoints another font is already resolving.
+    waiting: Vec<char>,
+    /// Codepoints nobody has asked about yet.
+    unresolved: Vec<char>,
+}
+
+/// Fallback work of one font configuration (ft-yccm0.2.12), counted per
+/// codepoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FallbackStats {
+    /// Handed to the resolver: each costs locator and font-database queries.
+    pub queried: u64,
+    /// Answered from the outcome cache with a face discovered earlier.
+    pub found: u64,
+    /// Answered from the outcome cache as covered by no font.
+    pub missing: u64,
+    /// Left alone because another font of the configuration is resolving it.
+    pub waiting: u64,
+}
+
+/// The process-wide fallback resolver (ft-yccm0.2.12). One thread serves
+/// every font configuration, so resolver threads stay bounded (one) however
+/// many windows, each with its own configuration, come and go. Before, every
+/// configuration started its own thread and kept it for its lifetime.
+static FALLBACK_RESOLVER: Mutex<Option<Sender<FallbackResolveInfo>>> = Mutex::new(None);
+
+/// Resolver threads started in this process: one, unless a resolve
+/// panicked and killed the thread, which is then replaced.
+static FALLBACK_RESOLVER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolver threads started in this process so far (ft-yccm0.2.12).
+pub fn fallback_resolver_threads_spawned() -> usize {
+    FALLBACK_RESOLVER_SPAWNS.load(Ordering::Acquire)
+}
+
+/// Hands `info` to the process-wide resolver thread, starting (or
+/// replacing) it when needed; resolves synchronously only if no thread can
+/// be started.
+fn submit_fallback_resolve(info: FallbackResolveInfo) {
+    let mut resolver = lock_or_recover(&FALLBACK_RESOLVER);
+    let info = match resolver.as_ref() {
+        Some(sender) => match sender.send(info) {
+            Ok(()) => return,
+            // A resolve panicked and its thread is gone: replace it.
+            Err(unsent) => {
+                resolver.take();
+                unsent.0
+            }
+        },
+        None => info,
+    };
+    let (sender, receiver) = channel::<FallbackResolveInfo>();
+    let spawned = std::thread::Builder::new()
+        .name("font-fallback-resolver".to_string())
+        .spawn(move || {
+            for info in receiver {
+                info.process();
+            }
+        });
+    match spawned {
+        Ok(_thread) => {
+            FALLBACK_RESOLVER_SPAWNS.fetch_add(1, Ordering::AcqRel);
+            match sender.send(info) {
+                Ok(()) => *resolver = Some(sender),
+                Err(unsent) => {
+                    drop(resolver);
+                    unsent.0.process();
+                }
+            }
+        }
+        Err(err) => {
+            drop(resolver);
+            log::error!("Failed to spawn font fallback resolver; resolving synchronously: {err}");
+            info.process();
+        }
+    }
+}
+
+/// Clears a resolve's `Pending` outcomes if it ends without recording any
+/// (it panicked), so that another font of the configuration asks again.
+struct PendingOutcomesGuard<'a> {
+    outcomes: &'a Mutex<FallbackOutcomes>,
+    generation: usize,
+    codepoints: &'a [char],
+    recorded: bool,
+}
+
+impl Drop for PendingOutcomesGuard<'_> {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        let mut outcomes = lock_or_recover(self.outcomes);
+        if outcomes.generation != self.generation {
+            return;
+        }
+        for &c in self.codepoints {
+            if outcomes.entries.get(&c).map(|(outcome, _)| *outcome)
+                == Some(FallbackOutcome::Pending)
+            {
+                outcomes.remove(c);
+            }
+        }
+    }
+}
+
+impl FallbackResolveInfo {
+    /// Records what this resolve learned: the face kept for each covered
+    /// codepoint, and `Missing` for the rest. A codepoint is recorded missing
+    /// only when every source answered; after an error it is forgotten
+    /// instead, so a later shape asks again.
+    fn record_outcomes(
+        &self,
+        kept: &[(ParsedFont, RangeSet<u32>)],
+        uncovered: &RangeSet<u32>,
+        every_source_answered: bool,
+    ) {
+        let mut outcomes = lock_or_recover(&self.outcomes);
+        if outcomes.generation != self.generation {
+            // The configuration changed while resolving; these outcomes
+            // describe the old fonts.
+            return;
+        }
+        for (face, covered) in kept {
+            let index = outcomes.face_index(face);
+            for c in covered.iter_values().filter_map(char::from_u32) {
+                match index {
+                    Some(index) => outcomes.set(c, FallbackOutcome::Found(index)),
+                    None => outcomes.remove(c),
+                }
+            }
+        }
+        for c in uncovered.iter_values().filter_map(char::from_u32) {
+            if every_source_answered {
+                outcomes.set(c, FallbackOutcome::Missing);
+            } else {
+                outcomes.remove(c);
+            }
+        }
+    }
+
+    fn process(self) {
+        let _in_flight = FallbackInFlight(Arc::clone(&self.in_flight));
+        let requested = self.no_glyphs.clone();
+        let mut pending_outcomes = PendingOutcomesGuard {
+            outcomes: &self.outcomes,
+            generation: self.generation,
+            codepoints: &requested,
+            recorded: false,
+        };
+        let fallback_str = self.no_glyphs.iter().collect::<String>();
+        let mut extra_handles = vec![];
+        let mut every_source_answered = true;
+
+        log::trace!(
+            "Looking for {} in fallback fonts",
+            fallback_str.escape_unicode()
+        );
+
+        match self.locator.locate_fallback_for_codepoints(&self.no_glyphs) {
+            Ok(ref mut handles) => extra_handles.append(handles),
+            Err(err) => {
+                every_source_answered = false;
+                log::error!(
+                    "Error: {:#} while resolving fallback for {} from font-locator",
+                    err,
+                    fallback_str.escape_unicode()
+                );
+            }
+        }
+
+        if self.config.search_font_dirs_for_fallback {
+            match self
+                .font_dirs
+                .locate_fallback_for_codepoints(&self.no_glyphs)
+            {
+                Ok(ref mut handles) => extra_handles.append(handles),
+                Err(err) => {
+                    every_source_answered = false;
+                    log::error!(
+                        "Error: {:#} while resolving fallback for {} from font_dirs",
+                        err,
+                        fallback_str.escape_unicode()
+                    );
+                }
+            }
+        }
+
+        match self
+            .built_in
+            .locate_fallback_for_codepoints(&self.no_glyphs)
+        {
+            Ok(ref mut handles) => extra_handles.append(handles),
+            Err(err) => {
+                every_source_answered = false;
+                log::error!(
+                    "Error: {:#} while resolving fallback for {} for built-in fonts",
+                    err,
+                    fallback_str.escape_unicode()
+                );
+            }
+        }
+
+        let mut wanted = RangeSet::new();
+        for &c in &self.no_glyphs {
+            wanted.add(c as u32);
+        }
+        log::trace!(
+            "Fallback fonts that match {} before sorting are: {:#?}",
+            fallback_str.escape_unicode(),
+            extra_handles
+        );
+
+        if wanted.len() > 1 && self.config.sort_fallback_fonts_by_coverage {
+            // Sort by ascending coverage
+            extra_handles.sort_by_cached_key(|p| {
+                p.coverage_intersection(&wanted)
+                    .map(|r| r.len())
+                    .unwrap_or(0)
+            });
+            // Re-arrange to descending coverage
+            extra_handles.reverse();
+            log::trace!(
+                "Fallback fonts that match {} after sorting are: {:#?}",
+                fallback_str.escape_unicode(),
+                extra_handles
+            );
+        }
+
+        // iteratively reduce to just the fonts that we need
+        let mut kept = Vec::with_capacity(extra_handles.len());
+        for p in extra_handles.drain(..) {
+            match p.coverage_intersection(&wanted) {
+                Ok(cov) if cov.is_empty() => {}
+                Ok(cov) => {
+                    // Remove the matches from the set, so that we avoid
+                    // picking up multiple fonts for the same glyphs
+                    wanted = wanted.difference(&cov);
+                    kept.push((p, cov));
+                }
+                Err(_) => {}
+            }
+        }
+        self.record_outcomes(&kept, &wanted, every_source_answered);
+        pending_outcomes.recorded = true;
+        drop(pending_outcomes);
+        let mut extra_handles: Vec<ParsedFont> = kept.into_iter().map(|(p, _)| p).collect();
+
+        let appended_fallbacks = if extra_handles.is_empty() {
+            false
+        } else {
+            let mut pending = lock_or_recover(&self.pending);
+            pending.append(&mut extra_handles);
+            true
+        };
+
+        if appended_fallbacks {
+            (self.completion)();
+        }
+
+        if !wanted.is_empty() {
+            // There were some glyphs we couldn't resolve!
+            let fallback_str = wanted
+                .iter_values()
+                .map(|c| std::char::from_u32(c).unwrap_or(' '))
+                .collect::<String>();
+
+            let current_gen = self.config.generation();
+            let show_warning = self.config.warn_about_missing_glyphs
+                && LAST_WARNING
+                    .lock()
+                    .unwrap()
+                    .map(|(instant, generation)| {
+                        generation != current_gen
+                            || instant.elapsed() > Duration::from_secs(60 * 60)
+                    })
+                    .unwrap_or(true);
+
+            if show_warning {
+                LAST_WARNING
+                    .lock()
+                    .unwrap()
+                    .replace((Instant::now(), self.config.generation()));
+                let url = "https://wezterm.org/config/fonts.html";
+                log::warn!(
+                    "No fonts contain glyphs for these codepoints: {}.\n\
+                     Placeholder glyphs are being displayed instead.\n\
+                     You may wish to install additional fonts, or adjust your\n\
+                     configuration so that it can find them.\n\
+                     {} has more information about configuring fonts.\n\
+                     Set warn_about_missing_glyphs=false to suppress this message.",
+                    fallback_str.escape_unicode(),
+                    url,
+                );
+
+                ToastNotification {
+                    title: "Font problem".to_string(),
+                    message: format!(
+                        "No fonts contain glyphs for these codepoints: {}.\n\
+                            Placeholder glyphs are being displayed instead.\n\
+                            You may wish to install additional fonts, or adjust\n\
+                            your configuration so that it can find them.\n\
+                            Set warn_about_missing_glyphs=false to suppress this\n\
+                            message.",
+                        fallback_str.escape_unicode()
+                    ),
+                    url: Some(url.to_string()),
+                    action: None,
+                    timeout: Some(Duration::from_secs(15)),
+                }
+                .show();
+            } else {
+                log::debug!(
+                    "No fonts contain glyphs for these codepoints: {}",
+                    fallback_str.escape_unicode()
+                );
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Entity {
+    Title,
+    CommandPalette,
+    CharSelect,
+    PaneSelect,
+}
+
+// Keep only the immediately preceding scale, and decline to retain an unusually
+// large style set. Cmd +/- reversals can reuse initialized fallback faces without
+// accumulating font engines for every size visited during a long zoom sequence.
+const MAX_RETAINED_SCALE_STYLES: usize = 64;
+const MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES: usize = 64;
+
+struct PreviousScaleFonts {
+    scale: f64,
+    dpi: usize,
+    fonts: HashMap<TextStyle, Rc<LoadedFont>>,
+    metrics: Option<FontMetrics>,
+}
+
+fn reuse_previous_scale_fonts() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_SCALE_FONT_REUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+struct FontConfigInner {
+    fonts: RefCell<HashMap<TextStyle, Rc<LoadedFont>>>,
+    raster_cache: RefCell<RasterCache>,
+    previous_scale_fonts: RefCell<Option<PreviousScaleFonts>>,
+    metrics: RefCell<Option<FontMetrics>>,
+    dpi: RefCell<usize>,
+    font_scale: RefCell<f64>,
+    config: RefCell<ConfigHandle>,
+    locator: Arc<dyn FontLocator + Send + Sync>,
+    font_dirs: RefCell<Arc<FontDatabase>>,
+    built_in: RefCell<Arc<FontDatabase>>,
+    title_font: RefCell<Option<Rc<LoadedFont>>>,
+    pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
+    char_select_font: RefCell<Option<Rc<LoadedFont>>>,
+    command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
+    /// Fallback resolves scheduled whose completion has not yet run.
+    fallback_resolves_in_flight: Arc<AtomicUsize>,
+    /// What is known about codepoints missing from this configuration's
+    /// fonts; the resolver thread fills it in (ft-yccm0.2.12).
+    fallback_outcomes: Arc<Mutex<FallbackOutcomes>>,
+    fallback_stats: Cell<FallbackStats>,
+}
+
+/// Matches and loads fonts for a given input style
+pub struct FontConfiguration {
+    inner: Rc<FontConfigInner>,
+}
+
+impl FontConfigInner {
+    /// Create a new empty configuration
+    pub fn new(config: Option<ConfigHandle>, dpi: usize) -> anyhow::Result<Self> {
+        let config = config.unwrap_or_else(configuration);
+        let locator = new_locator(config.font_locator);
+        Ok(Self {
+            fonts: RefCell::new(HashMap::new()),
+            raster_cache: RefCell::new(RasterCache::default()),
+            previous_scale_fonts: RefCell::new(None),
+            locator,
+            metrics: RefCell::new(None),
+            title_font: RefCell::new(None),
+            pane_select_font: RefCell::new(None),
+            char_select_font: RefCell::new(None),
+            command_palette_font: RefCell::new(None),
+            font_scale: RefCell::new(1.0),
+            dpi: RefCell::new(dpi),
+            config: RefCell::new(config.clone()),
+            font_dirs: RefCell::new(Arc::new(FontDatabase::with_font_dirs(&config)?)),
+            built_in: RefCell::new(Arc::new(FontDatabase::with_built_in()?)),
+            fallback_resolves_in_flight: Arc::new(AtomicUsize::new(0)),
+            fallback_outcomes: Arc::new(Mutex::new(FallbackOutcomes {
+                generation: config.generation(),
+                ..FallbackOutcomes::default()
+            })),
+            fallback_stats: Cell::new(FallbackStats::default()),
+        })
+    }
+
+    fn config_changed(&self, config: &ConfigHandle) -> anyhow::Result<()> {
+        let mut fonts = self.fonts.borrow_mut();
+        *self.config.borrow_mut() = config.clone();
+        // Config was reloaded, invalidate our caches
+        fonts.clear();
+        self.raster_cache.borrow_mut().clear();
+        self.previous_scale_fonts.borrow_mut().take();
+        self.title_font.borrow_mut().take();
+        self.pane_select_font.borrow_mut().take();
+        self.char_select_font.borrow_mut().take();
+        self.command_palette_font.borrow_mut().take();
+        self.metrics.borrow_mut().take();
+        *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
+        // The font directories were just rebuilt, so outcomes learned from
+        // the old ones are stale even when the generation is unchanged.
+        let mut outcomes = lock_or_recover(&self.fallback_outcomes);
+        *outcomes = FallbackOutcomes {
+            generation: config.generation(),
+            ..FallbackOutcomes::default()
+        };
+        Ok(())
+    }
+
+    /// Splits the codepoints a font lacks by what this configuration already
+    /// knows about them (ft-yccm0.2.12). Marks nothing: the caller records
+    /// what it settles, and [`Self::schedule_fallback_resolve`] marks what it
+    /// hands to the resolver.
+    fn plan_fallback(&self, missing: &[char]) -> FallbackPlan {
+        let generation = self.config.borrow().generation();
+        let mut outcomes = lock_or_recover(&self.fallback_outcomes);
+        outcomes.ensure_generation(generation);
+        let mut plan = FallbackPlan::default();
+        let mut face_indices = Vec::new();
+        for &c in missing {
+            match outcomes.get(c) {
+                Some(FallbackOutcome::Found(index)) => {
+                    plan.found.push(c);
+                    if !face_indices.contains(&index) {
+                        face_indices.push(index);
+                    }
+                }
+                Some(FallbackOutcome::Missing) => plan.missing.push(c),
+                Some(FallbackOutcome::Pending) => plan.waiting.push(c),
+                None => plan.unresolved.push(c),
+            }
+        }
+        // Discovery order, so that every font orders shared faces alike.
+        face_indices.sort_unstable();
+        plan.faces = face_indices
+            .into_iter()
+            .filter_map(|index| outcomes.faces.get(index).cloned())
+            .collect();
+        drop(outcomes);
+
+        let count = |codepoints: &[char]| codepoints.len() as u64;
+        let mut stats = self.fallback_stats.get();
+        stats.found += count(&plan.found);
+        stats.missing += count(&plan.missing);
+        stats.waiting += count(&plan.waiting);
+        self.fallback_stats.set(stats);
+        metrics::counter!("font.fallback.outcome_cache.found").increment(count(&plan.found));
+        metrics::counter!("font.fallback.outcome_cache.missing").increment(count(&plan.missing));
+        plan
+    }
+
+    fn schedule_fallback_resolve<F: FnOnce() + Send + 'static>(
+        &self,
+        no_glyphs: Vec<char>,
+        pending: &Arc<Mutex<Vec<ParsedFont>>>,
+        completion: F,
+    ) {
+        if no_glyphs.is_empty() {
+            return;
+        }
+
+        let generation = self.config.borrow().generation();
+        {
+            let mut outcomes = lock_or_recover(&self.fallback_outcomes);
+            outcomes.ensure_generation(generation);
+            for &c in &no_glyphs {
+                outcomes.set(c, FallbackOutcome::Pending);
+            }
+        }
+        let queried = no_glyphs.len() as u64;
+        let mut stats = self.fallback_stats.get();
+        stats.queried += queried;
+        self.fallback_stats.set(stats);
+        metrics::counter!("font.fallback.queried").increment(queried);
+
+        // Every path below ends in `process`, whose guard decrements this.
+        self.fallback_resolves_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        submit_fallback_resolve(FallbackResolveInfo {
+            completion: Box::new(completion),
+            no_glyphs,
+            pending: Arc::clone(pending),
+            font_dirs: Arc::clone(&*self.font_dirs.borrow()),
+            built_in: Arc::clone(&*self.built_in.borrow()),
+            locator: Arc::clone(&self.locator),
+            config: self.config.borrow().clone(),
+            in_flight: Arc::clone(&self.fallback_resolves_in_flight),
+            outcomes: Arc::clone(&self.fallback_outcomes),
+            generation,
+        });
+    }
+
+    fn compute_title_font(&self, config: &ConfigHandle, make_bold: bool) -> (TextStyle, f64) {
+        fn bold(family: &str) -> FontAttributes {
+            FontAttributes {
+                family: family.to_string(),
+                weight: FontWeight::BOLD,
+                ..Default::default()
+            }
+        }
+
+        let mut fonts = vec![if make_bold {
+            bold("Roboto")
+        } else {
+            FontAttributes::new("Roboto")
+        }];
+
+        // Fallback to their main font selection, so that we can pick up
+        // any fallback fonts they might have configured in the main
+        // config and so that they don't have to replicate that list for
+        // the title font.
+        for font in &config.font.font {
+            let mut font = font.clone();
+            font.is_fallback = true;
+            fonts.push(font);
+        }
+
+        let font_size = if cfg!(windows) { 10. } else { 12. };
+
+        (
+            TextStyle {
+                foreground: None,
+                font: fonts,
+            },
+            font_size,
+        )
+    }
+
+    fn make_entity_font_impl(
+        &self,
+        myself: &Rc<Self>,
+        entity: Entity,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        let config = self.config.borrow();
+        let make_bold = entity != Entity::CommandPalette;
+        let (sys_font, sys_size) = self.compute_title_font(&config, make_bold);
+
+        let (font_size, text_style) = match entity {
+            Entity::Title => (config.window_frame.font_size.unwrap_or(sys_size), None),
+            Entity::CommandPalette => (
+                config.command_palette_font_size,
+                config.command_palette_font.as_ref(),
+            ),
+            Entity::CharSelect => (
+                config.char_select_font_size,
+                config.char_select_font.as_ref(),
+            ),
+            Entity::PaneSelect => (
+                config.pane_select_font_size,
+                config.pane_select_font.as_ref(),
+            ),
+        };
+
+        let text_style =
+            text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font));
+
+        let dpi = *self.dpi.borrow() as u32;
+        let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+
+        let attributes = text_style.font_with_fallback();
+        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+
+        let shaper = new_shaper(&config, &handles)?;
+
+        let metrics = shaper.metrics(font_size, dpi).with_context(|| {
+            format!(
+                "obtaining metrics for font_size={} @ dpi {}",
+                font_size, dpi
+            )
+        })?;
+
+        let loaded = Rc::new(LoadedFont {
+            rasterizers: RefCell::new(HashMap::new()),
+            configured_handle_count: handles.len(),
+            handles: RefCell::new(handles),
+            shaper: RefCell::new(shaper),
+            metrics,
+            font_size,
+            dpi,
+            font_config: Rc::downgrade(myself),
+            pending_fallback: Arc::new(Mutex::new(vec![])),
+            text_style: text_style.clone(),
+            id: alloc_font_id(),
+            tried_glyphs: RefCell::new(TriedGlyphs::default()),
+            retired_walk_stats: Cell::new(FallbackWalkStats::default()),
+            pixel_geometry: config.display_pixel_geometry,
+        });
+
+        Ok(loaded)
+    }
+
+    fn title_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut title_font = self.title_font.borrow_mut();
+
+        if let Some(entry) = title_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_entity_font_impl(myself, Entity::Title)?;
+
+        title_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn command_palette_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut command_palette_font = self.command_palette_font.borrow_mut();
+
+        if let Some(entry) = command_palette_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_entity_font_impl(myself, Entity::CommandPalette)?;
+
+        command_palette_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn char_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut char_select_font = self.char_select_font.borrow_mut();
+
+        if let Some(entry) = char_select_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_entity_font_impl(myself, Entity::CharSelect)?;
+
+        char_select_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn pane_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut pane_select_font = self.pane_select_font.borrow_mut();
+
+        if let Some(entry) = pane_select_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_entity_font_impl(myself, Entity::PaneSelect)?;
+
+        pane_select_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn resolve_font_helper_impl(
+        &self,
+        attributes: &[FontAttributes],
+        pixel_size: u16,
+    ) -> anyhow::Result<(Vec<ParsedFont>, HashSet<FontAttributes>)> {
+        let preferred_attributes = attributes
+            .iter()
+            .filter(|a| !a.is_fallback)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fallback_attributes = attributes
+            .iter()
+            .filter(|a| a.is_fallback)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut loaded = HashSet::new();
+        let mut handles = vec![];
+
+        for &attrs in &[&preferred_attributes, &fallback_attributes] {
+            let mut candidates = vec![];
+
+            let font_dirs = self.font_dirs.borrow();
+            for attr in attrs {
+                candidates.append(&mut font_dirs.candidates(attr));
+            }
+
+            let mut loaded_ignored = HashSet::new();
+            let located = self
+                .locator
+                .load_fonts(attrs, &mut loaded_ignored, pixel_size)?;
+            for font in &located {
+                candidates.push(font);
+            }
+
+            let built_in = self.built_in.borrow();
+            for attr in attrs {
+                candidates.append(&mut built_in.candidates(attr));
+            }
+
+            let mut is_fallback = false;
+
+            for attr in attrs {
+                if attr.is_fallback {
+                    is_fallback = true;
+                }
+
+                if loaded.contains(attr) {
+                    continue;
+                }
+                let named_candidates: Vec<&ParsedFont> = candidates
+                    .iter()
+                    .filter_map(|&p| if p.matches_name(attr) { Some(p) } else { None })
+                    .collect();
+                if let Some(idx) =
+                    ParsedFont::best_matching_index(attr, &named_candidates, pixel_size)
+                {
+                    if let Some(&p) = named_candidates.get(idx) {
+                        loaded.insert(attr.clone());
+                        handles.push(p.clone().synthesize(attr))
+                    }
+                }
+            }
+
+            if !is_fallback && loaded.is_empty() {
+                // We didn't explicitly match any names.
+                // When using fontconfig, the system may have expanded a family name
+                // like "monospace" into the real font, in which case we wouldn't have
+                // found a match in the `named_candidates` vec above, because of the
+                // name mismatch.
+                // So what we do now is make a second pass over all the located candidates,
+                // ignoring their names, and just match based on font attributes.
+                let located_candidates: Vec<_> = located.iter().collect();
+                for attr in attrs {
+                    if let Some(idx) =
+                        ParsedFont::best_matching_index(attr, &located_candidates, pixel_size)
+                    {
+                        if let Some(&p) = located_candidates.get(idx) {
+                            loaded.insert(attr.clone());
+                            handles.push(p.clone().synthesize(attr))
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((handles, loaded))
+    }
+
+    fn resolve_font_helper(
+        &self,
+        style: &TextStyle,
+        config: &ConfigHandle,
+        pixel_size: u16,
+    ) -> anyhow::Result<(Box<dyn FontShaper>, Vec<ParsedFont>)> {
+        let attributes = style.font_with_fallback();
+
+        let (handles, loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+
+        for attr in &attributes {
+            if !attr.is_synthetic && !attr.is_fallback && !loaded.contains(attr) {
+                let styled_extra = if attr.weight != FontWeight::default()
+                    || attr.style != FontStyle::default()
+                    || attr.stretch != FontStretch::default()
+                {
+                    ". An alternative variant of the font was requested; \
+                    TrueType and OpenType fonts don't have an automatic way to \
+                    produce these font variants, so a separate font file containing \
+                    the bold or italic variant must be installed"
+                } else {
+                    ""
+                };
+
+                let is_primary = config.font.font.iter().any(|a| a == attr);
+                let derived_from_primary = config.font.font.iter().any(|a| a.family == attr.family);
+
+                let explanation = if is_primary {
+                    // This is the primary font selection
+                    format!(
+                        "Unable to load a font specified by your font={} configuration",
+                        attr
+                    )
+                } else if derived_from_primary {
+                    // it came from font_rules and may have been derived from
+                    // their primary font (we can't know for sure)
+                    format!(
+                        "Unable to load a font matching one of your font_rules: {}. \
+                        Note that wezterm will synthesize font_rules to select bold \
+                        and italic fonts based on your primary font configuration",
+                        attr
+                    )
+                } else {
+                    format!(
+                        "Unable to load a font matching one of your font_rules: {}",
+                        attr
+                    )
+                };
+
+                config::show_error(&format!(
+                    "{}. Fallback(s) are being used instead, and the terminal \
+                    may not render as intended{}. See \
+                    https://wezterm.org/config/fonts.html for more information",
+                    explanation, styled_extra
+                ));
+            }
+        }
+
+        Ok((new_shaper(config, &handles)?, handles))
+    }
+
+    /// Given a text style, load (with caching) the font that best
+    /// matches according to the fontconfig pattern.
+    fn resolve_font(&self, myself: &Rc<Self>, style: &TextStyle) -> anyhow::Result<Rc<LoadedFont>> {
+        let config = self.config.borrow();
+        let is_default = *style == config.font;
+        let def_font = if !is_default && config.use_cap_height_to_scale_fallback_fonts {
+            Some(self.default_font(myself)?)
+        } else {
+            None
+        };
+
+        let mut fonts = self.fonts.borrow_mut();
+
+        if let Some(entry) = fonts.get(style) {
+            return Ok(Rc::clone(entry));
+        }
+
+        let mut font_size = config.font_size * *self.font_scale.borrow();
+        let dpi = *self.dpi.borrow() as u32;
+        let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+
+        let (mut shaper, mut handles) = self.resolve_font_helper(style, &config, pixel_size)?;
+
+        let mut metrics = shaper.metrics(font_size, dpi).with_context(|| {
+            format!(
+                "obtaining metrics for font_size={} @ dpi {}",
+                font_size, dpi
+            )
+        })?;
+
+        if let Some(def_font) = def_font {
+            let def_metrics = def_font.metrics();
+            if let (Some(d), Some(m)) = (def_metrics.cap_height, metrics.cap_height) {
+                // Scale by the ratio of the pixel heights of the default
+                // and this font; this causes the `I` glyphs to appear to
+                // have the same height.
+                let scale = d.get() / m.get();
+                if scale != 1.0 {
+                    let scaled_pixel_size = (pixel_size as f64 * scale) as u16;
+                    let scaled_font_size = font_size * scale;
+                    log::trace!(
+                        "using cap height adjusted: pixel_size {} -> {}, font_size {} -> {}, {:?}",
+                        pixel_size,
+                        scaled_pixel_size,
+                        font_size,
+                        scaled_font_size,
+                        metrics,
+                    );
+                    let (alt_shaper, alt_handles) =
+                        self.resolve_font_helper(style, &config, scaled_pixel_size)?;
+                    shaper = alt_shaper;
+                    handles = alt_handles;
+
+                    metrics = shaper.metrics(scaled_font_size, dpi).with_context(|| {
+                        format!(
+                            "obtaining cap-height adjusted metrics for font_size={} @ dpi {}",
+                            scaled_font_size, dpi
+                        )
+                    })?;
+
+                    font_size = scaled_font_size;
+                }
+            }
+        }
+
+        let loaded = Rc::new(LoadedFont {
+            rasterizers: RefCell::new(HashMap::new()),
+            configured_handle_count: handles.len(),
+            handles: RefCell::new(handles),
+            shaper: RefCell::new(shaper),
+            metrics,
+            font_size,
+            dpi,
+            font_config: Rc::downgrade(myself),
+            pending_fallback: Arc::new(Mutex::new(vec![])),
+            text_style: style.clone(),
+            id: alloc_font_id(),
+            tried_glyphs: RefCell::new(TriedGlyphs::default()),
+            retired_walk_stats: Cell::new(FallbackWalkStats::default()),
+            pixel_geometry: config.display_pixel_geometry,
+        });
+
+        // Configured faces and cap-height metrics above must be selected anew:
+        // their best bitmap strike can change with the target pixel size. Only
+        // reuse installed dynamic fallbacks from this same style/configuration.
+        // Pending discovery and old font engines stay with the outgoing scale;
+        // the configuration's outcome cache, which is scale-independent,
+        // answers already-resolved codepoints for the new font.
+        // config_changed discards this entire history.
+        let fallback_handles = self
+            .previous_scale_fonts
+            .borrow()
+            .as_ref()
+            .and_then(|previous| previous.fonts.get(style))
+            .map(|font| font.clone_dynamic_fallback_handles())
+            .unwrap_or_default();
+        if let Err(err) = loaded.insert_fallback_handles(&fallback_handles) {
+            // This is optional reuse; the transaction retained the working
+            // configured-only shaper and normal discovery remains available.
+            log::warn!("Could not seed previous-scale font fallbacks: {err:#}");
+        }
+
+        fonts.insert(style.clone(), Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    pub fn change_scaling(&self, font_scale: f64, dpi: usize) -> (f64, usize) {
+        let prior_font = *self.font_scale.borrow();
+        let prior_dpi = *self.dpi.borrow();
+
+        if prior_font == font_scale && prior_dpi == dpi {
+            return (prior_font, prior_dpi);
+        }
+
+        let mut fonts = self.fonts.borrow_mut();
+        let mut metrics = self.metrics.borrow_mut();
+        let mut previous = self.previous_scale_fonts.borrow_mut();
+        let restored = previous
+            .take()
+            .filter(|entry| entry.scale == font_scale && entry.dpi == dpi);
+        let outgoing = std::mem::take(&mut *fonts);
+        let outgoing_metrics = metrics.take();
+        if reuse_previous_scale_fonts() {
+            if let Some(restored) = restored {
+                *fonts = restored.fonts;
+                *metrics = restored.metrics;
+            }
+            if !outgoing.is_empty() && outgoing.len() <= MAX_RETAINED_SCALE_STYLES {
+                *previous = Some(PreviousScaleFonts {
+                    scale: prior_font,
+                    dpi: prior_dpi,
+                    fonts: outgoing,
+                    metrics: outgoing_metrics,
+                });
+            }
+        }
+
+        *self.dpi.borrow_mut() = dpi;
+        *self.font_scale.borrow_mut() = font_scale;
+
+        // Entity fonts use their own point sizes, independent of terminal zoom.
+        // They do depend on DPI; every entity must refresh when the display does.
+        if prior_dpi != dpi {
+            self.title_font.borrow_mut().take();
+            self.pane_select_font.borrow_mut().take();
+            self.char_select_font.borrow_mut().take();
+            self.command_palette_font.borrow_mut().take();
+        }
+
+        (prior_font, prior_dpi)
+    }
+
+    /// Returns the baseline font specified in the configuration
+    pub fn default_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        self.resolve_font(myself, &self.config.borrow().font)
+    }
+
+    pub fn get_font_scale(&self) -> f64 {
+        *self.font_scale.borrow()
+    }
+
+    pub fn get_dpi(&self) -> usize {
+        *self.dpi.borrow()
+    }
+
+    pub fn default_font_metrics(&self, myself: &Rc<Self>) -> Result<FontMetrics, Error> {
+        {
+            let metrics = self.metrics.borrow();
+            if let Some(metrics) = metrics.as_ref() {
+                return Ok(*metrics);
+            }
+        }
+
+        let font = self.default_font(myself)?;
+        let metrics = font.metrics();
+
+        *self.metrics.borrow_mut() = Some(metrics);
+
+        Ok(metrics)
+    }
+
+    /// Apply the defined font_rules from the user configuration to
+    /// produce the text style that best matches the supplied input
+    /// cell attributes.
+    pub fn match_style<'a>(
+        &self,
+        config: &'a ConfigHandle,
+        attrs: &CellAttributes,
+    ) -> &'a TextStyle {
+        // a little macro to avoid boilerplate for matching the rules.
+        // If the rule doesn't specify a value for an attribute then
+        // it will implicitly match.  If it specifies an attribute
+        // then it has to have the same value as that in the input attrs.
+        macro_rules! attr_match {
+            ($ident:ident, $rule:expr) => {
+                if let Some($ident) = $rule.$ident {
+                    if $ident != attrs.$ident() {
+                        // Does not match
+                        continue;
+                    }
+                }
+                // matches so far...
+            };
+        }
+
+        let would_bright = match attrs.foreground() {
+            wezterm_term::color::ColorAttribute::PaletteIndex(idx) if idx < 8 => {
+                attrs.intensity() == Intensity::Bold
+            }
+            _ => false,
+        };
+
+        for rule in &config.font_rules {
+            if let Some(intensity) = rule.intensity {
+                let effective_intensity = match config.bold_brightens_ansi_colors {
+                    BoldBrightening::BrightOnly if would_bright => Intensity::Normal,
+                    BoldBrightening::No
+                    | BoldBrightening::BrightAndBold
+                    | BoldBrightening::BrightOnly => attrs.intensity(),
+                };
+                if intensity != effective_intensity {
+                    // Rule does not match
+                    continue;
+                }
+                // matches so far
+            }
+            attr_match!(underline, &rule);
+            attr_match!(italic, &rule);
+            attr_match!(blink, &rule);
+            attr_match!(reverse, &rule);
+            attr_match!(strikethrough, &rule);
+            attr_match!(invisible, &rule);
+
+            // If we get here, then none of the rules didn't match,
+            // so we therefore assume that it did match overall.
+            return &rule.font;
+        }
+        &config.font
+    }
+}
+
+impl FontConfiguration {
+    /// Create a new empty configuration
+    pub fn new(config: Option<ConfigHandle>, dpi: usize) -> anyhow::Result<Self> {
+        let inner = Rc::new(FontConfigInner::new(config, dpi)?);
+        Ok(Self { inner })
+    }
+
+    pub fn config_changed(&self, config: &ConfigHandle) -> anyhow::Result<()> {
+        self.inner.config_changed(config)
+    }
+
+    /// Fallback-font resolves scheduled whose completion callback has not yet
+    /// run. While nonzero, some glyph may still change font, so a frame drawn
+    /// now is not final (ft-yccm0.1.10 snapshots wait for zero).
+    pub fn fallback_resolves_in_flight(&self) -> usize {
+        self.inner
+            .fallback_resolves_in_flight
+            .load(Ordering::Acquire)
+    }
+
+    /// Per-codepoint fallback work so far (ft-yccm0.2.12): what reached the
+    /// resolver and what the outcome cache answered.
+    pub fn fallback_stats(&self) -> FallbackStats {
+        self.inner.fallback_stats.get()
+    }
+
+    pub fn config(&self) -> ConfigHandle {
+        self.inner.config.borrow().clone()
+    }
+
+    pub fn title_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.title_font(&self.inner)
+    }
+
+    pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.command_palette_font(&self.inner)
+    }
+
+    pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.pane_select_font(&self.inner)
+    }
+
+    pub fn char_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.char_select_font(&self.inner)
+    }
+
+    /// Given a text style, load (with caching) the font that best
+    /// matches according to the fontconfig pattern.
+    pub fn resolve_font(&self, style: &TextStyle) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.resolve_font(&self.inner, style)
+    }
+
+    pub fn change_scaling(&self, font_scale: f64, dpi: usize) -> (f64, usize) {
+        self.inner.change_scaling(font_scale, dpi)
+    }
+
+    /// Returns the baseline font specified in the configuration
+    pub fn default_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.default_font(&self.inner)
+    }
+
+    pub fn get_font_scale(&self) -> f64 {
+        self.inner.get_font_scale()
+    }
+
+    pub fn get_dpi(&self) -> usize {
+        self.inner.get_dpi()
+    }
+
+    pub fn default_font_metrics(&self) -> Result<FontMetrics, Error> {
+        self.inner.default_font_metrics(&self.inner)
+    }
+
+    pub fn list_fonts_in_font_dirs(&self) -> Vec<ParsedFont> {
+        let mut font_dirs = self.inner.font_dirs.borrow().list_available();
+        let mut built_in = self.inner.built_in.borrow().list_available();
+
+        font_dirs.append(&mut built_in);
+        font_dirs.sort();
+        font_dirs
+    }
+
+    pub fn list_system_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
+        self.inner.locator.enumerate_all_fonts()
+    }
+
+    /// Apply the defined font_rules from the user configuration to
+    /// produce the text style that best matches the supplied input
+    /// cell attributes.
+    pub fn match_style<'a>(
+        &self,
+        config: &'a ConfigHandle,
+        attrs: &CellAttributes,
+    ) -> &'a TextStyle {
+        self.inner.match_style(config, attrs)
+    }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": "reality_check.structure_validator_canary.v1",
+  "generated_at": "2026-05-12T23:36:00Z",
+  "fixture_dir": "tests/fixtures/bead-validator-canary",
+  "fixtures": 15,
+  "passing": 15,
+  "mutation_kill_rate": null,
+  "mutation_kill_rate_reason": "targeted fixture canary for the shell/Python structure validator; cargo-mutants is not applicable to this validator surface",
+  "test_command": "cargo test -p frankenterm --test reality_check_validator_canary -- --nocapture"
+}

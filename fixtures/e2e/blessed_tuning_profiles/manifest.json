@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "fleet_10",
+      "path": "fleet_10.toml",
+      "description": "Low-latency small-fleet baseline for approximately 10 panes."
+    },
+    {
+      "name": "fleet_50",
+      "path": "fleet_50.toml",
+      "description": "Balanced medium-fleet baseline for approximately 50 panes."
+    },
+    {
+      "name": "fleet_200_plus",
+      "path": "fleet_200_plus.toml",
+      "description": "Controlled-operations large-fleet baseline for 200 plus panes."
+    }
+  ]
+}

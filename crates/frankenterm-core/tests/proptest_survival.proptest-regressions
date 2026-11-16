@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 80cc0d0fa50271821aeb93e81003167d5f7cf83a970f1b831c2f870aa0d1329c # shrinks to cov = Covariates { rss_gb: 0.0, pane_count: 0.0, output_rate_mbps: 0.0, uptime_hours: 0.0, conn_error_rate: 9.715455136547053 }
+cc a567c424233970420cbf22b8f624b905286adad7940ed75176df056d97cc7cc0 # shrinks to t = 903.0270083351367, event = false, cov = Covariates { rss_gb: 0.0, pane_count: 0.0, output_rate_mbps: 0.0, uptime_hours: 0.0, conn_error_rate: 0.0 }, ts = 0
+cc 709baaf6aeb33799f908382b3972e3a75369f7daef53912573fe631f5e614da5 # shrinks to warmup = 1, lr = 0.9477886380151563
+cc 376121e6eff4bfe9d64345ba71248cafcd40d74b13ab71ad4ab700176fd5d420 # shrinks to alpha = 0.09007676361495147, default_act = 0.0
+cc 7145f7bea0db3d481578f35c624e7617b99e543ad6817d1131b0bdb42b9f3e30 # shrinks to mode = Automatic { min_score: 0.10352993747780119 }

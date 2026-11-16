@@ -1,0 +1,19 @@
+# The ft CLI command tree still overflows the default 8MB stack in debug/test
+# builds for some clap parser unit tests. 16MB is sufficient for those cases.
+[env]
+RUST_MIN_STACK = "16777216"
+
+[build]
+rustflags = ["-Z", "threads=4"]
+fingerprint = "content"
+
+# The browser viewer (crates/frankenterm-browser-ui) pulls getrandom through
+# ftui; on wasm32 it must use the browser's crypto.getRandomValues.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
+
+# RCH and DSR preserve source timestamps while reusing compilation directories.
+# A different snapshot can therefore contain changed files older than cached
+# artifacts. Compare source content so those artifacts cannot pass as current.
+[unstable]
+checksum-freshness = true

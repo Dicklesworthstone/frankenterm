@@ -1,0 +1,1 @@
+{"version":1,"seq":4,"sender":"agent-alpha","sent_at_ms":1700000000000,"payload":{"type":"detection","rule_id":"codex.usage.reached","agent_type":"codex","event_type":"usage.reached","severity":"critical","confidence":1.0,"extracted":{"reset_time":"2:30 PM"},"matched_text":"You've hit your usage limit","pane_id":42,"pane_uuid":"abc-def-123","detected_at_ms":1700000003000}}

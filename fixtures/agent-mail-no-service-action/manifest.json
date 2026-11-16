@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_no_service_action_gate.v1",
+  "bead": "ft-5lsqo.4",
+  "source_epic": "ft-5lsqo",
+  "proof_kind": "static-e2e-gate",
+  "canonical_manifest": "fixtures/agent-mail-failover/manifest.json",
+  "canonical_gate": "fixtures/agent-mail-failover/no-service-action-gate.json",
+  "contract_document": "docs/robot-contracts/agent-mail-no-service-action-gate.md",
+  "verifier": "tests/e2e/test_agent_mail_no_service_action_contract.sh",
+  "runtime_command_shipped": false,
+  "side_effect_policy": {
+    "agent_mail_repair_allowed": false,
+    "agent_mail_restart_allowed": false,
+    "agent_mail_reconstruct_allowed": false,
+    "process_kill_allowed": false,
+    "destructive_git_allowed": false,
+    "file_deletion_allowed": false,
+    "worker_mutation_allowed": false,
+    "build_cancellation_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "forbidden_guidance_patterns": [
+    "am service restart",
+    "am service stop",
+    "am doctor fix",
+    "am doctor repair",
+    "am doctor reconstruct",
+    "kill am",
+    "kill agent mail",
+    "kill mcp-agent-mail",
+    "kill am serve-http",
+    "git reset --hard",
+    "git clean -fd",
+    "rm -rf",
+    "delete files",
+    "mutate rch worker",
+    "cancel build",
+    "run local cargo as proof",
+    "local cargo proof"
+  ],
+  "expected_forbidden_action_identifiers": [
+    "am_service_restart",
+    "am_service_stop",
+    "am_doctor_fix",
+    "am_doctor_repair",
+    "am_doctor_reconstruct",
+    "kill_agent_mail_process",
+    "destructive_git",
+    "delete_files",
+    "mutate_rch_worker",
+    "cancel_build",
+    "run_local_cargo_as_proof",
+    "reopen_dirty_overlap_without_owner_clear"
+  ],
+  "document_scan_files": [
+    "docs/robot-contracts/agent-mail-failover-snapshot.md",
+    "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
+    "docs/robot-contracts/agent-mail-no-service-action-gate.md"
+  ],
+  "production_script_scan_files": [
+    "scripts/agent-mail-failover-classifier.sh",
+    "scripts/swarm-tick.sh"
+  ],
+  "fixture_scan_globs": [
+    "fixtures/agent-mail-failover/valid/*.json",
+    "fixtures/agent-mail-stale-reopen/policy.v1.json"
+  ],
+  "classifier_cases": "fixtures/agent-mail-failover/retry-classifier-cases.json",
+  "positive_fixtures": [
+    "fixtures/agent-mail-no-service-action/positive/beads-only-guidance.json",
+    "fixtures/agent-mail-no-service-action/positive/status-check-guidance.json"
+  ],
+  "negative_fixtures": [
+    "fixtures/agent-mail-no-service-action/negative/service-restart-guidance.json",
+    "fixtures/agent-mail-no-service-action/negative/destructive-cleanup-guidance.json",
+    "fixtures/agent-mail-no-service-action/negative/local-cargo-proof-guidance.json"
+  ],
+  "required_log_fields": [
+    "contract_id",
+    "checked_files",
+    "positive_cases",
+    "negative_cases",
+    "forbidden_pattern_count",
+    "verdict"
+  ]
+}

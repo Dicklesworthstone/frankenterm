@@ -1,0 +1,47 @@
+[package]
+name = "codec"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow.workspace = true
+asupersync = { workspace = true, optional = true }
+byteorder = "1.5.0"
+config.workspace = true
+frankenterm-core-audit-types = { path = "../../crates/frankenterm-core-audit-types" }
+leb128.workspace = true
+log.workspace = true
+metrics.workspace = true
+mux.workspace = true
+portable-pty = { workspace = true, features = ["serde_support"]}
+rangeset.workspace = true
+serde = {workspace=true, features = ["rc", "derive"]}
+sha2.workspace = true
+smol = { workspace = true, optional = true }
+termwiz.workspace = true
+thiserror.workspace = true
+varbincode.workspace = true
+frankenterm-term = { workspace=true, features=["use_serde"] }
+zstd.workspace = true
+
+[dev-dependencies]
+base91.workspace = true
+chrono.workspace = true
+criterion.workspace = true
+proptest = "1.8.0"
+serde_json.workspace = true
+
+[[bench]]
+name = "cdc_dedup"
+harness = false
+
+[features]
+default = ["async-asupersync"]
+
+async-smol = ["dep:smol"]
+async-asupersync = ["dep:asupersync"]
+fuzzing = []

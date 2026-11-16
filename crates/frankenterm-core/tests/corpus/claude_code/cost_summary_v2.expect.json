@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.session.cost_summary",
+    "agent_type": "claude_code",
+    "event_type": "session.summary",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "cost": "15.73"
+    },
+    "matched_text": "Total cost: $15.73"
+  }
+]

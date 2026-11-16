@@ -1,0 +1,3 @@
+# Pdu::Ping(Ping {}) encoded with serial=127.
+# tagged_len=2, serial=127, ident=1
+02 7f 01

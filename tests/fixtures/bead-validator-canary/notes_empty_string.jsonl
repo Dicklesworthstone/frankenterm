@@ -1,0 +1,2 @@
+{"id":"ft-canary","title":"validator canary epic","status":"open","description":"proof_category: process"}
+{"id":"ft-canary.1","title":"notes empty string","status":"closed","created_at":"2026-05-12T19:00:00Z","description":"Background: fixture background.\n\nWhy this matters: fixture rationale.\n\nAcceptance criteria: fixture acceptance.\n\nReferences: fixture references.","notes":"","comments":[{"text":"G55 affected-bead audit: verified docs/example and command output."}]}

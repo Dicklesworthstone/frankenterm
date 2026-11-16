@@ -1,0 +1,25 @@
+[
+  {
+    "rule_id": "claude_code.banner",
+    "agent_type": "claude_code",
+    "event_type": "session.start",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "version": "1.2.3",
+      "model": "claude-sonnet-4-20250514"
+    },
+    "matched_text": "Claude Code v1.2.3 model: claude-sonnet-4-20250514"
+  },
+  {
+    "rule_id": "claude_code.model.selected",
+    "agent_type": "claude_code",
+    "event_type": "session.model",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "model": "claude-sonnet-4-20250514"
+    },
+    "matched_text": "model: claude-sonnet-4-20250514"
+  }
+]

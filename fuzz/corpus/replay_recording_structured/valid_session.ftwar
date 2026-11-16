@@ -1,0 +1,6 @@
+FTWAR1
+output 0 hello from replay
+resize 10 120 40
+event 20 {"kind":"pattern_match","rule":"codex.usage.reached","matched":true}
+marker 30 checkpoint
+input 40 redacted input

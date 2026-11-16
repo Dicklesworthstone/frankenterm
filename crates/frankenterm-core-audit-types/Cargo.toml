@@ -1,0 +1,32 @@
+[package]
+name = "frankenterm-core-audit-types"
+description = "Audit / forensic / evidence DTOs extracted from frankenterm-core (ft-rqu5e / ft-8nqx0)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "audit", "forensics"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+# ft-xcsm0 Phase 4: recorder_retention_types::SensitivityTier::classify
+# consumes RecorderRedactionLevel, which already lives in this leaf
+# crate alongside the rest of recorder metadata (replay-types is itself
+# leaf-tier so the dep is leaf→leaf, no cycles).
+frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
+
+[dev-dependencies]
+jsonschema = { version = "0.61.2", default-features = false }
+proptest = "1.8.0"
+toon_rust.workspace = true

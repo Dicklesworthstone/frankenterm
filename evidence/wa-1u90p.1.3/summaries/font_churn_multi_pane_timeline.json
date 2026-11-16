@@ -1,0 +1,1734 @@
+{
+  "completed": true,
+  "mode": "resize_timeline_json",
+  "scenario": {
+    "name": "font_churn_multi_pane",
+    "description": "Six-pane font-size churn with intermittent resize pulses to emulate editor/UI density toggles",
+    "duration_ms": 7000,
+    "pane_count": 6,
+    "event_count": 25,
+    "expectation_count": 3,
+    "metadata": {
+      "font_steps": "18",
+      "pane_count": "6",
+      "scale_profile": "font_churn_focus",
+      "scrollback_lines": "6000",
+      "seed": "1003",
+      "suite": "resize_baseline",
+      "suite_version": "2026-02-13",
+      "tab_count": "2"
+    },
+    "reproducibility_key": "resize_baseline:2026-02-13:font_churn_multi_pane:1003"
+  },
+  "events_executed": 25,
+  "expectations_passed": 3,
+  "expectations_failed": 0,
+  "timeline": {
+    "scenario": "font_churn_multi_pane",
+    "reproducibility_key": "resize_baseline:2026-02-13:font_churn_multi_pane:1003",
+    "captured_at_ms": 1771033227389,
+    "executed_resize_events": 24,
+    "events": [
+      {
+        "event_index": 0,
+        "pane_id": 10,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 100000000,
+        "dispatch_offset_ns": 30625,
+        "total_duration_ns": 227625,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 41,
+            "queue_metrics": {
+              "depth_before": 24,
+              "depth_after": 23
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 83,
+            "duration_ns": 216084
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 216167,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 216209,
+            "duration_ns": 10708
+          }
+        ]
+      },
+      {
+        "event_index": 1,
+        "pane_id": 11,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 200000000,
+        "dispatch_offset_ns": 259833,
+        "total_duration_ns": 200334,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 41
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 41,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 23,
+              "depth_after": 22
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 41,
+            "duration_ns": 191208
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 191249,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 191249,
+            "duration_ns": 8792
+          }
+        ]
+      },
+      {
+        "event_index": 2,
+        "pane_id": 12,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 300000000,
+        "dispatch_offset_ns": 460250,
+        "total_duration_ns": 197708,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 42,
+            "queue_metrics": {
+              "depth_before": 22,
+              "depth_after": 21
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 189750
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 189792,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 189792,
+            "duration_ns": 7542
+          }
+        ]
+      },
+      {
+        "event_index": 3,
+        "pane_id": 13,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 400000000,
+        "dispatch_offset_ns": 658000,
+        "total_duration_ns": 199208,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 21,
+              "depth_after": 20
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 190834
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 190876,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 190918,
+            "duration_ns": 8000
+          }
+        ]
+      },
+      {
+        "event_index": 4,
+        "pane_id": 14,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 500000000,
+        "dispatch_offset_ns": 857250,
+        "total_duration_ns": 197833,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 20,
+              "depth_after": 19
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 189334
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 189376,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 189418,
+            "duration_ns": 8166
+          }
+        ]
+      },
+      {
+        "event_index": 5,
+        "pane_id": 15,
+        "action": "generate_scrollback",
+        "scheduled_at_ns": 600000000,
+        "dispatch_offset_ns": 1055750,
+        "total_duration_ns": 198208,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 19,
+              "depth_after": 18
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 189125
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 189125,
+            "duration_ns": 41
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 189166,
+            "duration_ns": 8583
+          }
+        ]
+      },
+      {
+        "event_index": 6,
+        "pane_id": 10,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1000000000,
+        "dispatch_offset_ns": 1254041,
+        "total_duration_ns": 9792,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 18,
+              "depth_after": 17
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 417
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 459,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 459,
+            "duration_ns": 9083
+          }
+        ]
+      },
+      {
+        "event_index": 7,
+        "pane_id": 11,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1100000000,
+        "dispatch_offset_ns": 1263916,
+        "total_duration_ns": 3167,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 17,
+              "depth_after": 16
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 209,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 209,
+            "duration_ns": 2708
+          }
+        ]
+      },
+      {
+        "event_index": 8,
+        "pane_id": 12,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1200000000,
+        "dispatch_offset_ns": 1267166,
+        "total_duration_ns": 8208,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 16,
+              "depth_after": 15
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 125
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 167,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 209,
+            "duration_ns": 7750
+          }
+        ]
+      },
+      {
+        "event_index": 9,
+        "pane_id": 13,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1300000000,
+        "dispatch_offset_ns": 1275875,
+        "total_duration_ns": 3583,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 15,
+              "depth_after": 14
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 209,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 209,
+            "duration_ns": 3125
+          }
+        ]
+      },
+      {
+        "event_index": 10,
+        "pane_id": 14,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1400000000,
+        "dispatch_offset_ns": 1279541,
+        "total_duration_ns": 8542,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 41,
+            "queue_metrics": {
+              "depth_before": 14,
+              "depth_after": 13
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 41,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 208,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 208,
+            "duration_ns": 8125
+          }
+        ]
+      },
+      {
+        "event_index": 11,
+        "pane_id": 15,
+        "action": "set_font_size",
+        "scheduled_at_ns": 1500000000,
+        "dispatch_offset_ns": 1288125,
+        "total_duration_ns": 3333,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 42,
+            "queue_metrics": {
+              "depth_before": 13,
+              "depth_after": 12
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 84,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 251,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 251,
+            "duration_ns": 2917
+          }
+        ]
+      },
+      {
+        "event_index": 12,
+        "pane_id": 10,
+        "action": "resize",
+        "scheduled_at_ns": 2000000000,
+        "dispatch_offset_ns": 1291541,
+        "total_duration_ns": 1375,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 12,
+              "depth_after": 11
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 667
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 709,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 709,
+            "duration_ns": 417
+          }
+        ]
+      },
+      {
+        "event_index": 13,
+        "pane_id": 11,
+        "action": "resize",
+        "scheduled_at_ns": 2100000000,
+        "dispatch_offset_ns": 1292958,
+        "total_duration_ns": 1125,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 11,
+              "depth_after": 10
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 333
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 333,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 333,
+            "duration_ns": 416
+          }
+        ]
+      },
+      {
+        "event_index": 14,
+        "pane_id": 12,
+        "action": "resize",
+        "scheduled_at_ns": 2200000000,
+        "dispatch_offset_ns": 1294125,
+        "total_duration_ns": 1000,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 42,
+            "queue_metrics": {
+              "depth_before": 10,
+              "depth_after": 9
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 292
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 334,
+            "duration_ns": 41
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 375,
+            "duration_ns": 417
+          }
+        ]
+      },
+      {
+        "event_index": 15,
+        "pane_id": 13,
+        "action": "resize",
+        "scheduled_at_ns": 2300000000,
+        "dispatch_offset_ns": 1295166,
+        "total_duration_ns": 1000,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 9,
+              "depth_after": 8
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 292
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 334,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 376,
+            "duration_ns": 375
+          }
+        ]
+      },
+      {
+        "event_index": 16,
+        "pane_id": 14,
+        "action": "resize",
+        "scheduled_at_ns": 2400000000,
+        "dispatch_offset_ns": 1296250,
+        "total_duration_ns": 1000,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 41
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 41,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 8,
+              "depth_after": 7
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 41,
+            "duration_ns": 291
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 332,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 332,
+            "duration_ns": 416
+          }
+        ]
+      },
+      {
+        "event_index": 17,
+        "pane_id": 15,
+        "action": "resize",
+        "scheduled_at_ns": 2500000000,
+        "dispatch_offset_ns": 1297666,
+        "total_duration_ns": 1167,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 7,
+              "depth_after": 6
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 375
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 375,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 375,
+            "duration_ns": 375
+          }
+        ]
+      },
+      {
+        "event_index": 18,
+        "pane_id": 10,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3000000000,
+        "dispatch_offset_ns": 1298916,
+        "total_duration_ns": 959,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 6,
+              "depth_after": 5
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 167,
+            "duration_ns": 42
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 209,
+            "duration_ns": 584
+          }
+        ]
+      },
+      {
+        "event_index": 19,
+        "pane_id": 11,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3100000000,
+        "dispatch_offset_ns": 1299958,
+        "total_duration_ns": 917,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 5,
+              "depth_after": 4
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 250
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 250,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 250,
+            "duration_ns": 417
+          }
+        ]
+      },
+      {
+        "event_index": 20,
+        "pane_id": 12,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3200000000,
+        "dispatch_offset_ns": 1300916,
+        "total_duration_ns": 917,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 41,
+            "queue_metrics": {
+              "depth_before": 4,
+              "depth_after": 3
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 83,
+            "duration_ns": 125
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 208,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 208,
+            "duration_ns": 500
+          }
+        ]
+      },
+      {
+        "event_index": 21,
+        "pane_id": 13,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3300000000,
+        "dispatch_offset_ns": 1301875,
+        "total_duration_ns": 875,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 42
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 42,
+            "duration_ns": 42,
+            "queue_metrics": {
+              "depth_before": 3,
+              "depth_after": 2
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 84,
+            "duration_ns": 125
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 209,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 209,
+            "duration_ns": 500
+          }
+        ]
+      },
+      {
+        "event_index": 22,
+        "pane_id": 14,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3400000000,
+        "dispatch_offset_ns": 1302833,
+        "total_duration_ns": 792,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 42,
+            "queue_metrics": {
+              "depth_before": 2,
+              "depth_after": 1
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 42,
+            "duration_ns": 167
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 209,
+            "duration_ns": 41
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 250,
+            "duration_ns": 417
+          }
+        ]
+      },
+      {
+        "event_index": 23,
+        "pane_id": 15,
+        "action": "set_font_size",
+        "scheduled_at_ns": 3500000000,
+        "dispatch_offset_ns": 1303708,
+        "total_duration_ns": 917,
+        "stages": [
+          {
+            "stage": "input_intent",
+            "start_offset_ns": 0,
+            "duration_ns": 0
+          },
+          {
+            "stage": "scheduler_queueing",
+            "start_offset_ns": 0,
+            "duration_ns": 0,
+            "queue_metrics": {
+              "depth_before": 1,
+              "depth_after": 0
+            }
+          },
+          {
+            "stage": "logical_reflow",
+            "start_offset_ns": 0,
+            "duration_ns": 208
+          },
+          {
+            "stage": "render_prep",
+            "start_offset_ns": 208,
+            "duration_ns": 0
+          },
+          {
+            "stage": "presentation",
+            "start_offset_ns": 208,
+            "duration_ns": 416
+          }
+        ]
+      }
+    ]
+  },
+  "stage_summary": [
+    {
+      "stage": "input_intent",
+      "samples": 24,
+      "total_duration_ns": 586,
+      "avg_duration_ns": 24.416666666666668,
+      "p95_duration_ns": 42,
+      "max_duration_ns": 42
+    },
+    {
+      "stage": "scheduler_queueing",
+      "samples": 24,
+      "total_duration_ns": 333,
+      "avg_duration_ns": 13.875,
+      "p95_duration_ns": 42,
+      "max_duration_ns": 42
+    },
+    {
+      "stage": "logical_reflow",
+      "samples": 24,
+      "total_duration_ns": 1170837,
+      "avg_duration_ns": 48784.875,
+      "p95_duration_ns": 190834,
+      "max_duration_ns": 216084
+    },
+    {
+      "stage": "render_prep",
+      "samples": 24,
+      "total_duration_ns": 375,
+      "avg_duration_ns": 15.625,
+      "p95_duration_ns": 42,
+      "max_duration_ns": 42
+    },
+    {
+      "stage": "presentation",
+      "samples": 24,
+      "total_duration_ns": 90749,
+      "avg_duration_ns": 3781.2083333333335,
+      "p95_duration_ns": 8792,
+      "max_duration_ns": 10708
+    }
+  ],
+  "flame_samples": [
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 42,
+      "event_index": 0,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 41,
+      "event_index": 0,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 216084,
+      "event_index": 0,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 42,
+      "event_index": 0,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 10708,
+      "event_index": 0,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 41,
+      "event_index": 1,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 1,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 191208,
+      "event_index": 1,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 0,
+      "event_index": 1,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 8792,
+      "event_index": 1,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 0,
+      "event_index": 2,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 42,
+      "event_index": 2,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 189750,
+      "event_index": 2,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 0,
+      "event_index": 2,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 7542,
+      "event_index": 2,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 42,
+      "event_index": 3,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 3,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 190834,
+      "event_index": 3,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 42,
+      "event_index": 3,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 8000,
+      "event_index": 3,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 42,
+      "event_index": 4,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 4,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 189334,
+      "event_index": 4,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 42,
+      "event_index": 4,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 8166,
+      "event_index": 4,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;input_intent",
+      "duration_ns": 0,
+      "event_index": 5,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 5,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;logical_reflow",
+      "duration_ns": 189125,
+      "event_index": 5,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;render_prep",
+      "duration_ns": 41,
+      "event_index": 5,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;generate_scrollback;presentation",
+      "duration_ns": 8583,
+      "event_index": 5,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 6,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 6,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 417,
+      "event_index": 6,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 6,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 9083,
+      "event_index": 6,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 7,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 7,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 7,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 7,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 2708,
+      "event_index": 7,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 8,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 8,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 125,
+      "event_index": 8,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 42,
+      "event_index": 8,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 7750,
+      "event_index": 8,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 9,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 9,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 9,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 9,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 3125,
+      "event_index": 9,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 0,
+      "event_index": 10,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 41,
+      "event_index": 10,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 10,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 10,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 8125,
+      "event_index": 10,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 11,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 42,
+      "event_index": 11,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 11,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 11,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 2917,
+      "event_index": 11,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 42,
+      "event_index": 12,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 12,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 667,
+      "event_index": 12,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 0,
+      "event_index": 12,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 417,
+      "event_index": 12,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 0,
+      "event_index": 13,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 13,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 333,
+      "event_index": 13,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 0,
+      "event_index": 13,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 416,
+      "event_index": 13,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 0,
+      "event_index": 14,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 42,
+      "event_index": 14,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 292,
+      "event_index": 14,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 41,
+      "event_index": 14,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 417,
+      "event_index": 14,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 42,
+      "event_index": 15,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 15,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 292,
+      "event_index": 15,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 42,
+      "event_index": 15,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 375,
+      "event_index": 15,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 41,
+      "event_index": 16,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 16,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 291,
+      "event_index": 16,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 0,
+      "event_index": 16,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 416,
+      "event_index": 16,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;input_intent",
+      "duration_ns": 0,
+      "event_index": 17,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 17,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;logical_reflow",
+      "duration_ns": 375,
+      "event_index": 17,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;render_prep",
+      "duration_ns": 0,
+      "event_index": 17,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;resize;presentation",
+      "duration_ns": 375,
+      "event_index": 17,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 0,
+      "event_index": 18,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 18,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 18,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 42,
+      "event_index": 18,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 584,
+      "event_index": 18,
+      "pane_id": 10
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 0,
+      "event_index": 19,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 19,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 250,
+      "event_index": 19,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 19,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 417,
+      "event_index": 19,
+      "pane_id": 11
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 20,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 41,
+      "event_index": 20,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 125,
+      "event_index": 20,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 20,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 500,
+      "event_index": 20,
+      "pane_id": 12
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 42,
+      "event_index": 21,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 42,
+      "event_index": 21,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 125,
+      "event_index": 21,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 21,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 500,
+      "event_index": 21,
+      "pane_id": 13
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 0,
+      "event_index": 22,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 42,
+      "event_index": 22,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 167,
+      "event_index": 22,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 41,
+      "event_index": 22,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 417,
+      "event_index": 22,
+      "pane_id": 14
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;input_intent",
+      "duration_ns": 0,
+      "event_index": 23,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;scheduler_queueing",
+      "duration_ns": 0,
+      "event_index": 23,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;logical_reflow",
+      "duration_ns": 208,
+      "event_index": 23,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;render_prep",
+      "duration_ns": 0,
+      "event_index": 23,
+      "pane_id": 15
+    },
+    {
+      "stack": "font_churn_multi_pane;set_font_size;presentation",
+      "duration_ns": 416,
+      "event_index": 23,
+      "pane_id": 15
+    }
+  ]
+}

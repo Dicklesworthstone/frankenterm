@@ -1,0 +1,42 @@
+{
+  "results": [
+    {
+      "command": "ghostty",
+      "mean": 0.564777667,
+      "stddev": null,
+      "median": 0.564777667,
+      "user": 0.531277,
+      "system": 0.033302,
+      "min": 0.564777667,
+      "max": 0.564777667,
+      "times": [
+        0.564777667
+      ],
+      "memory_usage_byte": [
+        10141696
+      ],
+      "exit_codes": [
+        0
+      ]
+    },
+    {
+      "command": "frankenterm",
+      "mean": 0.482566459,
+      "stddev": null,
+      "median": 0.482566459,
+      "user": 0.46825999999999995,
+      "system": 0.011823,
+      "min": 0.482566459,
+      "max": 0.482566459,
+      "times": [
+        0.482566459
+      ],
+      "memory_usage_byte": [
+        71008256
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

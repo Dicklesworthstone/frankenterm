@@ -1,0 +1,3380 @@
+// The Send proof for this file's async fixtures walks the storage-open chain
+// and, on nightly-2026-08-31 on macOS, exhausts the default 128-step budget
+// ("overflow evaluating the requirement ... : Send"). The same code type-checks
+// on the Linux proof workers, so this is the solver's depth budget, not a cycle;
+// frankenterm-core's lib crate has carried the same raise for a while.
+#![recursion_limit = "256"]
+
+#[cfg(feature = "web")]
+#[path = "common/fixtures.rs"]
+mod runtime_fixtures;
+
+#[cfg(feature = "web")]
+mod web_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    #[cfg(feature = "asupersync-runtime")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use frankenterm_core::events::{Event, EventBus};
+    use frankenterm_core::patterns::{AgentType, Detection, Severity};
+    use frankenterm_core::runtime_async::{
+        io::{AsyncReadExt, AsyncWriteExt, read},
+        net::{TcpListener, TcpStream},
+        sleep, task, timeout,
+    };
+    use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
+
+    use frankenterm_core::web::{
+        WebRuntimeLimits, WebServerConfig, WebSessionAuth, start_web_server,
+    };
+    #[cfg(feature = "asupersync-runtime")]
+    use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
+    #[cfg(feature = "asupersync-runtime")]
+    use frankenterm_core::web_framework::{
+        FrameworkApp, FrameworkAppConfig, FrameworkResponse, FrameworkResponseBody,
+        FrameworkStartupHookError, FrameworkWebRuntime,
+    };
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        // The shared fixture restores the ambient runtime handle even when
+        // an assertion unwinds. Do not retain a strong TLS handle into the
+        // next test's runtime or silently discard a runtime teardown panic.
+        crate::runtime_fixtures::RuntimeFixture::current_thread().block_on(future);
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn run_async_test_with_cx<F>(
+        test: impl FnOnce(frankenterm_core::cx::Cx, frankenterm_core::cx::Cx) -> F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_fixtures::RuntimeFixture::current_thread();
+        // Pinned Asupersync 0.3.10 does not expose request_cx_with_budget.
+        // Its block_on installs a fresh context backed by this runtime's
+        // drivers. Retain that context for the server, then enter a separate
+        // block_on for the client/cleanup driver: cancelling the server must
+        // not cancel the test that observes whether cleanup really happened.
+        let server_cx = runtime.block_on(async {
+            frankenterm_core::cx::Cx::current().expect("runtime-owned server context")
+        });
+        let cleanup_cx = runtime.block_on(async {
+            frankenterm_core::cx::Cx::current().expect("runtime-owned cleanup context")
+        });
+        runtime.block_on(async move {
+            let observer_cx =
+                frankenterm_core::cx::Cx::current().expect("runtime-owned observer context");
+            assert_ne!(server_cx.task_id(), observer_cx.task_id());
+            assert_ne!(cleanup_cx.task_id(), observer_cx.task_id());
+            assert_ne!(server_cx.task_id(), cleanup_cx.task_id());
+            test(server_cx, cleanup_cx).await;
+            observer_cx
+                .checkpoint()
+                .expect("server cancellation must not cancel the fixture observer");
+        });
+    }
+
+    /// Extract the HTTP response body from a raw HTTP response string.
+    fn extract_body(raw: &str) -> &str {
+        raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+    }
+
+    #[test]
+    fn web_openapi_discovery_http_fixture_preserves_body() {
+        assert_eq!(
+            extract_body("HTTP/1.1 200 OK\r\n\r\nfirst\r\n\r\nsecond"),
+            "first\r\n\r\nsecond"
+        );
+        assert_eq!(extract_body("HTTP/1.1 200 OK\r\n\r\n"), "");
+        assert_eq!(extract_body("incomplete headers"), "");
+    }
+
+    /// Extract the HTTP status code from a raw HTTP response string.
+    fn extract_status(raw: &str) -> u16 {
+        raw.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    async fn fetch_health(addr: SocketAddr) -> std::io::Result<String> {
+        let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        fetch_raw(addr, request).await
+    }
+
+    async fn fetch_raw(addr: SocketAddr, raw_request: &[u8]) -> std::io::Result<String> {
+        // These are finite JSON/error responses, not SSE. Bound the entire
+        // exchange (including connect/write/EOF), not just connection retries.
+        const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+        timeout(Duration::from_secs(5), async {
+            let mut last_err = None;
+            for _ in 0..50 {
+                match TcpStream::connect(addr).await {
+                    Ok(mut stream) => {
+                        stream.write_all(raw_request).await?;
+                        let mut buf = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let count = read(&mut stream, &mut chunk).await?;
+                            if count == 0 {
+                                return String::from_utf8(buf).map_err(|_| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP fixture response is not UTF-8",
+                                    )
+                                });
+                            }
+                            if count > MAX_RESPONSE_BYTES - buf.len() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "HTTP fixture response exceeds 1 MiB limit",
+                                ));
+                            }
+                            buf.extend_from_slice(&chunk[..count]);
+                        }
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+            }))
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP fixture exchange timed out",
+            )
+        })?
+    }
+
+    async fn fetch_stream_prefix(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        read_timeout: Duration,
+        min_bytes: usize,
+    ) -> std::io::Result<String> {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(mut stream) => {
+                    stream.write_all(raw_request).await?;
+                    let deadline = Instant::now() + read_timeout;
+                    let mut buf = Vec::new();
+                    while buf.len() < min_bytes {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let mut chunk = [0_u8; 2048];
+                        match timeout(deadline - now, read(&mut stream, &mut chunk)).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                            Ok(Err(err)) => return Err(err),
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(String::from_utf8_lossy(&buf).to_string());
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+        }))
+    }
+
+    fn stream_frame_kind_count(raw: &str, kind: &str) -> usize {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame["kind"] == kind)
+            .count()
+    }
+
+    async fn fetch_stream_until_kind_count(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        read_timeout: Duration,
+        kind: &str,
+        expected_count: usize,
+    ) -> std::io::Result<String> {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(mut stream) => {
+                    stream.write_all(raw_request).await?;
+                    let deadline = Instant::now() + read_timeout;
+                    let mut buf = Vec::new();
+                    loop {
+                        let raw = String::from_utf8_lossy(&buf);
+                        if stream_frame_kind_count(&raw, kind) >= expected_count {
+                            return Ok(raw.to_string());
+                        }
+
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(raw.to_string());
+                        }
+
+                        let mut chunk = [0_u8; 2048];
+                        match timeout(deadline - now, read(&mut stream, &mut chunk)).await {
+                            Ok(Ok(0)) => return Ok(raw.to_string()),
+                            Ok(Ok(n)) => {
+                                drop(raw);
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                            Ok(Err(err)) => return Err(err),
+                            Err(_) => {
+                                let raw = String::from_utf8_lossy(&buf);
+                                return Ok(raw.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+        }))
+    }
+
+    async fn fetch_stream_until_delta_count(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        read_timeout: Duration,
+        expected_deltas: usize,
+    ) -> std::io::Result<String> {
+        fetch_stream_until_kind_count(addr, raw_request, read_timeout, "delta", expected_deltas)
+            .await
+    }
+
+    fn epoch_ms_now() -> i64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        i64::try_from(ts.as_millis()).unwrap_or(0)
+    }
+
+    async fn create_test_storage_with_pane(
+        pane_id: u64,
+    ) -> Result<(StorageHandle, tempfile::TempDir), Box<dyn std::error::Error>> {
+        let tempdir = tempfile::tempdir()?;
+        let db_path = tempdir.path().join("web_stream_test.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_str).await?;
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test-pane".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: epoch_ms_now(),
+                last_seen_at: epoch_ms_now(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: Some(epoch_ms_now()),
+            })
+            .await?;
+        Ok((storage, tempdir))
+    }
+
+    #[test]
+    fn web_health_ephemeral_port() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown().await;
+
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert!(response.contains("200"));
+            assert!(response.contains("\"ok\":true"));
+            // ft-emlzp: no bus and no storage, so nothing feeds /stream/events.
+            assert!(response.contains("\"event_source\":\"none\""), "{response}");
+        });
+    }
+
+    fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+        let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    async fn fetch_path(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        fetch_raw(addr, request.as_bytes()).await
+    }
+
+    const VIEWER_TEST_CREDENTIAL: &str = "viewer-test-credential-with-at-least-32-characters";
+
+    fn session_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> String {
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: close\r\n"
+        );
+        if let Some(cookie) = cookie {
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if body.is_some() || method == "DELETE" {
+            request.push_str("Content-Type: application/json\r\n");
+            request.push_str(&format!("Content-Length: {}\r\n", body.map_or(0, str::len)));
+        }
+        request.push_str("\r\n");
+        if let Some(body) = body {
+            request.push_str(body);
+        }
+        request
+    }
+
+    async fn login_viewer(addr: SocketAddr, cookie: Option<&str>) -> anyhow::Result<String> {
+        use anyhow::{Context, ensure};
+
+        let body = serde_json::json!({ "token": VIEWER_TEST_CREDENTIAL }).to_string();
+        let request = session_request(addr, "POST", "/auth/session", cookie, Some(&body));
+        let response = fetch_raw(addr, request.as_bytes()).await?;
+        ensure!(
+            extract_status(&response) == 200,
+            "viewer login must succeed"
+        );
+        ensure!(header_value(&response, "cache-control") == Some("no-store"));
+        let header = header_value(&response, "set-cookie").context("issued session cookie")?;
+        ensure!(header.contains("HttpOnly") && header.contains("SameSite=Strict"));
+        ensure!(header.contains("Path=/") && header.contains("Max-Age="));
+        ensure!(!header.to_ascii_lowercase().contains("domain="));
+        let cookie = header.split(';').next().context("cookie value")?.to_owned();
+        ensure!(
+            !extract_body(&response).contains(&cookie),
+            "cookie must remain HTTP-only"
+        );
+        ensure!(
+            !response.contains(VIEWER_TEST_CREDENTIAL),
+            "bootstrap credential must not echo"
+        );
+        Ok(cookie)
+    }
+
+    async fn viewer_session_epoch(addr: SocketAddr, cookie: &str) -> anyhow::Result<String> {
+        use anyhow::{Context, ensure};
+
+        let request = session_request(addr, "GET", "/auth/status", Some(cookie), None);
+        let response = fetch_raw(addr, request.as_bytes()).await?;
+        ensure!(
+            extract_status(&response) == 200,
+            "authenticated session status"
+        );
+        let status: serde_json::Value = serde_json::from_str(extract_body(&response))?;
+        ensure!(
+            status["data"]["authenticated"] == true,
+            "live session grant"
+        );
+        let epoch = status["data"]["session_epoch"]
+            .as_str()
+            .context("session status must identify its grant epoch")?;
+        ensure!(epoch.len() == 32 && epoch.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        Ok(epoch.to_owned())
+    }
+
+    #[test]
+    fn web_sessions_protect_real_data_and_openapi_and_rotate_on_login() {
+        use anyhow::ensure;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let auth = WebSessionAuth::new(VIEWER_TEST_CREDENTIAL)
+                .unwrap()
+                .with_max_sessions(1)
+                .unwrap();
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_session_auth(auth),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(12), async {
+                for path in [
+                    "/panes",
+                    "/events",
+                    "/search?q=test",
+                    "/bookmarks",
+                    "/ruleset-profile",
+                    "/saved-searches",
+                    "/stream/events",
+                    "/stream/deltas",
+                    "/openapi.json",
+                    "/not-yet-a-route",
+                ] {
+                    let request = session_request(addr, "GET", path, None, None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 401, "protected route {path}");
+                    ensure!(
+                        !response.contains("test-pane"),
+                        "no unauthenticated pane title"
+                    );
+                    ensure!(header_value(&response, "cache-control") == Some("no-store"));
+                }
+                for path in ["/health", "/auth/status"] {
+                    let request = session_request(addr, "GET", path, None, None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "public status {path}");
+                    ensure!(!response.contains("test-pane"));
+                }
+                let wrong_body = serde_json::json!({ "token": "x".repeat(64) }).to_string();
+                let wrong = session_request(addr, "POST", "/auth/session", None, Some(&wrong_body));
+                let response = fetch_raw(addr, wrong.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "wrong credential refused");
+                ensure!(header_value(&response, "set-cookie").is_none());
+
+                let first_cookie = login_viewer(addr, None).await?;
+                let first_epoch = viewer_session_epoch(addr, &first_cookie).await?;
+                for path in ["/panes", "/openapi.json"] {
+                    let request = session_request(addr, "GET", path, Some(&first_cookie), None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "authorized route {path}");
+                    if path == "/panes" {
+                        ensure!(
+                            response.contains("test-pane"),
+                            "real stored pane is visible"
+                        );
+                    } else {
+                        ensure!(
+                            response.contains("\"openapi\""),
+                            "generated API schema is visible"
+                        );
+                    }
+                }
+
+                let alias = format!(
+                    "GET /panes HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nCookie: {first_cookie}\r\nConnection: close\r\n\r\n",
+                    addr.port(), addr.port(),
+                );
+                let response = fetch_raw(addr, alias.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 401,
+                    "a session is bound to its exact login origin, even on another loopback alias"
+                );
+
+                // Rotation succeeds even at capacity, and the previous token
+                // ceases to authorize reads instead of sharing the new lease.
+                let second_cookie = login_viewer(addr, Some(&first_cookie)).await?;
+                ensure!(first_cookie != second_cookie, "login rotates session token");
+                let second_epoch = viewer_session_epoch(addr, &second_cookie).await?;
+                ensure!(first_epoch != second_epoch, "login also rotates viewer state epoch");
+                let stale = session_request(addr, "GET", "/panes", Some(&first_cookie), None);
+                let response = fetch_raw(addr, stale.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "old token revoked");
+
+                // A native EventSource retries its original URL after a
+                // different tab has replaced the HttpOnly cookie. The new
+                // credential must not admit that old viewer's stream epoch.
+                for path in ["/stream/events", "/stream/deltas"] {
+                    let path = format!("{path}?session_epoch={first_epoch}");
+                    let stale = session_request(addr, "GET", &path, Some(&second_cookie), None);
+                    let response = fetch_raw(addr, stale.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 401, "old viewer epoch cannot reconnect");
+                }
+                let stale_read = format!(
+                    "GET /panes HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nCookie: {second_cookie}\r\nX-FT-Session-Epoch: {first_epoch}\r\nConnection: close\r\n\r\n"
+                );
+                let response = fetch_raw(addr, stale_read.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "old viewer epoch cannot read with a replacement cookie");
+
+                let logout =
+                    session_request(addr, "DELETE", "/auth/session", Some(&second_cookie), None);
+                let response = fetch_raw(addr, logout.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "logout succeeds");
+                ensure!(
+                    header_value(&response, "set-cookie")
+                        .is_some_and(|value| value.contains("Max-Age=0"))
+                );
+                let stale = session_request(addr, "GET", "/panes", Some(&second_cookie), None);
+                let response = fetch_raw(addr, stale.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "logged-out token revoked");
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            server.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+            scenario
+                .expect("session scenario deadline")
+                .expect("session assertions");
+        });
+    }
+
+    #[test]
+    fn web_session_boundary_refuses_untrusted_and_oversized_heads_before_body() {
+        run_async_test(async {
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap()),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let other_port = if addr.port() == u16::MAX {
+                addr.port() - 1
+            } else {
+                addr.port() + 1
+            };
+            let heads = [
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://elsewhere.invalid\r\nContent-Type: application/json\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 403),
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 403),
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Type: application/json\r\nContent-Length: 1025\r\nExpect: 100-continue\r\n\r\n"), 413),
+                (format!("POST /panes HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 401),
+                ("GET /auth/status HTTP/1.1\r\nHost: rebind.invalid\r\nConnection: close\r\n\r\n".to_owned(), 403),
+                (format!("GET /auth/status HTTP/1.1\r\nHost: {addr}\r\nSec-Fetch-Site: same-site\r\nConnection: close\r\n\r\n"), 403),
+                (format!("GET /auth/status HTTP/1.1\r\nHost: 127.0.0.1:{other_port}\r\nConnection: close\r\n\r\n"), 403),
+            ];
+            let mut observations = Vec::new();
+            for (request, expected) in heads {
+                observations.push((expected, fetch_raw(addr, request.as_bytes()).await));
+            }
+            server.shutdown().await.unwrap();
+            for (expected, response) in observations {
+                let response = response.expect("head rejection must not wait for body");
+                assert_eq!(extract_status(&response), expected);
+                assert!(!response.contains("100 Continue"));
+                assert_eq!(header_value(&response, "connection"), Some("close"));
+            }
+        });
+    }
+
+    #[test]
+    fn web_session_logout_closes_idle_event_and_delta_streams() {
+        use anyhow::ensure;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(16));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 60,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(event_bus.clone())
+                    .with_runtime_limits(limits)
+                    .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap()),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(8), async {
+                let cookie = login_viewer(addr, None).await?;
+                let epoch = viewer_session_epoch(addr, &cookie).await?;
+                let mut streams = Vec::new();
+                for path in [
+                    "/stream/events?channel=all&pane_id=7",
+                    "/stream/deltas?pane_id=7",
+                ] {
+                    let mut stream = TcpStream::connect(addr).await?;
+                    let path = format!("{path}&session_epoch={epoch}");
+                    let request = session_request(addr, "GET", &path, Some(&cookie), None);
+                    stream.write_all(request.as_bytes()).await?;
+                    let mut response = Vec::new();
+                    let ready =
+                        read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                    ensure!(extract_status(&ready) == 200, "authorized SSE starts");
+                    streams.push(stream);
+                }
+                ensure!(
+                    event_bus.subscriber_count() >= 2,
+                    "both producers have subscribed"
+                );
+                let logout = session_request(addr, "DELETE", "/auth/session", Some(&cookie), None);
+                let response = fetch_raw(addr, logout.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "logout acknowledged");
+                for mut stream in streams {
+                    // The client keeps reading: this checks application lease
+                    // cancellation, not the upstream blocked-write limitation.
+                    let mut tail = Vec::new();
+                    timeout(Duration::from_secs(2), stream.read_to_end(&mut tail))
+                        .await
+                        .map_err(anyhow::Error::msg)??;
+                    ensure!(
+                        !String::from_utf8_lossy(&tail).contains("data: "),
+                        "no application frame after idle revocation"
+                    );
+                }
+                ensure!(
+                    event_bus.subscriber_count() == 0,
+                    "logout drops both owned producers"
+                );
+                let reconnect = session_request(addr, "GET", "/stream/events", Some(&cookie), None);
+                let response = fetch_raw(addr, reconnect.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 401,
+                    "old stream cookie cannot reconnect"
+                );
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            server.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+            scenario
+                .expect("stream logout deadline")
+                .expect("stream logout assertions");
+        });
+    }
+
+    #[test]
+    fn web_stream_budget_is_shared_across_routes_and_released_after_disconnect() {
+        use anyhow::ensure;
+
+        async fn open_stream(
+            addr: SocketAddr,
+            path: &str,
+            cookie: Option<&str>,
+            epoch: Option<&str>,
+        ) -> anyhow::Result<TcpStream> {
+            let path = match epoch {
+                Some(epoch) => format!("{path}?pane_id=7&session_epoch={epoch}"),
+                None => format!("{path}?pane_id=7"),
+            };
+            let request = session_request(addr, "GET", &path, cookie, None);
+            let mut stream = TcpStream::connect(addr).await?;
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            let ready = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+            ensure!(extract_status(&ready) == 200, "authorized stream starts");
+            Ok(stream)
+        }
+
+        run_async_test(async {
+            for authenticated in [false, true] {
+                let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+                let event_bus = Arc::new(EventBus::new(16));
+                let mut config = WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_runtime_limits(WebRuntimeLimits {
+                        stream_keepalive_secs: 1,
+                        ..frankenterm_core::web::resolve_runtime_limits(None)
+                    });
+                if authenticated {
+                    config = config
+                        .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap());
+                }
+                let server = start_web_server(config).await.unwrap();
+                let addr = server.bound_addr();
+                let scenario = Box::pin(timeout(Duration::from_secs(20), async {
+                    let cookie = if authenticated {
+                        Some(login_viewer(addr, None).await?)
+                    } else {
+                        None
+                    };
+                    let epoch = match cookie.as_deref() {
+                        Some(cookie) => Some(viewer_session_epoch(addr, cookie).await?),
+                        None => None,
+                    };
+                    let paths = ["/stream/events", "/stream/deltas"];
+                    let mut streams = Vec::new();
+                    for index in 0..8 {
+                        streams.push(
+                            open_stream(
+                                addr,
+                                paths[index % paths.len()],
+                                cookie.as_deref(),
+                                epoch.as_deref(),
+                            )
+                            .await?,
+                        );
+                    }
+                    ensure!(event_bus.subscriber_count() == 8, "eight actual producers");
+                    for path in paths {
+                        let path = match epoch.as_deref() {
+                            Some(epoch) => format!("{path}?session_epoch={epoch}"),
+                            None => path.to_owned(),
+                        };
+                        let request = session_request(addr, "GET", &path, cookie.as_deref(), None);
+                        let response = fetch_raw(addr, request.as_bytes()).await?;
+                        ensure!(extract_status(&response) == 429, "shared viewer limit");
+                        ensure!(header_value(&response, "retry-after") == Some("1"));
+                        let body: serde_json::Value =
+                            serde_json::from_str(extract_body(&response))?;
+                        ensure!(body["error_code"] == "web_viewer_stream_capacity");
+                        ensure!(
+                            event_bus.subscriber_count() == 8,
+                            "denial creates no producer"
+                        );
+                    }
+
+                    let request = session_request(addr, "GET", "/panes", cookie.as_deref(), None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(
+                        extract_status(&response) == 200,
+                        "finite reads remain available"
+                    );
+                    ensure!(
+                        response.contains("test-pane"),
+                        "real stored data remains readable"
+                    );
+                    let other_viewer_stream = if authenticated {
+                        // Saturating one lease cannot consume another viewer's
+                        // budget or prevent a fresh authenticated login.
+                        let other = login_viewer(addr, None).await?;
+                        let other_epoch = viewer_session_epoch(addr, &other).await?;
+                        Some(open_stream(addr, paths[0], Some(&other), Some(&other_epoch)).await?)
+                    } else {
+                        None
+                    };
+                    let active = if authenticated { 9 } else { 8 };
+                    ensure!(event_bus.subscriber_count() == active);
+                    drop(streams.pop());
+                    timeout(Duration::from_secs(4), async {
+                        while event_bus.subscriber_count() != active - 1 {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    streams.push(
+                        open_stream(addr, paths[1], cookie.as_deref(), epoch.as_deref()).await?,
+                    );
+                    ensure!(
+                        event_bus.subscriber_count() == active,
+                        "disconnected slot reused"
+                    );
+                    drop(other_viewer_stream);
+                    drop(streams);
+                    Ok::<_, anyhow::Error>(())
+                }))
+                .await;
+                server.shutdown().await.unwrap();
+                storage.shutdown().await.unwrap();
+                scenario
+                    .expect("stream admission scenario deadline")
+                    .expect("stream admission assertions");
+            }
+        });
+    }
+
+    /// An invalid pane selection must be rejected before either data access
+    /// or SSE subscription. No backend is attached, so 400 rather than 503
+    /// also proves that validation owns the admission decision.
+    #[test]
+    fn web_pane_filters_fail_closed_before_data_or_stream_admission() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("start web server");
+            let addr = server.bound_addr();
+            let mut observations = Vec::new();
+            for endpoint in ["/events", "/search", "/stream/events", "/stream/deltas"] {
+                for query in [
+                    "pane_id=not-a-pane",
+                    "pane_id=-1",
+                    "pane_id=18446744073709551616",
+                    "pane_id=7&pane_id=8",
+                    "pane_id=7&pane%5Fid=7",
+                    "%70ane_id=%37&pane_id=%37",
+                ] {
+                    let path = format!("{endpoint}?q=needle&{query}");
+                    observations.push((
+                        path.clone(),
+                        "invalid_pane_id",
+                        fetch_path(addr, &path).await,
+                    ));
+                }
+                let path = format!("{endpoint}?{}pane_id=7", "x=1&".repeat(256));
+                observations.push((
+                    path.clone(),
+                    "too_many_query_parameters",
+                    fetch_path(addr, &path).await,
+                ));
+            }
+            let health = fetch_health(addr).await;
+            server.shutdown().await.expect("shutdown web server");
+
+            for (path, code, response) in observations {
+                let response = response.expect("invalid query must receive a finite response");
+                assert_eq!(extract_status(&response), 400, "{path}");
+                assert!(!response.contains("text/event-stream"), "{path}");
+                let body: serde_json::Value =
+                    serde_json::from_str(extract_body(&response)).expect("JSON rejection");
+                assert_eq!(body["ok"], false, "{path}");
+                assert_eq!(body["error_code"], code, "{path}");
+                assert!(body.get("data").is_none(), "{path}");
+            }
+            assert_eq!(extract_status(&health.unwrap()), 200);
+        });
+    }
+
+    /// `ft web --ui-dir` serves exactly the manifest's verified files under
+    /// `/ui/`, beside an unchanged API; nothing else on disk is reachable.
+    #[test]
+    fn web_serves_verified_ui_package_beside_the_api() {
+        use frankenterm_core::web::{UI_PACKAGE_SCHEMA, UiAssetSet};
+        use sha2::{Digest, Sha256};
+
+        let package = tempfile::tempdir().unwrap();
+        let files: &[(&str, &str)] = &[
+            ("index.html", "<!doctype html><title>fleet viewer</title>"),
+            ("app.mjs", "export const viewer = true;"),
+            ("pkg/viewer_bg.wasm", "wasm-module-bytes"),
+        ];
+        let mut listed = serde_json::Map::new();
+        for (rel, text) in files {
+            let path = package.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            listed.insert(
+                (*rel).to_string(),
+                hex::encode(Sha256::digest(text.as_bytes())).into(),
+            );
+        }
+        std::fs::write(
+            package.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"schema": UI_PACKAGE_SCHEMA, "files": listed}))
+                .unwrap(),
+        )
+        .unwrap();
+        // On disk inside the package directory, but not in the manifest.
+        std::fs::write(package.path().join("secret.txt"), "never served").unwrap();
+        let set = Arc::new(UiAssetSet::load(package.path()).expect("package verifies"));
+
+        run_async_test(async move {
+            let server =
+                start_web_server(WebServerConfig::default().with_port(0).with_ui_assets(set))
+                    .await
+                    .unwrap();
+            let addr = server.bound_addr();
+            let index = fetch_path(addr, "/ui/").await;
+            let bare = fetch_path(addr, "/ui").await;
+            let module = fetch_path(addr, "/ui/app.mjs").await;
+            let wasm = fetch_path(addr, "/ui/pkg/viewer_bg.wasm").await;
+            let unlisted = fetch_path(addr, "/ui/secret.txt").await;
+            let manifest = fetch_path(addr, "/ui/manifest.json").await;
+            let health = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            let index = index.unwrap();
+            assert_eq!(extract_status(&index), 200, "{index}");
+            assert_eq!(extract_body(&index), files[0].1);
+            assert_eq!(
+                header_value(&index, "content-type"),
+                Some("text/html; charset=utf-8")
+            );
+            let csp = header_value(&index, "content-security-policy").expect("CSP on the page");
+            assert!(
+                csp.contains("script-src 'self' 'wasm-unsafe-eval'"),
+                "{csp}"
+            );
+            assert_eq!(header_value(&index, "x-frame-options"), Some("DENY"));
+
+            let bare = bare.unwrap();
+            assert_eq!(extract_status(&bare), 308, "{bare}");
+            assert_eq!(header_value(&bare, "location"), Some("/ui/"));
+
+            let module = module.unwrap();
+            assert_eq!(extract_status(&module), 200);
+            assert_eq!(
+                header_value(&module, "content-type"),
+                Some("text/javascript; charset=utf-8")
+            );
+            assert_eq!(
+                header_value(&module, "x-content-type-options"),
+                Some("nosniff")
+            );
+            let wasm = wasm.unwrap();
+            assert_eq!(
+                header_value(&wasm, "content-type"),
+                Some("application/wasm")
+            );
+            assert_eq!(extract_body(&wasm), files[2].1);
+
+            assert_eq!(extract_status(&unlisted.unwrap()), 404);
+            assert_eq!(extract_status(&manifest.unwrap()), 404);
+            assert_eq!(extract_status(&health.unwrap()), 200);
+        });
+    }
+
+    /// Without a package there is no `/ui/` at all.
+    #[test]
+    fn web_without_ui_package_has_no_ui_routes() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let index = fetch_path(addr, "/ui/").await;
+            server.shutdown().await.unwrap();
+            assert_eq!(extract_status(&index.unwrap()), 404);
+        });
+    }
+
+    /// Build real chunk framing with many chunks, so the body cap is tested
+    /// against the aggregate decoded payload rather than a single chunk.
+    fn chunked_health_request(total: usize, connection: &str) -> Vec<u8> {
+        let mut request = format!(
+            "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+             Transfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
+        )
+        .into_bytes();
+        let chunk = [b'x'; 257];
+        let mut sent = 0;
+        while sent < total {
+            let len = chunk.len().min(total - sent);
+            request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            request.extend_from_slice(&chunk[..len]);
+            request.extend_from_slice(b"\r\n");
+            sent += len;
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+        request
+    }
+
+    /// The parser's wire bound includes header space. That extra allowance
+    /// must not let a slightly oversized decoded chunked body reach /health.
+    #[test]
+    fn web_decoded_body_cap_has_exact_boundaries_for_both_framings() {
+        run_async_test(async {
+            let mut limits = WebServerConfig::default().runtime_limits();
+            limits.max_request_body_bytes = 1024;
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let mut observed = Vec::new();
+            for size in [0, 1023, 1024, 1025, 16 * 1024] {
+                let chunked = fetch_raw(addr, &chunked_health_request(size, "close")).await;
+                let mut fixed = format!(
+                    "GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                fixed.resize(fixed.len() + size, b'x');
+                let fixed = fetch_raw(addr, &fixed).await;
+                observed.push((size, chunked, fixed));
+            }
+            let healthy = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            for (size, chunked, fixed) in observed {
+                for response in [chunked, fixed] {
+                    let response =
+                        response.expect("bounded requests must receive a finite response");
+                    let expected = if size > 1024 { 413 } else { 200 };
+                    assert_eq!(extract_status(&response), expected, "body size {size}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(extract_body(&response)).unwrap();
+                    assert_eq!(body["ok"], size <= 1024);
+                    if size > 1024 {
+                        assert_eq!(body["error_code"], "body_too_large");
+                        assert_eq!(header_value(&response, "connection"), Some("close"));
+                    }
+                }
+            }
+            assert_eq!(extract_status(&healthy.unwrap()), 200);
+        });
+    }
+
+    /// Exercise the production runtime's admission wiring with a handler
+    /// effect counter. Middleware-only rejection is insufficient: the pinned
+    /// server overrides a middleware Connection: close response and would
+    /// otherwise dispatch the already-buffered second request.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_oversized_body_closes_before_handler_or_pipelined_followup() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let handler_effects = Arc::clone(&effects);
+            let app = FrameworkApp::builder()
+                .config(FrameworkAppConfig::new().max_body_size(1024))
+                .get("/health", move |_, _| {
+                    handler_effects.fetch_add(1, Ordering::SeqCst);
+                    async { FrameworkResponse::ok() }
+                })
+                .build();
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("production runtime should start");
+            let positive = fetch_health(addr).await;
+            let effects_after_positive = effects.load(Ordering::SeqCst);
+            let mut pipeline = chunked_health_request(1025, "keep-alive");
+            pipeline.extend_from_slice(
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+            let rejected = fetch_raw(addr, &pipeline).await;
+            let effects_after_rejection = effects.load(Ordering::SeqCst);
+            let next_connection = fetch_health(addr).await;
+            let effects_after_next = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(
+                effects_after_positive, 1,
+                "positive control must invoke the handler"
+            );
+            let response = rejected.expect("oversize admission must return a finite 413");
+            assert_eq!(extract_status(&response), 413);
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
+            assert_eq!(
+                effects_after_rejection, 1,
+                "neither the rejected request nor its pipelined follower may run"
+            );
+            assert_eq!(extract_status(&next_connection.unwrap()), 200);
+            assert_eq!(
+                effects_after_next, 2,
+                "a fresh connection must remain usable"
+            );
+        });
+    }
+
+    /// Much larger chunked requests are still refused by the parser's own
+    /// total wire bound (64 KiB + header allowance). The application guard
+    /// above does not replace that earlier bounded-collection protection.
+    #[test]
+    fn web_chunked_body_over_the_cap_is_refused_at_the_parser() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let small = fetch_raw(addr, &chunked_health_request(1024, "close")).await;
+            let oversized = fetch_raw(addr, &chunked_health_request(300 * 1024, "close")).await;
+            let shutdown = server.shutdown().await;
+            shutdown.unwrap();
+
+            let small = small.expect("a small chunked body is ordinary framing");
+            assert_eq!(extract_status(&small), 200, "{small}");
+            // The parser refuses it ("request too large") with a finite 413,
+            // then drains what the client is still sending before closing,
+            // so the refusal is not lost to a connection reset.
+            let response = oversized.expect("a parser refusal must still be a finite response");
+            assert_eq!(
+                extract_status(&response),
+                413,
+                "300 KiB chunked body must be refused: {response}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+        });
+    }
+
+    /// Reads one response head (through the blank line) or up to EOF, so a
+    /// test can see an interim `100 Continue` before it sends the body.
+    async fn read_one_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !received.ends_with(b"\r\n\r\n") {
+            if read(stream, &mut byte).await? == 0 {
+                break;
+            }
+            received.push(byte[0]);
+        }
+        Ok(received)
+    }
+
+    async fn read_to_eof(stream: &mut TcpStream) -> std::io::Result<String> {
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = read(stream, &mut chunk).await?;
+            if count == 0 {
+                return Ok(String::from_utf8_lossy(&received).into_owned());
+            }
+            received.extend_from_slice(&chunk[..count]);
+        }
+    }
+
+    /// ft-xxfwy.55.15: at the production defaults, a head declaring one byte
+    /// more than the advertised cap is refused from the head alone. The
+    /// client sends no body, as an `Expect: 100-continue` client waits to do.
+    /// The keep-alive timeout is 1 s, so a server that waited for body bytes
+    /// would close this connection without any response.
+    #[test]
+    fn web_default_cap_refuses_a_declared_overflow_from_the_head() {
+        run_async_test(async {
+            let config = WebServerConfig::default().with_port(0);
+            let cap = config.runtime_limits().max_request_body_bytes;
+            let server = start_web_server(config).await.unwrap();
+            let addr = server.bound_addr();
+            let mut observed = Vec::new();
+            for expect in ["", "Expect: 100-continue\r\n"] {
+                let head = format!(
+                    "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{expect}\r\n",
+                    cap + 1
+                );
+                observed.push((expect, fetch_raw(addr, head.as_bytes()).await));
+            }
+            let healthy = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            for (expect, response) in observed {
+                let response = response.expect("a refused head must receive a finite response");
+                assert_eq!(extract_status(&response), 413, "{expect:?}: {response}");
+                assert!(!response.contains("100 Continue"), "{expect:?}: {response}");
+                assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+                assert_eq!(header_value(&response, "connection"), Some("close"));
+                let body: serde_json::Value =
+                    serde_json::from_str(extract_body(&response)).unwrap();
+                assert_eq!(body["error_code"], "body_too_large", "{expect:?}");
+            }
+            assert_eq!(extract_status(&healthy.unwrap()), 200);
+        });
+    }
+
+    /// The production runtime with a 1 KiB cap, a POST route and a
+    /// WebSocket route, each counting its effects.
+    #[cfg(feature = "asupersync-runtime")]
+    fn counted_upload_app(effects: &Arc<AtomicUsize>) -> FrameworkApp {
+        let upload_effects = Arc::clone(effects);
+        let ws_effects = Arc::clone(effects);
+        FrameworkApp::builder()
+            .config(FrameworkAppConfig::new().max_body_size(1024))
+            .post("/upload", move |_, _| {
+                upload_effects.fetch_add(1, Ordering::SeqCst);
+                async { FrameworkResponse::ok() }
+            })
+            .websocket("/ws", move |_, _, _| {
+                ws_effects.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            })
+            .build()
+    }
+
+    /// ft-xxfwy.55.15: headers-only overflow is denied before any payload.
+    /// A declared length one byte over the cap is refused by BodySizeGuard
+    /// from the head; 8 MiB is past the parser's own body limit and is
+    /// refused as unparseable. Neither sends 100 or 101, and no handler runs,
+    /// including for a WebSocket handshake that declares a body.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_headers_only_overflow_is_denied_before_the_payload() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let mut observed = Vec::new();
+            for declared in [1025_usize, 8 * 1024 * 1024] {
+                for extra in [
+                    "",
+                    "Expect: 100-continue\r\n",
+                    "Connection: Upgrade\r\nUpgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n",
+                ] {
+                    let (method, path) = if extra.contains("websocket") {
+                        ("GET", "/ws")
+                    } else {
+                        ("POST", "/upload")
+                    };
+                    let head = format!(
+                        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                         Content-Length: {declared}\r\n{extra}\r\n"
+                    );
+                    observed.push((declared, extra, fetch_raw(addr, head.as_bytes()).await));
+                }
+            }
+            let effects_after_refusals = effects.load(Ordering::SeqCst);
+            let positive = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+            let effects_after_positive = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            for (declared, extra, response) in observed {
+                let case = format!("declared {declared} with {extra:?}");
+                let response = response.unwrap_or_else(|err| panic!("{case}: {err}"));
+                assert_eq!(extract_status(&response), 413, "{case}: {response}");
+                assert!(!response.contains(" 100 "), "{case}: no 100: {response}");
+                assert!(!response.contains(" 101 "), "{case}: no 101: {response}");
+                assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{case}");
+                assert_eq!(
+                    header_value(&response, "connection"),
+                    Some("close"),
+                    "{case}"
+                );
+                if declared == 1025 {
+                    let body: serde_json::Value =
+                        serde_json::from_str(extract_body(&response)).unwrap();
+                    assert_eq!(body["error_code"], "body_too_large", "{case}");
+                }
+            }
+            assert_eq!(effects_after_refusals, 0, "no handler for a refused head");
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(effects_after_positive, 1, "the in-cap control is handled");
+        });
+    }
+
+    /// ft-xxfwy.55.15: a client that sends `Expect: 100-continue` and waits
+    /// gets the interim response before its body, then one final response.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_expect_continue_is_answered_before_the_body() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let exchange = timeout(Duration::from_secs(5), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream
+                    .write_all(
+                        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                          Expect: 100-continue\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                let interim = read_one_head(&mut stream).await?;
+                let effects_before_body = effects.load(Ordering::SeqCst);
+                stream.write_all(b"hello").await?;
+                let final_response = read_to_eof(&mut stream).await?;
+                Ok::<_, std::io::Error>((interim, effects_before_body, final_response))
+            })
+            .await;
+            let effects_after = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let (interim, effects_before_body, final_response) = exchange
+                .expect("the exchange must finish within 5 s")
+                .expect("exchange I/O");
+            assert_eq!(
+                String::from_utf8_lossy(&interim),
+                "HTTP/1.1 100 Continue\r\n\r\n",
+                "100 Continue must precede the body"
+            );
+            assert_eq!(effects_before_body, 0, "no handler before the body");
+            assert_eq!(extract_status(&final_response), 200, "{final_response}");
+            assert!(
+                !final_response.contains("100 Continue"),
+                "the 100 is sent once: {final_response}"
+            );
+            assert_eq!(effects_after, 1);
+        });
+    }
+
+    /// ft-xxfwy.55.15: the production runtime bounds how long one request may
+    /// take to arrive. A 100-byte body sent a byte every 500 ms, each inside
+    /// the 1 s keep-alive timeout, would take 50 s. It gets 408 at the
+    /// request read deadline and never reaches the handler; without the
+    /// deadline nothing answers within this test's 20 s bound.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_trickled_request_is_refused_at_the_read_deadline() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let trickled = Box::pin(timeout(Duration::from_secs(20), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream
+                    .write_all(
+                        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
+                    )
+                    .await?;
+                let mut chunk = [0_u8; 4096];
+                for _ in 0..100 {
+                    stream.write_all(b"x").await?;
+                    if let Ok(read) =
+                        timeout(Duration::from_millis(500), read(&mut stream, &mut chunk)).await
+                    {
+                        let read = read?;
+                        let rest = read_to_eof(&mut stream).await?;
+                        return Ok::<_, std::io::Error>(format!(
+                            "{}{rest}",
+                            String::from_utf8_lossy(&chunk[..read])
+                        ));
+                    }
+                }
+                Ok(String::new())
+            }))
+            .await;
+            let effects_after_trickle = effects.load(Ordering::SeqCst);
+            let in_time = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let response = trickled
+                .expect("the trickled request must be answered within 20 s")
+                .expect("trickle I/O");
+            assert!(
+                response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+                "{response}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(effects_after_trickle, 0, "no handler for a refused request");
+            assert_eq!(extract_status(&in_time.unwrap()), 200);
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the in-time control is handled"
+            );
+        });
+    }
+
+    /// ft-xxfwy.55.15: every request the parser refuses, at the production
+    /// parse limits, gets its final status and `connection: close` instead of
+    /// a bare close, and no handler runs. The last case has no header fields
+    /// at all and arrives whole while the server checks for the HTTP/2
+    /// preface; it is answered (no Host, so 400) instead of left until the
+    /// keep-alive timeout closes it.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_malformed_requests_get_a_final_status() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let long_target = "a".repeat(9 * 1024);
+            let long_value = "v".repeat(9 * 1024);
+            let many_headers = "X-Extra: v\r\n".repeat(101);
+            let cases = [
+                (
+                    format!("POST /{long_target} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+                    "414 URI Too Long",
+                ),
+                (
+                    format!("POST /upload HTTP/1.1\r\nHost: localhost\r\n{many_headers}\r\n"),
+                    "431 Request Header Fields Too Large",
+                ),
+                (
+                    format!(
+                        "POST /upload HTTP/1.1\r\nHost: localhost\r\nX-Long: {long_value}\r\n\r\n"
+                    ),
+                    "431 Request Header Fields Too Large",
+                ),
+                (
+                    "BREW /upload HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                    "501 Not Implemented",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n"
+                        .to_string(),
+                    "501 Not Implemented",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                     Transfer-Encoding: chunked\r\n\r\nhello"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nBad Header: x\r\n\r\n"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     zz\r\nhello\r\n0\r\n\r\n"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                ("GET / HTTP/1.0\r\n\r\n".to_string(), "400 Bad Request"),
+            ];
+            let mut observed = Vec::new();
+            for (request, status) in &cases {
+                observed.push((request, *status, fetch_raw(addr, request.as_bytes()).await));
+            }
+            let effects_after_refusals = effects.load(Ordering::SeqCst);
+            let positive = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            for (request, status, response) in observed {
+                let case: String = request.chars().take(60).collect();
+                let response = response.unwrap_or_else(|err| panic!("{case:?}: {err}"));
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                    "{case:?} needs {status}: {response:?}"
+                );
+                assert_eq!(
+                    header_value(&response, "connection"),
+                    Some("close"),
+                    "{case:?}"
+                );
+            }
+            assert_eq!(
+                effects_after_refusals, 0,
+                "no handler for a refused request"
+            );
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the in-cap control is handled"
+            );
+        });
+    }
+
+    /// ft-xxfwy.55.15: the web server does not serve HTTP/2 prior knowledge
+    /// (h2c), whose path in the pinned server has no read timeouts and
+    /// validates only after the whole body. The preface and an empty
+    /// SETTINGS frame are refused as an HTTP/1.1 request: 501 and a close,
+    /// and no handler runs. Served as HTTP/2, they would get binary SETTINGS
+    /// frames and a connection that stays open past this exchange's 5 s
+    /// bound.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_h2c_preface_is_refused() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let refused = fetch_raw(
+                addr,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0",
+            )
+            .await;
+            let effects_after = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let response = refused.expect("the h2c preface must get a finite HTTP/1.1 response");
+            assert!(
+                response.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+                "{response:?}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(effects_after, 0, "no handler for the preface");
+        });
+    }
+
+    #[test]
+    fn web_openapi_discovery_invokes_advertised_health() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let started = Instant::now();
+            let server = timeout(
+                Duration::from_secs(5),
+                start_web_server(WebServerConfig::default().with_port(0)),
+            )
+            .await
+            .expect("owned loopback startup exceeded its deadline")
+            .expect("owned loopback server must start");
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(5), async {
+                // Return failures instead of panicking while the server is
+                // live: both failed and successful scenarios attempt cleanup.
+                ensure!(addr.ip().is_loopback(), "server must remain loopback-only");
+                let raw = fetch_raw(
+                    addr,
+                    b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .context("live discovery request must succeed")?;
+                ensure!(
+                    extract_status(&raw) == 200,
+                    "discovery must return HTTP 200"
+                );
+                let (headers, document) = raw.split_once("\r\n\r\n").context("response headers")?;
+                ensure!(
+                    headers.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-type")
+                                && value.trim().eq_ignore_ascii_case("application/json")
+                        })
+                    }),
+                    "discovery must have JSON content type"
+                );
+                let spec: serde_json::Value =
+                    serde_json::from_str(document).context("live document must be JSON")?;
+                ensure!(spec["openapi"] == "3.1.0", "OpenAPI version must match");
+                ensure!(
+                    spec["info"]["version"] == frankenterm_core::VERSION,
+                    "application version must match"
+                );
+                let paths = spec["paths"].as_object().context("live paths object")?;
+                // The same inventory as web::openapi's unit test: ten reads
+                // plus local viewer sign-in and sign-out.
+                let expected: std::collections::BTreeSet<_> = [
+                    "/health",
+                    "/auth/status",
+                    "/panes",
+                    "/events",
+                    "/search",
+                    "/bookmarks",
+                    "/ruleset-profile",
+                    "/saved-searches",
+                    "/stream/events",
+                    "/stream/deltas",
+                ]
+                .into_iter()
+                .map(|path| (path, "get"))
+                .chain([("/auth/session", "post"), ("/auth/session", "delete")])
+                .collect();
+                let mut documented = std::collections::BTreeSet::new();
+                let mut operation_ids = std::collections::BTreeSet::new();
+                for (path, item) in paths {
+                    for (method, operation) in item.as_object().context("path item")? {
+                        documented.insert((path.as_str(), method.as_str()));
+                        let id = operation["operationId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .context("nonempty operation ID")?;
+                        ensure!(operation_ids.insert(id), "operation IDs must be unique");
+                        ensure!(
+                            operation.get("security").is_none(),
+                            "the default server runs in private operator mode"
+                        );
+                    }
+                }
+                ensure!(
+                    documented == expected,
+                    "live document must describe exactly the live operations"
+                );
+                ensure!(
+                    spec.get("security").is_none(),
+                    "private mode has no cookie requirement"
+                );
+                ensure!(
+                    spec["components"].get("securitySchemes").is_none(),
+                    "no unwired auth schemes"
+                );
+                let (health_path, _) = paths
+                    .iter()
+                    .find(|(_, item)| item["get"]["operationId"] == "get_health")
+                    .context("health operation must be discoverable")?;
+                ensure!(
+                    health_path == "/health",
+                    "health operation must map to /health"
+                );
+                ensure!(
+                    paths.len() == 11,
+                    "review missing or newly exposed operations"
+                );
+                ensure!(
+                    !paths.contains_key("/openapi.json"),
+                    "document route must not describe itself"
+                );
+                let request = format!(
+                    "GET {health_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                );
+                let health = fetch_raw(addr, request.as_bytes())
+                    .await
+                    .context("advertised route must answer")?;
+                ensure!(
+                    extract_status(&health) == 200,
+                    "health must return HTTP 200"
+                );
+                let body: serde_json::Value = serde_json::from_str(extract_body(&health))
+                    .context("health response must be JSON")?;
+                ensure!(body["ok"] == true, "health must report success");
+                Ok::<_, anyhow::Error>((paths.len(), document.len()))
+            }))
+            .await;
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let (routes, document_bytes) = scenario
+                .expect("discovery scenario exceeded its deadline")
+                .expect("live discovery/health assertions must pass");
+            shutdown
+                .expect("owned server shutdown exceeded its deadline")
+                .expect("owned server must shut down cleanly");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.2.1",
+                    "scenario": "live_route_then_health",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "routes": routes, "document_bytes": document_bytes,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "teardown": "clean", "status": "passed",
+                })
+            );
+        });
+    }
+
+    /// These synthetic TCP responses test the client fixture's bounds, not
+    /// FrankenTerm's production HTTP parser or request-body admission policy.
+    #[test]
+    fn web_openapi_discovery_http_fixture_response_limits() {
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        run_async_test(async {
+            for (name, response, expected_error) in [
+                ("at_cap", vec![b'a'; 1024 * 1024], None),
+                (
+                    "over_cap",
+                    vec![b'a'; 1024 * 1024 + 1],
+                    Some("HTTP fixture response exceeds 1 MiB limit"),
+                ),
+                (
+                    "invalid_utf8",
+                    vec![0xff],
+                    Some("HTTP fixture response is not UTF-8"),
+                ),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let response_len = response.len();
+                let server_task = task::spawn(async move {
+                    timeout(Duration::from_secs(5), async {
+                        let (mut stream, _) = listener.accept().await?;
+                        let mut request = [0_u8; REQUEST.len()];
+                        stream.read_exact(&mut request).await?;
+                        stream.write_all(&response).await
+                    })
+                    .await
+                });
+                let result = fetch_raw(addr, REQUEST).await;
+                // Join the owned peer before assertions, including failure cases.
+                let peer = timeout(Duration::from_secs(5), server_task).await;
+                peer.expect("fixture peer join deadline")
+                    .expect("fixture peer task")
+                    .expect("fixture peer exchange deadline")
+                    .expect("fixture peer must send the complete response");
+                match expected_error {
+                    Some(message) => {
+                        let error = result.expect_err(name);
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{name}");
+                        assert_eq!(error.to_string(), message, "{name}");
+                    }
+                    None => assert_eq!(result.expect(name).len(), response_len, "{name}"),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn web_redaction_depth_limit_protects_stored_events() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _directory) =
+                timeout(Duration::from_secs(5), create_test_storage_with_pane(71))
+                    .await
+                    .expect("owned database startup deadline")
+                    .expect("owned database starts");
+            let startup = timeout(
+                Duration::from_secs(5),
+                start_web_server(
+                    WebServerConfig::default()
+                        .with_port(0)
+                        .with_storage(storage.clone())
+                        .with_storage_event_tail(false),
+                ),
+            )
+            .await;
+            if !matches!(&startup, Ok(Ok(_))) {
+                let _ = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            }
+            let server = startup
+                .expect("owned HTTP server startup deadline")
+                .expect("owned HTTP server starts");
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(5), async {
+                let canary = "sk-livetest1234567890abcdefghij";
+                let mut nested = serde_json::Value::String(canary.to_owned());
+                for _ in 0..70 {
+                    nested = serde_json::Value::Array(vec![nested]);
+                }
+                // Seed a real legacy/unredacted row. This deliberately tests
+                // read-side protection, independently of capture redaction.
+                let event_id = storage.record_event(StoredEvent {
+                    id: 0, pane_id: 71,
+                    rule_id: "test.web.depth".to_owned(),
+                    agent_type: "codex".to_owned(),
+                    event_type: "depth_control".to_owned(),
+                    severity: "info".to_owned(), confidence: 1.0,
+                    extracted: Some(serde_json::json!({ "safe": "keep-me", "nested": nested })),
+                    matched_text: Some("ordinary event".to_owned()),
+                    segment_id: None, detected_at: epoch_ms_now(), dedupe_key: None,
+                    handled_at: None, handled_by_workflow_id: None, handled_status: None,
+                }).await.context("seed legacy event")?;
+                let rows = storage.get_events(EventQuery {
+                    pane_id: Some(71), limit: Some(1), ..EventQuery::default()
+                }).await.context("verify real stored precondition")?;
+                ensure!(rows.len() == 1 && rows[0].id == event_id, "real row must exist");
+                ensure!(
+                    serde_json::to_string(&rows[0].extracted)?.contains(canary),
+                    "precondition must contain the canary before HTTP redaction"
+                );
+                let raw = fetch_raw(
+                    addr,
+                    b"GET /events?pane_id=71 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                ).await.context("live event read")?;
+                ensure!(extract_status(&raw) == 200, "event read must succeed");
+                ensure!(!raw.contains(canary), "HTTP response must not disclose deep secret");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(body["data"]["total"] == 1, "must return the actual event");
+                let event = &body["data"]["events"][0];
+                ensure!(event["id"] == event_id, "must return the seeded event ID");
+                ensure!(event["extracted"]["safe"] == "keep-me", "shallow safe data must survive");
+                ensure!(event["matched_text"] == "ordinary event", "ordinary text must survive");
+                ensure!(raw.contains("[REDACTED: depth limit]"), "omitted subtree must be explicit");
+                Ok::<_, anyhow::Error>(raw.len())
+            })).await;
+            let http_shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let storage_shutdown = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            let response_bytes = scenario
+                .expect("HTTP scenario deadline")
+                .expect("HTTP redaction assertions");
+            http_shutdown
+                .expect("HTTP teardown deadline")
+                .expect("HTTP teardown");
+            storage_shutdown
+                .expect("database teardown deadline")
+                .expect("database teardown");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.21", "scenario": "stored_event_http_depth",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "response_bytes": response_bytes, "teardown": "clean",
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn web_redaction_depth_limit_protects_live_sse() {
+        use anyhow::{Context, ensure};
+        use base64::Engine as _;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(72).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(8));
+            let server = timeout(
+                Duration::from_secs(5),
+                start_web_server(
+                    WebServerConfig::default()
+                        .with_port(0)
+                        .with_storage(storage.clone())
+                        .with_storage_event_tail(false)
+                        .with_event_bus(Arc::clone(&event_bus)),
+                ),
+            )
+            .await
+            .expect("owned SSE server startup deadline")
+            .expect("owned SSE server starts");
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(5), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(b"GET /stream/events?channel=all&pane_id=72&max_hz=100 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+                let canary = "sk-livetest1234567890abcdefghij";
+                let mut response = Vec::new();
+                let mut sent = false;
+                loop {
+                    let mut chunk = [0_u8; 2048];
+                    let count = read(&mut stream, &mut chunk).await?;
+                    ensure!(count != 0, "SSE must not close before delivering the event");
+                    ensure!(response.len() + count <= 64 * 1024, "SSE proof byte budget");
+                    response.extend_from_slice(&chunk[..count]);
+                    let raw = std::str::from_utf8(&response).context("ASCII synthetic SSE response")?;
+                    // The actual ready frame, not a timing sleep, proves that
+                    // this stream subscribed before its two synthetic events.
+                    if !sent && stream_frame_kind_count(raw, "ready") == 1 {
+                        ensure!(extract_status(raw) == 200, "SSE must return HTTP 200");
+                        ensure!(raw.contains("text/event-stream"), "SSE content type");
+                        let mut nested = serde_json::Value::String(canary.to_owned());
+                        for _ in 0..70 {
+                            nested = serde_json::Value::Array(vec![nested]);
+                        }
+                        let delivered = event_bus.publish(Event::PatternDetected {
+                            pane_id: 72, pane_uuid: None, event_id: None,
+                            detection: Detection {
+                                rule_id: "test.web.depth".to_owned(),
+                                agent_type: AgentType::Codex,
+                                event_type: "depth_control".to_owned(),
+                                severity: Severity::Info, confidence: 1.0,
+                                extracted: serde_json::json!({ "safe": "keep-me", "nested": nested }),
+                                matched_text: "ordinary event".to_owned(), span: (0, 0),
+                            },
+                        });
+                        ensure!(delivered == 1, "one owned subscriber must receive the detection");
+                        let decoded = serde_json::json!({
+                            "safe": "keep-me",
+                            "secret": canary,
+                            "padding": "x".repeat(13_000),
+                        });
+                        let source = serde_json::to_string(&decoded)?
+                            .replace("sk-", r"\u0073\u006b-");
+                        ensure!(!source.contains(canary), "raw JSON source hides the token from text-only matching");
+                        ensure!(serde_json::from_str::<serde_json::Value>(&source)?["secret"] == canary,
+                            "the browser-visible parsed transport must contain the canary before redaction");
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(source);
+                        ensure!(encoded.len() > 16_384, "encoded precondition exceeds the old shortcut");
+                        let delivered = event_bus.publish(Event::UserVarReceived {
+                            pane_id: 72,
+                            name: "FT_EVENT".to_owned(),
+                            payload: frankenterm_core::events::UserVarPayload {
+                                value: encoded,
+                                event_type: Some("encoded_control".to_owned()),
+                                event_data: Some(decoded),
+                            },
+                        });
+                        ensure!(delivered == 1, "one owned subscriber must receive the user-var");
+                        sent = true;
+                    }
+                    if stream_frame_kind_count(raw, "event") == 2 {
+                        ensure!(sent, "only the published events may satisfy the oracle");
+                        ensure!(!raw.contains(canary), "SSE must not disclose deep secret");
+                        ensure!(raw.contains("[REDACTED: depth limit]"), "SSE truncation marker");
+                        ensure!(raw.contains("keep-me") && raw.contains("ordinary event"), "safe event fields survive");
+                        let user_var = raw.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .find(|frame| frame["data"]["event"]["type"] == "user_var_received")
+                            .context("the actual user-var event must be delivered")?;
+                        let payload = &user_var["data"]["event"]["payload"];
+                        let encoded = payload["value"].as_str().context("encoded value stays a string")?;
+                        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+                        let decoded: serde_json::Value = serde_json::from_slice(&decoded)?;
+                        ensure!(decoded["safe"] == "keep-me", "encoded safe data survives");
+                        ensure!(decoded["secret"] == "[REDACTED]", "encoded secret must be redacted");
+                        ensure!(decoded["padding"] == "x".repeat(13_000), "large benign transport data must not be lost");
+                        ensure!(payload["event_data"]["safe"] == "keep-me", "decoded safe data survives");
+                        ensure!(payload["event_data"]["secret"] == "[REDACTED]", "decoded view is redacted too");
+                        return Ok::<_, anyhow::Error>(response.len());
+                    }
+                }
+            }).await;
+            let shutdown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                // Receiver drop wakes the independently scheduled producer;
+                // keep its release inside the same teardown deadline.
+                while event_bus.subscriber_count() != 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let bytes = scenario
+                .expect("SSE scenario deadline")
+                .expect("SSE redaction assertions");
+            shutdown
+                .expect("SSE teardown deadline")
+                .expect("SSE teardown");
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "owned subscription released"
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.21", "scenario": "live_event_sse_depth",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "response_bytes": bytes, "teardown": "clean",
+                })
+            );
+        });
+    }
+
+    /// Dropping an idle live handle cannot await graceful cleanup, but its
+    /// owned runtime guard must synchronously signal shutdown and wake the
+    /// listener so the accept task releases its socket.
+    #[test]
+    fn dropped_idle_web_server_handle_releases_listener() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let response = fetch_health(addr)
+                .await
+                .expect("server should answer before handle drop");
+            assert!(response.contains("200"));
+
+            drop(server);
+
+            let mut listener_closed = false;
+            for _ in 0..50 {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        drop(stream);
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(_) => {
+                        listener_closed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                listener_closed,
+                "Drop fallback must stop the serve task and release {addr}"
+            );
+        });
+    }
+
+    /// Keep both real SSE response bodies parked beyond the entire shutdown
+    /// budget. Shutdown must wake them; an eventual keepalive is not cleanup.
+    #[test]
+    fn idle_event_and_delta_streams_shutdown_without_keepalive() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 60,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .expect("idle-stream server starts");
+            let addr = server.bound_addr();
+            let mut clients = Vec::new();
+            let mut response_bytes = 0_usize;
+            for path in ["/stream/events", "/stream/deltas"] {
+                let client = timeout(Duration::from_secs(2), async {
+                    let mut client = TcpStream::connect(addr).await.unwrap();
+                    let request = format!(
+                        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    );
+                    client.write_all(request.as_bytes()).await.unwrap();
+                    let mut received = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let count = read(&mut client, &mut chunk).await.unwrap();
+                        assert_ne!(count, 0, "stream ended before readiness");
+                        assert!(received.len() + count <= 4096, "bounded ready frame");
+                        received.extend_from_slice(&chunk[..count]);
+                        let raw = String::from_utf8_lossy(&received);
+                        if raw.contains("event: ready") && raw.contains("\"kind\":\"ready\"") {
+                            assert_eq!(extract_status(&raw), 200);
+                            response_bytes += received.len();
+                            break;
+                        }
+                    }
+                    client
+                })
+                .await
+                .expect("real SSE response must reach ready before shutdown");
+                clients.push(client);
+            }
+            assert_eq!(event_bus.subscriber_count(), 2, "both streams are live");
+
+            let started = Instant::now();
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let elapsed = started.elapsed();
+            shutdown
+                .expect("shutdown must finish before the outer watchdog")
+                .expect("idle streams must not survive either drain phase");
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "subscriptions settle before return"
+            );
+            for mut client in clients {
+                timeout(Duration::from_secs(1), async {
+                    let mut trailing_bytes = 0_usize;
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let count = read(&mut client, &mut chunk).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        trailing_bytes += count;
+                        assert!(trailing_bytes <= 4096, "bounded terminal stream bytes");
+                    }
+                    response_bytes += trailing_bytes;
+                })
+                .await
+                .expect("both real clients must observe EOF after shutdown");
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "bead": "ft-xxfwy.55.13.1", "scenario": "idle_events_and_deltas_drain",
+                    "selected": 1, "executed": 1, "passed": 1, "failed": 0, "skipped": 0,
+                    "streams": 2, "subscribers_after": 0, "response_bytes": response_bytes,
+                    "shutdown_ms": elapsed.as_millis(), "keepalive_secs": 60, "teardown": "clean",
+                })
+            );
+        });
+    }
+
+    /// A connection that stalls mid-request must not serialize the accept
+    /// loop. A later health request should complete while the first connection
+    /// is still waiting for the rest of its request bytes.
+    #[test]
+    fn web_server_serves_concurrent_connection_while_prior_read_is_stalled() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let mut stalled = TcpStream::connect(addr)
+                .await
+                .expect("stalled connection should connect");
+            stalled
+                .write_all(b"G")
+                .await
+                .expect("partial request byte should write");
+
+            // Let the accept loop hand the partial request to a connection
+            // task before opening the independent health request.
+            sleep(Duration::from_millis(50)).await;
+            let health = Box::pin(timeout(Duration::from_millis(750), fetch_health(addr)))
+                .await
+                .expect("health request must not wait for the stalled connection")
+                .expect("health request should succeed");
+            assert!(health.contains("200"));
+
+            drop(stalled);
+            server.shutdown().await.expect("server should shut down");
+        });
+    }
+
+    /// Graceful shutdown must be bounded even when a client leaves an HTTP
+    /// request incomplete. The configured idle-read timeout closes the stuck
+    /// connection inside the server's bounded drain window.
+    #[test]
+    fn web_shutdown_bounds_stalled_connection_read() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("server should start");
+            let addr = server.bound_addr();
+            let mut stalled = TcpStream::connect(addr)
+                .await
+                .expect("stalled connection should connect");
+            stalled
+                .write_all(b"G")
+                .await
+                .expect("partial request byte should write");
+            sleep(Duration::from_millis(50)).await;
+
+            let started = Instant::now();
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown())
+                .await
+                .expect("bounded web shutdown must not hit the outer timeout");
+            let elapsed = started.elapsed();
+            shutdown.expect("stalled idle read should drain within the configured bound");
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "stalled-read shutdown exceeded its drain bound: {elapsed:?}"
+            );
+
+            let mut byte = [0_u8; 1];
+            match timeout(Duration::from_secs(1), stalled.read(&mut byte)).await {
+                Ok(Ok(0) | Err(_)) => {}
+                Ok(Ok(count)) => panic!(
+                    "stalled connection should close without response bytes, read {count} byte(s)"
+                ),
+                Err(error) => panic!("stalled connection remained open after shutdown: {error}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: verify
+    /// `start_web_server_with_cx` + `shutdown_with_cx` roundtrip
+    /// on an ephemeral port, identically to the legacy pair. An
+    /// uncancelled cx must not affect the happy path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_health_with_cx_ephemeral_port() {
+        run_async_test_with_cx(|cx, _| async move {
+            let server = start_web_server_with_cx(&cx, WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown_with_cx(&cx).await;
+
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert!(response.contains("200"));
+            assert!(response.contains("\"ok\":true"));
+        });
+    }
+
+    /// Cancellation requested by a completed startup hook is a post-startup
+    /// failure: shutdown hooks must run before the cancellation is returned.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_startup_cancellation_rolls_back_shutdown_hooks() {
+        run_async_test_with_cx(|cx, _| async move {
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let cx_for_hook = cx.clone();
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    cx_for_hook.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("cancel from web startup hook rollback test"),
+                    );
+                    Ok(())
+                })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app).await;
+
+            let error = result
+                .err()
+                .expect("post-hook cancellation must fail startup");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "primary cancellation must survive startup rollback: {error}"
+            );
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "post-startup cancellation must run shutdown hooks exactly once"
+            );
+        });
+    }
+
+    /// A fatal startup hook can abort after earlier hooks acquired resources;
+    /// shutdown hooks must roll those resources back before the fatal hook
+    /// error is returned.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_startup_abort_rolls_back_shutdown_hooks() {
+        run_async_test_with_cx(|cx, _| async move {
+            const PRIVATE_HOOK_DETAIL: &str = "fatal-startup-private-sentinel";
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let later_startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let later_startup_count_for_hook = Arc::clone(&later_startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .on_startup(|| Err(FrameworkStartupHookError::new(PRIVATE_HOOK_DETAIL)))
+                .on_startup(move || {
+                    later_startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            // An invalid bind address is a competing later failure: the exact
+            // startup error below proves we never reached bind resolution.
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, "not-a-socket-address".to_string(), app)
+                    .await;
+
+            let error = result.err().expect("fatal startup hook must abort startup");
+            assert!(
+                matches!(
+                    &error,
+                    frankenterm_core::Error::RuntimeOperation {
+                        operation,
+                        source: frankenterm_core::error::RuntimeOperationSource::Backend(detail),
+                    } if *operation == "web startup hooks" && detail == "web_startup_hook_aborted"
+                ),
+                "the finite startup failure must remain primary: {error}"
+            );
+            assert!(!error.to_string().contains(PRIVATE_HOOK_DETAIL));
+            assert!(!format!("{error:?}").contains(PRIVATE_HOOK_DETAIL));
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(later_startup_count.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "startup abort must run shutdown hooks exactly once"
+            );
+        });
+    }
+
+    /// A bind failure after successful startup hooks must also roll back the
+    /// hook lifecycle, while preserving the bind error as the primary result.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_bind_failure_rolls_back_shutdown_hooks() {
+        run_async_test_with_cx(|cx, _| async move {
+            let occupied = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("port reservation should bind");
+            let occupied_addr = occupied
+                .local_addr()
+                .expect("port reservation should expose its address");
+            let startup_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let startup_count_for_hook = Arc::clone(&startup_count);
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .on_startup(move || {
+                    startup_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, occupied_addr.to_string(), app).await;
+
+            let error = result.err().expect("occupied address must fail startup");
+            let error_message = error.to_string();
+            assert!(
+                error_message.contains("I/O")
+                    || error_message.contains("address")
+                    || error_message.contains("Address"),
+                "primary bind failure must survive startup rollback: {error_message}"
+            );
+            assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "bind failure must run shutdown hooks exactly once"
+            );
+            drop(occupied);
+        });
+    }
+
+    /// A caller that is already cancelled when it consumes a server handle
+    /// must still release the listener and complete graceful cleanup before
+    /// receiving the cancellation error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_shutdown_with_precancelled_cx_cleans_before_error() {
+        run_async_test_with_cx(|start_cx, shutdown_cx| async move {
+            let server =
+                start_web_server_with_cx(&start_cx, WebServerConfig::default().with_port(0))
+                    .await
+                    .expect("server should start with a live Cx");
+            let addr = server.bound_addr();
+            let response = fetch_health(addr)
+                .await
+                .expect("server should answer before shutdown");
+            assert!(response.contains("200"));
+
+            shutdown_cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancelled WebServerHandle shutdown test"),
+            );
+
+            let error = server
+                .shutdown_with_cx(&shutdown_cx)
+                .await
+                .expect_err("shutdown must surface cancellation after cleanup");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "shutdown should return the caller cancellation: {error}"
+            );
+
+            let reconnect = timeout(Duration::from_secs(1), TcpStream::connect(addr)).await;
+            assert!(
+                matches!(reconnect, Ok(Err(_))),
+                "listener must be closed before shutdown returns: {reconnect:?}"
+            );
+        });
+    }
+
+    /// Framework cleanup must run registered shutdown hooks before it observes
+    /// cancellation of the context supplied to the finish phase.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_finish_with_precancelled_cx_runs_shutdown_hooks() {
+        run_async_test_with_cx(|start_cx, finish_cx| async move {
+            let shutdown_count = Arc::new(AtomicUsize::new(0));
+            let shutdown_count_for_hook = Arc::clone(&shutdown_count);
+            let app = FrameworkApp::builder()
+                .get("/health", |_, _| async { FrameworkResponse::ok() })
+                .on_shutdown(move || {
+                    shutdown_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                })
+                .build();
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&start_cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("framework server should start");
+            let response = fetch_health(addr)
+                .await
+                .expect("framework server should answer before shutdown");
+            assert!(response.contains("200"));
+
+            runtime.signal_shutdown();
+            let join_result = runtime.join_handle_mut().await;
+            finish_cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancelled framework finish test"),
+            );
+
+            let error = runtime
+                .finish_with_cx(&finish_cx, join_result)
+                .await
+                .expect_err("finish must surface cancellation after shutdown hooks");
+            assert!(
+                error.to_string().contains("cancelled"),
+                "finish should return the cleanup-context cancellation: {error}"
+            );
+            assert_eq!(
+                shutdown_count.load(Ordering::SeqCst),
+                1,
+                "finish must run shutdown hooks exactly once before returning cancellation"
+            );
+        });
+    }
+
+    /// A handler that outlives both bounded drain phases must produce a
+    /// truthful drain error rather than a false successful-shutdown result.
+    /// The test releases the synthetic handler afterward so no task is left
+    /// behind in the test runtime.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_finish_reports_connection_that_survives_bounded_drain() {
+        run_async_test_with_cx(|cx, _| async move {
+            let handler_started = Arc::new(AtomicUsize::new(0));
+            let release_handler = Arc::new(AtomicUsize::new(0));
+            let started_for_handler = Arc::clone(&handler_started);
+            let release_for_handler = Arc::clone(&release_handler);
+            let app = FrameworkApp::builder()
+                .get("/stuck", move |_, _| {
+                    let started = Arc::clone(&started_for_handler);
+                    let release = Arc::clone(&release_for_handler);
+                    async move {
+                        started.store(1, Ordering::SeqCst);
+                        while release.load(Ordering::SeqCst) == 0 {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        FrameworkResponse::ok()
+                            .body(FrameworkResponseBody::Bytes(b"released".to_vec()))
+                    }
+                })
+                .build();
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("framework server should start");
+            let mut client = TcpStream::connect(addr)
+                .await
+                .expect("stuck-handler client should connect");
+            client
+                .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("stuck-handler request should write");
+
+            let handler_start = timeout(Duration::from_secs(1), async {
+                while handler_started.load(Ordering::SeqCst) == 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if let Err(error) = handler_start {
+                release_handler.store(1, Ordering::SeqCst);
+                panic!("stuck handler should start: {error}");
+            }
+
+            let started = Instant::now();
+            let finish_result = timeout(Duration::from_secs(6), async move {
+                runtime.signal_shutdown();
+                let join_result = runtime.join_handle_mut().await;
+                runtime.finish_with_cx(&cx, join_result).await
+            })
+            .await;
+            let elapsed = started.elapsed();
+            release_handler.store(1, Ordering::SeqCst);
+            let error = finish_result
+                .expect("two bounded drain phases must not hit the outer timeout")
+                .expect_err("a connection beyond both drain bounds must be reported");
+            let message = error.to_string();
+            assert!(
+                message.contains("active connection") && message.contains("drain"),
+                "bounded-drain failure must report the live connection: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "two bounded drain phases exceeded their combined limit: {elapsed:?}"
+            );
+
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+                .await
+                .expect("released synthetic connection should close")
+                .expect("released synthetic response should read");
+            assert!(
+                String::from_utf8_lossy(&response).contains("released"),
+                "released handler should complete its response"
+            );
+            task::yield_now().await;
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 323: Pre-cancelled cx must refuse to bind.
+    ///
+    /// `start_web_server_with_cx` has a pre-flight `cx.checkpoint()` at
+    /// the top of the function. A cx that is already cancelled when the
+    /// call is made must cause the function to return `Err` *before*
+    /// any TCP bind is attempted — an operator who has abandoned the
+    /// request should not leave a socket in LISTEN state.
+    ///
+    /// Complements:
+    /// - tick 322: metrics server mid-flight cancel stops accept loop
+    ///   (parallel service-boundary contract on a different server)
+    /// - `web_health_with_cx_ephemeral_port`: happy path (live cx binds)
+    ///
+    /// Together they pin three timings of the cx signal: pre-start (this
+    /// tick), mid-start (metrics), and happy (pre-existing). ft-xbnl0.2.4
+    /// acceptance criterion 1 covers "TCP, TLS, and HTTP client or
+    /// service boundaries"; this is a service-boundary test.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_server_with_cx_pre_cancelled_refuses_to_bind() {
+        run_async_test_with_cx(|cx, _| async move {
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancel web_server_with_cx test"),
+            );
+
+            let result =
+                start_web_server_with_cx(&cx, WebServerConfig::default().with_port(0)).await;
+
+            assert!(
+                result.is_err(),
+                "pre-cancelled cx must cause start_web_server_with_cx to fail (WebServerHandle does not impl Debug so result value is elided)"
+            );
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("cancelled") || err_msg.contains("start_web_server cancelled"),
+                "error should surface cancellation; got: {err_msg}"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 417: `run_web_server_with_cx` orchestrator-level
+    /// mid-flight cx-cancel completes graceful cleanup and then surfaces the
+    /// cancellation.
+    ///
+    /// Complements `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick 323),
+    /// which pins the pre-start timing. This test pins the mid-flight
+    /// timing: cx is live when `run_web_server_with_cx` is called, the
+    /// server binds and enters its `select! { join | shutdown_signal }`
+    /// orchestration, then the test confirms a health response before
+    /// cancelling the caller Cx.
+    ///
+    /// `wait_for_shutdown_signal_with_cx` checks the caller context every
+    /// 100 ms via `sleep_with_cx`, so cx-cancel must wake the shutdown branch,
+    /// which then runs `signal_shutdown` (including listener wake), followed by
+    /// drain and hooks before checking cancellation at the finish boundary.
+    /// Only after that cleanup completes may the outer future return the
+    /// cancellation error.
+    ///
+    /// This pins the orchestrator-level cx→shutdown wiring that was
+    /// previously only covered by the pre-cancel pre-bind path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_server_with_cx_mid_flight_cancel_surfaces_after_cleanup() {
+        run_async_test_with_cx(|cx, _| async move {
+            let cx_for_server = cx.clone();
+
+            // Reserve a currently free port so the test can prove the server
+            // completed startup before cancellation. There is an unavoidable
+            // small release/rebind race, but readiness is verified below.
+            let port_probe = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral-port probe should bind");
+            let addr = port_probe
+                .local_addr()
+                .expect("ephemeral-port probe should expose its address");
+            drop(port_probe);
+
+            let server_task = task::spawn(async move {
+                run_web_server_with_cx(
+                    &cx_for_server,
+                    WebServerConfig::default().with_port(addr.port()),
+                )
+                .await
+            });
+
+            let response = fetch_health(addr)
+                .await
+                .expect("server must start successfully before mid-flight cancellation");
+            assert!(response.contains("200"));
+
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("mid-flight cancel run_web_server_with_cx test"),
+            );
+
+            // The orchestrator should exit within one or two 100ms poll cycles
+            // plus graceful shutdown drain time.
+            let started = Instant::now();
+            let outer = timeout(Duration::from_secs(10), server_task).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "run_web_server_with_cx should exit within 5s of cx-cancel; took {elapsed:?}"
+            );
+            let join = outer.expect("outer timeout should not fire");
+            let inner = join.expect("run_web_server_with_cx task must not panic");
+            let error = inner.expect_err(
+                "run_web_server_with_cx must surface caller cancellation after cleanup",
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("cancelled") || message.contains("shutdown wait"),
+                "returned error must identify cancellation: {message}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Hardening tests (wa-nu4.3.6.3)
+    // =========================================================================
+
+    #[test]
+    fn default_config_binds_localhost() {
+        let config = WebServerConfig::default();
+        // Default should produce 127.0.0.1:8000
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("127.0.0.1"),
+            "default host must be 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn public_bind_rejected_without_opt_in() {
+        run_async_test(async {
+            let config = WebServerConfig::new(0).with_host("0.0.0.0");
+            let result = start_web_server(config).await;
+            assert!(result.is_err(), "public bind should be rejected by default");
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("refusing to bind")
+                    && err_msg.contains("no authentication boundary"),
+                "error should explain localhost-only auth boundary: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn public_bind_rejected_even_with_explicit_opt_in_without_auth() {
+        run_async_test(async {
+            let config = WebServerConfig::new(0)
+                .with_host("0.0.0.0")
+                .with_dangerous_public_bind();
+            let result = start_web_server(config).await;
+            assert!(
+                result.is_err(),
+                "public bind should fail closed until auth exists"
+            );
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("dangerous public-bind opt-in")
+                    && err_msg.contains("no authentication boundary"),
+                "error should explain why opt-in is insufficient: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn panes_returns_503_without_storage() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert!(
+                response.contains("503"),
+                "should return 503 without storage: {response}"
+            );
+            assert!(
+                response.contains("no_storage"),
+                "should include error code: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_requires_query_param() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            // Request /search without ?q= parameter
+            let req = b"GET /search HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            // Without storage, 503 takes precedence over the missing-query 400.
+            assert!(
+                response.contains("503") || response.contains("400"),
+                "should reject missing q: {response}"
+            );
+        });
+    }
+
+    // =========================================================================
+    // Schema / contract tests (wa-nu4.3.6.4)
+    // =========================================================================
+
+    #[test]
+    fn health_schema_parseable() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("health response not valid JSON: {e}\nbody: {body}"));
+
+            assert_eq!(json["ok"], true, "health.ok should be true");
+            assert!(
+                json["version"].is_string(),
+                "health.version should be a string"
+            );
+        });
+    }
+
+    #[test]
+    fn events_returns_503_without_storage() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert_eq!(extract_status(&response), 503);
+
+            // Response body should be valid JSON with the error envelope
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("events 503 not valid JSON: {e}\nbody: {body}"));
+            assert_eq!(json["ok"], false, "error response ok should be false");
+            assert!(json["error_code"].is_string(), "should include error_code");
+        });
+    }
+
+    #[test]
+    fn panes_503_has_json_envelope() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("panes 503 not valid JSON: {e}\nbody: {body}"));
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], "no_storage");
+            assert!(
+                json["version"].is_string(),
+                "envelope should include version"
+            );
+        });
+    }
+
+    #[test]
+    fn unknown_route_returns_404() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert_eq!(
+                extract_status(&response),
+                404,
+                "unknown route should 404: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn post_method_not_allowed() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            let status = extract_status(&response);
+            assert!(
+                status == 404 || status == 405,
+                "POST should be rejected (404 or 405), got {status}: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_fetch_prefix_times_out_on_stalled_body() {
+        run_async_test(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server_task = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let mut req_buf = [0_u8; 512];
+                let _ = timeout(Duration::from_millis(250), read(&mut stream, &mut req_buf)).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                sleep(Duration::from_secs(1)).await;
+                Ok::<(), std::io::Error>(())
+            });
+
+            let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let start = Instant::now();
+            let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256)
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(700),
+                "fetch should return after read timeout, elapsed={elapsed:?}"
+            );
+            assert!(
+                response.contains("HTTP/1.1 200 OK"),
+                "expected partial HTTP response headers: {response}"
+            );
+
+            let _ = timeout(Duration::from_secs(2), server_task).await;
+        });
+    }
+
+    #[test]
+    fn stream_deltas_emits_schema_and_redacts_content() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let runtime_limits = WebRuntimeLimits {
+                max_list_limit: 50,
+                default_list_limit: 10,
+                max_request_body_bytes: 1024,
+                stream_default_max_hz: 200,
+                stream_max_max_hz: 200,
+                stream_keepalive_secs: 1,
+                stream_scan_limit: 4,
+                stream_scan_max_pages: 2,
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(runtime_limits)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 1).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+            let content = format!("auth {secret} ! done");
+            let seg = storage.append_segment(7, &content, None).await.unwrap();
+            let _ = event_bus.publish(Event::SegmentCaptured {
+                pane_id: 7,
+                seq: seg.seq,
+                content_len: seg.content_len,
+            });
+
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            assert!(
+                response.contains("text/event-stream"),
+                "SSE content-type header expected: {response}"
+            );
+
+            let delta_data = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .find(|line| line.contains("\"kind\":\"delta\""))
+                .expect("missing delta frame in SSE response");
+            let frame: serde_json::Value = serde_json::from_str(delta_data).unwrap();
+
+            assert_eq!(frame["schema"], "ft.stream.v1");
+            assert_eq!(frame["stream"], "deltas");
+            assert_eq!(frame["kind"], "delta");
+            assert_eq!(frame["data"]["pane_id"], 7);
+
+            let redacted = frame["data"]["content"]
+                .as_str()
+                .expect("delta content should be a string");
+            assert!(
+                redacted.contains("[REDACTED"),
+                "content must be redacted: {redacted:?}"
+            );
+            assert!(
+                !redacted.contains("sk-abc123"),
+                "raw secret should not appear"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_deltas_drains_backlog_beyond_single_scan_window() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let runtime_limits = WebRuntimeLimits {
+                max_list_limit: 50,
+                default_list_limit: 10,
+                max_request_body_bytes: 1024,
+                stream_default_max_hz: 1000,
+                stream_max_max_hz: 1000,
+                stream_keepalive_secs: 1,
+                stream_scan_limit: 2,
+                stream_scan_max_pages: 1,
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(runtime_limits)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/deltas?pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 5).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            let mut expected_segment_ids = Vec::new();
+            let mut last_seq = 0_u64;
+            let mut last_content_len = 0_usize;
+            for i in 0..5_u64 {
+                let content = format!("delta backlog payload {i}: {}", "x".repeat(96));
+                let seg = storage.append_segment(7, &content, None).await.unwrap();
+                expected_segment_ids.push(seg.id);
+                last_seq = seg.seq;
+                last_content_len = seg.content_len;
+            }
+            let _ = event_bus.publish(Event::SegmentCaptured {
+                pane_id: 7,
+                seq: last_seq,
+                content_len: last_content_len,
+            });
+
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            let delta_segment_ids: Vec<i64> = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|frame| frame["kind"] == "delta")
+                .map(|frame| {
+                    frame["data"]["segment_id"]
+                        .as_i64()
+                        .expect("delta segment_id should be an integer")
+                })
+                .collect();
+
+            assert_eq!(
+                delta_segment_ids, expected_segment_ids,
+                "SSE delta stream should drain all stored backlog pages: {response}"
+            );
+        });
+    }
+
+    fn durable_stream_fixture(text: &str, detected_at: i64) -> StoredEvent {
+        StoredEvent {
+            id: 0,
+            pane_id: 7,
+            rule_id: "test.durable.stream".to_owned(),
+            agent_type: "codex".to_owned(),
+            event_type: "durable_stream_test".to_owned(),
+            severity: "info".to_owned(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some(text.to_owned()),
+            segment_id: None,
+            detected_at,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    fn durable_stream_ids(raw: &str) -> Vec<i64> {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame["kind"] == "event" && frame["data"]["delivery"] == "durable")
+            .map(|frame| frame["data"]["event"]["event_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    async fn read_event_stream_until(
+        stream: &mut TcpStream,
+        response: &mut Vec<u8>,
+        kind: &str,
+        count: usize,
+    ) -> anyhow::Result<String> {
+        loop {
+            let raw = String::from_utf8_lossy(response);
+            if stream_frame_kind_count(&raw, kind) >= count {
+                return Ok(raw.into_owned());
+            }
+            let mut chunk = [0_u8; 2048];
+            let read_count = read(stream, &mut chunk).await?;
+            anyhow::ensure!(read_count != 0, "stream ended before {kind}");
+            anyhow::ensure!(
+                response.len() + read_count <= 256 * 1024,
+                "stream byte budget"
+            );
+            response.extend_from_slice(&chunk[..read_count]);
+        }
+    }
+
+    #[test]
+    fn stream_events_uses_storage_for_fresh_ordered_recoverable_delivery() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let old_id = storage
+                .record_event(durable_stream_fixture("old_baseline_row", 1))
+                .await
+                .unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 1,
+                stream_max_max_hz: 1000,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(12), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(b"GET /stream/events?channel=all&pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+                let mut response = Vec::new();
+                let ready_raw = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                ensure!(extract_status(&ready_raw) == 200, "fresh stream must start");
+                let ready = ready_raw.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|frame| frame["kind"] == "ready")
+                    .context("ready frame")?;
+                let baseline = ready["data"]["cursor"].as_str().context("ready durable cursor")?;
+                ensure!(baseline.starts_with("event-v1:"), "versioned checkpoint");
+                ensure!(baseline.ends_with(&format!(":pane:7:{old_id}")), "fresh high-water boundary");
+                ensure!(ready_raw.lines().any(|line| line == format!("id: {baseline}")), "ready sets Last-Event-ID");
+                let baseline = baseline.to_owned();
+
+                let first = storage.record_event(durable_stream_fixture("stored_first", 10)).await?;
+                let second = storage.record_event(durable_stream_fixture("stored_second", 11)).await?;
+                // Reversed notifications carry deliberately wrong content.
+                // Only the durable rows may determine order and payload.
+                for event_id in [second, first] {
+                    let _ = event_bus.publish(Event::PatternDetected {
+                        pane_id: 7,
+                        pane_uuid: None,
+                        event_id: Some(event_id),
+                        detection: Detection {
+                            rule_id: "forged_bus_payload".to_owned(),
+                            agent_type: AgentType::Codex,
+                            event_type: "forged_bus_payload".to_owned(),
+                            severity: Severity::Info,
+                            confidence: 1.0,
+                            extracted: serde_json::Value::Null,
+                            matched_text: "forged_bus_payload".to_owned(),
+                            span: (0, 0),
+                        },
+                    });
+                }
+                let raw = read_event_stream_until(&mut stream, &mut response, "event", 2).await?;
+                ensure!(durable_stream_ids(&raw) == [first, second], "fresh durable ordering");
+                ensure!(raw.contains("stored_first") && raw.contains("stored_second"), "storage payloads");
+                ensure!(!raw.contains("old_baseline_row") && !raw.contains("forged_bus_payload"), "baseline and notification payloads excluded");
+                let first_token = raw.lines().filter_map(|line| line.strip_prefix("id: "))
+                    .find(|token| token.ends_with(&format!(":pane:7:{first}")))
+                    .context("first event cursor")?.to_owned();
+
+                // A committed row with no notification must be discovered
+                // even while unrelated pane traffic prevents bus idleness.
+                let third = storage.record_event(durable_stream_fixture("stored_without_wakeup", 12)).await?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while durable_stream_ids(&String::from_utf8_lossy(&response)).len() < 3 {
+                    ensure!(Instant::now() < deadline, "periodic catchup starved by bus traffic");
+                    let _ = event_bus.publish(Event::SegmentCaptured {
+                        pane_id: 999,
+                        seq: 0,
+                        content_len: 0,
+                    });
+                    let mut chunk = [0_u8; 2048];
+                    match timeout(Duration::from_millis(20), read(&mut stream, &mut chunk)).await {
+                        Ok(Ok(count)) => {
+                            ensure!(count != 0, "durable stream closed during catchup");
+                            ensure!(response.len() + count <= 256 * 1024, "stream byte budget");
+                            response.extend_from_slice(&chunk[..count]);
+                        }
+                        Ok(Err(error)) => return Err(error.into()),
+                        Err(_) => {}
+                    }
+                }
+                let raw = String::from_utf8(response)?;
+                ensure!(durable_stream_ids(&raw) == [first, second, third], "lost wakeup repaired once");
+                let third_token = raw.lines().filter_map(|line| line.strip_prefix("id: "))
+                    .find(|token| token.ends_with(&format!(":pane:7:{third}")))
+                    .context("third event cursor")?.to_owned();
+                drop(stream);
+
+                // The ready checkpoint alone suffices if a client disconnects
+                // before it receives its first persisted detection.
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={baseline}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let replay = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "event", 3).await?;
+                ensure!(durable_stream_ids(&replay) == [first, second, third], "ready checkpoint reconnect");
+
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={third_token}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: {first_token}\r\nConnection: close\r\n\r\n");
+                let replay = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "event", 2).await?;
+                ensure!(durable_stream_ids(&replay) == [second, third], "header overrides URL without duplicates");
+
+                // Prune an unseen row between the resume boundary and the
+                // retained suffix. The stream must stop before that suffix.
+                let deleted = storage.delete_events_before(12, 256).await?;
+                ensure!(deleted >= 2, "retention fixture deletes the unseen second row");
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={first_token}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let gap = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "cursor_discontinuity", 1).await?;
+                ensure!(gap.contains("retention_pruned") && gap.contains("\"terminal\":true"), "explicit terminal retention gap");
+                ensure!(durable_stream_ids(&gap).is_empty(), "retained suffix must not conceal the gap");
+                let ids: Vec<_> = gap.lines().filter_map(|line| line.strip_prefix("id: ")).collect();
+                ensure!(ids == [first_token.as_str()], "gap must preserve the ready checkpoint");
+
+                let epoch = baseline.split(':').nth(1).context("cursor epoch")?;
+                let different_epoch = if epoch == "0".repeat(32) { "1".repeat(32) } else { "0".repeat(32) };
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor=event-v1:{different_epoch}:pane:7:{third}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let reset = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "cursor_discontinuity", 1).await?;
+                ensure!(reset.contains("cursor_epoch_mismatch"), "database epoch cannot be adopted on reconnect");
+                ensure!(!reset.lines().any(|line| line.starts_with("id: ")), "rejected epoch must not install a checkpoint");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("durable stream teardown deadline")
+                .expect("durable stream teardown");
+            scenario
+                .expect("durable stream scenario deadline")
+                .expect("durable stream assertions");
+            assert_eq!(event_bus.subscriber_count(), 0);
+        });
+    }
+
+    #[test]
+    fn stream_events_rejects_ambiguous_cursors_and_requires_durable_storage() {
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(8));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_event_bus(event_bus),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let token = "event-v1:0123456789abcdef0123456789abcdef:all:0";
+            let requests = [
+                (
+                    "channel=all".to_owned(),
+                    "",
+                    503,
+                    "event_replay_unavailable",
+                ),
+                (
+                    "channel=detections".to_owned(),
+                    "",
+                    503,
+                    "event_replay_unavailable",
+                ),
+                (
+                    "channel=detections&since_id=0".to_owned(),
+                    "",
+                    400,
+                    "invalid_event_cursor",
+                ),
+                (
+                    "channel=detections".to_owned(),
+                    "Last-Event-ID: 0\r\n",
+                    400,
+                    "invalid_event_cursor",
+                ),
+                (
+                    format!("channel=signals&cursor={token}"),
+                    "",
+                    400,
+                    "event_cursor_channel_mismatch",
+                ),
+                (
+                    format!("channel=detections&pane_id=7&cursor={token}"),
+                    "",
+                    400,
+                    "event_cursor_scope_mismatch",
+                ),
+            ];
+            let mut responses = Vec::new();
+            for (query, header, status, code) in requests {
+                let request = format!(
+                    "GET /stream/events?{query} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n"
+                );
+                responses.push((fetch_raw(addr, request.as_bytes()).await, status, code));
+            }
+            let signal = fetch_stream_until_kind_count(
+                addr,
+                b"GET /stream/events?channel=signals HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                Duration::from_secs(2),
+                "ready",
+                1,
+            )
+            .await;
+            server.shutdown().await.unwrap();
+            for (response, status, code) in responses {
+                let response = response.unwrap();
+                assert_eq!(extract_status(&response), status, "{response}");
+                assert!(response.contains(code), "{response}");
+            }
+            let signal = signal.unwrap();
+            assert_eq!(extract_status(&signal), 200, "{signal}");
+            assert_eq!(stream_frame_kind_count(&signal, "ready"), 1);
+            assert!(!signal.lines().any(|line| line.starts_with("id: ")));
+        });
+    }
+
+    #[test]
+    fn stream_events_reports_lag_and_releases_subscriber() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(11).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(2));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/events?channel=detections&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_until_kind_count(addr, req, Duration::from_secs(4), "lag", 1).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            for i in 0..64_u64 {
+                let detection = Detection {
+                    rule_id: format!("core.test:{i}"),
+                    agent_type: AgentType::Codex,
+                    event_type: "usage_reached".to_string(),
+                    severity: Severity::Warning,
+                    confidence: 1.0,
+                    extracted: serde_json::json!({
+                        "token": "sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "index": i
+                    }),
+                    matched_text: format!(
+                        "usage reached with secret sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb #{i}"
+                    ),
+                    span: (0, 0),
+                };
+                let _ = event_bus.publish(Event::PatternDetected {
+                    pane_id: 11,
+                    pane_uuid: None,
+                    detection,
+                    event_id: None,
+                });
+            }
+
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            storage.shutdown().await.unwrap();
+            assert!(
+                response.contains("event: lag") || response.contains("\"kind\":\"lag\""),
+                "expected lag event in stream output: {response}"
+            );
+
+            for _ in 0..20 {
+                if event_bus.subscriber_count() == 0 {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "subscriber should be released after disconnect"
+            );
+        });
+    }
+}

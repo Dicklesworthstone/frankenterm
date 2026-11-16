@@ -1,0 +1,51 @@
+302:    storage_lock_contention_events: ShardedCounter,
+314:    cursor_snapshot_bytes_max: ShardedMax,
+316:    cursor_snapshot_bytes_last: ShardedGauge,
+344:            storage_lock_contention_events: ShardedCounter::new(),
+350:            cursor_snapshot_bytes_max: ShardedMax::new(),
+351:            cursor_snapshot_bytes_last: ShardedGauge::new(),
+382:            self.storage_lock_contention_events.increment();
+398:        self.cursor_snapshot_bytes_max.observe(total_bytes);
+399:        self.cursor_snapshot_bytes_last.set(total_bytes);
+456:    pub fn max_storage_lock_wait_ms(&self) -> f64 {
+461:    pub fn storage_lock_contention_events(&self) -> u64 {
+462:        self.storage_lock_contention_events.get()
+479:    pub fn max_storage_lock_hold_ms(&self) -> f64 {
+484:    pub fn cursor_snapshot_bytes_last(&self) -> u64 {
+485:        self.cursor_snapshot_bytes_last.get_max()
+489:    pub fn cursor_snapshot_bytes_max(&self) -> u64 {
+490:        self.cursor_snapshot_bytes_max.get()
+495:    pub fn avg_cursor_snapshot_bytes(&self) -> f64 {
+918:                let cursor_snapshot_bytes = metrics.cursor_snapshot_bytes_last();
+1217:                    if metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+1220:                            metrics.max_storage_lock_wait_ms(),
+1222:                            metrics.storage_lock_contention_events()
+1225:                    if metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+1228:                            metrics.max_storage_lock_hold_ms(),
+1236:                            bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
+2266:const STORAGE_LOCK_WAIT_WARN_MS: f64 = 15.0;
+2268:const STORAGE_LOCK_HOLD_WARN_MS: f64 = 75.0;
+2501:        if self.metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+2504:                self.metrics.max_storage_lock_wait_ms(),
+2506:                self.metrics.storage_lock_contention_events()
+2509:        if self.metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+2512:                self.metrics.max_storage_lock_hold_ms(),
+2520:                bytes_to_mib(self.metrics.cursor_snapshot_bytes_max()),
+2995:        assert!((metrics.max_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+2996:        assert_eq!(metrics.storage_lock_contention_events(), 0);
+2998:        assert!((metrics.max_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+3006:        assert!(metrics.max_storage_lock_wait_ms() >= 2.0);
+3007:        assert_eq!(metrics.storage_lock_contention_events(), 1);
+3009:        assert!(metrics.max_storage_lock_hold_ms() >= 10.0);
+3016:        assert_eq!(metrics.cursor_snapshot_bytes_last(), 0);
+3017:        assert_eq!(metrics.cursor_snapshot_bytes_max(), 0);
+3018:        assert!((metrics.avg_cursor_snapshot_bytes() - 0.0).abs() < f64::EPSILON);
+3023:        assert_eq!(metrics.cursor_snapshot_bytes_last(), 4096);
+3024:        assert_eq!(metrics.cursor_snapshot_bytes_max(), 4096);
+3025:        assert!((metrics.avg_cursor_snapshot_bytes() - 2560.0).abs() < f64::EPSILON);
+3191:        assert!(metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS);
+3195:            metrics.max_storage_lock_wait_ms(),
+3197:            metrics.storage_lock_contention_events()
+3208:        assert!(metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS);
+3212:            metrics.max_storage_lock_hold_ms(),
+3227:            bytes_to_mib(metrics.cursor_snapshot_bytes_max()),

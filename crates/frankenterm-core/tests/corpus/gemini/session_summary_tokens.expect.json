@@ -1,0 +1,17 @@
+[
+  {
+    "rule_id": "gemini.session.summary",
+    "agent_type": "gemini",
+    "event_type": "session.summary",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "abcdef12-3456-7890-abcd-ef1234567890",
+      "tool_calls": "12",
+      "tokens_used": "9,876",
+      "input_tokens": "6,000",
+      "output_tokens": "3,876"
+    },
+    "matched_text": "Session ID: abcdef12-3456-7890-abcd-ef1234567890 Tool Calls: 12 Tokens Used: 9,876 Input Tokens: 6,000 Output Tokens: 3,876"
+  }
+]

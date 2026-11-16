@@ -1,0 +1,1880 @@
+//! Outbound MCP client support (feature: `mcp-client`).
+//!
+//! This module provides a framework-backed outbound MCP client surface for:
+//! - configuration-driven MCP server discovery,
+//! - deterministic server selection,
+//! - outbound tool invocation with mapped errors.
+
+use crate::config::{Config, McpClientConfig};
+use crate::mcp_framework::{
+    DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode, OutboundFrameworkClient,
+    OutboundFrameworkError, discover_server_configs,
+};
+use crate::policy::Redactor;
+use std::sync::LazyLock;
+use std::time::Instant;
+
+pub use frankenterm_core_mcp::{
+    ExternalServerConfig, McpClientContentItem, McpClientError, McpClientResult,
+    McpClientToolDefinition,
+};
+
+const LOG_TARGET: &str = "ft::mcp_client";
+
+const ERR_DISABLED: &str = "mcp_client.disabled";
+const ERR_DISCOVERY_DISABLED: &str = "mcp_client.discovery_disabled";
+const ERR_SERVER_NOT_FOUND: &str = "mcp_client.server_not_found";
+const ERR_SERVER_DISABLED: &str = "mcp_client.server_disabled";
+const ERR_SPAWN: &str = "mcp_client.spawn_failed";
+const ERR_TIMEOUT: &str = "mcp_client.timeout";
+const ERR_METHOD_NOT_FOUND: &str = "mcp_client.method_not_found";
+const ERR_INVALID_PARAMS: &str = "mcp_client.invalid_params";
+const ERR_TOOL_EXECUTION: &str = "mcp_client.tool_execution";
+const ERR_REQUEST_CANCELLED: &str = "mcp_client.request_cancelled";
+const ERR_UNSUPPORTED: &str = "mcp_client.unsupported";
+const ERR_PROTOCOL: &str = "mcp_client.protocol";
+// br-ft-m3c9s: distinguishable framework-error variants get
+// dedicated codes so operators can triage by class instead of
+// reading the redacted remote message text.
+const ERR_PARSE: &str = "mcp_client.parse_error";
+const ERR_RESOURCE_NOT_FOUND: &str = "mcp_client.resource_not_found";
+const ERR_RESOURCE_FORBIDDEN: &str = "mcp_client.resource_forbidden";
+const ERR_PROMPT_NOT_FOUND: &str = "mcp_client.prompt_not_found";
+
+/// Outbound MCP client wrapper.
+pub struct FtMcpClient {
+    client: OutboundFrameworkClient,
+    server: ExternalServerConfig,
+}
+
+impl FtMcpClient {
+    /// Connect to an external MCP server via stdio subprocess.
+    pub async fn connect_external(
+        cx: &crate::cx::Cx,
+        server: ExternalServerConfig,
+        settings: &McpClientConfig,
+    ) -> McpClientResult<Self> {
+        if !settings.enabled {
+            return Err(client_disabled_error());
+        }
+
+        if server.disabled {
+            return Err(server_disabled_error(&server.name));
+        }
+
+        let start = Instant::now();
+        let client = OutboundFrameworkClient::connect_stdio(cx, &server, settings)
+            .await
+            .map_err(|err| map_mcp_error(&server.name, err))?;
+        let configured_response_timeout_ms = client.configured_response_timeout_ms();
+        let log_server = redact_mcp_client_text(&server.name);
+        let log_command = redact_mcp_client_text(&server.command);
+
+        tracing::info!(
+            target: LOG_TARGET,
+            event = "mcp_client_connect",
+            server = %log_server,
+            command = %log_command,
+            configured_response_timeout_ms,
+            elapsed_ms = start.elapsed().as_millis(),
+            "Connected outbound MCP client"
+        );
+
+        Ok(Self { client, server })
+    }
+
+    /// Discover and connect to a configured server.
+    ///
+    /// Selection order:
+    /// 1. `requested_server` if provided,
+    /// 2. first enabled entry in `mcp_client.preferred_servers`,
+    /// 3. first enabled discovered server (alphabetical by name).
+    pub async fn connect_from_config(
+        cx: &crate::cx::Cx,
+        config: &Config,
+        requested_server: Option<&str>,
+    ) -> McpClientResult<Self> {
+        let discovered = discover_servers(config)?;
+        let selected = select_server(config, &discovered, requested_server)?;
+        Self::connect_external(cx, selected, &config.mcp_client).await
+    }
+
+    /// List tools from the connected server.
+    pub fn list_tools(&mut self) -> McpClientResult<Vec<McpClientToolDefinition>> {
+        let start = Instant::now();
+        let log_server = redact_mcp_client_text(&self.server.name);
+        match self.client.list_tool_definitions() {
+            Ok(tools) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "mcp_client_list_tools",
+                    server = %log_server,
+                    tool_count = tools.len(),
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Listed outbound MCP tools"
+                );
+                Ok(tools)
+            }
+            Err(err) => {
+                let mapped = match err {
+                    OutboundFrameworkError::Transport(err) => map_mcp_error(&self.server.name, err),
+                    OutboundFrameworkError::Mapping(err) => err,
+                };
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "mcp_client_list_tools_failed",
+                    server = %log_server,
+                    code = mapped.code,
+                    message = %mapped.message,
+                    "Failed to list outbound MCP tools"
+                );
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Call a remote tool, bounded by the connection's configured timeout.
+    pub fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
+        self.call_tool_bounded(None, name, arguments)
+    }
+
+    /// Call a remote tool, also bounded by `cx`: cancelling it or exhausting
+    /// its budget cancels the in-flight request instead of waiting out the
+    /// connection's configured timeout.
+    pub fn call_tool_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
+        self.call_tool_bounded(Some(cx), name, arguments)
+    }
+
+    fn call_tool_bounded(
+        &mut self,
+        cx: Option<&crate::cx::Cx>,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
+        let start = Instant::now();
+        let log_server = redact_mcp_client_text(&self.server.name);
+        let log_tool = redact_mcp_client_text(name);
+        let outcome = match cx {
+            Some(cx) => self.client.call_tool_content_with_cx(cx, name, arguments),
+            None => self.client.call_tool_content(name, arguments),
+        };
+        match outcome {
+            Ok(content) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "mcp_client_call_tool",
+                    server = %log_server,
+                    tool = %log_tool,
+                    content_items = content.len(),
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Executed outbound MCP tool"
+                );
+                Ok(content)
+            }
+            Err(err) => {
+                let mapped = match err {
+                    OutboundFrameworkError::Transport(err) => map_mcp_error(&self.server.name, err),
+                    OutboundFrameworkError::Mapping(err) => err,
+                };
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event = "mcp_client_call_tool_failed",
+                    server = %log_server,
+                    tool = %log_tool,
+                    code = mapped.code,
+                    message = %mapped.message,
+                    "Failed outbound MCP tool execution"
+                );
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Connected server name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.server.name
+    }
+
+    /// Gracefully terminate the outbound MCP subprocess.
+    pub fn shutdown(self) -> McpClientResult<()> {
+        self.client
+            .shutdown()
+            .map_err(|err| map_mcp_error(&self.server.name, err))
+    }
+}
+
+/// Discover external MCP servers from configured search paths.
+pub fn discover_servers(config: &Config) -> McpClientResult<Vec<ExternalServerConfig>> {
+    let settings = &config.mcp_client;
+    if !settings.enabled {
+        return Err(client_disabled_error());
+    }
+    if !settings.discovery_enabled {
+        return Err(discovery_disabled_error());
+    }
+    if !settings.include_default_paths && settings.discovery_paths.is_empty() {
+        tracing::info!(
+            target: LOG_TARGET,
+            event = "mcp_client_discover_empty",
+            include_default_paths = settings.include_default_paths,
+            "Outbound MCP discovery disabled for default paths and no explicit discovery paths configured"
+        );
+        return Ok(Vec::new());
+    }
+
+    let DiscoveredFrameworkServers {
+        search_paths,
+        servers: discovered,
+    } = discover_server_configs(settings)?;
+
+    tracing::info!(
+        target: LOG_TARGET,
+        event = "mcp_client_discover",
+        discovered_count = discovered.len(),
+        search_path_count = search_paths.len(),
+        "Discovered outbound MCP servers"
+    );
+    let redacted_search_paths: Vec<String> = search_paths
+        .iter()
+        .map(|path| redact_mcp_client_text(path))
+        .collect();
+    tracing::debug!(
+        target: LOG_TARGET,
+        event = "mcp_client_discover_paths",
+        paths = ?redacted_search_paths,
+        "Outbound MCP client discovery search paths"
+    );
+
+    Ok(discovered)
+}
+
+/// Select a server from discovered entries.
+pub fn select_server(
+    config: &Config,
+    discovered: &[ExternalServerConfig],
+    requested_server: Option<&str>,
+) -> McpClientResult<ExternalServerConfig> {
+    if let Some(requested) = requested_server {
+        let requested_trimmed = requested.trim();
+        let selected = discovered
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(requested_trimmed))
+            .cloned()
+            .ok_or_else(|| server_not_found_error(requested_trimmed))?;
+        if selected.disabled {
+            return Err(server_disabled_error(&selected.name));
+        }
+        return Ok(selected);
+    }
+
+    for preferred in &config.mcp_client.preferred_servers {
+        let preferred = preferred.trim();
+        if preferred.is_empty() {
+            continue;
+        }
+        if let Some(found) = discovered
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(preferred))
+        {
+            if !found.disabled {
+                return Ok(found.clone());
+            }
+        }
+    }
+
+    discovered
+        .iter()
+        .find(|item| !item.disabled)
+        .cloned()
+        .ok_or_else(|| {
+            server_not_found_error(
+                "no enabled outbound MCP servers discovered (check mcp_client discovery paths)",
+            )
+        })
+}
+
+// ─── br-ft-62jai: UCB1 bandit-aware server selection ─────────────────────
+//
+// Adaptive selection over multiple discovered servers using
+// `crate::ucb1_bandit::Ucb1Bandit` (Auer, Cesa-Bianchi, Fischer
+// 2002). Complements the existing preference-list `select_server`
+// for callers that want regret-bounded adaptation to per-tool
+// latency variation + server-health drift.
+//
+// Integration shape: caller maintains its own `Ucb1Bandit`
+// (typically per-tool, dimensioned to `discovered.len()`). On each
+// invocation:
+//
+// ```ignore
+// let arm = select_server_via_bandit(&discovered, requested, &bandit, &allowed)?;
+// let server = &discovered[arm];
+// // ... invoke server, observe success + latency ...
+// report_server_outcome(&mut bandit, arm, success, latency_ms);
+// ```
+//
+// The bandit converges to the empirically-fastest healthy server
+// over O(ln T) suboptimal pulls per Auer's Theorem 1. Per-tool
+// bandits adapt to the case where server A is fast for `wa.search`
+// but slow for `wa.get_text`.
+
+/// br-ft-62jai: select a server via UCB1 bandit. Honors explicit
+/// `requested_server` if provided (matches `select_server`
+/// semantics). Otherwise consults the bandit over the `allowed`
+/// subset of discovered servers (caller can mark servers as
+/// circuit-broken / disabled / preference-mismatched).
+///
+/// Returns the SELECTED ARM INDEX into the `discovered` slice.
+/// Caller is responsible for:
+/// 1. Sizing the bandit to `discovered.len()`.
+/// 2. Sizing `allowed` to `discovered.len()`.
+/// 3. Calling [`report_server_outcome`] after the invocation
+///    completes so the bandit learns from the observation.
+///
+/// Returns `Err` if no allowed server exists OR the requested
+/// server is not found / disabled.
+pub fn select_server_via_bandit(
+    discovered: &[ExternalServerConfig],
+    requested_server: Option<&str>,
+    bandit: &crate::ucb1_bandit::Ucb1Bandit,
+    allowed: &[bool],
+) -> McpClientResult<usize> {
+    if let Some(requested) = requested_server {
+        let requested_trimmed = requested.trim();
+        let idx = discovered
+            .iter()
+            .position(|item| item.name.eq_ignore_ascii_case(requested_trimmed))
+            .ok_or_else(|| server_not_found_error(requested_trimmed))?;
+        if discovered[idx].disabled {
+            return Err(server_disabled_error(&discovered[idx].name));
+        }
+        return Ok(idx);
+    }
+
+    if discovered.is_empty() {
+        return Err(server_not_found_error(
+            "no enabled outbound MCP servers discovered (check mcp_client discovery paths)",
+        ));
+    }
+    if discovered.len() != allowed.len() {
+        return Err(server_not_found_error(
+            "br-ft-62jai: select_server_via_bandit requires allowed.len() == discovered.len()",
+        ));
+    }
+    if discovered.len() != bandit.num_arms() {
+        return Err(server_not_found_error(
+            "br-ft-62jai: select_server_via_bandit requires bandit.num_arms() == discovered.len()",
+        ));
+    }
+
+    // Build the effective allowed mask: the caller's allowed AND
+    // the discovered server is not disabled.
+    let effective_allowed: Vec<bool> = discovered
+        .iter()
+        .zip(allowed.iter())
+        .map(|(srv, &ok)| ok && !srv.disabled)
+        .collect();
+
+    bandit.select_constrained(&effective_allowed).ok_or_else(|| {
+        server_not_found_error(
+            "br-ft-62jai: no allowed enabled server (caller-allowed mask + disabled flags eliminated all arms)",
+        )
+    })
+}
+
+/// br-ft-62jai: record an MCP server invocation outcome into the
+/// bandit. Reward normalization:
+/// - Failure (success=false): reward = 0.0.
+/// - Success: reward = 1.0 / (1.0 + latency_ms as f64 / 100.0)
+///   maps fast latencies (≤ 100ms) → ~0.5+, slow latencies
+///   (>> 100ms) → ~0.0. The 100ms typical-latency normalization
+///   is a reasonable default for MCP RPC; callers needing
+///   different normalization should call
+///   `bandit.record_reward(arm, custom_reward)` directly.
+pub fn report_server_outcome(
+    bandit: &mut crate::ucb1_bandit::Ucb1Bandit,
+    arm: usize,
+    success: bool,
+    latency_ms: u64,
+) {
+    if arm >= bandit.num_arms() {
+        return; // defensive — caller bug; silently drop
+    }
+    let reward = if success {
+        // Normalize to [0,1]: fast → high, slow → low.
+        1.0 / (1.0 + (latency_ms as f64) / 100.0)
+    } else {
+        0.0
+    };
+    bandit.record_reward(arm, reward);
+}
+
+fn client_disabled_error() -> McpClientError {
+    McpClientError::new(ERR_DISABLED, "mcp_client is disabled in configuration")
+        .with_hint("Enable [mcp_client].enabled=true to use outbound MCP client features.")
+}
+
+fn discovery_disabled_error() -> McpClientError {
+    McpClientError::new(
+        ERR_DISCOVERY_DISABLED,
+        "mcp_client discovery is disabled in configuration",
+    )
+    .with_hint("Set [mcp_client].discovery_enabled=true or provide explicit server config.")
+}
+
+fn server_not_found_error(server: &str) -> McpClientError {
+    let server = redact_mcp_client_text(server);
+    McpClientError::new(
+        ERR_SERVER_NOT_FOUND,
+        format!("Outbound MCP server not found: {server}"),
+    )
+    .with_hint("Check mcp_client.discovery_paths and mcp_client.include_default_paths, then retry.")
+}
+
+fn server_disabled_error(server: &str) -> McpClientError {
+    let server = redact_mcp_client_text(server);
+    McpClientError::new(
+        ERR_SERVER_DISABLED,
+        format!("Outbound MCP server is disabled: {server}"),
+    )
+    .with_hint("Enable the server entry in its mcpServers config before connecting.")
+}
+
+fn remote_error_reports_unsupported(message_lower: &str) -> bool {
+    message_lower.contains("ft-mcp-0010")
+        || message_lower.contains("robot.not_implemented")
+        || message_lower.contains("robot.feature_not_available")
+        || message_lower.contains("robot.unsupported")
+}
+
+fn redact_mcp_client_text(text: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    REDACTOR.redact(text)
+}
+
+fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
+    // [ft-qde8p] Redact secrets from the remote error text before it lands in
+    // `McpClientError.message`. The message flows straight into tracing warn
+    // logs at the `list_tools` / `call_tool` failure paths, so a remote server
+    // that echoes a token or credential in its error would otherwise leak it
+    // into operator-visible diagnostics. Error-code classification below still
+    // probes the raw `err.message` (for "timed out" / "failed to spawn"
+    // keywords) because those are structural sentinels that must survive any
+    // secret-pattern match, but only the redacted `base` is carried forward.
+    let redacted_remote = redact_mcp_client_text(&err.message);
+    let redacted_server = redact_mcp_client_text(server);
+    let base = format!("server '{redacted_server}': {redacted_remote}");
+    let message_lower = err.message.to_ascii_lowercase();
+
+    match err.code {
+        FrameworkMcpErrorCode::MethodNotFound => McpClientError::new(ERR_METHOD_NOT_FOUND, base)
+            .with_hint("Verify method compatibility between FrankenTerm and the external server."),
+        FrameworkMcpErrorCode::InvalidParams => McpClientError::new(ERR_INVALID_PARAMS, base)
+            .with_hint("Check tool arguments and request schema."),
+        FrameworkMcpErrorCode::ToolExecutionError
+        | FrameworkMcpErrorCode::InternalError
+        | FrameworkMcpErrorCode::Custom(_)
+            if remote_error_reports_unsupported(&message_lower) =>
+        {
+            McpClientError::new(ERR_UNSUPPORTED, base).with_hint(
+                "The remote MCP server reported an unsupported or unavailable surface; \
+                 check feature flags or call a supported tool.",
+            )
+        }
+        FrameworkMcpErrorCode::ToolExecutionError => McpClientError::new(ERR_TOOL_EXECUTION, base)
+            .with_hint("Inspect remote tool logs and retry with validated arguments."),
+        FrameworkMcpErrorCode::RequestCancelled => McpClientError::new(ERR_REQUEST_CANCELLED, base)
+            .with_hint("The request was cancelled; retry or increase timeout settings."),
+        FrameworkMcpErrorCode::InternalError if message_lower.contains("timed out") => {
+            McpClientError::new(ERR_TIMEOUT, base).with_hint(
+                "Increase mcp_client.timeout_ms or inspect remote server responsiveness.",
+            )
+        }
+        FrameworkMcpErrorCode::InternalError
+            if message_lower.contains("failed to spawn")
+                || message_lower.contains("spawn subprocess") =>
+        {
+            McpClientError::new(ERR_SPAWN, base).with_hint(
+                "Verify command path, execute permissions, and environment requirements.",
+            )
+        }
+        // br-ft-m3c9s: pre-fix the remaining 7 framework variants
+        // all collapsed into ERR_PROTOCOL with no hint. Operators
+        // surveying mcp_client.protocol couldn't distinguish a
+        // missing resource from a parse error from a custom
+        // remote code. Each variant now gets its own typed code
+        // and remediation hint; ERR_PROTOCOL is retained as the
+        // genuine catch-all for variants where the framework
+        // can't tell us much (InvalidRequest, generic InternalError,
+        // Custom(_)).
+        FrameworkMcpErrorCode::ParseError => McpClientError::new(ERR_PARSE, base).with_hint(
+            "Remote returned malformed JSON-RPC; check protocol/version compatibility \
+             between FrankenTerm and the external server.",
+        ),
+        FrameworkMcpErrorCode::ResourceNotFound => {
+            McpClientError::new(ERR_RESOURCE_NOT_FOUND, base)
+                .with_hint("Verify the requested resource URI exists on the remote server.")
+        }
+        FrameworkMcpErrorCode::ResourceForbidden => {
+            McpClientError::new(ERR_RESOURCE_FORBIDDEN, base)
+                .with_hint("Check authorization scope; the remote server denied resource access.")
+        }
+        FrameworkMcpErrorCode::PromptNotFound => McpClientError::new(ERR_PROMPT_NOT_FOUND, base)
+            .with_hint("Verify the requested prompt name on the remote server."),
+        FrameworkMcpErrorCode::Custom(code) => {
+            // br-ft-m3c9s: preserve the inner custom code in the
+            // message so forensic correlation against remote-server
+            // documentation works. Pre-fix the inner code was
+            // silently discarded.
+            let with_custom = format!("[custom_code={code}] {base}");
+            McpClientError::new(ERR_PROTOCOL, with_custom).with_hint(
+                "Custom error code from remote server; consult the server's \
+                 documentation for the meaning of the embedded custom_code.",
+            )
+        }
+        FrameworkMcpErrorCode::InvalidRequest | FrameworkMcpErrorCode::InternalError => {
+            McpClientError::new(ERR_PROTOCOL, base).with_hint(
+                "Generic protocol-layer error; inspect the redacted remote message \
+                 and the remote server's logs.",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Config, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PROMPT_NOT_FOUND, ERR_PROTOCOL,
+        ERR_REQUEST_CANCELLED, ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED,
+        ERR_SERVER_NOT_FOUND, ERR_SPAWN, ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig,
+        FrameworkMcpError, FrameworkMcpErrorCode, FtMcpClient, LOG_TARGET, McpClientConfig,
+        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
+        map_mcp_error, report_server_outcome, select_server, select_server_via_bandit,
+    };
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tempfile::tempdir;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    #[test]
+    fn map_mcp_error_method_not_found() {
+        let err = map_mcp_error("mock", FrameworkMcpError::method_not_found("tools/list"));
+        assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
+        assert!(err.message.contains("server 'mock'"));
+        assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn map_mcp_error_tool_execution() {
+        let err = map_mcp_error("mock", FrameworkMcpError::tool_error("boom"));
+        assert_eq!(err.code, ERR_TOOL_EXECUTION);
+        assert!(err.message.contains("boom"));
+    }
+
+    #[test]
+    fn map_mcp_error_remote_not_implemented_gets_unsupported_code() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::tool_error(format!(
+                "remote envelope FT-MCP-0010 robot.not_implemented for {secret}"
+            )),
+        );
+
+        assert_eq!(err.code, ERR_UNSUPPORTED);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("unsupported"))
+        );
+        assert!(
+            !err.message.contains(secret),
+            "remote unsupported mapping leaked caller-supplied secret"
+        );
+        assert!(err.message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn map_mcp_error_spawn_failure() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::internal_error("Failed to spawn subprocess: No such file"),
+        );
+        assert_eq!(err.code, ERR_SPAWN);
+        assert!(err.hint.is_some());
+    }
+
+    // ─── br-ft-m3c9s: framework-error variant exhaustiveness ─────────
+    //
+    // Pre-fix the seven variants ParseError / InvalidRequest /
+    // InternalError (uncaught) / ResourceNotFound / ResourceForbidden
+    // / PromptNotFound / Custom(_) all collapsed into ERR_PROTOCOL
+    // with NO hint. Operators couldn't distinguish a missing resource
+    // from a parse error from a custom remote code; for Custom(code)
+    // the inner code was silently discarded.
+    //
+    // Post-fix: 4 of the 7 variants get distinct typed codes + hints;
+    // Custom preserves the inner code in the message; the remaining
+    // catch-all (InvalidRequest + uncaught InternalError) keeps
+    // ERR_PROTOCOL but now carries a hint.
+
+    #[test]
+    fn map_mcp_error_parse_error_gets_typed_code_and_hint() {
+        let err = map_mcp_error("mock", FrameworkMcpError::parse_error("malformed JSON"));
+        assert_eq!(err.code, ERR_PARSE);
+        assert!(
+            err.hint.as_deref().unwrap_or("").contains("JSON-RPC"),
+            "br-ft-m3c9s: ParseError hint must mention JSON-RPC; got {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_resource_not_found_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::resource_not_found("file:///missing"),
+        );
+        assert_eq!(err.code, ERR_RESOURCE_NOT_FOUND);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("resource URI"),
+            "br-ft-m3c9s: ResourceNotFound hint must direct operator at the URI; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_resource_forbidden_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::ResourceForbidden, "denied"),
+        );
+        assert_eq!(err.code, ERR_RESOURCE_FORBIDDEN);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("authorization"),
+            "br-ft-m3c9s: ResourceForbidden hint must mention authorization; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_prompt_not_found_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::PromptNotFound, "missing prompt"),
+        );
+        assert_eq!(err.code, ERR_PROMPT_NOT_FOUND);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("prompt name"),
+            "br-ft-m3c9s: PromptNotFound hint must mention prompt name; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_invalid_request_keeps_protocol_code_with_new_hint() {
+        let err = map_mcp_error("mock", FrameworkMcpError::invalid_request("bad shape"));
+        assert_eq!(
+            err.code, ERR_PROTOCOL,
+            "br-ft-m3c9s: InvalidRequest stays under the catch-all ERR_PROTOCOL"
+        );
+        assert!(
+            err.hint.is_some(),
+            "br-ft-m3c9s: pre-fix the catch-all had NO hint; post-fix it must carry one"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_custom_preserves_inner_code_in_message() {
+        // br-ft-m3c9s: pre-fix the inner Custom(code) was silently
+        // discarded. Post-fix it MUST appear in the message so
+        // forensic correlation against remote-server documentation
+        // works.
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::Custom(-32099), "vendor specific"),
+        );
+        assert_eq!(err.code, ERR_PROTOCOL);
+        assert!(
+            err.message.contains("custom_code=-32099"),
+            "br-ft-m3c9s: Custom inner code must be embedded in the message; got {:?}",
+            err.message
+        );
+        assert!(err.hint.is_some());
+    }
+
+    // [ft-qde8p] Remote servers can echo operator-supplied arguments
+    // (tokens, credentials) back in error text. Before the redaction
+    // wrap in `map_mcp_error`, those tokens landed in the
+    // `McpClientError.message` verbatim and were emitted by the
+    // `list_tools` / `call_tool` failure log sites (`message =
+    // %mapped.message`). This regression pins that a recognizable
+    // secret in the remote error message is masked before it reaches
+    // the carried `McpClientError.message`.
+    #[test]
+    fn map_mcp_error_redacts_secrets_in_remote_error_ft_qde8p() {
+        // Anthropic-shaped key (`sk-ant-` + 20+ chars) is in the
+        // Redactor's `SECRET_PATTERNS`, so a remote error parroting it
+        // back must come out masked. Use a token-like string that won't
+        // collide with real credentials; the regex only checks shape.
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::tool_error(format!("upstream refused credential {secret} (401)")),
+        );
+
+        assert_eq!(err.code, ERR_TOOL_EXECUTION);
+        assert!(
+            !err.message.contains(secret),
+            "ft-qde8p: raw secret must not appear in mapped McpClientError.message, got {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "ft-qde8p: mapped message must carry the redaction marker, got {}",
+            err.message,
+        );
+        // The non-secret framing ("server 'mock'", the status code, the
+        // error word) should survive — redaction must be surgical, not
+        // wholesale. This protects operator-observable diagnostics
+        // from silently degrading to an unreadable stub.
+        assert!(
+            err.message.contains("server 'mock'"),
+            "ft-qde8p: server framing must survive redaction, got {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("(401)"),
+            "ft-qde8p: non-secret remote framing must survive redaction, got {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_redacts_secret_shaped_server_names() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(secret, FrameworkMcpError::tool_error("remote failed"));
+
+        assert_eq!(err.code, ERR_TOOL_EXECUTION);
+        assert!(
+            !err.message.contains(secret),
+            "raw server name leaked in mapped MCP client error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "expected redaction marker in mapped MCP client error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("remote failed"),
+            "non-secret remote error text should survive redaction: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn discover_servers_from_custom_path() {
+        let temp_dir = tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("mcp-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "disabled-server": {
+      "command": "python3",
+      "args": ["-m", "example_server"],
+      "disabled": true
+    }
+  }
+}"#,
+        )
+        .expect("write config");
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = vec![config_path.display().to_string()];
+
+        let discovered = discover_servers(&config).expect("discover servers");
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].name, "disabled-server");
+        assert!(discovered[0].disabled);
+        assert_eq!(discovered[1].name, "filesystem");
+    }
+
+    #[test]
+    fn discover_servers_rejects_malformed_configuration_without_exposing_contents() {
+        let temp_dir = tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("mcp-config.json");
+        let secret = "private-discovery-config-content";
+        std::fs::write(&config_path, format!("{{invalid-json:{secret}"))
+            .expect("write malformed config");
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = vec![config_path.display().to_string()];
+
+        let error = discover_servers(&config).expect_err("malformed source must fail discovery");
+        assert_eq!(error.code, "mcp_client.discovery_failed");
+        assert!(!error.message.contains(secret));
+        assert!(!error.message.contains(&config_path.display().to_string()));
+    }
+
+    #[test]
+    fn discover_servers_no_defaults_and_no_paths_returns_empty() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        config.mcp_client.discovery_paths = Vec::new();
+
+        let discovered = discover_servers(&config).expect("discover servers");
+        assert_eq!(
+            discovered,
+            [] as [frankenterm_core_mcp::ExternalServerConfig; 0]
+        );
+    }
+
+    #[test]
+    fn discover_servers_redacts_secret_shaped_discovery_paths_in_logs() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        config.mcp_client.discovery_paths = vec![format!("/tmp/{secret}/mcp-config.json")];
+
+        let (_guard, events) = install_capture();
+        let discovered = discover_servers(&config).expect("discover servers");
+
+        assert!(
+            discovered.is_empty(),
+            "missing discovery path should simply produce no servers"
+        );
+        let captured = events.lock().expect("lock logs").clone();
+        let path_event = captured
+            .iter()
+            .find(|event| {
+                event.target == LOG_TARGET
+                    && event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| field_matches(value, "mcp_client_discover_paths"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "discover paths debug event should be captured; static_max={:?}, current_max={:?}, captured={:?}",
+                    tracing::level_filters::STATIC_MAX_LEVEL,
+                    tracing::level_filters::LevelFilter::current(),
+                    captured
+                        .iter()
+                        .take(8)
+                        .map(|event| (&event.target, event.fields.get("event")))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let paths = path_event.fields.get("paths").expect("paths field");
+        assert!(
+            !paths.contains(secret),
+            "raw discovery path secret leaked in MCP client log field: {paths}"
+        );
+        assert!(
+            paths.contains("[REDACTED]"),
+            "expected redaction marker in MCP client discovery paths: {paths}"
+        );
+    }
+
+    #[test]
+    fn select_server_prefers_preferred_order() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.preferred_servers = vec!["beta".to_string(), "alpha".to_string()];
+
+        let discovered = vec![
+            ExternalServerConfig {
+                name: "alpha".to_string(),
+                command: "a".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+            ExternalServerConfig {
+                name: "beta".to_string(),
+                command: "b".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+        ];
+
+        let selected = select_server(&config, &discovered, None).expect("select preferred server");
+        assert_eq!(selected.name, "beta");
+    }
+
+    #[test]
+    fn select_server_trims_preferred_names() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.preferred_servers = vec!["  beta  ".to_string()];
+
+        let discovered = vec![ExternalServerConfig {
+            name: "beta".to_string(),
+            command: "b".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        }];
+
+        let selected = select_server(&config, &discovered, None).expect("select trimmed preferred");
+        assert_eq!(selected.name, "beta");
+    }
+
+    #[test]
+    fn select_server_rejects_disabled_requested_server() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+
+        let discovered = vec![ExternalServerConfig {
+            name: "filesystem".to_string(),
+            command: "npx".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            disabled: true,
+        }];
+
+        let err = select_server(&config, &discovered, Some("filesystem")).unwrap_err();
+        assert_eq!(err.code, ERR_SERVER_DISABLED);
+    }
+
+    #[test]
+    fn select_server_redacts_secret_shaped_requested_server_on_not_found() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let err = select_server(&config, &[], Some(secret)).unwrap_err();
+
+        assert_eq!(err.code, ERR_SERVER_NOT_FOUND);
+        assert!(
+            !err.message.contains(secret),
+            "raw requested server leaked in selection error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "expected redaction marker in selection error: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn outbound_connect_preserves_owner_cancellation_before_spawn() {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("MCP cancellation test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("MCP startup test"));
+            let server = ExternalServerConfig {
+                name: "cancelled-startup".to_string(),
+                command: "frankenterm-nonexistent-mcp-server-for-cancellation-test".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            };
+            let settings = McpClientConfig {
+                enabled: true,
+                ..McpClientConfig::default()
+            };
+            let result = FtMcpClient::connect_external(&cx, server, &settings).await;
+            match result {
+                Err(err) => assert_eq!(err.code, ERR_REQUEST_CANCELLED),
+                Ok(_) => panic!("cancelled owner must not connect a subprocess"),
+            }
+        });
+    }
+
+    #[test]
+    fn outbound_mcp_roundtrip_with_mock_stdio_server_emits_logs() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        std::fs::write(&script_path, mock_server_script()).expect("write mock script");
+
+        let server = ExternalServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), script_path.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            ..McpClientConfig::default()
+        };
+
+        let (_guard, events) = install_capture();
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+        let tools = client.list_tools().expect("list tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+
+        let output = client
+            .call_tool("echo", serde_json::json!({"text": "hello"}))
+            .expect("call tool");
+        assert_eq!(
+            output.first().and_then(McpClientContentItem::as_text),
+            Some("hello")
+        );
+
+        let captured = events.lock().expect("lock logs").clone();
+        assert!(captured.iter().any(|event| {
+            event.target == LOG_TARGET
+                && event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| field_matches(value, "mcp_client_connect"))
+                && event
+                    .fields
+                    .get("server")
+                    .is_some_and(|value| field_matches(value, "mock"))
+        }));
+        assert!(captured.iter().any(|event| {
+            event.target == LOG_TARGET
+                && event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| field_matches(value, "mcp_client_list_tools"))
+        }));
+        assert!(captured.iter().any(|event| {
+            event.target == LOG_TARGET
+                && event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| field_matches(value, "mcp_client_call_tool"))
+                && event
+                    .fields
+                    .get("tool")
+                    .is_some_and(|value| field_matches(value, "echo"))
+        }));
+        client.shutdown().expect("settle MCP subprocess cleanup");
+    }
+
+    #[test]
+    fn outbound_call_tool_with_cx_cancels_a_hung_remote_call_and_keeps_the_connection() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        std::fs::write(&script_path, mock_server_script()).expect("write mock script");
+        let server = ExternalServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), script_path.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        // A long connection timeout: only the caller's context may end the
+        // hung call within this test's bound.
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 60_000,
+            ..McpClientConfig::default()
+        };
+
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+
+        let caller = crate::cx::for_testing();
+        let canceller = caller.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            canceller.cancel_with(crate::outcome::CancelKind::User, Some("caller gave up"));
+        });
+        let start = std::time::Instant::now();
+        client
+            .call_tool_with_cx(&caller, "hang", serde_json::json!({}))
+            .expect_err("a cancelled caller must not wait for a hung remote tool");
+        cancel_thread.join().expect("cancel thread");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "caller cancellation must end the call well before the 60 s connection timeout"
+        );
+
+        // Cancelling one request leaves the connection usable.
+        let output = client
+            .call_tool("echo", serde_json::json!({"text": "after"}))
+            .expect("connection survives a cancelled call");
+        assert_eq!(
+            output.first().and_then(McpClientContentItem::as_text),
+            Some("after")
+        );
+        client.shutdown().expect("settle MCP subprocess cleanup");
+    }
+
+    /// `ft mcp serve` drops its proxy's upstream clients when it exits. A
+    /// dropped client must close the way `shutdown` does: the server's stdin
+    /// first, then a bounded wait for it to exit on EOF. FastMCP's own drop
+    /// signals a server that is still running at once, so this server was
+    /// killed before it could record EOF.
+    #[test]
+    fn dropped_outbound_client_lets_its_server_finish_on_eof() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        let closed_path = temp_dir.path().join("stdin-closed");
+        // The mock answers until EOF. This tail then takes a moment before
+        // recording that it saw EOF, as a server flushing its state would.
+        std::fs::write(
+            &script_path,
+            format!(
+                "{}\nimport pathlib, time\ntime.sleep(0.3)\npathlib.Path(sys.argv[1]).write_text('stdin closed')\n",
+                mock_server_script()
+            ),
+        )
+        .expect("write mock script");
+        let server = ExternalServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec![
+                "-u".to_string(),
+                script_path.display().to_string(),
+                closed_path.display().to_string(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            ..McpClientConfig::default()
+        };
+
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+        client.list_tools().expect("list tools");
+        drop(client);
+        assert!(
+            closed_path.exists(),
+            "a dropped client must let its server see EOF and finish before signalling it"
+        );
+    }
+
+    #[test]
+    fn outbound_mcp_logs_redact_secret_shaped_server_labels() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        std::fs::write(&script_path, mock_server_script()).expect("write mock script");
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let server = ExternalServerConfig {
+            name: secret.to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), script_path.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            ..McpClientConfig::default()
+        };
+
+        let (_guard, events) = install_capture();
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+        client.list_tools().expect("list tools");
+
+        let captured = events.lock().expect("lock logs").clone();
+        assert!(
+            captured.iter().any(|event| {
+                event.target == LOG_TARGET
+                    && event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| field_matches(value, "mcp_client_connect"))
+                    && event
+                        .fields
+                        .get("server")
+                        .is_some_and(|value| value.contains("[REDACTED]"))
+            }),
+            "expected connect log to carry a redacted server field"
+        );
+        for event in captured.iter().filter(|event| event.target == LOG_TARGET) {
+            for (field, value) in &event.fields {
+                assert!(
+                    !value.contains(secret),
+                    "raw secret leaked in MCP client log field {field}: {value}"
+                );
+            }
+        }
+        client.shutdown().expect("settle MCP subprocess cleanup");
+    }
+
+    #[test]
+    fn tool_definition_reads_destructive_annotation() {
+        let safe = McpClientToolDefinition {
+            name: "safe".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructive": false})),
+        };
+        let destructive = McpClientToolDefinition {
+            name: "drop_db".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructive": true})),
+        };
+
+        assert!(!safe.is_destructive());
+        assert!(destructive.is_destructive());
+    }
+
+    // ========================================================================
+    // McpClientError
+    // ========================================================================
+
+    #[test]
+    fn mcp_client_error_display() {
+        let err = McpClientError::new("mcp_client.timeout", "server did not respond");
+        assert_eq!(
+            err.to_string(),
+            "[mcp_client.timeout] server did not respond"
+        );
+        assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn mcp_client_error_with_hint() {
+        let err =
+            McpClientError::new("mcp_client.disabled", "disabled").with_hint("set enabled=true");
+        assert_eq!(err.hint.as_deref(), Some("set enabled=true"));
+    }
+
+    #[test]
+    fn mcp_client_error_serializes_with_hint() {
+        let err = McpClientError::new("mcp_client.test", "test error").with_hint("try again");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "mcp_client.test");
+        assert_eq!(json["message"], "test error");
+        assert_eq!(json["hint"], "try again");
+    }
+
+    #[test]
+    fn mcp_client_error_serializes_without_hint() {
+        let err = McpClientError::new("mcp_client.test", "no hint");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "mcp_client.test");
+        assert!(json.get("hint").is_none());
+    }
+
+    // ========================================================================
+    // ExternalServerConfig
+    // ========================================================================
+
+    #[test]
+    fn external_server_config_serde_roundtrip() {
+        let config = ExternalServerConfig {
+            name: "morph".to_string(),
+            command: "/usr/local/bin/morph-mcp".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::from([("MCP_DEBUG".to_string(), "1".to_string())]),
+            cwd: Some("/tmp".to_string()),
+            disabled: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ExternalServerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "morph");
+        assert_eq!(back.args, vec!["--stdio"]);
+        assert!(!back.disabled);
+        assert_eq!(back.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // ========================================================================
+    // McpClientToolDefinition
+    // ========================================================================
+
+    #[test]
+    fn tool_definition_is_not_destructive_without_annotations() {
+        let tool = McpClientToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("Read a file".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: Some("1.0".to_string()),
+            tags: vec!["fs".to_string()],
+            annotations: None,
+        };
+        assert!(!tool.is_destructive());
+    }
+
+    #[test]
+    fn tool_definition_serde_roundtrip() {
+        let tool = McpClientToolDefinition {
+            name: "search".to_string(),
+            description: Some("Search".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        };
+        let json = serde_json::to_string(&tool).unwrap();
+        let back: McpClientToolDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "search");
+        assert_eq!(back.description.as_deref(), Some("Search"));
+    }
+
+    // ========================================================================
+    // McpClientContentItem
+    // ========================================================================
+
+    #[test]
+    fn content_item_as_text_returns_text_content() {
+        let item = McpClientContentItem(serde_json::json!({"type": "text", "text": "hello world"}));
+        assert_eq!(item.as_text(), Some("hello world"));
+    }
+
+    #[test]
+    fn content_item_as_text_returns_none_for_non_text() {
+        let item = McpClientContentItem(serde_json::json!({"type": "image", "data": "base64..."}));
+        assert!(item.as_text().is_none());
+    }
+
+    #[test]
+    fn content_item_as_text_returns_none_for_missing_type() {
+        let item = McpClientContentItem(serde_json::json!({"text": "no type field"}));
+        assert!(item.as_text().is_none());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_select_server_requested_name_is_trimmed_and_case_insensitive(
+            name in "[A-Za-z0-9_.-]{1,24}",
+            pad_left in "[ \t]{0,3}",
+            pad_right in "[ \t]{0,3}",
+            use_upper in any::<bool>(),
+        ) {
+            let config = Config::default();
+            let discovered = vec![ExternalServerConfig {
+                name: name.clone(),
+                command: "cmd".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            }];
+
+            let requested_core = if use_upper {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_ascii_lowercase()
+            };
+            let requested = format!("{pad_left}{requested_core}{pad_right}");
+
+            let selected = select_server(&config, &discovered, Some(&requested)).expect("select server");
+            prop_assert_eq!(selected.name, name);
+        }
+
+        #[test]
+        fn prop_tool_definition_destructive_flag_follows_annotation(
+            name in "[A-Za-z0-9_.-]{1,24}",
+            destructive in any::<bool>(),
+        ) {
+            let tool = McpClientToolDefinition {
+                name,
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"destructive": destructive})),
+            };
+
+            prop_assert_eq!(tool.is_destructive(), destructive);
+        }
+
+        #[test]
+        fn prop_content_item_as_text_depends_on_type_field(
+            text in "[A-Za-z0-9 _.,:/-]{1,48}",
+        ) {
+            let text_item = McpClientContentItem(serde_json::json!({
+                "type": "text",
+                "text": text.clone(),
+            }));
+            let image_item = McpClientContentItem(serde_json::json!({
+                "type": "image",
+                "text": text.clone(),
+            }));
+
+            prop_assert_eq!(text_item.as_text(), Some(text.as_str()));
+            prop_assert_eq!(image_item.as_text(), None);
+        }
+    }
+
+    fn field_matches(value: &str, expected: &str) -> bool {
+        value == expected || value == format!("{expected:?}")
+    }
+
+    fn mock_server_script() -> &'static str {
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    request = json.loads(raw)
+    method = request.get("method")
+    req_id = request.get("id")
+
+    # JSON-RPC: a message without an id is a notification and MUST NOT
+    # receive any response. The spec-correct `notifications/initialized`
+    # lifecycle message lands here; answering it (even with an error)
+    # desyncs the response stream and the client reads the stray error
+    # as the reply to its next request.
+    if req_id is None:
+        continue
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "mock-server", "version": "1.0.0"}
+            }
+        })
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo input text",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}
+                }]
+            }
+        })
+    elif method == "tools/call":
+        params = request.get("params") or {}
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if tool_name == "echo":
+            send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": str(arguments.get("text", ""))}],
+                    "isError": False
+                }
+            })
+        elif tool_name == "hang":
+            continue
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": "tool not found"}],
+                    "isError": True
+                }
+            })
+    else:
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        })
+"#
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        target: String,
+        fields: HashMap<String, String>,
+    }
+
+    struct LogCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl LogCapture {
+        fn new() -> (Self, Arc<Mutex<Vec<CapturedEvent>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    events: events.clone(),
+                },
+                events,
+            )
+        }
+    }
+
+    struct FieldVisitor {
+        fields: HashMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for LogCapture {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor {
+                fields: HashMap::new(),
+            };
+            event.record(&mut visitor);
+            let target = event.metadata().target().to_string();
+            self.events
+                .lock()
+                .expect("lock log capture")
+                .push(CapturedEvent {
+                    target,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    fn install_capture() -> (
+        tracing::dispatcher::DefaultGuard,
+        Arc<Mutex<Vec<CapturedEvent>>>,
+    ) {
+        // tracing-core 0.1.36's single-dispatch callsite fast path consults
+        // the registering thread's default. Another discovery test can first
+        // reach our shared DEBUG callsite without a subscriber and cache
+        // `never`, even while this thread has an interested capture installed.
+        // Keep a second registered dispatcher alive so callsite interest is
+        // combined across the actual live dispatchers. This anchor is never
+        // installed as any thread's (or the process's) default subscriber.
+        static CALLSITE_ANCHOR: LazyLock<tracing::Dispatch> =
+            LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        LazyLock::force(&CALLSITE_ANCHOR);
+        let (layer, events) = LogCapture::new();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        (guard, events)
+    }
+
+    #[test]
+    fn capture_observes_callsite_first_registered_on_unsubscribed_thread() {
+        fn emit() {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event = "mcp_client_cross_thread_callsite",
+                "Capture must survive first registration on another thread"
+            );
+        }
+
+        let (_guard, events) = install_capture();
+        std::thread::spawn(|| {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), emit);
+        })
+        .join()
+        .expect("unsubscribed callsite registration thread");
+        assert!(events.lock().expect("lock logs").is_empty());
+        emit();
+        let captured = events.lock().expect("lock logs");
+        assert_eq!(captured.len(), 1, "only the subscribed event is captured");
+        assert_eq!(captured[0].target, LOG_TARGET);
+        assert!(
+            captured[0]
+                .fields
+                .get("event")
+                .is_some_and(|value| field_matches(value, "mcp_client_cross_thread_callsite"))
+        );
+    }
+
+    // ─── br-ft-62jai: UCB1 bandit-aware server selection tests ──────────
+    //
+    // Pin select_server_via_bandit + report_server_outcome behavior:
+    // honors requested_server, respects allowed mask + disabled flags,
+    // converges to fastest server with reward feedback.
+
+    fn three_servers() -> Vec<ExternalServerConfig> {
+        vec![
+            ExternalServerConfig {
+                name: "alpha".to_string(),
+                command: "a".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+            ExternalServerConfig {
+                name: "beta".to_string(),
+                command: "b".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+            ExternalServerConfig {
+                name: "gamma".to_string(),
+                command: "g".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn select_via_bandit_honors_explicit_requested_server() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let arm = select_server_via_bandit(&discovered, Some("beta"), &bandit, &allowed)
+            .expect("requested-server selection succeeds");
+        assert_eq!(arm, 1, "beta is at index 1");
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_disabled_requested_server() {
+        let mut discovered = three_servers();
+        discovered[1].disabled = true;
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let result = select_server_via_bandit(&discovered, Some("beta"), &bandit, &allowed);
+        assert!(
+            result.is_err(),
+            "disabled requested server must be rejected"
+        );
+    }
+
+    #[test]
+    fn select_via_bandit_initialization_walks_each_arm_first() {
+        let discovered = three_servers();
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        // First call: arm 0 (UCB1 init phase pulls each un-pulled arm).
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed)
+            .expect("init phase succeeds");
+        assert_eq!(arm, 0);
+        report_server_outcome(&mut bandit, arm, true, 50);
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_eq!(arm, 1);
+        report_server_outcome(&mut bandit, arm, true, 50);
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_eq!(arm, 2);
+    }
+
+    #[test]
+    fn select_via_bandit_skips_disallowed_arms() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        // Allow only arm 1 + 2; arm 0 is caller-circuit-broken.
+        let allowed = [false, true, true];
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_ne!(arm, 0, "disallowed arm must not be selected");
+        assert!(arm == 1 || arm == 2);
+    }
+
+    #[test]
+    fn select_via_bandit_skips_disabled_servers() {
+        let mut discovered = three_servers();
+        discovered[0].disabled = true;
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_ne!(arm, 0, "disabled server must not be selected");
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_size_mismatch_allowed() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true]; // wrong length
+        assert!(select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err());
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_size_mismatch_bandit() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(2); // wrong size
+        let allowed = [true, true, true];
+        assert!(select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err());
+    }
+
+    #[test]
+    fn report_server_outcome_failure_is_zero_reward() {
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(2);
+        report_server_outcome(&mut bandit, 0, false, 50);
+        assert!((bandit.expected_reward(0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn report_server_outcome_success_normalizes_latency() {
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(2);
+        // 0ms latency: reward = 1/(1+0) = 1.0.
+        report_server_outcome(&mut bandit, 0, true, 0);
+        assert!((bandit.expected_reward(0) - 1.0).abs() < 1e-9);
+        // 100ms latency: reward = 1/(1+1) = 0.5.
+        report_server_outcome(&mut bandit, 1, true, 100);
+        assert!((bandit.expected_reward(1) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bandit_converges_to_faster_server_over_many_invocations() {
+        // br-ft-62jai load-bearing test: with disparate latency
+        // distributions across 3 servers, the bandit must converge
+        // to selecting the fastest server most often.
+        let discovered = three_servers();
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        // Server 0 = fast (10ms), 1 = medium (50ms), 2 = slow (200ms).
+        let latency = [10u64, 50, 200];
+        for _ in 0..500 {
+            let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+            report_server_outcome(&mut bandit, arm, true, latency[arm]);
+        }
+        let p0 = bandit.pull_count(0);
+        let p1 = bandit.pull_count(1);
+        let p2 = bandit.pull_count(2);
+        assert!(
+            p0 > p1 && p0 > p2,
+            "br-ft-62jai convergence: server 0 (fastest 10ms) must dominate \
+             (got p0={p0} p1={p1} p2={p2})"
+        );
+        assert!(
+            p0 as f64 / 500.0 > 0.5,
+            "fastest server should be selected > 50% of the time after 500 pulls; got {p0}/500"
+        );
+    }
+}

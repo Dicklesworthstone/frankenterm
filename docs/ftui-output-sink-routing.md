@@ -1,0 +1,182 @@
+# Output Sink Routing Contract for FTUI Migration
+
+**Bead:** wa-1uqi (FTUI-03.2.a)
+**Date:** 2026-02-09
+**Extends:** ADR-0010 (One-Writer Rule Adaptation)
+
+## 1  Problem Statement
+
+When the TUI is active, only the rendering pipeline may write to stdout/stderr.
+Stray `println!` or `eprintln!` calls corrupt cursor state and layout. The
+ftui framework enforces this more strictly than ratatui — any bypass write
+produces visible glitches.
+
+## 2  Output Gate Contract
+
+### Gate Module: `frankenterm-core/src/tui/output_gate.rs`
+
+The gate tracks three phases via a global `AtomicU8`:
+
+| Phase | Value | stdout/stderr | When |
+|-------|-------|---------------|------|
+| `Inactive` | 0 | Safe to write | TUI not running |
+| `Active` | 1 | **FORBIDDEN** | TUI rendering pipeline owns terminal |
+| `Suspended` | 2 | Safe to write | Command handoff (subprocess owns terminal) |
+
+### Decision Rule
+
+```
+fn may_write_stdout_stderr() -> bool {
+    output_gate::phase() != GatePhase::Active
+}
+```
+
+### Sanctioned Output Paths
+
+When the TUI is `Active`, output MUST flow through one of:
+
+| Path | Mechanism | Used By |
+|------|-----------|---------|
+| ftui `Frame.buffer` | Cell-based rendering via `write_styled()` | All view rendering |
+| `TuiAwareWriter` | tracing subscriber writer that discards when suppressed | Logging (tracing macros) |
+| Output gate check | `if !is_output_suppressed() { eprintln!(...) }` | Crash handler |
+
+All other stdout/stderr writes are **forbidden** during `Active` phase.
+
+## 3  Inventory of Direct Writes
+
+### Already Protected (LOW risk)
+
+| Location | Mechanism | Notes |
+|----------|-----------|-------|
+| `crates/frankenterm-core/src/logging.rs` (`init_tracing`) | `TuiAwareWriter` when TUI/FTUI feature enabled | `cfg(any(feature = "tui", feature = "ftui"))` |
+| `crates/frankenterm-core/src/logging.rs` (`init_tracing` fallback writer branch) | Direct stderr when TUI feature disabled | `cfg(not(any(feature = "tui", feature = "ftui")))` |
+| `crates/frankenterm-core/src/crash.rs` (`install_panic_hook`) | `is_output_suppressed()` check before `eprintln!` | Only writes on panic, properly gated |
+| `crates/frankenterm-core/src/tui/output_gate.rs` (`TuiAwareWriter`) | TUI-aware stderr writer | Part of gate infrastructure |
+| `crates/frankenterm-core/src/tui/terminal_session.rs` (`TerminalSessionImpl::enter`) | `std::io::stdout()` for crossterm backend | TUI infrastructure (intentional terminal control) |
+| `crates/frankenterm-core/src/tui/app.rs` (`App::run`) | `io::stdout()` for crossterm terminal | TUI infrastructure |
+
+### Mutually Exclusive with TUI (SAFE — no gate needed)
+
+These code paths execute CLI commands that cannot co-exist with TUI rendering.
+The TUI is either not started, or these run before/after TUI lifecycle.
+
+| Location | Code Path | Why Safe |
+|----------|-----------|----------|
+| `main.rs` ~80+ println/eprintln | CLI command output (status, list, search, events, schedule, etc.) | Commands run instead of TUI, not alongside it |
+| `crates/frankenterm/src/main.rs` (`Some(Commands::Version { .. })`) | `ft version` output | One-shot command |
+| `crates/frankenterm/src/main.rs` (`ConfigCommands::Show`) | `ft config show` output | One-shot command |
+| `crates/frankenterm/src/main.rs` (`print_robot_response`) | Robot mode JSON/TOON output | Machine output, not TUI-concurrent |
+| `crates/frankenterm/src/main.rs` (`Some(Commands::Setup { .. })`) | Setup/confirmation prompts | Interactive setup, TUI not active |
+| `crates/frankenterm-core/src/output/format.rs` (`OutputFormat::should_use_*`) | `stdout().is_terminal()` | Read-only, no writes |
+
+### Requires Remediation (MEDIUM risk)
+
+These paths *could theoretically* run during TUI via command dispatch or
+background tasks, though they currently do not:
+
+| Location | Code | Risk | Remediation |
+|----------|------|------|-------------|
+| `crates/frankenterm-core/src/replay.rs` (`TerminalSink`) | `stdout().write_all()`, `eprintln!` in `write_output` / `show_event` / `show_marker` | Medium — replay runs as standalone command, not during TUI | Shipped: `debug_assert!(!is_output_suppressed())` now guards all TerminalSink write paths |
+| `crates/frankenterm/src/main.rs` (`Some(Commands::Audit { .. })`) | `writeln!(stdout, "{line}")` in audit stream | Medium — audit stream is a standalone command | No change needed (command-exclusive) |
+| `crates/frankenterm/src/main.rs` (`RecordCommands::Export`) | Export to stdout (asciinema, HTML) | Medium — export is a standalone command | No change needed (command-exclusive) |
+
+## 4  Removal Plan
+
+### Phase 1: Assert-guard (shipped)
+
+`TerminalSink` already carries debug assertions on every direct write path:
+
+```rust
+// In replay.rs TerminalSink::{write_output, show_event, show_marker}
+debug_assert!(
+    !output_gate::is_output_suppressed(),
+    "TerminalSink must not write while TUI is active"
+);
+```
+
+This catches accidental invocation during TUI without runtime cost in release.
+The remaining follow-up is broader sink centralization for command/export flows.
+
+### Phase 2: Centralized sink (future — FTUI-03.2.b)
+
+When subprocess output routing (wa-3gsu) is implemented:
+
+1. Replace `TerminalSink::write_output()` with gate-aware sink that buffers
+   output when suppressed and flushes when gate transitions to Inactive/Suspended
+2. Route export/audit stdout writes through the same sink
+3. Add compile-time lint (custom clippy or grep-based CI check) to detect
+   new `println!` / `eprintln!` calls in frankenterm-core outside of test modules
+
+### Phase 3: ftui TerminalWriter takeover (FTUI-09.3)
+
+When ftui's `TerminalWriter` fully owns output routing:
+
+1. Remove `output_gate.rs` atomic gate (ftui provides equivalent)
+2. Remove `TuiAwareWriter` (ftui provides built-in log routing)
+3. All output flows through ftui's write abstraction
+
+## 5  Verification Checks
+
+### Compile-Time Check (CI)
+
+```bash
+# Detect new println!/eprintln! in frankenterm-core/src/ (excluding tests and output_gate)
+rg '(println!|eprintln!|print!|eprint!)' crates/frankenterm-core/src/ \
+  --type rust \
+  -g '!**/tests/**' \
+  -g '!**/output_gate.rs' \
+  -g '!**/test*.rs' \
+  | grep -v '#\[cfg(test)\]' \
+  | grep -v '// SAFE:' \
+  | grep -v 'is_output_suppressed'
+```
+
+Expected: Only hits in `crash.rs` (gated) and `replay.rs` (assert-guarded).
+New hits MUST include either:
+- `// SAFE: <reason>` comment explaining why no gate is needed
+- An `is_output_suppressed()` check
+
+### Runtime Verification
+
+The existing output_gate tests verify:
+
+| Test | What it proves |
+|------|---------------|
+| `active_suppresses_output` | Gate correctly reports Active as suppressed |
+| `suspended_does_not_suppress` | Suspended allows writes (command handoff) |
+| `full_lifecycle` | Enter → Suspend → Resume → Leave transitions correct |
+| `tui_aware_writer_suppresses_when_active` | TuiAwareWriter discards during Active |
+| `tui_aware_writer_passes_through_when_inactive` | TuiAwareWriter forwards during Inactive |
+
+### Unit Test: Assert No Bypass
+
+```rust
+// Proof that TerminalSink respects output gate (to be added in Phase 1)
+#[test]
+fn terminal_sink_debug_asserts_when_gate_active() {
+    use crate::tui::output_gate::{set_phase, GatePhase};
+    set_phase(GatePhase::Active);
+    // TerminalSink creation or write_output should panic in debug mode
+    // (debug_assert! fires)
+    set_phase(GatePhase::Inactive);
+}
+```
+
+## 6  Policy Summary
+
+| Rule | Scope | Enforcement |
+|------|-------|-------------|
+| No direct stdout/stderr writes during `GatePhase::Active` | All frankenterm-core modules | `TuiAwareWriter` for logging, `is_output_suppressed()` for ad-hoc |
+| CLI command output is safe (TUI not co-active) | main.rs command handlers | Structural: commands and TUI are mutually exclusive |
+| New println!/eprintln! in frankenterm-core must be annotated | All new code | CI grep check + code review |
+| TerminalSink must assert gate is not Active | replay.rs | debug_assert! guard |
+
+## References
+
+- `crates/frankenterm-core/src/tui/output_gate.rs` — gate implementation
+- `crates/frankenterm-core/src/logging.rs` (`init_tracing`) — TuiAwareWriter integration
+- `crates/frankenterm-core/src/crash.rs` (`install_panic_hook`) — panic hook gate check
+- `crates/frankenterm-core/src/replay.rs` (`TerminalSink`) — shipped assert-guarded direct-write sink
+- ADR-0010: One-Writer Rule Adaptation
+- wa-3gsu (FTUI-03.2.b): Subprocess output through PTY capture (blocked by this)

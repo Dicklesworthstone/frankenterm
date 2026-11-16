@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "healthy",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/healthy.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "actionable",
+    "risk_level": "low",
+    "top_step": {
+      "candidate_id": "mission-twin.healthy.ready-work",
+      "action_kind": "choose_ready_bead",
+      "status": "actionable",
+      "proof_lane": "not_required"
+    },
+    "reason_codes_include": [
+      "planner.status.actionable",
+      "mission_twin.replay.ready_work_available",
+      "reservations.exclusive_active"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

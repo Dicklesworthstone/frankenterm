@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "gemini.model.used",
+    "agent_type": "gemini",
+    "event_type": "session.model",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "model": "gemini-2.0-flash-exp"
+    },
+    "matched_text": "Using model: gemini-2.0-flash-exp"
+  }
+]

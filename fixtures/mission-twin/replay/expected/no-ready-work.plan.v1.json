@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "no-ready-work",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/no-ready-work.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "no_ready_work",
+    "risk_level": "medium",
+    "top_step": {
+      "candidate_id": "fallback.bv_robot_triage.1771376400000",
+      "action_kind": "run_bv_robot_triage",
+      "status": "no_ready_work",
+      "proof_lane": "not_required"
+    },
+    "reason_codes_include": [
+      "planner.status.no_ready_work",
+      "mission_twin.no_ready_work",
+      "mission_twin.snapshot_contract_required",
+      "beads.dependency_blocked",
+      "beads.robot_triage_fallback"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

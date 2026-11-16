@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FrankenTerm fleet viewer</title>
+<link rel="icon" href="data:,">
+<link rel="preload" href="./fonts/pragmasevka-nf-subset.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./app.css">
+<link rel="stylesheet" href="./history-panel.css">
+</head>
+<body>
+<section id="web-auth" aria-labelledby="web-auth-title">
+  <h1 id="web-auth-title">FrankenTerm fleet viewer</h1>
+  <p id="web-auth-status" role="status" aria-live="polite">Checking your session…</p>
+  <form id="web-auth-form" hidden>
+    <label for="web-auth-token">Access token</label>
+    <input id="web-auth-token" type="password" minlength="32" maxlength="256" autocomplete="off" spellcheck="false" required>
+    <button id="web-auth-submit" type="submit">Sign in</button>
+  </form>
+  <button id="web-auth-retry" type="button" hidden>Check connection again</button>
+  <p>Use the local address supplied by the operator. Your token is used only to establish a session.</p>
+</section>
+<div id="web-auth-controls" hidden><span>Authenticated local session</span><button id="web-auth-logout" type="button">Sign out</button></div>
+<header id="inspect-toolbar" hidden>
+  <button id="history-search-open" type="button" disabled>Search captured history</button>
+  <button id="pane-output-open" type="button" disabled>Inspect selected pane (Enter)</button>
+  <form id="pane-output-form">
+    <label for="pane-output-id">Pane ID</label>
+    <input id="pane-output-id" type="text" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" autocomplete="off" required disabled>
+    <button id="pane-output-submit" type="submit" disabled>Open output</button>
+  </form>
+  <span id="pane-output-hint" role="status">Use 1/2 to switch fleet views. Captured output is read-only.</span>
+</header>
+<main id="workspace" data-output-open="false" hidden>
+  <section id="container" aria-label="Fleet inventory and detections">
+    <p id="fleet-mode" role="status">Loading fleet inventory. Search captured history or open a pane by ID above.</p>
+    <nav id="fleet-navigation" aria-label="Fleet navigation">
+      <button id="fleet-panes" type="button" disabled>Panes (1)</button>
+      <button id="fleet-events" type="button" disabled>Detections (2)</button>
+      <button id="fleet-first" type="button" disabled>First</button>
+      <button id="fleet-previous" type="button" disabled>Previous</button>
+      <button id="fleet-next" type="button" disabled>Next</button>
+      <button id="fleet-last" type="button" disabled>Last</button>
+      <button id="fleet-refresh" type="button" disabled>Refresh</button>
+      <button id="fleet-text-toggle" type="button" aria-pressed="false" disabled>Use text view</button>
+    </nav>
+    <p id="fleet-selection" role="status">No fleet selection yet.</p>
+    <p id="fleet-text-help">Text view supports native selection and copying. Select text to hold it steady; clear the selection to show updates. Use the navigation buttons, or focus the text and use arrows, 1/2, and Enter. Tab leaves the fleet.</p>
+    <div id="fleet-viewport">
+      <canvas id="terminal" tabindex="-1" hidden aria-label="FrankenTerm fleet viewer. Use arrows to select, 1 or 2 to switch views, Enter to inspect output, Tab to leave."></canvas>
+      <pre id="screen-text" class="fleet-text" tabindex="-1" aria-label="Fleet inventory and detections as text" aria-describedby="fleet-text-help fleet-selection"></pre>
+    </div>
+  </section>
+  <section id="pane-output" aria-labelledby="pane-output-title" hidden>
+    <div class="output-toolbar">
+      <h1 id="pane-output-title">Captured output</h1>
+      <button id="pane-output-close" type="button">Close</button>
+    </div>
+    <p id="pane-output-status" role="status"></p>
+    <div class="output-toolbar">
+      <button id="pane-output-pause" type="button" aria-pressed="false">Pause</button>
+      <button id="pane-output-history" type="button" title="Replace this view by replaying retained history from the beginning; large histories may take time.">Load retained history</button>
+      <label><input id="pane-output-follow" type="checkbox" checked> Follow output</label>
+    </div>
+    <p id="pane-output-warnings" role="status" hidden></p>
+    <form id="pane-output-find-form" class="output-toolbar">
+      <label for="pane-output-search">Find text</label>
+      <input id="pane-output-search" type="search" maxlength="256" autocomplete="off" aria-describedby="pane-output-find-help">
+      <button type="submit">Next</button>
+      <button id="pane-output-previous" type="button">Previous</button>
+    </form>
+    <span id="pane-output-find-help">Literal, case-sensitive search. Following output pauses while finding text; Resume continues from the received cursor.</span>
+    <span id="pane-output-find-status" role="status"></span>
+    <textarea id="pane-output-text" readonly spellcheck="false" wrap="off" aria-label="Captured pane output, read-only" aria-describedby="pane-output-status pane-output-warnings"></textarea>
+    <p class="output-note">Bounded captured text, not a terminal emulator. Select text to copy. Escape closes this view. Deleted history and database replacement cannot be recovered here.</p>
+  </section>
+</main>
+<dialog id="history-search" aria-labelledby="history-title" aria-describedby="history-help">
+  <div class="output-toolbar">
+    <h1 id="history-title">Search captured history</h1>
+    <button id="history-close" type="button">Close</button>
+  </div>
+  <p id="history-help">Search the stored full-text index across panes, not just the loaded transcript. Phrase mode matches tokenized words; choose FTS syntax for operators such as OR. Times below are local.</p>
+  <form id="history-search-form">
+    <label class="history-wide" for="history-query">Query
+      <input id="history-query" type="search" maxlength="2048" autocomplete="off" required>
+    </label>
+    <label for="history-mode">Query mode
+      <select id="history-mode"><option value="phrase">Phrase</option><option value="fts">FTS syntax</option></select>
+    </label>
+    <label for="history-pane">Pane ID (blank = all retained panes)
+      <input id="history-pane" type="text" inputmode="numeric" maxlength="20" pattern="[0-9]{1,20}" autocomplete="off">
+    </label>
+    <label for="history-since">From local time<input id="history-since" type="datetime-local"></label>
+    <label for="history-until">Through local time<input id="history-until" type="datetime-local"></label>
+    <label for="history-limit">Maximum results
+      <select id="history-limit"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select>
+    </label>
+    <div class="output-toolbar"><button type="submit">Search</button><button id="history-cancel" type="button" disabled>Cancel request</button></div>
+  </form>
+  <p id="history-status" role="status" aria-live="polite"></p>
+  <p id="history-note">Open a captured segment to inspect that historical result without following a current pane. Deleted or changed captures appear unavailable. Opening current output is a separate action: the pane may no longer exist or its ID may have been reused. Use Return to search results to inspect another match without repeating the query. All views are read-only. Results are capped, not paginated; narrow the query for older matches. Close or Escape clears this search.</p>
+  <ol id="history-results" aria-label="Ranked captured-history matches"></ol>
+</dialog>
+<div id="error" role="alert" hidden></div>
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>

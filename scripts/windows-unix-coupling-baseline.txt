@@ -1,0 +1,148 @@
+# ft-51fde windows unix-coupling baseline — content-keyed ratchet.
+# Regenerate with: BLESS=1 scripts/check_windows_unix_coupling.sh
+# Each line: <path>\t<trimmed source line>. Removing entries is always safe;
+# adding entries means you accepted a NEW ungated coupling — justify it in the commit.
+# ft-51gsu: these four test calls are already Unix-gated, beyond the eight-line
+# lookback. runtime is cfg(unix) in pty-guardian/src/lib.rs; the two named tests
+# gitless_metadata_accepts_only_exact_internal_tracked_links and
+# disk_includes_follow_one_owned_link_as_macos_crypto_conf_needs are cfg(unix).
+crates/frankenterm-pty-guardian/src/runtime.rs	let (reader, mut producer) = std::os::unix::net::UnixStream::pair().unwrap();
+crates/frankenterm/tests/cli_contract_tests.rs	std::os::unix::fs::symlink("../src/input.txt", source.join("src/linked.txt")).unwrap();
+frankenterm/config/src/mobile_export.rs	std::os::unix::fs::symlink("apple.conf", &link).unwrap();
+frankenterm/config/src/mobile_export.rs	std::os::unix::fs::symlink("crypto.conf", &twice).unwrap();
+Cargo.toml	DEP nix = "0.31.3"
+Cargo.toml	DEP passfd = "0.1.6"
+Cargo.toml	DEP signal-hook = "0.4.4"
+Cargo.toml	DEP termios = "0.3.3"
+# ft-y0gy9: this nix is under [target.'cfg(target_os = "macos")'.dependencies]
+# (F_BARRIERFSYNC); the table check only recognizes cfg(unix) tables.
+crates/frankenterm-core/Cargo.toml	DEP nix = { workspace = true, features = ["fs"] }
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&original_metadata)
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&replacement_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&rewritten_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&original_metadata)
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&replacement_metadata),
+crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&rewritten_metadata),
+# ft-vpoab: rehearsal_manifest_rejects_outside_file_and_directory_symlinks is #[cfg(unix)];
+# both symlink calls occur beyond the guard's eight-line lookback.
+crates/frankenterm-core/src/mcp_tools.rs	std::os::unix::fs::symlink(
+crates/frankenterm-core/src/mcp_tools.rs	std::os::unix::fs::symlink(outside.path(), root.path().join("directory")).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
+# ft-8r43i: persisted_state_staging_alias_rejection_preserves_published_state
+# is #[cfg(unix)]; the symlink is beyond the bounded source lookback.
+crates/frankenterm-core/src/recorder_storage.rs	std::os::unix::fs::symlink(&victim, &staging).unwrap();
+crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
+# ft-r937n: both lines are inside `#[cfg(unix)] mod unix` (system_symlinks.rs lines 43-384);
+# the module gate precedes them by more than the eight-line lookback.
+crates/frankenterm-core/src/system_symlinks.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
+crates/frankenterm-core/src/system_symlinks.rs	use std::os::unix::fs::MetadataExt as _;
+# ft-xxfwy.48: inside #[cfg(unix)] mission_store_late_leaf_attack_refuses_and_releases_lock_registry;
+# the function-level gate precedes this closure by more than the eight-line lookback.
+crates/frankenterm-core/src/tx_execution.rs	std::os::unix::fs::symlink(&retained, &path).unwrap();
+crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&sentinel_path, &ledger_path)
+crates/frankenterm-core/src/tx_idempotency.rs	std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
+crates/frankenterm-core/src/vendored/mux_client.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+crates/frankenterm-core/src/vendored/mux_client.rs	use std::os::unix::fs::FileTypeExt;
+crates/frankenterm-core/src/workflows/coordination.rs	std::os::unix::fs::symlink(&linked_dir_target, root.path().join("linked_dir")).unwrap();
+crates/frankenterm-core/src/workflows/descriptors.rs	std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
+crates/frankenterm-core/tests/crash_recovery_kill9.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-core/tests/frankensqlite_gate_tests.rs	use std::os::unix::fs::PermissionsExt;
+crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create parent symlink");
+crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement socket");
+crates/frankenterm-core/tests/integration_native_events.rs	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+# ft-yykm1: the whole test file is gated by the inner attribute #![cfg(unix)],
+# which the guard's lookback does not recognize.
+crates/frankenterm-core/tests/wezterm_cli_timeout_reaps_child.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy namespace symlink");
+crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(other.path(), &manifest_paths(other.path())[0])
+crates/frankenterm-gui/src/native_bridge.rs	let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::fs::PermissionsExt;
+crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::net::UnixStream;
+crates/frankenterm-gui/src/window_state_persist.rs	std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy window-state symlink");
+crates/frankenterm-mux-server-impl/src/dispatch.rs	let (left, mut right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink(
+crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink("lease-target", &lease)
+crates/frankenterm-mux-server-impl/src/guardian_output_keys.rs	use std::os::fd::AsFd as _;
+crates/frankenterm-mux-server-impl/src/guardian_proxy.rs	fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+# ft-y0gy9 crash-step tests (a_tail_killed_between_window_sync_and_publication...,
+# scrollback_transaction_killed_at_every_named_step..., a_gap_marker_killed_at_every_step...)
+# are #[cfg(unix)]; the import sits ~30 lines into each, beyond the eight-line lookback.
+crates/frankenterm-mux-server-impl/src/lib.rs	use std::os::unix::process::ExitStatusExt as _;
+crates/frankenterm-pty-guardian/src/broker.rs	raw_fd: std::os::fd::RawFd,
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::fd::{AsFd, BorrowedFd};
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
+# Enrollment subprocess/permission negative controls are inside the function-level
+# #[cfg(unix)] gate; this import is beyond the eight-line lookback.
+crates/frankenterm/tests/cli_golden_artifacts.rs	use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
+crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::prelude::AsRawFd as _;
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::ffi::OsStrExt;
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{PermissionsExt, symlink};
+crates/frankenterm-pty-guardian/src/runtime.rs	use std::os::fd::{AsFd, AsRawFd};
+crates/frankenterm-pty-guardian/src/runtime.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-pty-guardian/src/transport.rs	let (old_stream, _old_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
+crates/frankenterm-pty-guardian/src/transport.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
+crates/frankenterm-pty-guardian/tests/pty_lifetime.rs	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink("../escape", root.join("current"))
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&retained_collision_target, root.join(&colliding_selector))
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&target, &link).expect("create escaping symlink");
+# Release-wave B-I3: installer_upgrades_a_pre_generation_ft_and_restores_it_on_failure
+# is #[cfg(unix)]; the symlink is beyond the bounded source lookback.
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(app_ft, linked.join("ft")).expect("link 0.15.1 ft");
+crates/frankenterm/src/main.rs	use std::os::unix::ffi::OsStrExt as _;
+crates/frankenterm/src/main.rs	use std::os::unix::fs::MetadataExt as _;
+crates/frankenterm/src/main.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm/tests/epipe_exit_code.rs	use std::os::unix::process::ExitStatusExt;
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind legacy socket"));
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind replacement socket"));
+frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+frankenterm/client/src/discovery.rs	let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind live socket");
+frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&live_path).expect("bind socket");
+frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
+frankenterm/client/src/discovery.rs	std::os::unix::net::UnixListener::bind(&socket).expect("bind original socket");
+frankenterm/client/src/discovery.rs	use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+frankenterm/escape-parser/Cargo.toml	DEP nix = { workspace=true, optional=true, features=["mman", "fs"] }
+frankenterm/filedescriptor/src/unix.rs	fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for FileDescriptor {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for OwnedHandle {
+frankenterm/filedescriptor/src/unix.rs	unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) }
+frankenterm/filedescriptor/src/unix.rs	use std::os::unix::prelude::*;
+frankenterm/procinfo/src/macos.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/pty/Cargo.toml	DEP nix = {workspace=true, features=["term", "fs"]}
+frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt as _;
+frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/src/unix.rs	pub use std::os::unix::io::RawFd;
+frankenterm/pty/src/unix.rs	use std::os::fd::{AsFd, BorrowedFd};
+frankenterm/pty/src/unix.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/pty/src/unix.rs	use std::os::unix::io::{AsRawFd, FromRawFd};
+frankenterm/pty/src/unix.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::OsStringExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/termwiz/src/render/terminfo.rs	use std::os::fd::FromRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::io::AsRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::net::UnixStream;
+frankenterm/window/src/os/wayland/connection.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, RawFd};
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
+frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
+
+# ft-51gsu: mobile_attach and its tests are wholly cfg(unix) via src/main.rs.
+# The bounded per-file scan cannot see that parent-module gate.
+crates/frankenterm/src/mobile_attach.rs	use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{FileTypeExt, MetadataExt};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{PermissionsExt, symlink};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::net::{UnixListener, UnixStream};

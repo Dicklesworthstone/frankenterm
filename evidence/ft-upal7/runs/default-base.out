@@ -1,0 +1,23 @@
+[multi 12:18:40] app /Users/jemanuel/ft-build/upal7/fam-base/FrankenTerm.app retention 100000, 50 panes of 40000 rows
+[2026-11-06 12:18:41] published family 0.15.21-b4218ab
+[2026-11-06 12:18:41] recovery identities created
+[2026-11-06 12:18:41] recovery wrapping key created
+[2026-11-06 12:18:41] recovery store prepared
+[2026-11-06 12:18:41] recovery key enrolled
+[2026-11-06 12:18:45] install complete: mux /private/tmp/ftrt-43432/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, guardian /private/tmp/ftrt-43432/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, panes [0 1 2 3 4]
+[multi 12:20:20] first root 96 s after ready (capture 70179 ms)
+[multi 12:20:20] before the kill (no reads):
+   1 INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=N
+[multi 12:20:20] mux 48367 killed
+[2026-11-06 12:20:21] family 0.15.21-b4218ab already published
+[2026-11-06 12:21:24] install complete: mux /private/tmp/ftrt-43432/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, guardian /private/tmp/ftrt-43432/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, panes [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49]
+[multi 12:21:24] came back in 64 s
+[multi 12:21:29] after:
+  50 INFO  frankenterm_mux_server_impl] pane N store continues into its recovered rows: N matched, M to append
+   1 INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=N
+   1 INFO  frankenterm_mux_server_impl::guardian_proxy] verified the recovery root of 50 panes in 8064 ms
+   1 INFO  frankenterm_mux_server_impl::guardian_proxy] restored 50 guardian panes in 54387 ms, 4073 ms of it connecting and claiming
+[multi 12:22:14] panes up: 50; rows held: 0:40000 1:40000 2:40000 3:40000 4:40000 5:40000 6:40000 7:40000 8:40000 9:40000 10:40000 11:40000 12:40000 13:40000 14:40000 15:40000 16:40000 17:40000 18:40000 19:40000 20:40000 21:40000 22:40000 23:40000 24:40000 25:40000 26:40000 27:40000 28:40000 29:40000 30:40000 31:40000 32:40000 33:40000 34:40000 35:40000 36:40000 37:40000 38:40000 39:40000 40:40000 41:40000 42:40000 43:40000 44:40000 45:40000 46:40000 47:40000 48:40000 49:40000 
+[multi 12:22:14] panes holding every row 1..40000: 50 of 50
+[multi 12:22:14] PASS: all 50 panes hold their newest row; back in 64 s (the host script waits up to 310 s)
+[multi 12:22:16] sandbox /private/tmp/ftrt-43432, 1.4G

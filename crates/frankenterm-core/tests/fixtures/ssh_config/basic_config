@@ -1,0 +1,17 @@
+# Example SSH config
+Host prod
+  HostName prod.example.com
+  User ubuntu
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519
+  IdentityFile ~/.ssh/id_ed25519_work
+
+Host staging dev
+  HostName staging.example.com
+  User deploy
+
+Host *
+  User root
+
+Host ?wildcard
+  HostName should-ignore.example.com

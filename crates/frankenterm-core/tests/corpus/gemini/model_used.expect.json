@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "gemini.model.used",
+    "agent_type": "gemini",
+    "event_type": "session.model",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "model": "gemini-1.5-pro"
+    },
+    "matched_text": "Responding with gemini-1.5-pro"
+  }
+]

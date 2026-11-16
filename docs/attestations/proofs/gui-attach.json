@@ -1,0 +1,50 @@
+{
+  "schema": "ft.gui-attach.v1",
+  "host": "Mac-mini-max",
+  "generated_at": "2026-09-26T12:03:58Z",
+  "commit": "efe7619baf1f4cc589466d23b9228af9c1c0c8f4",
+  "ft_version": "ft 0.15.21 (649a0f51c9ac9b411cb2d4abf66801e647acfa43+dirty)",
+  "gui_version": "frankenterm-gui FrankenTerm 0.15.21 (649a0f51c9ac9b411cb2d4abf66801e647acfa43)",
+  "socket": "/tmp/ftga-nNTCeW/home/.local/share/frankenterm/frankenterm-gui-sock-85984",
+  "socket_source": "gui_published (no socket configured; dev GUI and ft share an isolated HOME)",
+  "build_profile": "release-interactive",
+  "status": "pass",
+  "steps": [
+    {
+      "step": "same_generation",
+      "ok": true,
+      "elapsed_ms": 59,
+      "detail": "ft 649a0f51c; gui: frankenterm-gui FrankenTerm 0.15.21 (649a0f51c9ac9b411cb2d4abf66801e647acfa43)"
+    },
+    {
+      "step": "doctor_pairs_with_gui_mux",
+      "ok": true,
+      "elapsed_ms": 176,
+      "detail": "paired: mux FrankenTerm 0.15.21 (649a0f51c9ac9b411cb2d4abf66801e647acfa43) (codec 67, accepts 61..=67), agreed codec 67; ft 0.15.21 (codec 67, accepts 61..=67)"
+    },
+    {
+      "step": "profile_apply_opens_a_gui_pane",
+      "ok": true,
+      "elapsed_ms": 236,
+      "detail": "pane 1"
+    },
+    {
+      "step": "robot_state_lists_the_pane",
+      "ok": true,
+      "elapsed_ms": 78,
+      "detail": "pane 1; 38 ms (bound 2000)"
+    },
+    {
+      "step": "robot_get_text_returns_the_marker",
+      "ok": true,
+      "elapsed_ms": 56,
+      "detail": "RC_MARKER_170568220"
+    },
+    {
+      "step": "robot_search_finds_the_marker_after_a_watch_pass",
+      "ok": true,
+      "elapsed_ms": 1058,
+      "detail": "RC_MARKER_170568220"
+    }
+  ]
+}

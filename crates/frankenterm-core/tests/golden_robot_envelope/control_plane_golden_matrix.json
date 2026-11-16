@@ -1,0 +1,2132 @@
+{
+  "schema_version": 1,
+  "generated_by": "ft-bsfb9.5-control-plane-golden-matrix",
+  "proof_target": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+  "nondeterministic_fields": [
+    "elapsed_ms",
+    "now",
+    "timestamp",
+    "captured_at",
+    "queried_at_ms",
+    "path",
+    "pid",
+    "uuid",
+    "worker_id",
+    "duration_ms"
+  ],
+  "entries": [
+    {
+      "id": "mcp-wa-state-json-healthy",
+      "surface": "wa.state",
+      "family": "state",
+      "action": "state",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_state.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test wa_state_mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "notes": "Pins the MCP state success envelope and input schema."
+    },
+    {
+      "id": "mcp-wa-get-text-toon-healthy",
+      "surface": "wa.get_text",
+      "family": "get_text",
+      "action": "get_text",
+      "transport": "mcp",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_get_text.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "Core-tool proof decodes TOON and compares it with the JSON golden semantics."
+    },
+    {
+      "id": "mcp-wa-search-json-degraded-semantic-fallback",
+      "surface": "wa.search",
+      "family": "search",
+      "action": "search",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "degraded",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_search.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "The fixture pins hybrid search falling back to lexical with semantic_no_hits metrics."
+    },
+    {
+      "id": "mcp-wa-send-json-dry-run-healthy",
+      "surface": "wa.send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_send.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "Pins wa.send dry-run as a policy-evaluated success envelope with no pane mutation."
+    },
+    {
+      "id": "mcp-wa-send-toon-dry-run-healthy",
+      "surface": "wa.send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "mcp",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_send.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "mcp_conformance_core_tools decodes wa.send TOON and checks parity with the JSON golden semantics."
+    },
+    {
+      "id": "mcp-wa-events-json-healthy",
+      "surface": "wa.events",
+      "family": "events",
+      "action": "events",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "events": [],
+          "total_count": 0,
+          "limit": 50,
+          "unhandled_only": false,
+          "cursor_capability": "non_resumable_newest_first_snapshot"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins the honest read-only MCP snapshot shape, including its non-resumable cursor capability, without depending on a live event store."
+    },
+    {
+      "id": "robot-dom-zones-json-healthy",
+      "surface": "robot dom zones",
+      "family": "dom",
+      "action": "zones",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft robot_dom_payload_serializes_json_and_toon_matrix -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "zones",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": null,
+          "output": null,
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the honest semantic-pane zones verb as a flat OSC 133 zone list, not a DOM tree."
+    },
+    {
+      "id": "robot-dom-last-command-json-healthy",
+      "surface": "robot dom last-command",
+      "family": "dom",
+      "action": "last_command",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft robot_dom_payload_serializes_json_and_toon_matrix -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "last_command",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": {
+            "command_index": 0,
+            "text": "cargo check",
+            "zone": {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            }
+          },
+          "output": null,
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the last-command verb selecting the latest command input zone from the flat semantic list."
+    },
+    {
+      "id": "robot-dom-output-of-toon-healthy",
+      "surface": "robot dom output-of",
+      "family": "dom",
+      "action": "output_of",
+      "transport": "robot",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft robot_dom_payload_serializes_json_and_toon_matrix -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "output_of",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": -1,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": {
+            "command_index": 0,
+            "text": "cargo check",
+            "zone": {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            }
+          },
+          "output": {
+            "command_index": 0,
+            "text": "done",
+            "zone": {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          },
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins TOON parity for output-of while storing the canonical JSON envelope semantics."
+    },
+    {
+      "id": "robot-dom-exit-code-json-healthy",
+      "surface": "robot dom exit-code",
+      "family": "dom",
+      "action": "exit_code",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft robot_dom_payload_serializes_json_and_toon_matrix -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "exit_code",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": null,
+          "output": null,
+          "exit_code": {
+            "command_index": 0,
+            "code": 0
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the latest retained OSC 133 exit status without adding fabricated command-tree fields."
+    },
+    {
+      "id": "mcp-wa-dom-zones-json-healthy",
+      "surface": "wa.dom",
+      "family": "dom",
+      "action": "zones",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --lib --no-default-features --features mcp,asupersync-runtime dom_tool_definition_matches_semantic_pane_contract -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "zones",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": null,
+          "output": null,
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins wa.dom zones as byte-equal to the robot semantic-pane DomData shape."
+    },
+    {
+      "id": "mcp-wa-dom-last-command-json-healthy",
+      "surface": "wa.dom",
+      "family": "dom",
+      "action": "last_command",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --lib --no-default-features --features mcp,asupersync-runtime dom_tool_definition_matches_semantic_pane_contract -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "last_command",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": {
+            "command_index": 0,
+            "text": "cargo check",
+            "zone": {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            }
+          },
+          "output": null,
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins wa.dom last_command on the shared semantic-pane envelope builder contract."
+    },
+    {
+      "id": "mcp-wa-dom-output-of-json-healthy",
+      "surface": "wa.dom",
+      "family": "dom",
+      "action": "output_of",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --lib --no-default-features --features mcp,asupersync-runtime dom_tool_definition_matches_semantic_pane_contract -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "output_of",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": -1,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": {
+            "command_index": 0,
+            "text": "cargo check",
+            "zone": {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            }
+          },
+          "output": {
+            "command_index": 0,
+            "text": "done",
+            "zone": {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          },
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins wa.dom output_of for a selected command-output pair and proves the MCP mirror owns the same verb."
+    },
+    {
+      "id": "mcp-wa-dom-exit-code-json-healthy",
+      "surface": "wa.dom",
+      "family": "dom",
+      "action": "exit_code",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --lib --no-default-features --features mcp,asupersync-runtime dom_tool_definition_matches_semantic_pane_contract -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 7,
+          "query": "exit_code",
+          "source": "osc133",
+          "confidence": 1.0,
+          "semantic_data_unavailable": false,
+          "unavailable_reason": null,
+          "requested_command_index": null,
+          "zones": [
+            {
+              "start_y": 10,
+              "start_x": 0,
+              "end_y": 10,
+              "end_x": 1,
+              "semantic_type": "prompt",
+              "text": "$ "
+            },
+            {
+              "start_y": 10,
+              "start_x": 2,
+              "end_y": 10,
+              "end_x": 12,
+              "semantic_type": "input",
+              "text": "cargo check"
+            },
+            {
+              "start_y": 11,
+              "start_x": 0,
+              "end_y": 11,
+              "end_x": 4,
+              "semantic_type": "output",
+              "text": "done"
+            }
+          ],
+          "command": null,
+          "output": null,
+          "exit_code": {
+            "command_index": 0,
+            "code": 0
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins wa.dom exit_code with a retained OSC 133 status and MCP v1 envelope metadata."
+    },
+    {
+      "id": "mcp-wa-dom-zones-json-degraded-unavailable",
+      "surface": "wa.dom",
+      "family": "dom",
+      "action": "zones",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "degraded",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --lib --no-default-features --features mcp,asupersync-runtime dom_tool_definition_matches_semantic_pane_contract -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_id": 8,
+          "query": "zones",
+          "source": "unavailable",
+          "confidence": 0.0,
+          "semantic_data_unavailable": true,
+          "unavailable_reason": "semantic data unavailable: pane has no OSC 133 prompt/input markers",
+          "requested_command_index": null,
+          "zones": [],
+          "command": null,
+          "output": null,
+          "exit_code": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins honest degradation: no OSC 133 prompt/input markers returns ok:true plus semantic_data_unavailable, never a fabricated tree."
+    },
+    {
+      "id": "mcp-wa-rules-list-toon-healthy",
+      "surface": "wa.rules_list",
+      "family": "rules",
+      "action": "list",
+      "transport": "mcp",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "notes": "mcp_conformance decodes wa.rules_list TOON and checks documented semantics."
+    },
+    {
+      "id": "robot-send-json-blocked-policy-denied",
+      "surface": "robot send",
+      "family": "send",
+      "action": "send",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "blocked",
+      "status": "error",
+      "expected_code": "robot.policy_denied",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "envelope": {
+        "ok": false,
+        "error": "Policy denied by rule policy.test.block",
+        "error_code": "robot.policy_denied",
+        "hint": "Run ft policy explain send to inspect the matching rule.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Documents the blocked robot envelope code path used by policy gates."
+    },
+    {
+      "id": "robot-send-json-dry-run-healthy",
+      "surface": "robot send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --test cli_contract_tests contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "command": "ft robot send 5252 \"conformance-ok\" --dry-run",
+          "dry_run": true,
+          "warnings": [],
+          "target_resolution": {
+            "pane_id": 5252,
+            "status": "resolved"
+          },
+          "policy_evaluation": {
+            "checks": [
+              {
+                "name": "policy_surface",
+                "status": "checked"
+              }
+            ],
+            "result": "requires_approval"
+          },
+          "expected_actions": [
+            {
+              "action_type": "send_text",
+              "pane_id": 5252,
+              "would_send": true
+            }
+          ]
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the Robot CLI dry-run report envelope that previews a send without pane mutation."
+    },
+    {
+      "id": "robot-events-mutate-json-policy-required",
+      "surface": "robot events mutate",
+      "family": "events",
+      "action": "annotate",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "policy_required",
+      "status": "error",
+      "expected_code": "robot.require_approval",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "envelope": {
+        "ok": false,
+        "error": "Command requires human approval",
+        "error_code": "robot.require_approval",
+        "hint": "Approve via ft approve <id> or wait for the configured approver.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins require-approval as distinct from a hard policy denial."
+    },
+    {
+      "id": "robot-get-text-json-pane-not-found",
+      "surface": "robot get-text",
+      "family": "get_text",
+      "action": "get_text",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "blocked",
+      "status": "error",
+      "expected_code": "robot.pane_not_found",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
+      "envelope": {
+        "ok": false,
+        "error": "Pane 424242 not found",
+        "error_code": "robot.pane_not_found",
+        "hint": "Use 'ft robot state' to list available panes",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the top-level Robot CLI pane-not-found error envelope; batched get-text also covers per-pane pane_not_found results."
+    },
+    {
+      "id": "robot-wait-for-json-timeout",
+      "surface": "robot wait-for",
+      "family": "wait_for",
+      "action": "wait_for",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "blocked",
+      "status": "error",
+      "expected_code": "robot.timeout",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
+      "envelope": {
+        "ok": false,
+        "error": "Timeout waiting for pattern 'ready>' after 1000ms (5 polls)",
+        "error_code": "robot.timeout",
+        "hint": "Increase --timeout-secs or check if the pattern is correct",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins wait-for timeout as a typed Robot error envelope, separate from pane lookup and policy failures."
+    },
+    {
+      "id": "mcp-wa-get-text-json-policy-denied",
+      "surface": "wa.get_text",
+      "family": "get_text",
+      "action": "get_text",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "blocked",
+      "status": "error",
+      "expected_code": "FT-MCP-0006",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
+      "envelope": {
+        "ok": false,
+        "error": "ft-hp70k denied get-text drill",
+        "error_code": "FT-MCP-0006",
+        "hint": "The MCP policy gate denied wa.get_text before pane text was read.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins MCP get-text policy denial as a typed FT-MCP policy envelope with no data payload."
+    },
+    {
+      "id": "mcp-wa-search-json-require-approval",
+      "surface": "wa.search",
+      "family": "search",
+      "action": "search",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "policy_required",
+      "status": "error",
+      "expected_code": "FT-MCP-0006",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
+      "envelope": {
+        "ok": false,
+        "error": "ft-hp70k require approval search drill",
+        "error_code": "FT-MCP-0006",
+        "hint": "Human approval is required before running wa.search for this policy scope.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0,
+        "mcp_version": "v1"
+      },
+      "notes": "Pins MCP search require-approval as an FT-MCP policy envelope distinct from Robot require_approval codes."
+    },
+    {
+      "id": "robot-fleet-scale-json-dry-run-receipt",
+      "surface": "robot fleet scale",
+      "family": "fleet",
+      "action": "scale",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "family": "fleet",
+          "action": "scale",
+          "backend": "native_agent_inventory",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
+          "requested": {
+            "program": "codex",
+            "program_slug": "codex",
+            "target_count": 2,
+            "dry_run": true
+          },
+          "status": "scale_up_plan_created",
+          "current_count": 1,
+          "target_count": 2,
+          "delta": 1,
+          "effective_delta": 1,
+          "remaining_delta": 0,
+          "selected_targets": [
+            {
+              "operation": "spawn_agent",
+              "step_id": "spawn-codex-2",
+              "program": "codex",
+              "requested_slot": 2
+            }
+          ],
+          "skipped_agents": [],
+          "running_inventory": {
+            "ok": true,
+            "error": null,
+            "count": 1
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "owner_convention": "<program_slug>:<pane_id>"
+          },
+          "policy": {
+            "max_target_count": 256
+          },
+          "plan": {
+            "plan_id": "fleet-scale:codex:1->2",
+            "idempotency_key": {
+              "key": "rk:0000000000000001",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000002",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "steps": [
+              {
+                "step_id": "spawn-codex-2",
+                "action": {
+                  "kind": "spawn_agent",
+                  "profile_name": "codex",
+                  "program": "codex",
+                  "cwd": null,
+                  "domain": null,
+                  "env": {}
+                },
+                "policy": {
+                  "decision": "allow"
+                },
+                "compensation": null
+              }
+            ]
+          },
+          "receipt": {
+            "plan_id": "fleet-scale:codex:1->2",
+            "idempotency_key": {
+              "key": "rk:0000000000000001",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000002",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "status": "dry_run",
+            "idempotent_replay": false,
+            "completed_count": 0,
+            "failed_count": 0,
+            "compensated_count": 0,
+            "skipped_count": 0,
+            "steps": [
+              {
+                "step_id": "spawn-codex-2",
+                "action": {
+                  "kind": "spawn_agent",
+                  "profile_name": "codex",
+                  "program": "codex",
+                  "cwd": null,
+                  "domain": null,
+                  "env": {}
+                },
+                "target_id": "profile:codex:program:codex",
+                "status": "planned",
+                "policy": {
+                  "decision": "allow"
+                },
+                "idempotency_key": {
+                  "key": "rk:0000000000000003",
+                  "action": "fleet_mutation_step"
+                },
+                "output": null,
+                "error": null,
+                "compensation": null
+              }
+            ]
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins a successful fleet scale dry-run receipt from the live mutation substrate; dry-run receipts are not durable crash-replay proof. Durable non-dry-run replay/conflict semantics are covered by the robot_fleet_durable receipt tests."
+    },
+    {
+      "id": "robot-fleet-scale-json-inventory-unavailable",
+      "surface": "robot fleet scale",
+      "family": "fleet",
+      "action": "scale",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "backend_unavailable",
+      "status": "error",
+      "expected_code": "robot.fleet.inventory_unavailable",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
+      "envelope": {
+        "ok": false,
+        "error": "ft robot fleet scale cannot compute a safe delta because running agent inventory is unavailable",
+        "error_code": "robot.fleet.inventory_unavailable",
+        "hint": "Retry after the terminal inventory backend is reachable; no fleet mutation was attempted.",
+        "data": {
+          "family": "fleet",
+          "action": "scale",
+          "backend": "native_agent_inventory",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
+          "requested": {
+            "program": "codex",
+            "program_slug": "codex",
+            "target_count": 2,
+            "dry_run": true
+          },
+          "status": "running_inventory_unavailable",
+          "reason_code": "running_inventory_unavailable",
+          "current_count": 0,
+          "target_count": 2,
+          "delta": 2,
+          "effective_delta": 0,
+          "remaining_delta": 2,
+          "selected_targets": [],
+          "skipped_agents": [],
+          "running_inventory": {
+            "ok": false,
+            "error": "inventory backend unreachable",
+            "count": 0
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "owner_convention": "<program_slug>:<pane_id>"
+          },
+          "policy": {
+            "max_target_count": 256
+          },
+          "plan": null,
+          "receipt": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins unavailable inventory as a typed backend error without reverting to the retired mutation stub."
+    },
+    {
+      "id": "robot-fleet-rebalance-toon-dry-run-receipt",
+      "surface": "robot fleet rebalance",
+      "family": "fleet",
+      "action": "rebalance",
+      "transport": "robot",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "family": "fleet",
+          "action": "rebalance",
+          "backend": "native_agent_inventory",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
+          "requested": {
+            "strategy": "load_based",
+            "strategy_normalized": "load_based",
+            "dry_run": true
+          },
+          "status": "rebalance_plan_created",
+          "strategy": "load_based",
+          "dry_run": true,
+          "items_reassigned": 1,
+          "reassignments": [
+            {
+              "operation": "reassign_work",
+              "step_id": "reassign-load_based-1",
+              "item_id": "ft-a",
+              "from_agent": "codex:1",
+              "to_agent": "codex:2",
+              "reason": "load_based: codex:1 load 2 -> codex:2 load 0",
+              "policy_decision": "allow"
+            }
+          ],
+          "skipped_work_items": [],
+          "agent_loads_before": [
+            {
+              "pane_id": 1,
+              "agent_id": "codex:1",
+              "program": "codex",
+              "state": "active",
+              "state_bucket": "active",
+              "claimed_work_count": 2
+            },
+            {
+              "pane_id": 2,
+              "agent_id": "codex:2",
+              "program": "codex",
+              "state": "idle",
+              "state_bucket": "idle",
+              "claimed_work_count": 0
+            }
+          ],
+          "agent_loads_after": [
+            {
+              "pane_id": 1,
+              "agent_id": "codex:1",
+              "program": "codex",
+              "state": "active",
+              "state_bucket": "active",
+              "claimed_work_count": 1
+            },
+            {
+              "pane_id": 2,
+              "agent_id": "codex:2",
+              "program": "codex",
+              "state": "idle",
+              "state_bucket": "idle",
+              "claimed_work_count": 1
+            }
+          ],
+          "running_inventory": {
+            "ok": true,
+            "error": null,
+            "count": 2
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "storage_table": "work_claims",
+            "owner_convention": "<program_slug>:<pane_id>",
+            "rows_scanned": 2
+          },
+          "plan": {
+            "plan_id": "fleet-rebalance:load_based:2-items",
+            "idempotency_key": {
+              "key": "rk:0000000000000011",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000012",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "steps": [
+              {
+                "step_id": "reassign-load_based-1",
+                "action": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:1",
+                  "to_agent": "codex:2",
+                  "reason": "load_based: codex:1 load 2 -> codex:2 load 0"
+                },
+                "policy": {
+                  "decision": "allow"
+                },
+                "compensation": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:2",
+                  "to_agent": "codex:1",
+                  "reason": "rollback load_based: codex:1 load 2 -> codex:2 load 0"
+                }
+              }
+            ]
+          },
+          "receipt": {
+            "plan_id": "fleet-rebalance:load_based:2-items",
+            "idempotency_key": {
+              "key": "rk:0000000000000011",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000012",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "status": "dry_run",
+            "idempotent_replay": false,
+            "completed_count": 0,
+            "failed_count": 0,
+            "compensated_count": 0,
+            "skipped_count": 0,
+            "steps": [
+              {
+                "step_id": "reassign-load_based-1",
+                "action": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:1",
+                  "to_agent": "codex:2",
+                  "reason": "load_based: codex:1 load 2 -> codex:2 load 0"
+                },
+                "target_id": "work:ft-a",
+                "status": "planned",
+                "policy": {
+                  "decision": "allow"
+                },
+                "idempotency_key": {
+                  "key": "rk:0000000000000013",
+                  "action": "fleet_mutation_step"
+                },
+                "output": null,
+                "error": null,
+                "compensation": null
+              }
+            ]
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins decoded TOON parity for a successful fleet rebalance dry-run receipt; dry-run receipts are not durable crash-replay proof. Durable non-dry-run replay/conflict semantics are covered by the robot_fleet_durable receipt tests."
+    },
+    {
+      "id": "robot-agents-json-feature-not-available",
+      "surface": "robot agents list",
+      "family": "agents",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "unsupported",
+      "status": "error",
+      "expected_code": "robot.feature_not_available",
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "envelope": {
+        "ok": false,
+        "error": "agent inventory feature is not available in this build",
+        "error_code": "robot.feature_not_available",
+        "hint": "Rebuild with the agent-detection feature enabled.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Documents feature-gated robot families that are unavailable in trimmed builds."
+    },
+    {
+      "id": "robot-batch-get-text-json-focused",
+      "surface": "robot batch-get-text",
+      "family": "get_text",
+      "action": "batch_get_text",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_ids": [1, 2],
+          "tail_lines": 20,
+          "escapes_included": false,
+          "results": {
+            "1": {
+              "status": "ok",
+              "text": "ready",
+              "truncated": false,
+              "truncation_info": null
+            },
+            "2": {
+              "status": "error",
+              "code": "robot.pane_not_found",
+              "message": "pane 2 was not found",
+              "hint": "Run ft robot state to refresh pane ids."
+            }
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the batched get-text data shape separately from the single-pane wa.get_text fixture."
+    },
+    {
+      "id": "robot-search-explain-json-focused",
+      "surface": "robot search-explain",
+      "family": "search",
+      "action": "explain",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "query": "panic",
+          "parser": "fts5",
+          "terms": ["panic"],
+          "plan": {
+            "strategy": "lexical",
+            "uses_semantic": false
+          },
+          "warnings": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins a focused search-explain success envelope for the ApiSurface matrix."
+    },
+    {
+      "id": "robot-search-pipeline-status-json-focused",
+      "surface": "robot search-pipeline-status",
+      "family": "search",
+      "action": "pipeline_status",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "indexed_documents": 12,
+          "pending_documents": 0,
+          "last_commit_epoch_ms": 0,
+          "pipeline_health": "healthy",
+          "backend": "tantivy"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Binds the ApiSurface search-pipeline-status row to the search-index stats response shape."
+    },
+    {
+      "id": "robot-workflow-run-json-focused",
+      "surface": "robot workflow run",
+      "family": "workflow",
+      "action": "run",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "workflow": "triage",
+          "pane_id": 1,
+          "status": "queued"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-run success receipt shape."
+    },
+    {
+      "id": "robot-workflow-list-json-focused",
+      "surface": "robot workflow list",
+      "family": "workflow",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workflows": [
+            {
+              "name": "triage",
+              "enabled": true
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-list success response shape."
+    },
+    {
+      "id": "robot-workflow-status-json-focused",
+      "surface": "robot workflow status",
+      "family": "workflow",
+      "action": "status",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "workflow": "triage",
+          "status": "running",
+          "current_step": "inspect"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-status success response shape."
+    },
+    {
+      "id": "robot-workflow-abort-json-focused",
+      "surface": "robot workflow abort",
+      "family": "workflow",
+      "action": "abort",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "aborted": true,
+          "status": "aborted"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-abort acknowledgement envelope."
+    },
+    {
+      "id": "robot-rules-lint-json-focused",
+      "surface": "robot rules lint",
+      "family": "rules",
+      "action": "lint",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "valid": true,
+          "warnings": [],
+          "errors": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the rules-lint success envelope."
+    },
+    {
+      "id": "robot-agent-inventory-json-focused",
+      "surface": "robot agents list",
+      "family": "agents",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "inventory": [
+            {
+              "agent_id": "codex:1",
+              "status": "running",
+              "pane_id": 1
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins an agent inventory success envelope in addition to the feature-gated error fixture."
+    },
+    {
+      "id": "robot-agent-configure-json-focused",
+      "surface": "robot agents configure",
+      "family": "agents",
+      "action": "configure",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "agent_id": "codex:1",
+          "dry_run": true,
+          "changed": false,
+          "applied": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the dry-run agent configure acknowledgement shape."
+    },
+    {
+      "id": "robot-accounts-list-json-focused",
+      "surface": "robot accounts list",
+      "family": "accounts",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "accounts": [
+            {
+              "account_id": "local",
+              "status": "available"
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the accounts-list success envelope."
+    },
+    {
+      "id": "robot-accounts-refresh-json-focused",
+      "surface": "robot accounts refresh",
+      "family": "accounts",
+      "action": "refresh",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "refreshed": true,
+          "account_count": 1,
+          "warnings": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the accounts-refresh success envelope."
+    },
+    {
+      "id": "robot-reserve-json-focused",
+      "surface": "robot reservations reserve",
+      "family": "reservations",
+      "action": "reserve",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "reservation_id": "res-0001",
+          "resource": "pane:1",
+          "status": "reserved",
+          "expires_at_ms": 0
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the reservation-create success envelope."
+    },
+    {
+      "id": "robot-release-json-focused",
+      "surface": "robot reservations release",
+      "family": "reservations",
+      "action": "release",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "reservation_id": "res-0001",
+          "released": true,
+          "status": "released"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the reservation-release success envelope."
+    },
+    {
+      "id": "robot-replay-inspect-json-focused",
+      "surface": "robot replay inspect",
+      "family": "replay",
+      "action": "inspect",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "artifact": "fixtures/replay/minimal.json",
+          "format_version": 1,
+          "event_count": 3,
+          "duration_ms": 0,
+          "metadata": {
+            "source": "golden"
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the stable replay-inspect data subset."
+    },
+    {
+      "id": "robot-replay-regression-json-focused",
+      "surface": "robot replay regression",
+      "family": "replay",
+      "action": "regression",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "suite": "minimal",
+          "verdict": "pass",
+          "case_count": 1,
+          "failed_count": 0,
+          "cases": [
+            {
+              "name": "startup",
+              "verdict": "pass"
+            }
+          ]
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the replay-regression summary envelope."
+    },
+    {
+      "id": "robot-health-json-focused",
+      "surface": "robot health",
+      "family": "diagnostics",
+      "action": "health",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "health_level": "green",
+          "summary": "healthy",
+          "snapshot_at": 0,
+          "observed_panes": 1,
+          "capture_queue_depth": 0,
+          "write_queue_depth": 0,
+          "ingest_lag_avg_ms": 0,
+          "ingest_lag_max_ms": 0,
+          "db_writable": true,
+          "restart_count": 0,
+          "consecutive_crashes": 0,
+          "in_crash_loop": false,
+          "current_backoff_ms": 0,
+          "leak_risk": {
+            "level": "low"
+          },
+          "warnings": [],
+          "guidance": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the diagnostics health success envelope and data subset."
+    },
+    {
+      "id": "robot-coordination-risk-json-focused",
+      "surface": "robot coordination-risk",
+      "family": "diagnostics",
+      "action": "coordination_risk",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "risk_level": "low",
+          "conflicts": [],
+          "recommended_actions": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins a coordination-risk success envelope alongside the dedicated schema artifact."
+    },
+    {
+      "id": "robot-quickstart-json-focused",
+      "surface": "robot quickstart",
+      "family": "meta",
+      "action": "quickstart",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "commands": ["ft robot state", "ft robot get-text 1"],
+          "default_format": "json"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the quickstart metadata envelope."
+    },
+    {
+      "id": "robot-why-json-focused",
+      "surface": "robot why",
+      "family": "meta",
+      "action": "why",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "code": "robot.policy_denied",
+          "meaning": "The requested operation was denied by policy.",
+          "remediation": "Review policy and request approval if appropriate."
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the why metadata explanation envelope."
+    },
+    {
+      "id": "robot-approve-json-focused",
+      "surface": "robot approve",
+      "family": "meta",
+      "action": "approve",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "approval_id": "appr-0001",
+          "approved": true,
+          "status": "approved"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the approval acknowledgement envelope."
+    },
+    {
+      "id": "contract-profile-list",
+      "surface": "ft.profile.list",
+      "family": "profile",
+      "action": "list",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-profile-show",
+      "surface": "ft.profile.show",
+      "family": "profile",
+      "action": "show",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-profile-apply",
+      "surface": "ft.profile.apply",
+      "family": "profile",
+      "action": "apply",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-profile-validate",
+      "surface": "ft.profile.validate",
+      "family": "profile",
+      "action": "validate",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-checkpoint-save",
+      "surface": "ft.checkpoint.save",
+      "family": "checkpoint",
+      "action": "save",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-checkpoint-rollback",
+      "surface": "ft.checkpoint.rollback",
+      "family": "checkpoint",
+      "action": "rollback",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-checkpoint-list",
+      "surface": "ft.checkpoint.list",
+      "family": "checkpoint",
+      "action": "list",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-work-claim",
+      "surface": "ft.work.claim",
+      "family": "work",
+      "action": "claim",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-work-complete",
+      "surface": "ft.work.complete",
+      "family": "work",
+      "action": "complete",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-work-release",
+      "surface": "ft.work.release",
+      "family": "work",
+      "action": "release",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-work-status",
+      "surface": "ft.work.status",
+      "family": "work",
+      "action": "status",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-work-list",
+      "surface": "ft.work.list",
+      "family": "work",
+      "action": "list",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-fleet-status",
+      "surface": "ft.fleet.status",
+      "family": "fleet",
+      "action": "status",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-fleet-launch",
+      "surface": "ft.fleet.launch",
+      "family": "fleet",
+      "action": "launch",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-fleet-stop",
+      "surface": "ft.fleet.stop",
+      "family": "fleet",
+      "action": "stop",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-fleet-describe",
+      "surface": "ft.fleet.describe",
+      "family": "fleet",
+      "action": "describe",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-context-status",
+      "surface": "ft.context.status",
+      "family": "context",
+      "action": "status",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-context-rotate",
+      "surface": "ft.context.rotate",
+      "family": "context",
+      "action": "rotate",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    },
+    {
+      "id": "contract-context-history",
+      "surface": "ft.context.history",
+      "family": "context",
+      "action": "history",
+      "transport": "robot+mcp",
+      "format": "schema",
+      "scenario": "contract_shape",
+      "status": "contract",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
+    }
+  ]
+}

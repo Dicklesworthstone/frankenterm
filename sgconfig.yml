@@ -1,0 +1,8 @@
+# ast-grep configuration for frankenterm
+# Enforces pattern code organization and bans ad-hoc regex usage
+#
+# Run: ast-grep scan --rule rules/
+# Or:  ./scripts/lint-patterns.sh
+
+ruleDirs:
+  - rules

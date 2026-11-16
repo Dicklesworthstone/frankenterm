@@ -1,0 +1,7 @@
+/tmp/ft-stale-a-target
+/tmp/ft-stale-b-target
+/tmp/ft-stale-c-target
+/tmp/ft-stale-d-target
+/tmp/ft-stale-e-target
+/tmp/ft-stale-f-target
+/tmp/ft-stale-g-target

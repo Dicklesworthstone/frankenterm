@@ -1,0 +1,33 @@
+[package]
+name = "frankenterm-flight-recorder"
+description = "Bounded allocation-free cross-layer interaction flight recorder for FrankenTerm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "performance", "telemetry"]
+categories = ["development-tools::profiling"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+platform-markers = ["dep:eventheader_dynamic"]
+
+[dependencies]
+crossbeam-queue.workspace = true
+crossbeam-utils.workspace = true
+frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eventheader_dynamic = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+static_assertions = "1.1.0"

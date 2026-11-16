@@ -1,0 +1,11 @@
+# Empty pack name — must fail PatternPack::validate() (and JSON Schema
+# minLength on `name`).
+name: ""
+version: "1.0.0"
+rules:
+  - id: example.empty_name.rule
+    agent_type: codex
+    event_type: e
+    severity: info
+    anchors: ["a"]
+    description: Pack name is the empty string.

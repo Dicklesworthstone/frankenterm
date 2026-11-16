@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9001",
+    "description": "An unexpected internal error occurred. This is likely a bug in ft.",
+    "error": "Runtime operation 'config_reload' failed: watch channel closed",
+    "hint": "Runtime operation 'config_reload' could not notify any active tasks because the watch channel is closed.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "If the runtime is shutting down, restart `ft watch` before retrying."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Runtime operation 'config_reload' could not notify any active tasks because the watch channel is closed."
+    },
+    "title": "Internal error"
+  },
+  "plain_lines": [
+    "Error: Internal error",
+    "",
+    "Runtime operation 'config_reload' failed: watch channel closed",
+    "",
+    "An unexpected internal error occurred. This is likely a bug in ft.",
+    "",
+    "Suggestions:",
+    "  • Runtime operation 'config_reload' could not notify any active tasks because the watch channel is closed.",
+    "  → Status: `ft status`",
+    "  → Diagnostics: `ft doctor`",
+    "  • If the runtime is shutting down, restart `ft watch` before retrying.",
+    "",
+    "Error code: FT-9001",
+    "Run `ft why FT-9001` for more details."
+  ]
+}

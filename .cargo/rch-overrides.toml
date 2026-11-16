@@ -1,0 +1,5 @@
+[patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+
+[patch."https://github.com/Dicklesworthstone/fastapi_rust"]
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }

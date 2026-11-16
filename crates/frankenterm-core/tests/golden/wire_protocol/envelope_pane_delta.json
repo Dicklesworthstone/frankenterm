@@ -1,0 +1,1 @@
+{"version":1,"seq":2,"sender":"agent-alpha","sent_at_ms":1700000000000,"payload":{"type":"pane_delta","pane_id":42,"seq":55,"content":"Hello, world!\nbuilding demo...","content_len":30,"captured_at_ms":1700000001000}}

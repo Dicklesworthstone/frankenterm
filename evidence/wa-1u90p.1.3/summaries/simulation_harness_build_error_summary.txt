@@ -1,0 +1,32 @@
+# Error code counts
+   6 error[E0277]
+  20 error[E0308]
+   1 error[E0609]
+   1 error[E0658]
+
+# Top error locations
+  20     --> crates/frankenterm-core/src/wezterm.rs:1885:15
+  20     --> /Users/jemanuel/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/time.rs:158:1
+  20     --> /Users/jemanuel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.49.0/src/time/instant.rs:34:1
+   6    --> /Users/jemanuel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.38.0/src/row.rs:285:32
+   1   --> crates/frankenterm-core/src/resize_scheduler.rs:53:9
+   1   --> crates/frankenterm-core/src/resize_scheduler.rs:53:25
+   1   --> crates/frankenterm-core/src/lib.rs:47:1
+   1    --> crates/frankenterm-core/src/search/chunking.rs:313:17
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:439:34
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:438:30
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:437:33
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:434:34
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:433:30
+   1    --> crates/frankenterm-core/src/search/chunk_vector_store.rs:432:33
+   1     --> crates/frankenterm-core/src/workflows.rs:7467:32
+   1     --> crates/frankenterm-core/src/workflows.rs:7458:43
+   1     --> crates/frankenterm-core/src/workflows.rs:7448:43
+   1     --> crates/frankenterm-core/src/workflows.rs:6516:37
+   1     --> crates/frankenterm-core/src/workflows.rs:6454:57
+   1     --> crates/frankenterm-core/src/workflows.rs:6399:57
+   1     --> crates/frankenterm-core/src/workflows.rs:6336:57
+   1     --> crates/frankenterm-core/src/workflows.rs:6330:64
+   1     --> crates/frankenterm-core/src/workflows.rs:6196:56
+   1     --> crates/frankenterm-core/src/workflows.rs:6124:56
+   1     --> crates/frankenterm-core/src/workflows.rs:6040:49

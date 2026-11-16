@@ -1,0 +1,15 @@
+[
+  {
+    "pane_id": 0,
+    "tab_id": 0,
+    "window_id": 0,
+    "domain_name": "local",
+    "title": "shell",
+    "some_new_field_v2": "future value",
+    "another_field_v3": {
+      "nested": true,
+      "version": 3
+    },
+    "numeric_future_field": 42
+  }
+]

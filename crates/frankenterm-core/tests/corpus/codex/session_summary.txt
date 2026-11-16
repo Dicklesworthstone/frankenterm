@@ -1,0 +1,3 @@
+Session complete.
+Token usage: total=15,000 input=8,500 (+ 2,000 cached) output=4,500 (reasoning 150)
+To resume later, run: codex resume abc12345-def6-7890-abcd-0123456789ab

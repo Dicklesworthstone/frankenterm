@@ -1,0 +1,143 @@
+services:
+  aggregator:
+    image: python:3.12-slim
+    platform: ${FT_E2E_COMPOSE_PLATFORM}
+    profiles: ["distributed"]
+    working_dir: /workspace
+    volumes:
+      - ${FT_E2E_COMPOSE_BINARY}:/opt/ft/ft:ro
+      - ${FT_E2E_COMPOSE_HARNESS}:/opt/harness/distributed_compose_harness.py:ro
+      - shared_artifacts:/artifacts
+    command: >
+      /bin/sh -lc '
+      mkdir -p /artifacts/aggregator-workspace/.ft &&
+      printf "%s\n" \
+        "[general]" \
+        "log_level = \"info\"" \
+        "log_format = \"json\"" \
+        "" \
+        "[distributed]" \
+        "enabled = true" \
+        "bind_addr = \"0.0.0.0:4141\"" \
+        "allow_insecure = true" \
+        "auth_mode = \"token\"" \
+        "token = \"${FT_E2E_COMPOSE_TOKEN}\"" \
+        "" \
+        "[storage]" \
+        "db_path = \"compose_dist.db\"" \
+        "retention_days = 7" \
+        > /artifacts/ft.toml &&
+      exec /opt/ft/ft --workspace /artifacts/aggregator-workspace --config /artifacts/ft.toml watch --foreground --no-patterns --poll-interval 1000 > /artifacts/aggregator.log 2>&1
+      '
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s = socket.create_connection(('127.0.0.1', 4141), 1); s.close()",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  fake-agent:
+    image: python:3.12-slim
+    platform: ${FT_E2E_COMPOSE_PLATFORM}
+    profiles: ["distributed"]
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    working_dir: /workspace
+    volumes:
+      - ${FT_E2E_COMPOSE_HARNESS}:/opt/harness/distributed_compose_harness.py:ro
+      - shared_artifacts:/artifacts
+    command:
+      [
+        "python",
+        "/opt/harness/distributed_compose_harness.py",
+        "fake-agent",
+        "--host",
+        "aggregator",
+        "--port",
+        "4141",
+        "--token",
+        "${FT_E2E_COMPOSE_TOKEN}",
+        "--agent-id",
+        "agent-compose",
+        "--marker",
+        "${FT_E2E_COMPOSE_MARKER}",
+        "--artifact",
+        "/artifacts/agent_log.json",
+        "--session-id",
+        "compose-stream-session",
+      ]
+
+  fake-agent-invalid:
+    image: python:3.12-slim
+    platform: ${FT_E2E_COMPOSE_PLATFORM}
+    profiles: ["distributed"]
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    working_dir: /workspace
+    volumes:
+      - ${FT_E2E_COMPOSE_HARNESS}:/opt/harness/distributed_compose_harness.py:ro
+      - shared_artifacts:/artifacts
+    command:
+      [
+        "python",
+        "/opt/harness/distributed_compose_harness.py",
+        "invalid-agent",
+        "--host",
+        "aggregator",
+        "--port",
+        "4141",
+        "--token",
+        "invalid-compose-token",
+        "--agent-id",
+        "agent-compose",
+        "--artifact",
+        "/artifacts/security_log.json",
+        "--session-id",
+        "compose-invalid-session",
+      ]
+
+  test-runner:
+    image: python:3.12-slim
+    platform: ${FT_E2E_COMPOSE_PLATFORM}
+    profiles: ["distributed"]
+    depends_on:
+      aggregator:
+        condition: service_healthy
+      fake-agent:
+        condition: service_completed_successfully
+      fake-agent-invalid:
+        condition: service_completed_successfully
+    working_dir: /workspace
+    volumes:
+      - ${FT_E2E_COMPOSE_BINARY}:/opt/ft/ft:ro
+      - ${FT_E2E_COMPOSE_HARNESS}:/opt/harness/distributed_compose_harness.py:ro
+      - shared_artifacts:/artifacts
+    command:
+      [
+        "python",
+        "/opt/harness/distributed_compose_harness.py",
+        "test-runner",
+        "--binary",
+        "/opt/ft/ft",
+        "--workspace",
+        "/artifacts/aggregator-workspace",
+        "--config",
+        "/artifacts/ft.toml",
+        "--db-path",
+        "/artifacts/aggregator-workspace/.ft/compose_dist.db",
+        "--artifacts",
+        "/artifacts",
+        "--marker",
+        "${FT_E2E_COMPOSE_MARKER}",
+      ]
+
+volumes:
+  shared_artifacts: {}

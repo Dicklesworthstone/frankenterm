@@ -1,0 +1,4604 @@
+# ft — FrankenTerm
+
+<div align="center">
+  <img src="frankenterm_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
+</div>
+
+<!-- Demo recordings are embedded only once they exist in the tree.
+     `scripts/demo.tape` (CLI tour) and `scripts/demo-full.tape` (10-pane
+     live swarm) are the vhs sources; the swarm recording is tracked under
+     ft-xl2kc.1 / ft-xxfwy.21 and must be captured from real agents, not
+     staged output, before it is linked here. -->
+
+<div align="center">
+
+[![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
+[![Async runtime](https://img.shields.io/badge/runtime-asupersync%20(Cx--first)-purple.svg)](#engineering-discipline)
+[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#engineering-discipline)
+[![Core Counts](https://img.shields.io/badge/core%20library-auto--stamped-blue.svg)](#workspace-structure)
+[![Test Counts](https://img.shields.io/badge/tests-auto--stamped-green.svg)](#testing)
+
+</div>
+
+### What's here
+
+| If you're... | Start with |
+|---|---|
+| Trying it out | [10-Minute Tour](#10-minute-tour) → [Commands](#commands) → [Robot Mode](#robot-mode-json-api) |
+| Building a meta-agent | [Robot Mode](#robot-mode-json-api) → [Sample Mission/Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) → [Operating Envelope](#operating-envelope) |
+| Operating at scale | [Capacity Planning](#deep-dive-capacity-planning) → [Operator Playbook](#operator-playbook-excerpts) → [Troubleshooting](#troubleshooting) |
+| Understanding how it works | [Architecture](#architecture) → [System Components](#system-components-and-responsibilities) → [Deep Dives](#deep-dive-the-watcher-capture-loop) |
+| Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
+| Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
+
+**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->97<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->540<!--/count--> core-library modules, <!--count:core_loc-->1389418<!--/count-->+ lines of Rust, <!--count:test_count-->64035<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1051<!--/count--> integration test files.
+
+_Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
+
+<div align="center">
+<h3>Quick Install</h3>
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
+```
+
+The installer verifies the DSR-published checksum and minisign signature, then
+publishes `ft`, the mux server, the PTY guardian, and (on Apple-Silicon macOS)
+a verified `FrankenTerm.app` candidate as one manifest-bound generation. On an
+idle first install, the standalone process family is promoted automatically
+through a selector-last transaction and must pass `ft doctor --json`; otherwise
+the transaction rolls back. Active or ambiguous hosts retain a pending
+candidate, as do upgrades unless `--activate-if-idle` is requested. In that
+case, use the receipt's exact `next_action` command after every old GUI, mux,
+guardian, and watcher has stopped. This maintenance activation is
+crash-resumable, but it does not preserve live panes. The macOS GUI app remains
+a separately verified candidate until its cross-launcher lifecycle and PTY
+handoff transaction is production-proven. Only a `current` process-family
+receipt authorizes ordinary `ft --version` and `ft doctor` through `PATH`; the
+same JSON is retained at
+`~/.local/bin/.frankenterm-process-family/install-receipt.json` for audit and
+automation.
+Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux
+endpoint. Native vendored builds prefer the direct pooled mux protocol; the
+external `wezterm` CLI is a compatibility fallback, not a universal
+prerequisite.
+
+</div>
+
+---
+
+## TL;DR
+
+**The Problem.** Running large AI coding swarms across ad-hoc terminal panes is chaos. When you're driving 50–200 Claude Code / Codex / Gemini agents at once, a single undetected rate limit wastes hours of compute. A stuck agent silently burns tokens. An auth failure goes unnoticed for thirty minutes. You have no search across agent output, no audit trail, no way for one AI to safely control another, and no way to know whether your swarm is operating inside or outside its safe envelope.
+
+**The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures bounded terminal-output deltas across observed panes and records explicit gaps whenever continuity cannot be established, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes those surfaces through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse admission outside the envelope justified by the telemetry and evidence currently available. That envelope is deliberately narrower than the eventual 200-pane target while target-class proof remains blocked.
+
+**Runtime model.** `Cx`-aware async on **asupersync**, with project-owned
+structured-task and cancellation conventions. Direct `tokio` usage is
+**banned at the dependency level** via `cargo-deny` and at the type level via
+the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical
+first-party async API; its implementation layer and explicitly audited
+integration seams may still name pinned asupersync types directly. The
+dual-runtime era is over. Cancellation responsiveness is an operation-level contract: a wait
+must checkpoint its `Cx` or explicitly race a cancellation signal; merely
+holding a `Cx` does not make every suspended primitive wake on cancellation.
+
+If you'd rather see commands than prose, jump straight to the [10-Minute Tour](#10-minute-tour) below.
+
+---
+
+## 10-Minute Tour
+
+A guided walkthrough from "I cloned this" to "I have an AI driving an AI." Each step builds on the previous one.
+
+### 1 · Install + verify (1 minute)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
+
+# An idle first install should report activation=current. If it is pending,
+# use the printed absolute "Candidate CLI" path without changing live authority:
+/absolute/candidate/generation/ft --version
+/absolute/candidate/generation/ft doctor
+```
+
+The installer selects one DSR release generation and verifies its checksum and
+minisign signature before publication. It automatically activates a first
+process-family generation only when two bounded censuses report the host idle
+and the stable paths pass `--version` plus `ft doctor --json`. It never treats a
+standalone `ft` binary as a complete installation. `ft` talks to a live
+FrankenTerm/WezTerm-fork mux. Native vendored builds can use the direct pooled
+mux protocol; compatibility configurations may instead require the external
+`wezterm` CLI in `PATH`. `ft doctor` reports the available backend
+prerequisites. If you need a source build or optional features (`mcp`, `web`,
+`distributed`, `semantic-search`, `ftui`), see [Installation](#installation)
+below. Do not substitute the stable `ft` path for the printed candidate path
+unless the installer receipt explicitly says the generation is current.
+
+### 2 · See the fleet (1 minute, no daemon yet)
+
+`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view. The full `RobotResponse` envelope wraps every response with `ok`, `data`, `elapsed_ms`, `version`, `now`, and `schema_version` (the MCP transport adds `mcp_version` on top of that); `data` for the `state` endpoint is a bare array of pane records (truncated below for clarity):
+
+```bash
+$ ft robot state
+{
+  "ok": true,
+  "data": [
+    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"},
+    {"pane_id": 1, "title": "codex",       "domain": "local", "cwd": "/project"},
+    {"pane_id": 2, "title": "build",       "domain": "local", "cwd": "/project"}
+  ],
+  "elapsed_ms": 4,
+  "version": "0.2.0",
+  "now": 1747371642000,
+  "schema_version": 1
+}
+```
+
+For AI-to-AI use, add `--format toon` to swap the JSON encoder for the lower-token [TOON](#deep-dive-toon-encoding) serialization. Exact savings depend on payload shape; pass `--stats` and the CLI prints estimated JSON and TOON token counts and the savings percentage to stderr.
+
+### 3 · Start observing (2 minutes)
+
+Now start the watcher so capture, pattern detection, and workflow execution kick in. Run it in the foreground for the tour:
+
+```bash
+ft watch --foreground
+# (leave this running; new terminal for the next steps)
+```
+
+In a second shell, peek at what the watcher is seeing. `ft robot events` returns an `EventsData` envelope that wraps the event list with filter + count metadata:
+
+```bash
+$ ft status                                     # human-readable fleet overview
+$ ft robot events --limit 5                     # recent pattern-triggered detections
+{
+  "ok": true,
+  "data": {
+    "events": [
+      {
+        "id": 1247,
+        "pane_id": 1,
+        "rule_id": "codex.usage.reached",
+        "pack_id": "builtin:core",
+        "event_type": "detection",
+        "severity": "warn",
+        "confidence": 0.95,
+        "captured_at": 1747371642000
+      }
+    ],
+    "total_count": 1,
+    "limit": 5,
+    "unhandled_only": false
+  },
+  "elapsed_ms": 3,
+  "version": "0.2.0",
+  "now": 1747371643000,
+  "schema_version": 1
+}
+```
+
+The watcher's pattern engine has already noticed pane 1 hit a rate limit; the event is queued for any registered workflow handler to react.
+
+### 4 · React safely (2 minutes — send + wait-for + policy gate)
+
+Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The default send path stays fast and only returns the policy-gated injection result plus optional wait-for data. Add `--verify-submit` or `--submit-level <write|composer|submitted|working>` when the caller needs a durable `submit` receipt persisted with the audit row under its `idempotency_key`:
+
+```bash
+$ ft robot send 1 "/compact" --verify-submit --wait-for "compaction complete" --timeout-secs 30
+{
+  "ok": true,
+  "data": {
+    "pane_id": 1,
+    "injection": { /* wire-level injection record */ },
+    "wait_for": {
+      "pane_id": 1,
+      "pattern": "compaction complete",
+      "matched": true,
+      "elapsed_ms": 4823,
+      "polls": 96,
+      "is_regex": false
+    },
+    "submit": {
+      "state": "submitted",
+      "guarantee_level": "submitted",
+      "guarantee_met": true,
+      "attempts": 1,
+      "evidence_rule_ids": ["policy.allow"],
+      "elapsed_ms": 4829,
+      "polls": 96,
+      "idempotency_key": "rk:0123456789abcdef"
+    }
+  },
+  "elapsed_ms": 4829,
+  "version": "0.2.0",
+  "now": 1747371646829,
+  "schema_version": 1
+}
+```
+
+Notice three things: (1) **`ft robot send` is policy-gated** — if you try to send something that violates a policy rule, you get a structured `RequireApproval` envelope with an 8-char approval code, not a silent error. (2) **`--wait-for` is condition-based**, not `sleep`-based — it polls until the pattern shows up or the timeout fires. (3) The response is **structured JSON** the calling agent can route on. Prompt-active evidence comes from OSC 133 markers emitted by the pane's shell: until you run `ft setup shell` (bash, zsh, or fish; idempotent, `--dry-run` to preview) in the shells you want to drive, an untrusted caller's first send to a pane returns `RequireApproval` with rule `policy.prompt_unknown` rather than `ok: true`. The running watcher reads those markers live from the mux's semantic zones, so keep `ft watch` up: with no watcher, pane state is unknown and the send returns `robot.approval_error` asking you to start it. Agent TUIs publish no prompt markers, so for Codex and Claude Code the watcher reads the screen instead: an idle input composer counts as prompt evidence (`agent_ready:codex`, `agent_ready:claude_code`), while a working agent (`esc to interrupt`) or any menu, confirmation or folder-trust prompt is treated as a running command and the send is denied. Other agents (Gemini today) and unrecognized screens keep the approval path.
+
+When `ok=false`, the error fields live at the top level of the envelope (not nested under `error`):
+
+```json
+{
+  "ok": false,
+  "error": "Action requires approval",
+  "error_code": "robot.require_approval",
+  "hint": "Run: ft approve AB12CD34",
+  "elapsed_ms": 1,
+  "version": "0.2.0",
+  "now": 1747371646830,
+  "schema_version": 1
+}
+```
+
+### 5 · Search the past (1 minute)
+
+Every byte of pane output the watcher captured is FTS5-indexed. `ft robot search` returns a `SearchData` wrapping the result list:
+
+```bash
+$ ft robot search "error: compilation failed" --limit 3
+{
+  "ok": true,
+  "data": {
+    "query": "error: compilation failed",
+    "results": [
+      {
+        "segment_id": 41827,
+        "pane_id": 1,
+        "seq": 5821,
+        "captured_at": 1747370104000,
+        "score": 1.2845,
+        "snippet": "  --> services/billing/pricing.rs:142:12\n  error: compilation failed: type mismatch"
+      }
+    ],
+    "total_hits": 1,
+    "limit": 3,
+    "mode": "lexical"
+  },
+  "elapsed_ms": 7,
+  "version": "0.2.0",
+  "now": 1747371700000,
+  "schema_version": 1
+}
+```
+
+Add `--mode hybrid` for semantic-ranked results; hits then carry `semantic_score` and `fusion_rank` fields alongside `score`.
+
+### 6 · Orchestrate transactionally (2 minutes — mission + tx)
+
+For multi-pane operations that need rollback semantics, use the Tx engine:
+
+```bash
+$ ft tx plan --contract-file deploy-staging.json     # validate the contract
+$ ft tx run                                          # prepare + commit, with auto-compensation on failure
+$ ft tx show --include-contract                      # full receipt with per-step audit
+```
+
+For a free-text operator goal that respects the safety envelope:
+
+```bash
+$ ft mission objective-plan --objective "spawn 5 codex panes for the pricing refactor"
+```
+
+This invokes the read-only objective planner. It ranks the objective against the scope you pass and a capacity posture you supply (`--capacity-posture admit|defer|pause|unknown`, default `admit`); it does not read the live operating envelope itself, so check `ft swarm envelope` first and pass the posture it implies. See [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) for the JSON shapes.
+
+### 7 · Verify the release attestation (1 minute)
+
+Every load-bearing claim links to a signed artifact slot. The CLI re-hashes every artifact from disk, recomputes the canonical signing payload, checks the recorded `.sigstore` file hash + size, and verifies the Sigstore signature. Exits 0 on full pass, non-zero on any failure.
+
+```bash
+ft attestation verify docs/attestations/<version>.json          # human-readable verdict
+ft attestation verify docs/attestations/<version>.json --json   # machine-readable verdict
+ft attestation show docs/attestations/<version>.json            # pretty-print without re-verifying
+```
+
+`ft attestation` is a thin Rust wrapper over `scripts/attestation-verify.sh`; third parties without the `ft` binary can run the script directly.
+
+### Where to go next
+
+- **[Robot Mode (JSON API)](#robot-mode-json-api)** — the full call contract AI agents use to drive other AI agents
+- **[Operating Envelope](#operating-envelope)** — the fail-closed safety surface that gates new pane admission
+- **[Commands](#commands)** — every `ft` subcommand with examples
+- **[Bundled Demo Scenarios](docs/demo-scenarios.md)** — side-effect-free onboarding/regression fixtures with retained artifacts
+- **[Configuration](#configuration)** — `ft.toml` reference for tuning poll intervals, retention, redaction tiers
+- **[Operator Playbook](#operator-playbook-excerpts)** — what to do when things break
+
+Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets — you won't accidentally leak a JWT into a notification or an event payload.
+
+---
+
+## Why use ft?
+
+Now that you've seen it run, here's the full capability surface:
+
+| Capability | What it does |
+|---|---|
+| **Full Observability** | Captures terminal output across panes with low-latency delta extraction; sub-50 ms lag is the benchmark-lane target ([attestation](#trust--attestation))[^ft-attest-perf-headline][^ft-attest-lindley] |
+| **Multi-Agent Detection** | Aho-Corasick multi-pattern engine + Bloom prefilter + BOCPD change-point detection. Native rule packs for Codex, Claude Code, and Gemini |
+| **Event-Driven Automation** | Workflows trigger on detected patterns with per-workflow trigger-policy allowlists (ft-j0ufc), never on `sleep` loops |
+| **Robot Mode API** | JSON / TOON envelopes optimized for AI-to-AI control[^ft-attest-robot-contracts] |
+| **Lexical + Hybrid Search** | SQLite FTS5 plus a hash-embedding semantic lane fused with RRF; lexical, semantic, and hybrid modes across captured output |
+| **Operating Envelope Contract** | `ft.operating_envelope.v1` planner module decides whether new pane work is admitted based on system pressure; fails closed when telemetry is missing |
+| **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
+| **Transactional Mission Orchestration** | Prepare/commit/compensate lifecycle, idempotency ledger, deterministic replay, kill switches, capacity-aware objective planner |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) with a worst-of fleet memory controller; 200-pane capacity and memory figures are benchmark-lane results, not a target-class or live-session guarantee[^ft-attest-perf-headline] |
+| **Incident Bundles** | Crash and swarm-incident bundles with recent events, stored pane state, DB metadata, config, git state, and a beads coordination snapshot |
+| **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
+| **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, versioned wire protocol, and stale-session pruning[^ft-attest-distributed-threat] |
+| **Reality-check + Attestation** | Maps claims to artifacts or explicit deferred slots in `docs/attestations/manifest.json`. Inspect bundle integrity with `ft attestation verify`; publisher authentication requires a trusted release policy |
+
+[^ft-attest-perf-headline]: Verified via the populated [`perf/headline-claims`](docs/perf/headline-claims.json) attestation slot in [`docs/attestations/manifest.json`](docs/attestations/manifest.json); this covers benchmark-lane capture latency, Bloom prefilter speedup, and pane/memory capacity rows. Target-class caveats remain governed by their linked artifacts and the fail-closed [`swarm-capacity-envelope`](docs/attestations/perf/swarm-capacity-envelope.json) adjunct.
+[^ft-attest-lindley]: Deferred: the [`perf/lindley-bounds`](docs/attestations/manifest.json) capture-path latency proof is assigned to `ft-7h5da.10.2`; the manifest currently contains no accepted artifact for this slot.
+[^ft-attest-robot-contracts]: Verified via the populated [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) attestation slot for JSON/TOON control-plane envelope contracts.
+[^ft-attest-distributed-threat]: Verified via the populated [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) attestation slot for distributed wire-protocol safety review and diff-fuzz coverage.
+
+### What "swarm-native" actually means
+
+The phrase has a concrete meaning here:
+
+1. **The minimum-useful-unit is the fleet, not the pane.** Every primary subsystem (storage, search, policy, workflows, mission, tx, distributed) models fleets rather than a single-pane-only world. The architecture targets dozens to hundreds of panes; the upper end remains a benchmark target until live and target-class qualification closes.
+2. **Fleet pressure is a first-class signal.** The operating envelope, fleet memory controller, and backpressure tiers compose pressure across the entire fleet, not per-pane in isolation. A single hot pane can throttle the rest of the fleet's poll cadence; a healthy fleet runs at full speed.
+3. **One AI can drive another safely.** Robot Mode, MCP, and the policy gate exist specifically so AI agents can control other AI agents without writing brittle text-parsing glue. The JSON envelopes are the contract.
+4. **Coordination primitives are built in.** Beads issue tracking, Agent Mail file reservations, work claim queues (`ft robot work`), and tx idempotency ledgers exist because swarm work needs coordination, not just observation.
+5. **Failure isolation is per-pane, but recovery is per-fleet.** A stuck pane doesn't take down the watcher. An auth failure on one agent doesn't pause the other 49. But the fleet memory controller throttles uniformly when pressure is real.
+
+### Who is this for?
+
+- **Anyone running 2+ AI coding agents in parallel** and tired of writing bash glue to coordinate them
+- **Anyone building meta-agents** (one AI driving N specialized AIs) who needs a structured control plane
+- **Operators targeting large swarms (50–200+ panes)** who need fleet-wide observability, memory bounds, and capacity admission and can honor the current provisional capacity envelope
+- **Anyone who has to audit what an AI did** in a terminal session after the fact
+- **Anyone who has lost work to a rate limit they didn't notice for 30 minutes**
+- **Anyone who wants their multi-agent infrastructure to fail closed rather than silently degrade**
+
+---
+
+## Supported Surface Matrix
+
+Honest status of every shipped surface, without migration-era hand-waving.
+
+| Surface | Status | Notes |
+|---|---|---|
+| Watch / status / triage / doctor / reproduce | **Supported** | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints |
+| Search / events / audit / workflows / mission / tx | **Supported** | Backed by local storage, policy, and workflow subsystems |
+| Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflow`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approve`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
+| Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
+| Mission objective planner | **Supported** | Read-only objective planner; the capacity posture is caller-supplied (`--capacity-posture`), not read from the operating envelope (ft-auy2g) |
+| Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; audit tail included, process tree opt-in (`--process-sample`); GPU, render and BSU/ESU collectors are not on the production path |
+| Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
+| Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
+| Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
+| Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
+| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). Optional operator-token sign-in protects HTTP reads and live streams. Authenticated Tailscale access, terminal attach and DSR-packaged assets remain under `ft-browser-frankenterm-7z4il` |
+| Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
+| MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
+| Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
+| Browser auth tooling | **Feature-gated (on by default)** | `ft auth` is real; it needs the `browser` feature (in default builds) and a usable browser stack on the host |
+| GUI (FrankenTerm.app) | **Supported on macOS** | Native macOS bundle; live render-state plumbing, BSU/ESU sync-output, classified drag handlers, command-palette domain labels |
+
+---
+
+## Design Philosophy
+
+### 1. Passive-First Architecture
+
+The default observation loop does not send pane input, but it is not
+side-effect-free: `ft watch` owns persistence lifecycle work, including schema
+migration, capture writes, and retention pruning. With `--auto-handle`, matched
+events can also enter policy-gated workflow actions. Input, workflow,
+mission, and transaction effects remain separately gated and auditable; do not
+treat starting a watcher as a passive offline diagnostic.
+
+### 2. Event-Driven, Not Time-Based
+
+No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. `ft robot wait-for` blocks until a specific pattern appears in pane output, not until a timer expires.
+
+### 3. Delta Extraction Over Full Capture
+
+Instead of repeatedly persisting entire scrollback buffers, `ft` uses a bounded 1 MiB overlap window to extract only new content. The larger default can match retained prefixes after realistic scrolls without turning routine polls into false full-snapshot gaps. When overlap still cannot be established (terminal reset, scrollback clear, or a shift beyond the bound), the discontinuity is recorded as an explicit event rather than silently dropped.
+
+### 4. Single-Writer Integrity
+
+A filesystem lock (via `fs2`) ensures only one watcher can write to the database. No corruption from concurrent mutations. Graceful fallback for read-only introspection. The lock metadata records PID and start time for diagnostics.
+
+### 5. Agent-First Interface
+
+Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) is the lower-token machine format; payload shape controls savings, and the benchmark substrate lives at [`docs/perf-ledger/toon-encoding.md`](docs/perf-ledger/toon-encoding.md). The format is built for machines to parse, not humans to read.
+
+### 6. Transactional Safety
+
+Multi-pane operations use a prepare/commit/compensate lifecycle borrowed from distributed transaction protocols. If a commit step fails, compensation rolls back the committed steps. Kill switches and pause controls provide emergency intervention. Every transition emits an observability event with a reason code and decision path.
+
+### 7. Defense in Depth for Memory
+
+The fleet memory controller synthesizes pressure signals from three independent subsystems: pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets. These feed a unified 4-tier pressure model (Normal, Elevated, Critical, Emergency) with asymmetric hysteresis that escalates fast and de-escalates slow. During incidents, operators use the [resource-pressure cockpit contract](docs/resource-pressure-cockpit-contract.md) to separate `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown` resident memory before calling anything a leak.
+
+### 8. Fail Closed on Missing Telemetry
+
+The operating envelope, network-pressure selector, process-snapshot pipeline, and RCH critical-pressure gate **all refuse to advance when their measurement source is absent or unhealthy**. A swarm controller that doesn't know what state the system is in must not pretend to know. This is enforced at the call sites of every component that consumes pressure or health telemetry.
+
+### 9. Layered via Extraction
+
+Layering is enforced through sub-crate extraction, not just discipline. `frankenterm-core` has 19 sibling sub-crates carved out. Core imports shared leaf types; cluster crates such as ARS, replay, search, and fleet depend on core and shared leaves. Cargo rejects cycles among normal and build dependencies; dev-dependency cycles allow core's tests to exercise extracted clusters.
+
+### 10. Reality-Check Discipline
+
+Every headline claim is meant to link to a signed attestation slot. The quarterly `/reality-check-for-project` discipline produces a bridge plan, a substrate of proof slots, and a per-release bundle. The current round (ft-xxfwy, opened 2026-09-01) closes the entry ramp first: a signed installable release, `ft` attaching to the running FrankenTerm.app, a live-agent proof of the observe → detect → react → audit loop, and the first real signed bundle. See [`docs/reality-check-bridge-plan-2026-09-01.md`](docs/reality-check-bridge-plan-2026-09-01.md); the earlier rounds are [`docs/reality-check-bridge-plan.md`](docs/reality-check-bridge-plan.md) (2026-04-30) and [`docs/reality-check-bridge-plan-2026-05-12.md`](docs/reality-check-bridge-plan-2026-05-12.md) (ft-tf6g3).
+
+---
+
+## Glossary of Terms
+
+Terminology used throughout this document and the codebase. Reading these once saves grepping later.
+
+| Term | Meaning |
+|---|---|
+| **Mux** | The terminal multiplexer process. `ft` talks to the WezTerm/FrankenTerm mux. |
+| **Domain** | A backend that hosts panes — `local`, `SSH:<host>`, `tmux:<socket>`, or a custom domain. Each pane has one. |
+| **Window / Tab / Pane** | Mux topology unit, in increasing granularity. A window holds tabs; a tab holds panes. |
+| **Session** | An `ft` concept: a coherent run of the watcher with persistent identity. Sessions outlive individual mux restarts. |
+| **Snapshot** | A point-in-time capture of the mux topology + per-pane state, persisted to the DB. |
+| **Checkpoint** | A persisted session-progress marker; checkpoints accumulate within a session. |
+| **Backup** | A portable archive of the entire `ft` database, separate from snapshots. |
+| **Capture** | The act of reading current scrollback from a pane and persisting any new bytes. |
+| **Delta** | The new bytes a capture produced after the bounded 1 MiB overlap match. |
+| **Gap** | Captured discontinuity (the previous tail didn't match anywhere in the new capture). Recorded as an event. |
+| **Rule** | A pattern with stable ID, anchor strings, regex, severity, and agent type. |
+| **Rule pack** | A versioned collection of rules; the default is `builtin:core`. |
+| **Detection** | A rule firing on captured text; emitted as an event with the originating `pane_id` and `rule_id`. |
+| **Event** | A typed message on the event bus — detections, gaps, lifecycle changes, system events. |
+| **Workflow** | A registered handler that runs in response to detected events (or on demand). |
+| **Mission** | A planned multi-pane operation with a contract, lifecycle state machine, and audit trail. |
+| **Tx (transaction)** | The execution engine for missions; prepare → commit → compensate with idempotency receipts. |
+| **Operating envelope** | The fail-closed admission contract that decides whether new pane/workflow work is safe right now. |
+| **Profile** | A reusable pane specification (agent + cwd + env + session settings). |
+| **Persona** | Behavioral defaults a profile inherits (skill mix, prompt preludes, tool palette). Planned: defined as a type, not yet loadable from `ft`. |
+| **Fleet template** | A composition of profiles with counts and dependencies. Planned: defined as a type, not yet loadable from `ft`. |
+| **Reservation** | An advisory lease on a pane (or file path) preventing concurrent edits. |
+| **Approval token** | A one-shot, scope-pinned 8-char code that lets a specific action through the policy gate. |
+| **Robot Mode** | The JSON / TOON API surface AI agents use to drive `ft`. |
+| **TOON** | Token-Optimized Object Notation — a compact tree serialization for AI-to-AI envelopes. |
+| **Cx** | asupersync's cancellation context; propagates cancel signals through structured concurrency. |
+| **RuntimeProof** | A sealed trait that makes `tokio::*` types refuse to compile in bounded API surfaces. |
+| **Aggregator** | In distributed mode, the host running `ft watch` with the listener; it receives streams from `ft distributed agent` peers. |
+| **Cockpit** | The resource-pressure cockpit contract; classifies resident memory before any "leak" claim. |
+| **Reality-check** | The quarterly discipline that produces a bridge plan + substrate + signed per-release attestation bundle. |
+| **Bead** | A unit of tracked work in `beads_rust` (`br`); IDs prefix `ft-*` for this project. |
+| **PDU** | Protocol Data Unit — the codec layer's wire message envelope between mux client and mux server. |
+
+---
+
+## Safety Guarantees
+
+- **Observe vs act split**: the default `ft watch` loop does not send pane input, but it does own local persistence effects such as schema migration, capture writes, and retention pruning. Input and `--auto-handle` workflow actions remain separately policy-gated and auditable.
+- **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
+- **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
+- **Policy-gated reads**: `get-text`/`search` surfaces enforce policy checks and return redacted text payloads.
+- **Transactional operations**: `ft tx run` uses prepare/commit/compensate phases with idempotency guards and deterministic replay.
+- **Approval tokens**: allow-once approval codes scoped to specific action + pane + fingerprint combinations.
+- **Secret redaction**: captured output is redacted before being returned through any API surface, with configurable sensitivity tiers (T1/T2/T3) and retention policies. Token redactor coverage was expanded in 2026-05 to include JWT, GitLab, Twilio, SendGrid, and Datadog patterns.
+- **Workflow trigger-policy allowlists** (ft-j0ufc): high-trust workflows declare allowlisted source panes to prevent low-trust panes from triggering them via output injection.
+- **Public-field bypass class eliminated**: ~6 audit findings closed where `pub` struct fields let callers bypass clamping or validation. Constructors/builders now own the invariants for `ErasureShard`, `CircuitBreaker::Config`, `QuantileBudgetMs`, `ArrivalCurve`, `ServiceCurve`, `ApprovalScope`/`AuditContext`, `ScaleFactor`, and `AxisValue`.
+- **Rubber-stamp `is_safe()` class eliminated**: ~17 audit findings closed where `is_safe()` returned `true` on cold start or before measurements were recorded. Every release-gate `is_safe` now requires evidence before reporting safe.
+- **Attestation bundles**: [`docs/attestations/`](docs/attestations/) records artifact hashes and deferred claims. Bundle integrity, publisher authentication under a trusted policy, and the DSR release artifact signatures are separate checks; a development bundle is not proof of a published release.
+
+### Trust & Attestation
+
+<!-- reality-check-drumbeat:auto -->
+_Latest reality-check drumbeat: [`docs/reports/reality-check-2026-09-01.md`](docs/reports/reality-check-2026-09-01.md) (2026-09-01). Third full pass: [`docs/reality-check-bridge-plan-2026-09-01.md`](docs/reality-check-bridge-plan-2026-09-01.md), epic `ft-xxfwy` (entry-ramp truth: signed install, GUI attach, live-loop proof, real attestation bundle). Predecessors: 2026-04-30 plan and 2026-05-12 plan (`ft-tf6g3`)._
+<!-- reality-check-drumbeat:auto:end -->
+
+The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json); each slot maps a claim category to its producing-bead artifact, and the per-release bundle signs those slot hashes.
+
+The README claim-to-slot map identifies populated artifacts and explicitly deferred proofs:
+
+<!-- attestation-claim-map:start -->
+| README claim | Manifest slot | Producing bead |
+|---|---|---|
+| Capture latency benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| Deferred: capture-path Lindley / min-plus bound | [`perf/lindley-bounds`](docs/attestations/manifest.json) | `ft-7h5da.10.2` |
+| Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
+| Scoped remote operating-envelope read-only admission proof; target-class capacity remains unproven | [`proofs/robot-contracts`](docs/attestations/proofs/operating-envelope.json) | `ft-booek.7` |
+| Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
+| Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
+| `runtime_async` Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
+| `RuntimeProof` sealed-trait guard | [`proofs/runtime-proof-trait`](docs/attestations/proofs/runtime-proof-trait.json) | `ft-i2eni.1` |
+| Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
+<!-- attestation-claim-map:end -->
+
+The operating-envelope contract (`ft.operating_envelope.v1`) remains deferred
+under the `proofs/robot-contracts` manifest category to `ft-booek.7`.
+Its retained artifact records scoped remote contract tests and development bundle
+verification; final artifact and bundle qualification remain pending. The slot does not
+prove target-class production capacity while the target-class resource-cockpit
+artifact remains `skipped_not_proven`. The
+renderer SLO suite is still tracked under [ft-tf6g3](#engineering-discipline)
+for inclusion in a future bundle. The optional `proofs/rehearsal-score` slot
+hashes the rehearsal-score golden matrix so blocked, skipped, degraded,
+missing-evidence, and fixture-only score rows stay visible; it is not a
+production support claim unless the cited receipt criterion has proven evidence.
+
+Verify a release attestation bundle in one command, offline, without trusting GitHub or any registry:
+
+```bash
+ft attestation verify docs/attestations/<version>.json
+```
+
+The CLI re-derives every artifact's SHA-256 from disk, recomputes the canonical signing payload, checks the recorded `.sigstore` file hash and size, and verifies the Sigstore signature. Exits 0 on full pass; non-zero on any failure. For machine-readable output:
+
+```bash
+ft attestation verify docs/attestations/<version>.json --json
+ft attestation show docs/attestations/<version>.json
+```
+
+Use `--strict-required` on `verify` to fail when the bundle's `required_categories` list does not match the canonical manifest. The release gate is meant to run the shell verifier with `--strict-deferred` so tagged releases cannot ship intentionally deferred slots; wiring that check into the DSR quality gate is tracked under `ft-xxfwy.15`. At this revision the only bundle in the tree is `docs/attestations/0.0.0-dev.json` (dev channel, `signature.method: unsigned`); no tagged release has shipped a signed bundle yet, so `<version>` in the examples above is a placeholder until the first one lands.
+
+The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-verify.sh`](scripts/attestation-verify.sh); third parties without an `ft` binary can run the script directly with the same arguments. For Sigstore signing identity, Fulcio/Rekor trust-root details, and manual `cosign verify-blob` commands, see [`docs/attestations/SIGNING.md`](docs/attestations/SIGNING.md). For the per-release closure procedure (when to run, how to file regressions on hash mismatch), see [`docs/release/attestation-checklist.md`](docs/release/attestation-checklist.md).
+
+---
+
+## How ft Compares
+
+| Feature | ft | WezTerm | Zellij | Ghostty |
+|---|---|---|---|---|
+| Swarm-native orchestration | Built in; 200-pane scale is benchmark-lane only, pending target qualification | External glue required | External glue required | External glue required |
+| Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
+| Machine API for agents | Robot Mode + MCP + TOON | None | None | None |
+| Operating-envelope safety | Native fail-closed contract | None | None | None |
+| Cross-session capture + inspection | Built-in snapshots + sessions; automated restore/restart execution is unavailable | Partial / manual | Session-centric, not swarm-centric | Minimal |
+| Agent-safe control plane | 14-subsystem policy diagnostics surface | Not native | Not native | Not native |
+| Transactional multi-pane ops | Prepare/commit/compensate + idempotency ledger | None | None | None |
+| Full-text search over output | FTS5 + hybrid (RRF) modes | None | None | None |
+| Memory management at scale | Three-tier scrollback + fleet controller | Single tier | Single tier | Single tier |
+| Replay and forensics | Decision graph + diff + provenance | None | None | None |
+| Reality-check attestation bundles | Sigstore-signed slot manifest | None | None | None |
+| Incident bundles | Events, pane rows, DB/config/git state, beads snapshot | None | None | None |
+| Async runtime contract | asupersync, `Cx`-first, project-audited cancellation, `tokio` banned | tokio (no `Cx` model) | smol (no `Cx` model) | none of these project-specific contracts |
+| Unsafe code | Forbidden in CLI/core; audited native/FFI exceptions | unsafe present | unsafe present | unsafe present |
+
+**When to use ft:**
+- Running 2+ AI coding agents that need coordination
+- Building automation that reacts to terminal output
+- Debugging multi-agent workflows with full observability
+- Operating agent swarms with memory and backpressure control, while treating the published 50–200-pane figures as provisional benchmark bounds until the target-class gate passes
+- Anywhere a swarm controller needs *attestable* safety bounds
+
+**When ft might not be ideal:**
+- Single-shell / single-agent usage where orchestration is unnecessary
+- Environments that only need a lightweight interactive terminal and no swarm control plane
+- Use cases that require driving a different mux backend (tmux, Zellij, kitty) — by design, `ft` runs on its own in-tree terminal engine, not an abstraction over arbitrary multiplexers
+
+---
+
+## Real-World Scenarios
+
+These are the workloads `ft` was built for. Each scenario describes the operator pain *without* `ft`, then how the platform addresses it.
+
+### Scenario 1 — Detect and recover from rate limits across a 50-pane swarm
+
+**Without `ft`:** You're driving 50 Codex/Claude Code panes in parallel. One agent hits its usage limit and silently stops making progress. You don't notice for 30 minutes. The other 49 agents continue burning tokens until they hit *their* limits.
+
+**With `ft`:** the native rule packs recognize supported usage-limit output and record the originating `pane_id` and `rule_id`. Provider wording changes and unknown forms still require detection updates; the 50-pane journey needs target-class qualification. Two approaches:
+
+```bash
+# A) Let the built-in workflow handle it (preferred)
+ft watch --foreground --auto-handle    # registers handle_usage_limits, handle_compaction, …
+
+# B) Inspect detected events before choosing a provider-specific recovery
+ft robot --format json events --unhandled --limit 50 | \
+  jq -c '.data.events[] | {id, pane_id, rule_id}'
+
+# Wait for literal output on one pane (this does not subscribe to a rule ID)
+ft robot wait-for 7 "Usage limit" --timeout-secs 3600
+```
+
+`ft robot wait-for` takes a single `pane_id` and a substring (or regex with `--regex`). For fleet-wide reactions, inspect `ft robot events --unhandled` or use `--auto-handle`. Context compaction does not reset an account quota. A custom consumer must deduplicate and acknowledge events after an observed outcome, and pause when recovery needs operator approval. Workflow sends pass the same policy gate as `ft robot send`: they go through when the pane shows prompt evidence (OSC 133 from an integrated shell, or a recognized Codex / Claude Code composer at rest) and stop at an approval request or a denial otherwise, so a busy agent or an open menu is never typed into.
+
+### Scenario 2 — Coordinate a multi-pane mission with safe rollback
+
+**Without `ft`:** You need to run a 5-step refactor across 4 panes (e.g., "pane 1 rewrites tests, panes 2–4 update implementations in parallel, then pane 1 verifies"). You wire this with bash, shell sleeps, and prayer. When step 3 fails halfway, you have no way to roll back the partial work.
+
+**With `ft`:**
+```bash
+ft mission plan --mission-file refactor.json    # validate the contract
+ft mission status                               # see the dispatch summary
+ft tx run --contract-file refactor-tx.json      # prepare + commit deterministically
+# if a step fails mid-commit, ft tx automatically runs compensation
+ft tx show --include-contract                   # see the receipt + per-step audit
+```
+
+The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. Mission planning and lifecycle metadata do not yet drive or cancel running agent tasks (`ft-majms`, `ft-xxfwy.48`). This scenario remains a product goal until that driver and crash/recovery path are qualified.
+
+### Scenario 3 — Reconstruct what an agent did six hours ago
+
+**Without `ft`:** A coding agent did something destructive at 02:14 AM and you find out at 08:00. The terminal scrollback rolled. The pane process exited. You have no record.
+
+**With `ft`:** captured pane deltas are redacted and stored in SQLite with FTS5 indexing. Capture gaps, truncation, retention, and periods without a running watcher limit the history; it is not a byte-perfect record of all terminal activity. Policy audit records cover instrumented action and denial paths; the supported-surface audit tracks the remaining coverage gaps.
+
+```bash
+# Search captured output for the timeframe (--since takes epoch ms)
+SIX_HOURS_AGO_MS=$(( $(date +%s) * 1000 - 6 * 3600 * 1000 ))
+ft search "the suspicious string" --pane 7 --since $SIX_HOURS_AGO_MS
+
+# `ft history` accepts human-readable since strings
+ft history --pane 7 --since "6 hours ago"
+ft history --pane 7 --since "2026-05-16T02:00:00" --until "2026-05-16T03:00:00"
+
+# Check the audit trail for actions ft itself took (--since takes epoch ms)
+ft audit --pane 7 --since $SIX_HOURS_AGO_MS
+
+# Pull a long tail of the pane's current buffer (audit history covers the rest)
+ft robot get-text 7 --tail 5000
+```
+
+### Scenario 4 — Stand up a fresh swarm host with a known-safe envelope
+
+**Without `ft`:** You provision a new VPS, install your CLI tools, kick off 100 agents, and the box OOMs at 87. You have no model of what "safe" capacity is for this hardware.
+
+**With `ft`:** The operating-envelope planner evaluates available pressure snapshots and configured bounds. Admission is a model decision, not a hardware safety guarantee. Target-class resource evidence remains unproven, and authenticated receipt consumption is tracked in `ft-7h5da.10.4.4`. Inspect the evidence state and limiting inputs before starting a large fleet.
+
+```bash
+ft swarm envelope                  # current admission verdict and the limiting inputs
+ft mission objective-plan --objective "spawn 100 codex panes" --strictness strict \
+                          --capacity-posture defer
+# objective-plan does not read the envelope; pass the posture the envelope implies
+```
+
+### Scenario 5 — Drive one AI by another, safely
+
+**Without `ft`:** You want Claude Code (the meta-agent) to control 10 specialist Codex panes. You build glue with `tmux send-keys`, regex parsing of scrollback, and brittle sleep loops. Three weeks later you have a 2000-line Python script with seven race conditions.
+
+**With `ft`:** The meta-agent runs `ft robot --format toon state` for fleet snapshots, `ft robot wait-for` for condition-based blocking, `ft robot send` for input (with policy gates), and `ft robot search` for cross-pane retrieval. Every call returns a structured envelope. The meta-agent never sees raw scrollback unless it explicitly asks.
+
+```bash
+# Snapshot every pane the mux can see (use TOON to save tokens)
+ft robot --format toon state
+
+# Wait for a specific condition on a single pane
+ft robot wait-for 7 "Press Enter to continue" --timeout-secs 600
+ft robot send 7 ""    # respond
+
+# Pull unhandled events across the fleet, react per rule_id
+ft robot --format json events --unhandled --limit 50 | \
+  jq -c '.data.events[]' | while read -r e; do
+    rule=$(echo "$e" | jq -r .rule_id); pane=$(echo "$e" | jq -r .pane_id)
+    case "$rule" in
+      *.usage.reached) printf 'Review provider recovery for pane %s\n' "$pane" ;;
+      *.approval_needed) printf 'Operator approval required for pane %s\n' "$pane" ;;
+    esac
+  done
+```
+
+### Scenario 6 — Investigate a crash without losing context
+
+**Without `ft`:** A pane crashes. You have a core file maybe, scrollback definitely gone, no way to correlate with the other panes' state at the moment of failure.
+
+**With `ft`:**
+```bash
+ft reproduce export --kind crash --out /tmp/incident
+# Bundle includes: recent events, audit tail, stored pane/mux rows, SQLite metadata,
+# redacted config, git status, latest crash report, beads coordination snapshot
+# (add --process-sample for a redacted process-tree snapshot)
+```
+
+Live collectors snapshot the world at the moment of failure. The bundle is portable; you can attach it to a bug report and a reviewer can reconstruct the incident without the original host.
+
+---
+
+## Why FrankenTerm Owns Its Terminal Engine
+
+FrankenTerm runs on its own terminal engine — a fully vendored, **in-tree** fork of WezTerm's `mux`/`termwiz`/`term` crates that the project now owns and has diverged, not a live dependency on upstream WezTerm and not an abstraction layer over arbitrary terminal multiplexers. The terminal-emulation core *began* as a WezTerm fork; everything built on top of it — the watcher capture loop, the pattern/change-point engine, Robot Mode + MCP, missions and transactions, the policy gate, and the operating-envelope contract — is FrankenTerm's own. This section explains why that engine is vendored and owned rather than wrapped, and how upstream fixes are still harvested.
+
+### The decision
+
+The vendored `frankenterm/<crate>/` workspace members are first-class. There are currently <!--count:vendored_top_level-->42<!--/count--> top-level vendored crate directories and <!--count:vendored_members-->55<!--/count--> Cargo workspace members when nested derive/lua crates are included. No "implementation boundary" exists between `ft` and "the mux"; the in-process mux session API is the `MuxInterface` trait, and the audit under [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) (7,803 LOC examined, 31 importers, 192 concrete-type refs, 0 trait-object consumers) confirmed that nobody actually treats the boundary as polymorphic.
+
+### Why not abstract over both WezTerm and (say) Zellij?
+
+1. **Mux semantics aren't interchangeable.** WezTerm's pane lifecycle, scrollback model, alt-screen handling, and PDU schema are concretely different from Zellij's or tmux's. Pretending otherwise produces an abstraction that's a worst-of-all-worlds compromise.
+2. **The asupersync runtime contract is tighter than upstream WezTerm assumes.** `ft` owns its own async story (`Cx`-first propagation, structured task ownership, and audited cancellation checkpoints/races). Reusing the vendored crates means we can (and do) patch them when their runtime assumptions don't fit ours.
+3. **Test/proof surfaces are easier on owned code.** RuntimeProof, the `asupersync_test!` macro, the Loom model, and the cargo-deny tokio ban only work because we control the entire dependency graph.
+4. **Bundle identity matters.** FrankenTerm.app is a distinct macOS bundle (separate bundle ID, separate icon, separate update channel). Side-by-side install with upstream WezTerm is intentional.
+
+### Weekly upstream backport workflow
+
+We **never** blindly merge upstream WezTerm. Upstream is treated as a read-only patch source:
+
+1. Find the upstream baseline from `frankenterm/PROVENANCE.json` (`divergence_point.subject` records the imported WezTerm commit).
+2. Fetch upstream into a read-only tracking ref.
+3. Build an inventory of upstream commits since the baseline, grouped by subsystem: `term`, `termwiz`, `window`, `config`, `mux`, `pty`, `font`, `ssh`, `codec`, GUI, mux-server.
+4. Prioritize security, crash, data-loss, terminal-correctness, macOS/windowing, PTY, SSH, and font fixes before cosmetic changes.
+5. For each accepted upstream commit, port the smallest coherent slice manually into the renamed FrankenTerm paths (no regex-based code rewrites). Include the upstream SHA in the commit body as `Upstream-WezTerm: <sha>`.
+6. Validate package-scoped first (e.g., `cargo check -p mux --lib`), then broader workspace checks.
+7. Update provenance/backport notes at the end of each batch.
+
+Good backports feel like FrankenTerm-native fixes with traceable upstream provenance, not like a partial re-import of WezTerm.
+
+---
+
+## Installation
+
+### Via install script (curl | bash)
+
+The one-liner installs a prebuilt `ft` binary (no Rust toolchain required) and, on Apple-Silicon macOS, the **FrankenTerm.app** GUI bundle:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
+```
+
+```bash
+# Force a fresh fetch past any CDN cache:
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh?$(date +%s)" | bash
+```
+
+What it does:
+- Downloads one DSR-published release generation for your platform, verifies its SHA-256 checksum and repository-pinned minisign signature, and stages the manifest-bound `ft`, mux-server, and PTY-guardian process family under `~/.local/bin` (override with `--dest DIR`, or `--system` for `/usr/local/bin`).
+- Requires `minisign` for release verification (`brew install minisign` on macOS); the installer checks this before downloading any release artifact.
+- **On macOS arm64**, it also stages and proves the matching **FrankenTerm.app** (the GUI terminal emulator, bundled `ft`, mux server, and PTY guardian) at `/Applications` (or `~/Applications` when `/Applications` isn't writable). Until cross-launcher lifetime serialization and PTY handoff are production-proven, the verified app remains at its generation-specific candidate path and the live app bundle is unchanged. It does **not** restart the Dock or add a Dock tile. Skip it with `--no-app`, force it with `--with-app`, or relocate it with `--app-dest DIR`.
+- Falls back to a from-source build when no prebuilt asset matches your platform (Intel Mac, uncommon targets).
+
+| Flag | Effect |
+|---|---|
+| `--version vX.Y.Z` | Install a specific release (default: latest) |
+| `--dest DIR` / `--system` | CLI install location (`~/.local/bin` default; `/usr/local/bin` with sudo) |
+| `--easy-mode` | Append `~/.local/bin` to `PATH` in your shell rc files |
+| `--with-font` | Also install the bundled Pragmasevka Nerd Font |
+| `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
+| `--from-source` | Build from source instead of downloading (needs Rust + git) |
+| `--offline TARBALL` | Install from a local tarball; no network |
+| `--activate-if-idle` | After publishing an upgrade, promote it only when the bounded process census remains inactive at the activation boundary. First installs use this safe-idle path by default. Active or ambiguous hosts retain the verified candidate without changing authority. |
+| `--activate ID --idle-host-confirmed` | Promote the published candidate generation `ID` (printed in the install receipt) to the current authority so `ft`, the mux server, and the PTY guardian resolve on `PATH`. It takes the permanent installer lock, requires explicit idle-host confirmation, repeats the process census, commits the shared selector last, runs stable-path readiness plus `ft doctor --json`, and restores the exact prior authority if readiness fails. This is an idle maintenance operation, not live-pane handoff. |
+| `--no-verify` | Skip the DSR minisign signature check only; SHA-256 remains mandatory (testing only) |
+| `--verify` | Run the published generation's `ft doctor --json` by immutable path; fail installation verification on a non-zero exit or malformed/oversized JSON. A passing pending-candidate self-test does not activate it. |
+
+The bundled GUI app is **ad-hoc signed** (not Developer-ID notarized). A curl/terminal-placed bundle isn't Gatekeeper-quarantined, so it launches normally; if you instead fetch the `.app` asset through a browser, clear the quarantine flag with `xattr -dr com.apple.quarantine /Applications/FrankenTerm.app` before first launch.
+
+On the first launch that uses the canonical `frankenterm` data and cache
+namespaces, FrankenTerm transactionally reconstructs only validated,
+FrankenTerm-owned window state and remembered-domain authority from the former
+`wezterm` data leaf. It never bulk-copies that directory and never deletes old
+evidence. Rebuildable cache and update metadata start fresh. Plugins, REPL
+history, recent commands, recent emoji, unknown files, and other
+ownership-ambiguous state remain untouched only in the legacy leaf so a
+side-by-side WezTerm installation cannot be imported or overwritten.
+
+### Why direct `cargo install` is not an installation path
+
+Installing only the `ft` Cargo binary can silently combine a new CLI with an
+older mux server, PTY guardian, or GUI bundle. That is not a supported
+FrankenTerm installation. Use the release installer above for a coherent,
+signed generation. Use the next section only to build an uninstalled checkout
+for development.
+
+### Build a checkout from source
+
+```bash
+git clone https://github.com/Dicklesworthstone/frankenterm.git
+cd frankenterm
+bash scripts/install-hooks.sh
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-readme-release-interactive \
+  cargo build --locked --profile release-interactive \
+    -p frankenterm --bin ft \
+    -p frankenterm-mux-server --bin frankenterm-mux-server \
+    -p frankenterm-pty-guardian --bin frankenterm-pty-guardian
+```
+
+This builds an uninstalled candidate process family on the selected RCH worker.
+The command requests `/tmp/ft-readme-release-interactive` as `CARGO_TARGET_DIR`;
+RCH can remap it to a worker-scoped build directory. Consult the RCH transcript
+and artifact receipt for actual remote and retrieved local paths. Do **not**
+copy only `ft` over a live
+installation: the CLI, mux server, and PTY guardian are an atomic family with a
+shared build identity, manifest, and selector. On Apple-Silicon macOS, build the
+complete four-role app bundle (GUI plus that process family) with
+`scripts/create-macos-bundle.sh`; the script uses the repository's strict RCH
+source-fencing contract and emits `FrankenTerm.app` plus its component manifest.
+
+To install a published release from source rather than merely build a checkout,
+use the installer path so the complete family is sealed and verified:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh \
+  | bash -s -- --from-source
+```
+
+### With optional features
+
+```bash
+# MCP server support
+cargo build -p frankenterm --profile release-interactive --features mcp
+
+# Web API with SSE event/delta streaming
+cargo build -p frankenterm --profile release-interactive --features web
+
+# Distributed mode (agent streaming)
+cargo build -p frankenterm --profile release-interactive --features distributed
+
+# Semantic search (ML embeddings)
+cargo build -p frankenterm --profile release-interactive --features semantic-search
+
+# TUI dashboard (FrankenTUI backend)
+cargo build -p frankenterm --profile release-interactive --features ftui
+
+# Legacy ratatui parity oracle for development/regression checks
+cargo build -p frankenterm --features tui-oracle
+
+# Everything
+cargo build -p frankenterm --profile release-interactive --all-features
+```
+
+### Requirements
+
+- **Rust nightly** (Rust 2024 edition; see `rust-toolchain.toml`)
+- **A reachable FrankenTerm/WezTerm-fork mux endpoint** for pane discovery,
+  live read/write, and snapshot capture. The direct pooled mux protocol is the
+  preferred path; the external WezTerm CLI is an eligible compatibility
+  fallback, not a universal prerequisite.
+- **SQLite** (bundled via `rusqlite` — no system dependency)
+
+---
+
+## Setup & First-Run Checklist
+
+For *setting up a new host* (font, daemon, persistent config). For *learning the tool*, see the [10-Minute Tour](#10-minute-tour) above.
+
+### 1. Run setup (recommended)
+
+```bash
+ft setup
+ft setup font --apply               # Pragmasevka Nerd Font (auto-installs on normal usage)
+FT_SKIP_BUNDLED_FONT_INSTALL=1 ft status   # opt out of automatic font install
+```
+
+### 2. Verify first-run health
+
+```bash
+ft doctor
+ft status --health
+wezterm cli list
+```
+
+### 3. Start the watcher
+
+```bash
+ft watch                     # daemonized
+ft -v watch --foreground     # foreground for debugging
+```
+
+### 4. Check status
+
+```bash
+ft status                    # human-readable
+ft robot state               # JSON
+```
+
+### 5. Search captured output
+
+```bash
+ft search "error"                     # full-text search (alias: ft query)
+ft events                             # recent detections
+ft events annotate 123 --note "Investigating"
+ft events triage 123 --state investigating
+ft events label 123 --add urgent
+ft robot search "compilation failed" --limit 20
+```
+
+### 6. React to events
+
+```bash
+ft robot wait-for 0 "Usage limit"
+ft robot send 0 "/compact"
+```
+
+### 7. Stream live updates (`web` feature)
+
+```bash
+ft web                                                          # start local server
+curl -N http://127.0.0.1:9999/stream/events
+curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz=25"
+curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
+```
+
+- `/stream/events` delivers persisted detections in database ID order as `text/event-stream`. Fresh subscriptions start at an atomic database checkpoint; reconnects resume from the last received checkpoint or detection cursor. EventBus notifications wake storage reads promptly, and periodic reads recover detections whose notifications were lost. Lifecycle and diagnostic signals remain best-effort live events; bus overflow produces an explicit `lag` frame.
+- `/stream/deltas` streams redacted pane output deltas and gap markers from storage.
+- `max_hz` bounds fan-out rate; `pane_id` narrows to one pane; `channel` accepts `all`, `deltas`, `detections`, or `signals`.
+
+---
+
+## Commands
+
+### Watcher management
+
+```bash
+ft watch                     # start watcher in background
+ft watch --foreground        # run in foreground
+ft watch --auto-handle       # enable auto workflows
+ft stop                      # stop running watcher
+```
+
+### Pane inspection
+
+```bash
+ft status                    # overview of observed panes
+ft status --health           # health view with operator next steps
+ft show <pane_id>            # detailed pane info for a live pane
+ft get-text <pane_id>        # recent output from pane
+```
+
+### Pane actions
+
+```bash
+ft send <pane_id> "<text>"                  # send input (policy-gated)
+ft send <pane_id> "<text>" --dry-run        # preview without executing
+ft send <pane_id> "<text>" --wait-for "ok"  # verify via wait-for
+ft send <pane_id> "<text>" --no-paste --no-newline
+# Default = the text as one bracketed paste, then a typed Enter that submits it
+# (agent composers and shell prompts alike). --no-paste types the characters
+# instead; --no-newline leaves out the Enter. The receipt reports the mode as "no_paste".
+```
+
+### Search
+
+```bash
+ft search "<query>"          # full-text search
+ft search "<query>" --pane 0
+ft search "<query>" --limit 50
+```
+
+### Explainability
+
+```bash
+ft why --list                # list explanation templates
+ft why deny.alt_screen       # explain a common policy denial
+ft why FT-1001               # explain the error code an error message names
+```
+
+### Attention console
+
+`ft attention` ranks what needs an operator or agent next, without changing
+anything. Without `--input` it reads live sources:
+
+- the watcher's operating envelope;
+- policy denials and approval holds from the last 24 hours of the audit log;
+- verified-submit profile drift;
+- unhandled warning and critical detection events;
+- operator pane holds;
+- watcher crash bundles from the last day;
+- a failed or compensating mission transaction.
+
+Each item carries its reasons, a safe next action and a mute key. MCP
+`wa.attention` with `live: true` reads the same database sources, but not the
+watcher envelope, crash bundles or the transaction contract. The JSON contract is in
+`docs/robot-contracts/attention-router.md`.
+
+```bash
+ft attention status               # scored snapshot and source health
+ft attention next                 # the highest-priority safe next action
+ft attention explain              # why the next item ranks first
+ft robot attention next           # the same, as a robot envelope
+ft mute add <identity_key>        # stop one item resurfacing (the key is in its summary)
+```
+
+### Workflows
+
+```bash
+ft workflow list
+ft workflow run handle_usage_limits --pane 0
+ft workflow run handle_usage_limits --pane 0 --dry-run
+ft workflow status <execution_id> -v
+```
+
+**Security model: source-pane trust scope (ft-j0ufc).** Workflows fire when a detection pattern matches a pane's output. By default any pane may fire any workflow. That default is convenient when every pane is operated by the same trust principal and dangerous when a low-trust pane shares a runtime with a high-trust pane. Workflows that act on high-trust panes should declare an allowlist via `Workflow::trigger_policy()`:
+
+```rust
+fn trigger_policy(&self) -> WorkflowTriggerPolicy {
+    WorkflowTriggerPolicy::allowlist([trusted_pane_id])
+}
+```
+
+The runner enforces the allowlist before any lock, audit row, or engine state is created; refused triggers surface as `WorkflowStartResult::SourcePaneNotTrusted` and the originating `source_pane_id` is recorded on the workflow's persisted trigger context for post-incident forensics. The default policy (`allow_all()`) preserves pre-ft-j0ufc behavior.
+
+### Mission & Tx control
+
+```bash
+ft mission plan                                # validate mission contract + compute hash
+ft mission run                                 # advance lifecycle into execution
+ft mission status                              # lifecycle + assignment summary
+ft mission explain                             # legal lifecycle transitions
+ft mission pause                               # canonical lifecycle transitions
+ft mission resume
+ft mission abort
+ft mission objective-plan --objective "<text>" # read-only objective planner (ft-auy2g)
+ft tx plan                                     # validate tx contract + summarize lifecycle
+ft tx run                                      # prepare + commit, deterministically
+ft tx run --fail-step tx-step:commit
+ft tx rollback                                 # compensation for committed steps
+ft tx show --include-contract                  # receipts and full tx payload
+```
+
+The mission objective planner reads the requested objective and a caller-supplied capacity posture (`--capacity-posture`, default `admit`), ranks the candidate work, and prints a deterministic plan artifact. It does not query the operating envelope (`ft swarm envelope` does), and planning is side-effect-free: nothing is spawned, sent, or stored. See [Operating Envelope](#operating-envelope) below.
+
+### Rules
+
+```bash
+ft rules list                            # list detection rules
+ft rules test "Usage limit reached"      # test text against rules
+ft rules show codex.usage.reached        # show rule details
+ft robot rules lint --fixtures --strict  # validate the pack (naming + regex safety + fixture coverage)
+```
+
+### Audit & approvals
+
+```bash
+ft approve AB12CD34 --dry-run            # check approval status
+ft audit --limit 50 --pane 3             # filter audit history
+ft audit --decision deny                 # only denied decisions
+```
+
+### Diagnostics
+
+```bash
+ft triage                               # summarize issues (health/crashes/events)
+ft diag bundle --output /tmp/ft-diag    # collect diagnostic bundle
+ft reproduce export --kind crash        # export latest crash bundle
+ft doctor                               # environment health check
+ft doctor --json                        # machine-readable diagnostics
+ft proof-doctor --bead <id> -- <cmd>    # check a proof command's RCH-required shape (does not run it)
+```
+
+### Attestation
+
+```bash
+ft attestation verify docs/attestations/<version>.json
+ft attestation verify docs/attestations/<version>.json --json
+ft attestation verify docs/attestations/<version>.json --strict-required
+ft attestation show docs/attestations/<version>.json
+```
+
+### Bundled demo scenarios
+
+`ft demo` is the side-effect-free onboarding and regression surface for the
+bundled demo-lab fixtures. It validates the manifest-backed scenarios
+(`quickstart`, `usage_limit`, and `compaction`) and reports retained artifact
+links and follow-up simulation commands without sending input to live panes,
+repairing Agent Mail, mutating RCH workers, or claiming production-capacity
+proof.
+
+```bash
+ft demo                                           # list available demos
+ft demo quickstart                                # validate one demo scenario
+ft demo quickstart --format json                  # machine-readable JSON
+ft demo quickstart --format toon                  # machine-readable TOON
+ft demo quickstart --manifest fixtures/demo-lab/manifest.v1.json
+
+ft simulate validate fixtures/demo-lab/scenarios/quickstart.yaml --json
+ft simulate run fixtures/demo-lab/scenarios/quickstart.yaml --speed 1
+```
+
+The retained artifacts live under `fixtures/demo-lab/` and are indexed in
+[`docs/demo-scenarios.md`](docs/demo-scenarios.md). They prove deterministic
+fixture and CLI/simulation command contracts only; they do not prove remote
+Cargo, target-class capacity, live-pane mutation, or production-scale behavior.
+
+### Web API (feature-gated)
+
+Run `ft web` (the `web` feature is in default builds) to expose a local HTTP surface on `127.0.0.1:9999` by default. Builds before 2026-11 used port 8000. Set `[tuning.web] default_port` in `ft.toml`, or pass `--port`, to choose another.
+
+```bash
+ft web
+curl http://127.0.0.1:9999/health
+curl http://127.0.0.1:9999/panes
+curl -N http://127.0.0.1:9999/stream/events
+curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=3&max_hz=50"
+```
+
+Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
+
+`/stream/events` reads persisted detections from the database in ascending ID order. Standalone `ft web` also tails the watcher's database every 250 ms to publish prompt wakeups; `ft watch --web [--web-port N]` receives wakeups directly from its watcher. Periodic storage reads repair missing wakeups in either mode, including when `FT_WEB_STORAGE_TAIL=0` disables the standalone tail. The `all` and `detections` channels require event storage. The `signals` and `deltas` channels carry best-effort live bus traffic without durable resume cursors; `/stream/deltas` is the separate storage-backed output endpoint.
+
+The first `ready` frame establishes an accepted durable checkpoint and includes its cursor in both `data.cursor` and the SSE `id` field. Each persisted detection then carries its own cursor. Browser `EventSource` reconnects send the most recently received value as `Last-Event-ID`; other clients can supply that exact value in the header or the `cursor` query parameter:
+
+```bash
+curl -N -H "Last-Event-ID: $CURSOR" \
+  "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7"
+```
+
+Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:all:<id>` or `event-v1:<epoch>:pane:<pane_id>:<id>`, where the epoch binds the cursor to the database's retention history. Keep the same pane filter when resuming. Numeric legacy IDs and `since_id` bootstrap requests are rejected; begin a fresh subscription without a cursor to deliberately start at the current tail. A nonempty `Last-Event-ID` takes precedence over a URL cursor. Invalid tokens fail before streaming, and an expired cursor, changed database epoch, or unprovable retention interval produces an explicit discontinuity instead of silently resetting the position. Lifecycle, lag, and error frames do not overwrite the durable checkpoint. Delivery is at least once across reconnects; clients should deduplicate by cursor when necessary.
+
+#### Browser fleet viewer (preview)
+
+`ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `1`/`2` switch views, `j`/`k` move, `r` refetches, and `Tab` leaves the viewer for the page's buttons. It never writes to a pane.
+
+```bash
+RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
+ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:9999/ui/
+```
+
+The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. Browsers without WebGPU use the fleet viewer's native text view. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
+
+To require local browser sign-in, set an environment variable to a randomly generated access token of 32–256 visible ASCII characters, then pass its **name** to either server entry point:
+
+```bash
+ft web --ui-dir /tmp/ft-ui/site --auth-token-env FT_BROWSER_TOKEN
+ft watch --web --web-ui-dir /tmp/ft-ui/site --web-auth-token-env FT_BROWSER_TOKEN
+```
+
+The viewer checks `/auth/status` before starting any data requests. Sign-in exchanges the operator token for an opaque `HttpOnly`, `SameSite=Strict` cookie; the token is never placed in a URL or browser storage. Sessions expire after one hour, with at most 16 concurrent sessions. Sign-out revokes that session, stops its stream producers, and clears the viewer, pane output and history results. Restarting the server revokes all sessions. Each session has an independent nonsecret epoch that binds reads and stream reconnects to the original viewer; a changed session starts with a fresh model and cursor. Health, session status and UI assets stay public; data routes and OpenAPI require a valid session.
+
+Authentication is opt-in. With either token flag, Host and Origin checks require the actual loopback listener address and port, and a session stays bound to its original origin. This mode does not accept reverse-proxy or Tailscale origins, and does not qualify remote authenticated access. The pinned HTTP substrate still collapses duplicate raw header lines and does not provide a cancellation deadline for a blocked socket write; those transport requirements remain part of `ft-xxfwy.55.3`.
+
+The server always refuses to bind any non-loopback address. Without a token flag, the existing unauthenticated local mode remains available. To forward that mode from a laptop, tablet or phone, put Tailscale Serve in front of it. Tailscale terminates HTTPS with the machine's tailnet certificate and accepts only devices on your tailnet:
+
+```bash
+ft web --ui-dir /tmp/ft-ui/site &
+tailscale serve --bg 9999           # then open https://<this-machine>.<tailnet>.ts.net/ui/ on any tailnet device
+tailscale serve status              # show what is shared
+tailscale serve --https=443 off     # stop sharing
+```
+
+In this unauthenticated forwarding mode, everything `ft web` serves is readable from every device allowed by the tailnet rules. That includes captured pane output and history search. The streams redact the secrets they recognize, but the application does not authenticate the reader. Use tailnet access rules to restrict access. Never use `tailscale funnel`: it publishes to the whole internet. The milestones still open in `ft-browser-frankenterm-7z4il` are authenticated tailnet access, terminal attach, and DSR packaging.
+
+`ft web` runs no capture pipeline of its own. Its storage tail follows newly persisted `events` rows written by the watcher and republishes wakeups on its in-process bus. Subscriptions always obtain detection content and ordering from storage, so a delayed or reordered wakeup cannot skip an earlier row. The tail starts after existing history; explicit subscription cursors control replay. Embedders that publish to the same bus in-process can disable the extra wakeup tail with `WebServerConfig::with_storage_event_tail(false)`.
+
+### Session persistence
+
+```bash
+ft snapshot save                 # persist a bounded mux metadata projection
+ft snapshot list                 # list recent snapshots
+ft snapshot inspect <id>         # inspect snapshot contents
+ft snapshot diff <id1> <id2>     # compare pane-ID membership only
+ft snapshot restore <id> --dry-run # metadata-only descriptor/status report
+ft session list --limit 50 --offset 0              # bounded page of saved sessions
+ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
+ft session doctor                # health check for session persistence
+ft session acknowledge-cleanup <attempt> --force # resume retention after an interrupted cleanup attempt that doctor reports
+ft session dump                  # private, checksummed live pane-content/topology export
+ft session verify-dump <path>    # offline schema/checksum/private-file verification
+ft session list-durable          # discover continuously persisted cold-scrollback panes
+ft session export-durable <id>   # read-only export of one 32-hex durable pane ID
+ft session recover <pane_uuid>   # export a complete orphan transcript; never write it to a PTY
+ft session recover <pane_uuid> --allow-partial # explicitly retain a reported partial salvage
+ft session discard <pane_uuid> --force         # remove only the leased data leaf; retain its lock inode
+ft watch                         # start the persistence/observation lifecycle; may prune retained data
+```
+
+`ft session dump` lists the currently visible mux panes, reads each through the
+bounded read-only mux API, then lists the topology again. It redacts pane text
+and metadata, records per-pane SHA-256 digests, and writes a mode-0600 JSON
+envelope under
+`~/.local/share/ft/mux-dumps/` by default. It refuses to overwrite a path,
+rejects symlinked path components, fsyncs both the artifact and its containing
+directory, verifies the persisted handle, and returns failure for a pane-read
+error or changed topology fingerprint unless `--allow-partial` is explicit.
+`ft session verify-dump <path>` revalidates the private regular-file shape,
+schema, complete-publication marker, payload and artifact checksums, per-pane
+text checksums and byte/line counts, aggregate limits, summary counters,
+completeness, and the explicit non-restorable capability claims without
+contacting a mux.
+This is a pre-upgrade/crash-forensics safety artifact. It preserves observable
+redacted text and bounded topology metadata. Pane text is captured sequentially,
+not as one atomic point-in-time terminal snapshot; the schema says so explicitly.
+It does not preserve live PTY file descriptors, process memory, shell/editor
+internal state, terminal parser/render state, or running-agent continuity.
+
+On mux servers, cold rows evicted from the hot terminal viewport are also
+persisted continuously under a stable pane UUID with checksummed styled-line
+records and crash-recoverable sequence authority. A rejected cold write retains
+the row in memory instead of silently dropping it. This protects scrollback,
+but it still does not make the current mux process replaceable: PTY and child
+ownership must move into the documented guardian before live upgrades can
+preserve running processes.
+
+`ft session list-durable` validates and lists those per-pane manifests without
+opening their content logs for write. `ft session export-durable <id>` performs
+a bounded, read-only snapshot of the committed log prefix, rejects checksum,
+identity, sequence, privacy, replacement-race, and resource-limit failures,
+decodes the styled rows with the bounded codec, reapplies current redaction,
+and creates a new private synchronized transcript without overwriting a prior
+artifact. A final torn record is reported and excluded because it was never
+durability-acknowledged. This export is historical output, never PTY input, and
+is not an executable process checkpoint.
+
+`ft session recover` is intentionally export-only. Historical terminal output
+is output, not shell input: recovery never creates or splits a live pane and
+never sends archive bytes through a PTY input channel. It preserves the
+header-declared source-completeness result and refuses to publish an incomplete
+source or a transcript with skipped records unless `--allow-partial` is
+explicit. An authorized partial artifact reports `complete: false` and the
+finite terminal reason; it is never promoted to a complete recovery. `ft
+session discard --force` holds the same recovery lease through descriptor- and
+identity-checked unlink plus parent-directory synchronization. It deliberately
+retains the private lock inode so a competing writer cannot create a second
+flock authority while the operation is retiring.
+
+Note: `list-orphans`, `recover`, and `discard` operate on the flat per-pane
+mmap scrollback files under `~/.local/share/ft/scrollback/`. No production
+capture path writes those files today (the per-pane mmap writer is reserved,
+see `config.rs`), so on a normal install these commands find nothing. Durable
+cold scrollback from the mux server is read with `list-durable` /
+`export-durable` instead.
+
+All three flat-mmap orphan commands accept the same explicit recovery envelope:
+`--max-directory-entries`, `--max-file-bytes`, `--max-records`,
+`--max-replay-chunks`, `--max-payload-bytes`, and
+`--max-transcript-bytes`. Defaults stay conservative. Operators who configured
+a larger valid writer capacity can opt in up to the finite hard ceilings rather
+than having that file become impossible to inspect or discard. Invalid limits
+and operational scan/read/write/discard failures remain bounded and redacted in
+JSON/TOON output and exit with status 2.
+
+`ft snapshot restore <id> --dry-run` reads a bounded checkpoint descriptor and
+prints a metadata-only descriptor/status report. It does not load a full restorable projection and
+is not evidence that execution would succeed. Every non-dry snapshot restore,
+on every platform, returns a finite unavailable diagnostic before database
+resolution, process discovery, subprocess launch, or mux mutation. Robot
+checkpoint rollback has the same boundary: dry-run planning only, with
+non-dry execution returning `robot.feature_not_available`.
+
+The executable layout restorer remains library/test substrate. That substrate
+can exercise a limited windows/tabs/splits/local-CWD projection and honor an
+explicit per-tab active-pane identifier when one is actually present, but the
+current pane-list-derived snapshot does not preserve durable tab order or a
+stable active-tab identity. It also does not establish mux-domain identity,
+workspace/window placement, historical scrollback, render state, process or
+agent continuity, titles, exact geometry, or full appearance.
+
+`ft restart` execution is likewise deliberately unavailable: it fails closed
+before locks, capture, process discovery, signals, spawning, or mux mutation
+until one authenticated mux endpoint can be bound to an exact process
+incarnation and verified relaunch receipt. The production `ft watch` startup
+path runs the unclean-session detector and logs what it finds, but it does not
+prompt or restore. Use snapshot/session commands for evidence inspection and
+make any recovery changes manually.
+
+The top-level `[session]` configuration table is entirely unsupported and is
+rejected, including the retired `session.restore_max_lines` key. The retired
+`[snapshots.process_relaunch]` table is also rejected; no production relaunch
+or scrollback-replay setting exists.
+
+### Configuration
+
+```bash
+ft config show
+ft config validate
+ft config set <key> <value>
+ft config export                 # TOML or JSON
+```
+
+For the full command matrix (human + robot + MCP), see [`docs/cli-reference.md`](docs/cli-reference.md). For the evidence model behind these support claims, see [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md). For GUI onboarding and WezTerm migration, see [`docs/frankenterm-gui-user-guide.md`](docs/frankenterm-gui-user-guide.md).
+
+---
+
+## Robot Mode (JSON API)
+
+The `ft robot` subcommand provides machine-optimized output for AI agents. Always use `--format toon` for token-efficient output when piping results to another AI.
+
+### Output formats
+
+| Flag | Format | Use case |
+|---|---|---|
+| `--format json` | JSON | Default, easy parsing |
+| `--format toon` | TOON | Lower-token AI-to-AI envelopes |
+| `--stats` | Stats on stderr | Token-savings visibility |
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `FT_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
+| `TOON_DEFAULT_FORMAT` | Fallback default format |
+| `FT_WORKSPACE` | Workspace root directory |
+| `FT_ROBOT_FAIL_ON_ERROR` | `1` makes `ft robot` exit with status 1 when it printed an `ok: false` envelope (default: exit 0, the envelope is the result), so `ft robot wait-for 0 Done && next` stops on a timeout or refusal |
+
+**Precedence:** CLI flag > `FT_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > `json`
+
+### Implementation status
+
+| Family | Actions | Status |
+|---|---|---|
+| `ft robot state` | current pane state | shipped |
+| `ft robot get-text` | single / batch / all pane output | shipped |
+| `ft robot send` | send text (with policy gate) | shipped |
+| `ft robot wait-for` | pattern trigger | shipped |
+| `ft robot search` | lexical / semantic / hybrid | shipped |
+| `ft robot events` | recent detection events | shipped |
+| `ft robot approve` | approve gated action | shipped |
+| `ft robot agent-mail-outbox` | retained fallback outbox entries + replay state | shipped (read-only fixture/queued-entry surface; not live delivery proof) |
+| `ft robot checkpoint` | save / list / show / delete / rollback | shipped for save/list/show/delete; rollback is metadata-only with `--dry-run`, while non-dry rollback fails closed until an authenticated, incarnation-pinned mux execution contract exists |
+| `ft robot context` | status / rotate / history | shipped (native SQLite registry; rotation receipts are durable; raw context content is not stored) |
+| `ft robot work` | claim / release / complete / list / ready / assign | shipped (native SQLite `work_claims` queue) |
+| `ft robot fleet` | status / scale / rebalance / agents | shipped (live scale/rebalance plans, dry-run receipts, durable non-dry-run receipt replay, typed mutation/error receipts) |
+| `ft robot profile` | list / show / validate / apply | shipped (read paths + dry-run apply + mux-backed non-dry-run apply with durable receipts) |
+
+### State & discovery
+
+```bash
+ft robot state                              # JSON
+ft robot --format toon state                # compact TOON
+ft robot --format toon --stats state        # with token stats on stderr
+ft robot state --include-text --tail 20     # pane metadata + per-pane tail output
+```
+
+Response envelope:
+```json
+{
+  "ok": true,
+  "data": [
+    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"}
+  ]
+}
+```
+
+`ft robot state` serializes `data` as a bare `PaneState` array. The `--include-text` variant wraps the array in an object:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "panes": [{"pane_id": 0, "title": "claude-code", "domain": "local"}],
+    "tail_lines": 200,
+    "escapes_included": false,
+    "pane_text": { "0": "…tail…" }
+  }
+}
+```
+
+### Reading pane content
+
+```bash
+ft robot get-text 0                       # recent output
+ft robot get-text 0 --tail 50             # last N lines
+ft robot get-text 0 --escapes             # include escape sequences
+ft robot get-text --panes 0,1,2 --tail 20 # batch
+ft robot get-text --all --tail 10         # all active panes
+```
+
+### Sending input
+
+```bash
+ft robot send 1 "/compact"                          # paste, then a typed Enter submits it
+ft robot send 2 "make test" --no-paste              # type the characters instead of pasting
+ft robot send 1 "dangerous command" --dry-run       # preview without executing
+ft robot send 1 "y" --wait-for "confirmed"          # send and wait for confirmation
+ft robot send 1 "/compact" --verify-submit          # return submitted-level SubmitReceipt
+ft robot send 1 "/compact" --submit-level working   # require working/output evidence
+```
+
+### Pattern waiting
+
+```bash
+ft robot wait-for 0 "Usage limit" --timeout-secs 3600
+ft robot wait-for 0 "Done" --timeout-secs 60
+```
+
+### Deferred proof queue
+
+```bash
+ft proof queue --bead ft-w8 --kind test --package frankenterm-core -- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-w8-target cargo test -p frankenterm-core --lib proof_intent
+ft proof status --format json
+ft proof replay --admission-state admitted --dry-run
+ft robot proof status
+```
+
+The queue is a fail-closed proof-debt surface. Status and dry-run replay explain
+what would run; live replay refuses stale source hashes and never replaces a
+remote-required RCH proof with local Cargo.
+
+### Search
+
+```bash
+ft robot search "error: compilation failed"
+ft robot search "rate limit" --pane 0
+ft robot search "warning" --limit 5
+ft robot search "compilation failed" --mode hybrid
+```
+
+### Events
+
+```bash
+ft robot events --limit 10
+ft robot events --pane 0
+ft robot events --rule-id "codex.usage.reached"   # exact rule id match
+ft robot events --unhandled
+```
+
+### Agent Mail outage outbox
+
+```bash
+ft robot agent-mail-outbox
+ft robot --format toon agent-mail-outbox --entry fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json
+```
+
+`ft robot agent-mail-outbox` reads retained fallback outbox fixtures and
+additional queued-entry JSON files. It is for outage review and replay
+planning, not live service repair: queued entries, dry-run-ok rows, and fixture
+replay logs are not Agent Mail delivery proof until a replay receipt records a
+delivered message id. The command is read-only and never restarts, repairs, or
+reconstructs the shared Agent Mail service.
+
+### Profile management (ft-hac7w)
+
+The `ft robot profile` family is the **ship-first proof of the robot-contract methodology** (BR-RC-ROBOT-CONTRACT.1). Its contract doctrine (idempotency rules, failure semantics, side-effect surface, concurrency contract) is the canonical example for every other robot family. See [`docs/robot-contracts/profile.md`](docs/robot-contracts/profile.md).
+
+```bash
+ft robot profile list
+ft robot profile list --role agent
+ft robot profile list --tag claude-code
+ft robot profile show codex_ws
+ft robot profile apply codex_ws --count 3
+ft robot profile apply codex_ws --count 3 --dry-run
+ft robot profile validate codex_ws
+ft robot profile create codex_ws --role agent --command codex --cwd . \
+    --tag codex --env OPENAI_LOG=warn --bootstrap "/status"   # persist a profile so apply can spawn it
+```
+
+Profiles live in the `agent_profiles` table and are created with `ft robot profile create` (nothing else defines them; the name must be unique).
+
+**Family contract:**
+
+| Action | Idempotency | Failure semantics | Side effects |
+|---|---|---|---|
+| `list` | Idempotent | MustNotPartiallyMutate | read-only |
+| `show` | Idempotent | MustNotPartiallyMutate | read-only |
+| `apply` | Receipt-based replay for the same request | Live compensation can fail; inspect rollback and per-pane effects | tables: `agent_profiles`; mux: spawns `count` panes |
+| `validate` | Idempotent | MustNotPartiallyMutate | read-only |
+| `create` | Not idempotent: a repeated name fails with `robot.profile.already_exists` and changes nothing | MustNotPartiallyMutate | tables: `agent_profiles` (one row) |
+
+**Concurrency:** the model's intended contract is serialization per profile name. Live requests also share mux capacity and mutation state; cross-process serialization, retries, and compensation require their own proof. A saved idempotency receipt does not make arbitrary concurrent external effects atomic.
+
+```json
+$ ft robot --format json profile apply codex_ws --count 3
+{
+  "ok": true,
+  "data": {
+    "profile_name": "codex_ws",
+    "panes_spawned": [10, 11, 12],
+    "dry_run": false,
+    "requested_agents": 3,
+    "spawned_agents": 3,
+    "skipped_existing_agents": 0,
+    "idempotency_key": "<profiles_applied_log content_hash>",
+    "mutation_idempotency_key": "<fleet mutation key>",
+    "rollback_status": "succeeded",
+    "idempotent_replay": false,
+    "mutation_receipt": { "...": "full fleet mutation receipt" }
+  },
+  "elapsed_ms": 37
+}
+```
+
+### Error handling
+
+Robot mode returns structured errors using the flat envelope shape (`error`, `error_code`, and `hint` are sibling top-level fields, not nested):
+
+```json
+{
+  "ok": false,
+  "error": "Pane 99 not found",
+  "error_code": "robot.pane_not_found",
+  "hint": "Use 'ft robot state' to list available panes",
+  "elapsed_ms": 1,
+  "version": "0.2.0",
+  "now": 1747371700000,
+  "schema_version": 1
+}
+```
+
+Error codes include `robot.pane_not_found`, `robot.timeout`, `robot.wezterm_not_running`, `robot.mux_version_skew` (the CLI and the running FrankenTerm.app are from different releases; the hint names both codec generations), `robot.policy_denied`, `robot.require_approval`, `robot.storage_error`, `robot.feature_not_available`, `robot.fleet.inventory_unavailable`, `robot.profile.spawn_failed`, and the full `robot.fleet.*` typed envelope family.
+
+### MCP (Model Context Protocol)
+
+```bash
+cargo build --profile release-interactive --features mcp
+ft mcp serve                                # MCP server over stdio
+```
+
+MCP covers a subset of Robot Mode (plus MCP-only mission lifecycle and steer-plan tools); [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) lists which families are mirrored, partial, or robot-only. See [`docs/mcp-api-spec.md`](docs/mcp-api-spec.md) for the tool list and [`docs/json-schema/`](docs/json-schema/) for response schemas.
+
+---
+
+## Configuration
+
+Configuration is discovered in canonical precedence order:
+1. Explicit `--config <path>` CLI option
+2. Workspace-local configuration via `FT_WORKSPACE` (`$FT_WORKSPACE/.ft/config.toml`, `$FT_WORKSPACE/.ft/ft.toml`, or `$FT_WORKSPACE/ft.toml`)
+3. Current working directory (`./.ft/config.toml`, `./.ft/ft.toml`, or `./ft.toml`)
+4. Platform default configuration (`~/Library/Application Support/ft/ft.toml` on macOS; elsewhere, Windows included, `$XDG_CONFIG_HOME/ft/ft.toml` or else `~/.config/ft/ft.toml` under the home directory)
+
+```toml
+[general]
+log_level = "info"                # trace, debug, info, warn, error
+log_format = "pretty"             # pretty (human) or json (machine)
+data_dir = "~/.local/share/ft"
+
+[ingest]
+poll_interval_ms = 200
+[ingest.panes]
+include = []
+[[ingest.panes.exclude]]
+id = "exclude_htop"
+title = "htop"
+[[ingest.panes.exclude]]
+id = "exclude_vim"
+title = "vim"
+
+[ingest.priorities]
+default_priority = 100
+[[ingest.priorities.rules]]
+id = "critical_codex"
+priority = 10
+title = "codex"
+
+[ingest.budgets]
+max_captures_per_sec = 0          # 0 = unlimited
+max_bytes_per_sec = 0
+
+[storage]
+writer_queue_size = 100
+retention_days = 30
+
+[gc]
+enabled = true
+interval_seconds = 3600
+vacuum_threshold = 0.20           # Advise explicit VACUUM when >20% pages are free
+log_report = true
+
+[vendored]
+mux_socket_path = "~/.local/share/wezterm/default.sock"
+
+[vendored.mux_pool]
+max_connections = 64
+idle_timeout_seconds = 60
+acquire_timeout_seconds = 10
+pipeline_depth = 32
+pipeline_timeout_ms = 5000
+max_frame_bytes = 4194304
+max_outbound_codec_bytes = 1073741824
+max_outbound_in_flight_requests = 256
+compression = "auto"
+
+[vendored.sharding]
+enabled = false
+socket_paths = ["/tmp/ft-shard-0.sock", "/tmp/ft-shard-1.sock"]
+assignment = { strategy = "round_robin" }
+
+[backup.scheduled]
+enabled = false
+schedule = "daily"                # hourly, daily, weekly, or 5-field cron
+retention_days = 30
+max_backups = 10
+destination = "~/.local/share/ft/backups"
+
+[patterns]
+packs = ["builtin:core"]          # Claude Code, Codex, Gemini, terminal runtime events
+
+[workflows]
+enabled = ["handle_compaction"]   # empty = all built-in workflows
+max_concurrent = 10
+
+[safety]
+require_prompt_active = true      # needs OSC 133 prompt markers in the pane's shell: run `ft setup shell` (bash/zsh/fish, idempotent)
+block_alt_screen = true
+rate_limit_per_pane = 30
+rate_limit_global = 100
+
+[safety.redaction]
+enabled = true                    # T1/T2/T3 sensitivity tiers
+
+[agent_detection]
+enabled = true
+active_output_threshold_ms = 5000     # Output within 5s → Active (green)
+thinking_silence_ms = 5000            # Input sent, no output for 5s → Thinking (yellow)
+stuck_silence_ms = 30000              # No output for 30s after input → Stuck (red)
+idle_silence_ms = 60000               # No activity for 60s → Idle (gray)
+```
+
+Operator-tunable runtime constants live under `[tuning]` sections such as `[tuning.runtime]`, `[tuning.patterns]`, and `[tuning.search]`. See [`docs/tuning-reference.md`](docs/tuning-reference.md) for every key, default, unit, validation guard, and provisional starting ranges for 10-pane, 50-pane, and 200+-pane benchmark workloads. Those ranges are not target-class certification.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `FT_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
+| `TOON_DEFAULT_FORMAT` | Fallback default format |
+| `FT_WORKSPACE` | Workspace root directory |
+| `FT_SKIP_BUNDLED_FONT_INSTALL` | Skip automatic font install |
+
+---
+
+## Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                       ft Swarm Runtime Core                           │
+│ Session Graph │ Pane Registry │ State Store │ Control Plane           │
+│ Mission Orchestrator │ Fleet Memory Controller │ Tx Engine            │
+│ Operating-Envelope Planner │ Mission Objective Planner                │
+└───────────────────────────────────────────────────────────────────────┘
+                                   │
+                  asupersync runtime (Cx-first cancellation contract)
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                  Ingest + Normalization Pipeline                      │
+│ Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
+│ SIMD Scan → Pattern Trigger (AC + Bloom) → zstd Compression           │
+└───────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                  Storage Layer (SQLite + FTS5 + embeddings)           │
+│ output_segments │ events │ workflow_executions │ audit_actions        │
+│ approval_tokens │ session_checkpoints │ mux_pane_state                │
+│ policy_denied_audit (v24+) │ work_claims │ profiles_applied_log       │
+└───────────────────────────────────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+             ┌───────────┐  ┌───────────┐  ┌───────────┐
+             │  Pattern  │  │   Event   │  │  Workflow │
+             │  Engine   │  │    Bus    │  │  Engine   │
+             │ (detect)  │  │ (fanout)  │  │ (execute) │
+             └───────────┘  └───────────┘  └───────────┘
+                    │              │              │
+                    └──────────────┼──────────────┘
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                   Policy Engine (14 health checks)                    │
+│ Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
+│ Secret Redaction (T1/T2/T3) │ Backpressure Tiers │ Circuit Breakers   │
+│ Source-Pane Trust Scope (ft-j0ufc)                                    │
+└───────────────────────────────────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+┌──────────────────────┐ ┌──────────────┐ ┌───────────────────────┐
+│   Robot Mode API     │ │  MCP Server  │ │  Distributed Streamer │
+│   JSON / TOON        │ │  (stdio)     │ │  (wire protocol v1)   │
+└──────────────────────┘ └──────────────┘ └───────────────────────┘
+                                   │
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│             Attestation & Incident Plumbing                           │
+│ Sigstore-signed bundles │ Live crash + incident-bundle collectors     │
+│ Beads coordination snapshot │ Reality-check drumbeat                  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### Workspace Structure
+
+```
+frankenterm/                              # <!--count:workspace_members-->97<!--/count--> workspace members (auto-stamped)
+├── Cargo.toml
+├── crates/
+│   ├── frankenterm/                      # CLI binary (ft)
+│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->540<!--/count--> top-level modules, <!--count:core_loc-->1389418<!--/count--> LOC
+│   │   ├── src/
+│   │   │   ├── runtime.rs                # Observation runtime orchestration
+│   │   │   ├── runtime_async.rs          # Canonical asupersync wrapper API surface
+│   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
+│   │   │   ├── patterns.rs               # Pattern detection engine
+│   │   │   ├── events.rs                 # Event bus and detection fanout
+│   │   │   ├── storage/                  # SQLite + FTS5 (schema version: see storage/schema_ddl.rs::SCHEMA_VERSION)
+│   │   │   ├── policy.rs                 # Safety / access control
+│   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
+│   │   │   ├── plan.rs                   # Mission + Tx types
+│   │   │   ├── workflows/                # Workflow engine + handlers + lock
+│   │   │   ├── search/                   # Lexical / semantic / hybrid + daemon
+│   │   │   ├── connector_*.rs            # Connector fabric (14 modules)
+│   │   │   ├── scrollback_tiers.rs       # Three-tier scrollback storage
+│   │   │   ├── simd_scan.rs              # Newline + ANSI density metrics (BOCPD features)
+│   │   │   ├── wire_protocol.rs          # Distributed messaging
+│   │   │   ├── operating_envelope.rs     # ft.operating_envelope.v1 planner
+│   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
+│   │   │   ├── mission_objective_plan.rs # Capacity-aware objective planner
+│   │   │   └── …                         # 500+ additional modules
+│   │   ├── tests/                        # <!--count:core_rust_test_files-->1051<!--/count--> Rust test files, <!--count:test_count-->64035<!--/count-->+ test annotations
+│   │   └── benches/                      # <!--count:criterion_bench_files-->119<!--/count--> Criterion bench files
+│   │
+│   ├── frankenterm-core-ars/             # ARS (Adaptive/Autonomous Reflex System)
+│   ├── frankenterm-core-tantivy/         # Lexical search stack
+│   ├── frankenterm-core-replay/          # Replay subsystem
+│   ├── frankenterm-core-fleet/           # Fleet dashboard
+│   ├── frankenterm-core-connectors/      # Connector boundary
+│   ├── frankenterm-core-mcp/             # MCP type boundary
+│   ├── frankenterm-core-test-macros/     # #[lab_runtime_test] proc macros
+│   │
+│   │   # ── 12 leaf type crates (no first-party deps but one) ──
+│   ├── frankenterm-core-resource-types/
+│   ├── frankenterm-core-error-types/
+│   ├── frankenterm-core-config-types/
+│   ├── frankenterm-core-policy-types/
+│   ├── frankenterm-core-replay-types/
+│   ├── frankenterm-core-telemetry-types/
+│   ├── frankenterm-core-cass-types/
+│   ├── frankenterm-core-caut-types/
+│   ├── frankenterm-core-connector-types/
+│   ├── frankenterm-core-audit-types/
+│   ├── frankenterm-core-atlas-pack-types/
+│   ├── frankenterm-core-x11-resize-types/
+│   │
+│   ├── frankenterm-flight-recorder/      # Bounded cross-layer interaction tracing
+│   ├── frankenterm-gui/                  # GUI binary crate (FrankenTerm.app)
+│   ├── frankenterm-mux-server/           # Headless mux server binary
+│   ├── frankenterm-mux-server-impl/      # Shared mux-server implementation
+│   ├── frankenterm-alloc/                # Allocator + telemetry support (jemalloc)
+│   ├── frankenterm-topo/                 # Workspace topology + cycle detection
+│   ├── ft-perf-gate/                     # SPRT + conformal + KL-divergence gating
+│   └── ft-test-log/                      # Centralized test-logging convention
+├── lints/cx_propagation/                 # Custom Cx-propagation lint
+├── frankenterm/                          # In-tree vendored crates (42 dirs, 47 members)
+│   ├── codec/  config/  mux/  pty/  term/  termwiz/  ssh/  scripting/
+│   ├── font/  window/  client/  surface/  …
+│   ├── deps-freetype/  deps-harfbuzz/  deps-fontconfig/
+│   ├── env-bootstrap/  tabout/  gui-subcommands/  toast-notification/  open-url/
+│   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
+├── fuzz/                                 # <!--count:fuzz_targets-->52<!--/count--> fuzz targets
+├── docs/                                 # <!--count:doc_markdown_files-->549<!--/count--> Markdown documentation files
+├── tests/e2e/                            # <!--count:e2e_scripts-->300<!--/count--> shell E2E scripts
+└── fixtures/                             # Test fixtures (including operating-envelope goldens)
+```
+
+### Sub-crate extraction invariants
+
+- **Leaf type crates** (`*-types`) declare no first-party dependencies, with one exception: `frankenterm-core-audit-types` depends on `frankenterm-core-replay-types`.
+- **Cluster sub-crates** (`*-ars`, `*-tantivy`, `*-replay`, `*-fleet`) depend on `frankenterm-core` and, where needed, shared leaf types.
+- **Core imports shared leaves**, including the feature-gated MCP type crate. The connector boundary imports connector types, not core.
+- **Normal/build dependency cycles are forbidden.** Dev-dependency cycles let core tests exercise the extracted clusters.
+- See [`docs/proposals/ft-l3tfo-cold-build-measurements.md`](docs/proposals/ft-l3tfo-cold-build-measurements.md) for the cold-build ADR.
+
+### Key algorithms and techniques
+
+| Subsystem | Algorithm / technique | Purpose |
+|---|---|---|
+| Delta extraction | Bounded 1 MiB overlap matching with gap semantics | Efficient incremental capture without persisting full-buffer re-reads |
+| Pattern detection | Aho-Corasick multi-pattern + anchor filtering + Bloom prefilter | Fast multi-agent pattern matching with probabilistic pre-rejection |
+| Search | FTS5 lexical + hash-embedding semantic lane | Lexical, semantic, and hybrid modes via RRF fusion |
+| Change-point detection | BOCPD (Bayesian Online Change-Point Detection) | Catch novel failure modes regex patterns miss |
+| Backpressure | Four-tier model (Green/Yellow/Red/Black) with queue-depth gauges | Prevent OOM and cascading latency under load |
+| Fleet memory | Worst-of tier synthesis with asymmetric hysteresis | Coordinated fleet-wide pressure response; 200-pane qualification remains pending |
+| Scrollback | Hot (RAM) → Warm (zstd compressed) → Cold (evicted) tiering | Memory-efficient scrollback for large pane counts |
+| Tx execution | Prepare/commit/compensate with idempotency ledger | Safe multi-pane transactional operations |
+| Operating envelope | Side-effect-free planner over RCH + network + process pressure | Refuse admission when telemetry missing / critical |
+| Mission objectives | Capacity-aware planner with golden corpus harness | Safe swarm orchestration under operating-envelope constraints |
+| Retry | Exponential backoff with jitter + circuit breaker integration | Robust I/O error handling without retry storms |
+| Latency analysis | Min-plus algebra (network calculus) + Lindley equation | Formal worst-case delay and backlog bounds |
+| Graph analysis | Dijkstra + Bellman-Ford + Floyd-Warshall | Agent routing and dependency chain analysis |
+| Decision replay | Normalized DAG + causal edges + diff engine | Post-incident forensics and regression testing |
+| Content dedup | SHA-256 content hashing + FNV-1a fast hash + XOR filter | Prevent duplicate indexing in search pipeline |
+| Quiescence detection | Composable gauge + activity tracker with atomic CAS | Wait for system to settle before taking action |
+
+### Data flow
+
+1. **Discovery** — enumerate pane/session resources via active backend adapters
+2. **Capture** — stream output and state deltas from adapters / runtime hooks
+3. **Delta** — compare with the previous capture using the bounded 1 MiB overlap window
+4. **Store** — append new segments to SQLite with FTS5 indexing
+5. **Detect** — run pattern engine (anchored + Bloom-prefiltered + BOCPD) against new content
+6. **Event** — broadcast detections to event bus subscribers
+7. **Admit** — operating-envelope planner decides whether new pane/workflow work is safe
+8. **Workflow** — execute registered workflows on matching events (with trigger-policy allowlists)
+9. **Policy** — gate all actions through capability and rate-limit checks
+11. **API** — expose everything via Robot Mode JSON, MCP, web/SSE, and distributed streamer
+
+### System Components and Responsibilities
+
+`ft` is composed of cleanly-separated subsystems. Each owns a specific responsibility surface; cross-subsystem communication goes through typed event-bus messages, the policy gate, or the storage layer, never direct mutation.
+
+| Component | Owns | Talks to | Doesn't do |
+|---|---|---|---|
+| **Ingest pipeline** (`ingest.rs`) | Pane discovery, delta extraction, gap detection, overlap matching | Storage (write), Event bus (deltas) | Pattern detection, policy decisions, sending input |
+| **Pattern engine** (`patterns.rs`) | Rule packs, Bloom prefilter, anchor evaluation, regex execution, BOCPD | Event bus (detections), Storage (read-only) | Sending input, mutating panes |
+| **Event bus** (`events.rs`) | Bounded broadcast of typed events, fanout to subscribers, backpressure | All subscribers | Persistence (subscribers persist if needed) |
+| **Storage** (`storage/`) | SQLite schema + migrations, FTS5 indexing, single-writer lock, page-stat advisories + explicit VACUUM, backup/restore | All readers | Pattern matching, workflow execution |
+| **Search** (`search/`) | Lexical (FTS5), semantic (embeddings), hybrid (RRF fusion), index daemon | Storage (read), embedder daemon | Pattern matching, workflow execution |
+| **Policy engine** (`policy.rs`) | Capability gates, rate limits, approval tokens, audit trail writes, secret redaction | Storage (audit writes), Event bus (denials) | Direct pane I/O |
+| **Workflow engine** (`workflows/`) | Engine + runner + lock + handlers + trigger-policy allowlists | Event bus (subscribe to triggers), Policy gate, Pane I/O | Pattern detection |
+| **Mission engine** (`plan.rs`, `mission_objective_plan.rs`, `mcp_missions.rs`) | Mission contracts, lifecycle state machine, dispatch, objective planner | Policy gate, Workflow engine, Storage | Pane discovery |
+| **Tx engine** (`plan.rs::TxReceipt` + `prepared_plans` table + `workflow_action_plans` table) | Prepare/commit/compensate, idempotency ledger, kill switches | Mission engine, Policy gate, Storage | Pattern detection |
+| **Operating envelope** (`operating_envelope.rs`) | Admission decisions, fail-closed verdicts, telemetry composition | Mission engine (consumer), Diagnostics | Spawning panes, sending input |
+| **Connector fabric** (`connector_*.rs`) | Inbound/outbound bridges, mesh routing, capability envelopes, host runtime | Event bus, Policy gate, External systems | Storage management, pane I/O |
+| **Robot/MCP surface** (`robot_*.rs`, `mcp*.rs`) | JSON/TOON envelope contracts, MCP tool registration, request routing | All read+action subsystems through their public APIs | Direct storage I/O |
+| **Distributed streamer** (`wire_protocol.rs`, `distributed.rs`) | Versioned envelopes, per-agent dedup, stale-session pruning, TLS | Storage (write-through for remote panes), Event bus | Local pane discovery |
+| **GUI** (`frankenterm-gui`) | Window/font/render-state, BSU/ESU drain, classified drag handlers, command palette | Storage (read), Event bus, Scripting | Pattern detection, policy |
+| **Mux server** (`frankenterm-mux-server`) | Headless mux, federation, command transport, durable state checkpoints | PTY layer, codec layer | Pattern detection, policy |
+| **Attestation** (CLI + `scripts/attestation-verify.sh`) | Bundle verification, Sigstore signature checks, manifest hash recomputation | Filesystem (read-only) | Anything mutating |
+
+### Sub-crate boundaries explained
+
+| Sub-crate | What lives there | Why it's separated |
+|---|---|---|
+| `frankenterm-core-ars` | Adaptive/Autonomous Reflex System (15 modules) — drift detection, evidence ledger, blast radius, regime analysis | Heavy ML/statistics surface that shouldn't be in everyone's compile graph |
+| `frankenterm-core-tantivy` | Full Tantivy lexical search stack (~16k LOC) | Tantivy is a heavy dep; sub-crating it lets `frankenterm-core` test paths skip it |
+| `frankenterm-core-replay` | Replay + replay-assessment harness (~40k LOC) | Determinism testing has its own dep set (proptest, criterion) |
+| `frankenterm-core-fleet` | Fleet dashboard | Will host multi-host coordination; partial extraction in progress |
+| `frankenterm-core-connectors` | Connector type boundary | Reuses connector types without importing the core runtime |
+| `frankenterm-core-mcp` | MCP type boundary | MCP integration is feature-gated; types live in their own crate so consumers can depend on schemas without dragging in the server |
+| `frankenterm-core-test-macros` | `#[lab_runtime_test]` proc macros | Proc-macros must live in their own crate by Cargo decree |
+| `frankenterm-core-*-types` (12 leaves) | Data-only types (errors, configs, telemetry, audit, etc.) | Zero first-party deps; importable from anywhere without cycles |
+
+### Dependency rules (enforced by the build, not just by convention)
+
+1. **Core imports shared type crates.** The normal dependency direction for extracted implementation clusters is cluster → core; core's dev-dependencies can exercise those clusters in tests.
+2. **Leaf type crates declare no first-party deps.** They depend only on external libs (serde, etc.), except that `frankenterm-core-audit-types` uses `frankenterm-core-replay-types`.
+3. **Implementation clusters depend on core and shared leaves.** MCP and connector type boundaries have narrower dependency graphs; the `frankenterm-core-*` prefix alone does not identify a cluster.
+4. **`tokio` ban** at the `cargo-deny` layer fails the build if any first-party `Cargo.toml` declares `tokio` directly.
+5. **Cycle detection** runs in the release gate (`scripts/release-gates.sh`, DSR quality) via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
+
+Practical consequence: distinguish data-only leaves from implementation clusters when following imports. The Cargo manifests identify the actual normal, optional, and dev-dependency edges.
+
+---
+
+## Operating Envelope
+
+The operating envelope contract is the system's answer to "is it safe to do more work right now?"
+
+**Contract:** `ft.operating_envelope.v1` (see [`docs/robot-contracts/operating-envelope.md`](docs/robot-contracts/operating-envelope.md) and the JSON schema at [`docs/json-schema/ft-operating-envelope.json`](docs/json-schema/ft-operating-envelope.json)).
+
+**Inputs** (each fails closed when missing):
+- RCH (remote compilation helper) cluster pressure
+- System network pressure (recently fail-closed when telemetry source is missing)
+- Process snapshots (recently fail-closed)
+- Fleet memory pressure tier (from the worst-of synthesis described in §7 of [Design Philosophy](#7-defense-in-depth-for-memory))
+- SQLite write queue depth + GC budget
+
+**Outputs:**
+- An admission verdict per (pane class, count) pair
+- A typed envelope status object for the operator runbook (`ft.operating_envelope.v1`)
+- A side-effect-free plan that the mission objective planner consumes
+
+**Failure semantics** (reason codes from `operating_envelope.rs`):
+- Missing or stale telemetry → reason `telemetry.stale` / `capacity.stale`; the planner denies admission rather than guessing
+- Critical pressure on any input → reasons `capacity.red` (critical) or `capacity.black` (emergency); planner emits `envelope.shed` (and `capacity.pressure_shed`)
+- Target-class artifact missing or `skipped_not_proven` → reason `capacity.target_class_unproven`; high-scale claims are held back
+- All required sources healthy → reason `envelope.all_required_sources_available`; verdict is `envelope.admit` with the admitted (pane class, count) tuple
+- Tier classification flows through `capacity.green` for headroom-available healthy state
+
+This is the surface that protects swarms from accidentally being driven outside their proven operating range. See [`docs/operator-runbook.md`](docs/operator-runbook.md) for the operator-facing recovery procedures (ft-booek.6).
+
+---
+
+## Mission Objective Planner
+
+```bash
+ft mission objective-plan --objective "<operator goal as free text>" \
+                          --strictness {advisory|normal|strict} \
+                          --capacity-posture {admit|defer|pause|unknown} \
+                          --target-bead <ft-XXXXX>            # optional Beads candidate
+                          --owned-path <path>[,<path>...]     # for dirty-overlap checks
+                          --dirty-path <path>[,<path>...]     # caller-observed dirty state
+```
+
+`ft mission objective-plan` invokes the capacity-aware mission objective planner (ft-auy2g). Inputs and behavior:
+
+1. Takes a free-text `--objective` string (operator's stated goal). No JSON contract is required.
+2. Takes the capacity posture from the caller (`--capacity-posture`, default `admit`) together with the supplied scope (owned paths, candidate bead, dirty paths). It does not query the operating envelope; run `ft swarm envelope` for the live verdict and pass the posture it implies.
+3. Builds a read-only plan, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
+4. Prints a deterministic plan artifact (golden-fixture-comparable). Nothing is persisted; keep the output if you need a record.
+
+The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)); today it advances the mission lifecycle only and does not dispatch into panes (`ft-majms`, `ft-xxfwy.48`).
+
+---
+
+## Incident Bundles
+
+When something goes wrong (a crash, a stuck pane, a fleet-wide degradation), `ft` packages what it knows into an *incident bundle*. `ft reproduce export` runs as its own process, so sources that only a running watcher publishes (tailer health, resource pressure, live robot state) are recorded as unavailable rather than invented.
+
+**Collected today:**
+- Recent events (last 50)
+- Pane/mux state from stored pane rows (not a live mux query)
+- SQLite metadata (journal mode, size, schema version, row counts)
+- Redacted config, git status, and the latest crash report
+- Audit-trail tail: recent policy decisions and results from `audit_actions` (no free-text summaries)
+- Process tree: a bounded, redacted `ps` snapshot when you pass `--process-sample`
+- Beads coordination snapshot from `.beads/issues.jsonl` (ft-tkkqx)
+
+**Not yet on the production path:** GPU state, render-state snapshots, SynchronizedOutput (BSU/ESU) drain telemetry, and WAL checkpoint detail.
+
+**Producer side:** the swarm wire protocol carries publish-side bundle source notifications (ft-9sy9e family) so distributed incidents include each participating agent's local view.
+
+**Consumer side:** `ft reproduce export --kind crash --out DIR` exports the latest crash bundle for external forensic tools; `ft robot incidents autopsy` compiles a redacted post-mortem from a flight-recorder source set.
+
+**Replay side:** `ft robot incidents list/show/explain/replay` reads persisted
+flight-recorder source sets and classifies proof evidence without mutating
+panes, Beads, RCH, Agent Mail, or git. Use
+[`docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook`](docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook)
+for source failures, RCH infrastructure blocks, dirty-tree contamination,
+policy denials, communication outages, operator cancellations, and
+proof-incomplete closeouts.
+
+---
+
+## Substrate Audit Discipline
+
+The codebase is swept by family rather than by spot. Each family is a defect class with a known pattern; the discipline is that every audit closes every member of the family it touches.
+
+| Family | What it looks like | Example fixes |
+|---|---|---|
+| **Public-field bypass** | `pub` struct field lets callers bypass clamping, NaN-rejection, or invariants | `ErasureShard`, `CircuitBreaker::Config`, `QuantileBudgetMs`, `ArrivalCurve`/`ServiceCurve`, `ApprovalScope`, `ScaleFactor`, `AxisValue` |
+| **Rubber-stamp `is_safe()`** | Release-gate `is_safe()` returns `true` on cold start or before any measurement is recorded | `display_pipeline_ci_matrix` (CRITICAL release-gate forgery), `gpu_regression_fuzz_report`, `redactor_coverage_matrix`, `iterm2_osc_1337`, 7 cold-start doctor snapshots, others |
+| **Sanitization gap** | Input sanitizer accepts DEL / C1 / argv-flag injection / path traversal | `restore_process` (DEL + C1 + CSI), `kitty_graphics_alt_text` (HIGH bypass), `browser::sanitize_path_component`, `cass` argv flag injection |
+| **NaN / unbounded input** | Float input not validated against NaN / `NEG_INFINITY` / unbounded ranges | `chaos`, `recorder_replay::ReplayConfig`, `VirtualClock`, `bench_stats::empirical_bernstein_ci`, `disk_pressure::EwmaEstimator` |
+| **Privacy bypass** | Optional redaction field can be skipped via direct access | `scrollback_cold_tier::ChunkMetadata.redaction`, `incident_bundle::truncate_file_content`, `truncate_excerpt` |
+| **Redactor coverage** | Token family not in the redactor pattern set | Added JWT, GitLab, Twilio, SendGrid, Datadog patterns |
+| **State-machine defects** | Transitions accept impossible / inconsistent input | `pane_groups`, `triple_buffer_watchdog`, `sync_output_watchdog`, `frame_budget::SustainedBurstHarness` |
+| **Docstring overpromise** | Docstring claims behavior the implementation doesn't honor | OSC 52 docstring honesty (ft-uea9o) |
+
+See [`docs/audit-checklist.md`](docs/audit-checklist.md) for the per-substrate audit checklist and the bead-keyed exemplars.
+
+---
+
+## Deep Dive: Bayesian Regime Detection (BOCPD)
+
+Regex patterns catch known failure modes. But what about novel failures that nobody wrote a pattern for? `ft` includes a Bayesian Online Change-Point Detection (BOCPD) engine that detects *statistical* regime changes in pane output:
+
+- Infinite loops producing repetitive output at unusual cadence
+- Output quality degradation (token ratio shifts, response length changes)
+- Novel failure modes that don't match any existing pattern
+- Subtle behavioral drift over multi-hour agent sessions
+
+The BOCPD module maintains a posterior distribution over possible "run lengths" (how long the current regime has lasted). When the posterior probability of a regime change exceeds a configurable threshold, a change-point event is emitted. This triggers a context snapshot that captures the execution environment (CWD, env vars, process info, shell state) at microsecond precision.
+
+The workspace also carries ARS (Autonomous Reflex System) modules in `frankenterm-core-ars` for drift detection, evidence ledgers, blast-radius estimation, secret scanning, and compile-time regime analysis. They are implemented and tested but not wired into any live path yet: no production code consults them, so they scan, intercept, and gate nothing today (ft-7p0qz).
+
+---
+
+## Deep Dive: Probabilistic Data Structures
+
+Several subsystems use space-efficient probabilistic data structures to avoid costly exact lookups:
+
+**Bloom Filter (Pattern Engine).** Before evaluating regex patterns against captured text, the pattern engine checks a Bloom filter seeded with the anchor strings from each rule. If the Bloom filter rejects, the text cannot possibly match, and the full regex evaluation is skipped. This reduces CPU cost by 10–100× for rule packs with dozens of patterns, since most text chunks match zero rules.
+
+**XOR Filter (Search Dedup).** The search indexing pipeline uses XOR filters for space-efficient content-hash membership testing. An XOR filter uses approximately `1.23 * n * fingerprint_bytes` to represent a set of n items, which is more compact than Bloom filters at equivalent false-positive rates. XOR filters are static (built once from a known set), and that fits the dedup use case where the known-hash set changes infrequently.
+
+**FNV-1a Hash (Fast Content Fingerprinting).** For real-time dedup decisions where SHA-256 is too expensive, the pipeline uses FNV-1a (64-bit, non-cryptographic) as a fast fingerprint. FNV-1a processes one byte per cycle and is deterministic across platforms.
+
+---
+
+## Deep Dive: Session Persistence and Restore
+
+The session-restoration library/test substrate can identify sessions that did
+not shut down cleanly (`shutdown_clean = 0`), load a checkpoint, and exercise a
+restore state machine:
+
+```
+Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
+```
+
+Production `ft watch` startup runs that detector and logs its result; it does
+not prompt for or execute a restore. The human snapshot-restore and
+robot-rollback commands provide bounded metadata-only dry-runs; all non-dry
+execution is unavailable.
+
+The checkpoint schema can record:
+
+- A deterministic topology snapshot derived from numeric window/tab/pane IDs;
+  schema v1 does not preserve user tab order or stable active-tab identity
+- Per-pane terminal metadata such as dimensions, cursor position, title, and
+  alt-screen flag, plus CWD when supplied by the bridge
+- Optional foreground-process, scrollback-reference, agent, and redacted
+  environment fields
+
+The production `PaneInfo` projection currently populates terminal metadata and
+CWD; optional process/agent/environment schema fields must not be mistaken for
+evidence that those values or their continuity were captured.
+
+The library/test layout substrate can create new panes and map old pane IDs to
+new ones for a limited projection. It does not preserve durable tab order,
+stable active-tab identity, mux domains, workspace/window placement, or full
+appearance. It never replays historical output through PTY input or restarts
+captured processes; those processes receive finite manual dispositions. Its
+same-session durable intent/outcome/lifecycle chain records mappings and keeps
+interrupted or partial attempts unclean for explicit reconciliation instead of
+silently retrying unknown external effects. No production CLI reaches this
+execution path today.
+
+Scheduled backups use the SQLite online backup API for consistent snapshots. Backup archives include the database binary, a JSON manifest with SHA-256 checksums, and optional SQL text dumps. Retention and rotation are configurable by day count and maximum backup count, with 5-field cron scheduling support.
+
+---
+
+## Deep Dive: Disaster Recovery Drills
+
+The `disaster_recovery_drills` module provides structured, repeatable DR drill scenarios that exercise the backup/restore pipeline and measure RTO/RPO compliance. Each drill scenario specifies:
+
+- **RTO target** (Recovery Time Objective): maximum acceptable time to restore service
+- **RPO target** (Recovery Point Objective): maximum acceptable data loss window
+- **Completeness threshold**: minimum fraction of panes that must be restored successfully
+
+Drills produce scored reports with pass/fail/degraded verdicts and per-metric breakdowns. The verdict logic uses asymmetric scoring: completeness failures are always "Fail," but missing one RTO/RPO target while meeting completeness produces "Degraded" rather than outright failure.
+
+`ContinuityReport` was hardened in 2026-05 so that an empty report reports `Unknown` rather than `Healthy` — a release-gate forgery class that previously slipped through the rubber-stamp `is_safe()` sweep (ft-38rxl).
+
+---
+
+## Deep Dive: Connection Pool and Circuit Breaker
+
+The mux connection pool reduces overhead by reusing persistent connections to the WezTerm mux server. Key design choices:
+
+- **Semaphore-based concurrency.** A `Semaphore` (via `runtime_async`) limits concurrent connections. Each `acquire` returns a guard that holds a permit; dropping the guard releases the slot. This prevents pool starvation even when operations fail.
+- **Recovery with retry.** On transient/recoverable errors, the pool discards the failed connection (guard drop releases the semaphore) and retries with a new connection using configurable backoff. The connection is intentionally not returned to the pool after an error since its state may be corrupted.
+- **Circuit breaker integration.** After exhausting retries, failure is reported to a circuit breaker state machine. When the circuit opens (too many recent failures), subsequent operations fail immediately rather than waiting for timeouts. The circuit transitions through Closed → Open → Half-Open → Closed states with configurable cooldown periods.
+
+The retry layer supports exponential backoff with random jitter (uniform ±10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100 ms initial; database writes: 5 attempts / 50 ms initial). `ft watch` webhook delivery uses its own bounded policy: 5 attempts, 1 s initial delay doubling to a 4 s cap, retrying only transport errors, 408, 429 and 5xx.
+
+The circuit-breaker `Config` had its `pub` fields tightened (ft-l5z7z) so callers can no longer bypass clamping; see the [Substrate Audit Discipline](#substrate-audit-discipline) section for the broader public-field bypass family closure.
+
+---
+
+## Deep Dive: Pattern Engine Architecture
+
+The pattern engine is a four-stage filter chain optimized for the common case (most text matches zero rules):
+
+```
+text chunk
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Stage 1: Bloom prefilter                   │  ← reject 80–95% of chunks
+│ (anchor strings from every rule)           │
+└────────────────────────────────────────────┘
+  │ pass
+  ▼
+┌────────────────────────────────────────────┐
+│ Stage 2: Aho-Corasick anchor match         │  ← exact anchor confirmation
+│ (single-pass over the buffer)              │
+└────────────────────────────────────────────┘
+  │ candidate rules
+  ▼
+┌────────────────────────────────────────────┐
+│ Stage 3: Regex evaluation (fancy_regex)    │  ← only on candidates
+│ (per-rule, with timeout guards)            │
+└────────────────────────────────────────────┘
+  │ matches
+  ▼
+┌────────────────────────────────────────────┐
+│ Stage 4: Dedup context + severity scoring  │  ← suppress duplicate triggers
+└────────────────────────────────────────────┘
+  │
+  ▼ emit DetectionEvent → event bus
+```
+
+### Why this chain is fast
+
+- **Bloom prefilter rejects most chunks for zero cost.** A pack with 100 rules has 100–500 anchor strings; the Bloom filter computes ~8 hashes per chunk and rejects when none match.
+- **Aho-Corasick is O(n)** in chunk length regardless of pattern count. Anchors are exact substrings, so AC is the right tool; regexes are deferred to candidates only.
+- **Regex evaluation is per-rule, with timeout guards.** The substrate audit closed the regex-ReDoS class via `ft robot rules lint --strict`, which warns on nested wildcards, excessive length (>500 chars), and consecutive spaces.
+- **Dedup context** prevents the same trigger from firing twice when output is repeated within a configurable window (the rate-limit retry-duration regex was recently tightened to anchor near rate-limit markers, reducing false positives; see CHANGELOG 2026-04-26).
+
+### Cross-chunk subtlety
+
+Aho-Corasick's LeftmostFirst non-overlapping mode is **not composable across chunk boundaries**. Earlier bytes consume match positions, preventing later patterns from matching. The **live production engine** — `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs` — solves this with a *bounded* tail re-scan: each new segment is prepended with `DetectionContext::tail_buffer` (capped at `PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES`, 2 KiB) and only that overlap is re-scanned, with the common no-match case rejected up front by the Bloom `quick_reject` before Aho-Corasick runs at all (segments are themselves capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES`, 64 KiB).
+
+### Rule pack composition
+
+A "rule pack" is a versioned, named collection of detection rules. The default pack is `builtin:core` (Codex + Claude Code + Gemini + terminal runtime events). Custom packs are TOML files discovered in `<config_dir>/patterns/` (override with `[patterns] user_packs_dir`) and in the workspace's `.ft/patterns/`, or listed explicitly as `file:/path/to/pack.toml` in `[patterns] packs`. Each rule has:
+
+- `id` (stable, machine-readable, prefix-namespaced; e.g., `codex.usage.reached`)
+- `agent_type` (codex / claude_code / gemini / wezterm / unknown; must align with the `id` prefix)
+- `event_type` and `description`
+- `anchors` (Bloom-prefilter + AC input; short literal strings the rule needs to see)
+- `regex` (optional; confirms the match, only run if anchors fire)
+- `severity` (info / warning / critical)
+
+### Linter checks
+
+`ft robot rules lint --fixtures --strict` enforces:
+
+- **Naming** — IDs start with `codex.`, `claude_code.`, `gemini.`, or `wezterm.`
+- **Agent-type alignment** — Rule ID prefix matches its `agent_type` field
+- **Regex safety** — warns on nested wildcards (potential ReDoS), excessive length (>500 chars), consecutive spaces
+- **Fixture coverage** — every rule has at least one corpus fixture
+
+---
+
+## Deep Dive: Search Modes — Lexical, Semantic, Hybrid
+
+`ft search` and `ft robot search` support three modes, selected via `--mode`:
+
+| Mode | Backend | Best for | Latency target |
+|---|---|---|---|
+| `lexical` (default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
+| `semantic` | FNV-1a hash embeddings (`fnv1a-hash-128`) | Token-overlap similarity on reworded queries; not true paraphrase understanding | vector scan over stored embeddings |
+| `hybrid` | RRF fusion of lexical + semantic | Best of both; recommended when in doubt | lexical + semantic + fusion overhead |
+
+### Lexical (FTS5 + Tantivy)
+
+SQLite FTS5 indexes captured output at write time. A Tantivy secondary index exists as a separate crate but is not populated on the production path.
+
+### Semantic (hash embeddings)
+
+Every appended segment also gets a 128-dimension FNV-1a hash embedding (`fnv1a-hash-128`) stored alongside it. Queries are embedded the same way and matched by vector similarity. This is a lexical-flavored semantic lane, not an ML model; fastembed and the embedder daemon are not on the production path.
+
+It sits behind the `semantic-search` feature, which the `ft` binary enables by default; without it, semantic and hybrid modes return lexical-only results.
+
+### Hybrid (RRF fusion)
+
+Hybrid mode runs both backends in parallel and fuses results with Reciprocal Rank Fusion (RRF):
+
+```
+score(doc) = sum over backends of 1 / (k + rank_in_backend(doc))
+```
+
+`k` defaults to 60 (the canonical RRF constant). Hybrid mode is the recommended default when you don't know in advance whether a query is best served by exact matching or by the looser token-overlap recall of the hash-embedding lane. The cost is roughly `lexical_latency + semantic_latency + small fusion overhead`.
+
+### Future-query recall caveat
+
+The current recall bound for semantic search on held-out data is a **vacuous PAC-Bayes bound** until production query data is collected ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json)). Treat semantic recall claims as benchmark-substrate only, not production-data-validated, until the bound is non-vacuous.
+
+---
+
+## Deep Dive: Policy Engine
+
+The policy engine sits between every action and its target. Its job: turn a request like "send `<text>` to pane 7" into a decision: **Allow**, **Deny**, or **RequireApproval**.
+
+### Decision pipeline
+
+```
+ActionRequest
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Capability gate                            │  ← does the caller have this capability?
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Surface check (alt-screen, prompt-active)  │  ← is the target in a state that accepts input?
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Rate limit (per-pane + global)             │  ← have we exceeded the rate budget?
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Approval gate (if required by policy)      │  ← does this action need explicit human consent?
+└────────────────────────────────────────────┘
+  │
+  ▼
+┌────────────────────────────────────────────┐
+│ Redactor (for read-path responses)         │  ← strip secrets before returning text
+└────────────────────────────────────────────┘
+  │
+  ▼ Decision { Allow | Deny(reason) | RequireApproval(token) }
+```
+
+### Audit writes
+
+Every Deny / RequireApproval decision from the MCP gate helpers is persisted to the `policy_denied_audit` table (storage schema v24+). The wiring is in `mcp_tools.rs::persist_mcp_policy_denial_async`; the matrix at [`docs/security/policy-denial-audit-wiring-matrix.md`](docs/security/policy-denial-audit-wiring-matrix.md) catalogs which surfaces are wired.
+
+### Approval tokens
+
+When the policy returns `RequireApproval`, it emits an 8-character approval code. The token is scoped to a specific `(action, pane_id, fingerprint)` triple; a code issued for sending `/compact` to pane 7 cannot be reused to send `/compact` to pane 9 or to send `/clear` to pane 7.
+
+```bash
+ft robot send 7 "rm -rf ~/important"        # returns RequireApproval with code AB12CD34
+ft approve AB12CD34                          # operator approves
+ft robot send 7 "rm -rf ~/important"        # now succeeds; token is one-shot
+```
+
+### Secret redaction
+
+Every outbound pane-content read path (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, MCP `wa.get_text`/`wa.search`, web SSE `/stream/deltas`) routes through the `Redactor`. Configurable T1/T2/T3 sensitivity tiers control aggressiveness; the [`docs/security/redactor-coverage.json`](docs/security/redactor-coverage.json) attestation slot catalogs which token families are covered. The 2026-05 expansion (ft-8nd26) added JWT, GitLab, Twilio, SendGrid, and Datadog patterns to the default ruleset.
+
+### Policy surfaces and subsystem diagnostics
+
+The policy framework recognizes a small set of `PolicySurface` variants — `Mux`, `Swarm`, `Robot`, `Connector`, `Workflow`, `Mcp`, `Ipc`, `Unknown` — on every decision, so audit rows record *which subsystem* originated the request. Around those surfaces, the framework exposes a wider set of diagnostic subsystems (capability passport, command guard, approval flow, rate limiter, redactor, audit writer, etc.) — `ft doctor --json` reports per-subsystem health verdicts, and `ft proof-doctor` checks whether an intended proof command has the RCH-required shape before it is run. Those doctor rows describe a fresh engine, not the running watcher's counters. The operator kill-switch tier is persisted; quarantines, the in-memory audit chain, and pending approvals remain process-local. A trip receipt identifies the integrated owner and does not prove settlement of previously admitted remote work. See the [kill-switch contract](docs/robot-contracts/kill-switch.md) for per-effect refresh and fence semantics. Failures are typed and routed back through the same error-code taxonomy as the rest of robot mode.
+
+---
+
+## Deep Dive: Workflow Engine
+
+A workflow is a registered handler that triggers on detected patterns. The engine runs them safely:
+
+### Components
+
+- **Engine** (`workflows/engine.rs`) — the orchestrator. Registers handlers, listens to the event bus, dispatches matching events to handlers.
+- **Runner** (`workflows/runner.rs`) — runs a single workflow execution. Persists state to `workflow_executions`. Enforces timeout + cancellation.
+- **Lock** (`workflows/lock.rs`) — per-pane workflow lock. Prevents two workflows from racing each other on the same pane. `LockManagerHealth` telemetry surface (ft-rai3h) tracks lock acquisition latency, hold time, and contention.
+- **Handlers** (`workflows/handlers.rs`) — built-in workflow implementations (`HandleCompaction`, `HandleUsageLimits`, `HandleAuthRequired`, `HandleOnErrorCassSearch`, others; see the [Built-in Workflow Handler Catalog](#deep-dive-built-in-workflow-handler-catalog) for the full list).
+- **Traits** (`workflows/traits.rs`) — the `Workflow` trait every handler implements. Required methods: `name()`, `description()`, `handles(detection)`, `steps()`, `execute_step(ctx, step_idx)`; defaulted ones include `trigger_event_types()`, `supported_agent_types()` and `trigger_policy()` (defaults to `allow_all`).
+
+### Trigger-policy allowlists (ft-j0ufc)
+
+Workflows that act on high-trust panes can declare an allowlist:
+
+```rust
+fn trigger_policy(&self) -> WorkflowTriggerPolicy {
+    WorkflowTriggerPolicy::allowlist([trusted_pane_id])
+}
+```
+
+The runner enforces the allowlist **before** any lock, audit row, or engine state is created. Refused triggers surface as `WorkflowStartResult::SourcePaneNotTrusted` and the originating `source_pane_id` is recorded for post-incident forensics. This closes the privilege-amplification class where a low-trust pane's output could fire a high-trust workflow whose actions land on a different pane.
+
+### Workflow lifecycle
+
+```
+TriggerEvent → trigger_policy check
+                   │
+                   ▼ pass
+              acquire pane lock
+                   │
+                   ▼
+              persist WorkflowExecution(state=Started)
+                   │
+                   ▼
+              handler.execute(ctx)
+                   │
+              ┌────┼────┐
+              ▼    ▼    ▼
+          Success Failure Cancel
+              │    │    │
+              └────┼────┘
+                   ▼
+              persist WorkflowExecution(state=Final)
+                   │
+                   ▼ emit WorkflowCompleted event
+              release pane lock
+```
+
+### Idempotency
+
+A workflow can declare itself idempotent. The engine then deduplicates triggers within a configurable window, so the same `(pane_id, rule_id)` event firing twice in 100 ms only runs the handler once.
+
+---
+
+## Deep Dive: Transactional Mission Execution
+
+Multi-pane operations use a prepare/commit/compensate lifecycle borrowed from distributed transaction protocols.
+
+### Lifecycle
+
+```
+TxContract
+   │
+   ▼
+┌────────────────────────────────────────────┐
+│ PREPARE                                    │
+│ - validate preconditions (policy, liveness)│
+│ - reserve resources (pane reservations)    │
+│ - obtain approval tokens if required       │
+│ - persist PrepareReceipt                   │
+└────────────────────────────────────────────┘
+   │ success
+   ▼
+┌────────────────────────────────────────────┐
+│ COMMIT                                     │
+│ - execute steps in dependency order        │
+│ - persist per-step receipt                 │
+│ - on failure: stop and trigger compensate  │
+└────────────────────────────────────────────┘
+   │ success
+   ▼ done
+                or, on failure:
+┌────────────────────────────────────────────┐
+│ COMPENSATE                                 │
+│ - run compensating action for each         │
+│   committed step in reverse order          │
+│ - persist CompensationReceipt              │
+└────────────────────────────────────────────┘
+   │
+   ▼ TxOutcome
+```
+
+### Idempotency ledger
+
+Every step execution is recorded with a content-hash idempotency key. If a tx crashes mid-flight and is resumed, steps whose receipts already exist are skipped. This makes tx safe to retry after operator-host crashes, network partitions, or operator Ctrl-C.
+
+### Kill switches
+
+The mission engine exposes a kill-switch enum (`MissionKillSwitchLevel` in `plan.rs`) with three levels:
+
+- **Off** — default; mission proceeds normally
+- **SafeMode** — restrict the mission to non-mutating / read-only steps; operator can still resume
+- **HardStop** — abort immediately; compensation runs for any committed steps
+
+The transition graph is enforced as a state machine; illegal transitions return a typed error. The TLA+ model for the kill-switch invariants is the `proofs/tx-killswitch` attestation slot (ft-tf6g3.12). Adjacent enums govern the broader execution model: `KillSwitchAction` in `tx_killswitch_model.rs` and `FleetKillSwitch` in `robot_fleet_state_machine.rs`.
+
+### Failure injection
+
+`ft tx run --fail-step tx-step:commit` triggers an injected failure at the named step. This is how compensation paths are exercised in tests and in operator dry-runs.
+
+---
+
+## Deep Dive: Fleet Memory Controller
+
+The fleet memory controller synthesizes pressure from three independent subsystems into a single 4-tier model that drives uniform action across the system.
+
+### Inputs
+
+1. **Pipeline backpressure** — the capture queue and the storage-writer queue depths against their capacities (the same rows the resource cockpit's `queue_backpressure` domain reports).
+2. **System memory utilization** — process RSS / total RAM, with platform-specific source (`sysctl` on macOS, `/proc/meminfo` on Linux).
+3. **Per-pane memory budgets** — each pane's resident scrollback as the mux reports it (warm resident bytes plus in-memory rows), against `[fleet_scrollback] per_pane_budget_bytes`.
+
+### Synthesis: worst-of
+
+The controller takes the **worst** tier across the three inputs. If pipeline backpressure is Green but per-pane budget is Red, the synthesized tier is Red. A single hot signal must always escalate.
+
+### 4-tier pressure model
+
+| Tier | Meaning | Action |
+|---|---|---|
+| **Normal** | All inputs healthy | None |
+| **Elevated** | One input is yellow | Idle panes may back off to a 4x longer poll ceiling; active panes keep their poll rate |
+| **Critical** | Any input is red | Idle panes are paused (a 16x longer poll ceiling), plus `ft watch` asks the mux to move the most pressured panes' warm scrollback to the cold tier (mux codec 67+; older muxes log a recommendation) |
+| **Emergency** | Any input is black | Idle panes are paused (16x ceiling); warm scrollback is evicted on every pane |
+
+Pausing an idle pane stretches its poll ceiling rather than stopping capture:
+its next poll captures what it printed meanwhile (a burst larger than the
+capture window becomes an explicit gap segment, as at any poll rate), and a
+pane that starts printing returns to the fast poll floor at once.
+
+`ft watch` also evaluates the global admission controller every health tick
+for a standard new agent spawn: capture/write queue fullness and measured
+failure rate, the compound fleet tier, the mux warm-tier budget, and measured
+p95 stage latencies against their budgets. The verdict (admit, defer, degrade,
+or shed, with reason codes; missing evidence is reported, never guessed) is
+published in the resource cockpit's `resource_admission` domain in
+`ft doctor --json`. `ft robot profile apply` and a scaling-up
+`ft robot fleet scale` consult it before spawning: a fresh `shed` verdict
+refuses the spawn (`robot.admission_shed`; override with `--force-admission`),
+and every other verdict, including `unavailable` when no
+watcher answers or its snapshot is older than 90 s, proceeds and is reported
+in the response's `admission` field.
+
+### Asymmetric hysteresis
+
+Escalation is fast: any input crossing into a hotter tier escalates immediately. De-escalation is slow: the controller requires N consecutive samples of the cooler state before stepping down a tier. This prevents flapping when an input oscillates near a tier boundary.
+
+### Cockpit data
+
+During incidents, the [resource-pressure cockpit contract](docs/resource-pressure-cockpit-contract.md) gives operators the residency breakdown: `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, `unknown`. Before calling anything a "leak," operators classify the residency source. The cockpit also exposes `action_receipts` — what mitigations have already been attempted and their outcomes.
+
+---
+
+## Deep Dive: Three-Tier Scrollback
+
+In a simple sizing model, 200 panes retaining roughly 20 MB of uncompressed
+backbuffer each consume about 4 GB before other process costs. That is an
+illustrative calculation, not a measured comparison against every stock
+terminal. `ft` keeps scrollback in three tiers and migrates lines between them
+based on access patterns and pressure.
+
+### Tier transitions
+
+```
+new line
+  │
+  ▼
+┌──────────┐
+│   HOT    │  VecDeque in RAM, ~200 bytes/line
+│ (last N) │
+└──────────┘
+  │ aged out (configurable: line count, time)
+  ▼
+┌──────────┐
+│   WARM   │  zstd-compressed in RAM, ~40 bytes/line (~5:1 ratio typical)
+│ (mid-age)│  Decompressed on demand
+└──────────┘
+  │ evicted (configurable: pressure tier, age)
+  ▼
+┌──────────┐
+│   COLD   │  Persisted in SQLite output_segments
+│ (queryable on demand) │
+└──────────┘
+```
+
+### Hot tier
+
+A bounded `VecDeque` of decoded terminal lines. Direct indexing for renderer paint; O(1) push to the head. Tier boundary is configurable (default: most recent N lines, with N depending on pane priority).
+
+### Warm tier
+
+Block-compressed (zstd) older lines. Compression block size is tuned so a single block is roughly the size of a screenful. Decompression is on-demand: a request for line 5000 decompresses only the block containing that line, not the entire warm tier.
+
+### Cold tier
+
+When a line is evicted from warm (under Critical/Emergency pressure or aged past the warm threshold), it is dropped from RAM. Within the configured durable-retention window, the line remains queryable via the `output_segments` table (which is the canonical source of truth) and via FTS5 search; age, count, or storage-size retention may later prune it.
+
+### Why this layout
+
+- **Renderer hot path stays fast.** The renderer only reads from the hot tier.
+- **Tier eviction does not create an immediate search gap.** Lines that leave RAM remain searchable in SQLite until the configured durable-retention policy prunes them.
+- **Memory scales sublinearly with scrollback depth.** Adding 10× more scrollback doesn't add 10× RAM.
+
+---
+
+## Deep Dive: Distributed Wire Protocol
+
+Distributed mode lets remote hosts stream pane state into an aggregator. The wire protocol is designed defensively: every input is validated, dedup'd, and bounded.
+
+### Envelope schema
+
+Every message is wrapped in a versioned envelope (`crates/frankenterm-core/src/wire_protocol.rs`):
+
+```rust
+pub const PROTOCOL_VERSION: u32 = 1;
+
+pub struct WireEnvelope {
+    pub version: u32,        // protocol version for compat checking
+    pub seq: u64,            // monotonically increasing per sender (ordering + dedup)
+    pub sender: String,      // sender identity (hostname or agent id)
+    pub sent_at_ms: i64,     // epoch-ms timestamp; informational only
+    pub payload: WirePayload,// typed variants: pane meta, deltas, gaps, detections, …
+}
+```
+
+### Defenses
+
+- **Versioning** — `version` is the first field; mismatch is a typed rejection.
+- **Sender identity validation** — at session start, the agent authenticates (token or mTLS); subsequent envelopes are rejected if `sender` doesn't match the authenticated identity.
+- **Per-sender sequence-number dedup** — if `seq` is repeated or arrives out of order, the envelope is rejected. Prevents replay attacks and accidental double-delivery.
+- **Bounded message size** — enforced at the codec layer via `WireProtocolTuning::DEFAULT_MAX_MESSAGE_SIZE`. Larger payloads are rejected before allocation.
+- **Stale-session pruning** — sessions with no activity for `DEFAULT_AGENT_STALE_AFTER_MS` (5 min default) are pruned by the aggregator.
+- **Local receipt-clock decisions** — the aggregator never uses remote clocks for liveness or ordering decisions. The `sent_at_ms` field is informational only; capacity eviction and stale-session pruning are local decisions.
+- **TLS recommended for non-loopback binds** — `[distributed]` config supports TLS; tokens from files / env vars (avoid inline). `ft doctor --json` verifies effective security state.
+
+### Safety review
+
+The full safety review and diff-fuzz coverage live in [`docs/security/distributed-threat-model.md`](docs/security/distributed-threat-model.md), the producer for the `security/distributed-threat-model` attestation slot.
+
+---
+
+## Deep Dive: RuntimeProof Sealed Trait
+
+The "no tokio" rule is enforced at three layers: dependency (cargo-deny), test (CI checks), and **type** (RuntimeProof sealed trait).
+
+### The mechanism
+
+```rust
+// In runtime_proof.rs (sketch)
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait RuntimeProof: sealed::Sealed { /* … */ }
+
+// asupersync types implement RuntimeProof
+impl sealed::Sealed for asupersync::sync::Mutex<()> {}
+impl RuntimeProof for asupersync::sync::Mutex<()> { /* … */ }
+
+// tokio types DO NOT implement RuntimeProof
+// (and cannot, because Sealed is in a private module)
+```
+
+### What it does
+
+Any API surface that bounds its generic parameter by `RuntimeProof` cannot accept `tokio::sync::*` types. Those types don't implement the sealed trait, and they cannot implement it because the `Sealed` super-trait lives in a private module. Adding an `impl Sealed for tokio::*` line elsewhere in the workspace fails to compile.
+
+### Why this matters
+
+The two looser enforcement layers (cargo-deny, CI test grep) catch direct declarations of tokio. But what if a transitive dep re-exports `tokio::sync::Mutex` under a different name? Or what if someone writes a generic adapter that erases the runtime origin? The sealed trait catches these at the type level. The build refuses to even compile code that tries to smuggle tokio types into a RuntimeProof-bounded API.
+
+### The soundness argument
+
+The `Sealed` super-trait is modeled in [`docs/proofs/runtime-proof-soundness.lean`](docs/proofs/runtime-proof-soundness.lean) and checked by `scripts/check-runtime-proof-soundness.sh`. The proof argues: (1) `Sealed` is in a private module; (2) no external code can construct an `impl Sealed for T`; (3) therefore no external T can implement `RuntimeProof`; (4) therefore any RuntimeProof-bounded API rejects all non-allowlisted runtime types.
+
+This is the `proofs/runtime-proof-trait` attestation slot (`ft-i2eni.1`).
+
+---
+
+## Deep Dive: Attestation Bundle Format
+
+A release attestation bundle is a content-addressed, Sigstore-signed JSON file under `docs/attestations/<version>.json`. Its job: prove that every load-bearing README/AGENTS claim is backed by a hash-verified artifact.
+
+### Bundle structure
+
+Top-level shape per the live bundles under `docs/attestations/`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-17T03:47:27Z",
+  "generator": { "name": "...", "version": "..." },
+  "release":   { "channel": "...", "tag": "...", "version": "..." },
+  "git":       { "branch": "...", "commit": "<sha>", "tree": "..." },
+  "required_categories": ["perf/headline-claims", "security/redactor-coverage", "..."],
+  "artifacts": [
+    {
+      "category": "perf/headline-claims",
+      "description": "...",
+      "media_type": "application/json",
+      "path": "docs/perf/headline-claims.json",
+      "produced_by_bead": "ft-syqcz.3",
+      "proof_categories": ["..."],
+      "sha256": "<64 hex>",
+      "size_bytes": 12345
+    }
+  ],
+  "confidence_summary":  { "best_confidence_by_category": {}, "records": [], "schema_path": "...", "schema_version": "..." },
+  "taxonomy_coverage":   { "below_threshold_count": 0, "category_counts": {}, "delta_from_prior_release": {}, "schema_version": "...", "taxonomy_path": "...", "uncategorized_artifact_count": 0 },
+  "deferred_slots":      [],
+  "retractions":         [],
+  "signature":           { "canonical_sha256": "<64 hex>", "method": "...", "reason": "..." }
+}
+```
+
+### Verify flow
+
+```bash
+ft attestation verify docs/attestations/<version>.json
+```
+
+This:
+1. Re-derives every `artifacts[].sha256` by reading the artifact from disk and hashing it
+2. Recomputes the canonical signing payload (deterministic serialization of the slots + metadata)
+3. Verifies that `signature.canonical_sha256` matches the recomputed hash
+4. Verifies that the `.sigstore` file's hash + size match the recorded values
+5. Verifies the Sigstore signature against the canonical payload using the Fulcio cert + Rekor entry
+
+Exits 0 on full pass, non-zero on any failure. `--json` mode emits a machine-readable verdict envelope. `--strict-required` adds a check that `required_categories` matches the canonical manifest exactly (catches under-declaration).
+
+### Signing identity
+
+Sigstore keyless signing via Fulcio + Rekor. The signing identity, trust roots, and `cosign verify-blob` recipes live in [`docs/attestations/SIGNING.md`](docs/attestations/SIGNING.md). The closure procedure (when to run, how to file regressions on hash mismatch) lives in [`docs/release/attestation-checklist.md`](docs/release/attestation-checklist.md).
+
+### Retraction
+
+When a shipped slot turns out to be wrong, the bundle is not edited. Instead, a retraction is recorded:
+
+```bash
+ft attestation retract --bundle docs/attestations/<version>.json --slot proofs/tx-killswitch \
+                       --rationale-file why.txt --retracted-by-release <release>
+ft attestation retractions --bundle docs/attestations/<version>.json --json
+```
+
+Retractions are append-only and visible to anyone who verifies the bundle; this is the bundle-retraction substrate (ft-tf6g3.41).
+
+---
+
+## Deep Dive: The Watcher Capture Loop
+
+`ft watch` runs the main capture loop that produces every byte of observed data. Understanding the loop is essential to understanding what `ft` is doing while it's "doing nothing visible."
+
+### Per-tick stages
+
+```
+                          ┌────────────────────────────────────┐
+                          │ tick start (~poll_interval_ms)     │
+                          └────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. Discovery — call into the mux, list current panes                 │
+│    - Detect new panes, retired panes, identity changes               │
+│    - Update pane registry + bookmarks                                │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2. Round-robin scheduling among equal-priority panes                 │
+│    - Honor [ingest.priorities] overrides                             │
+│    - Respect per-pane / per-fleet capture budgets                    │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3. Capture — pull current scrollback from each pane (concurrent)     │
+│    - Bounded by [ingest.max_concurrent_captures]                     │
+│    - Uses native push events when the bridge is available;           │
+│      falls back to poll otherwise                                    │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4. Delta extraction — bounded 1 MiB overlap vs. last capture         │
+│    - On match: append the new tail to the segment buffer             │
+│    - On miss: emit explicit Gap event (never silent)                 │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 5. Scan pipeline — SIMD metrics → AC trigger → zstd compression      │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 6. Persist — append to output_segments + FTS5 + hash embedding       │
+│    - Goes through the single-writer queue with batched commits       │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 7. Detect — pattern engine evaluates new content (BOCPD parallel)    │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 8. Event fanout — broadcast detections to EventBus subscribers       │
+│    (workflow engine, web/SSE streamer, distributed streamer, …)      │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 9. Maintenance — GC compaction (cooldown'd), backup window check,    │
+│    pressure-tier re-evaluation, watchdog heartbeat                   │
+└──────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼ tick end
+```
+
+### Provisional tick-budget bands
+
+- **10-pane fleet**: the current planning default is ~200 ms.
+- **50-pane fleet**: evaluate a tighter poll interval only while the measured pressure tier stays Normal; consider per-pane priority bumps for hot panes.
+- **200+-pane target**: treat native push events and fleet-pressure throttling as required design assumptions, then qualify the exact host and workload before deployment.
+
+These are starting hypotheses for measurement, not release-qualified latency or
+capacity guarantees.
+
+### When the loop throttles
+
+- **Elevated tier** — idle panes back off to a 4x longer poll ceiling.
+- **Critical tier** — idle panes are paused (16x poll ceiling; capture continues at that cadence), and the watcher evicts the targeted panes' warm scrollback on the mux (codec 67+).
+- **Emergency tier** — idle panes are paused; warm scrollback is evicted on every pane.
+  `ft robot profile apply` and `ft robot fleet scale` refuse spawns only on a fresh `shed` admission verdict.
+
+### What the loop **never** does
+
+- It never *sends input* to a pane. That always goes through the policy gate via `ft send` / robot send / workflow handlers.
+- It never *retries forever* against an unreachable mux. The circuit breaker eventually opens; doctor reports the failure.
+- It never *invents data when capture fails*. Gaps are recorded as explicit events.
+
+---
+
+## Deep Dive: Storage Schema and Migration Strategy
+
+`ft` stores everything in a single SQLite database. The schema is versioned and migrations are tracked.
+
+### Current schema version
+
+The current version is **v<!--count:storage_schema_version-->48<!--/count-->**. The authoritative source is
+[`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
+documentation must follow that constant rather than becoming an independent
+version authority.
+
+### Core tables
+
+| Table | Purpose |
+|---|---|
+| `output_segments` | Append-only captured-output deltas with FTS5 index. The canonical source of truth for everything searchable. |
+| `events` | Detection + system events with categorical filters (rule_id, severity, handled flag, pane_id). |
+| `audit_actions` | Every action that went through the policy gate (allow / deny / approve / rate-limited / failed). |
+| `policy_denied_audit` (schema v24+) | Every Deny / RequireApproval decision from MCP gate helpers — see [`docs/security/policy-denial-audit-wiring-matrix.md`](docs/security/policy-denial-audit-wiring-matrix.md). |
+| `approval_tokens` | Approval codes + scope (action, pane, fingerprint), with one-shot semantics. |
+| `workflow_executions` | Per-execution state and lifecycle for every workflow run. |
+| `pane_reservations` | Cross-process pane-edit reservations (advisory leases). |
+| `work_claims` | Native SQLite work-queue backing `ft robot work claim / complete / list / ready`. |
+| `pane_contexts` + `context_rotations` | Native context registry for `ft robot context status / rotate / history`. |
+| `agent_profiles` + `profiles_applied_log` | Profile definitions + per-apply receipts. |
+| `session_checkpoints` + `mux_pane_state` | Session persistence (snapshots, restore IDs). |
+| `prepared_plans` + `workflow_action_plans` | Tx prepare-phase state and pre-planned action records. Mission and Tx contracts themselves live as JSON files at `.ft/mission/active.json` and `.ft/mission/tx-active.json`; tx receipts (`TxReceipt`) are typed values persisted into those workspace contracts. |
+| `mux_sessions` + `agent_sessions` + `panes` | Live mux/session/pane registry. |
+| `notification_history` + `event_labels` + `event_notes` + `event_mutes` | Notification dedup history and event annotation. |
+| `output_gaps` + `segment_embeddings` + `fts_index_state` + `fts_pane_progress` | Capture gaps, semantic embeddings, FTS5 index health. |
+| `saved_searches` + `pane_bookmarks` + `accounts` + `action_undo` + `secret_scan_reports` + `usage_metrics` + `maintenance_log` | Operator-facing surfaces (saved queries, bookmarks, accounts, undo log, secret-scan reports, usage metrics, bounded operational advisories, and retained cleanup receipts). |
+| `ft_meta` | Single-row table holding `schema_version`, `min_compatible_ft`, `created_by_ft`. |
+
+### Why SQLite specifically
+
+- **No system dep.** rusqlite bundles SQLite; no install step.
+- **In-process I/O.** No IPC overhead between `ft` and the store.
+- **WAL mode** lets multiple readers proceed while a single writer commits.
+- **FTS5** is built-in and battle-tested.
+- **Online backup API** gives us consistent snapshots without stop-the-world.
+- **Schema migrations** are versioned + tracked + reversible (forensic_migration + rollback_execution support).
+
+### Single-writer integrity
+
+A filesystem lock (`fs2`) ensures at most one watcher writes. The lock metadata records PID and start time. Read-only consumers (e.g., `ft robot state` from a second shell) acquire a shared lock and proceed without blocking the writer.
+
+### GC and VACUUM
+
+The `[gc]` config controls periodic page-stat reporting. The cycle (configurable, default hourly) checks the free-page ratio and advises an explicit operator-run `VACUUM` when more than `vacuum_threshold` (default 20%) of pages are free. It never runs a full `VACUUM` automatically because that database rewrite can monopolize FrankenTerm's single writer during a large active session. Each cycle emits a bounded advisory report (`log_report = true` by default); global retention deletes only old `cache_gc` and `fleet_scrollback_coordinator` advisories in finite FIFO batches while preserving cleanup receipts and unknown maintenance classes.
+
+### Schema migration safety
+
+- **Forward migrations** are deterministic and idempotent. The migration engine in `crates/frankenterm-core/src/storage/migrations.rs` applies versioned steps; `ft db migrate --status` shows the plan, `ft db migrate --dry-run` previews, `ft db migrate` applies, and `--to <version>` targets a specific revision.
+- **Health checks** are available via `ft db check` (integrity + FTS + WAL + schema verdicts in `auto`/`plain`/`json`).
+- **Repair** is available via `ft db repair` (FTS rebuild, WAL checkpoint, vacuum); `--dry-run` previews before executing.
+- **Compatibility window.** `ft_meta.min_compatible_ft` records the minimum `ft` version that can read the current schema. A binary older than that refuses to open the DB rather than corrupting it.
+
+---
+
+## Deep Dive: Recorder and Replay
+
+Beyond delta capture, `ft` has a separate **recorder** subsystem that produces high-fidelity execution traces, and a **replay** harness that runs those traces back deterministically. Together they enable post-incident reconstruction and regression testing.
+
+### Recorder
+
+- **Append-log backend** (current shipped default) — newline-delimited JSON events appended to a per-session log file.
+- **frankensqlite backend** (rollout/test only; live bootstrap pending): a structured-row backend for tighter querying.
+- The recorder owns its own invariants checker (`recorder_invariants.rs`) and audit surface (`recorder_audit.rs`); the migration story (`recorder_migration.rs`) handles upgrading old session logs into the current event schema.
+
+### Replay
+
+The replay subsystem is its own crate (`frankenterm-core-replay`, ~40k LOC, 31 source files). It accepts a recorded session and produces:
+- A normalized event DAG (decision graph with causal edges)
+- A virtual-clock harness so timing-dependent steps can be replayed deterministically
+- A diff engine that compares two replays, useful for catching nondeterminism in workflow handlers
+- A replay-assessment scorer that produces pass / fail / degraded verdicts per scenario
+
+### What replay catches
+
+- **Nondeterministic workflow handlers** — handlers that read the wall clock, generate random IDs without a seeded RNG, or depend on iteration order over a `HashMap`.
+- **Off-by-N in event causality** — events that should be downstream of a trigger but get persisted out of order under load.
+- **Regressions in policy decisions** — a recorded session can be replayed against a newer policy ruleset to see whether previously-allowed actions are now blocked (or vice versa).
+
+### Replay invariants
+
+- The `VirtualClock` validator rejects NaN and `NEG_INFINITY` for time inputs (br-ft-p2xmz / br-ft-gldyy, see CHANGELOG).
+- `ReplayConfig::validate` rejects non-finite numeric inputs at the boundary.
+- Replays are byte-equal across machines when the recorded session is byte-equal; this is the project's definition of replay determinism.
+
+---
+
+## Deep Dive: Connector Fabric
+
+The connector subsystem lets `ft` talk to external systems (issue trackers, monitoring, secret stores, log aggregators, custom internal services) through a unified bridge model.
+
+### Pieces (14 `connector_*.rs` modules in `frankenterm-core/src/`)
+
+- **`connector_sdk`** — the contract every connector implements. Versioned capability envelopes, request/response schemas, error taxonomy.
+- **`connector_registry`** — name-keyed registry of installed connectors, with version pinning.
+- **`connector_lifecycle`** — install / start / stop / restart / drain semantics.
+- **`connector_host_runtime`** — the connector host model plus an HTTP delivery client that runs inside the watcher when `[safety.connector_transport]` is configured (no separate host process).
+- **`connector_inbound_bridge`** — converts external signals (e.g., a webhook from PagerDuty) into typed `ft` events.
+- **`connector_outbound_bridge`** — converts typed `ft` events (e.g., a critical detection) into external calls (e.g., a Slack post).
+- **`connector_mesh`** — multi-host routing across a fleet of `ft` aggregators.
+- **`connector_governor`** — rate limits, capability gating, credential management.
+- **`connector_credential_broker`** — short-lived credential issuance.
+- **`connector_data_classification`** — tags data flowing through with sensitivity tier before redaction.
+- **`connector_reliability`** — circuit breaker + retry budget per connector.
+- **`connector_event_model`** — typed event variants the bridges produce/consume.
+- **`connector_bundles`** — packaged connector definitions for distribution.
+- **`connector_testbed`** — synthetic providers for tests; the only place mock connectors should live (the mock-finder discipline ratifies this).
+
+### Capability envelopes
+
+Every connector declares its capabilities: what actions it can invoke, what state it can read, what events it can stream. The default envelope includes `Invoke`, `ReadState`, `StreamEvents`. Capabilities are enforced at the policy layer; a connector that didn't declare `StreamEvents` cannot subscribe to the event bus even if its code tries to.
+
+### Certification probe pipeline
+
+A **certification probe pipeline** (`connector_sdk.rs`) models this flow:
+1. Validate the connector binary signature
+2. Run the capability round-trip evidence harness (the connector reports its capabilities; the host verifies them)
+3. Record the result
+4. Refuse to start the connector if certification fails
+
+It is exercised by the SDK simulator and tests only: `ft robot connector install` does not run it yet, and there is no certification table.
+
+### Mock-finder discipline
+
+Mock connectors live only in `connector_testbed.rs` by design. The mock-finder sweep (per-substrate audit family) automatically detects production-stub regressions; the latest sweep on the connector cluster verified 14 connector_*.rs files clean. (See MEMORY note `connector-cluster-mock-finder-sweep-2026-04-26` — referenced as ft-z4wvi + ft-6scm7 sweep follow-ups.)
+
+---
+
+## Deep Dive: Agent Profiles, Personas, and Fleet Templates
+
+A **profile** is a reusable specification of a pane: which agent (codex / claude_code / gemini), what cwd, what env overrides, what session settings, what tools it can use. Profiles let you say "spawn 3 of `codex_ws`" without re-stating the details every time.
+
+### Three-level composition
+
+| Level | What it specifies | Example |
+|---|---|---|
+| **Persona** | Behavioral defaults (skill mix, prompt preludes, tool palette) | `codex_engineer`, `claude_reviewer` |
+| **Profile** | Concrete pane spec (persona + cwd + env + session settings) | `codex_ws` (codex_engineer + workspace cwd) |
+| **Fleet template** | A composition of profiles (counts + dependencies) | `swarm_5x_codex_1x_claude` |
+
+### Registry
+
+Profiles persist in `agent_profiles` (DB-backed). `ft robot profile list` enumerates them; `ft robot profile show <name>` shows the full definition. `ft robot profile validate <name>` validates the definition without spawning.
+
+### Apply semantics (idempotent on identical input)
+
+`ft robot profile apply codex_ws --count 3` is **idempotent on `(name, count, env_overrides, dry_run)`**. Re-running with identical inputs returns the same plan + same idempotency key. The mutation receipt is persisted to `profiles_applied_log` for replay.
+
+Non-dry-run apply spawns panes through the mux bridge with rollback on mid-apply failure. The full contract (including idempotency rules, failure semantics, side-effect surface, and concurrency contract) is the canonical example for the broader robot-contract methodology ([`docs/robot-contracts/profile.md`](docs/robot-contracts/profile.md)).
+
+### Why profile-driven spawning?
+
+- **Reproducibility.** Two operators running `ft robot profile apply codex_ws --count 3` get the same fleet shape.
+- **Audit.** The applied-log records who applied what when, with the content hash as the idempotency key.
+- **Composability (planned).** Personas and fleet templates exist as types (`session_profiles.rs`) but cannot yet be loaded or applied from `ft`; profiles are created with `ft robot profile create` and applied directly.
+
+---
+
+## Deep Dive: The `Cx` Cancellation Model
+
+`Cx` is asupersync's capability and cancellation context. When FrankenTerm
+threads it explicitly through a call graph, it preserves typed cancellation,
+deadline, budget, and capability state at each audited operation boundary.
+
+### What `Cx` is
+
+A `Cx` is a token-bearing scope. When you spawn a child task with the canonical
+`spawn_with_cx` wrapper, the child inherits the exact context and effective
+capability mask. Cancellation becomes observable through explicit checkpoints
+and operation-specific races. Budget-aware sleeps, timeouts, receives, and
+locks do not all share identical direct-cancellation wake behavior, so each
+wrapper documents its own contract.
+
+### What this buys us
+
+- **Monotone cancellation authority.** Explicit child tasks inherit the
+  parent's `Cx` and effective capability restrictions. Lifetime enforcement
+  still requires owned handles or a `JoinSet`; a `Cx` by itself does not
+  forcibly terminate a detached future.
+- **Budget-aware primitives with explicit direct-cancel handling.** The pinned
+  asupersync `budget_sleep` / `budget_timeout` primitives honor the `Cx` budget
+  deadline, but do not register a direct-cancellation wake. Callers that need
+  prompt cancellation checkpoint before/after bounded waits or race an
+  explicit cancellation signal, then classify timeout and cancellation from
+  the typed context state.
+- **Auditable shutdown.** When the operator hits Ctrl-C, the root `Cx` requests
+  cancellation and owned top-level handles are drained under a bounded budget.
+  Shutdown reports when acknowledgement or independently delegated/blocking
+  work remains unproven instead of claiming that no operation can survive.
+
+### Pre-cancel vs mid-flight semantics
+
+asupersync's recv/acquire primitives observe pre-cancel cleanly but **not** mid-flight by default; a `recv` that's already past the cancellation check at the moment cancel arrives will complete its current iteration. The project standard for mid-flight cancel responsiveness is the **select-race pattern**: race the awaited operation against `cx.cancelled()`. See [`docs/proofs/runtime-async-cancel-traces.md`](docs/proofs/runtime-async-cancel-traces.md) (Mazurkiewicz cancel-trace classes) for the formal model.
+
+### Cancellation is not a circuit-breaker failure
+
+`Error::Cancelled` is explicitly exempted from circuit-breaker failure counts (ft-gc4hz). Cancelling a request because the operator hit Ctrl-C is not a sign that the downstream system is unhealthy; treating it as one would open the circuit on every clean shutdown.
+
+---
+
+## Deep Dive: Error Taxonomy
+
+Every `ft` error is a typed envelope with a stable code, a human-readable message, and an optional actionable hint. The taxonomy is operator-readable and machine-routable.
+
+### Code prefixes
+
+| Prefix | Meaning |
+|---|---|
+| `robot.*` | Robot Mode surface errors (most common; one per failure mode) |
+| `policy.*` | Policy decision errors (deny, require_approval) |
+| `mission.*` | Mission lifecycle errors |
+| `tx.*` | Tx prepare/commit/compensate errors |
+| `envelope.*` | Operating-envelope admission verdicts |
+| `storage.*` | DB / FTS5 / migration errors |
+| `wezterm.*` | Mux backend errors (subset of `robot.wezterm_*`) |
+| `cass.*` | Cross-Agent Session Search errors |
+| `caut.*` | Errors from the `caut` account-usage CLI wrapper |
+| `connector.*` | Connector fabric errors |
+
+### Categories (`ErrorCategory`)
+
+Each code is classified into a category for routing, one per code range: `Wezterm` (1xxx), `Storage` (2xxx), `Pattern` (3xxx), `Policy` (4xxx), `Workflow` (5xxx), `Network` (6xxx), `Config` (7xxx), and `Internal` (9xxx). Categories enable bulk policy decisions (e.g., "retry every `Network` error, alert on every `Internal`").
+
+### Retryability
+
+Each code has a `is_retryable()` verdict. Examples of retryable codes: `robot.wezterm_not_running`, `robot.timeout`, `robot.cass_timeout`, `robot.rate_limited`, `robot.circuit_open`, `robot.tx_lock_failed`, `robot.tx_in_progress`. Non-retryable codes include pane-not-found (the pane really doesn't exist; retrying won't help) and policy-denied (deny is a decision, not a transient).
+
+### Actionable hints
+
+The `hint_for(code) -> Option<&'static str>` registry maps codes to operator suggestions. When a caller doesn't set a site-specific hint, the central registry provides a fallback. **Unknown codes return `None`** — callers are not allowed to fabricate generic hints; an absent hint is the signal that the code needs an entry in the registry. The registry is allocation-free (`&'static str`).
+
+This pattern (`ft-tzolj`) closed the class of error responses that shipped `hint: None` and left operators to look up the code in external docs.
+
+---
+
+## Deep Dive: Resource Pressure Cockpit
+
+When operators see "high memory," the cockpit contract demands they classify the residency source first. The contract is at [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md).
+
+### Residency classes
+
+| Class | What it counts | Where it usually lives |
+|---|---|---|
+| `rust_heap` | Heap allocations of the watcher itself | jemalloc stats |
+| `mmap_file_backed` | mmap'd file regions | SQLite + Tantivy index files |
+| `sqlite_page_cache` | SQLite's page cache | Tunable via PRAGMA cache_size |
+| `graphics_media` | GPU buffers, texture atlases | Only on GUI builds |
+| `scrollback_cache` | Hot + warm scrollback tiers | Per-pane budgets |
+| `child_processes` | Spawned mux/pty processes | OS process accounting |
+| `unknown` | Everything else | Should always be near-zero; non-zero is a yellow flag |
+
+### Action receipts
+
+Each cockpit response includes `action_receipts` — what mitigations have already been attempted and their outcomes. Operators check these before claiming a mitigation "actually ran." This prevents the classic incident-response anti-pattern of "tried X, didn't help, but we never confirmed X actually ran."
+
+### Conformance artifact
+
+The resource-cockpit conformance lane is the e2e script [`tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh`](tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh) (retained remote-reduced conformance artifact: `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`). Target-class proof is governed by [`docs/perf/target-class-hardware.md`](docs/perf/target-class-hardware.md) and is currently `skipped_not_proven`.
+
+---
+
+## Deep Dive: Mux Server Federation
+
+`frankenterm-mux-server` is the headless mux daemon. `frankenterm-mux-server-impl` houses the shared implementation. Together they enable federated multi-host setups where one operator runs the GUI / Robot Mode and remote hosts run the mux + agents.
+
+### Federation primitives
+
+- **Command transport** — typed scope + kind enums (`CommandScope`, `CommandKind`), with deduplication on the wire (`CommandDeduplicator`) to avoid double-execution under retry.
+- **Topology orchestrator** — layout templates + template registry; the orchestrator decides where to place new panes based on the registered topology spec.
+- **In-process federation checkpoints** — `DurableStateManager` keeps bounded
+  lifecycle-registry checkpoints and optional topology in memory for rollback
+  and diff operations. It can encode/decode checkpoint JSON, but no production
+  disk writer/loader is wired, and it does not preserve terminal bytes, PTYs,
+  or child processes.
+- **Federation router** — outbound mux events are routed to the right federated participant; inbound events are stamped with origin metadata.
+
+### Why a separate headless server
+
+Some operators want to run `ft watch` and `ft robot` from a laptop while the agent fleet lives on a beefier remote box. The headless mux server provides the mux + PTY layer remotely; `ft` on the laptop talks to it over a connection (loopback in the local case; TLS-secured in the remote case).
+
+### Operator topology
+
+```
+Operator workstation                           Remote agent host
+┌──────────────────────────────┐               ┌────────────────────────────┐
+│  ft (GUI / Robot Mode)       │ ◄──────────── │  frankenterm-mux-server    │
+│  ft watch (capture/store)    │   loopback /  │  agent panes (codex/cc/…)  │
+│  SQLite + FTS5 + Tantivy     │   TLS         │  pty layer                 │
+└──────────────────────────────┘               └────────────────────────────┘
+```
+
+For wider topologies (one operator, many remote hosts), see [Secure Distributed Mode](#secure-distributed-mode).
+
+---
+
+## Deep Dive: Native Event Bridge (push mode)
+
+The default capture mode is poll: `ft watch` queries the mux for pane state every `poll_interval_ms`. A complementary push mode is available when the **native event bridge** is wired up.
+
+### What push mode does
+
+The native event bridge subscribes to OS-level signals from the mux/GUI process: pane lifecycle events (created, exited, focus changed), PTY events (output ready), and visibility events. When a signal arrives, the watcher captures the affected pane immediately rather than waiting for the next poll tick.
+
+### Why this matters at scale
+
+- A 200-pane fleet polling every 200 ms generates 1000 mux queries/sec just for discovery. Push mode collapses that to ~zero for idle panes.
+- Latency from "agent produces output" to "ft has captured it" drops from ~half the poll interval to ~bridge round-trip + extraction time.
+- Capture is more accurate: poll-mode can miss bursts that started and finished within a poll window; push-mode catches them.
+
+### Implementation
+
+`native_events.rs` houses the bridge. It forwards native events to the runtime over an asupersync `mpsc` channel. The emitter side lives in the GUI / mux process and ships through the codec layer. The receiver side in `ft watch` subscribes per-pane.
+
+### Fallback
+
+When the native event bridge is unavailable (running against an older mux, or against a backend that doesn't expose push signals), the watcher transparently falls back to poll mode. `ft doctor --json` reports the effective bridge state.
+
+---
+
+## Deep Dive: WASM Extension Surface (type substrate; runtime not yet wired)
+
+`ft` has a typed extension contract surface in `extensions.rs` designed for out-of-process WASM execution via `wasmtime` (component-model, async, std). **The wasmtime runtime itself is not yet wired in the current shipped build** — the source explicitly notes: *"The actual WASM runtime (wasmtime) is a future addition; these types..."* The substrate is in place so the ABI freezes early; the live execution path is pending.
+
+### Why ship the types first
+
+- Letting the contract shape stabilize while implementation evolves means external authors can start writing against it.
+- Replay determinism, fuel budgets, and policy-gating story can be designed before the runtime arrives.
+- `extensions.rs` lives in `frankenterm-core` and is compiled into every build; it holds contract types only, with no runtime behind them.
+
+### Intended capabilities (when wired)
+
+- Custom detection rules (compiled regex or richer logic)
+- Custom workflow handlers
+- Custom search rewriters
+
+### Intended constraints
+
+- No filesystem or network access outside host-mediated APIs
+- No cross-extension state access
+- No policy-gate bypass
+- wasmtime fuel-budget enforcement so runaway extensions can't lock up the host
+
+When tracking issue: the WASM execution path is part of the broader extension-system roadmap; this README will be updated when `wasmtime` is wired and a working example ships.
+
+---
+
+## Deep Dive: Notification Pipeline
+
+When detections fire, `ft watch` can notify operators through desktop notifications and webhooks.
+
+### Backends
+
+| Channel | File | When to use |
+|---|---|---|
+| Desktop notification | `desktop_notify.rs` | Interactive operator on a workstation |
+| Email | `email_notify.rs` (config only) | Not wired: no SMTP sender exists yet; `--notify-via email` on its own is rejected and an enabled email config logs a warning (ft-9b41l) |
+| Webhook | `webhook.rs` | Integrate with PagerDuty / Slack / custom routers |
+| Prometheus alert | via the metrics surface | Existing alerting infra |
+| In-app events | event bus | Other `ft` surfaces (web/SSE, MCP, robot events) |
+
+### Alert manager (`alerts.rs`)
+
+Planned: an alert manager that routes detections to channels by rule (severity, rule_id pattern, pane, time-of-day). `alerts.rs` currently evaluates usage/cost thresholds only and is not connected to the notification pipeline. The intended rule shape:
+- Severity threshold
+- Channel list (one or more backends)
+- Throttling window (suppress duplicates)
+- Mute list (operator can `ft mute add <identity_key> --for 1h`; find the identity_key via `ft events --format json`)
+
+### Redaction before emission
+
+All outbound notifications go through the Redactor first; the same one used for `get-text` and search responses. A detection whose snippet contains a secret never leaves the host via email or webhook.
+
+### Reliability
+
+Under `ft watch`, webhook delivery retries transport errors, 408, 429 and 5xx up to 5 attempts (1 s initial delay, doubling, capped at 4 s); other 4xx responses and cancellation are not retried. Each endpoint has a circuit breaker: after 5 consecutive failed deliveries it is skipped for 5 minutes (recorded as `webhook_circuit_open`) so a dead endpoint cannot stall the pipeline.
+
+---
+
+## Deep Dive: IPC and Local Auth
+
+`ft` exposes a local IPC surface so the Robot Mode CLI and the watcher can talk to each other without going through the database for every request (the GUI does not use it yet).
+
+### Surface
+
+The IPC server (`ipc.rs`) listens on a Unix domain socket configured via `[ipc]` (Windows uses an AF_UNIX socket too, through the in-tree `frankenterm-uds` transport). The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
+
+### Scope
+
+`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (a Unix domain socket on every platform).
+
+### Why an IPC layer at all
+
+- **Faster than SQLite-mediated coordination** for high-frequency reads such as pane state and health (a future GUI consumer could read the current pressure tier this way).
+- **Push-based.** Subscribers get notified when state changes, instead of polling.
+- **Bounded blast radius.** A bad client request returns a typed error envelope; it doesn't corrupt the database.
+
+---
+
+## Deep Dive: Backup, Restore, and Retention
+
+### Scheduled backups (`[backup.scheduled]`)
+
+```toml
+[backup.scheduled]
+enabled = false                       # off by default
+schedule = "daily"                    # hourly, daily, weekly, or 5-field cron
+retention_days = 30
+max_backups = 10
+destination = "~/.local/share/ft/backups"
+```
+
+Each backup uses the SQLite online backup API for a consistent snapshot. The output archive contains:
+- The database binary (zstd-compressed only when scheduled backups set `[backup.scheduled].compress = true`; the default is uncompressed)
+- A JSON manifest with SHA-256 checksums + bundle metadata
+- Optional SQL text dumps for human inspection
+
+### Manual backups
+
+```bash
+ft backup export --output /tmp/ft-snapshot                # produces a portable, checksummed backup directory
+ft backup export --sql-dump                               # also include a SQL text dump for human inspection
+ft backup import /tmp/ft-snapshot                         # restore with a safety backup of current data first
+ft backup import /tmp/ft-snapshot --verify                # verify integrity without importing
+ft backup import /tmp/ft-snapshot --dry-run --yes         # show what would happen
+```
+
+### Retention
+
+Retention is governed by both `retention_days` and `max_backups`. Whichever bound is hit first triggers pruning. Pruning runs after each scheduled backup; it deletes old archives on disk and writes no audit row.
+
+### Disaster recovery drills
+
+`disaster_recovery_drills` (see deep dive above) models backup/restore drills against operator-defined RTO/RPO targets. Nothing schedules or invokes it today, so no drill runs on its own. Reports include pass / fail / degraded verdicts. The `ContinuityReport` cold-start case was fixed in 2026-04 to report `Unknown` (not `Healthy`) when no drills have run yet; see CHANGELOG / br-ft-38rxl.
+
+---
+
+## Deep Dive: Formal Methods in This Repo
+
+The project uses formal methods where they earn their keep, typically on invariant-critical paths where the cost of an undetected bug is high.
+
+### What's modeled where
+
+| Tool | Where | What it proves |
+|---|---|---|
+| **Loom** | `runtime_async` cancel-traces | All interleavings of cancellation + recv/acquire avoid the lost-wakeup class |
+| **TLA+** | `docs/specs/tx-killswitch.tla` | Tx kill-switch invariants under arbitrary commit/compensate orderings |
+| **TLA+** | `docs/specs/blocker-radar-merge.tla` | Blocker-radar incident-merge invariants |
+| **TLA+** | `docs/specs/capture-fairness-scheduler.tla` | Round-robin scheduling fairness under priority overrides |
+| **TLA+** | `docs/specs/durable-state-checkpoint.tla` | Mux durable-state checkpoint correctness across crash + restore |
+| **Explicit-state models (Stateright-style, hand-rolled)** | `tx_killswitch_model.rs`, `wire_dedup_model.rs`, `robot_fleet_state_machine.rs`, `robot_family_contract.rs` | Exhaustive small-bound state-space checks of the tx kill switch, wire dedup, fleet state machine, and work-claim atomicity (`docs/attestations/proofs/robot-work-atomicity.json`); no external model-checker crate is used |
+| **Lean** | [`docs/proofs/runtime-proof-soundness.lean`](docs/proofs/runtime-proof-soundness.lean) | The `RuntimeProof` sealed-trait argument (external code cannot implement `Sealed`) |
+| **proptest** | workspace-wide | Property-based testing of serde roundtrips, parser invariants, state-machine transitions (many hundreds of suites) |
+| **dylint** | custom lints | The `lints/cx_propagation` crate enforces `Cx` propagation conventions at lint time |
+| **cargo-deny** | `deny.toml` | Tokio direct-dep ban; license + advisory checks |
+
+### The "proof gauntlet" path
+
+The current reality-check round (ft-tf6g3) is wiring the formal-methods substrate into the attestation graph. The intent is that every formal proof produces a per-release artifact slot; the DSR release gate runs the model checker and verifies the slot. Where proofs are vacuous (e.g., the current semantic-search PAC-Bayes bound until production data lands), the artifact says so explicitly rather than overstating coverage.
+
+### Methodology playbooks
+
+- [`docs/methodology/proof-techniques.md`](docs/methodology/proof-techniques.md) — when to use Loom / TLA+ / Stateright / proptest / dylint / cargo-deny.
+- [`docs/methodology/statistics.md`](docs/methodology/statistics.md) — sequential testing, concentration-of-measure sample sizing (Hoeffding + Bernstein), conformal SLO bands, Mann-Whitney U / KS.
+
+---
+
+## Compile-Time Feature Matrix
+
+The `ft` binary (`-p frankenterm`) turns nearly every surface on by default; the features exist so trimmed builds still compile. Defaults below come from `crates/frankenterm/Cargo.toml`.
+
+| Feature | What it enables | Default | Disable cost |
+|---|---|---|---|
+| `agent-detection` | `ft robot agents list / running / configure` family | **on** | Calls return `robot.feature_not_available`; no inventory |
+| `mcp` | MCP stdio server (`ft mcp serve`) | **on** | MCP integration unavailable |
+| `web` | HTTP server + SSE streaming (`ft web`) | **on** | No web surface |
+| `distributed` | Distributed mode (`ft distributed agent`, aggregator) | **on** | Distributed unavailable |
+| `semantic-search` | Hash-embedding semantic lane for semantic and hybrid search | **on** | Hybrid/semantic modes return lexical-only |
+| `ftui`, `tui-dashboard`, `tui-widgets` | FrankenTUI dashboard backend and widgets | **on** | TUI dashboard unavailable |
+| `vendored` | Vendored migration map for upgrades | **on** | Older DBs need manual upgrade path |
+| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | **on** | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
+| `subprocess-bridge` | Subprocess-bridge mission/tx surface | **on** | Subprocess-based mission steps unavailable |
+| `browser`, `native-wezterm`, `session-resume`, `redis-session`, `sync`, `jemalloc`, `asupersync-runtime` | Remaining default surfaces and the allocator/runtime choice | **on** | The matching surface is compiled out |
+| `tui-oracle` | Legacy ratatui parity oracle for regression checks | off | Dev-only |
+
+`mcp-client` (the MCP client transport) and `disk-pressure` (disk-pressure telemetry) are `frankenterm-core` features. The `ft` binary depends on the core crate without its defaults and does not enable them, so its operating envelope uses fallback disk signals.
+
+### `--all-features` build
+
+`cargo build -p frankenterm --profile release-interactive --all-features` builds the entire surface with the shipped unwind contract; operators typically build a subset.
+
+### Trimming for embedded / minimal builds
+
+`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. It drops every default surface in the table above (agent inventory, MCP server, web/SSE, distributed mode, semantic search, the TUI dashboard, the metrics endpoint and the rest), so add back with `--features` only what a headless or scripted deployment needs.
+
+---
+
+## Deep Dive: TOON Encoding
+
+TOON (Token-Optimized Object Notation) is a compact tree serialization optimized for AI-to-AI envelopes. The goal is fewer tokens for the same payload when the consumer is an LLM, not byte-level compression.
+
+### What it looks like
+
+A JSON envelope:
+```json
+{"ok": true, "data": {"panes": [{"pane_id": 0, "title": "claude-code"}]}}
+```
+
+The TOON form expresses the same shape with less redundant punctuation and a more LLM-friendly key/value layout. Exact output is library-controlled; the `--format toon` CLI flag invokes it transparently.
+
+### When TOON saves tokens
+
+- **Wide objects with predictable schemas** (pane states, event lists). The fixed-key overhead amortizes well.
+- **Deeply nested but sparse trees** (mission contracts, tx receipts). Keys are emitted once.
+
+### When TOON saves nothing
+
+- **Short single-value responses.** Overhead of the format setup can dominate.
+- **Heavily-stringified payloads** (e.g., a `get-text` response that's 95% raw pane text). The text doesn't compress; only the envelope does.
+
+### The honesty rule
+
+The README intentionally avoids fixed percentage claims for TOON savings, because payload shape controls the actual savings. Substrate work for token measurement (the `ft-0zoq3` benchmark) lives at [`docs/perf-ledger/toon-encoding.md`](docs/perf-ledger/toon-encoding.md). When `--stats` is passed, the CLI prints the JSON vs TOON byte counts to stderr so callers can verify per-response.
+
+### Precedence
+
+`CLI flag > FT_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > json`. Operators typically set `FT_OUTPUT_FORMAT=toon` in agent shells and `json` for human-facing scripts.
+
+### Defaults across surfaces
+
+- `ft robot *` defaults to JSON unless `--format toon` or `FT_OUTPUT_FORMAT` says otherwise.
+- MCP responses use TOON-compatible types so MCP-aware hosts can render them natively.
+- The web SSE `/stream/*` endpoints emit JSON (TOON over SSE is intentionally not exposed).
+
+---
+
+## Deep Dive: Terminal Emulator Capabilities
+
+`ft` inherits its terminal-emulation surface from the vendored `term` + `termwiz` crates. The discipline here is "implement upstream WezTerm correctness, then patch fixes upstream-wards." Recent correctness work:
+
+- **DEC private modes** — full save/restore stack (DECSC/DECRC + the private-mode variants). The 2026-05 DEC private mode restore landed under [`19d289158`](https://github.com/Dicklesworthstone/frankenterm/commit/19d289158) with cache-reset coverage at [`0332dca07`](https://github.com/Dicklesworthstone/frankenterm/commit/0332dca07).
+- **OSC 8 hyperlinks** — display percent-encodes reserved field separators; parse decodes the escaped form back. Closes a class of hyperlink rendering bugs in the GUI and in `get-text` output.
+- **OSC 52 (clipboard)** — docstring honesty fix (ft-uea9o); the implementation matches the documented behavior.
+- **OSC 1337 (iTerm2)** — sanitization gap closure (ft-t9ydu); the cluster of iTerm2 OSC handlers (`iterm2_osc_1337`) was hardened against pure-rejection storm corner cases.
+- **DEL + C1 + CSI sanitization** — the `restore_process` path now rejects DEL and C1 controls (including CSI) rather than silently filtering, closing a bypass class (br-ft-asoso).
+- **Application keypad mode** — DECPAM / DECPNM state changes affect numpad escape sequences (closed under the 2026-04-26 ship-readiness pass).
+- **Wayland DPI overrides** — per-screen DPI overrides are honored; native Windows alternate-screen requests report explicit "unsupported" errors instead of silent success.
+- **Kitty graphics** — alt-text sanitization (ft-t9ydu) + alt-text attestation generator + release gate (br-ft-d1pv3).
+- **Subpixel positioning** — `ScaleFactor` fields privatized to prevent denominator=0 + non-canonical bypass (br-ft-1mktd).
+- **Bidi text** — vendored `bidi` crate provides Unicode BiDi algorithm support.
+- **Synchronized Output (BSU/ESU)** — full mux notification plumbing; GUI drain telemetry; orchestrator-level pinned drain cause for soft-reset under BSU.
+
+The renderer SLO catalog covers resize FPS, input-to-photon latency, atlas stability, parity SSIM, and idle GPU power: [`docs/perf/resize-quality-slo.md`](docs/perf/resize-quality-slo.md) (+ [machine-readable JSON](docs/perf/resize-quality-slo.json)).
+
+---
+
+## Deep Dive: Recording vs Replay vs Snapshot vs Backup
+
+These four words refer to four distinct mechanisms. They are often conflated; the codebase treats them as separate concerns.
+
+| Concept | What it captures | Why | Restored how? | Lives where? |
+|---|---|---|---|---|
+| **Snapshot** | Bounded mux topology + per-pane terminal metadata at a point in time | "What did the swarm look like?" | Inspect it or compare pane membership; `ft snapshot restore <id> --dry-run` emits a metadata-only, non-executable descriptor/status report | `session_checkpoints` + `mux_pane_state` tables |
+| **Session checkpoint** | Persistent session-progress markers | Diagnose and plan manual recovery after an unclean shutdown | Inspect with `ft session`; production does not execute a checkpoint restore | `session_checkpoints` table |
+| **Recording** | Time-ordered event log of *everything* that happened | "What did the swarm *do*?" | Deterministic replay via the replay subsystem | `.ft/recorder-log/events.log` (append-log backend) |
+| **Backup** | The whole `ft.db` + manifest as a portable archive | Disaster recovery, host migration | `ft backup import` | `[backup.scheduled].destination` when set; otherwise `<workspace>/.ft/backups/` |
+
+### When to use which
+
+- **Crashed and want my panes back?** Inspect saved sessions/checkpoints, use the restore dry-run as a bounded metadata aid, and recreate the required state manually. Neither `ft watch` nor the snapshot CLI currently executes recovery.
+- **Want to debug a workflow that fired in a way you didn't expect?** Recording + replay; you can re-run with the exact inputs and step through.
+- **Moving to a new host or recovering from disk loss?** Backup. Always backup before major upgrades; the migration engine will create a safety backup automatically but explicit is better.
+- **Need a quick "what did this fleet look like 3 hours ago" answer?** Snapshot. They're cheap to take and labeled.
+
+### Recording determinism guarantee
+
+A recording, replayed on the same `ft` version with the same seed, produces byte-equal results. This is the project's definition of replay determinism. The replay subsystem owns the harness; deviations are caught by the diff engine.
+
+
+### Export terminal context in CASR format
+
+Export one pane's retained native flight-recorder history as a JSON bundle of
+CASR canonical sessions:
+
+```bash
+ft record export-casr --pane 7 --output conversation.json
+
+# Write JSON to stdout, or raise source admission limits for a larger recorder.
+ft record export-casr --pane 7 > conversation.json
+ft record export-casr --pane 7 \
+  --max-source-bytes 1073741824 \
+  --max-scan-events 500000 \
+  --output conversation-large.json
+```
+
+This command uses the workspace's configured append-log or SQLite recorder and
+a read-only snapshot. It does not open a recorder writer or repair its files.
+A missing or unavailable selected backend is an error; the command does not
+silently read a different backend. It is included in the default
+`session-resume` feature and does not require the `casr` executable to export.
+
+Terminal input and output carry explicit terminal-observation roles. They are
+not authenticated conversation turns: input may be an attempted or denied
+send, and output may contain echoes, status lines, or screen snapshots. The
+bundle preserves session boundaries and history-gap information, always
+redacts text, and omits raw recorder identity and marker-detail strings.
+Exporting does not import the bundle into a provider or resume an agent.
+
+The default bounds are 10,000 selected events, 100,000 scanned events, 256 MiB of
+stored event data including framing, and 16 MiB each for selected text and the
+serialized bundle. Source admission includes other panes in the retained
+recorder. Exceeding a bound refuses the export instead of silently returning a
+complete-looking truncated history. The bundle is fully
+converted before output publication. `--output` uses private, no-overwrite
+publication on supported platforms; stdout remains available where that
+publication mechanism is unavailable. A concurrent rotation or incomplete
+active frame can require retrying the read.
+
+---
+
+## Deep Dive: Pane Filter Rules
+
+`[ingest.panes]` lets you control which panes the watcher observes. Filter rules are deterministic; `ft list --json` and `ft robot state` report each pane's `observed` flag and, for an excluded pane, its `ignore_reason`.
+
+### Rule shape
+
+Each rule is a `PaneFilterRule`:
+```toml
+[[ingest.panes.exclude]]
+id = "exclude_htop"      # stable, machine-readable ID for the rule itself
+title = "htop"           # substring match on pane title (default)
+# title = "re:^(htop|btop)$"  # regex match (use re: prefix)
+# domain = "SSH:*"             # match SSH-backed panes
+# cwd = "/secret"              # match panes with a particular CWD prefix
+```
+
+### Evaluation order
+
+1. **Excludes win.** If any exclude rule matches, the pane is ignored.
+2. **Includes filter.** If the include list is non-empty, the pane must match one to be observed.
+3. **Default include.** Empty include list means "observe everything not excluded."
+
+### Priority overrides
+
+`[ingest.priorities]` works similarly:
+```toml
+[ingest.priorities]
+default_priority = 100
+
+[[ingest.priorities.rules]]
+id = "critical_codex"
+priority = 10       # lower number = higher priority
+title = "codex"
+
+[[ingest.priorities.rules]]
+id = "deprioritize_ssh"
+priority = 200
+domain = "SSH:*"
+```
+
+Priority directly affects the watcher's round-robin scheduling; high-priority panes get more capture cycles per tick under pressure.
+
+### Live override
+
+`ft panes priority <pane_id> --weight 10 --ttl-secs 600` applies a runtime-only priority override (cleared at watcher restart unless persisted to config).
+
+### Bookmarks
+
+`ft panes bookmark add <pane_id> --alias build` stores a stable alias in the `pane_bookmarks` table; aliases persist across restarts. Pass one with `--bookmark <alias>` to `ft search` and `ft status`; other commands take numeric pane IDs.
+
+---
+
+## Deep Dive: Capacity Planning
+
+Provisional sizing hypotheses gathered from operator practice and the perf
+substrate. They are inputs to measurement, not qualified upper bounds. In
+particular, the 100/200-pane memory rows are synthetic benchmark-lane budgets,
+and per-pane disk volume depends directly on output rate and retention.
+
+### Per-pane resource footprint (defaults)
+
+- **CPU planning target**: ~50 µs per pane per idle benchmark tick (poll + delta check); remeasure the production path on the deployment host.
+- **Hot-scrollback model**: ~200 KB per 1000 representative lines.
+- **Warm-scrollback model**: ~40 KB per 1000 representative lines at the assumed 5:1 compression ratio.
+- **Disk planning example**: ~10 MB/day for the declared compressed-delta + FTS5 workload; this is not a per-pane production upper bound.
+
+### Fleet sizes
+
+| Fleet size | Recommended `poll_interval_ms` | Memory envelope | Native push events | Distributed mode |
+|---|---|---|---|---|
+| 1–10 panes | 200 (default) | planning budget: ~50 MB | optional | not needed |
+| 11–50 panes | 200–300 | provisional extrapolation: ~100 MB | recommended | not needed |
+| 51–200 panes | 300–500 | synthetic benchmark budget: ~200 MB | **required** | optional |
+| 200+ panes | 500–1000 + per-pane priorities | target-class artifact required (see [target hardware](docs/perf/target-class-hardware.md)) | required | recommended (split across aggregators) |
+
+### What each default feature buys
+
+All of these are on in a default `ft` build ([feature matrix](#compile-time-feature-matrix)); keep them in a `--no-default-features` build only where they apply:
+
+- **`semantic-search`**: the hash-embedding lane behind semantic and hybrid search. It is model-free, so the cost is an embedding row per segment rather than a resident model.
+- **`web`**: wiring `ft` into a non-CLI tool (dashboard, webhook router, downstream service).
+- **`distributed`**: an agent fleet that spans multiple hosts.
+- **`mcp`**: integrating with MCP-aware agent hosts.
+- **`ftui`**: an in-terminal dashboard.
+
+### Tuning knobs
+
+The full [`docs/tuning-reference.md`](docs/tuning-reference.md) catalogs every `[tuning.*]` key with default, unit, validation guard, and provisional starting ranges for 10/50/200+-pane workloads. The most commonly tuned:
+
+- `[ingest].max_concurrent_captures` — bounds per-tick capture parallelism (default 10)
+- `[tuning.search].default_limit` / `max_limit` — default and maximum search result counts
+- `[tuning.patterns].bloom_false_positive_rate` — anchor prefilter false-positive rate (0.001–0.2, default 0.01)
+
+Unknown `[tuning.*]` keys are ignored rather than rejected, so check a key against the reference before relying on it.
+
+---
+
+## Deep Dive: Signal Handling and Clean Shutdown
+
+`ft watch` attempts a bounded **clean shutdown** for catchable signals and
+reports an unclean result when task acknowledgement or storage flush does not
+finish. `SIGKILL`, blocking OS work, and independently delegated work remain
+outside that guarantee.
+
+### SIGINT (Ctrl-C)
+
+1. The signal handler cancels the root `Cx`.
+2. Owned tasks receive the cancellation context and observe it at their
+   operation-specific checkpoints or races.
+3. Top-level runtime handles are asked to settle within the shutdown budget.
+4. The storage writer is asked to flush queued segments and commit the WAL
+   within its bounded cleanup phase.
+5. On complete settlement, resources are released and the clean-shutdown state
+   can be recorded; otherwise the shutdown result stays explicitly unclean.
+
+### SIGTERM
+
+Identical to SIGINT in steady state. The shutdown deadline is configurable; if
+the deadline passes before flush completes, the process exits with a non-zero
+code and the persisted unclean authority remains available to the explicit
+session-inspection commands. Production `ft watch` startup runs the session
+detector and logs its verdict; it does not offer a recovery prompt or restore.
+
+### SIGKILL
+
+There's no clean path. The watcher is killed mid-flush. On the next start:
+- The file lock is detected as stale (PID no longer exists).
+- The clean-shutdown marker is absent.
+- The persisted unclean marker remains available to the session inspection
+  commands. `ft watch` startup detects and logs the unclean session but does
+  not prompt; inspection and any manual reconstruction are explicit operator
+  actions.
+- The DB is opened in WAL recovery mode; SQLite reconstructs consistent state from the WAL.
+
+### Cancel-correctness in long ops
+
+Long operations are cancellation-responsive only when their implementation
+uses the operation-specific `Cx` contract: checkpoints at bounded progress
+boundaries, cancellation-aware I/O, or an explicit race against a cancellation
+signal. The pinned `sleep_with_cx` and `timeout_with_cx` helpers honor budget
+deadlines but do not themselves register a direct-cancellation wake, so callers
+must not rely on a bare long sleep/timeout for prompt shutdown.
+
+### What Ctrl-C *won't* do
+
+- It won't roll back a tx that already entered the commit phase; that's the compensation engine's job, not the shutdown path.
+- It won't kill child mux/pty processes that aren't owned by the watcher; those are owned by the mux server.
+- It won't fire workflow handlers' rollback methods; handlers are responsible for their own cleanup-on-cancel logic.
+
+---
+
+## Deep Dive: The `.ft` Directory and Platform Layout
+
+`ft` manages workspace-local state under `.ft/` in the workspace root, while global defaults and shared tooling follow OS platform conventions.
+
+### Workspace Layout (`<workspace>/.ft/`)
+
+```
+.ft/
+├── config.toml              # workspace-local config (overrides platform default)
+├── ft.db                    # SQLite database (default relative db_path)
+├── ft.db-wal                # SQLite WAL file
+├── ft.db-shm                # SQLite shared-memory index
+├── watch.lock               # single-writer watcher file lock
+├── ipc.sock                 # local IPC domain socket
+├── logs/
+│   └── ft-watch.log         # watcher service log
+├── crash/                   # crash dumps and reproduction bundles
+├── diag/                    # diagnostics bundles
+├── recordings/              # session recordings (.war files)
+├── mission/
+│   ├── active.json          # current mission contract
+│   └── tx-active.json       # current tx contract
+└── recorder-log/
+    ├── events.log           # append-log recorder backend
+    └── state.json           # recorder state snapshot
+```
+
+### Platform Default Locations
+
+| Platform | Default Config File | Default Data Directory (`data_dir`) |
+|---|---|---|
+| **Linux / XDG** | `~/.config/ft/ft.toml` (or `$XDG_CONFIG_HOME/ft/ft.toml`) | `~/.local/share/ft/` (`$XDG_DATA_HOME` is not consulted) |
+| **macOS** | `~/Library/Application Support/ft/ft.toml` | `~/Library/Application Support/ft/` |
+| **Windows** | `%USERPROFILE%\.config\ft\ft.toml` (or `%XDG_CONFIG_HOME%\ft\ft.toml`) | `%APPDATA%\ft\` (Roaming) |
+
+### Workspace vs Global State
+
+- **Workspace state** (`.ft/`): contains workspace-scoped database, session checkpoints, watch locks, active contracts, and logs for that directory tree.
+- **Global / System state** (`data_dir`): holds global templates, cross-workspace backups (`backups/`), and tool caches.
+
+### Directory Initialization
+
+Workspace directories (`.ft/`, `logs/`, `crash/`, `diag/`) are initialized when the workspace layout is ensured by `ft` runtime dispatch. Absolute `storage.db_path` or `general.data_dir` overrides can relocate specific stores outside the workspace root.
+
+---
+
+## Deep Dive: asupersync Primitive Reference
+
+The `runtime_async` module re-exports asupersync primitives with project-curated ergonomics. Quick reference for what's available:
+
+### Sync primitives
+
+| Primitive | Use case | Notes |
+|---|---|---|
+| `runtime_async::Mutex<T>` | Mutually-exclusive access | Async-aware; doesn't block the runtime when contended |
+| `runtime_async::MutexGuard<'a, T>` | RAII guard from `.lock().await` | Drop releases the mutex |
+| `runtime_async::RwLock<T>` | Many readers OR one writer | `.read().await` / `.write().await` |
+| `runtime_async::Semaphore` | Bounded concurrency | `.acquire().await` returns `SemaphorePermit`; drop returns the permit |
+| `runtime_async::OwnedSemaphorePermit` | Permit that can be moved across tasks | Useful for handing off bounded slots |
+
+### Channels
+
+| Module | Shape | When to use |
+|---|---|---|
+| `runtime_async::mpsc` | Multi-producer, single-consumer | Work queues, fanout-to-one |
+| `runtime_async::watch` | Single-value pub-sub (always latest) | State distribution (pressure tier, config) |
+| `runtime_async::broadcast` | Multi-producer, multi-consumer | Event bus fanout |
+| `runtime_async::oneshot` | One-shot single-value channel | Request/reply pattern |
+
+### Notifications
+
+| Primitive | Use case |
+|---|---|
+| `runtime_async::notify::Notify` | One-time wakeup signaling between tasks |
+
+### Tasks
+
+| Primitive | Use case |
+|---|---|
+| `runtime_async::task::JoinHandle<T>` | Handle to a spawned task; `.await` yields the result |
+| `runtime_async::task::JoinError` | Finite task failure, abort, context, deadline/budget, or completion-waker class |
+| `runtime_async::task::JoinSet<T>` | A collection of spawned tasks with structured awaiting |
+
+### Cx-aware ergonomics
+
+| Helper | What it does |
+|---|---|
+| `sleep_with_cx(cx, duration)` | Budget-bounded sleep; direct cancellation requires caller checkpoints or an explicit race |
+| `timeout_with_cx(cx, duration, future)` | Budget-bounded timeout; callers classify timeout vs cancellation from the typed `Cx` state |
+| `spawn_with_cx(parent_cx, future)` | Spawns a child task inheriting the parent's `Cx` |
+| `RuntimeBuilder` | Project-curated builder for the runtime handle used by the binary |
+
+### Runtime lifecycle
+
+| Helper | What it does |
+|---|---|
+| `install_runtime_handle(handle)` | Install the process-wide asupersync runtime handle |
+| `current_runtime_handle()` | Get the installed handle (or `None`) |
+| `clear_runtime_handle()` | Clear the installed handle (test/teardown only) |
+
+### Why a project-owned wrapper
+
+The wrapper exposes ~115 stable surfaces. Reasons:
+- **Audited boundary.** A single place to apply policy (cancellation, timeout, scope) consistently.
+- **Migrate-safety.** When asupersync evolves, the project's call sites change one place, not 187 files.
+- **Sealed-trait integration.** `RuntimeProof` only knows about asupersync types because they're exported through this wrapper.
+
+See [`docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md`](docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md) for the design rationale.
+
+---
+
+## Deep Dive: Built-in Workflow Handler Catalog
+
+The workflow engine ships with the following built-in handlers (`crates/frankenterm-core/src/workflows/`):
+
+| Handler | Triggers on | Action |
+|---|---|---|
+| `HandleCompaction` | `session.compaction` detections (rule ids containing `compaction`) | Re-injects critical context (AGENTS.md) after the agent compacts its conversation |
+| `HandleUsageLimits` | Codex only: `codex.usage.reached`, `codex.usage_limit`, `codex.rate_limit.detected` | Codex usage-limit recovery |
+| `HandleClaudeCodeLimits` | Claude-Code-specific limit detections | Claude-specific recovery flows |
+| `HandleGeminiQuota` | `gemini.usage.reached` | Gemini quota recovery |
+| `HandleSessionEnd` | `*.session.end` patterns | Records session-end + writes a checkpoint |
+| `HandleSessionStartContext` | New session detection | Captures context (CWD, env, agent type) at session start |
+| `HandleProcessTriageLifecycle` | Process state changes | Records process triage info + lifecycle events |
+| `HandleAuthRequired` | Auth-prompt detections | Surfaces an auth required signal; optionally invokes the `ft auth` flow |
+| `HandleOnErrorCassSearch` | Error patterns in pane output | Queries `cass` (Cross-Agent Session Search) for past fixes and surfaces them as event metadata |
+| `HandleSwarmLearningIndex` | Mass swarm activity | Indexes swarm interactions for the learning system |
+
+### Workflow opt-in via config
+
+```toml
+[workflows]
+enabled = ["handle_compaction", "handle_usage_limits"]   # empty = all built-ins
+max_concurrent = 10
+```
+
+### Source-pane trust policy (per-handler)
+
+Each handler can declare `trigger_policy()` returning `WorkflowTriggerPolicy::allow_all()` (default) or `WorkflowTriggerPolicy::allowlist([pane_ids...])`. Allowlist refusals surface as `WorkflowStartResult::SourcePaneNotTrusted` and the originating `source_pane_id` is recorded for forensics (ft-j0ufc).
+
+---
+
+## Deep Dive: Saved Searches and Scheduled Queries
+
+`ft search saved` lets operators bookmark FTS queries and optionally schedule them to re-run periodically.
+
+### Commands
+
+```bash
+ft search saved list                                    # list saved searches
+ft search saved run <name>                              # run a saved search by name
+ft search saved schedule <name> <interval_ms>           # enable + set interval (min 1000 ms)
+ft search saved unschedule <name>                       # disable scheduling + clear interval
+ft search saved enable <name>                           # re-enable an already-scheduled search
+ft search saved disable <name>                          # stop scheduled execution without clearing config
+```
+
+### Why scheduled queries
+
+- **Polling-free alerting.** A scheduled saved search can route results into the notification pipeline (e.g., "every 5 min, check for `panic` across all panes; alert if any match").
+- **Auditable.** Scheduled-search results are persisted as events with the search name attached.
+- **Bounded cost.** The minimum interval is 1000 ms; the search executes against the indexed FTS5 data so each run is bounded.
+
+### Saved-search storage
+
+The `saved_searches` table holds: name, query string, optional pane filter, a since mode (`last_run` by default) with an optional `since_ms`, schedule interval, enabled flag, and the last run's time, result count and error. Saved searches run lexical queries; there is no per-search mode or `until` bound.
+
+---
+
+## Deep Dive: Notification Identity Keys
+
+A notification identity key is the deduplication primitive for the notification pipeline. Two notifications with the same identity key are treated as duplicates and the second is suppressed (subject to the throttling window) or muted.
+
+### Composition
+
+Identity keys are deterministic functions of:
+- `rule_id` (or other event taxonomy key)
+- `pane_id` (when pane-scoped)
+- Severity bucket
+- Optional payload digest (when the rule's content is the dedup axis, not just the ID)
+
+### Why this matters
+
+- **Storm suppression.** A pane producing the same warning every second won't flood operators with notifications.
+- **Mute granularity.** `ft mute add <identity_key>` mutes one specific dedup class without silencing the entire rule.
+- **Auditable.** `notification_history` records every emission with the identity key, so operators can trace exactly which channel got pinged for which class.
+
+### Finding identity keys
+
+```bash
+ft events --format json | jq '.[] | {id, identity_key: .dedupe_key, rule_id, muted}'
+```
+
+### Mute semantics
+
+```bash
+ft mute add <identity_key>                          # permanent
+ft mute add <identity_key> --for 1h                 # time-bounded
+ft mute add <identity_key> --scope global           # all workspaces
+ft mute add <identity_key> --reason "investigating"
+ft mute list
+ft mute remove <identity_key>
+```
+
+Mute scope `workspace` (default) only mutes for the current workspace; `global` mutes across every workspace on this host.
+
+---
+
+## Deep Dive: Threat Model
+
+What `ft` is designed to resist, and what's explicitly out of scope.
+
+### In scope
+
+- **Low-trust pane output.** A malicious agent on pane A printing pattern-matching text cannot fire a workflow whose actions land on a high-trust pane B (workflow trigger-policy allowlists, ft-j0ufc).
+- **Secret leakage through read-path APIs.** Every outbound text return (get-text, search, web/SSE, notifications) routes through the redactor before emission.
+- **Privilege amplification via `pub` field bypass.** The substrate-audit family closed dozens of public-field bypass sites; constructors/builders own the invariants.
+- **Rubber-stamp safety verdicts.** `is_safe()` methods cannot return `true` before a measurement is recorded (substrate-audit family).
+- **Replay attacks on the wire protocol.** Per-sender sequence-number dedup rejects out-of-order and duplicate envelopes.
+- **Unbounded inputs causing DoS.** Float validators reject NaN / Inf / non-finite; size limits enforced at codec boundaries; circuit breakers stop retry storms.
+- **Argv flag injection.** Anywhere a user-controlled string reaches argv, flag-prefix bytes are normalized or rejected (cass argv flag-injection closure).
+- **Path traversal in browser auth.** `browser::sanitize_path_component` blocks bare `.` and `..` (br-ft-klznn).
+- **Unredacted output in incident bundles.** Bundle truncation honors per-file and per-excerpt size limits (br-ft-cw0j3, br-ft-6j9ig); redaction runs before bundle assembly.
+
+### Out of scope
+
+- **Compromised operator workstation.** If an attacker has root on the host running `ft`, they can read the SQLite DB directly. `ft` does not encrypt the DB at rest.
+- **Compromised mux process.** `ft` trusts the mux to report pane state honestly. A compromised mux can lie.
+- **Side-channel attacks via timing.** `ft` is not designed to resist timing-channel attacks against the redactor or policy gate.
+- **Coercive credential extraction.** If a user is forced to enter credentials, `ft` cannot detect that.
+- **Adversarial agent collusion within the same trust principal.** Workflow trigger-policy allowlists prevent cross-trust-principal amplification; intra-principal collusion is the user's problem.
+
+### Distributed-mode-specific
+
+See [`docs/security/distributed-threat-model.md`](docs/security/distributed-threat-model.md) for the wire-protocol-specific threat model and diff-fuzz coverage.
+
+### Audit and forensics surface
+
+When something does go wrong, the policy_denied_audit table (schema v24+), the audit_actions table, the events table with full taxonomic filters, and the incident-bundle live collectors are all designed for post-incident reconstruction. Even when defense-in-depth fails, the operator has the data needed to understand what happened.
+
+---
+
+## Deep Dive: Sample Mission and Tx Contracts
+
+For operators writing their first mission or tx contract, the authoritative shapes are the Rust types in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs) — `pub struct Mission` (`MISSION_SCHEMA_VERSION = 2`) and `pub struct MissionTxContract` (`MISSION_TX_SCHEMA_VERSION = 1`). The skeletons below are illustrative; check the structs for the complete field list, defaults, and required vs `#[serde(default)]` fields before authoring a contract.
+
+### Mission contract (`.ft/mission/active.json`)
+
+Shape per `pub struct Mission` in `plan.rs`:
+
+```json
+{
+  "mission_version": 2,
+  "mission_id": "mission-refactor-pricing-2026-05-16",
+  "generation": "<storage incarnation, generated once at creation>",
+  "revision": 0,
+  "title": "Refactor pricing module across services",
+  "workspace_id": "frankenterm",
+  "lifecycle_state": "planning",
+  "ownership": { "...": "MissionOwnership shape" },
+  "created_at_ms": 1747371600000,
+  "candidates": [
+    { "...": "CandidateAction entries" }
+  ],
+  "assignments": [
+    {
+      "assignment_id": "a1",
+      "candidate_id": "c1",
+      "assigned_by": "operator",
+      "assignee": "codex_ws",
+      "approval_state": "...",
+      "created_at_ms": 1747371600000
+    }
+  ]
+}
+```
+
+Required fields: `mission_version`, `mission_id`, `generation`, `revision`, `title`, `workspace_id`, `ownership`, `created_at_ms`. Enum values are snake_case (`planning`, `running`, ...). Defaulted: `lifecycle_state`, `candidates`, `assignments`, `pause_resume_state`. Optional: `provenance`, `updated_at_ms`.
+
+`ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state.
+
+### Tx contract (`.ft/mission/tx-active.json`)
+
+Shape per `pub struct MissionTxContract` in `plan.rs`. The tx steps live **inside** `plan`, and compensations are a `Vec<TxCompensation>` keyed by `for_step_id`:
+
+```json
+{
+  "tx_version": 1,
+  "intent": { "...": "TxIntent shape" },
+  "plan": {
+    "plan_id": "deploy-staging-plan",
+    "tx_id": "tx-deploy-staging-2026-05-16",
+    "steps": [
+      {
+        "step_id": "build",
+        "ordinal": 0,
+        "action": {
+          "type": "send_text",
+          "pane_id": 1,
+          "text": "cargo build --profile release-interactive"
+        }
+      },
+      {
+        "step_id": "deploy",
+        "ordinal": 1,
+        "action": {
+          "type": "send_text",
+          "pane_id": 2,
+          "text": "./deploy-staging.sh"
+        }
+      }
+    ],
+    "preconditions": [
+      { "prompt_active": { "pane_id": 1 } }
+    ],
+    "compensations": [
+      {
+        "for_step_id": "deploy",
+        "action": {
+          "type": "send_text",
+          "pane_id": 2,
+          "text": "./rollback-staging.sh"
+        }
+      }
+    ]
+  },
+  "lifecycle_state": "draft",
+  "outcome": "pending",
+  "receipts": []
+}
+```
+
+Note the action discriminator (`#[serde(tag = "type", rename_all = "snake_case")]`): use `"type": "send_text"`, not `"kind": "Send"`. `StepAction` variants include `send_text`, `wait_for`, `acquire_lock`, `release_lock`, `store_data`, and others; consult the enum in `plan.rs` for the full list.
+
+`ft tx plan` validates. `ft tx run` prepares + commits. `ft tx run --fail-step tx-step:commit` triggers failure-injection (useful in test/dev). `ft tx rollback` runs the compensations for steps that committed. `ft tx show --include-contract` shows the receipts and full payload.
+
+The complete shapes (including `TxIntent`, `MissionOwnership`, `CandidateAction`, `Approval*`, etc.) are in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs); the operating-envelope, blocker-radar, and herd-wave JSON schemas (which mission contracts *consume*) live under [`docs/json-schema/`](docs/json-schema/).
+
+---
+
+## Operator Playbook Excerpts
+
+Curated runbook fragments. The full operator playbook lives in [`docs/operator-playbook.md`](docs/operator-playbook.md); these excerpts are the highest-frequency ones.
+
+### "I see exit 143 from cargo"
+
+That's an RCH (Remote Compilation Helper) SIGTERM with no diagnostic. Treat it
+as a blocked remote proof lane, not as permission to run Cargo locally:
+```bash
+rch doctor
+rch workers probe --all
+```
+
+Record the exact command that failed, the RCH health output, and the worker or
+admission reason code in the bead. Keep proof-required beads open or blocked
+until a remote RCH run reaches Cargo/test execution. While RCH is unavailable,
+use static/read-only checks only. Do not use local Cargo as an exit-143 bypass;
+if a human explicitly requests an emergency local diagnostic, record it as
+non-closeout context only and wait for retained RCH proof before closing the
+bead.
+
+### "I think there's a memory leak"
+
+Don't. First classify residency:
+```bash
+ft doctor --json | jq .swarm_capacity.resource_cockpit.residency_buckets
+```
+The cockpit separates `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown`. Only after classification should you call something a leak. The `unknown` class being non-zero is the only one that's an immediate yellow flag.
+
+### "A pane is stuck"
+
+Codex panes display rotating idle suggestions ("Find and fix a bug in @", "Explain this codebase", …) when waiting for input. These are placeholder hints, not stuck-pane evidence. Real stuck-pane evidence requires *all* of:
+- Identical TOOL-OUTPUT lines across consecutive ticks
+- Zero new commits attributable to the pane
+- No `br update` activity from the pane's assignee
+
+### "The watcher won't start — `watcher lock held`"
+
+Run `ft status` and identify the exact workspace and watcher owner. Do not
+force-stop a shared or unidentified process and do not manually remove its
+lock. If an explicitly owned disposable watcher is confirmed stale, coordinate
+with its operator and use that instance's normal lifecycle path.
+
+### "Pattern detection isn't firing for a new agent version"
+
+Follow the rule-drift workflow:
+1. Capture: `ft robot get-text <pane_id> --tail 500 > /tmp/new_output.txt`
+2. Add fixture under `crates/frankenterm-core/tests/corpus/<agent>/<event>.txt`
+3. `cargo test corpus_fixtures_match_expected` to see the diff
+4. Update rule anchors/regex
+5. `ft robot rules lint --fixtures --strict` to validate
+6. Commit fixture + rule changes together
+
+### "I need to swap to a different rule pack temporarily"
+
+```toml
+[patterns]
+packs = ["builtin:core", "file:/path/to/my_lab_pack.toml"]
+```
+The daemon can hot-reload config on `SIGHUP`, but address only an exact,
+operator-owned watcher instance through its supervised lifecycle. Never use a
+broad process-name match on a shared host. `ft rules list --verbose` confirms
+the active set.
+
+### "I need to debug what the operating envelope is denying"
+
+```bash
+ft swarm envelope
+ft swarm envelope --surface explain --explain-reason <code>
+```
+The envelope shows reason codes (`telemetry.stale`, `capacity.red`, `capacity.black`, `capacity.target_class_unproven`, etc.) and per-input verdicts.
+
+---
+
+## Deep Dive: GUI Render State
+
+The native GUI (`frankenterm-gui`, shipped as `FrankenTerm.app` on macOS) is fully render-state-aware. Live state is plumbed through paint and reduce-motion gates:
+
+- **Terminal triple-buffer registry** — current/staged/pending frame tracked per pane with a watchdog
+- **Quad allocation snapshot** — atlas usage + frame-budget reduce-motion gate decides whether to render in full-fidelity or reduced-motion mode
+- **SynchronizedOutput (BSU/ESU)** — mux notification plumbing emits `Admission` events before mid-chunk `Drain`; GUI consumes drain telemetry and feeds it into watchdog + orchestrator
+- **Classified drag handlers** (ft-spcu0) — per-mode handlers replaced the "drag not implemented" catch-all
+- **Domain-aware command palette** (ft-dkd26) — palette renders user-facing labels instead of raw domain IDs
+- **Tab progress indicator** — indeterminate-mode rendering for tabs whose work has unknown completion
+- **Scripting dimensions expose live window state** (ft-zfcsc) — `window:get_dimensions()` returns the live state, not stale config
+- **Wayland direct-scanout policy substrate** — direct-scanout decisions are policy-gated and observable
+- **DEC private mode restore** — terminal correctly restores DEC private modes from save/restore stacks
+
+The renderer SLO catalog is consolidated at [`docs/perf/resize-quality-slo.md`](docs/perf/resize-quality-slo.md) (with machine-readable JSON sibling), covering resize FPS, input-to-photon, atlas stability, parity SSIM, and idle GPU power.
+
+---
+
+## Pattern Detection
+
+`ft` detects state transitions across multiple AI coding agents:
+
+| Agent | Pattern examples |
+|---|---|
+| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected`, `codex.session.resume_hint` |
+| **Claude Code** | `claude_code.usage.reached`, `claude_code.approval_needed`, `claude_code.session.end` |
+| **Gemini** | `gemini.usage.reached`, `gemini.rate_limit.detected` |
+| **Terminal runtime** | `wezterm.mux.connection_lost`, `wezterm.pane.exited` |
+
+### Pattern IDs
+
+Every detection has a stable `rule_id` like `codex.usage.reached`. Use these in:
+- `ft robot events --rule-id <rule_id>` to filter detections for a specific condition
+- Workflow triggers that automatically react to patterns
+- Allowlists to suppress false positives
+- `ft rules test "text"` to validate patterns against sample text
+
+### Agent pane state detection
+
+Separately from pattern matching, `ft` continuously classifies each agent pane into a visual state:
+
+| State | Color | Condition |
+|---|---|---|
+| **Active** | Green | Output received within 5 seconds |
+| **Thinking** | Yellow | Input sent, no output for 5–30 seconds |
+| **Stuck** | Red | No output for 30+ seconds after input, or flagged by watchdog |
+| **Idle** | Gray | No input or output for 60+ seconds |
+| **Human** | Default | Pane is not agent-controlled |
+
+These states drive GUI pane border colors and enable mass operations like "kill all stuck agents."
+
+### Rule drift workflow
+
+When agent output patterns change (new versions, updated prompts), follow this fixture-first workflow:
+
+1. **Capture** the new output that isn't matching:
+   ```bash
+   ft robot get-text <pane_id> --tail 500 > /tmp/new_output.txt
+   ```
+2. **Add fixture**:
+   ```bash
+   cp /tmp/new_output.txt crates/frankenterm-core/tests/corpus/<agent>/<event>.txt
+   echo "[]" > crates/frankenterm-core/tests/corpus/<agent>/<event>.expect.json
+   ```
+3. **Test and iterate**: `cargo test corpus_fixtures_match_expected`
+4. **Update rule**: modify anchors/regex in the pack definition until the test passes
+5. **Validate**: `ft robot rules lint --fixtures --strict`
+6. **Ship**: commit the fixture and rule changes together
+
+---
+
+## Engineering Discipline
+
+### Async runtime — asupersync, `Cx`-first, `tokio`-banned
+
+The project uses **asupersync** exclusively. Direct `tokio` usage is forbidden at three layers:
+
+1. **Dependency layer.** `deny.toml` declares a `[bans]` entry for `tokio`; the `cargo deny check bans` release gate fails the build if any first-party `Cargo.toml` declares `tokio` as a direct dependency.
+2. **Type layer.** The `RuntimeProof` sealed trait makes `tokio::sync::*` types fail to compile in `RuntimeProof`-bounded API surfaces. The sealed-trait soundness argument is modeled in [`docs/proofs/runtime-proof-soundness.lean`](docs/proofs/runtime-proof-soundness.lean) and checked by `scripts/check-runtime-proof-soundness.sh`.
+3. **Test layer.** `scripts/check_asupersync_test_only.sh` (run by `scripts/release-gates.sh`) plus `tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` are release-gate and cargo-test-time checks that no active `#[tokio::test]` attribute lands in supported paths. The supported async-test substrate is the `asupersync_test!` declarative macro and the `LabRuntime` helpers in `crates/frankenterm-core/tests/common/asupersync_test.rs`.
+
+`runtime_async` is the canonical asupersync wrapper API surface, exposing `Mutex`, `RwLock`, `Semaphore`, `mpsc`, `watch`, `broadcast`, `oneshot`, plus project-curated ergonomic helpers (`sleep_with_cx`, `timeout_with_cx`, `RuntimeBuilder`).
+
+### Unsafe code
+
+The workspace sets `unsafe_code = "forbid"` in `[workspace.lints.rust]` for crates that inherit those lints. The CLI and core library also declare `#![forbid(unsafe_code)]`. Native/FFI crates, including the GUI and vendored WezTerm code, have separately audited exceptions; the entire workspace is not unsafe-free. See [`docs/vendored-wezterm-design.md`](docs/vendored-wezterm-design.md).
+
+### Reality-check discipline
+
+Reality-check is a quarterly / full-run discipline that produces a bridge plan, a substrate of proof slots, and a per-release bundle. The current round (ft-tf6g3, opened 2026-05-12) is closing final-mile gaps:
+
+- Attestation graph completeness (every headline claim → signed slot)
+- Renderer SLO attestation suite (resize FPS, input-to-photon, SSIM parity, atlas stability, idle GPU power)
+- Round-3 statistical elevations (Lindley, Fano, SPRT, conformal bands, Mazurkiewicz cancel-traces, TLA+ TX-killswitch, Stateright work-family atomicity)
+- `scripts/ft-reality-check.sh status` / `next` / `silent-close-audit` / `structure-audit` operator verbs (a shell script, not an `ft` subcommand)
+- Verify-the-verifier self-test for `ft attestation verify`
+
+See [`docs/process/reality-check-discipline.md`](docs/process/reality-check-discipline.md) for trigger rules; `scripts/check-reality-check-due.sh` reports when another full pass is due.
+
+### Substrate audit discipline (extended)
+
+Beyond the seven defect families catalogued earlier, the audit discipline has produced a set of meta-rules that future code follows:
+
+- **`is_safe()` returns are never gates.** A method named `is_safe` may not be the *only* check before releasing a release gate. The release gate must also verify that measurements were recorded, that the safety bound is non-vacuous, and that the verdict was computed after the latest input was seen.
+- **`pub` struct fields are a privilege escalation surface.** Constructor-controlled invariants only hold if callers can't reach in and edit the fields directly. The audit converted dozens of `pub` fields to private + builder/constructor APIs.
+- **Float validation is part of the contract.** Any public function that takes `f64`/`f32` must reject NaN, `INFINITY`, and `NEG_INFINITY` at the boundary. Default-trait derives (`Default::default()`) must produce inputs that pass this check.
+- **Sanitization rejects, not silently filters.** A sanitizer that returns its input with bad bytes stripped is worse than one that rejects the input outright; silent stripping hides upstream bugs.
+- **Privacy fields are required, not optional.** The `redaction` field on `ChunkMetadata` was made non-optional because the optional version let callers persist unredacted output by simply not setting the field.
+- **Argv flag injection is the same class as SQL injection.** Anywhere user-controlled strings reach an argv vector, the flag-prefix bytes (`-`, `--`) are normalized or rejected; see `cass` argv flag-injection closure.
+
+The full catalog lives in [`docs/audit-checklist.md`](docs/audit-checklist.md) with bead-keyed exemplars for each family.
+
+---
+
+## Algorithm & Data Structure Catalog
+
+This section catalogs every non-trivial algorithm or data structure the project uses, *why* it was chosen, and where to read more.
+
+### Throughput-critical primitives
+
+| Algorithm | Where | Why this one |
+|---|---|---|
+| **Aho-Corasick (multi-pattern)** | `patterns.rs` scan trigger | O(n) in chunk length regardless of pattern count; the right tool for *exact-substring multi-pattern* matching. |
+| **Bloom filter** (FNV-1a seeded) | `patterns.rs` prefilter | Rejects 80–95% of chunks in O(k) per chunk where k is small. The false-positive rate is tunable; we tune for "reject when possible, but never miss." |
+| **SIMD newline / ANSI density scan** | `simd_scan.rs`, feeding BOCPD features | One linear pass per chunk gives us both newline count and ANSI escape density (TUI-vs-text output) at near-zero extra cost. |
+| **zstd compression** | `byte_compression.rs`, warm scrollback tiers | 5:1 to 10:1 ratios typical on terminal output; high compression ratio with low decompression cost. |
+| **FNV-1a (64-bit non-crypto hash)** | Content fingerprinting | One byte per cycle; deterministic across platforms; ideal for real-time dedup decisions where SHA-256 is too expensive. |
+| **SHA-256** | Audit trail, attestation bundle, content addressing | Cryptographic strength is required where the hash is a security primitive (audit row signing, attestation verification, idempotency keys). |
+| **XOR filter** | Search dedup | Approximately 1.23 × n × fingerprint_bytes, which is more compact than Bloom at equivalent FP rates. Static (built once from a known set), which fits the dedup case where the known-hash set changes infrequently. |
+
+### Search and retrieval
+
+| Algorithm | Where | Why this one |
+|---|---|---|
+| **SQLite FTS5** | Storage (lexical index) | Bundled with rusqlite (no system dep); BM25-like ranking; reliable on commodity hardware. |
+| **Tantivy** | `frankenterm-core-tantivy` | Richer scoring + faster ranked queries when relevance matters more than raw matching. The crate exists, but its index is not populated on the production path. |
+| **FNV-1a hash embeddings** | `search/` semantic lane | Deterministic, model-free and cheap enough to embed every segment at write time; fastembed/ONNX models are not on the production path. |
+| **Reciprocal Rank Fusion (RRF)** | `search/` hybrid mode | `score(doc) = sum 1/(k + rank)` with k=60 (canonical). Robust to rank-vs-score scale differences across backends. |
+
+### Concurrency & cancellation
+
+| Algorithm | Where | Why this one |
+|---|---|---|
+| **`Cx` cancellation tokens (asupersync)** | Workspace-wide | Structured concurrency primitive that propagates cancel signals through the call graph. Replaces ad-hoc `Arc<AtomicBool>` patterns and tokio's `CancellationToken` — see [Engineering Discipline](#engineering-discipline) for the ban. |
+| **Semaphore-guarded pools** | `runtime_async::Semaphore`, mux connection pool | Each acquire returns a guard that holds a permit; dropping the guard releases. Prevents pool starvation when operations fail. |
+| **Circuit breaker (Closed → Open → Half-Open → Closed)** | mux pool, web/SSE, distributed connector | Stops retry storms after sustained failure; configurable cooldown periods; status snapshot exposed via telemetry. |
+| **Exponential backoff with jitter** | retry layer | Uniform ±10% by default; per-use-case policies (mux CLI: 3/100 ms, DB writes: 5/50 ms, webhooks: 5/1 s). Cancellation does **not** count as a circuit-breaker failure (ft-gc4hz). |
+| **Atomic CAS quiescence gauges** | `wait.rs`, watchdog | Composable activity tracker; multiple watchers can wait for system idle without blocking each other. |
+
+### Statistical / probabilistic
+
+| Algorithm | Where | Why this one |
+|---|---|---|
+| **BOCPD (Bayesian Online Change-Point Detection)** | Pattern engine novel-failure detector | Detects statistical regime changes without a-priori failure templates. Catches what regex doesn't. |
+| **EWMA estimator** (NaN-sanitized) | `disk_pressure.rs`, telemetry | Smooth running average with configurable alpha. The NaN-sanitization closure (ft-fiuu6) ensures bad inputs can't poison the estimator. |
+| **T-Digest** (NaN-aware) | `quantile_sketch`, latency telemetry | Online quantile estimation in bounded memory. Returns NaN for NaN input (not silent 0) per the substrate-audit closure. |
+| **Empirical Bernstein CI** | `bench_stats` | Concentration-of-measure inequality with rejection of non-finite range. Used in bench result statistical gating. |
+| **Hoeffding inequality** | bench statistics, ML monitoring | Sample-size derivation: how many samples do we need to bound error with high confidence? |
+| **Conformal SLO bands** | renderer SLO catalog, perf-gate | Distribution-free prediction intervals. Future round-3 elevation (ft-tf6g3.30). |
+| **SPRT (Sequential Probability Ratio Test)** | `ft-perf-gate` substrate | Stop testing as soon as the decision is statistically clear. Round-3 elevation (ft-tf6g3.30). |
+| **Reservoir sampling** | telemetry retention | Bounded-memory uniform sampling over an unbounded stream. |
+
+### Graphs and ordering
+
+| Algorithm | Where | Why this one |
+|---|---|---|
+| **Dijkstra, Bellman-Ford, Floyd-Warshall** | Agent routing, dependency analysis | Three different complexity points; pick the right one based on graph properties (sparse vs dense, negative edges, all-pairs vs single-source). |
+| **Topological sort + cycle detection** | Mission/tx step ordering, dependency-aware ready-set computation | Catches dependency cycles before execution. Aligned with `bv --robot-insights` cycle detection. |
+| **Causal DAG construction** | Replay subsystem | Decision graph with provenance edges; enables diff between two execution traces. |
+| **Min-plus algebra (network calculus)** | Latency analysis | Formal worst-case delay and backlog bounds on the capture pipeline. The Lindley/min-plus bound artifact is at [`docs/attestations/perf/lindley-bounds.json`](docs/attestations/perf/lindley-bounds.json). |
+
+### Specialized data structures
+
+| Structure | Where | Why this one |
+|---|---|---|
+| **Adaptive Radix Tree (ART)** | `adaptive_radix_tree.rs` | Memory-efficient prefix-keyed structure; outperforms B-tree for string keys with shared prefixes. |
+| **Van Emde Boas (interface)** | `van_emde_boas.rs` | Bounded-universe integer set with O(1) insert/remove/min/max and word-scan successor/predecessor; substrate for time-bucketed event indexing. |
+| **Wavelet tree** | `wavelet_tree.rs` | O(log σ) rank/quantile and O(log n · log σ) select over byte sequences; substrate for scrollback byte-distribution analysis. |
+| **Binomial heap** | `binomial_heap.rs` | Worst-case O(log n) insert/extract-min; arena-allocated, so meld copies the donor arena (O(m)) — substrate for single-queue priority scheduling. |
+| **Compact bitset** | `compact_bitset.rs` | Dense membership representation; faster than `HashSet<u32>` for small universes. |
+| **Bimap** | `bimap.rs` | Bidirectional `HashMap`; substrate for pane-id ↔ session-id style mappings. |
+| **Consistent hash** | `consistent_hash.rs` | Stable load distribution across shards (mux sharding); minimizes shuffle when a shard joins/leaves. |
+| **Union-find** | `union_find.rs` | Disjoint-set partition tracking; the error-clustering engine merges MinHash clusters with a module-local equivalent. |
+| **Bounded edit distance** | `bounded_edit_distance.rs` | Levenshtein with an early-bail bound (Ukkonen banded DP); used by output compression for line-similarity checks. |
+| **Work-stealing deque** | `work_stealing_deque.rs` | Single-producer multi-consumer queue (mutex-backed with try-lock steal; safe-Rust Chase-Lev interface); scheduling substrate for worker pools. |
+
+---
+
+## Build, Beads, and Swarm Coordination
+
+This is the engineering-process surface: what's around `ft` and how it integrates.
+
+### `br` — beads (issue tracking)
+
+The project tracks work in [`beads_rust`](https://github.com/Dicklesworthstone/beads_rust) (`br`). Issues live in `.beads/`, sync to JSONL, and are checked into git. The conventions:
+
+- Issue IDs prefix the work (`ft-xxxxx`); use the ID as the Agent Mail `thread_id` and in commit messages for traceability
+- Status flow: `open → in_progress → closed`
+- Dependencies: `br dep add <issue> <depends-on>`; `br ready` shows only unblocked work
+- `br sync --flush-only` exports to JSONL (no automatic git operations); commit `.beads/` manually
+
+This is how the open epics surface in the README: `ft-tf6g3` (reality-check round 2), `ft-booek` (operating envelope), `ft-auy2g` (mission objective planner), `ft-y0loj.*` (sub-crate carving), etc.
+
+### `bv` — beads triage
+
+`bv --robot-triage` returns ranked actionable items, quick wins, blockers-to-clear, and copy-paste shell commands. `bv --robot-plan` returns parallel execution tracks with `unblocks` lists. `bv --robot-insights` returns full graph metrics (PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core, articulation points, slack).
+
+### `am` — Agent Mail
+
+Shared singleton service for inter-agent coordination. Agents register an identity, send messages with thread IDs, reserve file paths during edits, and acknowledge messages. The reservations layer prevents conflicting concurrent edits across the swarm.
+
+### `rch` — Remote Compilation Helper
+
+`rch` offloads `cargo build`, `cargo test`, and `cargo clippy` to a fleet of remote Contabo VPS workers. Hooks into Claude Code's `PreToolUse` automatically. This prevents compilation storms when many agents are building simultaneously.
+
+### `ntm` — multi-agent tmux orchestration
+
+Adjacent orchestration tooling. `ft` is the swarm-native terminal platform; `ntm` handles pane spawning + lifecycle for the agent fleet. Operator playbooks like the "Swarm Orchestration Playbook" in `AGENTS.md` codify the empirically-validated rules: prefer `--robot-send` over `--robot-interrupt`, always send `tmux Enter` after `--robot-send`, distinguish codex idle-placeholder text from stuck-pane evidence, use `commits-1h ≤ 4` rather than `≤ 2` as a convergence signal.
+
+### `cass` — Cross-Agent Session Search
+
+Indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT). When `ft` detects an error pattern, the `HandleOnErrorCassSearch` workflow handler searches `cass` for past fixes and surfaces them in the event metadata.
+
+---
+
+## Design Decisions Explained
+
+This section catalogues the non-obvious design decisions the project has made, the choices a reasonable engineer might second-guess. For each, the rationale.
+
+### Why SQLite, not Postgres / RocksDB / a custom store?
+
+- **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
+- **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
+- **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
+- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->48<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
+
+### Why asupersync, not tokio?
+
+- **`Cx` cancellation propagation** is built into the runtime rather than
+  retrofitted via `CancellationToken`. FrankenTerm still has to prove each
+  operation's checkpoints, wakeups, side-effect boundary, and settlement
+  behavior; propagation alone is not an end-to-end cancel-correctness proof.
+- **Structured task ownership** — explicit handles and `JoinSet` scopes make
+  task lifetime and terminal acknowledgement auditable. The project verifies
+  propagation and abort semantics at the wrapper boundary instead of claiming
+  that a detached handle is impossible by construction.
+- **Loom model** for `runtime_async` is published as an attestation slot (`proofs/loom-runtime-async`).
+- **The dual-runtime migration is done.** Direct `tokio` use is banned and
+  `runtime_async` is the supported first-party async API. Its implementation
+  layer and explicitly audited integration seams may still name pinned
+  asupersync types directly; those references are not evidence that every
+  operation has completed its cancellation/ownership proof.
+
+### Why forbid unsafe code in the CLI and core?
+
+- **Keep unsafe out of application logic.** The CLI and core forbid unsafe code, and other crates inherit the workspace lint where applicable. Native/FFI exceptions remain subject to separate audits.
+- **Native-API workarounds use `std::process::Command`** (sysctl, ps, pgrep on macOS) rather than FFI.
+- **Vendored WezTerm crates with unsafe** are audited separately and tracked in `docs/vendored-wezterm-design.md`.
+- **Trade-off accepted**: some optimizations require unsafe and we don't take them. Performance work remains measurement-driven within safe Rust; current target-class input latency, resize/zoom responsiveness, and long-session scalability are not certified and must not be inferred from this safety policy.
+
+### Why TOON in addition to JSON?
+
+- **Tokens cost money** when responses are fed back to LLMs. TOON (Token-Optimized Object Notation) is a tree serialization optimized for low token count.
+- **Savings depend on payload shape.** The README intentionally avoids fixed percentages; substrate at `docs/perf-ledger/toon-encoding.md`.
+- **JSON remains the default.** TOON is opt-in via `--format toon` or `FT_OUTPUT_FORMAT=toon`.
+
+### Why a Bloom prefilter in the pattern engine?
+
+- **Most chunks match zero rules.** A 1 KB chunk of plain output rarely needs to be regex-evaluated against 100 patterns.
+- **Bloom prefilter rejects in O(k)** with k small (8 hashes typical). False positives gracefully fall through to AC + regex; false negatives are forbidden (the filter is built from rule anchors, so a chunk that *could* match always passes).
+- **Result**: 10–100× CPU reduction for typical rule packs.
+
+### Why a 1 MiB overlap window for delta extraction?
+
+- **Scrollback capture is a sliding snapshot.** Matching may need to reach through a large retained prefix after scrolling; a tiny fixed border turns ordinary polls into false gaps.
+- **The window remains bounded.** One MiB caps per-pane matching work and memory while covering realistic shifts in retained terminal history.
+- **Misses stay explicit.** A reset, clear, or shift beyond the bound produces a gap event instead of silently inventing continuity.
+
+### Why prepare/commit/compensate for multi-pane ops?
+
+- **Multi-pane ops are distributed transactions** whether you call them that or not.
+- **Two-phase commit (prepare + commit)** lets us validate every precondition before any side effect.
+- **Compensation** is per-step undo for the steps that *did* commit before the failure.
+- **The idempotency ledger** makes mid-flight crash recovery trivial: replay re-attempts only steps without receipts.
+- **Trade-off accepted**: tx contracts are more verbose than direct command scripts. The verbosity is the documentation of what could go wrong.
+
+### Why three scrollback tiers instead of two?
+
+- **Hot/cold is the easy two-tier design.** It also wastes RAM: a line accessed five minutes ago doesn't need to be in `VecDeque`, but it doesn't need to be evicted to SQLite either.
+- **Warm (compressed in RAM)** is the sweet spot for the 5-30 minute window: ~5× smaller than hot, but still in-process, decompressible on demand.
+- **Cold (SQLite-backed)** is the queryable safety net for everything older.
+- **Benchmark-lane observation**: the retained five-minute synthetic workload records
+  a ~200 MB ceiling for 200 simulated panes with its declared tier boundaries.
+  This is not evidence for native GUI/mux operation, a long-running production
+  session, or the M4/M5/high-core target classes. The fail-closed
+  [`swarm-capacity-envelope`](docs/attestations/perf/swarm-capacity-envelope.json)
+  currently forbids promoting it to a high-scale memory guarantee.
+
+### Why fail-closed instead of fail-open for missing telemetry?
+
+- **A swarm controller that doesn't know the state of the system must not pretend to know.** Pretending is how you OOM the box at pane 87.
+- **The cost of being wrong fail-open is silent damage.** The cost of being wrong fail-closed is operator inconvenience.
+- **The operator runbook is the recovery path.** When the envelope denies admission because telemetry is missing, the runbook walks the operator through restoring the missing source.
+
+### Why reality-check + Sigstore attestation bundles?
+
+- **The README makes load-bearing claims.** Operators rely on those claims to make decisions.
+- **Without verification, claims drift from reality.** The substrate audit found dozens of `is_safe()` methods that returned `true` before any measurement was recorded; the README was making claims that the code couldn't back up.
+- **Attestation bundles close the gap.** Every claim links to an artifact slot, the artifact is hashed, and the bundle is signed. Operators can verify any release offline without trusting GitHub or any registry.
+
+### Why a vendored WezTerm fork instead of a thin wrapper?
+
+- **Mux semantics aren't interchangeable** across multiplexers. An abstraction that pretends they are produces a worst-of-all-worlds compromise.
+- **Owning the dep graph** lets us enforce the runtime ban (cargo-deny, RuntimeProof, forbid-unsafe).
+- **Test/proof surfaces** are easier on owned code.
+- **Trade-off accepted**: weekly upstream backports require manual work. The backport process is codified in `AGENTS.md`.
+
+---
+
+## Observability Surfaces
+
+`ft` is designed to be observable from the outside in five distinct ways. Each is useful in a different operational context.
+
+### 1. Robot Mode (JSON / TOON)
+
+Synchronous read/write API for AI agents. Every call returns a structured envelope. Used when a meta-agent needs to make a decision based on current state.
+
+### 2. MCP server (stdio)
+
+The MCP server (feature-gated) exposes Robot Mode operations as MCP tools. Use this when integrating with an MCP-aware agent host (Claude Desktop, Cursor, etc.).
+
+### 3. Web API + SSE streaming (feature-gated)
+
+```
+GET /health
+GET /panes
+GET /events
+GET /search?q=…
+GET /stream/events       (channel=all|deltas|detections|signals, pane_id, max_hz, cursor)
+GET /stream/deltas       (pane_id, max_hz)
+```
+
+`/stream/*` endpoints are Server-Sent Events with schema `ft.stream.v1`. Use this when wiring `ft` into a non-CLI tool (a dashboard, a webhook router, a downstream service).
+
+### 4. Prometheus metrics (when enabled)
+
+`ft watch --metrics` (built with the `metrics` feature) serves `/metrics` on localhost, every name under the configured `[metrics] prefix`:
+- Uptime, observed panes, capture queue depth and capacity, storage write queue depth
+- Segments persisted, events recorded, ingest lag (average, maximum, sum and count), age of the last DB write
+- Native output coalescing (input events and bytes, emitted batches and bytes, largest batch, coalesce ratio)
+- Event bus publish, drop, subscriber, lag and per-channel queue figures
+- `verified_submit_receipts_total{agent_type,state}`: verified-submit receipts built in the watcher process (workflow `send_verified`); the MCP server logs its `wa.send` receipts as `frankenterm::verified_submit` tracing events instead
+- `verified_submit_idempotency_keys{state}` and `verified_submit_idempotency_oldest_unresolved_age_seconds`: the `wa.send` idempotency store's keys per state and the age of its oldest unresolved key, from a census the watcher takes every 5 minutes; an `in_doubt` key never clears without `wa.send` `reconcile`. `verified_submit_idempotency_census_age_seconds` says how old that census is
+
+### 5. `ft doctor --json` + diagnostic bundles
+
+For point-in-time debugging:
+- `ft doctor --json` — per-subsystem health verdict
+- `ft status --health` — fleet snapshot
+- `ft triage` — issues summary
+- `ft diag bundle --output /tmp/ft-diag` — collect everything for handoff
+- `ft reproduce export --kind crash` — incident bundle for forensics
+
+For continuous monitoring, prefer Prometheus + SSE. For incident response, prefer the bundle + cockpit data.
+
+---
+
+## Secure Distributed Mode
+
+Secure distributed mode is available as an optional feature-gated build and is off by default.
+
+```bash
+cargo build -p frankenterm --profile release-interactive --features distributed
+```
+
+The distributed wire protocol provides:
+- Versioned message envelopes with sender identity validation
+- Per-agent sequence-number dedup (no duplicate processing)
+- 1 MiB maximum message size enforcement
+- Stale-session pruning with configurable idle thresholds
+- Local receipt-clock decisions (untrusted remote clocks not used for liveness)
+
+Operational topology:
+- Run `ft watch` on the aggregator host with `[distributed].enabled = true`; the watcher starts the distributed listener alongside normal local capture.
+- Run `ft distributed agent --connect <host:port> --agent-id <name>` on remote hosts to stream pane metadata, deltas, gaps, and detections into the aggregator.
+- Persisted remote panes appear in `ft status`, `ft query` / `ft search`, `ft robot state`, MCP `wa.state`, and the `wa://panes` resource.
+
+Operator guidance:
+- Keep `distributed.bind_addr` on loopback unless you explicitly need remote access.
+- For non-loopback binds, enable TLS and use file/env token sources (avoid inline tokens).
+- Use `ft doctor` (or `ft doctor --json`) to verify effective distributed security status.
+- Follow [`docs/distributed-security-spec.md`](docs/distributed-security-spec.md) for setup, rotation, and troubleshooting.
+
+The wire protocol's safety review and diff-fuzz coverage are tracked in [`docs/security/distributed-threat-model.md`](docs/security/distributed-threat-model.md)[^ft-attest-distributed-threat].
+
+---
+
+## Performance Benchmarks
+
+Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->119<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-compile \
+  cargo bench -p frankenterm-core --benches --no-run             # compile sanity check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-pattern \
+  cargo bench -p frankenterm-core --bench pattern_detection
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-delta \
+  cargo bench -p frankenterm-core --bench delta_extraction
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-fts \
+  cargo bench -p frankenterm-core --bench fts_query
+```
+
+When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
+- `target/criterion/ft-bench-meta.jsonl` (budgets + environment)
+- `target/criterion/ft-bench-manifest-<bench>.json` (artifact manifest)
+
+### Performance targets
+
+| Operation | Target | Notes |
+|---|---|---|
+| Delta capture latency | <50 ms benchmark lane | Bounded 1 MiB overlap matching; 200-pane / target-class claims must cite the capture fairness proof artifact |
+| Pattern detection | <1 ms per rule pack | Bloom prefilter rejection |
+| FTS5 query | <10 ms | SQLite full-text search |
+| Robot Mode response | <5 ms | JSON envelope generation |
+| Context snapshot | <100 µs | Per-event environment capture |
+| Memory per pane (hot) | ~200 bytes/line | Uncompressed in `VecDeque` |
+| Memory per pane (warm) | ~40 bytes/line | 5:1 zstd compression |
+
+For renderer-overhaul SLOs (resize FPS, input-to-photon, atlas stability, parity SSIM, idle GPU power), see [`docs/perf/resize-quality-slo.md`](docs/perf/resize-quality-slo.md) (with [machine-readable JSON](docs/perf/resize-quality-slo.json)). The upstream-of-render scheduler/reflow stage budgets live in [`docs/resize-performance-slos.md`](docs/resize-performance-slos.md).
+
+The sustained real-systems performance campaign for Mac keypress → LAN mux →
+remote PTY → presented frame, live resize/zoom, and 4h/24h/72h aged sessions
+lives in
+[`docs/perf/mux-long-session-performance-campaign.md`](docs/perf/mux-long-session-performance-campaign.md).
+It explicitly separates core/headless proxy benches from live GUI, transport,
+PTY, Metal, and display evidence; rejected hypotheses and their retry
+predicates live in
+[`docs/perf-ledger/interactive-systems-negative-results.md`](docs/perf-ledger/interactive-systems-negative-results.md).
+
+### Interactive-performance negative-evidence ledger
+
+Passing component benches is not permission to claim an interactive result.
+The following promotion gaps remain open at this source revision:
+
+| Desired claim | Evidence currently missing | Promotion condition |
+|---|---|---|
+| Responsive Mac keypress → LAN mux → remote PTY → presented frame | No retained end-to-end native trace covering the input event, transport, PTY, render queue, GPU submission, and display presentation | Reproducible percentile traces on the declared LAN topology, with the exact build/config/workload retained |
+| Smooth, visually correct resize and zoom | No retained live-GUI resize/zoom run couples frame pacing and CPU/GPU cost to image-quality/reflow checks | Signed native artifact with frame-time distributions, dropped-frame accounting, reflow correctness, and visual-differential evidence |
+| M4/M5 Apple-silicon qualification | No non-skipped end-to-end interactive qualification artifact for either generation at this source revision | Repeat the declared interactive and aged-session matrix on each named chip; do not substitute a different Apple-silicon generation |
+| Threadripper PRO 5995WX qualification | No retained end-to-end interactive `trj` result for the 64-core/128-thread host, including NUMA/scheduler/affinity evidence | Repeat the matrix on the declared high-core-count AMD host with topology, affinity, clock, and workload provenance |
+| Large ongoing-session responsiveness | Short synthetic/component lanes do not establish 4h/24h/72h behavior, post-parse RSS, or tail latency | Retained aged-session soaks with bounded workload, memory attribution, responsiveness percentiles, and failure/recovery evidence |
+| Reusing completed `list_panes` results is safe | The former elapsed-time TTL cache was removed because full `PaneInfo` contains volatile focus/cursor/CWD/title/viewport/zoom state and elapsed time is not an authority revision | Only reconsider coalescing when it is cross-client, cross-transport, in-flight-only, and bound to an authoritative mux revision/event stream |
+
+Until those conditions are met, renderer SLO documents and component benches
+are targets and diagnostic substrates, not native M4/M5/Threadripper, LAN,
+resize/zoom, or long-session proof.
+
+---
+
+## Testing
+
+The project maintains extensive test coverage:
+
+| Category | Count | Purpose |
+|---|---|---|
+| Test annotations | <!--count:test_count-->64035<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
+| Core Rust test files | <!--count:core_rust_test_files-->1051<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
+| E2E shell scripts | <!--count:e2e_scripts-->300<!--/count--> | Full-pipeline validation |
+| Criterion bench files | <!--count:criterion_bench_files-->119<!--/count--> | Performance regression detection |
+| Fuzz targets | <!--count:fuzz_targets-->52<!--/count--> | Security / robustness |
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
+  cargo test --workspace                                      # all tests
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-core-lib-test \
+  cargo test -p frankenterm-core --lib                        # core lib tests
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-subprocess-test \
+  cargo test -p frankenterm-core --features subprocess-bridge # specific feature
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-proptest \
+  cargo test -p frankenterm-core --test 'proptest_*'          # property tests
+```
+
+For a fast supplemental workspace-format check, the dependency-free atlas
+crate exposes the unchanged canonical formatting test. It still runs
+`cargo fmt --all -- --check` across the workspace, verifies the formatter's
+positive and negative controls, and requires a retained RCH source receipt:
+
+```bash
+FT_FORMAT_BASE=$(git rev-parse HEAD)
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_DISABLE_TARGET_REUSE=1 \
+  rch --no-self-healing exec \
+  --base "$FT_FORMAT_BASE" --clean-overlay --no-overlay -- \
+  env FT_FORMAT_PROOF_SHA="$FT_FORMAT_BASE" \
+      FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+      CARGO_TARGET_DIR=/tmp/ft-workspace-format-lean \
+  cargo test -j 2 -p frankenterm-core-atlas-pack-types \
+    --test workspace_format_proof --locked \
+    workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
+```
+
+This checks the committed revision, excluding local edits. Count it only when
+the remote transcript shows the named test passing, `1 passed`, `0 filtered
+out`, and `WORKSPACE_FORMAT_PROOF_SUCCESS` naming that revision. An exit-zero
+command alone is insufficient. The mandatory core-package verification
+command in `AGENTS.md` remains in effect.
+The per-job target prevents this tiny check from waiting on a larger build's
+shared Cargo lock; it trades incremental reuse for a small isolated compile.
+
+### Methodology playbooks
+
+- [`docs/methodology/proof-techniques.md`](docs/methodology/proof-techniques.md) — when to use Loom / TLA+ / Stateright / proptest / dylint / cargo-deny, with exemplar files in this repo
+- [`docs/methodology/statistics.md`](docs/methodology/statistics.md) — sequential testing, concentration-of-measure sample sizing (Hoeffding + Bernstein), conformal SLO bands, Mann-Whitney U / KS, with cross-links to `bench_stats::*` functions
+- [`docs/audit-checklist.md`](docs/audit-checklist.md) — per-substrate audit pattern catalog (the substrate-audit families listed above)
+
+---
+
+## Troubleshooting
+
+For a step-by-step operator guide (triage → why → reproduce), see [`docs/operator-playbook.md`](docs/operator-playbook.md).
+
+### Compatibility backend returns empty pane list
+
+Use `ft status` to verify the exact pre-existing mux endpoint and workspace.
+Do not start a new GUI instance as a diagnostic: doing so can steal focus and
+creates a different endpoint rather than explaining the empty result.
+
+### Daemon won't start: "watcher lock held"
+
+Another `ft` watcher is already running.
+
+Use `ft status` to identify the exact workspace and watcher owner. Do not
+force-stop a shared or unidentified watcher and do not manually delete its
+lock. Coordinate normal shutdown only for an explicitly owned disposable
+instance.
+
+### High memory usage
+
+Classify the residency source first instead of assuming a heap leak. The [resource-pressure cockpit contract](docs/resource-pressure-cockpit-contract.md) separates `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown` resident bytes. See [`docs/operator-playbook.md`](docs/operator-playbook.md) for the collection flow.
+
+```bash
+ft doctor --json > /tmp/ft-doctor-memory.json
+ft status --health > /tmp/ft-status-health.txt
+```
+
+To poll less frequently, increase the interval in `ft.toml`:
+```toml
+[ingest]
+poll_interval_ms = 500
+```
+
+### Pattern not detecting
+
+```bash
+ft -vv watch --foreground
+ft rules test "Usage limit reached. Try again later."
+ft rules list --verbose
+```
+
+### Robot mode returns errors
+
+```bash
+ft status                               # check watcher is running
+ft robot state                          # verify pane exists
+wezterm cli list                        # backend sanity check
+ft robot send 0 "test" --dry-run        # check policy blocks
+```
+
+### Transaction failures
+
+```bash
+ft tx plan --contract-file tx.json                # validate before running
+ft tx run --fail-step tx-step:commit              # failure injection
+ft tx show --include-contract                     # inspect what happened
+```
+
+### Operating envelope denying admission
+
+The operating-envelope planner (`ft.operating_envelope.v1`) is library-resident; `ft swarm envelope` (and `ft robot swarm envelope` for agents) renders its current verdict and reason codes. The resource cockpit behind it appears in `ft doctor --json` under `swarm_capacity.resource_cockpit` once a watcher has published a health snapshot. Use:
+
+```bash
+ft swarm envelope                                            # verdict + limiting inputs
+ft swarm envelope --surface explain --explain-reason <code>  # drill into one reason code
+ft doctor --json | jq .swarm_capacity
+```
+
+If admission is denied because telemetry is missing (rather than critical), the operator runbook ([`docs/operator-runbook.md`](docs/operator-runbook.md), ft-booek.6) walks through restoring the missing source. If it's denied because of critical pressure, the envelope's reason codes name the input responsible (RCH pressure, network pressure, process snapshots, fleet memory tier, or SQLite write-queue depth).
+
+---
+
+## Limitations
+
+### What ft doesn't do yet
+
+- **Driving a different mux backend** (tmux, Zellij, kitty) — by design. `ft` runs on its own vendored, in-tree terminal engine, not an abstraction layer over arbitrary mux engines.
+- **Live remote-pane text reads in distributed mode** — remote panes are searchable and visible in state, but `get-text` is intentionally unavailable there.
+- **Arbitrary GUI automation** — the core product is terminal / state orchestration, not desktop automation.
+- **Green release gates across every finish-line lane** — the release-gate machinery exists, but the current gate status still depends on the latest artifact bundles. Specifically, the high-scale memory envelope wording for 200+ panes is held back until the target-class hardware gate signs a non-skipped artifact (currently `skipped_not_proven`).
+
+### Known limitations
+
+| Capability | Current state |
+|---|---|
+| Live pane/session interop without WezTerm | Not shipped (by design) |
+| Browser automation (OAuth) | Feature-gated, partial |
+| MCP server integration | Feature-gated (stdio) |
+| Web server + SSE | Feature-gated, shipped |
+| Multi-host federation | Distributed mode shipped with explicit limitations |
+| Semantic search | Feature-gated (requires ML embeddings) |
+| Target-class memory envelope claims | Held back pending non-skipped target-class artifact |
+| `ft restart` / non-dry `ft snapshot restore` | Execution unavailable on every platform; both fail closed before process or mux mutation |
+| Render-differential OSC 8 hyperlink + resize-control | Outstanding follow-ups (ft-tf6g3.54 / .55) |
+
+---
+
+## FAQ
+
+### Why "ft"?
+
+**F**ranken**T**erm. Short, typeable, memorable.
+
+### Is my terminal output stored permanently?
+
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `<workspace>/.ft/ft.db` (the workspace is `FT_WORKSPACE` or the current directory; relocate it with an absolute `storage.db_path` or `general.data_dir`). Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
+
+### Does ft send data anywhere?
+
+Default mode is local-first: no telemetry and no cloud dependency. Network activity only occurs when you explicitly enable integrations like webhooks or distributed mode.
+
+### Can I use ft without running AI agents?
+
+Yes. The pattern detection and search work for any terminal output. Useful for debugging, auditing, or building custom automation.
+
+### How do I add custom patterns?
+
+Custom rules live in a **pattern pack** file (a TOML doc with `name`, `version`, and a `[[rules]]` array). Drop it into `<config_dir>/patterns/` or the workspace's `.ft/patterns/`, where it is discovered automatically, or reference it from your `ft.toml` with a `file:` prefix (a bare path is rejected as an unknown pack):
+
+```toml
+# ft.toml — load builtin pack + your custom file
+[patterns]
+packs = ["builtin:core", "file:/path/to/my_lab_pack.toml"]
+```
+
+A minimal `my_lab_pack.toml`:
+
+```toml
+name = "lab:my-pack"
+version = "0.1.0"
+
+[[rules]]
+id = "claude_code.lab.fatal_error" # a reserved prefix must match agent_type
+agent_type = "claude_code"          # claude_code / codex / gemini / wezterm / unknown
+event_type = "error"                # short, machine-readable event taxonomy key
+severity = "critical"               # info / warning / critical
+anchors = ["FATAL ERROR"]           # literal strings for Bloom + Aho-Corasick prefilter (required)
+regex = "FATAL ERROR:.*"            # optional confirming regex
+description = "Application-level fatal error in agent output."
+```
+
+Validate with `ft rules test "FATAL ERROR: database connection lost"` and lint with `ft robot rules lint --fixtures --strict`. See the [`crates/frankenterm-core/src/patterns.rs`](crates/frankenterm-core/src/patterns.rs) `RuleDef` struct for the full optional-field surface (`remediation`, `workflow`, `manual_fix`, `preview_command`, `learn_more_url`).
+
+### What's the performance overhead?
+
+The current numbers are benchmark budgets, not production guarantees:
+
+- **CPU**: <1% idle is a target that still requires current-source native workload proof
+- **Memory**: the retained benchmark lane budgets ~50 MB at 100 simulated panes and ~200 MB at 200 simulated panes; target-class promotion is currently blocked
+- **Disk**: ~10 MB/day is a planning estimate for a typical compressed-delta workload, not a qualified upper bound
+- **Latency**: <50 ms is the capture-lag benchmark target; it does not prove native key-to-photon, LAN, resize, zoom, or long-session responsiveness
+
+### How does the transaction system work?
+
+`ft tx` implements a prepare/commit/compensate lifecycle:
+
+1. **Prepare** — validate preconditions (policy checks, pane liveness, reservations)
+2. **Commit** — execute steps in dependency order with per-step receipts
+3. **Compensate** — if any commit step fails, undo committed steps in reverse order
+
+Each phase emits observability events with reason codes, and the entire execution is recorded in an idempotency ledger for safe resume after crashes.
+
+### How does the operating envelope decide admission?
+
+The planner reads RCH cluster pressure, network pressure, process snapshots, fleet memory tier, and SQLite write-queue depth. Each input has fail-closed semantics: if the input is missing or stale, the envelope denies admission with reasons `telemetry.stale` / `capacity.stale`. If any input is critical, admission is denied with `capacity.red` (critical) or `capacity.black` (emergency) plus `envelope.shed`. When everything is healthy, the verdict is `envelope.admit` with a plan that fits inside the envelope.
+
+### How does tiered scrollback save memory?
+
+For the illustrative 200-pane/20-MB-per-backbuffer model above, uncompressed
+scrollback alone is about 4 GB. This is a sizing example, not a measured
+cross-terminal claim. `ft` organizes scrollback into three tiers:
+
+| Tier | Storage | Access | Memory per 1000 lines |
+|---|---|---|---|
+| **Hot** | `VecDeque` (RAM) | Instant | ~200 KB |
+| **Warm** | zstd compressed (RAM) | Decompress on demand | ~40 KB |
+| **Cold** | Evicted (re-fetch from SQLite) | Query on demand | 0 KB |
+
+The default settings keep hot scrollback small and shift older content into compressed or on-demand tiers.
+
+### Is tokio really banned?
+
+Yes. `cargo-deny`'s `[bans]` rule fails the build if any first-party `Cargo.toml` declares `tokio` as a direct dependency. The `RuntimeProof` sealed trait makes `tokio::sync::*` types fail to compile in `RuntimeProof`-bounded API surfaces. The `asupersync_test!` declarative macro plus CI checks prevent `#[tokio::test]` from landing in supported paths. The classification and release-bundle evidence live at [`docs/tokio-test-classification.md`](docs/tokio-test-classification.md) and [`docs/attestations/doctrine/tokio-eradication-status.json`](docs/attestations/doctrine/tokio-eradication-status.json).
+
+### What agents does ft detect?
+
+Currently: **Codex** (OpenAI), **Claude Code** (Anthropic), **Gemini** (Google), and terminal runtime events. Custom patterns can detect any agent or application.
+
+---
+
+## Reference Card
+
+- **Reality-check discipline**: [`docs/process/reality-check-discipline.md`](docs/process/reality-check-discipline.md) defines the quarterly/full-run triggers; `scripts/check-reality-check-due.sh` reports when another full pass is due.
+- **Weekly drumbeat**: `scripts/reality-check-status.sh` writes the progress report linked in the Trust & Attestation section.
+- **Attestations**: `ft attestation verify docs/attestations/<version>.json` verifies release proof bundles offline.
+- **Operator runbook**: [`docs/operator-runbook.md`](docs/operator-runbook.md) — the gate operators reach from `ft doctor` when envelope state is degraded (ft-booek.6).
+- **Audit checklist**: [`docs/audit-checklist.md`](docs/audit-checklist.md) — the per-substrate audit pattern catalog driving the substrate-audit family closures.
+- **Tuning reference**: [`docs/tuning-reference.md`](docs/tuning-reference.md) — every `[tuning.*]` key, default, unit, validation guard, and starting ranges for 10/50/200+-pane fleets.
+
+---
+
+## Maintainers: how counts stay honest
+
+Every numeric claim in this README is wrapped in `<!--count:* -->` markers and refreshed by `scripts/stamp-readme-counts.sh`. The default worktree recipe each marker maps to:
+
+<details>
+<summary>Click for the full marker → command mapping</summary>
+
+| Marker | Default worktree command |
+|---|---|
+| `<!--count:workspace_members-->` | `awk '/^members = \[/,/^]/' Cargo.toml \| grep -c '^\s*"'` |
+| `<!--count:core_subcrates-->` | `ls -d crates/frankenterm-core-* \| wc -l` |
+| `<!--count:vendored_members-->` | `awk '/^members = \[/,/^]/' Cargo.toml \| grep -c '^\s*"frankenterm/'` |
+| `<!--count:vendored_top_level-->` | `find frankenterm -maxdepth 2 -name Cargo.toml \| wc -l` |
+| `<!--count:core_top_level_modules-->` | `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' \| wc -l` |
+| `<!--count:core_rust_test_files-->` | `find crates/frankenterm-core/tests -type f -name '*.rs' \| wc -l` |
+| `<!--count:criterion_bench_files-->` | `find crates/frankenterm-core/benches -type f -name '*.rs' \| wc -l` |
+| `<!--count:fuzz_targets-->` | `find fuzz -type f -path '*/fuzz_targets/*.rs' \| wc -l` |
+| `<!--count:doc_markdown_files-->` | `find docs -type f -name '*.md' \| wc -l` |
+| `<!--count:e2e_scripts-->` | `git ls-files tests/e2e \| awk '/\\.sh$/ { count++ } END { print count + 0 }'` |
+| `<!--count:core_loc-->` | LOC count across `crates/frankenterm-core/src/**/*.rs` |
+| `<!--count:test_count-->` | rough total of `#[test]` / `#[asupersync_test]` / etc. annotations |
+
+</details>
+
+Stamp markers and their plain-text duplicates (in tables, the workspace tree, and the Testing section) should agree. If you see numeric drift during normal development, re-run the stamp script. For release or attestation work, run `bash scripts/stamp-readme-counts.sh --source=head` and regenerate `docs/attestations/doctrine/agents-md-counts.json` with `--source=head --json` so the artifact is based on the committed tree. Plain-text duplications without `<!--count:* -->` wrapping need manual updates; if you spot one, wrap it in markers so the script picks it up on the next pass.
+
+---
+
+## About Contributions
+
+Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
+
+---
+
+## License
+
+MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
+
+---
+
+<div align="center">
+
+**Built to be the terminal runtime for the AI agent age.**
+
+*<!--count:workspace_members-->97<!--/count--> workspace crates. <!--count:core_top_level_modules-->540<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1389418<!--/count-->+ lines. <!--count:test_count-->64035<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+
+</div>

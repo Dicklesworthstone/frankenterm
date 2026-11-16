@@ -1,0 +1,17 @@
+{
+  "timestamp": "[TIMESTAMP]",
+  "source": "bridge.sorted",
+  "data": {
+    "agents": [
+      "agent-a",
+      "agent-b",
+      "agent-c"
+    ],
+    "tags": [
+      "alpha",
+      "mu",
+      "zeta"
+    ]
+  },
+  "degraded": false
+}

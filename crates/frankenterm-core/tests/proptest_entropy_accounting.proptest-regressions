@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 77fc1276d1e5037620881d34bcd09ef334195942b134782f4dc78d242f0b67ff # shrinks to b = InformationBudget { budget_bytes: 1.0, current_cost: 9147077.038492091, pane_count: 0 }
+cc 35985979fdf255096d3bb6549a25394f88e8b2728dbdce860ef816c6da2477a7 # shrinks to s = PaneEntropySummary { pane_id: 0, raw_bytes: 0, entropy: 0.0, information_cost: 9839934.057546917, compression_ratio_bound: 0.0, eviction_score: 0.0 }
+cc 96332edf4437dd525566955466b179bf622a73afabb37a1f7d4dae57c5909574 # shrinks to data_len = 4606, window = 1000

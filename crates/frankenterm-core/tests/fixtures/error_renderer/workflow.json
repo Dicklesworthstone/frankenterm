@@ -1,0 +1,38 @@
+{
+  "json": {
+    "category": "workflow",
+    "code": "FT-5030",
+    "description": "The target pane is locked by an active workflow. Only one workflow can control a pane at a time to prevent conflicts.",
+    "error": "Workflow error: Pane locked by another workflow",
+    "hint": "Pane is locked by another workflow. Wait for it to complete.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Avoid running multiple workflows on the same pane."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Pane is locked by another workflow. Wait for it to complete."
+    },
+    "title": "Pane locked"
+  },
+  "plain_lines": [
+    "Error: Pane locked",
+    "",
+    "The target pane is locked by an active workflow. Only one workflow can control a pane at a time to prevent conflicts.",
+    "",
+    "Suggestions:",
+    "  • Pane is locked by another workflow. Wait for it to complete.",
+    "  → Status: `ft status`",
+    "  • Avoid running multiple workflows on the same pane.",
+    "",
+    "Error code: FT-5030",
+    "Run `ft why FT-5030` for more details."
+  ]
+}

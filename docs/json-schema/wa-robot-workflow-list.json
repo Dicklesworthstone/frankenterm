@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-list.json",
+  "title": "WA Robot Workflow List Response",
+  "description": "Schema for the data field when calling 'wa robot workflow list'. Lists available workflows.",
+  "type": "object",
+  "required": ["workflows", "total"],
+  "properties": {
+    "workflows": {
+      "type": "array",
+      "description": "Available workflow definitions",
+      "items": {
+        "$ref": "#/$defs/workflow_info"
+      }
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of workflows"
+    },
+    "enabled_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of currently enabled workflows"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "workflow_info": {
+      "type": "object",
+      "description": "Information about a workflow",
+      "required": ["name", "enabled"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Workflow name (used in 'wa robot workflow run <name>')"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of what the workflow does"
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the workflow is currently enabled"
+        },
+        "trigger_event_types": {
+          "type": "array",
+          "description": "Event types that can trigger this workflow",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trigger_rule_ids": {
+          "type": "array",
+          "description": "Rule IDs that can trigger this workflow",
+          "items": {
+            "type": "string"
+          }
+        },
+        "agent_types": {
+          "type": "array",
+          "description": "Agent types this workflow supports (e.g., 'codex', 'claude_code', 'gemini')",
+          "items": {
+            "type": "string"
+          }
+        },
+        "step_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of steps in the workflow"
+        },
+        "parameters": {
+          "type": "array",
+          "description": "Parameters the workflow accepts",
+          "items": {
+            "$ref": "#/$defs/workflow_parameter"
+          }
+        },
+        "requires_pane": {
+          "type": "boolean",
+          "description": "Whether this workflow requires a target pane"
+        },
+        "requires_approval": {
+          "type": "boolean",
+          "description": "Whether this workflow requires approval before execution"
+        },
+        "can_abort": {
+          "type": "boolean",
+          "description": "Whether this workflow can be safely aborted mid-execution"
+        },
+        "destructive": {
+          "type": "boolean",
+          "description": "Whether this workflow performs destructive actions"
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "External dependencies required by this workflow (e.g., 'caut', 'playwright')",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "workflow_parameter": {
+      "type": "object",
+      "description": "A workflow parameter definition",
+      "required": ["name", "type"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Parameter name"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["string", "integer", "boolean", "pane_id"],
+          "description": "Parameter type"
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Whether the parameter is required"
+        },
+        "default": {
+          "description": "Default value if not provided"
+        },
+        "description": {
+          "type": "string",
+          "description": "Parameter description"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

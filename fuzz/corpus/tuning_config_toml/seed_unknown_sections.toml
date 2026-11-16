@@ -1,0 +1,10 @@
+[runtime]
+tick_interval_ms = 100
+max_concurrent_panes = 64
+
+[future_feature]
+enabled = true
+magic_level = 42
+
+[runtime.subsection_that_doesnt_exist]
+key = "value"

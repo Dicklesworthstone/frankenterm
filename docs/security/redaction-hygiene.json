@@ -1,0 +1,194 @@
+{
+  "schema_version": "ft.security.redaction_hygiene.v1",
+  "category": "security/redaction-hygiene",
+  "produced_by_bead": "ft-7h5da.1.5",
+  "generated_at": "2026-09-21T04:50:18.900654+00:00",
+  "status": "scoped_remote_and_native_maintenance_passed_release_qualification_pending",
+  "summary": "Atomic offline redaction maintenance, catalog identity and backup roundtrip passed retained remote regression tests on the recorded source. RC51 native backfill and purge each passed dry-run, mutation and idempotence against an owned full-schema smoke database copy. Historical RC46 ingest-stamping evidence remains separately scoped. Producing-bead bundle closeout and signed release qualification remain pending. This file does not certify deployment corpus cleanliness.",
+  "attestation_manifest_slot": {
+    "category": "security/redaction-hygiene",
+    "path": "docs/security/redaction-hygiene.json",
+    "media_type": "application/json",
+    "produced_by_bead": "ft-7h5da.1.5"
+  },
+  "catalog": {
+    "fingerprint": "live-secret-patterns-v2-sha256:1b2cd2692bc04ff839dc0750f554d414aefcc4ebde07e5e1c7d1285b6fdc0186",
+    "fingerprint_algorithm": "SHA-256 of domain frankenterm-secret-catalog-v2 NUL sequential-regex-replace-all NUL, then UTF-8 fields framed by u64 big-endian byte lengths: default marker, named marker template, and each ordered family name plus actual regex expression",
+    "computed_at_runtime_by": "frankenterm_core::redact_backfill::catalog_version()",
+    "reproducible": "redactor::secret_catalog_version is canonical; the names below alone cannot reconstruct expression-sensitive identity. The retained remote catalog-identity and manifest-schema tests verified this fingerprint against the live implementation.",
+    "family_count": 33,
+    "families": [
+      "anthropic_key",
+      "openai_key",
+      "github_token",
+      "github_fine_grained_pat",
+      "gitlab_token",
+      "xai_key",
+      "groq_key",
+      "google_api_key",
+      "google_oauth_token",
+      "huggingface_token",
+      "replicate_token",
+      "anyscale_key",
+      "perplexity_key",
+      "ai_provider_keyed_value",
+      "aws_access_key_id",
+      "aws_secret_key",
+      "bearer_token",
+      "http_basic_auth",
+      "slack_token",
+      "stripe_key",
+      "sendgrid_key",
+      "datadog_api_key",
+      "database_url",
+      "ssh_private_key",
+      "pgp_block",
+      "jwt_token",
+      "device_code",
+      "oauth_url",
+      "generic_api_key",
+      "generic_token",
+      "generic_password",
+      "generic_secret",
+      "twilio_account_sid"
+    ]
+  },
+  "temporal_redaction": {
+    "ingest_stamping": {
+      "since_schema_version": 29,
+      "column": "output_segments.redaction_catalog_version",
+      "stamped_by": "frankenterm_core::redact_backfill::current_catalog_version()",
+      "pre_v29_rows": "NULL = catalog unknown; a successful non-dry-run sweep stamps the applied catalog on every scanned row atomically with its receipt. This column identifies the last applied catalog, not immutable capture provenance.",
+      "produced_by_bead": "ft-7h5da.1.5"
+    },
+    "backfill": {
+      "tool": "ft redact backfill",
+      "engine": "frankenterm_core::redact_backfill::run_redact_backfill",
+      "receipt_location": "maintenance_log table, event_type='redaction_backfill'",
+      "receipt_schema_version": "ft.redact-backfill.v1",
+      "receipt_fields": [
+        "catalog_version",
+        "patterns_checked",
+        "resume_after_id",
+        "segments_scanned",
+        "segments_rewritten",
+        "family_counts",
+        "last_segment_id",
+        "embeddings_invalidated",
+        "fts_rebuilt"
+      ],
+      "properties": [
+        "idempotent content rewrites; every completed real sweep records a receipt including zero-rewrite scans",
+        "resumable (segment-id cursor)",
+        "one SQLite transaction covers row rewrites, catalog adoption, configured SQLite derived-store maintenance, and mandatory receipt; failure rolls back",
+        "derived-store rebuild: output_segments_fts FTS5 + segment_embeddings invalidation"
+      ],
+      "produced_by_bead": "ft-7h5da.1.3"
+    },
+    "purge": {
+      "tool": "ft redact purge --secret-hash",
+      "status": "remote_transaction_and_receipt_controls_passed",
+      "tracking_bead": "ft-7h5da.1.4",
+      "note": "run_redact_purge transaction, receipt and dry-run controls passed remotely. Only active-catalog matches are eligible. Sealed backups require separate review."
+    }
+  },
+  "coverage_map_reference": "docs/security/redaction-coverage-map.md",
+  "verification": {
+    "claim": "Scoped remote maintenance, catalog and backup regression proof; release manifest remains deferred until producing-bead bundle qualification completes.",
+    "not_claimed": "No whole-corpus cleanliness claim: scans are per-segment, resumed scans exclude earlier rows, and catalog coverage is finite. Tantivy rebuild_requested records required external work; no rebuild is queued or performed. mmap mirrors, archived backups and external indexes are not certified by a SQLite maintenance receipt.",
+    "required_proofs": [
+      "redact_backfill::tests",
+      "redactor::tests::catalog_identity_changes_with_expression_order_and_family",
+      "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip",
+      "attestation_manifest_schema::redaction_hygiene_attestation_matches_live_catalog"
+    ],
+    "retained_remote_receipts": [
+      {
+        "transcript": "/Volumes/USB_NVME/ft-release-20260915/rc40-redaction-proof-rch.log",
+        "transcript_sha256": "fc06d8cbe5925c4f697d67216954e5750a5f3d0fb1f271c131b6f52ff75d7f0a",
+        "worker": "ts1",
+        "base_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+        "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
+        "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
+        "source_mode": "clean_baseline_empty_overlay",
+        "target": "x86_64-unknown-linux-gnu",
+        "profile": "test-recovery",
+        "features": ["default", "mcp", "mcp-client", "vendored"],
+        "test_filter": "redact",
+        "passed_tests": {
+          "core_library_filtered_total": 530,
+          "attestation_manifest_schema_filtered_total": 1
+        },
+        "failed_tests": 0,
+        "ignored_tests": 0,
+        "exit_code": 0,
+        "scope": "Filtered library suite includes catalog expression/order controls, real SQLite backfill/purge receipts, rollback and dry-run controls, and backup roundtrip. The named live-catalog attestation test also passed. This is not a whole-workspace or release-profile pass."
+      },
+      {
+        "transcript": "/Volumes/USB_NVME/ft-release-20260915/rc40-redaction-backup-proof-rch.log",
+        "transcript_sha256": "8eb5b98ba1f5c0dc23b07a4031d618e90de577b250e76003e0ce42b86ad4ad13",
+        "worker": "ts1",
+        "base_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+        "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
+        "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
+        "source_mode": "clean_baseline_empty_overlay",
+        "target": "x86_64-unknown-linux-gnu",
+        "profile": "test-recovery",
+        "features": ["default", "mcp", "mcp-client", "vendored"],
+        "exact_test": "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip",
+        "passed_tests": 1,
+        "failed_tests": 0,
+        "ignored_tests": 0,
+        "exit_code": 0
+      }
+    ],
+    "scoped_source_comparison": {
+      "verified_at": "2026-09-21",
+      "tested_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+      "compared_checkout_commit": "abc5c9357aa3553c5faf4acc05f79a343769db92",
+      "unchanged_files": [
+        "crates/frankenterm-core/src/redact_backfill.rs",
+        "crates/frankenterm-core/src/redactor.rs",
+        "crates/frankenterm-core/src/backup.rs",
+        "crates/frankenterm-core/tests/attestation_manifest_schema.rs"
+      ],
+      "file_sha256": {
+        "crates/frankenterm-core/src/redact_backfill.rs": "941f362a70a24eadf18711980ce5fedceeba61e7a7a9826653d28243f9765573",
+        "crates/frankenterm-core/src/redactor.rs": "f97e7936de0ebdd2561d5e23ce9da95da143fa540aa763519ca5452146e49a86",
+        "crates/frankenterm-core/src/backup.rs": "79e3fd8a570fa9c7c36dbdcb50c883fb87eca004016597f3393bd417acf1d9cc",
+        "crates/frankenterm-core/tests/attestation_manifest_schema.rs": "64b83975f7962567caf226ec4d5b325ddde7230794c02a87f6ac024b87a9d111"
+      },
+      "method": "git diff from the tested commit to the RC51 source commit returned no changes for these four files; their current bytes were hashed independently",
+      "limit": "Source equality is limited to the listed files. Dependencies, the rest of the workspace and native execution are not qualified by this comparison. Native maintenance has its own receipt below."
+    },
+    "native_ingest_receipt": {
+      "path": "/Volumes/USB_NVME/ft-release-20260915/rc46-native-ingest-catalog-stamp.json",
+      "sha256": "a2c61bd5f2b9e3ff605ac9ea44ed20572c5f2a12ae1263a1db2c4a05b19fb861",
+      "source_revision": "53f815807b390df83637356d4b4c8d8e821fa4eb",
+      "dsr_run_id": "bdb9e11f-0091-4391-ad4b-8daeccf163f8",
+      "stamped_rows": 3,
+      "maintenance_receipts": 0,
+      "scope": "Owned RC46 native DSR smoke database only; all three captured rows carry the catalog fingerprint above. No backfill or purge was performed. The diagnostic DSR build later timed out during packaging and is not a publishable release."
+    },
+    "native_maintenance_receipt": {
+      "path": "/private/var/tmp/ft-release-20260921/native-redaction-vh9kr356/receipt.json",
+      "sha256": "6b9a4341313c1373ffca803b0f5ed1ca0177df26b62384c6d3c659999542081c",
+      "identity_receipt": "/private/var/tmp/ft-release-20260921/rc51-redaction-seed-h8fg211w/identity.json",
+      "identity_receipt_sha256": "607b986aea3770ba50a276eebf4682b2b7bedb284e0ab30493bd5be28571be53",
+      "source_revision": "abc5c9357aa3553c5faf4acc05f79a343769db92",
+      "source_tree": "e875e3fadbd539c937c9000e8b91376ec49d5626",
+      "dsr_run_id": "e325be75-473d-4db7-89a0-155932a18c35",
+      "version": "0.15.6-rc.51",
+      "profile": "release-interactive",
+      "target": "aarch64-apple-darwin",
+      "ft_sha256": "b01c713078e0a8bc5ce52c5ce0ce9c7307a86a22355da0461f7869ccae30b065",
+      "full_candidate_schema": true,
+      "schema_version": 47,
+      "passed_steps": ["backfill/dry-run", "backfill/mutate", "backfill/idempotence", "purge/dry-run", "purge/mutate", "purge/idempotence"],
+      "scope": "Native CLI over a read-only SQLite backup of the stopped owned RC51 smoke database. Each operation scans two added synthetic rows after cursor 3; original rows and embeddings are preserved. Real mutation validates catalog stamping, SQLite FTS rebuild, embedding invalidation and durable receipt equality. Dry-run preserves database bytes and state; repetition changes no content or embeddings.",
+      "provenance_boundary": "The identity receipt records root's independent terminal DSR success and offline family verification review. The maintenance driver verifies executable hash binding but does not establish provenance itself.",
+      "not_claimed": ["deployment corpus cleanliness", "whole-corpus or cross-segment coverage", "Tantivy rebuild", "backup archive purge", "schema migration", "ingest stamping", "signed release qualification"]
+    },
+    "release_qualification": "Pending producing-bead bundle build/verify, manifest completeness, retained evidence packaging and signed release qualification. RC51 native maintenance passed for the exact source and executable above; this does not qualify other release gates. Referenced external receipts must be retained with the release evidence; this artifact alone does not embed their bytes."
+  }
+}

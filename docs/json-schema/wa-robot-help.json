@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-help.json",
+  "title": "WA Robot Help Response",
+  "description": "Schema for the data field when calling 'wa robot help'. Lists available robot commands and global flags.",
+  "type": "object",
+  "required": ["commands", "global_flags"],
+  "properties": {
+    "commands": {
+      "type": "array",
+      "description": "Available robot subcommands",
+      "items": {
+        "type": "object",
+        "required": ["name", "description"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Command name (e.g., 'state', 'get-text')"
+          },
+          "description": {
+            "type": "string",
+            "description": "Brief description of what the command does"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "global_flags": {
+      "type": "array",
+      "description": "Global flags accepted by all robot commands",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,22 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2510  single-line table",
+    "\u2502 pane  \u2502 state \u2502 age \u2502",
+    "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2524",
+    "\u2502 cod_1 \u2502 busy  \u2502 04m \u2502",
+    "\u2502 cc_2  \u2502 idle  \u2502 16m \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2518",
+    "\u2554\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2557  double-line joins \u2560\u256c\u2563 \u2569\u2566",
+    "\u2580\u2580\u2580 upper halves   \u2584\u2584\u2584 lower halves   \u258c\u258c left   \u2590\u2590 right",
+    "\u2591\u2591 light shade  \u2592\u2592 medium shade  \u2593\u2593 dark shade  quadrants \u2596\u2597\u2598\u259d\u259a\u259e",
+    "ASCII ruler: +---+---+---+---+---+---+---+---+"
+  ],
+  "cursor": {
+    "row": 3,
+    "col": 12,
+    "shape": "beam"
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

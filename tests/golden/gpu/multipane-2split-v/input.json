@@ -1,0 +1,25 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250f\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 TOP focused pane \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2513",
+    "\u2503 pane 0: build output stays above the horizontal divider.        \u2503",
+    "\u2503 pane 0: focus border uses heavy glyphs and exact corners.       \u2503",
+    "\u2523\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 seam between stacked panes \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u252b",
+    "\u2502 pane 1: unfocused border starts immediately below the seam.      \u2502",
+    "\u2502 pane 1: bottom pane text must not overlap the divider row.       \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 bottom unfocused pane \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 10,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 5,
+    "start_col": 11,
+    "end_row": 5,
+    "end_col": 43
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

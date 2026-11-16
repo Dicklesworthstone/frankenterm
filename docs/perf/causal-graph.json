@@ -1,0 +1,29 @@
+{
+  "schema_version": "ft.perf.causal-graph.v1",
+  "claim_id": "robot.p95",
+  "sample_count": 200,
+  "variables": [
+    {
+      "name": "metric_regressed",
+      "role": "metric",
+      "cardinality": 2
+    },
+    {
+      "name": "commit_sha",
+      "role": "factor",
+      "cardinality": 2
+    }
+  ],
+  "edges": [
+    {
+      "left": "commit_sha",
+      "right": "metric_regressed",
+      "mutual_information_bits": 0.21642183614672564
+    }
+  ],
+  "separating_sets": [],
+  "decision": {
+    "kind": "accept",
+    "reason": "PC skeleton retained at least one metric-adjacent causal candidate"
+  }
+}

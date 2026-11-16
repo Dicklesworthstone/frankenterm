@@ -1,0 +1,16 @@
+== /private/tmp/ftrt-46956
+2026-11-07T02:17:55Z mux periodic recovery published local generation=1 in 28428 ms (3360 ms of it verifying the newest root); replica durability unpr
+2026-11-07T02:19:24Z mux periodic recovery published local generation=2 in 86844 ms (6100 ms of it verifying the newest root); replica durability unpr
+2026-11-07T02:21:39Z restored 50 guardian panes in 64842 ms, 7644 ms of it connecting and claiming
+  all (from 00:00:00): busy 165.6 s
+    Checkpoint       n=   172 total=    21.6 s mean=  125790 us
+    Replay           n= 11190 total=    69.0 s mean=    6166 us
+    Spawn            n=    50 total=     3.6 s mean=   71424 us
+    ReplayAck        n= 11141 total=     1.0 s mean=      90 us
+    CheckpointStage  n=  2762 total=    67.2 s mean=   24317 us
+    Claim            n=    50 total=     3.2 s mean=   64426 us
+  after-restart (from 02:21:39): busy 34.5 s
+    Checkpoint       n=    50 total=     3.6 s mean=   72313 us
+    Replay           n=  2195 total=    19.2 s mean=    8749 us
+    ReplayAck        n=  2146 total=     0.2 s mean=      93 us
+    CheckpointStage  n=   400 total=    11.5 s mean=   28660 us

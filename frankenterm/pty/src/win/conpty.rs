@@ -1,0 +1,121 @@
+use crate::cmdbuilder::CommandBuilder;
+use crate::win::psuedocon::PsuedoCon;
+use crate::{Child, MasterPty, PtyPair, PtySize, PtySystem, SlavePty};
+use anyhow::Error;
+use filedescriptor::{FileDescriptor, Pipe};
+use std::sync::{Arc, Mutex, MutexGuard};
+use winapi::um::wincon::COORD;
+
+#[derive(Default)]
+pub struct ConPtySystem {}
+
+impl PtySystem for ConPtySystem {
+    fn openpty(&self, size: PtySize) -> anyhow::Result<PtyPair> {
+        let stdin = Pipe::new()?;
+        let stdout = Pipe::new()?;
+
+        let con = PsuedoCon::new(
+            COORD {
+                X: size.cols.min(i16::MAX as u16) as i16,
+                Y: size.rows.min(i16::MAX as u16) as i16,
+            },
+            stdin.read,
+            stdout.write,
+        )?;
+
+        let master = ConPtyMasterPty {
+            inner: Arc::new(Mutex::new(Inner {
+                con,
+                readable: stdout.read,
+                writable: Some(stdin.write),
+                size,
+            })),
+        };
+
+        let slave = ConPtySlavePty {
+            inner: master.inner.clone(),
+        };
+
+        Ok(PtyPair {
+            master: Box::new(master),
+            slave: Box::new(slave),
+        })
+    }
+}
+
+struct Inner {
+    con: PsuedoCon,
+    readable: FileDescriptor,
+    writable: Option<FileDescriptor>,
+    size: PtySize,
+}
+
+fn lock_inner(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Inner {
+    pub fn resize(
+        &mut self,
+        num_rows: u16,
+        num_cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<(), Error> {
+        self.con.resize(COORD {
+            X: num_cols.min(i16::MAX as u16) as i16,
+            Y: num_rows.min(i16::MAX as u16) as i16,
+        })?;
+        self.size = PtySize {
+            rows: num_rows,
+            cols: num_cols,
+            pixel_width,
+            pixel_height,
+        };
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ConPtyMasterPty {
+    inner: Arc<Mutex<Inner>>,
+}
+
+pub struct ConPtySlavePty {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl MasterPty for ConPtyMasterPty {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        let mut inner = lock_inner(&self.inner);
+        inner.resize(size.rows, size.cols, size.pixel_width, size.pixel_height)
+    }
+
+    fn get_size(&self) -> Result<PtySize, Error> {
+        let inner = lock_inner(&self.inner);
+        Ok(inner.size)
+    }
+
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+        Ok(Box::new(lock_inner(&self.inner).readable.try_clone()?))
+    }
+
+    fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+        Ok(Box::new(
+            lock_inner(&self.inner)
+                .writable
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("writer already taken"))?,
+        ))
+    }
+}
+
+impl SlavePty for ConPtySlavePty {
+    fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
+        let inner = lock_inner(&self.inner);
+        let child = inner.con.spawn_command(cmd)?;
+        Ok(Box::new(child))
+    }
+}

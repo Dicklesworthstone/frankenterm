@@ -1,0 +1,2117 @@
+use crate::colorease::ColorEase;
+use crate::customglyph::{BlockKey, *};
+use crate::glyphcache::{CachedGlyph, GlyphCache};
+use crate::quad::{
+    HeapQuadAllocator, QuadAllocator, QuadImpl, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait,
+};
+use crate::shapecache::*;
+use crate::termwindow::box_model::ChromeTarget;
+use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::{BorrowedShapeCacheKey, ShapedInfo};
+use crate::utilsprites::RenderMetrics;
+use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
+use ::window::{DeadKeyStatus, PointF, RectF, SizeF};
+use anyhow::{Context, anyhow};
+use config::{
+    BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, TextStyle,
+    VerticalWindowContentAlignment, VisualBellTarget,
+};
+use euclid::num::Zero;
+use frankenterm_alloc::resource_ledger::CacheGauge;
+use frankenterm_font::shaper::PresentationWidth;
+use frankenterm_font::units::{IntPixelLength, PixelLength};
+use frankenterm_font::{GlyphInfo, LoadedFont};
+use frankenterm_gui::line_shaping::GlyphSlice;
+use lfucache::LfuCache;
+use mux::pane::{Pane, PaneId};
+use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use ordered_float::NotNan;
+use std::cell::RefCell;
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+use termwiz::cellcluster::CellCluster;
+use termwiz::hyperlink::Hyperlink;
+use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo};
+use wezterm_term::color::{ColorAttribute, ColorPalette};
+use wezterm_term::{CellAttributes, Line, StableRowIndex};
+use window::color::LinearRgba;
+
+pub mod borders;
+pub mod compositor;
+pub mod corners;
+pub mod dirty_lines;
+pub mod draw;
+pub mod elastic_buffer;
+pub mod fancy_tab_bar;
+pub mod frame_dedup;
+pub mod paint;
+pub mod pane;
+pub mod per_row_quad_cache;
+pub mod redraw_predicate;
+pub mod screen_line;
+pub mod split;
+pub mod tab_bar;
+pub mod window_buttons;
+
+/// Identity token for one `TermWindow`'s line-state cache.
+///
+/// The pointee has no numeric identity that can wrap or collide. A cached line
+/// state is reusable only when its retained `Arc` is pointer-equal to the
+/// current window's owner token.
+#[derive(Debug, Default)]
+pub(super) struct LineStateCacheOwner;
+
+/// The data that we associate with a line; we use this to cache its shape hash.
+#[derive(Debug)]
+pub struct CachedLineState {
+    pub id: u64,
+    owner: Arc<LineStateCacheOwner>,
+    /// Owning pane. This lets pane retirement purge hot LFU entries instead of
+    /// allowing closed-pane history to crowd out long-lived active panes.
+    pub pane_id: PaneId,
+    pub seqno: SequenceNo,
+    pub shape_hash: [u8; 16],
+    // Computed only when populating this source's entry. Image payloads can
+    // change behind shared handles without changing the Line sequence.
+    pub shape_hash_cacheable: bool,
+}
+
+impl CachedLineState {
+    fn belongs_to(&self, owner: &Arc<LineStateCacheOwner>, pane_id: PaneId) -> bool {
+        Arc::ptr_eq(&self.owner, owner) && self.pane_id == pane_id
+    }
+
+    fn shape_hash_if_fresh(
+        &self,
+        owner: &Arc<LineStateCacheOwner>,
+        pane_id: PaneId,
+        line: &Line,
+    ) -> Option<[u8; 16]> {
+        if !self.belongs_to(owner, pane_id)
+            || !frankenterm_gui::cached_line_shape_hash_is_fresh(self.seqno, line.current_seqno())
+        {
+            return None;
+        }
+        Some(if self.shape_hash_cacheable {
+            self.shape_hash
+        } else {
+            line.compute_shape_hash()
+        })
+    }
+}
+
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+pub struct LineQuadCacheKey {
+    pub config_generation: usize,
+    pub shape_generation: usize,
+    pub quad_generation: usize,
+    /// Only set if cursor.y == stable_row
+    pub composing: Option<String>,
+    pub selection: Range<usize>,
+    pub shape_hash: [u8; 16],
+    pub top_pixel_y: NotNan<f32>,
+    pub left_pixel_x: NotNan<f32>,
+    pub pixel_width: NotNan<f32>,
+    pub phys_line_idx: usize,
+    pub pane_id: PaneId,
+    pub pane_is_active: bool,
+    /// A cursor position with the y value fixed at 0.
+    /// Only is_some() if the y value matches this row.
+    pub cursor: Option<CursorProperties>,
+    pub reverse_video: bool,
+    pub password_input: bool,
+}
+
+pub struct LineQuadCacheValue {
+    pub expires: Option<Instant>,
+    pub layers: HeapQuadAllocator,
+    // Only set if the line contains any hyperlinks, so
+    // that we can invalidate when it changes
+    pub current_highlight: Option<Arc<Hyperlink>>,
+    pub invalidate_on_hover_change: bool,
+    pub(crate) hyperlinks: Vec<crate::selection::HyperlinkSpan>,
+}
+
+impl LineQuadCacheValue {
+    pub(crate) fn apply_to_with_hyperlinks(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<crate::selection::HyperlinkSpan>> {
+        self.layers.apply_to(layers)?;
+        Ok(self.hyperlinks.clone())
+    }
+}
+
+pub struct LineToElementParams<'a> {
+    pub line: &'a Line,
+    pub config: &'a ConfigHandle,
+    pub palette: &'a ColorPalette,
+    pub window_is_transparent: bool,
+    pub reverse_video: bool,
+    pub shape_key: &'a Option<LineToEleShapeCacheKey>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub struct LineToEleShapeCacheKey {
+    pub shape_hash: [u8; 16],
+    pub composing: Option<(usize, String)>,
+    pub shape_generation: usize,
+}
+
+pub struct LineToElementShapeItem {
+    pub expires: Option<Instant>,
+    pub shaped: Rc<Vec<LineToElementShape>>,
+    // Only set if the line contains any hyperlinks, so
+    // that we can invalidate when it changes
+    pub current_highlight: Option<Arc<Hyperlink>>,
+    pub invalidate_on_hover_change: bool,
+}
+
+pub struct LineToElementShape {
+    pub underline_tex_rect: TextureRect,
+    pub fg_color: LinearRgba,
+    pub bg_color: LinearRgba,
+    pub underline_color: LinearRgba,
+    pub x_pos: f32,
+    pub pixel_width: f32,
+    pub glyph_info: GlyphSlice<ShapedInfo>,
+    pub cluster: CellCluster,
+}
+
+pub struct RenderScreenLineResult {
+    pub invalidate_on_hover_change: bool,
+    pub(crate) hyperlinks: Vec<crate::selection::HyperlinkSpan>,
+}
+
+pub struct RenderScreenLineParams<'a> {
+    /// zero-based offset from top of the window viewport to the line that
+    /// needs to be rendered, measured in pixels
+    pub top_pixel_y: f32,
+    /// zero-based offset from left of the window viewport to the line that
+    /// needs to be rendered, measured in pixels
+    pub left_pixel_x: f32,
+    pub pixel_width: f32,
+    pub stable_line_idx: Option<StableRowIndex>,
+    pub line: &'a Line,
+    pub selection: Range<usize>,
+    pub cursor: &'a StableCursorPosition,
+    pub palette: &'a ColorPalette,
+    pub dims: &'a RenderableDimensions,
+    pub config: &'a ConfigHandle,
+    pub pane: Option<&'a Arc<dyn Pane>>,
+
+    pub white_space: TextureRect,
+    pub filled_box: TextureRect,
+
+    pub cursor_border_color: LinearRgba,
+    pub foreground: LinearRgba,
+    pub is_active: bool,
+
+    pub selection_fg: LinearRgba,
+    pub selection_bg: LinearRgba,
+    pub cursor_fg: LinearRgba,
+    pub cursor_bg: LinearRgba,
+    pub cursor_is_default_color: bool,
+
+    pub window_is_transparent: bool,
+    pub default_bg: LinearRgba,
+
+    /// Override font resolution; useful together with
+    /// the resolved title font
+    pub font: Option<Rc<LoadedFont>>,
+    pub style: Option<&'a TextStyle>,
+
+    /// If true, use the shaper-determined pixel positions,
+    /// rather than using monospace cell based positions.
+    pub use_pixel_positioning: bool,
+
+    pub render_metrics: RenderMetrics,
+    pub shape_key: Option<LineToEleShapeCacheKey>,
+    pub password_input: bool,
+}
+
+#[inline]
+pub(crate) fn image_padding_fits_cell(
+    (left, top, right, bottom): (u16, u16, u16, u16),
+    cell_width: isize,
+    cell_height: isize,
+) -> bool {
+    let (Ok(cell_width), Ok(cell_height)) = (u64::try_from(cell_width), u64::try_from(cell_height))
+    else {
+        return false;
+    };
+    cell_width > 0
+        && cell_height > 0
+        && u64::from(left) + u64::from(right) < cell_width
+        && u64::from(top) + u64::from(bottom) < cell_height
+}
+
+#[inline]
+pub(crate) fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
+    if cell_width <= 0 || cell_height <= 0 {
+        return None;
+    }
+    let extent = usize::try_from(cell_width.max(cell_height)).ok()?;
+    extent.checked_next_power_of_two()
+}
+
+#[inline]
+pub(crate) fn canonical_image_texture_region(
+    top_left: termwiz::image::TextureCoordinate,
+    bottom_right: termwiz::image::TextureCoordinate,
+) -> Option<(f32, f32, f32, f32)> {
+    let left = top_left.x.into_inner();
+    let top = top_left.y.into_inner();
+    let right = bottom_right.x.into_inner();
+    let bottom = bottom_right.y.into_inner();
+    const WIRE_TOLERANCE: f32 = f32::EPSILON * 8.0;
+
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || left < -WIRE_TOLERANCE
+        || top < -WIRE_TOLERANCE
+        || right > 1.0 + WIRE_TOLERANCE
+        || bottom > 1.0 + WIRE_TOLERANCE
+        || left >= right
+        || top >= bottom
+    {
+        return None;
+    }
+
+    let canonical = (
+        left.clamp(0.0, 1.0),
+        top.clamp(0.0, 1.0),
+        right.clamp(0.0, 1.0),
+        bottom.clamp(0.0, 1.0),
+    );
+    (canonical.0 < canonical.2 && canonical.1 < canonical.3).then_some(canonical)
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub struct CursorProperties {
+    pub position: StableCursorPosition,
+    pub dead_key_or_leader: bool,
+    pub cursor_is_default_color: bool,
+    pub cursor_fg: LinearRgba,
+    pub cursor_bg: LinearRgba,
+    pub cursor_border_color: LinearRgba,
+}
+
+pub struct ComputeCellFgBgParams<'a> {
+    pub selected: bool,
+    pub cursor: Option<&'a StableCursorPosition>,
+    pub fg_color: LinearRgba,
+    pub bg_color: LinearRgba,
+    pub is_active_pane: bool,
+    pub config: &'a ConfigHandle,
+    pub selection_fg: LinearRgba,
+    pub selection_bg: LinearRgba,
+    pub cursor_fg: LinearRgba,
+    pub cursor_bg: LinearRgba,
+    pub cursor_is_default_color: bool,
+    pub cursor_border_color: LinearRgba,
+    pub pane: Option<&'a Arc<dyn Pane>>,
+}
+
+#[derive(Debug)]
+pub struct ComputeCellFgBgResult {
+    pub fg_color: LinearRgba,
+    pub fg_color_alt: LinearRgba,
+    pub bg_color: LinearRgba,
+    pub bg_color_alt: LinearRgba,
+    pub fg_color_mix: f32,
+    pub bg_color_mix: f32,
+    pub cursor_border_color: LinearRgba,
+    pub cursor_border_color_alt: LinearRgba,
+    pub cursor_border_mix: f32,
+    pub cursor_shape: Option<CursorShape>,
+}
+
+/// Basic cache of computed data from prior cluster to avoid doing the same
+/// work for space separated clusters with the same style
+#[derive(Clone, Debug)]
+pub struct ClusterStyleCache<'a> {
+    attrs: &'a CellAttributes,
+    style: &'a TextStyle,
+    underline_tex_rect: TextureRect,
+    fg_color: LinearRgba,
+    bg_color: LinearRgba,
+    underline_color: LinearRgba,
+}
+
+/// How often a window refreshes its cache gauges (ft-yccm0.1.7).
+const CACHE_GAUGE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Entries and accounted heap bytes of a window's shape, line-shape and
+/// line-quad caches for the cache-gauge ledger (ft-yccm0.1.7). Bytes count
+/// each entry's key and value structs plus the vectors and strings they own
+/// (cluster and composing text, quad vectors, hyperlink spans). Glyphs are not
+/// counted, and the sprite vectors that line entries share are counted once,
+/// as the glyph cache's shape bindings, which the caller adds to the shape
+/// bytes.
+fn render_cache_gauge_values(
+    shapes: &LfuCache<ShapeCacheKey, Rc<CachedShape>>,
+    lines: &LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>,
+    quads: &LfuCache<LineQuadCacheKey, LineQuadCacheValue>,
+) -> [(CacheGauge, u64); 6] {
+    use std::mem::size_of;
+
+    let mut shape_bytes = 0u64;
+    shapes.for_each_resident(|key, shape| {
+        shape_bytes +=
+            (size_of::<ShapeCacheKey>() + key.heap_bytes()) as u64 + shape.accounted_bytes();
+    });
+    let mut line_bytes = 0u64;
+    lines.for_each_resident(|key, item| {
+        let composing = key
+            .composing
+            .as_ref()
+            .map_or(0, |(_, text)| text.capacity());
+        let elements: usize = item
+            .shaped
+            .iter()
+            .map(|element| element.cluster.text.capacity())
+            .sum();
+        line_bytes += (size_of::<LineToEleShapeCacheKey>()
+            + composing
+            + size_of::<LineToElementShapeItem>()
+            + item.shaped.capacity() * size_of::<LineToElementShape>()
+            + elements) as u64;
+    });
+    let mut quad_bytes = 0u64;
+    quads.for_each_resident(|key, value| {
+        let composing = key.composing.as_ref().map_or(0, String::capacity);
+        quad_bytes += (size_of::<LineQuadCacheKey>()
+            + composing
+            + size_of::<LineQuadCacheValue>()
+            + value.hyperlinks.capacity() * size_of::<crate::selection::HyperlinkSpan>())
+            as u64
+            + value.layers.accounted_bytes();
+    });
+    [
+        (CacheGauge::ShapeCacheEntries, shapes.len() as u64),
+        (CacheGauge::ShapeCacheBytes, shape_bytes),
+        (CacheGauge::LineShapeCacheEntries, lines.len() as u64),
+        (CacheGauge::LineShapeCacheBytes, line_bytes),
+        (CacheGauge::LineQuadCacheEntries, quads.len() as u64),
+        (CacheGauge::LineQuadCacheBytes, quad_bytes),
+    ]
+}
+
+/// Keep only complete successful resolutions. A failure must reach the bounded
+/// frame retry without becoming an LFU hit that prevents the shaper running again.
+fn resolve_cached_shape(
+    cache: &RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,
+    key: BorrowedShapeCacheKey<'_>,
+    resolve: impl FnOnce() -> anyhow::Result<CachedShape>,
+) -> anyhow::Result<Rc<CachedShape>> {
+    if let Some(cached) = cache
+        .borrow_mut()
+        .get(&key as &dyn ShapeCacheKeyTrait)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    // No cache borrow may span shaping, fallback notification, or rasterization.
+    let cached = Rc::new(resolve()?);
+    cache.borrow_mut().put(key.to_owned(), Rc::clone(&cached));
+    Ok(cached)
+}
+
+impl crate::TermWindow {
+    /// Publish this window's cache sizes into the process cache gauges, at
+    /// most once per [`CACHE_GAUGE_REPORT_INTERVAL`] (ft-yccm0.1.7).
+    pub(crate) fn report_cache_gauges(&mut self, now: Instant) {
+        let Some(render_state) = self.render_state.as_mut() else {
+            return;
+        };
+        if render_state
+            .last_cache_gauge_report
+            .is_some_and(|last| now.saturating_duration_since(last) < CACHE_GAUGE_REPORT_INTERVAL)
+        {
+            return;
+        }
+        render_state.last_cache_gauge_report = Some(now);
+        let values = render_cache_gauge_values(
+            &self.shape_cache.borrow(),
+            &self.line_to_ele_shape_cache.borrow(),
+            &self.line_quad_cache.borrow(),
+        );
+        let (glyph_entries, image_bytes, binding_bytes) = {
+            let glyph_cache = render_state.glyph_cache.borrow();
+            (
+                glyph_cache.glyph_entries() as u64,
+                glyph_cache.image_cache_retained_bytes() as u64,
+                glyph_cache.shape_binding_bytes(),
+            )
+        };
+        for (gauge, mut value) in values {
+            if gauge == CacheGauge::ShapeCacheBytes {
+                value += binding_bytes;
+            }
+            render_state.cache_gauges.set(gauge, value);
+        }
+        render_state
+            .cache_gauges
+            .set(CacheGauge::GlyphCacheEntries, glyph_entries);
+        render_state
+            .cache_gauges
+            .set(CacheGauge::ImageCacheBytes, image_bytes);
+        let shaping = render_state.shaping.get();
+        for (gauge, value) in [
+            (CacheGauge::ShapedLinesTotal, shaping.lines),
+            (CacheGauge::ShapedClustersTotal, shaping.clusters),
+            (CacheGauge::ShapingRunsTotal, shaping.runs),
+            (CacheGauge::UnsplitShapingRunsTotal, shaping.unsplit_runs),
+        ] {
+            render_state.cache_gauges.set(gauge, value);
+        }
+    }
+
+    pub fn update_next_frame_time(&self, next_due: Option<Instant>) {
+        if next_due.is_some() {
+            update_next_frame_time(&mut *self.has_animation.borrow_mut(), next_due);
+        }
+    }
+
+    pub(crate) fn get_intensity_if_bell_target_ringing(
+        &self,
+        pane: &Arc<dyn Pane>,
+        config: &ConfigHandle,
+        target: VisualBellTarget,
+    ) -> Option<f32> {
+        let mut per_pane = self.pane_state(pane.pane_id())?;
+        if let Some(ringing) = per_pane.bell_start {
+            if config.visual_bell.target == target {
+                let mut color_ease = ColorEase::new(
+                    config.visual_bell.fade_in_duration_ms,
+                    config.visual_bell.fade_in_function,
+                    config.visual_bell.fade_out_duration_ms,
+                    config.visual_bell.fade_out_function,
+                    Some(ringing),
+                );
+
+                let intensity = color_ease.intensity_one_shot();
+
+                match intensity {
+                    None => {
+                        per_pane.bell_start.take();
+                    }
+                    Some((intensity, next)) => {
+                        self.update_next_frame_time(Some(next));
+                        return Some(intensity);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Where window chrome is laid out and drawn: the WebGpu front end's
+    /// render state, or a Metal window's own chrome target (ft-yccm0.4.7.1).
+    pub(crate) fn chrome(&self) -> anyhow::Result<&dyn ChromeTarget> {
+        match (&self.render_state, &self.metal_chrome) {
+            (Some(state), _) => Ok(state),
+            (None, Some(chrome)) => Ok(chrome),
+            (None, None) => Err(anyhow!("render state is not initialized")),
+        }
+    }
+
+    pub fn filled_rectangle<'a>(
+        &self,
+        layers: &'a mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        color: LinearRgba,
+    ) -> anyhow::Result<QuadImpl<'a>> {
+        let mut quad = layers.allocate(layer_num)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.;
+        let chrome = self.chrome()?;
+        quad.set_position(
+            rect.min_x() as f32 - left_offset,
+            rect.min_y() as f32 - top_offset,
+            rect.max_x() as f32 - left_offset,
+            rect.max_y() as f32 - top_offset,
+        );
+        quad.set_texture(chrome.util_sprites().filled_box.texture_coords());
+        quad.set_is_background();
+        quad.set_fg_color(color);
+        quad.set_hsv(None);
+        Ok(quad)
+    }
+
+    pub fn poly_quad<'a>(
+        &self,
+        layers: &'a mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        point: PointF,
+        polys: &'static [Poly],
+        underline_height: IntPixelLength,
+        cell_size: SizeF,
+        color: LinearRgba,
+    ) -> anyhow::Result<QuadImpl<'a>> {
+        let left_offset = self.dimensions.pixel_width as f32 / 2.;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.;
+        let sprite = self
+            .chrome()?
+            .glyph_cache()
+            .borrow_mut()
+            .cached_block(
+                BlockKey::PolyWithCustomMetrics {
+                    polys,
+                    underline_height,
+                    cell_size: euclid::size2(cell_size.width as isize, cell_size.height as isize),
+                },
+                &self.render_metrics,
+            )?
+            .texture_coords();
+
+        let mut quad = layers.allocate(layer_num)?;
+
+        quad.set_position(
+            point.x - left_offset,
+            point.y - top_offset,
+            (point.x + cell_size.width as f32) - left_offset,
+            (point.y + cell_size.height as f32) - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.);
+        quad.set_hsv(None);
+        quad.set_has_color(false);
+        Ok(quad)
+    }
+
+    pub fn min_scroll_bar_height(&self) -> f32 {
+        self.config
+            .min_scroll_bar_height
+            .evaluate_as_pixels(DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.terminal_size.pixel_height as f32,
+                pixel_cell: self.render_metrics.cell_size.height as f32,
+            })
+    }
+
+    pub fn padding_left_top(&self) -> (f32, f32) {
+        let h_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_width as f32,
+            pixel_cell: self.render_metrics.cell_size.width as f32,
+        };
+        let v_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_height as f32,
+            pixel_cell: self.render_metrics.cell_size.height as f32,
+        };
+
+        let padding_left = self
+            .config
+            .window_padding
+            .left
+            .evaluate_as_pixels(h_context);
+        let padding_right = self.config.window_padding.right;
+        let padding_top = self.config.window_padding.top.evaluate_as_pixels(v_context);
+        let padding_bottom = self
+            .config
+            .window_padding
+            .bottom
+            .evaluate_as_pixels(v_context);
+
+        let horizontal_gap = self.dimensions.pixel_width as f32
+            - self.terminal_size.pixel_width as f32
+            - padding_left
+            - if self.show_scroll_bar && padding_right.is_zero() {
+                h_context.pixel_cell
+            } else {
+                padding_right.evaluate_as_pixels(h_context)
+            };
+        let vertical_gap = self.dimensions.pixel_height as f32
+            - self.terminal_size.pixel_height as f32
+            - padding_top
+            - padding_bottom
+            - if self.show_tab_bar {
+                self.tab_bar_pixel_height().unwrap_or(0.)
+            } else {
+                0.
+            };
+        let left_gap = match self.config.window_content_alignment.horizontal {
+            HorizontalWindowContentAlignment::Left => 0.,
+            HorizontalWindowContentAlignment::Center => (horizontal_gap / 2.).round(),
+            HorizontalWindowContentAlignment::Right => horizontal_gap,
+        };
+        let top_gap = match self.config.window_content_alignment.vertical {
+            VerticalWindowContentAlignment::Top => 0.,
+            VerticalWindowContentAlignment::Center => (vertical_gap / 2.).round(),
+            VerticalWindowContentAlignment::Bottom => vertical_gap,
+        };
+
+        (padding_left + left_gap, padding_top + top_gap)
+    }
+
+    fn resolve_lock_glyph(
+        &self,
+        style: &TextStyle,
+        attrs: &CellAttributes,
+        font: Option<&Rc<LoadedFont>>,
+        gl_state: &dyn ChromeTarget,
+        metrics: &RenderMetrics,
+    ) -> anyhow::Result<Rc<CachedGlyph>> {
+        let fa_lock = "\u{f023}";
+        let line = Line::from_text(fa_lock, attrs, 0, None);
+        let cluster = line.cluster(None);
+        let first_cluster = cluster
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("lock indicator produced empty cluster"))?;
+        let shape_info =
+            self.cached_cluster_shape(style, first_cluster, gl_state, font, metrics, None)?;
+        let first_glyph = shape_info
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("lock indicator glyph shaping produced no glyphs"))?;
+        Ok(Rc::clone(&first_glyph.glyph))
+    }
+
+    pub fn populate_block_quad(
+        &self,
+        block: BlockKey,
+        gl_state: &dyn ChromeTarget,
+        quads: &mut dyn QuadAllocator,
+        pos_x: f32,
+        params: &RenderScreenLineParams,
+        hsv: Option<config::HsbTransform>,
+        glyph_color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let sprite = gl_state
+            .glyph_cache()
+            .borrow_mut()
+            .cached_block(block, &params.render_metrics)?
+            .texture_coords();
+
+        let mut quad = quads.allocate()?;
+        let cell_width = params.render_metrics.cell_size.width as f32;
+        let cell_height = params.render_metrics.cell_size.height as f32;
+        let pos_y = (self.dimensions.pixel_height as f32 / -2.) + params.top_pixel_y;
+        quad.set_position(pos_x, pos_y, pos_x + cell_width, pos_y + cell_height);
+        quad.set_hsv(hsv);
+        quad.set_fg_color(glyph_color);
+        quad.set_texture(sprite);
+        quad.set_has_color(false);
+        Ok(())
+    }
+
+    /// Render iTerm2 style image attributes
+    pub fn populate_image_quad(
+        &self,
+        image: &termwiz::image::ImageCell,
+        gl_state: &dyn ChromeTarget,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        cell_idx: usize,
+        params: &RenderScreenLineParams,
+        hsv: Option<config::HsbTransform>,
+        glyph_color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if self.allow_images == AllowImage::No {
+            return Ok(());
+        }
+
+        let Some((texture_left, texture_top, texture_right, texture_bottom)) =
+            canonical_image_texture_region(image.top_left(), image.bottom_right())
+        else {
+            // ImageCell is directly serde-capable, and NotNan deliberately
+            // permits infinities. Keep malformed peer geometry away from both
+            // decoded-image admission and atlas/shader coordinate arithmetic.
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_texture_region",
+            )
+            .increment(1);
+            return Ok(());
+        };
+
+        let image_padding = image.padding();
+        if !image_padding_fits_cell(
+            image_padding,
+            params.render_metrics.cell_size.width,
+            params.render_metrics.cell_size.height,
+        ) {
+            // Padding is transported over the mux wire and can originate from
+            // a different cell geometry. Reject it before decoded-image cache
+            // admission or quad allocation, so an invalid remote cell cannot
+            // trigger image work or inflate the next frame's GPU buffers.
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_padding",
+            )
+            .increment(1);
+            return Ok(());
+        }
+
+        let Some(padding) = image_cache_padding_for_cell(
+            params.render_metrics.cell_size.width,
+            params.render_metrics.cell_size.height,
+        ) else {
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_cell_geometry",
+            )
+            .increment(1);
+            return Ok(());
+        };
+
+        let (sprite, next_due, load_state) = gl_state
+            .glyph_cache()
+            .borrow_mut()
+            .cached_image(image.image_data(), Some(padding), self.allow_images)
+            .context("cached_image")?;
+        self.update_next_frame_time(next_due);
+        self.note_image_load_state(load_state, next_due);
+        if load_state != crate::glyphcache::LoadState::Loaded {
+            return Ok(());
+        }
+        let width = sprite.coords.size.width;
+        let height = sprite.coords.size.height;
+
+        // We *could* call sprite.texture.to_texture_coords() here,
+        // but since that takes integer pixel coordinates, we'd
+        // lose precision and end up with visual artifacts.
+        // Instead, we compute the texture coords here in floating point.
+
+        let texture_width = sprite.texture.width() as f32;
+        let texture_height = sprite.texture.height() as f32;
+        let origin = TextureCoord::new(
+            (sprite.coords.origin.x as f32 + (texture_left * width as f32)) / texture_width,
+            (sprite.coords.origin.y as f32 + (texture_top * height as f32)) / texture_height,
+        );
+
+        let size = TextureSize::new(
+            (texture_right - texture_left) * width as f32 / texture_width,
+            (texture_bottom - texture_top) * height as f32 / texture_height,
+        );
+
+        let texture_rect = TextureRect::new(origin, size);
+
+        let mut quad = layers.allocate(layer_num)?;
+        let cell_width = params.render_metrics.cell_size.width as f32;
+        let cell_height = params.render_metrics.cell_size.height as f32;
+        let pos_y = (self.dimensions.pixel_height as f32 / -2.) + params.top_pixel_y;
+
+        let pos_x = (self.dimensions.pixel_width as f32 / -2.)
+            + params.left_pixel_x
+            + (cell_idx as f32 * cell_width);
+
+        let (padding_left, padding_top, padding_right, padding_bottom) = image_padding;
+
+        quad.set_position(
+            pos_x + padding_left as f32,
+            pos_y + padding_top as f32,
+            pos_x + cell_width - padding_right as f32,
+            pos_y + cell_height - padding_bottom as f32,
+        );
+        quad.set_hsv(hsv);
+        quad.set_fg_color(glyph_color);
+        quad.set_texture(texture_rect);
+        quad.set_has_color(true);
+
+        Ok(())
+    }
+
+    fn ensure_min_contrast(&self, fg_color: LinearRgba, bg_color: LinearRgba) -> LinearRgba {
+        match self.config.text_min_contrast_ratio {
+            Some(ratio) => fg_color
+                .ensure_contrast_ratio(&bg_color, ratio)
+                .unwrap_or(fg_color),
+            None => fg_color,
+        }
+    }
+
+    pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {
+        if params.cursor.is_some() {
+            if let Some(bg_color_mix) = self.get_intensity_if_bell_target_ringing(
+                params.pane.expect("cursor only set if pane present"),
+                params.config,
+                VisualBellTarget::CursorColor,
+            ) {
+                let (fg_color, bg_color) = if self.use_reverse_video_cursor(&params) {
+                    (params.bg_color, params.fg_color)
+                } else {
+                    (params.cursor_fg, params.cursor_bg)
+                };
+
+                let fg_color = self.ensure_min_contrast(fg_color, bg_color);
+
+                // interpolate between the background color
+                // and the the target color
+                let bg_color_alt = params
+                    .config
+                    .resolved_palette
+                    .visual_bell
+                    .map(|c| c.to_linear())
+                    .unwrap_or(fg_color);
+
+                return ComputeCellFgBgResult {
+                    fg_color,
+                    fg_color_alt: fg_color,
+                    fg_color_mix: 0.,
+                    bg_color,
+                    bg_color_alt,
+                    bg_color_mix,
+                    cursor_shape: Some(CursorShape::Default),
+                    cursor_border_color: bg_color,
+                    cursor_border_color_alt: bg_color_alt,
+                    cursor_border_mix: bg_color_mix,
+                };
+            }
+
+            let dead_key_or_leader =
+                self.dead_key_status != DeadKeyStatus::None || self.leader_is_active();
+
+            if dead_key_or_leader && params.is_active_pane {
+                let (fg_color, bg_color) = if self.use_reverse_video_cursor(&params) {
+                    (params.bg_color, params.fg_color)
+                } else {
+                    (params.cursor_fg, params.cursor_bg)
+                };
+
+                let fg_color = self.ensure_min_contrast(fg_color, bg_color);
+
+                let color = params
+                    .config
+                    .resolved_palette
+                    .compose_cursor
+                    .map(|c| c.to_linear())
+                    .unwrap_or(bg_color);
+
+                return ComputeCellFgBgResult {
+                    fg_color,
+                    fg_color_alt: fg_color,
+                    fg_color_mix: 0.,
+                    bg_color,
+                    bg_color_alt: bg_color,
+                    bg_color_mix: 0.,
+                    cursor_shape: Some(CursorShape::Default),
+                    cursor_border_color: color,
+                    cursor_border_color_alt: color,
+                    cursor_border_mix: 0.,
+                };
+            }
+        }
+
+        let (cursor_shape, visibility) = match params.cursor {
+            Some(cursor) => (
+                params
+                    .config
+                    .default_cursor_style
+                    .effective_shape(cursor.shape),
+                cursor.visibility,
+            ),
+            _ => (CursorShape::default(), CursorVisibility::Hidden),
+        };
+
+        let focused_and_active = self.focused.is_some() && params.is_active_pane;
+
+        let (fg_color, bg_color, cursor_bg) = match (
+            params.selected,
+            focused_and_active,
+            cursor_shape,
+            visibility,
+        ) {
+            // Selected text overrides colors
+            (true, _, _, CursorVisibility::Hidden) => (
+                params.selection_fg.when_fully_transparent(params.fg_color),
+                params.selection_bg,
+                params.cursor_bg,
+            ),
+            // block Cursor cell overrides colors
+            (
+                _,
+                true,
+                CursorShape::BlinkingBlock | CursorShape::SteadyBlock,
+                CursorVisibility::Visible,
+            ) => {
+                if self.use_reverse_video_cursor(&params) {
+                    (params.bg_color, params.fg_color, params.fg_color)
+                } else {
+                    (
+                        params.cursor_fg.when_fully_transparent(params.fg_color),
+                        params.cursor_bg,
+                        params.cursor_bg,
+                    )
+                }
+            }
+            (
+                _,
+                true,
+                CursorShape::BlinkingUnderline
+                | CursorShape::SteadyUnderline
+                | CursorShape::BlinkingBar
+                | CursorShape::SteadyBar,
+                CursorVisibility::Visible,
+            ) => {
+                if self.use_reverse_video_cursor(&params) {
+                    (params.fg_color, params.bg_color, params.fg_color)
+                } else {
+                    (params.fg_color, params.bg_color, params.cursor_bg)
+                }
+            }
+            // Normally, render the cell as configured (or if the window is unfocused)
+            _ => (params.fg_color, params.bg_color, params.cursor_border_color),
+        };
+
+        let fg_color = self.ensure_min_contrast(fg_color, bg_color);
+
+        let blinking = params.cursor.is_some()
+            && params.is_active_pane
+            && cursor_shape.is_blinking()
+            && params.config.cursor_blink_rate != 0
+            && self.focused.is_some();
+
+        let mut fg_color_alt = fg_color;
+        let bg_color_alt = bg_color;
+        let mut fg_color_mix = 0.;
+        let bg_color_mix = 0.;
+        let mut cursor_border_color_alt = cursor_bg;
+        let mut cursor_border_mix = 0.;
+
+        if blinking {
+            let mut color_ease = self.cursor_blink_state.borrow_mut();
+            color_ease.update_start(self.prev_cursor.last_cursor_movement());
+            let (intensity, next) = self.blink_intensity(&mut color_ease);
+
+            cursor_border_mix = intensity;
+            cursor_border_color_alt = params.bg_color;
+
+            if matches!(
+                cursor_shape,
+                CursorShape::BlinkingBlock | CursorShape::SteadyBlock,
+            ) {
+                fg_color_alt = params.fg_color;
+                fg_color_mix = intensity;
+            }
+
+            self.update_next_frame_time(Some(next));
+        }
+
+        ComputeCellFgBgResult {
+            fg_color,
+            fg_color_alt,
+            bg_color,
+            bg_color_alt,
+            fg_color_mix,
+            bg_color_mix,
+            cursor_border_color: cursor_bg,
+            cursor_border_color_alt,
+            cursor_border_mix,
+            cursor_shape: if visibility == CursorVisibility::Visible {
+                match cursor_shape {
+                    CursorShape::BlinkingBlock | CursorShape::SteadyBlock if focused_and_active => {
+                        Some(CursorShape::Default)
+                    }
+                    // When not focused, convert bar to block to make it more visually
+                    // distinct from the focused bar in another pane
+                    _shape if !focused_and_active => Some(CursorShape::SteadyBlock),
+                    shape => Some(shape),
+                }
+            } else {
+                None
+            },
+        }
+    }
+
+    fn use_reverse_video_cursor(&self, params: &ComputeCellFgBgParams) -> bool {
+        should_use_reverse_video_cursor(
+            self.config.force_reverse_video_cursor,
+            self.config.reverse_video_cursor_min_contrast,
+            params.cursor_is_default_color,
+            params.fg_color,
+            params.bg_color,
+        )
+    }
+
+    fn glyph_infos_to_glyphs(
+        &self,
+        style: &TextStyle,
+        glyph_cache: &mut GlyphCache,
+        infos: &[GlyphInfo],
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+    ) -> anyhow::Result<Vec<Rc<CachedGlyph>>> {
+        let mut glyphs = Vec::with_capacity(infos.len());
+        let mut iter = infos.iter().peekable();
+        while let Some(info) = iter.next() {
+            if self.config.custom_block_glyphs {
+                if info.only_char.and_then(BlockKey::from_char).is_some() {
+                    // Don't bother rendering the glyph from the font, as it can
+                    // have incorrect advance metrics.
+                    // Instead, just use our pixel-perfect cell metrics
+                    glyphs.push(Rc::new(CachedGlyph {
+                        brightness_adjust: 1.0,
+                        has_color: false,
+                        texture: None,
+                        x_advance: PixelLength::new(metrics.cell_size.width as f64),
+                        x_offset: PixelLength::zero(),
+                        y_offset: PixelLength::zero(),
+                        bearing_x: PixelLength::zero(),
+                        bearing_y: PixelLength::zero(),
+                        scale: 1.0,
+                    }));
+                    continue;
+                }
+            }
+
+            let followed_by_space = match iter.peek() {
+                Some(next_info) => next_info.is_space,
+                None => false,
+            };
+
+            glyphs.push(glyph_cache.cached_glyph(
+                info,
+                &style,
+                followed_by_space,
+                font,
+                metrics,
+                info.num_cells,
+            )?);
+        }
+        Ok(glyphs)
+    }
+
+    /// Shape the printable text from a cluster
+    fn cached_cluster_shape(
+        &self,
+        style: &TextStyle,
+        cluster: &CellCluster,
+        gl_state: &dyn ChromeTarget,
+        font: Option<&Rc<LoadedFont>>,
+        metrics: &RenderMetrics,
+        paragraph_context: Option<(&str, Range<usize>)>,
+    ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
+        let shape_resolve_start = Instant::now();
+        let font = match font {
+            Some(font) => Rc::clone(font),
+            None => self.fonts.resolve_font(style)?,
+        };
+        let key = BorrowedShapeCacheKey::new(style, font.id(), cluster, paragraph_context.clone());
+        let (shape_text, paragraph_range) = match paragraph_context {
+            Some((text, range)) => (text, Some(range)),
+            None => (cluster.text.as_str(), None),
+        };
+        let shape = || -> anyhow::Result<(Vec<GlyphInfo>, Rc<Vec<ShapedInfo>>)> {
+            let fallback_completion = self.fallback_font_completion();
+
+            let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
+            let presentation_width = match paragraph_byte_offset {
+                Some(offset) => PresentationWidth::with_cluster_and_byte_offset(cluster, offset),
+                None => PresentationWidth::with_cluster(cluster),
+            };
+
+            let mut info = font
+                .shape(
+                    shape_text,
+                    fallback_completion,
+                    BlockKey::filter_out_synthetic,
+                    Some(cluster.presentation),
+                    cluster.direction,
+                    paragraph_range.clone(),
+                    Some(&presentation_width),
+                )
+                .context("shaper error")?;
+            if let Some(offset) = paragraph_byte_offset {
+                rebase_glyph_clusters(&mut info, offset)?;
+            }
+            let glyphs = self.glyph_infos_to_glyphs(
+                style,
+                &mut gl_state.glyph_cache().borrow_mut(),
+                &info,
+                &font,
+                metrics,
+            )?;
+            let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
+            Ok((info, shaped))
+        };
+        let mut fresh = None;
+        let cached = resolve_cached_shape(&self.shape_cache, key, || {
+            let (infos, glyphs) = shape()?;
+            fresh = Some(glyphs);
+            Ok(CachedShape::new(infos))
+        })?;
+        let mut glyph_cache = gl_state.glyph_cache().borrow_mut();
+        let glyph_info = if let Some(glyphs) = fresh {
+            glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+            glyphs
+        } else if let Some(glyphs) = glyph_cache.shape_binding(cached.id()) {
+            glyphs
+        } else {
+            // The bindings died with a rebuilt atlas (or were evicted);
+            // resolve only the sprites from the kept HarfBuzz output. This
+            // now also applies to exact paragraph-context cache hits.
+            let infos = cached.infos();
+            let glyphs =
+                self.glyph_infos_to_glyphs(style, &mut glyph_cache, infos, &font, metrics)?;
+            let glyphs = Rc::new(ShapedInfo::process(infos, &glyphs));
+            glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+            glyphs
+        };
+        drop(glyph_cache);
+        metrics::histogram!("cached_cluster_shape").record(shape_resolve_start.elapsed());
+        log::trace!(
+            "shape_resolve for cluster len {} -> elapsed {:?}",
+            cluster.text.len(),
+            shape_resolve_start.elapsed()
+        );
+        Ok(glyph_info)
+    }
+
+    pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
+        // Do NOT clear `shape_cache` here: the cached HarfBuzz output is
+        // atlas-invariant, and the entries' sprite bindings live in the glyph
+        // cache, which the replacement below drops with the old atlas. Each
+        // surviving entry re-resolves its sprites (cheap) on next access
+        // instead of re-shaping (the slow HarfBuzz path). The invalidation
+        // bumps `shape_generation` and clears the generation-keyed line_to_ele
+        // / line_quad caches. This removes the full-screen re-shape that every
+        // atlas overflow used to trigger — the root cause of the progressive
+        // GUI slowdown.
+        //
+        // ft-yccm0.2.5: every other per-window holder of an `Rc<CachedGlyph>`
+        // (the line caches here, the fancy tab bar and modal elements below)
+        // lets go BEFORE the old glyph cache is replaced, so dropping that
+        // cache frees the old atlas texture instead of leaving it pinned.
+        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+        if let Some(render_state) = self.render_state.as_mut() {
+            render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
+        }
+        Ok(())
+    }
+
+    fn shape_hash_for_line(&mut self, pane_id: PaneId, line: &Line) -> [u8; 16] {
+        let seqno = line.current_seqno();
+        let mut id = None;
+        if let Some(cached_arc) = line.get_appdata() {
+            if let Some(line_state) = cached_arc.downcast_ref::<CachedLineState>() {
+                if let Some(hash) =
+                    line_state.shape_hash_if_fresh(&self.line_state_cache_owner, pane_id, line)
+                {
+                    // Touch the LRU
+                    self.line_state_cache.borrow_mut().get(&line_state.id);
+                    // Image hits keep existing metadata but compute live;
+                    // plain text hits never scan cells for attachments.
+                    return hash;
+                }
+                if line_state.belongs_to(&self.line_state_cache_owner, pane_id) {
+                    id.replace(line_state.id);
+                }
+            }
+        }
+
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let Some(id) =
+                    frankenterm_gui::take_monotonic_cache_id(&mut self.next_line_state_id)
+                else {
+                    // Cache identity can no longer advance. Compute directly
+                    // instead of wrapping into a live entry's identity.
+                    return line.compute_shape_hash();
+                };
+                id
+            }
+        };
+
+        let shape_hash = line.compute_shape_hash();
+
+        let state = Arc::new(CachedLineState {
+            id,
+            owner: Arc::clone(&self.line_state_cache_owner),
+            pane_id,
+            seqno,
+            shape_hash,
+            shape_hash_cacheable: !line.has_image_attachments(),
+        });
+
+        line.set_appdata(Arc::clone(&state));
+
+        self.line_state_cache.borrow_mut().put(id, state);
+        shape_hash
+    }
+}
+
+pub(super) fn resolve_fg_color_attr(
+    attrs: &CellAttributes,
+    fg: ColorAttribute,
+    palette: &ColorPalette,
+    config: &config::Config,
+    style: &config::TextStyle,
+) -> LinearRgba {
+    match fg {
+        wezterm_term::color::ColorAttribute::Default => {
+            if let Some(fg) = style.foreground {
+                fg.into()
+            } else {
+                palette.resolve_fg(attrs.foreground())
+            }
+        }
+        wezterm_term::color::ColorAttribute::PaletteIndex(idx)
+            if idx < 8 && config.bold_brightens_ansi_colors != BoldBrightening::No =>
+        {
+            // For compatibility purposes, switch to a brighter version
+            // of one of the standard ANSI colors when Bold is enabled.
+            // This lifts black to dark grey.
+            let idx = if attrs.intensity() == wezterm_term::Intensity::Bold {
+                idx + 8
+            } else {
+                idx
+            };
+
+            palette.resolve_fg(wezterm_term::color::ColorAttribute::PaletteIndex(idx))
+        }
+        _ => palette.resolve_fg(fg),
+    }
+    .to_linear()
+}
+
+fn update_next_frame_time(storage: &mut Option<Instant>, next_due: Option<Instant>) {
+    if let Some(next_due) = next_due {
+        match storage.take() {
+            None => {
+                storage.replace(next_due);
+            }
+            Some(t) if next_due < t => {
+                storage.replace(next_due);
+            }
+            Some(t) => {
+                storage.replace(t);
+            }
+        }
+    }
+}
+
+fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn same_hyperlink_or_both_none(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn should_use_reverse_video_cursor(
+    force_reverse_video_cursor: bool,
+    reverse_video_cursor_min_contrast: f32,
+    cursor_is_default_color: bool,
+    fg_color: LinearRgba,
+    bg_color: LinearRgba,
+) -> bool {
+    force_reverse_video_cursor
+        && cursor_is_default_color
+        && fg_color.contrast_ratio(&bg_color) >= reverse_video_cursor_min_contrast
+}
+
+/// Rebase shaper-emitted absolute byte clusters back into per-cluster local
+/// indices. Wezterm's shaper accepts a `paragraph_range` so harfbuzz can see
+/// surrounding text for bidi/script context (ft-6scm7); the resulting glyph
+/// clusters are absolute offsets into the paragraph buffer, but downstream
+/// code expects offsets relative to the cluster's own text. Subtract the
+/// paragraph_byte_offset from each cluster, erroring if the shaper emits a
+/// cluster that precedes the paragraph start (which would underflow).
+fn rebase_glyph_clusters(
+    info: &mut [GlyphInfo],
+    paragraph_byte_offset: usize,
+) -> anyhow::Result<()> {
+    for glyph in info {
+        let absolute_cluster = glyph.cluster as usize;
+        if absolute_cluster < paragraph_byte_offset {
+            return Err(anyhow!(
+                "shaper returned cluster {} before paragraph range start {}",
+                absolute_cluster,
+                paragraph_byte_offset
+            ));
+        }
+        glyph.cluster = (absolute_cluster - paragraph_byte_offset) as u32;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CachedLineState, LineStateCacheOwner, canonical_image_texture_region,
+        image_cache_padding_for_cell, image_padding_fits_cell, rebase_glyph_clusters,
+        resolve_cached_shape, resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
+        should_use_reverse_video_cursor, update_next_frame_time,
+    };
+    use config::{BoldBrightening, ConfigHandle, TextStyle};
+    use frankenterm_font::GlyphInfo;
+    use frankenterm_font::units::PixelLength;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use termwiz::hyperlink::Hyperlink;
+    use termwiz::image::TextureCoordinate;
+    use wezterm_term::color::{ColorAttribute, ColorPalette};
+    use wezterm_term::{CellAttributes, Intensity};
+    use window::color::LinearRgba;
+
+    /// ft-yccm0.1.7: the cache gauges count real LFU entries and grow with the
+    /// strings and shaping output an entry owns.
+    #[test]
+    fn render_cache_gauges_count_entries_and_track_owned_bytes() {
+        use super::{
+            LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShapeItem,
+            render_cache_gauge_values,
+        };
+        use crate::quad::HeapQuadAllocator;
+        use crate::shapecache::{BorrowedShapeCacheKey, CachedShape, ShapeCacheKey};
+        use config::{ConfigHandle, TextStyle};
+        use frankenterm_alloc::resource_ledger::CacheGauge;
+        use lfucache::LfuCache;
+        use ordered_float::NotNan;
+        use std::rc::Rc;
+
+        let config = ConfigHandle::default_config();
+        let mut shapes: LfuCache<ShapeCacheKey, Rc<CachedShape>> =
+            LfuCache::new("t.s.hit", "t.s.miss", |c| c.shape_cache_size, &config);
+        let mut lines: LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem> = LfuCache::new(
+            "t.l.hit",
+            "t.l.miss",
+            |c| c.line_to_ele_shape_cache_size,
+            &config,
+        );
+        let mut quads: LfuCache<LineQuadCacheKey, LineQuadCacheValue> =
+            LfuCache::new("t.q.hit", "t.q.miss", |c| c.line_quad_cache_size, &config);
+        let gauge = |values: &[(CacheGauge, u64); 6], wanted: CacheGauge| {
+            values
+                .iter()
+                .find(|(gauge, _)| *gauge == wanted)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+
+        let empty = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert!(empty.iter().all(|(_, value)| *value == 0), "{empty:?}");
+
+        let key = |text: &str| {
+            let clusters =
+                termwiz::surface::Line::from_text(text, &CellAttributes::default(), 0, None)
+                    .cluster(None);
+            BorrowedShapeCacheKey::new(&TextStyle::default(), 0, &clusters[0], None).to_owned()
+        };
+        let shaped = Rc::new(CachedShape::new(Vec::with_capacity(8)));
+        shapes.put(key("a"), Rc::clone(&shaped));
+        shapes.put(key("bb"), Rc::new(CachedShape::new(Vec::new())));
+        lines.put(
+            LineToEleShapeCacheKey {
+                shape_hash: [0; 16],
+                composing: Some((0, "compose".to_string())),
+                shape_generation: 3,
+            },
+            LineToElementShapeItem {
+                expires: None,
+                shaped: Rc::new(Vec::new()),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+            },
+        );
+        quads.put(
+            LineQuadCacheKey {
+                config_generation: 0,
+                shape_generation: 3,
+                quad_generation: 0,
+                composing: None,
+                selection: 0..0,
+                shape_hash: [0; 16],
+                top_pixel_y: NotNan::new(0.0).unwrap(),
+                left_pixel_x: NotNan::new(0.0).unwrap(),
+                pixel_width: NotNan::new(10.0).unwrap(),
+                phys_line_idx: 0,
+                pane_id: 1,
+                pane_is_active: true,
+                cursor: None,
+                reverse_video: false,
+                password_input: false,
+            },
+            LineQuadCacheValue {
+                expires: None,
+                layers: HeapQuadAllocator::default(),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+                hyperlinks: Vec::new(),
+            },
+        );
+
+        let populated = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert_eq!(gauge(&populated, CacheGauge::ShapeCacheEntries), 2);
+        assert_eq!(gauge(&populated, CacheGauge::LineShapeCacheEntries), 1);
+        assert_eq!(gauge(&populated, CacheGauge::LineQuadCacheEntries), 1);
+        let shape_bytes = gauge(&populated, CacheGauge::ShapeCacheBytes);
+        assert_eq!(
+            shape_bytes,
+            2 * std::mem::size_of::<ShapeCacheKey>() as u64
+                + 3
+                + shaped.accounted_bytes()
+                + std::mem::size_of::<CachedShape>() as u64,
+            "keys, their text and each entry's shaping output"
+        );
+        assert!(
+            shaped.accounted_bytes()
+                >= (std::mem::size_of::<CachedShape>()
+                    + 8 * std::mem::size_of::<frankenterm_font::shaper::GlyphInfo>())
+                    as u64
+        );
+        assert!(gauge(&populated, CacheGauge::LineShapeCacheBytes) >= "compose".len() as u64);
+        assert!(gauge(&populated, CacheGauge::LineQuadCacheBytes) > 0);
+    }
+
+    #[test]
+    fn shape_cache_retries_failed_resolution_and_keeps_successful_runs() {
+        use crate::glyphcache::GlyphCache;
+        use crate::shapecache::{
+            BorrowedShapeCacheKey, CachedShape, ShapeCacheKeyTrait, ShapedInfo,
+        };
+        use crate::utilsprites::RenderMetrics;
+        use frankenterm_font::{ClearShapeCache, FontConfiguration};
+        use lfucache::LfuCache;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use wezterm_bidi::Direction;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 1024).unwrap();
+        let style = fonts.config().font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let cache = RefCell::new(LfuCache::new(
+            "test.shape_cache.hit.rate",
+            "test.shape_cache.miss.rate",
+            |_| 8,
+            &fonts.config(),
+        ));
+        let clusters = termwiz::surface::Line::from_text("A", &CellAttributes::default(), 0, None)
+            .cluster(None);
+        let key = BorrowedShapeCacheKey::new(&style, font.id(), &clusters[0], None);
+        let attempts = Cell::new(0);
+        let mut resolve = || -> anyhow::Result<CachedShape> {
+            assert!(
+                cache.try_borrow_mut().is_ok(),
+                "resolution cannot retain an LFU borrow"
+            );
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // Explicit failure injection at the production resolution seam;
+                // subsequent resolution uses the real bundled shaper/rasterizer.
+                anyhow::bail!("transient shape-resolution test control");
+            }
+            let infos = font.blocking_shape("A", None, Direction::LeftToRight, None, None)?;
+            assert_eq!(infos.len(), 1);
+            assert_ne!(infos[0].glyph_pos, 0);
+            let glyph = glyph_cache.cached_glyph(
+                &infos[0],
+                &style,
+                false,
+                &font,
+                &metrics,
+                infos[0].num_cells,
+            )?;
+            assert!(
+                glyph.texture.is_some(),
+                "successful retry must produce real ink"
+            );
+            let shaped = ShapedInfo::process(&infos, &[glyph]);
+            let shape = CachedShape::new(infos);
+            glyph_cache.bind_shape(shape.id(), Rc::new(shaped));
+            Ok(shape)
+        };
+        let failed = resolve_cached_shape(&cache, key, &mut resolve).unwrap_err();
+        assert!(
+            failed
+                .to_string()
+                .contains("transient shape-resolution test control")
+        );
+        assert!(cache.borrow().is_empty());
+
+        let success = resolve_cached_shape(&cache, key, &mut resolve).unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(cache.borrow().len(), 1);
+        let hit =
+            resolve_cached_shape(&cache, key, || panic!("cache hit must not resolve")).unwrap();
+        assert!(Rc::ptr_eq(&success, &hit));
+        assert_eq!(hit.infos().len(), 1);
+        assert!(glyph_cache.shape_binding(hit.id()).is_some());
+
+        let other_clusters =
+            termwiz::surface::Line::from_text("B", &CellAttributes::default(), 0, None)
+                .cluster(None);
+        let other = BorrowedShapeCacheKey::new(&style, font.id(), &other_clusters[0], None);
+        let clear = resolve_cached_shape(&cache, other, || {
+            Err(anyhow::Error::new(ClearShapeCache {}).context("shaper error"))
+        })
+        .unwrap_err();
+        assert!(
+            clear
+                .root_cause()
+                .downcast_ref::<ClearShapeCache>()
+                .is_some()
+        );
+        assert!(
+            cache
+                .borrow_mut()
+                .get(&other as &dyn ShapeCacheKeyTrait)
+                .is_none()
+        );
+        assert_eq!(
+            cache.borrow().len(),
+            1,
+            "an unrelated failure must retain successful entries"
+        );
+
+        assert!(Rc::ptr_eq(
+            &success,
+            cache
+                .borrow_mut()
+                .get(&key as &dyn ShapeCacheKeyTrait)
+                .unwrap(),
+        ));
+    }
+
+    #[test]
+    fn contextual_shape_cache_matches_uncached_shaping_and_stays_bounded() {
+        use crate::shapecache::{BorrowedShapeCacheKey, CachedShape};
+        use frankenterm_font::FontConfiguration;
+        use frankenterm_font::shaper::PresentationWidth;
+        use lfucache::LfuCache;
+        use std::cell::{Cell, RefCell};
+        use std::ops::Range;
+        use std::rc::Rc;
+        use termwiz::cellcluster::CellCluster;
+        use termwiz::surface::Line;
+        use wezterm_bidi::Direction;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let style = fonts.config().font.clone();
+        let font = fonts.resolve_font(&style).unwrap();
+        let cache = RefCell::new(LfuCache::new(
+            "test.context_shape_cache.hit.rate",
+            "test.context_shape_cache.miss.rate",
+            |_| 4,
+            &fonts.config(),
+        ));
+        let mut cases = Vec::new();
+        for (text, context, rtl) in [
+            ("ffi", Some(("office ffi", 1..4)), false),
+            ("ffi", Some(("office ffi", 7..10)), false),
+            ("ffi", Some(("affice ffi", 1..4)), false),
+            ("ffi", None, false),
+            ("A\u{301}", Some(("XA\u{301}Y", 1..4)), false),
+            ("界", None, false),
+            ("😀", None, false),
+            ("لا", Some(("بلا", 2..6)), true),
+            ("لا", Some((" لا", 1..5)), true),
+        ] {
+            let mut cluster = Line::from_text(text, &CellAttributes::default(), 0, None)
+                .cluster(None)
+                .remove(0);
+            if rtl {
+                cluster.direction = Direction::RightToLeft;
+            }
+            cases.push((cluster, context));
+        }
+        let shape = |cluster: &CellCluster, context: Option<(&str, Range<usize>)>| {
+            let (text, range) = match context {
+                Some((text, range)) => (text, Some(range)),
+                None => (cluster.text.as_str(), None),
+            };
+            let width = match &range {
+                Some(range) => {
+                    PresentationWidth::with_cluster_and_byte_offset(cluster, range.start)
+                }
+                None => PresentationWidth::with_cluster(cluster),
+            };
+            let mut infos = font
+                .blocking_shape(
+                    text,
+                    Some(cluster.presentation),
+                    cluster.direction,
+                    range.clone(),
+                    Some(&width),
+                )
+                .unwrap();
+            if let Some(range) = range {
+                rebase_glyph_clusters(&mut infos, range.start).unwrap();
+            }
+            infos
+        };
+        // Settle font discovery before comparing cached output from a fixed
+        // chain. Production fallback invalidation clears this same LFU.
+        for (cluster, context) in &cases {
+            shape(cluster, context.clone());
+        }
+        let calls = Cell::new(0);
+        for (cluster, context) in &cases {
+            let key = BorrowedShapeCacheKey::new(&style, font.id(), cluster, context.clone());
+            let expected = shape(cluster, context.clone());
+            let cached = resolve_cached_shape(&cache, key, || {
+                calls.set(calls.get() + 1);
+                Ok(CachedShape::new(shape(cluster, context.clone())))
+            })
+            .unwrap();
+            assert_eq!(
+                cached.infos(),
+                expected.as_slice(),
+                "{cluster:?} {context:?}"
+            );
+            let hit = resolve_cached_shape(&cache, key, || panic!("exact contextual hit reshaped"))
+                .unwrap();
+            assert!(Rc::ptr_eq(&cached, &hit));
+            assert!(cache.borrow().len() <= 4);
+        }
+        assert_eq!(calls.get(), cases.len());
+        cache.borrow_mut().clear();
+        assert!(cache.borrow().is_empty());
+        let (cluster, context) = &cases[0];
+        let key = BorrowedShapeCacheKey::new(&style, font.id(), cluster, context.clone());
+        let rebuilt = resolve_cached_shape(&cache, key, || {
+            calls.set(calls.get() + 1);
+            Ok(CachedShape::new(shape(cluster, context.clone())))
+        })
+        .unwrap();
+        assert_eq!(rebuilt.infos(), shape(cluster, context.clone()).as_slice());
+        assert_eq!(
+            calls.get(),
+            cases.len() + 1,
+            "invalidation must resolve again"
+        );
+    }
+
+    fn glyph_with_cluster(cluster: u32) -> GlyphInfo {
+        GlyphInfo {
+            // The font crate keeps `text` only with debug assertions (its
+            // own `test` cfg is not set when this crate's tests build it).
+            #[cfg(debug_assertions)]
+            text: String::new(),
+            only_char: None,
+            is_space: false,
+            num_cells: 1,
+            cluster,
+            font_idx: 0,
+            glyph_pos: 0,
+            x_advance: PixelLength::new(0.0),
+            y_advance: PixelLength::new(0.0),
+            x_offset: PixelLength::new(0.0),
+            y_offset: PixelLength::new(0.0),
+        }
+    }
+
+    #[test]
+    fn image_padding_accepts_the_largest_non_empty_cell_interior() {
+        assert!(image_padding_fits_cell((4, 3, 5, 6), 10, 10));
+        assert!(image_padding_fits_cell((0, 0, 0, 0), 1, 1));
+        assert!(image_padding_fits_cell(
+            (u16::MAX, u16::MAX, u16::MAX, u16::MAX),
+            131_071,
+            131_071,
+        ));
+        assert!(!image_padding_fits_cell(
+            (u16::MAX, u16::MAX, u16::MAX, u16::MAX),
+            131_070,
+            131_070,
+        ));
+    }
+
+    #[test]
+    fn image_padding_rejects_each_empty_or_inverted_axis_boundary() {
+        assert!(!image_padding_fits_cell((10, 0, 0, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 10, 0), 10, 10));
+        assert!(!image_padding_fits_cell((4, 0, 6, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 10, 0, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 10), 10, 10));
+        assert!(!image_padding_fits_cell((0, 4, 0, 6), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 0), 0, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 0), 10, 0));
+    }
+
+    #[test]
+    fn image_cache_padding_uses_one_consistent_checked_cell_extent() {
+        assert_eq!(image_cache_padding_for_cell(1, 1), Some(1));
+        assert_eq!(image_cache_padding_for_cell(9, 16), Some(16));
+        assert_eq!(image_cache_padding_for_cell(17, 2), Some(32));
+        assert_eq!(image_cache_padding_for_cell(0, 10), None);
+        assert_eq!(image_cache_padding_for_cell(10, 0), None);
+        assert_eq!(image_cache_padding_for_cell(-1, -1), None);
+        assert_eq!(
+            image_cache_padding_for_cell(isize::MAX, 1),
+            Some(1usize << (usize::BITS - 1)),
+        );
+    }
+
+    #[test]
+    fn image_texture_region_accepts_and_canonicalizes_wire_tolerance() {
+        let tolerance = f32::EPSILON * 8.0;
+        assert_eq!(
+            canonical_image_texture_region(
+                TextureCoordinate::new_f32(-tolerance, -tolerance),
+                TextureCoordinate::new_f32(1.0 + tolerance, 1.0 + tolerance),
+            ),
+            Some((0.0, 0.0, 1.0, 1.0)),
+        );
+    }
+
+    #[test]
+    fn image_texture_region_rejects_non_finite_reversed_empty_and_out_of_range() {
+        let coordinate = |left, top, right, bottom| {
+            canonical_image_texture_region(
+                TextureCoordinate::new_f32(left, top),
+                TextureCoordinate::new_f32(right, bottom),
+            )
+        };
+        assert_eq!(coordinate(f32::INFINITY, 0.0, 1.0, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.0, f32::INFINITY, 1.0), None);
+        assert_eq!(coordinate(0.75, 0.0, 0.25, 1.0), None);
+        assert_eq!(coordinate(0.25, 0.0, 0.25, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.75, 1.0, 0.25), None);
+        assert_eq!(coordinate(0.0, 0.25, 1.0, 0.25), None);
+        let beyond_tolerance = f32::EPSILON * 16.0;
+        assert_eq!(coordinate(-beyond_tolerance, 0.0, 1.0, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.0, 1.0 + beyond_tolerance, 1.0), None);
+    }
+
+    #[test]
+    fn cached_line_state_requires_exact_termwindow_cache_owner() {
+        let owner = Arc::new(LineStateCacheOwner);
+        let same_owner = Arc::clone(&owner);
+        let foreign_owner = Arc::new(LineStateCacheOwner);
+        let state = CachedLineState {
+            id: 0,
+            owner,
+            pane_id: 41,
+            seqno: 7,
+            shape_hash: [0x5a; 16],
+            shape_hash_cacheable: true,
+        };
+
+        assert!(state.belongs_to(&same_owner, 41));
+        let line = wezterm_term::Line::from_text("text", &Default::default(), 7, None);
+        assert_eq!(
+            state.shape_hash_if_fresh(&same_owner, 41, &line),
+            Some([0x5a; 16])
+        );
+        assert_eq!(state.shape_hash_if_fresh(&foreign_owner, 41, &line), None);
+        assert_eq!(state.shape_hash_if_fresh(&same_owner, 42, &line), None);
+        let mut image_state = CachedLineState {
+            shape_hash_cacheable: false,
+            ..state
+        };
+        assert_eq!(
+            image_state.shape_hash_if_fresh(&same_owner, 41, &line),
+            Some(line.compute_shape_hash())
+        );
+        image_state.seqno = 6;
+        assert_eq!(
+            image_state.shape_hash_if_fresh(&same_owner, 41, &line),
+            None
+        );
+        assert!(
+            !image_state.belongs_to(&foreign_owner, 41),
+            "equal pane and numeric cache IDs from another TermWindow must not be accepted",
+        );
+        assert!(
+            !image_state.belongs_to(&same_owner, 42),
+            "one cache owner must still keep pane identities isolated",
+        );
+    }
+
+    /// ft-5qph8: missing acceptance-criterion coverage from ft-6scm7.
+    /// Pin the rebase math that translates absolute paragraph-buffer
+    /// cluster offsets back into per-cluster local indices.
+    #[test]
+    fn rebase_glyph_clusters_zero_offset_is_identity() {
+        let mut info = vec![
+            glyph_with_cluster(0),
+            glyph_with_cluster(3),
+            glyph_with_cluster(7),
+        ];
+        rebase_glyph_clusters(&mut info, 0).expect("zero offset must succeed");
+        assert_eq!(info[0].cluster, 0);
+        assert_eq!(info[1].cluster, 3);
+        assert_eq!(info[2].cluster, 7);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_subtracts_paragraph_offset() {
+        // Simulate the RTL+Indic shaping case from ft-6scm7: the cluster
+        // text starts at byte 4 of a longer paragraph, and harfbuzz emits
+        // absolute offsets 4, 6, 10. After rebase the offsets must be
+        // local to the cluster (0, 2, 6).
+        let mut info = vec![
+            glyph_with_cluster(4),
+            glyph_with_cluster(6),
+            glyph_with_cluster(10),
+        ];
+        rebase_glyph_clusters(&mut info, 4).expect("rebase must succeed");
+        assert_eq!(info[0].cluster, 0);
+        assert_eq!(info[1].cluster, 2);
+        assert_eq!(info[2].cluster, 6);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_boundary_equals_zero() {
+        let mut info = vec![glyph_with_cluster(12)];
+        rebase_glyph_clusters(&mut info, 12).expect("cluster == offset must succeed");
+        assert_eq!(info[0].cluster, 0);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_below_offset_returns_error() {
+        // Defensive: if the shaper ever emits a cluster index that
+        // precedes the paragraph range start (would underflow the
+        // `as usize - offset` subtraction), surface an explicit error
+        // rather than silently wrapping.
+        let mut info = vec![glyph_with_cluster(2)];
+        let err = rebase_glyph_clusters(&mut info, 5)
+            .expect_err("cluster < offset must error, not underflow");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("before paragraph range start"),
+            "error message should explain the underflow guard, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_empty_slice_is_noop() {
+        let mut info: Vec<GlyphInfo> = Vec::new();
+        rebase_glyph_clusters(&mut info, 99).expect("empty slice must succeed");
+        assert!(info.is_empty());
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_prefers_style_foreground_for_default_text() {
+        let attrs = CellAttributes::default();
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+        let style = TextStyle {
+            foreground: Some((0x12, 0x34, 0x56).into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_fg_color_attr(&attrs, ColorAttribute::Default, &palette, &config, &style),
+            LinearRgba::with_srgba(0x12, 0x34, 0x56, 0xff)
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_keeps_default_foreground_unbrightened_when_bold() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::PaletteIndex(1));
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::Default,
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(1))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_brightens_explicit_ansi_foreground_when_bold() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(1),
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(9))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_ignores_style_override_for_explicit_palette_color() {
+        let attrs = CellAttributes::default();
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+        let style = TextStyle {
+            foreground: Some((0x12, 0x34, 0x56).into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(4),
+                &palette,
+                &config,
+                &style,
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(4))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_keeps_explicit_bright_palette_index_when_bold() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(9),
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(9))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_respects_disabled_bold_brightening() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let mut config = config::Config::default_config();
+        config.bold_brightens_ansi_colors = BoldBrightening::No;
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(1),
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(1))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn update_next_frame_time_preserves_the_earliest_deadline() {
+        let base = Instant::now();
+        let first = base + Duration::from_millis(30);
+        let later = base + Duration::from_millis(60);
+        let earlier = base + Duration::from_millis(10);
+        let mut storage = None;
+
+        update_next_frame_time(&mut storage, Some(first));
+        assert_eq!(storage, Some(first));
+
+        update_next_frame_time(&mut storage, Some(later));
+        assert_eq!(storage, Some(first));
+
+        update_next_frame_time(&mut storage, Some(earlier));
+        assert_eq!(storage, Some(earlier));
+    }
+
+    #[test]
+    fn update_next_frame_time_ignores_absent_deadlines() {
+        let base = Instant::now();
+        let due = base + Duration::from_millis(25);
+        let mut storage = None;
+
+        update_next_frame_time(&mut storage, None);
+        assert_eq!(storage, None);
+
+        update_next_frame_time(&mut storage, Some(due));
+        update_next_frame_time(&mut storage, None);
+        assert_eq!(storage, Some(due));
+    }
+
+    #[test]
+    fn same_hyperlink_requires_the_same_arc_instance() {
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let alias = Arc::clone(&link);
+        let distinct = Arc::new(Hyperlink::new("https://example.com"));
+
+        assert!(same_hyperlink(Some(&link), Some(&alias)));
+        assert!(!same_hyperlink(Some(&link), Some(&distinct)));
+        assert!(!same_hyperlink(Some(&link), None));
+        assert!(!same_hyperlink(None, None));
+    }
+
+    #[test]
+    fn same_hyperlink_or_both_none_treats_absent_hover_as_unchanged() {
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let alias = Arc::clone(&link);
+        let distinct = Arc::new(Hyperlink::new("https://example.com"));
+
+        assert!(same_hyperlink_or_both_none(Some(&link), Some(&alias)));
+        assert!(!same_hyperlink_or_both_none(Some(&link), Some(&distinct)));
+        assert!(!same_hyperlink_or_both_none(Some(&link), None));
+        assert!(same_hyperlink_or_both_none(None, None));
+    }
+
+    #[test]
+    fn should_use_reverse_video_cursor_requires_feature_flag_and_default_color() {
+        let fg = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        let bg = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+
+        assert!(!should_use_reverse_video_cursor(false, 1.0, true, fg, bg));
+        assert!(!should_use_reverse_video_cursor(true, 1.0, false, fg, bg));
+        assert!(should_use_reverse_video_cursor(true, 1.0, true, fg, bg));
+    }
+
+    #[test]
+    fn should_use_reverse_video_cursor_requires_enough_contrast() {
+        let fg = LinearRgba::with_components(0.5, 0.5, 0.5, 1.0);
+        let bg = LinearRgba::with_components(0.5, 0.5, 0.5, 1.0);
+
+        assert!(!should_use_reverse_video_cursor(true, 1.1, true, fg, bg));
+    }
+
+    #[test]
+    fn should_use_reverse_video_cursor_accepts_exact_threshold_match() {
+        let fg = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        let bg = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+        let exact_threshold = fg.contrast_ratio(&bg);
+
+        assert!(should_use_reverse_video_cursor(
+            true,
+            exact_threshold,
+            true,
+            fg,
+            bg
+        ));
+    }
+}

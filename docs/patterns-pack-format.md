@@ -1,0 +1,281 @@
+# Pattern Pack File Format (v1)
+
+> Authoritative spec for the YAML / JSON / TOML files that
+> `crates/frankenterm-core/src/patterns.rs` parses into a
+> `PatternPack`. External rule authors and security auditors should
+> read this document — not the loader source — to learn the format.
+>
+> Tracked under bead **ft-b35tw**. The companion JSON Schema lives at
+> [`docs/json-schema/ft-pattern-pack.json`](json-schema/ft-pattern-pack.json).
+
+## At a glance
+
+A pattern pack is a single document with three required top-level
+fields plus optional submit-profile data and an optional supply-chain
+manifest:
+
+```yaml
+name: builtin:core
+version: "1.0.0"
+rules:
+  - id: codex.usage.reached
+    agent_type: codex
+    event_type: usage_limit
+    severity: warning
+    anchors: ["usage limit", "Please try again"]
+    regex: 'usage limit for the (?P<window_hours>\d+)h window'
+    description: Codex hit its rolling-window quota.
+    remediation: Wait for the quota to reset or rotate accounts.
+```
+
+Discovery rules:
+
+- **Built-in packs** are compiled into the binary and loaded
+  unconditionally.
+- **User packs** under `.ft/patterns/` (any depth) are auto-discovered
+  via `discover_packs_from_dir`. The discovery walker rejects any
+  symlink whose canonical target escapes the workspace root (fix
+  landed at commit `6ab52765`).
+- **Explicit packs** named in `[patterns]` config are loaded from
+  the documented path.
+
+Supported extensions (case-insensitive): `.yaml`, `.yml`, `.json`,
+`.toml`. The extension determines the parser; the on-disk content
+shape is the same across all three.
+
+## Top-level fields
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `name` | string | **MUST** | Pack identifier. Built-in packs use a `builtin:` prefix (`builtin:core`); user packs use a plain or namespaced name (`example.com:custom-rules`). MUST be non-empty after trimming. |
+| `version` | string | **MUST** | Pack version. Convention is semver-like (`"1.0.0"`) but the loader treats it as opaque; MUST be non-empty after trimming. |
+| `rules` | array of [Rule](#rule-fields) | **MUST** | The rule list. MAY be empty for an intentionally-stubbed pack, but every rule's `id` MUST be unique within the pack. |
+| `submit_profiles` | array of [SubmitProfile](#submit-profile-fields) | MAY | Verified-submit profiles carried as pack data. Every profile's `id` MUST be unique within the pack. |
+| `supply_chain` | object | MAY | Supply-chain verification manifest for user or extension packs. See [Supply-chain fields](#supply-chain-fields). |
+
+Unknown top-level fields are tolerated by the parser (default serde
+behavior) but are not part of the spec — authors SHOULD NOT rely on
+them being preserved.
+
+## Rule fields
+
+A rule (Rust: `RuleDef`) has the following fields. `MUST` /
+`SHOULD` / `MAY` follows RFC 2119 semantics.
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `id` | string | **MUST** | Stable rule identifier (e.g. `codex.usage.reached`). MUST be unique within the pack. Authors SHOULD use a `<agent>.<feature>.<event>` dotted convention. |
+| `agent_type` | enum | **MUST** | One of `codex`, `claude_code`, `gemini`, `wezterm`, `unknown`. Serde rename is `snake_case`. |
+| `event_type` | string | **MUST** | The event-type label emitted on match (e.g. `usage_limit`, `compaction_required`). MUST be non-empty after trimming. |
+| `severity` | enum | **MUST** | One of `info`, `warning`, `critical`. Serde rename is `snake_case`. |
+| `anchors` | array of string | **MUST** | Literal substrings used by the Aho-Corasick quick-reject pass. MUST include at least one non-empty anchor. |
+| `regex` | string | MAY | Optional extraction regex. Named captures (`(?P<name>...)`) are preferred; unnamed groups MAY be used but are not surfaced as `extracted` fields. |
+| `zone` | enum | MAY | Require `prompt`, `input`, or `output` semantic annotation. Missing, ambiguous, or different annotations suppress the rule. Omitted or null preserves unscoped matching. |
+| `description` | string | **MUST** | Human-readable description shown in `ft why <rule_id>` and the doctor pack listing. MUST be non-empty after trimming. |
+| `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. If present, MUST be non-empty after trimming. |
+| `workflow` | string | MAY | Workflow this rule starts (e.g. `handle_usage_limits`). `ft watch --auto-handle` starts a detection's workflow only if its rule names it here and that workflow accepts the detection; a rule without one starts nothing. Packs downgraded to observe-only have it removed. If present, MUST be non-empty after trimming. |
+| `manual_fix` | string | MAY | Manual fix instructions for environments where workflow execution is unavailable. Stored as `Option<String>`; absent in the serialized form when null. If present, MUST be non-empty after trimming. |
+| `preview_command` | string | MAY | Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation. If present, MUST be non-empty after trimming. |
+| `learn_more_url` | string | MAY | URL for additional documentation about this rule. If present, MUST be non-empty after trimming. |
+
+Unknown rule fields are tolerated by the parser (silent drop), but
+the conformance gate enforces the JSON Schema `additionalProperties`
+contract: pack files MUST NOT carry unknown rule fields. CI treats
+unknown rule fields as a build failure even though the lower-level
+serde parser can still deserialize them.
+
+### Semantic-zone filters
+
+A rule can opt into OSC 133 zone filtering, for example:
+
+```yaml
+name: local:build
+version: "1.0.0"
+rules:
+  - id: wezterm.local_build_failure
+    agent_type: wezterm
+    event_type: build.failed
+    severity: critical
+    anchors: ["error: could not compile"]
+    zone: output
+    description: A compiler failure inside a shell output region.
+```
+
+Unscoped rules retain their existing matching, overlap, and deduplication
+behavior. Built-in rules remain unscoped. An output-scoped rule cannot match
+text annotated as prompt or input, or text without an annotation. A rejected
+zone does not consume the rule's deduplication key. Regex lookarounds and
+anchors are evaluated inside the annotated region, so they cannot borrow a
+prefix from a different or unknown zone.
+
+The live capture path currently correlates the **entire captured segment**
+with a fresh semantic-zone snapshot. It accepts a type only when a zone
+contains the whole segment and matching zones agree on the type. It strips
+only trailing CR/LF for that comparison. Partial or mixed segments, ambiguous
+types, unavailable snapshots, and failed capture-authority revalidation stay
+unclassified. Cached snapshots are never used to enable scoped detection.
+
+This correlation does not provide exact render-coordinate or command-origin
+proof. An agent's quoted error can itself appear inside shell output; this
+filter does not remove that false positive. It is an opt-in matching filter,
+not action authorization. Current snapshots also lack a stable zone identity,
+so the live path deliberately does not join scoped matches across captured
+segments. Rules spanning two live deltas may therefore be missed.
+
+Embedding callers can use `PatternEngine::detect_with_context_in_zone` and
+`detect_with_context_and_trace_in_zone` to supply a known zone. They must call
+`DetectionContext::clear_zone_continuity` at each new zone, discontinuity, or
+uncertain boundary, including a new zone with the same type. Contiguous input
+inside the same known zone can then match across segments. Context-free
+`detect` and the existing unannotated context/trace APIs suppress scoped
+rules; they never assume that arbitrary input is output.
+
+## Submit profile fields
+
+`submit_profiles` is data for the verified-submit state machine. It
+keeps per-agent composer and progress heuristics in the same maintenance
+lane as detection rules, so third-party UI drift is handled by updating
+pack data and corpus fixtures rather than verifier code.
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `id` | string | **MUST** | Stable profile identifier, usually `<agent>.default`. MUST be non-empty, dot-separated, and whitespace-free. |
+| `agent_type` | enum | **MUST** | One of `codex`, `claude_code`, `gemini`. `unknown` and terminal-runtime agents do not have submit profiles; unknown agents intentionally resolve to no profile and downstream verification reports `verification_unavailable`. |
+| `version` | string | **MUST** | Profile data version recorded by durable submit receipts. MUST be non-empty after trimming. |
+| `anchors` | object | **MUST** | Required anchor sets for the verifier. Each set MUST contain at least one non-empty string. |
+| `remediation` | array | MAY | Optional data-only remediation steps with `when` and `action` strings. |
+
+Required `anchors` fields:
+
+| Field | Description |
+|-------|-------------|
+| `composer_nonempty` | Evidence that the composer/input box still contains pending text. |
+| `composer_cleared` | Evidence that submitted text left the composer and the agent accepted the send. |
+| `working_state` | Evidence that the agent is actively processing after submission. |
+| `queued_behind_operation` | Evidence that submission is blocked behind an approval, tool call, auth flow, or other operation. |
+| `crash_to_shell` | Evidence that the agent exited or crashed back to a shell/resume state. |
+
+## Supply-chain fields
+
+`supply_chain` mirrors the Rust `PatternPackSupplyChain` structure and
+is optional. When present, it has the following fields.
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `provenance.author` | string | **MUST** | Pack author or producing system. MUST be non-empty after trimming. |
+| `provenance.source` | string | **MUST** | Source repository, fixture path, or generator identifier. MUST be non-empty after trimming. |
+| `provenance.revision` | string | **MUST** | Source revision, release id, or reviewed snapshot id. MUST be non-empty after trimming. |
+| `fixture_hashes` | object | MAY | Map of fixture path to expected hash. Keys and values MUST be non-empty after trimming. Defaults to an empty map when omitted. |
+| `lint.passed` | boolean | **MUST** | Whether the pattern-pack lint gate passed. |
+| `lint.errors` | array of string | MAY | Lint errors retained with the manifest. Each item MUST be non-empty after trimming. Defaults to an empty list when omitted. |
+| `lint.warnings` | array of string | MAY | Lint warnings retained with the manifest. Each item MUST be non-empty after trimming. Defaults to an empty list when omitted. |
+| `regex_backtrack_budget` | integer | **MUST** | Backtracking budget declared for regex validation. |
+| `redaction_review.reviewer` | string | **MUST** | Reviewer or review system. MUST be non-empty after trimming. |
+| `redaction_review.reviewed_at` | string | **MUST** | Review timestamp or retained review id. MUST be non-empty after trimming. |
+| `redaction_review.approved` | boolean | **MUST** | Whether redaction review approved the pack. |
+| `compatibility_target` | string | **MUST** | Compatibility target, currently `frankenterm-patterns.v1`. MUST be non-empty after trimming. |
+| `rollout.stage` | string | **MUST** | Rollout stage name. MUST be non-empty after trimming. |
+| `rollout.dry_run_match_telemetry` | boolean | **MUST** | Whether dry-run match telemetry was collected. |
+| `rollout.observe_only_until_verified` | boolean | **MUST** | Whether actions must stay observe-only until verification passes. |
+| `signature` | object | MAY | Optional signature object with `algorithm`, non-empty `signer`, `payload_sha256` (`sha256:<hex>`), and `value` (`sha256:<hex>`). |
+
+## Validation
+
+`PatternPack::validate()` runs in two flavours:
+
+1. **Built-in pack validation** (default for packs loaded via
+   `[patterns]`). Each rule's regex is validated as Rust-regex
+   syntax; anchors are checked for non-emptiness; rule IDs are
+   checked for uniqueness within the pack.
+2. **User-pack validation** (`validate_as_user_pack`). Same rules
+   PLUS additional safety checks: rule IDs MUST start with a
+   namespace prefix (no bare `core.*` or `builtin:*` in user
+   packs); regexes MUST NOT contain unbounded backreferences
+   (`\1`+) that could enable catastrophic-backtracking DoS.
+3. **Submit profile validation**. Profile IDs are checked for
+   whitespace, dot-segment shape, duplicate IDs, supported coding-agent
+   type, reserved-prefix/agent consistency, non-empty version, non-empty
+   required anchor groups, and non-empty remediation fields.
+
+A pack that passes the JSON Schema check MAY still fail validation —
+the schema is a structural gate, not a semantic one.
+
+## Versioning policy
+
+The format itself does not (yet) carry a `format_version` field. The
+file format has been **additive-only since v1**:
+
+- New OPTIONAL rule fields (e.g. `manual_fix`, `preview_command`,
+  `learn_more_url` in recent commits) are backward-compatible.
+- New OPTIONAL top-level data fields such as `submit_profiles` are
+  backward-compatible because absent fields deserialize to empty data.
+- A REQUIRED field rename or removal is a breaking change and MUST
+  be guarded by a `format_version` field bump (deferred until the
+  first such change is needed).
+- Enum widening (new `agent_type` or `severity` variants) is a
+  compatibility break for the current first-party loader. The Rust
+  enums are serde-tagged without an `other` catch-all, so unknown
+  variants fail deserialization instead of being coerced to
+  `unknown`. The `unknown` agent type is a literal supported value,
+  not a fallback for unrecognized strings.
+
+When the first breaking change ships, this spec gains a
+`format_version` row in the top-level table; older packs continue to
+load by treating absent `format_version` as `1`.
+
+## Discovery + sandbox guarantees
+
+- `discover_packs_from_dir` (sandboxed via `sandbox_resolve_dir`)
+  rejects any path whose canonical resolution escapes the workspace
+  root. `..` traversal and symlink-escape are both blocked in a
+  single `fs::canonicalize` call followed by a prefix check
+  (commits `0239fbd6`, `37384b01`, `6ab52765`).
+- Pack files outside the discovery roots are loaded only when
+  named explicitly in `[patterns]` config; the loader does NOT
+  walk `$HOME` or system directories.
+- A malformed YAML/JSON/TOML file fails fast with
+  `PatternError::InvalidRule` carrying the parser error string;
+  the loader does NOT silently ignore unparseable files.
+
+## Reference fixtures
+
+`crates/frankenterm-core/tests/fixtures/pattern_packs/` ships a
+fixture corpus mirroring this spec:
+
+- `valid/minimal_pack.yaml` — smallest legal pack (one rule, only
+  required fields).
+- `valid/full_pack.yaml` — every documented field exercised at least
+  once.
+- `valid/multi_rule_pack.json` — multiple rules in JSON form.
+- `valid/supply_chain_pack.json` — optional supply-chain manifest in
+  JSON form.
+- `valid/toml_pack.toml` — TOML round-trip example.
+- `invalid/duplicate_rule_id.yaml` — two rules with the same `id`.
+- `invalid/missing_severity.yaml` — rule with no `severity`.
+- `invalid/empty_name.yaml` — pack with `name: ""`.
+
+The conformance test
+(`tests/conformance_pattern_pack_format.rs`) loads each valid
+fixture, validates against the JSON Schema, asserts a successful
+`PatternPack` parse + `validate()`, and confirms each invalid fixture
+fails with the documented error.
+
+## Coverage matrix
+
+The conformance test enumerates every Rule field below and asserts
+each is exercised by at least one valid fixture. New OPTIONAL
+fields landing in `RuleDef` without a fixture update fail the
+matrix check.
+
+The same conformance fixture also exercises every submit-profile field.
+`ft robot rules lint --fixtures --strict` additionally checks that every
+loaded submit profile has a complete `.submit-profile.json` corpus
+fixture covering the five required anchor states.
+
+## References
+
+- `crates/frankenterm-core/src/patterns.rs` — `PatternPack`, `RuleDef`, and `SubmitProfile`
+- `docs/json-schema/ft-pattern-pack.json` — companion JSON Schema
+- `tests/conformance_pattern_pack_format.rs` — CI gate
+- Sandbox commits: `6ab52765`, `0239fbd6`, `37384b01`
+- Bead: ft-b35tw

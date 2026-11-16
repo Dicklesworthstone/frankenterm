@@ -1,0 +1,67 @@
+name: quickstart
+description: "First-run pane discovery, capture, detection, and robot state demo"
+duration: "3s"
+metadata:
+  suite: demo_lab
+  suite_version: "1"
+  seed: "demo-lab-v1-quickstart-1001"
+  scenario_id: quickstart
+  redaction_tier: t1_standard
+  proof_category: conformance
+  live_services: "none"
+panes:
+  - id: 1001
+    title: "demo-shell"
+    domain: local
+    cwd: /tmp/frankenterm-demo
+    window_id: 0
+    tab_id: 0
+    cols: 100
+    rows: 28
+    initial_content: "$ ft demo quickstart\n"
+  - id: 1002
+    title: "demo-agent"
+    domain: local
+    cwd: /tmp/frankenterm-demo
+    window_id: 0
+    tab_id: 0
+    cols: 100
+    rows: 28
+    initial_content: "agent ready for first capture\n"
+events:
+  - at: "0.200s"
+    pane: 1001
+    action: append
+    content: "frankenterm demo: discovering panes\n"
+  - at: "0.400s"
+    pane: 1002
+    action: typing
+    content: "summarize active pane state"
+  - at: "0.700s"
+    pane: 1001
+    action: marker
+    name: pane_discovery_complete
+  - at: "1.000s"
+    pane: 1002
+    action: append
+    content: "detected prompt: ready\n"
+  - at: "1.300s"
+    pane: 1002
+    action: marker
+    name: structured_robot_state_emitted
+expectations:
+  - contains:
+      pane: 1001
+      text: "frankenterm demo: discovering panes"
+  - contains:
+      pane: 1001
+      text: "[MARKER:pane_discovery_complete]"
+  - contains:
+      pane: 1002
+      text: "[TYPING:summarize active pane state]"
+  - contains:
+      pane: 1002
+      text: "detected prompt: ready"
+  - contains:
+      pane: 1002
+      text: "[MARKER:structured_robot_state_emitted]"

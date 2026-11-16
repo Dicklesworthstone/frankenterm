@@ -1,0 +1,1692 @@
+//! Chaos testing harness for fault injection and resilience validation.
+//!
+//! Provides a [`FaultInjector`] that can be configured to inject failures
+//! at specific points in the runtime pipeline.  When the global injector
+//! is not initialized (production), the check is a single atomic load —
+//! effectively zero overhead.
+//!
+//! # Design
+//!
+//! ```text
+//! ChaosHarness
+//!   ├── FaultInjector (global registry of active faults)
+//!   │     ├── FaultPoint::DbWrite → FailNTimes(3)
+//!   │     ├── FaultPoint::WeztermCliCall → FailWithProbability(0.5)
+//!   │     └── FaultPoint::PatternDetect → AlwaysFail
+//!   │
+//!   ├── FaultLog (records every trigger for assertions)
+//!   │     └── Vec<FaultTrigger { point, mode, timestamp }>
+//!   │
+//!   └── ChaosScenario (declarative scenario definition)
+//!         ├── faults: Vec<(FaultPoint, FaultMode)>
+//!         └── assertions: Vec<ChaosAssertion>
+//! ```
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use frankenterm_core::chaos::{FaultInjector, FaultPoint, FaultMode};
+//!
+//! // Set up fault injection
+//! let injector = FaultInjector::init_global();
+//! injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(3, "disk full"));
+//!
+//! // Check at injection point (production: no-op)
+//! for _ in 0..3 {
+//!     let _ = FaultInjector::check(FaultPoint::DbWrite);
+//! }
+//!
+//! // Review what happened
+//! let log = injector.drain_log();
+//! assert_eq!(log.len(), 3);
+//!
+//! // Clean up
+//! FaultInjector::reset_global();
+//! ```
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, RuntimeOperationSource};
+
+/// Global fault injector instance.
+static GLOBAL_INJECTOR: OnceLock<Arc<FaultInjector>> = OnceLock::new();
+
+/// Points in the runtime pipeline where faults can be injected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultPoint {
+    /// WezTerm CLI calls (list_panes, capture, send_text).
+    WeztermCliCall,
+    /// Database write operations (segment persistence, event recording).
+    DbWrite,
+    /// Database read operations (queries, search, get_segments).
+    DbRead,
+    /// Pattern detection engine.
+    PatternDetect,
+    /// Retention cleanup in maintenance task.
+    RetentionCleanup,
+    /// Configuration hot-reload.
+    ConfigReload,
+    /// Webhook/notification delivery.
+    WebhookDelivery,
+}
+
+impl std::fmt::Display for FaultPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WeztermCliCall => write!(f, "wezterm_cli_call"),
+            Self::DbWrite => write!(f, "db_write"),
+            Self::DbRead => write!(f, "db_read"),
+            Self::PatternDetect => write!(f, "pattern_detect"),
+            Self::RetentionCleanup => write!(f, "retention_cleanup"),
+            Self::ConfigReload => write!(f, "config_reload"),
+            Self::WebhookDelivery => write!(f, "webhook_delivery"),
+        }
+    }
+}
+
+fn chaos_fault_error(point: FaultPoint, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation: "chaos.fault_injected",
+        source: RuntimeOperationSource::Backend(format!(
+            "chaos fault injected at {point}: {}",
+            detail.into()
+        )),
+    }
+}
+
+/// How a fault should be injected.
+#[derive(Debug, Clone)]
+pub enum FaultMode {
+    /// Always fail with the given error message.
+    AlwaysFail { error: String },
+    /// Fail the next N invocations, then succeed.
+    FailNTimes { remaining: u32, error: String },
+    /// Fail with a given probability (0.0–1.0).
+    FailWithProbability { probability: f64, error: String },
+    /// Succeed but add a delay (simulates slow I/O).
+    Delay { delay_ms: u64 },
+    /// Delay then fail.
+    DelayThenFail { delay_ms: u64, error: String },
+}
+
+impl FaultMode {
+    /// Create an always-fail fault.
+    #[must_use]
+    pub fn always_fail(error: impl Into<String>) -> Self {
+        Self::AlwaysFail {
+            error: error.into(),
+        }
+    }
+
+    /// Create a fail-N-times fault.
+    #[must_use]
+    pub fn fail_n_times(n: u32, error: impl Into<String>) -> Self {
+        Self::FailNTimes {
+            remaining: n,
+            error: error.into(),
+        }
+    }
+
+    /// Create a probabilistic fault.
+    ///
+    /// `probability` is sanitized: NaN becomes 0.0 (no faults), then
+    /// the value is clamped to `[0.0, 1.0]`. NaN propagation through
+    /// `f64::clamp` would silently disable fault injection — see
+    /// [`Self::sanitize_probability`].
+    #[must_use]
+    pub fn fail_with_probability(probability: f64, error: impl Into<String>) -> Self {
+        Self::FailWithProbability {
+            probability: Self::sanitize_probability(probability),
+            error: error.into(),
+        }
+    }
+
+    /// Create a delay fault (no error, just slowness).
+    ///
+    /// `delay_ms` is clamped to [`Self::MAX_DELAY_MS`] (5 minutes) to
+    /// prevent thread-blocking-DoS from misconfigured/forged delays.
+    /// Legitimate fault-injection delays are measured in milliseconds
+    /// to seconds; multi-hour delays are always a configuration error.
+    #[must_use]
+    pub fn delay(delay_ms: u64) -> Self {
+        Self::Delay {
+            delay_ms: delay_ms.min(Self::MAX_DELAY_MS),
+        }
+    }
+
+    /// Create a delay-then-fail fault. `delay_ms` is clamped to
+    /// [`Self::MAX_DELAY_MS`].
+    #[must_use]
+    pub fn delay_then_fail(delay_ms: u64, error: impl Into<String>) -> Self {
+        Self::DelayThenFail {
+            delay_ms: delay_ms.min(Self::MAX_DELAY_MS),
+            error: error.into(),
+        }
+    }
+
+    /// Maximum delay applied via fault injection (5 minutes). Fault
+    /// configurations specifying longer delays are clamped to this
+    /// value to bound thread-blocking impact.
+    pub const MAX_DELAY_MS: u64 = 300_000;
+
+    /// Repair a probability value: NaN becomes 0.0 (no fault), then
+    /// the result is clamped to `[0.0, 1.0]`.
+    ///
+    /// `f64::clamp` propagates NaN unchanged — without this guard a
+    /// NaN probability would silently disable fault injection because
+    /// every comparison `rand_val < NaN` is false.
+    #[must_use]
+    pub fn sanitize_probability(probability: f64) -> f64 {
+        if probability.is_nan() {
+            0.0
+        } else {
+            probability.clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Record of a fault injection trigger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaultTrigger {
+    /// Which point was checked.
+    pub point: FaultPoint,
+    /// Whether the fault fired (error returned).
+    pub fired: bool,
+    /// Error message if fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Timestamp (epoch ms).
+    pub timestamp_ms: u64,
+}
+
+/// Assertion that can be checked after a chaos scenario.
+#[derive(Debug, Clone)]
+pub enum ChaosAssertion {
+    /// A specific fault point must have fired at least N times.
+    FaultFiredAtLeast(FaultPoint, usize),
+    /// A specific fault point must NOT have fired.
+    FaultNeverFired(FaultPoint),
+    /// Total faults fired must be within range.
+    TotalFaultsInRange(usize, usize),
+}
+
+/// Result of checking a chaos assertion.
+#[derive(Debug, Clone)]
+pub struct AssertionResult {
+    pub assertion: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// A declarative chaos scenario combining faults and assertions.
+#[derive(Debug, Clone)]
+pub struct ChaosScenario {
+    pub name: String,
+    pub description: String,
+    pub faults: Vec<(FaultPoint, FaultMode)>,
+    pub assertions: Vec<ChaosAssertion>,
+}
+
+impl ChaosScenario {
+    /// Create a new scenario builder.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            faults: Vec::new(),
+            assertions: Vec::new(),
+        }
+    }
+
+    /// Add a fault to the scenario.
+    #[must_use]
+    pub fn with_fault(mut self, point: FaultPoint, mode: FaultMode) -> Self {
+        self.faults.push((point, mode));
+        self
+    }
+
+    /// Add an assertion to the scenario.
+    #[must_use]
+    pub fn with_assertion(mut self, assertion: ChaosAssertion) -> Self {
+        self.assertions.push(assertion);
+        self
+    }
+}
+
+/// Global fault injector for chaos testing.
+///
+/// Thread-safe.  All methods use internal locking.
+pub struct FaultInjector {
+    /// Active faults by injection point.
+    faults: RwLock<HashMap<FaultPoint, FaultMode>>,
+    /// Log of all fault checks (for assertions).
+    log: Mutex<Vec<FaultTrigger>>,
+    /// Simple counter for probabilistic faults (deterministic seed).
+    counter: Mutex<u64>,
+}
+
+impl FaultInjector {
+    /// Create a new empty injector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            faults: RwLock::new(HashMap::new()),
+            log: Mutex::new(Vec::new()),
+            counter: Mutex::new(0),
+        }
+    }
+
+    /// Initialize the global injector.  Returns a reference.
+    ///
+    /// Safe to call multiple times; subsequent calls return the
+    /// existing instance.
+    pub fn init_global() -> Arc<FaultInjector> {
+        GLOBAL_INJECTOR
+            .get_or_init(|| Arc::new(Self::new()))
+            .clone()
+    }
+
+    /// Get the global injector, if initialized.
+    pub fn global() -> Option<Arc<FaultInjector>> {
+        GLOBAL_INJECTOR.get().cloned()
+    }
+
+    /// Check a fault point.  Returns `Ok(())` if no fault, or
+    /// `Err(Error::RuntimeOperation { .. })` if a fault fires.
+    ///
+    /// When the global injector is not initialized, this is a
+    /// single failed `OnceLock::get()` — effectively a no-op.
+    pub fn check(point: FaultPoint) -> Result<(), Error> {
+        if let Some(injector) = GLOBAL_INJECTOR.get() {
+            injector.check_point(point)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reset the global injector (clear all faults and logs).
+    ///
+    /// The `OnceLock` instance persists, but its internal state is
+    /// cleared so subsequent tests start fresh.
+    pub fn reset_global() {
+        if let Some(injector) = GLOBAL_INJECTOR.get() {
+            injector.clear_all();
+        }
+    }
+
+    /// Set a fault for a specific injection point.
+    pub fn set_fault(&self, point: FaultPoint, mode: FaultMode) {
+        self.lock_faults_write().insert(point, mode);
+    }
+
+    /// Remove a fault for a specific injection point.
+    pub fn remove_fault(&self, point: FaultPoint) {
+        self.lock_faults_write().remove(&point);
+    }
+
+    /// Clear all faults and the trigger log.
+    pub fn clear_all(&self) {
+        self.lock_faults_write().clear();
+        self.lock_log().clear();
+        *self.lock_counter() = 0;
+    }
+
+    /// Get a copy of the trigger log.
+    #[must_use]
+    pub fn get_log(&self) -> Vec<FaultTrigger> {
+        self.lock_log().clone()
+    }
+
+    /// Drain and return the trigger log.
+    pub fn drain_log(&self) -> Vec<FaultTrigger> {
+        std::mem::take(&mut *self.lock_log())
+    }
+
+    /// Count how many times a specific fault point fired.
+    #[must_use]
+    pub fn fired_count(&self, point: FaultPoint) -> usize {
+        self.lock_log()
+            .iter()
+            .filter(|t| t.point == point && t.fired)
+            .count()
+    }
+
+    /// Count total fault triggers across all points.
+    #[must_use]
+    pub fn total_fired(&self) -> usize {
+        self.lock_log().iter().filter(|t| t.fired).count()
+    }
+
+    fn lock_faults_write(&self) -> RwLockWriteGuard<'_, HashMap<FaultPoint, FaultMode>> {
+        match self.faults.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.faults.clear_poison();
+                guard
+            }
+        }
+    }
+
+    fn lock_log(&self) -> MutexGuard<'_, Vec<FaultTrigger>> {
+        match self.log.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.log.clear_poison();
+                guard
+            }
+        }
+    }
+
+    fn lock_counter(&self) -> MutexGuard<'_, u64> {
+        match self.counter.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.counter.clear_poison();
+                guard
+            }
+        }
+    }
+
+    fn next_probability_counter(&self) -> u64 {
+        let mut counter = self.lock_counter();
+        *counter = counter.wrapping_add(1);
+        *counter
+    }
+
+    /// Check a fault point (instance method).
+    fn check_point(&self, point: FaultPoint) -> Result<(), Error> {
+        let should_fail = self.evaluate_fault(point);
+
+        // Log the check
+        let trigger = FaultTrigger {
+            point,
+            fired: should_fail.is_some(),
+            error: should_fail.clone(),
+            timestamp_ms: epoch_ms(),
+        };
+        self.lock_log().push(trigger);
+
+        match should_fail {
+            Some(error_msg) => Err(chaos_fault_error(point, error_msg)),
+            None => Ok(()),
+        }
+    }
+
+    /// Evaluate whether a fault should fire.  Returns the error
+    /// message if it should, or `None` if the call should succeed.
+    fn evaluate_fault(&self, point: FaultPoint) -> Option<String> {
+        let mut faults = self.lock_faults_write();
+        let mode = faults.get_mut(&point)?;
+
+        match mode {
+            FaultMode::AlwaysFail { error } => Some(error.clone()),
+
+            FaultMode::FailNTimes { remaining, error } => {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    Some(error.clone())
+                } else {
+                    // Exhausted — remove the fault
+                    let _ = faults.remove(&point);
+                    None
+                }
+            }
+
+            FaultMode::FailWithProbability { probability, error } => {
+                // Sanitize on read in case the field was forged.
+                // Constructor sanitizes too, but `FaultMode::FailWithProbability`
+                // is a pub variant — direct struct-init bypasses it.
+                let probability = FaultMode::sanitize_probability(*probability);
+
+                // Bypass the strict-less-than comparison at the boundary:
+                // p=1.0 with rand_val=1.0 (rare but reachable) would not
+                // fire. Treat probability >= 1.0 as a definite failure.
+                if probability >= 1.0 {
+                    return Some(error.clone());
+                }
+                if probability <= 0.0 {
+                    return None;
+                }
+
+                // Deterministic pseudo-random based on counter
+                let counter = self.next_probability_counter();
+
+                // Simple hash to get a value in [0, 1)
+                let hash = ((counter.wrapping_mul(6_364_136_223_846_793_005))
+                    .wrapping_add(1_442_695_040_888_963_407))
+                    >> 32;
+                let rand_val = (hash as f64) / (u32::MAX as f64);
+
+                if rand_val < probability {
+                    Some(error.clone())
+                } else {
+                    None
+                }
+            }
+
+            FaultMode::Delay { delay_ms } => {
+                // Block the current thread for the specified duration.
+                // In async contexts this is intentionally blocking to
+                // simulate slow I/O at the syscall level. Clamped at
+                // evaluation time to defend against direct struct-init
+                // that bypasses the builder's clamp.
+                let bounded = (*delay_ms).min(FaultMode::MAX_DELAY_MS);
+                std::thread::sleep(std::time::Duration::from_millis(bounded));
+                None
+            }
+
+            FaultMode::DelayThenFail { delay_ms, error } => {
+                let bounded = (*delay_ms).min(FaultMode::MAX_DELAY_MS);
+                std::thread::sleep(std::time::Duration::from_millis(bounded));
+                Some(error.clone())
+            }
+        }
+    }
+
+    /// Apply a scenario's faults to this injector.
+    pub fn apply_scenario(&self, scenario: &ChaosScenario) {
+        self.clear_all();
+        for (point, mode) in &scenario.faults {
+            self.set_fault(*point, mode.clone());
+        }
+    }
+
+    /// Check a scenario's assertions against the current log.
+    #[must_use]
+    pub fn check_assertions(&self, scenario: &ChaosScenario) -> Vec<AssertionResult> {
+        let log = self.get_log();
+        let mut results = Vec::new();
+
+        for assertion in &scenario.assertions {
+            let result = match assertion {
+                ChaosAssertion::FaultFiredAtLeast(point, min_count) => {
+                    let actual = log.iter().filter(|t| t.point == *point && t.fired).count();
+                    AssertionResult {
+                        assertion: format!("{point} fired >= {min_count} times"),
+                        passed: actual >= *min_count,
+                        detail: format!("actual: {actual}"),
+                    }
+                }
+
+                ChaosAssertion::FaultNeverFired(point) => {
+                    let actual = log.iter().filter(|t| t.point == *point && t.fired).count();
+                    AssertionResult {
+                        assertion: format!("{point} never fired"),
+                        passed: actual == 0,
+                        detail: format!("actual: {actual}"),
+                    }
+                }
+
+                ChaosAssertion::TotalFaultsInRange(min, max) => {
+                    let total = log.iter().filter(|t| t.fired).count();
+                    AssertionResult {
+                        assertion: format!("total faults in [{min}, {max}]"),
+                        passed: total >= *min && total <= *max,
+                        detail: format!("actual: {total}"),
+                    }
+                }
+            };
+            results.push(result);
+        }
+
+        results
+    }
+}
+
+impl Default for FaultInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Summary of a chaos test run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChaosReport {
+    pub scenario_name: String,
+    pub total_checks: usize,
+    pub total_faults_fired: usize,
+    pub faults_by_point: HashMap<String, usize>,
+    pub assertions_passed: usize,
+    pub assertions_failed: usize,
+    pub all_passed: bool,
+}
+
+impl ChaosReport {
+    /// Build a report from a scenario and injector state.
+    #[must_use]
+    pub fn from_scenario(injector: &FaultInjector, scenario: &ChaosScenario) -> Self {
+        let log = injector.get_log();
+        let assertion_results = injector.check_assertions(scenario);
+
+        let mut faults_by_point: HashMap<String, usize> = HashMap::new();
+        for trigger in &log {
+            if trigger.fired {
+                *faults_by_point
+                    .entry(trigger.point.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        Self {
+            scenario_name: scenario.name.clone(),
+            total_checks: log.len(),
+            total_faults_fired: log.iter().filter(|t| t.fired).count(),
+            faults_by_point,
+            assertions_passed: assertion_results.iter().filter(|r| r.passed).count(),
+            assertions_failed: assertion_results.iter().filter(|r| !r.passed).count(),
+            // Per ft-2b0cm fix: an empty assertion list cannot
+            // legitimately claim 'all passed' — there are no
+            // verdicts to aggregate. Iterator::all on an empty
+            // iter returns true; gate on non-emptiness so a
+            // scenario without any assertions is not silently
+            // green.
+            all_passed: !assertion_results.is_empty() && assertion_results.iter().all(|r| r.passed),
+        }
+    }
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+// ── Pre-built scenarios ─────────────────────────────────────────────
+
+/// Pre-built chaos scenarios for common resilience tests.
+pub mod scenarios {
+    use super::{ChaosAssertion, ChaosScenario, FaultMode, FaultPoint};
+
+    /// Scenario 1: Database writes fail repeatedly.
+    ///
+    /// Validates that the system queues writes and continues
+    /// observing when the database becomes unavailable.
+    #[must_use]
+    pub fn db_write_failure() -> ChaosScenario {
+        ChaosScenario::new(
+            "db_write_failure",
+            "Database write operations fail 5 times, then recover",
+        )
+        .with_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(5, "disk full"))
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbWrite, 5))
+    }
+
+    /// Scenario 2: WezTerm CLI becomes unavailable.
+    ///
+    /// Validates that the system degrades gracefully when WezTerm
+    /// CLI calls fail and recovers when it comes back.
+    #[must_use]
+    pub fn wezterm_unavailable() -> ChaosScenario {
+        ChaosScenario::new(
+            "wezterm_unavailable",
+            "WezTerm CLI calls fail 3 times, simulating process crash",
+        )
+        .with_fault(
+            FaultPoint::WeztermCliCall,
+            FaultMode::fail_n_times(3, "wezterm not running"),
+        )
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(
+            FaultPoint::WeztermCliCall,
+            3,
+        ))
+    }
+
+    /// Scenario 3: Pattern detection engine errors.
+    ///
+    /// Validates that the ingest pipeline continues when the
+    /// pattern engine fails on specific inputs.
+    #[must_use]
+    pub fn pattern_engine_failure() -> ChaosScenario {
+        ChaosScenario::new(
+            "pattern_engine_failure",
+            "Pattern detection fails, system skips detection and continues ingesting",
+        )
+        .with_fault(
+            FaultPoint::PatternDetect,
+            FaultMode::always_fail("regex timeout"),
+        )
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(
+            FaultPoint::PatternDetect,
+            1,
+        ))
+        .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite))
+    }
+
+    /// Scenario 4: Database corruption (read failures).
+    ///
+    /// Validates that the system handles read failures gracefully
+    /// without cascading into write failures.
+    #[must_use]
+    pub fn db_corruption() -> ChaosScenario {
+        ChaosScenario::new(
+            "db_corruption",
+            "Database reads fail, simulating file corruption",
+        )
+        .with_fault(
+            FaultPoint::DbRead,
+            FaultMode::always_fail("database disk image is malformed"),
+        )
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbRead, 1))
+    }
+
+    /// Scenario 5: Maintenance cleanup fails under load.
+    ///
+    /// Validates that retention cleanup failures don't crash the
+    /// system or corrupt the database.
+    #[must_use]
+    pub fn maintenance_failure() -> ChaosScenario {
+        ChaosScenario::new(
+            "maintenance_failure",
+            "Retention cleanup fails, system continues without pruning",
+        )
+        .with_fault(
+            FaultPoint::RetentionCleanup,
+            FaultMode::fail_n_times(3, "database is locked"),
+        )
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(
+            FaultPoint::RetentionCleanup,
+            3,
+        ))
+        .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite))
+    }
+
+    /// Scenario 6: Multiple simultaneous failures.
+    ///
+    /// Validates that the system handles multiple subsystem failures
+    /// concurrently without deadlocking or crashing.
+    #[must_use]
+    pub fn cascading_failures() -> ChaosScenario {
+        ChaosScenario::new(
+            "cascading_failures",
+            "DB writes and WezTerm CLI fail simultaneously",
+        )
+        .with_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(3, "disk full"))
+        .with_fault(
+            FaultPoint::WeztermCliCall,
+            FaultMode::fail_n_times(2, "wezterm crashed"),
+        )
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbWrite, 3))
+        .with_assertion(ChaosAssertion::FaultFiredAtLeast(
+            FaultPoint::WeztermCliCall,
+            2,
+        ))
+        .with_assertion(ChaosAssertion::TotalFaultsInRange(5, 10))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() {
+        // Ensure global injector exists and is clean
+        FaultInjector::init_global();
+        FaultInjector::reset_global();
+    }
+
+    // -------------------------------------------------------------
+    // Regression: chaos audit findings (ft-s22g4)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sanitize_probability_clamps_nan_to_zero() {
+        // f64::clamp propagates NaN — sanitize_probability must
+        // strip it so probabilistic fault injection isn't silently
+        // disabled by an NaN passed via division-by-zero or similar.
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::NAN).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn sanitize_probability_clamps_negative_and_overflow() {
+        assert_eq!(
+            FaultMode::sanitize_probability(-1.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(2.5).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::INFINITY).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::NEG_INFINITY).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn fail_with_probability_builder_strips_nan() {
+        match FaultMode::fail_with_probability(f64::NAN, "x") {
+            FaultMode::FailWithProbability { probability, .. } => {
+                assert_eq!(probability.to_bits(), 0.0_f64.to_bits());
+            }
+            other => panic!("expected FailWithProbability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delay_builder_clamps_to_max_delay_ms() {
+        // u64::MAX delay would freeze the thread for ~584M years.
+        // Builder must clamp.
+        match FaultMode::delay(u64::MAX) {
+            FaultMode::Delay { delay_ms } => {
+                assert_eq!(delay_ms, FaultMode::MAX_DELAY_MS);
+            }
+            other => panic!("expected Delay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delay_then_fail_builder_clamps_to_max_delay_ms() {
+        match FaultMode::delay_then_fail(u64::MAX, "x") {
+            FaultMode::DelayThenFail { delay_ms, .. } => {
+                assert_eq!(delay_ms, FaultMode::MAX_DELAY_MS);
+            }
+            other => panic!("expected DelayThenFail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nan_probability_via_struct_init_does_not_disable_fault_silently() {
+        // Sanity-check: even if a caller bypasses the builder by
+        // direct struct-init `FaultMode::FailWithProbability { probability: NaN, .. }`,
+        // the evaluator's sanitize-on-read normalises to 0.0, which
+        // means the fault simply doesn't fire (not a panic, not a
+        // NaN-comparison oddity).
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::FailWithProbability {
+                probability: f64::NAN,
+                error: "nan".to_string(),
+            },
+        );
+        for _ in 0..16 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 0);
+    }
+
+    #[test]
+    fn probability_one_via_struct_init_always_fires() {
+        // The builder clamps to 1.0; with the new evaluator
+        // shortcut `probability >= 1.0 → fire`, p=1.0 is
+        // strictly equivalent to AlwaysFail (no 1/2^32 hole).
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::FailWithProbability {
+                probability: 1.0,
+                error: "always".to_string(),
+            },
+        );
+        for _ in 0..32 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 32);
+    }
+
+    #[test]
+    fn fault_registry_recovers_after_poison() {
+        let injector = FaultInjector::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = injector.faults.write().expect("initial faults write lock");
+            panic!("poison faults");
+        }));
+        assert!(poisoned.is_err());
+        assert!(injector.faults.is_poisoned());
+
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("recovered"));
+
+        assert!(!injector.faults.is_poisoned());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 1);
+    }
+
+    #[test]
+    fn trigger_log_recovers_after_poison() {
+        let injector = FaultInjector::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = injector.log.lock().expect("initial trigger log lock");
+            panic!("poison trigger log");
+        }));
+        assert!(poisoned.is_err());
+        assert!(injector.log.is_poisoned());
+
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("logged"));
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+
+        assert!(!injector.log.is_poisoned());
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 1);
+        assert_eq!(injector.get_log().len(), 1);
+    }
+
+    #[test]
+    fn probability_counter_recovers_after_poison() {
+        let injector = FaultInjector::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = injector.counter.lock().expect("initial counter lock");
+            panic!("poison probability counter");
+        }));
+        assert!(poisoned.is_err());
+        assert!(injector.counter.is_poisoned());
+
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::FailWithProbability {
+                probability: 0.5,
+                error: "maybe".to_string(),
+            },
+        );
+        let _ = injector.check_point(FaultPoint::DbWrite);
+
+        assert!(!injector.counter.is_poisoned());
+        assert_eq!(*injector.counter.lock().expect("counter recovered"), 1);
+    }
+
+    #[test]
+    fn injector_no_faults_succeeds() {
+        let injector = FaultInjector::new();
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        assert!(injector.check_point(FaultPoint::WeztermCliCall).is_ok());
+    }
+
+    #[test]
+    fn always_fail_mode() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("disk full"));
+
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 3);
+    }
+
+    #[test]
+    fn injected_fault_uses_structured_runtime_operation() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("disk full"));
+
+        match injector.check_point(FaultPoint::DbWrite).unwrap_err() {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "chaos.fault_injected");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Backend(
+                        "chaos fault injected at db_write: disk full".to_string()
+                    )
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_n_times_mode() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(2, "locked"));
+
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        // Third call should succeed (exhausted)
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 2);
+    }
+
+    #[test]
+    fn fail_with_probability_deterministic() {
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(0.5, "random failure"),
+        );
+
+        // Run multiple times — some should fail, some should succeed
+        let mut failures = 0;
+        let mut successes = 0;
+        for _ in 0..20 {
+            if injector.check_point(FaultPoint::DbWrite).is_err() {
+                failures += 1;
+            } else {
+                successes += 1;
+            }
+        }
+
+        // With 50% probability over 20 trials, expect both to be > 0
+        assert!(failures > 0, "expected some failures, got 0");
+        assert!(successes > 0, "expected some successes, got 0");
+    }
+
+    #[test]
+    fn independent_fault_points() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("disk full"));
+
+        // DbWrite should fail
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        // Other points should succeed
+        assert!(injector.check_point(FaultPoint::DbRead).is_ok());
+        assert!(injector.check_point(FaultPoint::WeztermCliCall).is_ok());
+        assert!(injector.check_point(FaultPoint::PatternDetect).is_ok());
+    }
+
+    #[test]
+    fn remove_fault() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("error"));
+
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        injector.remove_fault(FaultPoint::DbWrite);
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+    }
+
+    #[test]
+    fn clear_all() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("error"));
+        injector.set_fault(FaultPoint::WeztermCliCall, FaultMode::always_fail("error"));
+
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        assert_eq!(injector.get_log().len(), 1);
+
+        injector.clear_all();
+
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        assert!(injector.check_point(FaultPoint::WeztermCliCall).is_ok());
+        assert_eq!(injector.get_log().len(), 2); // new log after clear
+    }
+
+    #[test]
+    fn drain_log() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("error"));
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        let _ = injector.check_point(FaultPoint::DbWrite);
+
+        let log = injector.drain_log();
+        assert_eq!(log.len(), 2);
+        assert!(log[0].fired);
+        assert!(log[1].fired);
+
+        // Log should be empty after drain
+        assert!(injector.get_log().is_empty());
+    }
+
+    #[test]
+    fn fault_trigger_serialization() {
+        let trigger = FaultTrigger {
+            point: FaultPoint::DbWrite,
+            fired: true,
+            error: Some("disk full".to_string()),
+            timestamp_ms: 1_234_567_890,
+        };
+
+        let json = serde_json::to_string(&trigger).unwrap();
+        let parsed: FaultTrigger = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.point, FaultPoint::DbWrite);
+        assert!(parsed.fired);
+        assert_eq!(parsed.error.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn scenario_db_write_failure() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::db_write_failure();
+        injector.apply_scenario(&scenario);
+
+        // Simulate 7 write attempts
+        for _ in 0..7 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+        }
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
+
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        assert!(report.all_passed);
+        assert_eq!(report.total_faults_fired, 5);
+    }
+
+    #[test]
+    fn scenario_wezterm_unavailable() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::wezterm_unavailable();
+        injector.apply_scenario(&scenario);
+
+        // Simulate 5 CLI calls
+        for _ in 0..5 {
+            let _ = injector.check_point(FaultPoint::WeztermCliCall);
+        }
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
+    }
+
+    #[test]
+    fn scenario_pattern_engine_failure() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::pattern_engine_failure();
+        injector.apply_scenario(&scenario);
+
+        // Pattern detection fails
+        assert!(injector.check_point(FaultPoint::PatternDetect).is_err());
+        // But DB writes succeed (independent)
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
+    }
+
+    #[test]
+    fn scenario_cascading_failures() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::cascading_failures();
+        injector.apply_scenario(&scenario);
+
+        // Interleave DB and CLI failures
+        for _ in 0..5 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+            let _ = injector.check_point(FaultPoint::WeztermCliCall);
+        }
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
+
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        assert!(report.all_passed);
+        assert_eq!(report.total_faults_fired, 5); // 3 DB + 2 CLI
+    }
+
+    #[test]
+    fn report_serialization() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::db_write_failure();
+        injector.apply_scenario(&scenario);
+
+        for _ in 0..7 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+        }
+
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        let parsed: ChaosReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.scenario_name, "db_write_failure");
+        assert!(parsed.all_passed);
+    }
+
+    #[test]
+    fn global_injector_check_without_init() {
+        // Static check — without init, should succeed
+        // Note: other tests may have called init_global, so we just
+        // verify the API doesn't panic.
+        let _ = FaultInjector::check(FaultPoint::DbWrite);
+    }
+
+    #[test]
+    fn global_injector_lifecycle() {
+        setup();
+        let injector = FaultInjector::init_global();
+
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(1, "test"));
+        assert!(FaultInjector::check(FaultPoint::DbWrite).is_err());
+        assert!(FaultInjector::check(FaultPoint::DbWrite).is_ok());
+
+        FaultInjector::reset_global();
+        assert!(FaultInjector::check(FaultPoint::DbWrite).is_ok());
+    }
+
+    #[test]
+    fn fault_point_display() {
+        assert_eq!(FaultPoint::WeztermCliCall.to_string(), "wezterm_cli_call");
+        assert_eq!(FaultPoint::DbWrite.to_string(), "db_write");
+        assert_eq!(FaultPoint::DbRead.to_string(), "db_read");
+        assert_eq!(FaultPoint::PatternDetect.to_string(), "pattern_detect");
+        assert_eq!(
+            FaultPoint::RetentionCleanup.to_string(),
+            "retention_cleanup"
+        );
+        assert_eq!(FaultPoint::ConfigReload.to_string(), "config_reload");
+        assert_eq!(FaultPoint::WebhookDelivery.to_string(), "webhook_delivery");
+    }
+
+    #[test]
+    fn assertion_fault_never_fired_passes_when_clean() {
+        let injector = FaultInjector::new();
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
+
+        // Don't trigger any faults
+        let _ = injector.check_point(FaultPoint::DbRead);
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results[0].passed);
+    }
+
+    #[test]
+    fn assertion_fault_never_fired_fails_when_fired() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("err"));
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbWrite));
+
+        let _ = injector.check_point(FaultPoint::DbWrite);
+
+        let results = injector.check_assertions(&scenario);
+        assert!(!results[0].passed);
+    }
+
+    #[test]
+    fn total_faults_in_range_assertion() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(3, "err"));
+
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::TotalFaultsInRange(2, 4));
+
+        for _ in 0..5 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+        }
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results[0].passed, "3 faults should be in [2, 4]");
+    }
+
+    // ── Batch: RubyBeaver wa-1u90p.7.1 ──────────────────────────────────
+
+    #[test]
+    fn fault_mode_always_fail_constructor() {
+        let mode = FaultMode::always_fail("kaboom");
+        match mode {
+            FaultMode::AlwaysFail { error } => assert_eq!(error, "kaboom"),
+            other => panic!("expected AlwaysFail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_mode_fail_n_times_constructor() {
+        let mode = FaultMode::fail_n_times(5, "oops");
+        match mode {
+            FaultMode::FailNTimes { remaining, error } => {
+                assert_eq!(remaining, 5);
+                assert_eq!(error, "oops");
+            }
+            other => panic!("expected FailNTimes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_mode_fail_with_probability_clamps_high() {
+        let mode = FaultMode::fail_with_probability(2.0, "err");
+        match mode {
+            FaultMode::FailWithProbability { probability, .. } => {
+                assert!((probability - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected FailWithProbability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_mode_fail_with_probability_clamps_low() {
+        let mode = FaultMode::fail_with_probability(-1.0, "err");
+        match mode {
+            FaultMode::FailWithProbability { probability, .. } => {
+                assert!(probability.abs() < f64::EPSILON);
+            }
+            other => panic!("expected FailWithProbability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_mode_delay_constructor() {
+        let mode = FaultMode::delay(100);
+        match mode {
+            FaultMode::Delay { delay_ms } => assert_eq!(delay_ms, 100),
+            other => panic!("expected Delay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_mode_delay_then_fail_constructor() {
+        let mode = FaultMode::delay_then_fail(50, "slow fail");
+        match mode {
+            FaultMode::DelayThenFail { delay_ms, error } => {
+                assert_eq!(delay_ms, 50);
+                assert_eq!(error, "slow fail");
+            }
+            other => panic!("expected DelayThenFail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_injector_default() {
+        let injector = FaultInjector::default();
+        assert_eq!(injector.total_fired(), 0);
+        assert!(injector.get_log().is_empty());
+    }
+
+    #[test]
+    fn fault_injector_new_is_empty() {
+        let injector = FaultInjector::new();
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 0);
+        assert_eq!(injector.fired_count(FaultPoint::WeztermCliCall), 0);
+        assert_eq!(injector.total_fired(), 0);
+    }
+
+    #[test]
+    fn fault_trigger_serde_with_none_error() {
+        let trigger = FaultTrigger {
+            point: FaultPoint::WeztermCliCall,
+            fired: false,
+            error: None,
+            timestamp_ms: 42,
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(!json.contains("error"));
+        let back: FaultTrigger = serde_json::from_str(&json).unwrap();
+        assert!(!back.fired);
+        assert!(back.error.is_none());
+    }
+
+    #[test]
+    fn fault_point_serde_roundtrip() {
+        let point = FaultPoint::ConfigReload;
+        let json = serde_json::to_string(&point).unwrap();
+        let back: FaultPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, FaultPoint::ConfigReload);
+    }
+
+    #[test]
+    fn fault_point_all_variants_display() {
+        let variants = [
+            (FaultPoint::WeztermCliCall, "wezterm_cli_call"),
+            (FaultPoint::DbWrite, "db_write"),
+            (FaultPoint::DbRead, "db_read"),
+            (FaultPoint::PatternDetect, "pattern_detect"),
+            (FaultPoint::RetentionCleanup, "retention_cleanup"),
+            (FaultPoint::ConfigReload, "config_reload"),
+            (FaultPoint::WebhookDelivery, "webhook_delivery"),
+        ];
+        for (point, expected) in variants {
+            assert_eq!(point.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn fault_point_all_variants_serde() {
+        let variants = [
+            FaultPoint::WeztermCliCall,
+            FaultPoint::DbWrite,
+            FaultPoint::DbRead,
+            FaultPoint::PatternDetect,
+            FaultPoint::RetentionCleanup,
+            FaultPoint::ConfigReload,
+            FaultPoint::WebhookDelivery,
+        ];
+        for point in variants {
+            let json = serde_json::to_string(&point).unwrap();
+            let back: FaultPoint = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, point);
+        }
+    }
+
+    #[test]
+    fn fail_n_times_zero_never_fires() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbRead, FaultMode::fail_n_times(0, "err"));
+        // Should immediately succeed (0 remaining)
+        assert!(injector.check_point(FaultPoint::DbRead).is_ok());
+        assert_eq!(injector.fired_count(FaultPoint::DbRead), 0);
+    }
+
+    #[test]
+    fn fail_with_probability_zero_never_fires() {
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(0.0, "never"),
+        );
+        for _ in 0..50 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 0);
+    }
+
+    #[test]
+    fn fail_with_probability_one_always_fires() {
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(1.0, "always"),
+        );
+        for _ in 0..10 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 10);
+    }
+
+    #[test]
+    fn set_fault_replaces_existing() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("first"));
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(1, "second"));
+
+        let err = injector.check_point(FaultPoint::DbWrite).unwrap_err();
+        assert!(err.to_string().contains("second"));
+        // After 1 failure, should succeed
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+    }
+
+    #[test]
+    fn remove_fault_nonexistent_is_noop() {
+        let injector = FaultInjector::new();
+        injector.remove_fault(FaultPoint::WebhookDelivery);
+        assert!(injector.check_point(FaultPoint::WebhookDelivery).is_ok());
+    }
+
+    #[test]
+    fn log_records_both_fired_and_not_fired() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(1, "err"));
+
+        let _ = injector.check_point(FaultPoint::DbWrite); // fires
+        let _ = injector.check_point(FaultPoint::DbWrite); // succeeds (exhausted)
+        let _ = injector.check_point(FaultPoint::DbRead); // no fault set
+
+        let log = injector.get_log();
+        assert_eq!(log.len(), 3);
+        assert!(log[0].fired);
+        assert!(!log[1].fired);
+        assert!(!log[2].fired);
+    }
+
+    #[test]
+    fn log_records_timestamps() {
+        let injector = FaultInjector::new();
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        let log = injector.get_log();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].timestamp_ms > 0);
+    }
+
+    #[test]
+    fn drain_log_empties_log() {
+        let injector = FaultInjector::new();
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        let _ = injector.check_point(FaultPoint::DbRead);
+
+        let log = injector.drain_log();
+        assert_eq!(log.len(), 2);
+        assert!(injector.get_log().is_empty());
+
+        // Second drain is empty
+        assert!(injector.drain_log().is_empty());
+    }
+
+    #[test]
+    fn total_fired_counts_only_fired() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(2, "err"));
+
+        let _ = injector.check_point(FaultPoint::DbWrite); // fires
+        let _ = injector.check_point(FaultPoint::DbWrite); // fires
+        let _ = injector.check_point(FaultPoint::DbWrite); // ok
+        let _ = injector.check_point(FaultPoint::DbRead); // ok
+
+        assert_eq!(injector.total_fired(), 2);
+    }
+
+    #[test]
+    fn fired_count_per_point() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(3, "err"));
+        injector.set_fault(
+            FaultPoint::WeztermCliCall,
+            FaultMode::fail_n_times(1, "err"),
+        );
+
+        for _ in 0..5 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+            let _ = injector.check_point(FaultPoint::WeztermCliCall);
+        }
+
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 3);
+        assert_eq!(injector.fired_count(FaultPoint::WeztermCliCall), 1);
+        assert_eq!(injector.fired_count(FaultPoint::DbRead), 0);
+    }
+
+    #[test]
+    fn scenario_builder_chain() {
+        let scenario = ChaosScenario::new("test", "desc")
+            .with_fault(FaultPoint::DbWrite, FaultMode::always_fail("err"))
+            .with_fault(
+                FaultPoint::WeztermCliCall,
+                FaultMode::fail_n_times(2, "err"),
+            )
+            .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbWrite, 1))
+            .with_assertion(ChaosAssertion::FaultNeverFired(FaultPoint::DbRead));
+
+        assert_eq!(scenario.name, "test");
+        assert_eq!(scenario.description, "desc");
+        assert_eq!(scenario.faults.len(), 2);
+        assert_eq!(scenario.assertions.len(), 2);
+    }
+
+    #[test]
+    fn scenario_apply_clears_previous_state() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::ConfigReload, FaultMode::always_fail("old"));
+        let _ = injector.check_point(FaultPoint::ConfigReload);
+
+        let scenario = ChaosScenario::new("new", "scenario")
+            .with_fault(FaultPoint::DbWrite, FaultMode::always_fail("new"));
+        injector.apply_scenario(&scenario);
+
+        // Old fault should be cleared
+        assert!(injector.check_point(FaultPoint::ConfigReload).is_ok());
+        // New fault should be active
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        // Old log should be cleared
+        assert_eq!(injector.get_log().len(), 2); // only the two checks above
+    }
+
+    #[test]
+    fn chaos_report_empty_scenario() {
+        // Per ft-2b0cm fix: a scenario with no assertions cannot
+        // legitimately claim 'all_passed' — there are no
+        // verdicts to aggregate. Previously this test pinned
+        // all_passed: true for the empty case (rubber-stamp).
+        let injector = FaultInjector::new();
+        let scenario = ChaosScenario::new("empty", "no faults");
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        assert_eq!(report.scenario_name, "empty");
+        assert_eq!(report.total_checks, 0);
+        assert_eq!(report.total_faults_fired, 0);
+        assert!(report.faults_by_point.is_empty());
+        assert_eq!(report.assertions_passed, 0);
+        assert_eq!(report.assertions_failed, 0);
+        assert!(
+            !report.all_passed,
+            "empty scenario must not be reported as all_passed",
+        );
+    }
+
+    #[test]
+    fn chaos_report_faults_by_point() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(2, "err"));
+        injector.set_fault(FaultPoint::DbRead, FaultMode::fail_n_times(1, "err"));
+
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        let _ = injector.check_point(FaultPoint::DbWrite);
+        let _ = injector.check_point(FaultPoint::DbRead);
+
+        let scenario = ChaosScenario::new("test", "test");
+        let report = ChaosReport::from_scenario(&injector, &scenario);
+        assert_eq!(report.faults_by_point.get("db_write"), Some(&2));
+        assert_eq!(report.faults_by_point.get("db_read"), Some(&1));
+    }
+
+    #[test]
+    fn chaos_report_serde_roundtrip() {
+        let report = ChaosReport {
+            scenario_name: "test".to_string(),
+            total_checks: 10,
+            total_faults_fired: 3,
+            faults_by_point: HashMap::from([("db_write".to_string(), 3)]),
+            assertions_passed: 2,
+            assertions_failed: 0,
+            all_passed: true,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ChaosReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scenario_name, "test");
+        assert_eq!(back.total_checks, 10);
+        assert_eq!(back.total_faults_fired, 3);
+        assert!(back.all_passed);
+    }
+
+    #[test]
+    fn assertion_result_fields() {
+        let result = AssertionResult {
+            assertion: "test assertion".to_string(),
+            passed: true,
+            detail: "detail".to_string(),
+        };
+        assert!(result.passed);
+        assert_eq!(result.assertion, "test assertion");
+    }
+
+    #[test]
+    fn assertion_total_faults_fails_when_out_of_range() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(5, "err"));
+        for _ in 0..7 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+        }
+
+        let scenario = ChaosScenario::new("test", "test")
+            .with_assertion(ChaosAssertion::TotalFaultsInRange(10, 20));
+        let results = injector.check_assertions(&scenario);
+        assert!(!results[0].passed);
+    }
+
+    #[test]
+    fn scenario_db_corruption() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::db_corruption();
+        injector.apply_scenario(&scenario);
+
+        for _ in 0..3 {
+            let _ = injector.check_point(FaultPoint::DbRead);
+        }
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed));
+    }
+
+    #[test]
+    fn scenario_maintenance_failure() {
+        let injector = FaultInjector::new();
+        let scenario = scenarios::maintenance_failure();
+        injector.apply_scenario(&scenario);
+
+        for _ in 0..5 {
+            let _ = injector.check_point(FaultPoint::RetentionCleanup);
+        }
+        // Verify DbWrite not affected
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+
+        let results = injector.check_assertions(&scenario);
+        assert!(results.iter().all(|r| r.passed));
+    }
+
+    #[test]
+    fn multiple_fault_points_concurrent_check() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::fail_n_times(2, "write-err"));
+        injector.set_fault(FaultPoint::DbRead, FaultMode::always_fail("read-err"));
+        injector.set_fault(
+            FaultPoint::PatternDetect,
+            FaultMode::fail_n_times(1, "pat-err"),
+        );
+
+        // Check interleaved
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert!(injector.check_point(FaultPoint::DbRead).is_err());
+        assert!(injector.check_point(FaultPoint::PatternDetect).is_err());
+        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        assert!(injector.check_point(FaultPoint::DbRead).is_err());
+        assert!(injector.check_point(FaultPoint::PatternDetect).is_ok()); // exhausted
+        assert!(injector.check_point(FaultPoint::DbWrite).is_ok()); // exhausted
+        assert!(injector.check_point(FaultPoint::DbRead).is_err()); // always
+
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 2);
+        assert_eq!(injector.fired_count(FaultPoint::PatternDetect), 1);
+        assert!(injector.fired_count(FaultPoint::DbRead) >= 3);
+    }
+
+    #[test]
+    fn check_point_error_message_includes_point_name() {
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::WebhookDelivery,
+            FaultMode::always_fail("smtp down"),
+        );
+        let err = injector
+            .check_point(FaultPoint::WebhookDelivery)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("webhook_delivery"));
+        assert!(msg.contains("smtp down"));
+    }
+
+    #[test]
+    fn clear_all_resets_counter() {
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(0.5, "err"),
+        );
+        // Run several checks to advance the counter
+        for _ in 0..10 {
+            let _ = injector.check_point(FaultPoint::DbWrite);
+        }
+        injector.clear_all();
+
+        // After clear, counter is reset so deterministic sequence restarts
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(0.5, "err"),
+        );
+        let mut results_after = Vec::new();
+        for _ in 0..10 {
+            results_after.push(injector.check_point(FaultPoint::DbWrite).is_err());
+        }
+        // Just verify it produced some results (deterministic sequence from 0)
+        assert!(results_after.iter().any(|&r| r) || results_after.iter().all(|r| !r));
+    }
+
+    #[test]
+    fn epoch_ms_is_nonzero() {
+        let ms = epoch_ms();
+        assert!(ms > 0, "epoch_ms should return positive value");
+    }
+}

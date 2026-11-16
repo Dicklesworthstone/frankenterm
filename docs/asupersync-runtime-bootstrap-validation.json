@@ -1,0 +1,30 @@
+{
+  "checked_at": "2026-03-10T05:12:57Z",
+  "checks": [
+    {
+      "count": 18,
+      "name": "required_tokens",
+      "status": "passed"
+    },
+    {
+      "name": "main_runtime_bootstrap_contract",
+      "status": "passed"
+    },
+    {
+      "name": "lifecycle_payload_helper_contract",
+      "status": "passed"
+    },
+    {
+      "count": 8,
+      "name": "lifecycle_reason_codes",
+      "status": "passed"
+    },
+    {
+      "count": 5,
+      "name": "unit_test_contract",
+      "status": "passed"
+    }
+  ],
+  "main_path": "/Users/jemanuel/projects/frankenterm/crates/frankenterm/src/main.rs",
+  "status": "passed"
+}

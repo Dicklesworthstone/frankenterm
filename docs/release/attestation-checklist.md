@@ -1,0 +1,383 @@
+# Attestation closure checklist
+
+Per-release verification that the **attestation bundle** is
+complete, signed, and re-verifiable offline. Run alongside
+`docs/release/checklist.md` (the mandatory step list); this
+file is the focused closer for `BR-RC-ATTESTATION-CLOSURE`
+(ft-187kv).
+
+## When to run
+
+- **Before publication** of `vX.Y.0`. Complete source-derived evidence before
+  tagging; measurements of the built candidate follow the post-build procedure
+  below. An immutable candidate tag does not authorize publication.
+  DSR is the exclusive release orchestrator;
+  a successful development-bundle check is not release qualification.
+- **After** the DSR release path lands the signed bundle —
+  re-verify offline as a third party would.
+
+## Producing-bead closing convention
+
+Every bead that produces or updates an attestation artifact MUST close with the
+same manifest wiring discipline the release gate later enforces. Before closing
+that bead, verify:
+
+- [ ] Artifact file is at the path declared in
+  [`docs/attestations/manifest.json`](../attestations/manifest.json), or the
+  manifest path is updated in the same commit.
+- [ ] `bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned`
+  exits 0 without `--allow-partial` for non-deferred slots.
+- [ ] `bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned --strict-deferred`
+  exits 0 only if every previously deferred slot is now resolved.
+- [ ] `bash scripts/attestation-verify.sh <bundle>` round-trip exits 0.
+- [ ] `cargo test -p frankenterm-core --test readme_hedge_alignment` exits 0
+  when the artifact changes README/AGENTS claim wording.
+- [ ] `cargo test -p frankenterm-core --test attestation_manifest_completeness --no-default-features`
+  exits 0.
+- [ ] Capacity or memory-envelope wording changes also run
+  `cargo test -p frankenterm-core --test swarm_capacity_resource_budget_model --no-default-features`
+  and confirm `docs/attestations/perf/swarm-capacity-envelope.json` still keeps
+  high-scale claims fail-closed unless the target-class artifact is non-skipped.
+- [ ] Rehearsal-score wording changes cite the retained receipt or golden matrix
+  path, preserve `blocked`, `missing_evidence`, `degraded`, `skipped`, and
+  `fixture_only` states, and do not turn `score_percent` into a release claim.
+  The optional manifest slot is `proofs/rehearsal-score`, currently backed by
+  `crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json`.
+- [ ] Deferred-proof replay wording changes cite the retained queue/harness
+  artifact or live-attempt record, preserve `queued`, `wait_rch`,
+  `dirty_overlap`, `prerequisite_blocked`, `stale_command`, `ambiguous`, and
+  `completed` states, and do not turn a queued receipt into green proof. The
+  optional robot-contract manifest slot is
+  `docs/attestations/proofs/deferred-proof-replay.json`.
+- [ ] Operating-envelope wording changes cite
+  `docs/attestations/proofs/operating-envelope.json`, preserve the read-only
+  admission scope, and keep target-class production capacity blocked
+  until `docs/attestations/proofs/resource-cockpit-target-class.json` is
+  non-skipped, passed, fresh, and authenticated for the exact source/target.
+  The consumer's trust enforcement remains `ft-7h5da.10.4.4`.
+- [ ] The closing comment cites the manifest slot category, artifact path,
+  build/verify exit codes, and retained RCH artifact bundle path.
+
+Use
+[`docs/release/attestation-bead-closing-template.md`](attestation-bead-closing-template.md)
+for the closing-comment shape. This convention exists because a bead that ships
+an artifact but forgets the manifest slot can recreate the `ft-e87u6` NO_BEAD
+gap. If you skip this checklist, the `ft-e87u6.5`
+`attestation_manifest_completeness` regression test will fail CI.
+
+## Post-build release evidence
+
+Artifacts measured from a DSR-built candidate are generated after its source
+tag is frozen. Retain them under `artifacts/releases/<version>/` with a complete
+manifest selected through `FT_ATTESTATION_MANIFEST`. Preserve every canonical
+slot's category, producer identity, proof categories, and required-category
+membership. A deferred slot may acquire a release artifact only after its
+producer's actual executions and validators satisfy the declared contract.
+Before approving the retained manifest digest, independently compare it with
+the frozen source manifest: required categories, proof taxonomy, and the complete
+slot identity set must match. Only qualified producer artifact paths/receipts
+and removal of their resolved deferral metadata may differ. The assembler reads
+required categories from the selected manifest, so its success alone cannot
+prove this equality or authorize a shortened manifest.
+Missing, skipped, failed, or deferred evidence cannot qualify that slot. Run
+the complete DSR quality lane with this manifest, including strict-required
+and strict-deferred bundle verification; an earlier incomplete run is not a pass.
+
+The independently approved release policy must pin the retained manifest digest
+and the exact DSR-confirmed source commit/tree, profile, and targets. Verify
+measured executable hashes against the DSR receipts. A supplied source
+environment variable, a valid signature, or artifact hashes alone do not prove
+producer success. Retain the named execution results, causal negative checks,
+measurement acceptance results, and independent review with the release bundle.
+Preserve each producer's scope limits, including unproven target-class capacity.
+
+This qualifies the exact release, not an unfinished repository-wide producer
+campaign. Keep a producer bead active while its canonical manifest slot remains
+deferred; closing it in that state violates the manifest completeness contract.
+Record release-specific qualification and retained paths on the bead, using
+`br --no-auto-flush` during the source freeze. Source-maintained artifact and
+canonical manifest changes still use the same-commit closing convention above.
+Generating release evidence must not move the source tag, change tracked source,
+or substitute weaker tests to avoid recompilation.
+
+## Pre-flight: every category has a producing bead
+
+The canonical required-category list lives in
+[`docs/attestations/manifest.json`](../attestations/manifest.json)
+(`required_categories` array). Before tagging, walk the list
+and confirm each producing bead has shipped its artifact:
+
+```sh
+jq -r '.required_categories[]' docs/attestations/manifest.json
+```
+
+Also confirm every manifest slot declares proof taxonomy metadata:
+
+```sh
+jq -e '[.slots[] | select((.proof_categories // []) | length == 0)] | length == 0' \
+  docs/attestations/manifest.json
+```
+
+For each category, check the corresponding "producing bead"
+in [`docs/attestations/README.md`](../attestations/README.md)
+"Required artifact categories" table:
+
+| Category                            | Producing bead     | Verify         |
+|-------------------------------------|--------------------|----------------|
+| `perf/headline-claims`              | `ft-syqcz.3`       | `br show ft-syqcz.3` reports closed |
+| `perf/competitor-matrix`            | `ft-e87u6.9`       | `br show ft-e87u6.9` reports closed |
+| `perf/lindley-bounds`               | `ft-7h5da.10.2`    | `br show ft-7h5da.10.2` reports closed |
+| `tui/render-parity`                 | `ft-35yac.1.2` + `ft-35yac.2` | both beads report closed |
+| `security/passive-watch`            | `ft-x0666.1`       | `br show ft-x0666.1` reports closed |
+| `security/redactor-coverage`        | `ft-x0666.2`       | `br show ft-x0666.2` reports closed |
+| `security/distributed-threat-model` | `ft-x0666.3`       | `br show ft-x0666.3` reports closed |
+| `proofs/loom-runtime-async`         | `ft-e87u6.12`      | `br show ft-e87u6.12` reports closed |
+| `proofs/runtime-proof-trait`        | `ft-i2eni.1`       | `br show ft-i2eni.1` reports closed |
+| `proofs/robot-contracts`            | `ft-0elb9`         | `br show ft-0elb9` reports closed |
+| `doctrine/agents-md-counts`         | `ft-tf6g3.2`       | `br show ft-tf6g3.2` reports closed |
+| `doctrine/cx-propagation`           | `ft-q0tz3`         | `br show ft-q0tz3` reports closed |
+
+Optional release-support slots are still hashed when present, but they do not
+appear in `required_categories` until the owning epic graduates them. For
+rehearsal-score closeout, confirm the `proofs/rehearsal-score` slot remains
+present and points at the golden matrix unless a later bead replaces it with a
+stronger retained no-mock receipt bundle.
+For deferred-proof replay closeout, confirm the optional
+`proofs/robot-contracts` slot points at
+`docs/attestations/proofs/deferred-proof-replay.json` and that the artifact
+keeps queued/deferred receipts visibly distinct from completed remote proof.
+For operating-envelope closeout, confirm the `proofs/robot-contracts` slot
+points at `docs/attestations/proofs/operating-envelope.json`, that the artifact
+records the retained fixture/proof-calendar counts, and that target-class
+capacity remains blocked when the resource-cockpit target-class artifact is
+`skipped_not_proven`.
+
+For source-maintained slots, an unclosed producing bead blocks release. For
+post-build slots, the complete retained release manifest and the independently
+verified producer results above establish qualification for that exact release;
+an open canonical-wiring bead does not substitute for or invalidate those
+results. In both cases, incomplete producer evidence MUST block publication.
+
+## Build: assemble the bundle
+
+```sh
+ED25519_PRIVATE_KEY_PATH=release-ed25519.pem \
+  scripts/attestation-build.sh --version 0.X.0 --channel stable --sign ed25519 \
+    --profile release-interactive --target aarch64-apple-darwin
+```
+
+Run this as a retained DSR quality/release step, repeating `--target` for every
+shipped Rust target. These flags bind the declared build identity into the
+signature; retain the corresponding DSR build receipts to prove the identity.
+Non-development builds require the interactive profile, target set and complete
+non-deferred artifacts. A DSR installation with an explicitly configured
+non-GitHub OIDC issuer may still build a cosign bundle, but the external release
+policy currently accepts Ed25519 only. GitHub Actions identities and workflow
+refs are forbidden.
+
+Outputs:
+- `docs/attestations/0.X.0.json` — the signed bundle
+  (artifact paths + SHA-256 + size + producing-bead pointer).
+- `docs/attestations/0.X.0.ed25519.sig.hex` — the Ed25519
+  signature when using the default DSR attestation path.
+- `docs/attestations/0.X.0.sigstore` — an optional cosign sigstore
+  bundle when DSR is configured with an explicit non-GitHub OIDC issuer.
+
+The build script **fails loudly** on:
+- Any required-category slot with `path: null`.
+- Any artifact path that doesn't exist on disk.
+- Any artifact whose hash differs from what the bead promised.
+- Any manifest `proof_categories` ID that is not declared in
+  `docs/proof-taxonomy.json`.
+
+If the build fails, do NOT manually patch the manifest — fix
+the producing bead's artifact instead. Manual edits silently
+drift the schema.
+
+## Verify: re-derive every hash
+
+```sh
+scripts/attestation-verify.sh docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
+```
+
+The verifier:
+1. Parses the bundle.
+2. Re-derives every artifact's SHA-256 from disk.
+3. Recomputes the canonical signing payload.
+4. Checks the `taxonomy_coverage` summary from
+   `docs/proof-taxonomy.json`.
+5. Requires the Ed25519 key to match the independently configured release
+   policy, then verifies the signature. The same authority applies to retractions.
+6. Checks signer validity and revocation, bundle freshness, exact release,
+   source commit/tree, target set, interactive profile and canonical manifest
+   hash. Every required manifest slot needs one matching artifact; deferred
+   slots are rejected.
+7. Exits 0 on full pass; non-zero on any check failure. Signature verification
+   inputs and crypto diagnostics are retained for offline inspection.
+
+For machine-readable output (DSR quality gates):
+
+```sh
+scripts/attestation-verify.sh docs/attestations/0.X.0.json --json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
+```
+
+Without `--release-policy`, the verifier reports
+`verification_mode: development_integrity` and `publisher_authenticated: false`,
+including for a valid self-signature. The DSR development-bundle quality check
+uses this mode. `--strict-required` alone still permits declared deferred
+categories; release policy implies both strict-required and strict-deferred.
+
+`FT_ATTESTATION_RELEASE_POLICY` supplies the same policy through the existing
+`ft attestation verify` command. `FT_ATTESTATION_MANIFEST` may select a retained
+manifest for offline replay; its hash must match the external policy. Never
+construct a trusted policy by accepting a downloaded bundle's self-description.
+The operator owns the key, validity interval, expected identities and approved
+manifest digest. The file contains public verification material only:
+
+```json
+{
+  "schema_version": "frankenterm.release-attestation-policy.v1",
+  "signer": {
+    "method": "ed25519",
+    "public_key": "<64 lowercase hex digits from the independent trust root>",
+    "revoked": false,
+    "not_before": 0,
+    "not_after": 0
+  },
+  "max_age_seconds": 86400,
+  "release": {"version": "0.X.0", "tag": "v0.X.0", "channel": "stable"},
+  "git": {"commit": "<40 hex digits>", "tree": "<40 hex digits>"},
+  "build": {"profile": "release-interactive", "targets": ["aarch64-apple-darwin"]},
+  "manifest_sha256": "<64 lowercase hex digits>"
+}
+```
+
+This is an intentionally invalid template: replace the key, identities and UTC
+epoch validity endpoints from operator-owned records. Targets must be sorted
+and unique. Verification checks current time and signed `generated_at`; offline
+replay does not bypass expiry. Rotations and revocations require updating the
+operator's trust configuration. No production policy or key is generated by
+the verifier or its tests.
+
+These checks authenticate signed claims and artifact bytes. Native execution,
+actual build profiles and live-service behavior still require their producing
+receipts. `ft-xxfwy.49` remains open until the DSR release/installer/canary
+closeout invokes this mode with the operator's production trust policy.
+
+The existing release verifier can enforce the policy alongside the exact DSR
+asset set. Pass both inputs for published-release verification:
+
+```sh
+scripts/release/verify-release.sh 0.X.0 \
+  --attestation-bundle docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
+```
+
+For offline verification, replace the version with `--manifest <DSR-manifest>`
+and `--assets-dir <downloaded-assets>`. The verifier retains bounded copies of
+the policy and bundle, checks the authenticated source, version, profile and
+four Rust targets against the DSR manifest, then verifies the existing signed
+17-file asset set. The attestation inputs stay outside that asset directory.
+Omitting both inputs verifies the artifact set only; supplying just one fails.
+Retain the resulting receipt with the separate installer and canary results.
+
+## Tag + publish: DSR only
+
+```sh
+dsr version tag frankenterm
+dsr build frankenterm --version 0.X.0
+dsr release frankenterm 0.X.0 --verify-tag
+dsr release verify frankenterm 0.X.0
+```
+
+Use `--push` on the DSR tag command only when publication is explicitly
+authorized. DSR owns the build, signing, checksum, provenance, publication,
+and verification receipts. Do not invoke, inspect, or depend on a GitHub
+Actions workflow at any point in this process.
+
+## Post-tag: third-party offline verification
+
+An operator can recheck artifact hashes in the existing primary checkout
+at the intended release revision. Preserve dirty files and active sessions;
+do not create a parallel checkout for this procedure:
+
+```sh
+git rev-parse HEAD    # must match the candidate identity in the receipt
+scripts/attestation-verify.sh docs/attestations/0.X.0.json \
+  --release-policy /operator-owned/frankenterm-release-policy.json
+```
+
+Retain the policy digest, verified bundle digest, crypto inputs and DSR release
+verification result together. A passing release-policy check authenticates
+the configured signing authority and the declared release bindings. It does
+not establish current-source runtime proof or passed target qualification.
+A failed verification blocks the candidate; investigate the exact artifact
+and trust failure before deciding on any published-release remediation.
+
+## Demonstration: missing artifact fails the build
+
+The smoke test at
+[`tests/attestation/smoke-test.sh`](../../tests/attestation/smoke-test.sh)
+exercises both directions:
+
+- **Positive**: build a complete bundle, verify it passes.
+- **Negative**: tamper with one artifact's hash, verify the
+  verifier rejects it.
+
+Run as part of pre-tag validation:
+
+```sh
+bash tests/attestation/smoke-test.sh
+```
+
+A green smoke test means the attestation pipeline catches a
+deliberate tampering. A red smoke test means the verifier is
+broken — block the release until repaired.
+
+## What this checklist replaces
+
+Before this closure, each producing-bead epic could ship its
+artifact, mark itself complete, and the release would tag
+without anyone confirming the FULL bundle was ready. With
+this checklist:
+
+1. Every release runs the pre-flight category sweep.
+2. The build script refuses partial bundles.
+3. The verifier re-derives everything.
+4. The smoke test asserts tamper detection.
+
+Net: a bundle that passes this checklist is **complete**
+(every required category present), **content-addressed**
+(every artifact's hash baked in), and **signed**
+(through the retained DSR signing path).
+
+## Cross-references
+
+- [`docs/attestations/README.md`](../attestations/README.md)
+  — bundle-format reference, build/verify commands.
+- [`docs/attestations/schema.json`](../attestations/schema.json)
+  — JSON Schema 2020-12 for the bundle format.
+- [`docs/attestations/manifest.json`](../attestations/manifest.json)
+  — canonical required-categories list.
+- [`docs/proof-taxonomy.json`](../proof-taxonomy.json)
+  — proof category registry used by `proof_categories` and
+  `taxonomy_coverage`.
+- [`scripts/attestation-build.sh`](../../scripts/attestation-build.sh)
+  — bundle assembler.
+- [`scripts/attestation-verify.sh`](../../scripts/attestation-verify.sh)
+  — bundle verifier.
+- [`tests/attestation/smoke-test.sh`](../../tests/attestation/smoke-test.sh)
+  — positive + tamper-detection smoke test.
+- [`docs/release/checklist.md`](checklist.md) — broader
+  release checklist; this attestation-checklist.md is the
+  focused closer.
+- [`docs/reality-check-bridge-plan.md`](../reality-check-bridge-plan.md)
+  — the doctrine that motivates the attestation graph.
+- BR-RC-FOUNDATION.G3.1 (`ft-syqcz.1`, closed) — schema +
+  build + verify pipeline.
+- BR-RC-FOUNDATION.G3.1.1 (`ft-syqcz.1.1`, open) —
+  user-facing `ft attestation verify` CLI.
+- BR-RC-ATTESTATION-CLOSURE (`ft-187kv`, this bead) —
+  per-epic closure.

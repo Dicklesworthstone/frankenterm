@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "source": "seed_contract_budget",
+  "generated_at": "2026-02-24T00:00:00Z",
+  "sample": {
+    "capture_overhead_ms_per_event": 1.0,
+    "replay_throughput_events_per_sec": 100000.0,
+    "diff_latency_ms_per_1000_divergences": 1000.0,
+    "report_generation_ms": 100.0,
+    "artifact_read_events_per_sec": 500000.0
+  }
+}

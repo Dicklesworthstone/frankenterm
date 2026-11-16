@@ -1,0 +1,4 @@
+# The wa CLI has a 56-variant Commands enum that causes stack overflow
+# in debug/test builds with the default 8MB stack. 16MB is sufficient.
+[env]
+RUST_MIN_STACK = "16777216"

@@ -1,0 +1,1 @@
+{"claim_id":"bloom.speedup_ratio","commit_sha":"fd89ed378","metric_unit":"ratio","metric_value":19.3867,"sample_size":500,"schema_version":"ft.perf.evidence-sample.v1","tags":{"fixture_seq":"0","frankenterm_version":"0.0.0-dev"},"ts_ms":1715500000000,"workload_class":"bloom-large-corpus-infrequent-query"}

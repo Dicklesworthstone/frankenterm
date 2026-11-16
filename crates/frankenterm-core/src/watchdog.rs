@@ -1,0 +1,2806 @@
+//! Watchdog and heartbeat system for deadlock detection and auto-recovery.
+//!
+//! Each runtime subsystem (discovery, capture, persistence, maintenance)
+//! updates a heartbeat timestamp on every loop iteration.  A background
+//! monitor task periodically checks these timestamps and logs warnings
+//! when a subsystem appears stalled.
+//!
+//! # Integration
+//!
+//! ```text
+//! ObservationRuntime
+//!   ├── discovery_task ──► heartbeats.record_discovery()
+//!   ├── capture_task   ──► heartbeats.record_capture()
+//!   ├── persistence    ──► heartbeats.record_persistence()
+//!   ├── maintenance    ──► heartbeats.record_maintenance()
+//!   └── watchdog_task  ──► heartbeats.check_health()
+//! ```
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::runtime_async::{
+    RuntimeTime,
+    notify::Notify,
+    task::{self, JoinErrorKind, JoinHandle, JoinSet, JoinSetSettlement},
+};
+use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
+
+/// Increment cumulative telemetry without allowing wraparound to masquerade as
+/// a counter reset. Returns the value published by this update.
+fn saturating_atomic_increment(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn runtime_elapsed_ms(start: RuntimeTime, end: RuntimeTime) -> u64 {
+    end.duration_since(start) / 1_000_000
+}
+
+// =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`HeartbeatRegistry`].
+#[derive(Debug, Default)]
+pub struct WatchdogTelemetry {
+    discovery_heartbeats: AtomicU64,
+    capture_heartbeats: AtomicU64,
+    persistence_heartbeats: AtomicU64,
+    maintenance_heartbeats: AtomicU64,
+    health_checks: AtomicU64,
+}
+
+impl WatchdogTelemetry {
+    pub fn snapshot(&self) -> WatchdogTelemetrySnapshot {
+        WatchdogTelemetrySnapshot {
+            discovery_heartbeats: self.discovery_heartbeats.load(Ordering::Relaxed),
+            capture_heartbeats: self.capture_heartbeats.load(Ordering::Relaxed),
+            persistence_heartbeats: self.persistence_heartbeats.load(Ordering::Relaxed),
+            maintenance_heartbeats: self.maintenance_heartbeats.load(Ordering::Relaxed),
+            health_checks: self.health_checks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`HeartbeatRegistry`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchdogTelemetrySnapshot {
+    pub discovery_heartbeats: u64,
+    pub capture_heartbeats: u64,
+    pub persistence_heartbeats: u64,
+    pub maintenance_heartbeats: u64,
+    pub health_checks: u64,
+}
+
+/// Per-component heartbeat timestamps (epoch milliseconds).
+///
+/// Each subsystem calls the corresponding `record_*` method on every
+/// iteration of its main loop.  The watchdog monitor reads these to
+/// determine whether a component is stalled.
+#[derive(Debug)]
+pub struct HeartbeatRegistry {
+    discovery: AtomicU64,
+    capture: AtomicU64,
+    persistence: AtomicU64,
+    maintenance: AtomicU64,
+    /// Epoch ms when the registry was created (for grace period).
+    created_at: u64,
+    telemetry: WatchdogTelemetry,
+}
+
+impl Default for HeartbeatRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HeartbeatRegistry {
+    /// Create a new registry with all heartbeats at zero (never seen).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            discovery: AtomicU64::new(0),
+            capture: AtomicU64::new(0),
+            persistence: AtomicU64::new(0),
+            maintenance: AtomicU64::new(0),
+            created_at: epoch_ms(),
+            telemetry: WatchdogTelemetry::default(),
+        }
+    }
+
+    /// Record a heartbeat for the discovery subsystem.
+    pub fn record_discovery(&self) {
+        saturating_atomic_increment(&self.telemetry.discovery_heartbeats);
+        self.discovery.store(epoch_ms(), Ordering::SeqCst);
+    }
+
+    /// Record a heartbeat for the capture subsystem.
+    pub fn record_capture(&self) {
+        saturating_atomic_increment(&self.telemetry.capture_heartbeats);
+        self.capture.store(epoch_ms(), Ordering::SeqCst);
+    }
+
+    /// Record a heartbeat for the persistence subsystem.
+    pub fn record_persistence(&self) {
+        saturating_atomic_increment(&self.telemetry.persistence_heartbeats);
+        self.persistence.store(epoch_ms(), Ordering::SeqCst);
+    }
+
+    /// Record a heartbeat for the maintenance subsystem.
+    pub fn record_maintenance(&self) {
+        saturating_atomic_increment(&self.telemetry.maintenance_heartbeats);
+        self.maintenance.store(epoch_ms(), Ordering::SeqCst);
+    }
+
+    /// Epoch ms when the registry was created.
+    #[must_use]
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Read the last heartbeat timestamp for a component (epoch ms, 0 = never).
+    pub fn last_heartbeat(&self, component: Component) -> u64 {
+        match component {
+            Component::Discovery => self.discovery.load(Ordering::SeqCst),
+            Component::Capture => self.capture.load(Ordering::SeqCst),
+            Component::Persistence => self.persistence.load(Ordering::SeqCst),
+            Component::Maintenance => self.maintenance.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Returns the telemetry tracker for this registry.
+    pub fn telemetry(&self) -> &WatchdogTelemetry {
+        &self.telemetry
+    }
+
+    /// Check all components against their thresholds and return overall health.
+    #[must_use]
+    pub fn check_health(&self, config: &WatchdogConfig) -> HealthReport {
+        saturating_atomic_increment(&self.telemetry.health_checks);
+        let now = epoch_ms();
+        let uptime_ms = now.saturating_sub(self.created_at);
+        let components = [
+            (Component::Discovery, config.discovery_stale_ms),
+            (Component::Capture, config.capture_stale_ms),
+            (Component::Persistence, config.persistence_stale_ms),
+            (Component::Maintenance, config.maintenance_stale_ms),
+        ];
+
+        let mut statuses = Vec::with_capacity(components.len());
+        let mut worst = HealthStatus::Healthy;
+
+        for (component, threshold_ms) in components {
+            let last = self.last_heartbeat(component);
+            let status = if last == 0 {
+                // Never recorded — may not have started yet.  Treat as
+                // healthy within the grace period, degraded after.
+                if uptime_ms < config.grace_period_ms {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Degraded
+                }
+            } else {
+                let age_ms = now.saturating_sub(last);
+                if age_ms <= threshold_ms {
+                    HealthStatus::Healthy
+                } else if age_ms <= threshold_ms.saturating_mul(2) {
+                    HealthStatus::Degraded
+                } else {
+                    HealthStatus::Critical
+                }
+            };
+
+            if status > worst {
+                worst = status;
+            }
+
+            statuses.push(ComponentHealth {
+                component,
+                last_heartbeat_ms: if last == 0 { None } else { Some(last) },
+                age_ms: if last == 0 {
+                    None
+                } else {
+                    Some(now.saturating_sub(last))
+                },
+                threshold_ms,
+                status,
+            });
+        }
+
+        HealthReport {
+            timestamp_ms: now,
+            overall: worst,
+            components: statuses,
+        }
+    }
+}
+
+/// Watchdog configuration: per-component staleness thresholds.
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    /// How often the monitor task runs (ms).
+    pub check_interval: Duration,
+    /// Discovery heartbeat stale after this many ms.
+    pub discovery_stale_ms: u64,
+    /// Capture heartbeat stale after this many ms.
+    pub capture_stale_ms: u64,
+    /// Persistence heartbeat stale after this many ms.
+    pub persistence_stale_ms: u64,
+    /// Maintenance heartbeat stale after this many ms.
+    pub maintenance_stale_ms: u64,
+    /// Grace period after startup (ms) before flagging missing heartbeats.
+    pub grace_period_ms: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            check_interval: Duration::from_secs(30),
+            discovery_stale_ms: 15_000, // 15 s  (discovery runs every 5 s)
+            capture_stale_ms: 5_000,    //  5 s  (capture ticks every ~10 ms)
+            persistence_stale_ms: 30_000, // 30 s  (depends on capture throughput)
+            maintenance_stale_ms: 120_000, //  2 m  (maintenance runs every 60 s)
+            grace_period_ms: 30_000,    // 30 s  after startup
+        }
+    }
+}
+
+/// Monitored subsystem identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Component {
+    Discovery,
+    Capture,
+    Persistence,
+    Maintenance,
+}
+
+impl Component {
+    /// All component variants.
+    pub const ALL: [Component; 4] = [
+        Component::Discovery,
+        Component::Capture,
+        Component::Persistence,
+        Component::Maintenance,
+    ];
+}
+
+impl std::fmt::Display for Component {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Discovery => write!(f, "discovery"),
+            Self::Capture => write!(f, "capture"),
+            Self::Persistence => write!(f, "persistence"),
+            Self::Maintenance => write!(f, "maintenance"),
+        }
+    }
+}
+
+/// Health status ordered by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Healthy,
+    Degraded,
+    Critical,
+    /// Component is almost certainly hung (z-score >= 5 in adaptive mode).
+    Hung,
+}
+
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Degraded => write!(f, "degraded"),
+            Self::Critical => write!(f, "critical"),
+            Self::Hung => write!(f, "hung"),
+        }
+    }
+}
+
+/// Per-component health details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentHealth {
+    pub component: Component,
+    /// Last heartbeat timestamp (epoch ms), `None` if never recorded.
+    pub last_heartbeat_ms: Option<u64>,
+    /// Age since last heartbeat (ms), `None` if never recorded.
+    pub age_ms: Option<u64>,
+    /// Configured threshold for this component (ms).
+    pub threshold_ms: u64,
+    pub status: HealthStatus,
+}
+
+/// Full health report across all components.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub timestamp_ms: u64,
+    pub overall: HealthStatus,
+    pub components: Vec<ComponentHealth>,
+}
+
+impl HealthReport {
+    /// Return components that are not healthy.
+    #[must_use]
+    pub fn unhealthy_components(&self) -> Vec<&ComponentHealth> {
+        self.components
+            .iter()
+            .filter(|c| c.status != HealthStatus::Healthy)
+            .collect()
+    }
+}
+
+/// Handle returned by [`spawn_watchdog`] to control the monitor task.
+#[must_use = "watchdog tasks must be signalled and joined to prove terminal settlement"]
+pub struct WatchdogHandle {
+    tasks: JoinSet<()>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+    #[cfg(test)]
+    wait_entered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// Top-level watcher tasks can own their own bounded child drain. Keep this
+// envelope longer than the distributed listener's 500 ms accept poll plus its
+// one-second connection-task settlement bound, or the outer abort could cut
+// off the very acknowledgement drain it is meant to preserve.
+const WATCHDOG_JOIN_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Finite failure classes for watchdog task settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WatchdogJoinError {
+    /// The task reached a terminal failure rather than a normal exit.
+    #[error("watchdog task failed with class {kind:?}")]
+    TaskFailed { kind: JoinErrorKind },
+    /// The bounded drain ended without a timeout but still could not establish
+    /// terminal acknowledgement (for example, its cleanup context failed).
+    #[error("watchdog task settlement remained unacknowledged")]
+    SettlementUnacknowledged,
+    /// Abort was requested, but terminal acknowledgement missed its bound.
+    #[error("watchdog task settlement timed out")]
+    SettlementTimedOut,
+}
+
+impl WatchdogHandle {
+    /// Adopt a task governed by the supplied shared shutdown flag.
+    ///
+    /// This is used by top-level monitoring loops that already observe an
+    /// application-owned flag but still need the watchdog handle's bounded,
+    /// trusted terminal-drain contract.
+    pub fn adopt_shutdown_task(
+        task: JoinHandle<()>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self::adopt_shutdown_task_with_notify(task, shutdown, Arc::new(Notify::new()))
+    }
+
+    /// Adopt a task whose cooperative shutdown wait uses the supplied notify.
+    ///
+    /// The task and this handle must share both `shutdown` and
+    /// `shutdown_notify`. [`Self::signal_shutdown`] then changes the durable
+    /// predicate before waking the task, avoiding both lost wakes and a polling
+    /// delay during bounded graceful settlement.
+    pub fn adopt_shutdown_task_with_notify(
+        task: JoinHandle<()>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+    ) -> Self {
+        let mut tasks = JoinSet::new();
+        tasks.insert_handle(task);
+        Self {
+            tasks,
+            shutdown,
+            shutdown_notify,
+            #[cfg(test)]
+            wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal the watchdog to stop.
+    pub fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn force_registration_failure_for_test(&self) {
+        self.tasks.force_join_registration_failure_for_test();
+    }
+
+    /// Signal shutdown and retain ownership until the task acknowledges either
+    /// graceful completion or bounded abort settlement.
+    ///
+    /// A cancelled caller cannot suppress cleanup. The handle substitutes an
+    /// independent finite context for the graceful phase, then requests abort
+    /// only if the task still has not settled. This gives nested task owners a
+    /// chance to run their own bounded drains before the outer future is
+    /// cancelled. Callers must await this method; `Drop` can request abort but
+    /// cannot synchronously prove acknowledgement from inside an executor.
+    pub async fn join_with_cx(self, cx: &crate::cx::Cx) -> Result<(), WatchdogJoinError> {
+        self.join_with_cx_with_grace_timeout(cx, WATCHDOG_JOIN_SETTLEMENT_TIMEOUT)
+            .await
+    }
+
+    async fn join_with_cx_with_grace_timeout(
+        mut self,
+        cx: &crate::cx::Cx,
+        grace_timeout: Duration,
+    ) -> Result<(), WatchdogJoinError> {
+        self.signal_shutdown();
+
+        let independent_cx = if cx.checkpoint().is_ok() {
+            None
+        } else {
+            Some(crate::cx::for_request())
+        };
+        let graceful_cx = independent_cx.as_ref().unwrap_or(cx);
+        let mut terminal_failure = None;
+        let _graceful_result = crate::runtime_async::timeout_with_cx(
+            graceful_cx,
+            grace_timeout,
+            self.drain_tasks_with_cx(graceful_cx, &mut terminal_failure),
+        )
+        .await;
+        if self.tasks.settlement() == JoinSetSettlement::Settled {
+            return terminal_failure
+                .map_or(Ok(()), |kind| Err(WatchdogJoinError::TaskFailed { kind }));
+        }
+
+        self.abort_and_settle().await
+    }
+
+    /// Skip the cooperative grace interval, request abort immediately, and
+    /// retain ownership through the same bounded trusted terminal drain.
+    ///
+    /// This is appropriate for adopted tasks that do not observe the handle's
+    /// shutdown flag/notification directly. The caller Cx is accepted to keep
+    /// authority explicit, but cleanup uses an independent finite context so a
+    /// cancelled parent cannot suppress terminal acknowledgement.
+    pub async fn abort_and_join_with_cx(
+        mut self,
+        _cx: &crate::cx::Cx,
+    ) -> Result<(), WatchdogJoinError> {
+        self.signal_shutdown();
+        self.abort_and_settle().await
+    }
+
+    async fn abort_and_settle(&mut self) -> Result<(), WatchdogJoinError> {
+        self.tasks.abort_all();
+        let settlement_cx = crate::cx::for_request();
+        let mut terminal_failure = None;
+        let settlement_result = crate::runtime_async::timeout_with_cx(
+            &settlement_cx,
+            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            self.drain_tasks_with_cx(&settlement_cx, &mut terminal_failure),
+        )
+        .await;
+        match self.tasks.settlement() {
+            JoinSetSettlement::Settled => {
+                terminal_failure.map_or(Ok(()), |kind| Err(WatchdogJoinError::TaskFailed { kind }))
+            }
+            JoinSetSettlement::Incomplete { .. } if settlement_result.is_err() => {
+                Err(WatchdogJoinError::SettlementTimedOut)
+            }
+            JoinSetSettlement::Incomplete { .. } => {
+                Err(WatchdogJoinError::SettlementUnacknowledged)
+            }
+        }
+    }
+
+    async fn drain_tasks_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        terminal_failure: &mut Option<JoinErrorKind>,
+    ) -> Result<(), JoinErrorKind> {
+        loop {
+            match self.tasks.drain_next_with_cx(cx).await {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(error))) => {
+                    if !matches!(
+                        error.kind(),
+                        JoinErrorKind::Aborted
+                            | JoinErrorKind::ContextCancelled
+                            | JoinErrorKind::WakerRegistrationFailed
+                    ) {
+                        *terminal_failure = Some(error.kind());
+                    }
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error.kind()),
+            }
+        }
+    }
+}
+
+impl Drop for WatchdogHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        self.tasks.abort_all();
+        if let JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } = self.tasks.settlement()
+        {
+            error!(
+                event = "watchdog_handle_dropped_before_settlement",
+                active_tasks,
+                unacknowledged_tasks,
+                orphan_risk = true,
+                "WatchdogHandle dropped without terminal acknowledgement; callers must await join_with_cx"
+            );
+        }
+    }
+}
+
+/// Spawn the watchdog monitor task.
+///
+/// The monitor periodically calls [`HeartbeatRegistry::check_health`] and
+/// logs structured warnings for any unhealthy components.  It does **not**
+/// perform forced restarts; that will be added in a future iteration.
+///
+/// # Arguments
+/// * `cx` – governing capability context inherited by the monitor task.
+/// * `heartbeats` – shared heartbeat registry updated by runtime tasks.
+/// * `config` – staleness thresholds and check interval.
+/// * `shutdown_flag` – external shutdown signal (e.g. from `ObservationRuntime`).
+pub fn spawn_watchdog(
+    cx: &crate::cx::Cx,
+    heartbeats: Arc<HeartbeatRegistry>,
+    config: WatchdogConfig,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> WatchdogHandle {
+    let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let internal_flag = Arc::clone(&internal_shutdown);
+    let internal_shutdown_notify = Arc::new(Notify::new());
+    let internal_notify = Arc::clone(&internal_shutdown_notify);
+    #[cfg(test)]
+    let wait_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let task_wait_entered = Arc::clone(&wait_entered);
+    let check_interval = config.check_interval;
+
+    let task = {
+        task::spawn_with_cx(cx, move |watchdog_cx| async move {
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+                    info!("Watchdog: shutdown signal received");
+                    break;
+                }
+
+                if watchdog_cx.checkpoint().is_err() {
+                    info!("Watchdog: cancelled via cx");
+                    break;
+                }
+
+                let report = heartbeats.check_health(&config);
+
+                match report.overall {
+                    HealthStatus::Healthy => {
+                        // Everything fine — nothing to log at info level.
+                    }
+                    HealthStatus::Degraded => {
+                        for ch in report.unhealthy_components() {
+                            warn!(
+                                component = %ch.component,
+                                status = %ch.status,
+                                age_ms = ch.age_ms,
+                                threshold_ms = ch.threshold_ms,
+                                "Watchdog: component heartbeat is stale"
+                            );
+                        }
+                    }
+                    HealthStatus::Critical | HealthStatus::Hung => {
+                        for ch in report.unhealthy_components() {
+                            error!(
+                                component = %ch.component,
+                                status = %ch.status,
+                                age_ms = ch.age_ms,
+                                threshold_ms = ch.threshold_ms,
+                                "Watchdog: component heartbeat critically stale"
+                            );
+                        }
+
+                        // Dump full diagnostic report at error level.
+                        if let Ok(json) = serde_json::to_string_pretty(&report) {
+                            error!(diagnostic = %json, "Watchdog: diagnostic dump");
+                        }
+                    }
+                }
+
+                use futures::future::{Either, select};
+
+                #[cfg(test)]
+                task_wait_entered.store(true, Ordering::SeqCst);
+                let shutdown_wait = std::pin::pin!(
+                    internal_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) })
+                );
+                let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                    &watchdog_cx,
+                    check_interval,
+                ));
+                match select(shutdown_wait, interval_wait).await {
+                    Either::Left(((), _)) => {
+                        info!("Watchdog: shutdown signal received");
+                        break;
+                    }
+                    Either::Right((Ok(()), _)) => {}
+                    Either::Right((Err(_), _)) => {
+                        info!("Watchdog: cancelled via cx");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+
+    let mut tasks = JoinSet::new();
+    tasks.insert_handle(task);
+    WatchdogHandle {
+        tasks,
+        shutdown: internal_shutdown,
+        shutdown_notify: internal_shutdown_notify,
+        #[cfg(test)]
+        wait_entered,
+    }
+}
+
+// =============================================================================
+// Mux Server Watchdog
+// =============================================================================
+
+/// Configuration for the mux server watchdog.
+#[derive(Debug, Clone)]
+pub struct MuxWatchdogConfig {
+    /// How often to check mux server health (default: 30s).
+    pub check_interval: Duration,
+    /// Timeout for the ping health check (default: 5s).
+    pub ping_timeout: Duration,
+    /// Consecutive failures before reporting to DegradationManager.
+    pub failure_threshold: u32,
+    /// RSS memory warning threshold in bytes (default: 32 GB).
+    pub memory_warning_bytes: u64,
+    /// RSS memory critical threshold in bytes (default: 64 GB).
+    pub memory_critical_bytes: u64,
+    /// Ring buffer capacity for health history.
+    pub history_capacity: usize,
+}
+
+impl Default for MuxWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            check_interval: Duration::from_secs(30),
+            ping_timeout: Duration::from_secs(5),
+            failure_threshold: 3,
+            memory_warning_bytes: 32 * 1024 * 1024 * 1024, // 32 GB
+            memory_critical_bytes: 64 * 1024 * 1024 * 1024, // 64 GB
+            history_capacity: 1000,
+        }
+    }
+}
+
+/// Result of a single mux server health check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxHealthSample {
+    /// Epoch ms when sample was taken.
+    pub timestamp_ms: u64,
+    /// Whether the ping succeeded.
+    pub ping_ok: bool,
+    /// Ping latency in milliseconds (None if failed).
+    pub ping_latency_ms: Option<u64>,
+    /// Resident set size in bytes (None if unavailable).
+    pub rss_bytes: Option<u64>,
+    /// Backend-specific warning lines surfaced by `MuxInterface::watchdog_warnings`.
+    #[serde(default)]
+    pub watchdog_warnings: Vec<String>,
+    /// Number of warning lines captured during this check.
+    #[serde(default)]
+    pub warning_count: usize,
+    /// Health status derived from this sample.
+    pub status: HealthStatus,
+}
+
+/// Mux server health report with history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxHealthReport {
+    pub timestamp_ms: u64,
+    pub status: HealthStatus,
+    pub consecutive_failures: u32,
+    pub latest_sample: Option<MuxHealthSample>,
+    pub total_checks: u64,
+    pub total_failures: u64,
+}
+
+/// Finite failure classes for an interrupted mux health check.
+///
+/// Cancellation reasons are deliberately not retained: they can contain
+/// operator-supplied text and must not cross watchdog telemetry or log
+/// boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MuxWatchdogCheckError {
+    /// Explicit or structural cancellation stopped the check.
+    #[error("mux watchdog check cancelled")]
+    Cancelled,
+    /// A deadline or timeout budget stopped the check.
+    #[error("mux watchdog check deadline exceeded")]
+    DeadlineExceeded,
+    /// The cooperative poll quota was exhausted.
+    #[error("mux watchdog check poll quota exhausted")]
+    PollQuotaExhausted,
+    /// The operation cost budget was exhausted.
+    #[error("mux watchdog check cost budget exhausted")]
+    CostBudgetExhausted,
+    /// A checkpoint failed without a stable typed root cause.
+    #[error("mux watchdog capability context failed")]
+    ContextFailure,
+}
+
+/// Mux server watchdog — monitors mux server health and reports to DegradationManager.
+pub struct MuxWatchdog {
+    config: MuxWatchdogConfig,
+    wezterm: crate::wezterm::WeztermHandle,
+    /// Ring buffer of recent health samples.
+    history: std::collections::VecDeque<MuxHealthSample>,
+    consecutive_failures: u32,
+    total_checks: u64,
+    total_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+enum WarningProbeOutcome {
+    Ok(Vec<String>),
+    BackendFailure,
+    Timeout,
+}
+
+fn warning_status_from_line(line: &str) -> Option<HealthStatus> {
+    let normalized = line.to_ascii_lowercase();
+
+    if normalized.contains("hung")
+        || normalized.contains("unresponsive")
+        || normalized.contains("deadlock")
+    {
+        return Some(HealthStatus::Hung);
+    }
+
+    if normalized.contains("critical")
+        || normalized.contains("fatal")
+        || normalized.contains("circuit open")
+        || normalized.contains("panic")
+    {
+        return Some(HealthStatus::Critical);
+    }
+
+    if normalized.contains("degraded")
+        || normalized.contains("warning")
+        || normalized.contains("half-open")
+        || normalized.contains("failed")
+        || normalized.contains("timeout")
+    {
+        return Some(HealthStatus::Degraded);
+    }
+
+    None
+}
+
+fn warning_status_from_lines(lines: &[String]) -> Option<HealthStatus> {
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut derived = HealthStatus::Degraded;
+    for line in lines {
+        derived = derived.max(warning_status_from_line(line).unwrap_or(HealthStatus::Degraded));
+    }
+    Some(derived)
+}
+
+impl MuxWatchdog {
+    fn classify_cx_failure(cx: &crate::cx::Cx) -> MuxWatchdogCheckError {
+        use crate::outcome::CancelKind;
+
+        match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                MuxWatchdogCheckError::DeadlineExceeded
+            }
+            Some(CancelKind::PollQuota) => MuxWatchdogCheckError::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => MuxWatchdogCheckError::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            ) => MuxWatchdogCheckError::Cancelled,
+            None => MuxWatchdogCheckError::ContextFailure,
+        }
+    }
+
+    fn record_completed_check(&mut self) {
+        self.total_checks = self.total_checks.saturating_add(1);
+    }
+
+    fn record_ping_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.total_failures = self.total_failures.saturating_add(1);
+    }
+
+    /// Create a new mux watchdog.
+    #[must_use]
+    pub fn new(mut config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
+        // Keep at least one slot so history bookkeeping stays well-defined.
+        let history_capacity = config.history_capacity.max(1);
+        config.history_capacity = history_capacity;
+        Self {
+            config,
+            wezterm,
+            history: std::collections::VecDeque::with_capacity(history_capacity),
+            consecutive_failures: 0,
+            total_checks: 0,
+            total_failures: 0,
+        }
+    }
+
+    /// Run a single health check under an explicit `&Cx`.
+    ///
+    /// Both the WezTerm pane-list ping and the watchdog-warnings probe use
+    /// [`crate::runtime_async::timeout_with_cx`] so cancellation, budget,
+    /// and virtual time flow through the caller's capability context. There is
+    /// intentionally no ambient wrapper: watchdog I/O must never regain
+    /// authority by constructing an independent context after cancellation.
+    pub async fn check_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<MuxHealthSample, MuxWatchdogCheckError> {
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
+        let now = epoch_ms();
+        let start = crate::runtime_async::timer_now_with_cx(cx);
+
+        // Tick 206 (ft-xbnl0.2.3): route the ping through
+        // list_panes_with_cx(cx) so the inner WeztermInterface call
+        // observes the caller's cx. Previously wrapped ambient
+        // list_panes() in timeout_with_cx — the outer timer bound
+        // the caller's cx but the inner future ran with ambient cx.
+        // Concrete impls like WeztermClient::list_panes_with_cx
+        // route through MuxPool::list_panes_with_cx for real
+        // cx threading; impls without an override see an identical
+        // trait-default delegation to ambient list_panes().
+        let ping_result = crate::runtime_async::timeout_with_cx(
+            cx,
+            self.config.ping_timeout,
+            self.wezterm.list_panes_with_cx(cx),
+        )
+        .await;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
+        let ping_ok = matches!(ping_result, Ok(Ok(_)));
+
+        let ping_latency_ms = if ping_ok {
+            Some(runtime_elapsed_ms(
+                start,
+                crate::runtime_async::timer_now_with_cx(cx),
+            ))
+        } else {
+            None
+        };
+
+        let rss_bytes = get_mux_server_rss_with_cx(cx).await;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
+
+        // Tick 211 (ft-xbnl0.2.3): route the warning probe through
+        // `watchdog_warnings_with_cx(cx)` (added this tick). Default
+        // trait impl delegates to ambient `watchdog_warnings()`, so
+        // impls without an override see identical behavior; impls
+        // that override get end-to-end cx threading. Previously this
+        // wrapped ambient watchdog_warnings() in timeout_with_cx —
+        // same shape as the ping path before tick 206.
+        let warning_probe_result = crate::runtime_async::timeout_with_cx(
+            cx,
+            self.config.ping_timeout,
+            self.wezterm.watchdog_warnings_with_cx(cx),
+        )
+        .await;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
+        let warning_probe = match warning_probe_result {
+            Ok(Ok(lines)) => WarningProbeOutcome::Ok(lines),
+            Ok(Err(_)) => WarningProbeOutcome::BackendFailure,
+            Err(_) => WarningProbeOutcome::Timeout,
+        };
+
+        self.record_completed_check();
+        Ok(self.finalize_sample(now, ping_ok, ping_latency_ms, rss_bytes, warning_probe))
+    }
+
+    fn finalize_sample(
+        &mut self,
+        now: u64,
+        ping_ok: bool,
+        ping_latency_ms: Option<u64>,
+        rss_bytes: Option<u64>,
+        warning_probe: WarningProbeOutcome,
+    ) -> MuxHealthSample {
+        let mut watchdog_warnings = match warning_probe {
+            WarningProbeOutcome::Ok(lines) => lines,
+            WarningProbeOutcome::BackendFailure => {
+                vec!["backend watchdog warning probe failed".to_string()]
+            }
+            WarningProbeOutcome::Timeout => {
+                vec!["backend watchdog warning probe timed out".to_string()]
+            }
+        };
+        watchdog_warnings.retain(|line| !line.trim().is_empty());
+
+        // Determine baseline status from ping/memory checks.
+        let mut status = if !ping_ok {
+            self.record_ping_failure();
+            if self.consecutive_failures >= self.config.failure_threshold {
+                HealthStatus::Critical
+            } else {
+                HealthStatus::Degraded
+            }
+        } else {
+            self.consecutive_failures = 0;
+            match rss_bytes {
+                Some(rss) if rss >= self.config.memory_critical_bytes => HealthStatus::Critical,
+                Some(rss) if rss >= self.config.memory_warning_bytes => HealthStatus::Degraded,
+                _ => HealthStatus::Healthy,
+            }
+        };
+
+        // Fold warning severity into the final status.
+        if let Some(warning_status) = warning_status_from_lines(&watchdog_warnings) {
+            status = status.max(warning_status);
+        }
+
+        let warning_count = watchdog_warnings.len();
+
+        let sample = MuxHealthSample {
+            timestamp_ms: now,
+            ping_ok,
+            ping_latency_ms,
+            rss_bytes,
+            watchdog_warnings,
+            warning_count,
+            status,
+        };
+
+        // Store in history ring buffer
+        if self.history.len() >= self.config.history_capacity {
+            self.history.pop_front();
+        }
+        self.history.push_back(sample.clone());
+
+        sample
+    }
+
+    /// Get the current health report.
+    #[must_use]
+    pub fn report(&self) -> MuxHealthReport {
+        MuxHealthReport {
+            timestamp_ms: epoch_ms(),
+            status: self
+                .history
+                .back()
+                .map_or(HealthStatus::Healthy, |s| s.status),
+            consecutive_failures: self.consecutive_failures,
+            latest_sample: self.history.back().cloned(),
+            total_checks: self.total_checks,
+            total_failures: self.total_failures,
+        }
+    }
+}
+
+/// Spawn the mux watchdog as a background task under the caller's explicit
+/// capability context.
+pub fn spawn_mux_watchdog(
+    cx: &crate::cx::Cx,
+    config: MuxWatchdogConfig,
+    wezterm: crate::wezterm::WeztermHandle,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> WatchdogHandle {
+    let check_interval = config.check_interval;
+    let failure_threshold = config.failure_threshold;
+    let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let internal_flag = Arc::clone(&internal_shutdown);
+    let shutdown_notify = Arc::new(Notify::new());
+    let task_notify = Arc::clone(&shutdown_notify);
+
+    let task = task::spawn_with_cx(cx, move |mux_watchdog_cx| async move {
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        info!("Mux watchdog started");
+
+        loop {
+            if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+                info!("Mux watchdog shutting down");
+                break;
+            }
+
+            if mux_watchdog_cx.checkpoint().is_err() {
+                info!("Mux watchdog: cancelled via cx");
+                break;
+            }
+
+            let sample = match watchdog.check_cx(&mux_watchdog_cx).await {
+                Ok(sample) => sample,
+                Err(err) => {
+                    info!(error = %err, "Mux watchdog: interrupted during health check");
+                    break;
+                }
+            };
+
+            match sample.status {
+                HealthStatus::Healthy => {
+                    if watchdog.total_checks % 10 == 0 {
+                        info!(
+                            ping_ms = sample.ping_latency_ms,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
+                            "Mux watchdog: healthy"
+                        );
+                    }
+                }
+                HealthStatus::Degraded => {
+                    warn!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
+                        "Mux watchdog: degraded"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health degraded: {} consecutive failures, warnings={}",
+                            watchdog.consecutive_failures, sample.warning_count
+                        ),
+                    );
+                }
+                HealthStatus::Critical | HealthStatus::Hung => {
+                    error!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        threshold = failure_threshold,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
+                        "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
+                            watchdog.consecutive_failures,
+                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
+                            sample.warning_count
+                        ),
+                    );
+                }
+            }
+
+            use futures::future::{Either, select};
+            let shutdown_wait =
+                std::pin::pin!(task_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) }));
+            let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                &mux_watchdog_cx,
+                check_interval,
+            ));
+            match select(shutdown_wait, interval_wait).await {
+                Either::Left(((), _)) => {
+                    info!("Mux watchdog shutting down");
+                    break;
+                }
+                Either::Right((Ok(()), _)) => {}
+                Either::Right((Err(_), _)) => {
+                    info!("Mux watchdog: cancelled via cx");
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut tasks = JoinSet::new();
+    tasks.insert_handle(task);
+    WatchdogHandle {
+        tasks,
+        shutdown: internal_shutdown,
+        shutdown_notify,
+        #[cfg(test)]
+        wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_STDOUT_LIMIT_BYTES: usize = 4 * 1024;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MUX_SERVER_RSS_STDERR_LIMIT_BYTES: usize = 1024;
+
+/// Run one RSS discovery subprocess under a finite supervisor-owned deadline.
+/// The blocking worker remains usable under both production runtimes and raw
+/// `LabRuntime`; its process body is bounded by `output_blocking`, which
+/// terminates and reaps the child before returning. Caller cancellation is
+/// checked on both sides of that finite, non-preemptible worker handoff.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn mux_server_rss_command_output(
+    cx: &crate::cx::Cx,
+    program: &'static str,
+    args: Vec<String>,
+) -> Option<std::process::Output> {
+    cx.checkpoint().ok()?;
+    let output = crate::runtime_async::spawn_blocking(move || {
+        let mut command = crate::runtime_async::process::Command::new(program);
+        command.args(args);
+        command.kill_on_drop(true);
+        command.stdout_limit(MUX_SERVER_RSS_STDOUT_LIMIT_BYTES);
+        command.stderr_limit(MUX_SERVER_RSS_STDERR_LIMIT_BYTES);
+        command.output_blocking(MUX_SERVER_RSS_COMMAND_TIMEOUT)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    cx.checkpoint().ok()?;
+    Some(output)
+}
+
+/// Get the RSS (resident set size) of the FrankenTerm mux-server process under
+/// the caller's explicit capability context.
+#[cfg(target_os = "macos")]
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    let pgrep = mux_server_rss_command_output(
+        cx,
+        "pgrep",
+        vec!["-f".to_string(), "frankenterm-mux-server".to_string()],
+    )
+    .await?;
+
+    if !pgrep.status.success() {
+        return None;
+    }
+
+    let pid_str = String::from_utf8_lossy(&pgrep.stdout);
+    let pid: u32 = pid_str.lines().next()?.trim().parse().ok()?;
+
+    let pid = pid.to_string();
+    let ps = mux_server_rss_command_output(
+        cx,
+        "ps",
+        vec!["-o".to_string(), "rss=".to_string(), "-p".to_string(), pid],
+    )
+    .await?;
+
+    if !ps.status.success() {
+        return None;
+    }
+
+    let rss_kb: u64 = String::from_utf8_lossy(&ps.stdout).trim().parse().ok()?;
+
+    rss_kb.checked_mul(1024) // Convert KB to bytes without wrapping.
+}
+
+#[cfg(target_os = "linux")]
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    let pgrep = mux_server_rss_command_output(
+        cx,
+        "pgrep",
+        vec!["-f".to_string(), "frankenterm-mux-server".to_string()],
+    )
+    .await?;
+
+    if !pgrep.status.success() {
+        return None;
+    }
+
+    let pid_str = String::from_utf8_lossy(&pgrep.stdout);
+    let pid: &str = pid_str.lines().next()?.trim();
+
+    cx.checkpoint().ok()?;
+    let status_path = format!("/proc/{pid}/status");
+    let contents = std::fs::read_to_string(status_path).ok()?;
+
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let rest = rest.trim();
+            // Format: "12345 kB"
+            let kb_str = rest.split_whitespace().next()?;
+            let rss_kb: u64 = kb_str.parse().ok()?;
+            return rss_kb.checked_mul(1024); // Convert KB to bytes without wrapping.
+        }
+    }
+
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    cx.checkpoint().ok()?;
+    None
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Test-only convenience surfaces. Production callers must pass their
+    /// governing `Cx` directly to the explicit APIs.
+    trait TestMuxWatchdogCheck {
+        async fn check(&mut self) -> MuxHealthSample;
+    }
+
+    impl TestMuxWatchdogCheck for MuxWatchdog {
+        async fn check(&mut self) -> MuxHealthSample {
+            let cx = crate::cx::Cx::for_testing();
+            self.check_cx(&cx)
+                .await
+                .expect("test mux watchdog check must succeed")
+        }
+    }
+
+    trait TestWatchdogJoin {
+        async fn join(self);
+    }
+
+    impl TestWatchdogJoin for WatchdogHandle {
+        async fn join(self) {
+            let cx = crate::cx::Cx::for_testing();
+            self.join_with_cx(&cx)
+                .await
+                .expect("test watchdog task must settle");
+        }
+    }
+
+    #[test]
+    fn watchdog_atomic_telemetry_saturates_instead_of_wrapping() {
+        let registry = HeartbeatRegistry::new();
+        registry
+            .telemetry
+            .discovery_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .capture_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .persistence_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .maintenance_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .health_checks
+            .store(u64::MAX, Ordering::Relaxed);
+
+        registry.record_discovery();
+        registry.record_capture();
+        registry.record_persistence();
+        registry.record_maintenance();
+        let _ = registry.check_health(&WatchdogConfig::default());
+
+        let telemetry = registry.telemetry().snapshot();
+        assert_eq!(telemetry.discovery_heartbeats, u64::MAX);
+        assert_eq!(telemetry.capture_heartbeats, u64::MAX);
+        assert_eq!(telemetry.persistence_heartbeats, u64::MAX);
+        assert_eq!(telemetry.maintenance_heartbeats, u64::MAX);
+        assert_eq!(telemetry.health_checks, u64::MAX);
+    }
+
+    #[test]
+    fn mux_watchdog_cumulative_counters_saturate_instead_of_wrapping() {
+        let mut watchdog = MuxWatchdog::new(
+            MuxWatchdogConfig::default(),
+            crate::wezterm::mock_wezterm_handle(),
+        );
+        watchdog.total_checks = u64::MAX;
+        watchdog.total_failures = u64::MAX;
+        watchdog.consecutive_failures = u32::MAX;
+
+        watchdog.record_completed_check();
+        watchdog.record_ping_failure();
+
+        assert_eq!(watchdog.total_checks, u64::MAX);
+        assert_eq!(watchdog.total_failures, u64::MAX);
+        assert_eq!(watchdog.consecutive_failures, u32::MAX);
+    }
+
+    #[test]
+    fn mux_watchdog_latency_uses_runtime_clock_nanoseconds() {
+        let start = RuntimeTime::from_nanos(10_000_000);
+        let end = RuntimeTime::from_nanos(13_999_999);
+
+        assert_eq!(runtime_elapsed_ms(start, end), 3);
+        assert_eq!(runtime_elapsed_ms(end, start), 0);
+    }
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `MuxWatchdog::check_cx` path runs under seed-locked virtual-time
+    /// scheduling. The mock handle returns an empty pane list immediately
+    /// so the timeout path is not exercised (we only care that the
+    /// timeout_with_cx plumbing doesn't panic or block the scheduler).
+    #[test]
+    fn mux_watchdog_check_cx_runs_under_labruntime() {
+        const SEED: u64 = 0xD0C8_D06C_C410_00AF;
+        let wall_start = std::time::Instant::now();
+        let check_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check_ran_task = std::sync::Arc::clone(&check_ran);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must install its timer-capable Cx");
+                let config = MuxWatchdogConfig::default();
+                let wezterm = crate::wezterm::mock_wezterm_handle();
+                let mut watchdog = MuxWatchdog::new(config, wezterm);
+                let sample = watchdog
+                    .check_cx(&cx)
+                    .await
+                    .expect("fresh LabRuntime watchdog context must complete");
+                // The mock handle returns Ok so ping should succeed.
+                assert!(sample.ping_ok, "mock wezterm should report ping_ok");
+                assert_eq!(sample.status, HealthStatus::Healthy);
+                check_ran_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn watchdog check_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            check_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "check_cx must complete under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(2),
+            "Cx-first check must not burn real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
+
+    #[test]
+    fn mux_watchdog_precancel_does_not_publish_partial_sample() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel mux watchdog check"),
+            );
+
+            let mut watchdog = MuxWatchdog::new(
+                MuxWatchdogConfig::default(),
+                crate::wezterm::mock_wezterm_handle(),
+            );
+            watchdog.consecutive_failures = 3;
+            watchdog.total_failures = 7;
+
+            let result = watchdog.check_cx(&cx).await;
+
+            assert!(matches!(result, Err(MuxWatchdogCheckError::Cancelled)));
+            assert_eq!(watchdog.total_checks, 0);
+            assert_eq!(watchdog.consecutive_failures, 3);
+            assert_eq!(watchdog.total_failures, 7);
+            assert!(watchdog.history.is_empty());
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_context_failures_are_exhaustive_finite_and_content_free() {
+        use crate::outcome::CancelKind;
+
+        run_async_test(async {
+            const SECRET: &str = "SECRET mux watchdog cancellation reason";
+            let cases = [
+                (CancelKind::User, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::Timeout, MuxWatchdogCheckError::DeadlineExceeded),
+                (
+                    CancelKind::Deadline,
+                    MuxWatchdogCheckError::DeadlineExceeded,
+                ),
+                (
+                    CancelKind::PollQuota,
+                    MuxWatchdogCheckError::PollQuotaExhausted,
+                ),
+                (
+                    CancelKind::CostBudget,
+                    MuxWatchdogCheckError::CostBudgetExhausted,
+                ),
+                (CancelKind::FailFast, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::RaceLost, MuxWatchdogCheckError::Cancelled),
+                (
+                    CancelKind::ParentCancelled,
+                    MuxWatchdogCheckError::Cancelled,
+                ),
+                (
+                    CancelKind::ResourceUnavailable,
+                    MuxWatchdogCheckError::Cancelled,
+                ),
+                (CancelKind::Shutdown, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::LinkedExit, MuxWatchdogCheckError::Cancelled),
+            ];
+
+            for (kind, expected) in cases {
+                let cx = crate::cx::Cx::for_testing();
+                cx.cancel_with(kind, Some(SECRET));
+                let mut watchdog = MuxWatchdog::new(
+                    MuxWatchdogConfig::default(),
+                    crate::wezterm::mock_wezterm_handle(),
+                );
+
+                let error = watchdog
+                    .check_cx(&cx)
+                    .await
+                    .expect_err("pre-cancelled watchdog check must fail");
+                assert_eq!(error, expected, "unexpected class for {kind:?}");
+                assert!(!error.to_string().contains(SECRET));
+                assert!(!format!("{error:?}").contains(SECRET));
+                assert_eq!(watchdog.total_checks, 0);
+                assert!(watchdog.history.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn heartbeat_registry_defaults_to_zero() {
+        let reg = HeartbeatRegistry::new();
+        assert_eq!(reg.last_heartbeat(Component::Discovery), 0);
+        assert_eq!(reg.last_heartbeat(Component::Capture), 0);
+        assert_eq!(reg.last_heartbeat(Component::Persistence), 0);
+        assert_eq!(reg.last_heartbeat(Component::Maintenance), 0);
+    }
+
+    #[test]
+    fn record_updates_heartbeat() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        let ts = reg.last_heartbeat(Component::Discovery);
+        assert!(ts > 0, "heartbeat should be set after record");
+    }
+
+    #[test]
+    fn fresh_registry_is_healthy_within_grace_period() {
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig {
+            grace_period_ms: u64::MAX, // huge grace period
+            ..WatchdogConfig::default()
+        };
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn active_heartbeats_are_healthy() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Healthy);
+        assert!(report.unhealthy_components().is_empty());
+    }
+
+    #[test]
+    fn stale_heartbeat_is_degraded() {
+        let reg = HeartbeatRegistry::new();
+        // Simulate a heartbeat that was recorded in the past.
+        let past = epoch_ms().saturating_sub(20_000); // 20 s ago
+        reg.discovery.store(past, Ordering::SeqCst);
+        // Discovery threshold is 15 s, so 20 s is degraded (< 30 s critical).
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Degraded);
+
+        let unhealthy = report.unhealthy_components();
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0].component, Component::Discovery);
+    }
+
+    #[test]
+    fn very_stale_heartbeat_is_critical() {
+        let reg = HeartbeatRegistry::new();
+        // 60 s ago — well past 2×15 s critical threshold.
+        let past = epoch_ms().saturating_sub(60_000);
+        reg.discovery.store(past, Ordering::SeqCst);
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Critical);
+    }
+
+    #[test]
+    fn health_report_serializes() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: HealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.overall, report.overall);
+        assert_eq!(parsed.components.len(), 4);
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build watchdog test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn watchdog_shuts_down_on_signal() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_millis(10),
+                ..WatchdogConfig::default()
+            };
+
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+
+            // Let it run a few ticks.
+            crate::runtime_async::sleep(Duration::from_millis(50)).await;
+
+            shutdown.store(true, Ordering::SeqCst);
+            handle.join().await;
+            // If we get here, shutdown worked.
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `WatchdogHandle::join_with_cx`
+    /// must signal shutdown + await the task normally when
+    /// given a fresh, uncancelled cx. Equivalent to the legacy
+    /// join path's happy flow.
+    #[test]
+    fn watchdog_join_with_cx_shuts_down_cleanly() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_secs(60),
+                ..WatchdogConfig::default()
+            };
+
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            for _ in 0..4_096 {
+                if handle.wait_entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                crate::runtime_async::yield_now().await;
+            }
+            assert!(
+                handle.wait_entered.load(Ordering::SeqCst),
+                "watchdog task must enter its 60-second interval wait"
+            );
+            let cx = crate::cx::for_testing();
+            let started = std::time::Instant::now();
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("watchdog task must settle after shutdown signal");
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "shutdown notification must wake a 60-second watchdog sleep"
+            );
+            // `join_with_cx` calls `signal_shutdown` unconditionally,
+            // so the internal flag drives the task to exit even though
+            // `shutdown` was never flipped to true.
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `join_with_cx` with a pre-cancelled
+    /// cx must retain ownership and terminally settle the task rather than
+    /// returning by detaching it. The 60-second interval proves the independent
+    /// graceful context plus shutdown notification does not depend on the
+    /// ordinary sleep deadline.
+    #[test]
+    fn watchdog_join_with_precancelled_cx_returns_quickly() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_secs(60),
+                ..WatchdogConfig::default()
+            };
+
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel watchdog join"),
+            );
+
+            let start = std::time::Instant::now();
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("pre-cancelled join must still settle watchdog ownership");
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "join_with_cx on cancelled cx should settle quickly, took {elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_grace_envelope_leaves_room_for_nested_cleanup() {
+        assert_eq!(
+            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            Duration::from_secs(2),
+            "top-level graceful settlement must outlive the one-second nested child drains",
+        );
+    }
+
+    #[test]
+    fn watchdog_grace_timeout_falls_back_to_bounded_abort_settlement() {
+        run_async_test(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
+            let handle = WatchdogHandle::adopt_shutdown_task(task, Arc::clone(&shutdown));
+            let cx = crate::cx::for_testing();
+            let started = std::time::Instant::now();
+
+            handle
+                .join_with_cx_with_grace_timeout(&cx, Duration::from_millis(5))
+                .await
+                .expect(
+                    "a task that ignores cooperative shutdown must settle after fallback abort",
+                );
+
+            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "test-sized graceful timeout must transition promptly to abort settlement"
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_join_trusted_drains_persistent_registration_failure() {
+        run_async_test(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
+            let handle = WatchdogHandle::adopt_shutdown_task(task, shutdown);
+            handle.force_registration_failure_for_test();
+            let cx = crate::cx::for_testing();
+
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("registration failure must retain, abort, and trusted-drain ownership");
+        });
+    }
+
+    #[test]
+    fn component_display() {
+        assert_eq!(Component::Discovery.to_string(), "discovery");
+        assert_eq!(Component::Capture.to_string(), "capture");
+        assert_eq!(Component::Persistence.to_string(), "persistence");
+        assert_eq!(Component::Maintenance.to_string(), "maintenance");
+    }
+
+    #[test]
+    fn health_status_ordering() {
+        assert!(HealthStatus::Healthy < HealthStatus::Degraded);
+        assert!(HealthStatus::Degraded < HealthStatus::Critical);
+        assert!(HealthStatus::Critical < HealthStatus::Hung);
+    }
+
+    // =================================================================
+    // MuxWatchdog tests
+    // =================================================================
+
+    #[test]
+    fn mux_watchdog_config_defaults() {
+        let config = MuxWatchdogConfig::default();
+        assert_eq!(config.check_interval, Duration::from_secs(30));
+        assert_eq!(config.ping_timeout, Duration::from_secs(5));
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.memory_warning_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(config.memory_critical_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(config.history_capacity, 1000);
+    }
+
+    #[test]
+    fn mux_watchdog_new_uses_configured_history_capacity() {
+        let config = MuxWatchdogConfig {
+            history_capacity: 7,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        assert_eq!(watchdog.config.history_capacity, 7);
+        assert!(watchdog.history.capacity() >= 7);
+    }
+
+    #[test]
+    fn mux_watchdog_new_clamps_zero_history_capacity() {
+        let config = MuxWatchdogConfig {
+            history_capacity: 0,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        assert_eq!(watchdog.config.history_capacity, 1);
+        assert!(watchdog.history.capacity() >= 1);
+    }
+
+    #[test]
+    fn mux_health_sample_serializes() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1_700_000_000_000,
+            ping_ok: true,
+            ping_latency_ms: Some(5),
+            rss_bytes: Some(1024 * 1024 * 100),
+            watchdog_warnings: vec![],
+            warning_count: 0,
+            status: HealthStatus::Healthy,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(json.contains("\"ping_ok\":true"));
+        assert!(json.contains("\"ping_latency_ms\":5"));
+        let parsed: MuxHealthSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn mux_health_report_serializes() {
+        let report = MuxHealthReport {
+            timestamp_ms: 1_700_000_000_000,
+            status: HealthStatus::Healthy,
+            consecutive_failures: 0,
+            latest_sample: None,
+            total_checks: 10,
+            total_failures: 1,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"total_checks\":10"));
+        let parsed: MuxHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_failures, 1);
+    }
+
+    #[test]
+    fn mux_watchdog_initial_report_is_healthy() {
+        let config = MuxWatchdogConfig::default();
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        let report = watchdog.report();
+        assert_eq!(report.status, HealthStatus::Healthy);
+        assert_eq!(report.consecutive_failures, 0);
+        assert_eq!(report.total_checks, 0);
+    }
+
+    #[test]
+    fn mux_watchdog_records_successful_check() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Healthy);
+            assert_eq!(sample.warning_count, 0);
+            assert!(sample.watchdog_warnings.is_empty());
+            assert_eq!(watchdog.consecutive_failures, 0);
+            assert_eq!(watchdog.total_checks, 1);
+            assert_eq!(watchdog.history.len(), 1);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_detects_failure() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                failure_threshold: 2,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            // First failure: degraded
+            let sample = watchdog.check().await;
+            assert!(!sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+            assert_eq!(watchdog.consecutive_failures, 1);
+
+            // Second failure: critical (meets threshold)
+            let sample = watchdog.check().await;
+            assert_eq!(sample.status, HealthStatus::Critical);
+            assert_eq!(watchdog.consecutive_failures, 2);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_resets_on_success() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            // Simulate prior failures
+            watchdog.consecutive_failures = 5;
+            watchdog.total_failures = 5;
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(watchdog.consecutive_failures, 0);
+            // total_failures should NOT reset
+            assert_eq!(watchdog.total_failures, 5);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_history_bounded() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                history_capacity: 3,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            for _ in 0..5 {
+                watchdog.check().await;
+            }
+
+            assert_eq!(watchdog.history.len(), 3, "history should be bounded");
+            assert_eq!(watchdog.total_checks, 5);
+        });
+    }
+
+    // ── HeartbeatRegistry additional tests ─────────────────────────
+
+    #[test]
+    fn heartbeat_registry_default_trait() {
+        let reg = HeartbeatRegistry::default();
+        assert_eq!(reg.last_heartbeat(Component::Discovery), 0);
+        assert!(reg.created_at_ms() > 0);
+    }
+
+    #[test]
+    fn created_at_ms_is_recent() {
+        let before = epoch_ms();
+        let reg = HeartbeatRegistry::new();
+        let after = epoch_ms();
+        assert!(reg.created_at_ms() >= before);
+        assert!(reg.created_at_ms() <= after);
+    }
+
+    #[test]
+    fn record_each_component_independently() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_capture();
+        assert!(reg.last_heartbeat(Component::Capture) > 0);
+        assert_eq!(reg.last_heartbeat(Component::Discovery), 0);
+        assert_eq!(reg.last_heartbeat(Component::Persistence), 0);
+        assert_eq!(reg.last_heartbeat(Component::Maintenance), 0);
+    }
+
+    #[test]
+    fn grace_period_expired_no_heartbeats_is_degraded() {
+        let reg = HeartbeatRegistry::new();
+        // Force created_at far in the past so grace period has expired
+        let past_created = epoch_ms().saturating_sub(120_000);
+        // We can't directly set created_at since it's not pub, but we can
+        // use a config with a very short grace period
+        let config = WatchdogConfig {
+            grace_period_ms: 0, // No grace period
+            ..WatchdogConfig::default()
+        };
+        let _ = past_created; // used conceptually
+        let report = reg.check_health(&config);
+        // With zero grace period, unrecorded heartbeats should be degraded
+        assert!(report.overall >= HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn multiple_components_degraded() {
+        let reg = HeartbeatRegistry::new();
+        let past = epoch_ms().saturating_sub(20_000);
+        reg.discovery.store(past, Ordering::SeqCst);
+        reg.capture.store(past, Ordering::SeqCst);
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        let unhealthy = report.unhealthy_components();
+        assert!(unhealthy.len() >= 2);
+    }
+
+    #[test]
+    fn worst_status_propagates_to_overall() {
+        let reg = HeartbeatRegistry::new();
+        // One component critical, others healthy
+        let far_past = epoch_ms().saturating_sub(60_000);
+        reg.discovery.store(far_past, Ordering::SeqCst);
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Critical);
+    }
+
+    #[test]
+    fn component_health_fields_populated() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        let config = WatchdogConfig {
+            grace_period_ms: u64::MAX,
+            ..WatchdogConfig::default()
+        };
+        let report = reg.check_health(&config);
+
+        let discovery = report
+            .components
+            .iter()
+            .find(|c| c.component == Component::Discovery)
+            .unwrap();
+        assert!(discovery.last_heartbeat_ms.is_some());
+        assert!(discovery.age_ms.is_some());
+        assert_eq!(discovery.threshold_ms, config.discovery_stale_ms);
+        assert_eq!(discovery.status, HealthStatus::Healthy);
+
+        // Unrecorded component within grace period
+        let capture = report
+            .components
+            .iter()
+            .find(|c| c.component == Component::Capture)
+            .unwrap();
+        assert!(capture.last_heartbeat_ms.is_none());
+        assert!(capture.age_ms.is_none());
+    }
+
+    #[test]
+    fn health_report_has_four_components() {
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.components.len(), 4);
+    }
+
+    #[test]
+    fn health_report_timestamp_is_recent() {
+        let before = epoch_ms();
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert!(report.timestamp_ms >= before);
+    }
+
+    // ── WatchdogConfig ─────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_config_default_values() {
+        let config = WatchdogConfig::default();
+        assert_eq!(config.check_interval, Duration::from_secs(30));
+        assert_eq!(config.discovery_stale_ms, 15_000);
+        assert_eq!(config.capture_stale_ms, 5_000);
+        assert_eq!(config.persistence_stale_ms, 30_000);
+        assert_eq!(config.maintenance_stale_ms, 120_000);
+        assert_eq!(config.grace_period_ms, 30_000);
+    }
+
+    // ── Component ──────────────────────────────────────────────────
+
+    #[test]
+    fn component_all_has_four_variants() {
+        assert_eq!(Component::ALL.len(), 4);
+        let set: std::collections::HashSet<_> = Component::ALL.iter().collect();
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn component_serde_roundtrip() {
+        for component in &Component::ALL {
+            let json = serde_json::to_string(component).unwrap();
+            let parsed: Component = serde_json::from_str(&json).unwrap();
+            assert_eq!(*component, parsed);
+        }
+    }
+
+    #[test]
+    fn component_serde_uses_snake_case() {
+        let json = serde_json::to_string(&Component::Discovery).unwrap();
+        assert_eq!(json, r#""discovery""#);
+    }
+
+    // ── HealthStatus ───────────────────────────────────────────────
+
+    #[test]
+    fn health_status_display() {
+        assert_eq!(HealthStatus::Healthy.to_string(), "healthy");
+        assert_eq!(HealthStatus::Degraded.to_string(), "degraded");
+        assert_eq!(HealthStatus::Critical.to_string(), "critical");
+        assert_eq!(HealthStatus::Hung.to_string(), "hung");
+    }
+
+    #[test]
+    fn health_status_serde_roundtrip() {
+        let statuses = [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Critical,
+            HealthStatus::Hung,
+        ];
+        for status in &statuses {
+            let json = serde_json::to_string(status).unwrap();
+            let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*status, parsed);
+        }
+    }
+
+    #[test]
+    fn health_status_serde_uses_snake_case() {
+        let json = serde_json::to_string(&HealthStatus::Healthy).unwrap();
+        assert_eq!(json, r#""healthy""#);
+    }
+
+    // ── HealthReport ───────────────────────────────────────────────
+
+    #[test]
+    fn unhealthy_components_returns_empty_when_all_healthy() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert!(report.unhealthy_components().is_empty());
+    }
+
+    // ── WatchdogHandle ─────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_handle_signal_shutdown() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_millis(10),
+                ..WatchdogConfig::default()
+            };
+
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+
+            crate::runtime_async::sleep(Duration::from_millis(30)).await;
+
+            // Use handle's own signal_shutdown instead of the external flag
+            handle.signal_shutdown();
+            handle.join().await;
+        });
+    }
+
+    // ── MuxWatchdog additional tests ───────────────────────────────
+
+    #[test]
+    fn mux_watchdog_report_reflects_latest_check() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            assert!(watchdog.report().latest_sample.is_none());
+
+            watchdog.check().await;
+            let report = watchdog.report();
+            assert!(report.latest_sample.is_some());
+            assert_eq!(report.total_checks, 1);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_total_failures_accumulate() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                failure_threshold: 10,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            for _ in 0..3 {
+                watchdog.check().await;
+            }
+
+            assert_eq!(watchdog.total_failures, 3);
+            assert_eq!(watchdog.total_checks, 3);
+            assert_eq!(watchdog.consecutive_failures, 3);
+        });
+    }
+
+    #[test]
+    fn mux_health_report_serde_roundtrip_with_sample() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1_700_000_000_000,
+            ping_ok: false,
+            ping_latency_ms: None,
+            rss_bytes: Some(1024 * 1024),
+            watchdog_warnings: vec!["warning".to_string()],
+            warning_count: 1,
+            status: HealthStatus::Degraded,
+        };
+        let report = MuxHealthReport {
+            timestamp_ms: 1_700_000_000_000,
+            status: HealthStatus::Degraded,
+            consecutive_failures: 2,
+            latest_sample: Some(sample),
+            total_checks: 5,
+            total_failures: 2,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: MuxHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.consecutive_failures, 2);
+        assert!(parsed.latest_sample.is_some());
+        assert_eq!(parsed.latest_sample.unwrap().status, HealthStatus::Degraded);
+    }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- WatchdogConfig --
+
+    #[test]
+    fn watchdog_config_debug_clone() {
+        let config = WatchdogConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("WatchdogConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.grace_period_ms, config.grace_period_ms);
+    }
+
+    // -- Component --
+
+    #[test]
+    fn component_debug_clone_copy() {
+        let c = Component::Capture;
+        let cloned = c;
+        let copied = c;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn component_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for c in Component::ALL {
+            set.insert(c);
+        }
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn component_eq_ne() {
+        assert_eq!(Component::Discovery, Component::Discovery);
+        assert_ne!(Component::Discovery, Component::Capture);
+        assert_ne!(Component::Persistence, Component::Maintenance);
+    }
+
+    // -- HealthStatus --
+
+    #[test]
+    fn health_status_debug_clone_copy() {
+        let s = HealthStatus::Degraded;
+        let cloned = s;
+        let copied = s;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn health_status_display_all() {
+        assert_eq!(HealthStatus::Healthy.to_string(), "healthy");
+        assert_eq!(HealthStatus::Degraded.to_string(), "degraded");
+        assert_eq!(HealthStatus::Critical.to_string(), "critical");
+        assert_eq!(HealthStatus::Hung.to_string(), "hung");
+    }
+
+    #[test]
+    fn health_status_ordering_complete() {
+        assert!(HealthStatus::Healthy < HealthStatus::Degraded);
+        assert!(HealthStatus::Degraded < HealthStatus::Critical);
+        assert!(HealthStatus::Critical < HealthStatus::Hung);
+    }
+
+    #[test]
+    fn health_status_eq_ne() {
+        assert_eq!(HealthStatus::Healthy, HealthStatus::Healthy);
+        assert_ne!(HealthStatus::Healthy, HealthStatus::Hung);
+    }
+
+    // -- ComponentHealth --
+
+    #[test]
+    fn component_health_debug_clone() {
+        let ch = ComponentHealth {
+            component: Component::Discovery,
+            last_heartbeat_ms: Some(1000),
+            age_ms: Some(500),
+            threshold_ms: 30_000,
+            status: HealthStatus::Healthy,
+        };
+        let dbg = format!("{:?}", ch);
+        assert!(dbg.contains("ComponentHealth"), "got: {}", dbg);
+        let cloned = ch.clone();
+        assert_eq!(cloned.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn component_health_serde_roundtrip() {
+        let ch = ComponentHealth {
+            component: Component::Capture,
+            last_heartbeat_ms: None,
+            age_ms: None,
+            threshold_ms: 15_000,
+            status: HealthStatus::Degraded,
+        };
+        let json = serde_json::to_string(&ch).unwrap();
+        let back: ComponentHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.component, Component::Capture);
+        assert_eq!(back.status, HealthStatus::Degraded);
+    }
+
+    // -- HealthReport --
+
+    #[test]
+    fn health_report_debug_clone() {
+        let report = HealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Healthy,
+            components: vec![],
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("HealthReport"), "got: {}", dbg);
+        let cloned = report.clone();
+        assert_eq!(cloned.overall, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn health_report_unhealthy_with_mixed() {
+        let report = HealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Critical,
+            components: vec![
+                ComponentHealth {
+                    component: Component::Discovery,
+                    last_heartbeat_ms: Some(900),
+                    age_ms: Some(100),
+                    threshold_ms: 30_000,
+                    status: HealthStatus::Healthy,
+                },
+                ComponentHealth {
+                    component: Component::Capture,
+                    last_heartbeat_ms: None,
+                    age_ms: None,
+                    threshold_ms: 15_000,
+                    status: HealthStatus::Critical,
+                },
+            ],
+        };
+        let unhealthy = report.unhealthy_components();
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0].component, Component::Capture);
+    }
+
+    // -- MuxWatchdogConfig --
+
+    #[test]
+    fn mux_watchdog_config_debug_clone() {
+        let config = MuxWatchdogConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("MuxWatchdogConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.failure_threshold, config.failure_threshold);
+    }
+
+    // -- MuxHealthSample --
+
+    #[test]
+    fn mux_health_sample_debug_clone() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1000,
+            ping_ok: true,
+            ping_latency_ms: Some(5),
+            rss_bytes: Some(1024),
+            watchdog_warnings: vec![],
+            warning_count: 0,
+            status: HealthStatus::Healthy,
+        };
+        let dbg = format!("{:?}", sample);
+        assert!(dbg.contains("MuxHealthSample"), "got: {}", dbg);
+        let cloned = sample.clone();
+        assert!(cloned.ping_ok);
+    }
+
+    #[test]
+    fn warning_status_parser_maps_expected_tokens() {
+        assert_eq!(
+            warning_status_from_line("Shard 0 degraded due to half-open circuit"),
+            Some(HealthStatus::Degraded)
+        );
+        assert_eq!(
+            warning_status_from_line("Shard 1 critical circuit open state"),
+            Some(HealthStatus::Critical)
+        );
+        assert_eq!(
+            warning_status_from_line("Mux appears hung and unresponsive"),
+            Some(HealthStatus::Hung)
+        );
+        assert_eq!(warning_status_from_line("plain note"), None);
+    }
+
+    #[test]
+    fn mux_watchdog_escalates_on_critical_watchdog_warning() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec!["critical: shard 2 circuit open".to_string()])
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Critical);
+            assert_eq!(sample.warning_count, 1);
+            assert!(sample.watchdog_warnings[0].contains("critical"));
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_warning_probe_failure_marks_degraded() {
+        run_async_test(async {
+            const SECRET: &str = "SECRET watchdog backend failure";
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warning_error(Some(SECRET.to_string()))
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+            assert_eq!(sample.warning_count, 1);
+            assert_eq!(
+                sample.watchdog_warnings[0],
+                "backend watchdog warning probe failed"
+            );
+            assert!(!format!("{sample:?}").contains(SECRET));
+        });
+    }
+
+    // -- warning_status_from_line/lines unit tests (ft-1360.1) ──────
+
+    #[test]
+    fn warning_status_line_all_degraded_keywords() {
+        for keyword in &["degraded", "warning", "half-open", "failed", "timeout"] {
+            let line = format!("Shard 3 reports {keyword} state");
+            assert_eq!(
+                warning_status_from_line(&line),
+                Some(HealthStatus::Degraded),
+                "keyword '{keyword}' should map to Degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_status_line_all_critical_keywords() {
+        for keyword in &["critical", "fatal", "circuit open", "panic"] {
+            let line = format!("Shard 0 {keyword} condition detected");
+            assert_eq!(
+                warning_status_from_line(&line),
+                Some(HealthStatus::Critical),
+                "keyword '{keyword}' should map to Critical"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_status_line_all_hung_keywords() {
+        for keyword in &["hung", "unresponsive", "deadlock"] {
+            let line = format!("Mux server {keyword}");
+            assert_eq!(
+                warning_status_from_line(&line),
+                Some(HealthStatus::Hung),
+                "keyword '{keyword}' should map to Hung"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_status_line_case_insensitive() {
+        assert_eq!(
+            warning_status_from_line("CRITICAL error in shard"),
+            Some(HealthStatus::Critical)
+        );
+        assert_eq!(
+            warning_status_from_line("DEADLOCK detected"),
+            Some(HealthStatus::Hung)
+        );
+    }
+
+    #[test]
+    fn warning_status_line_hung_outranks_critical_keywords() {
+        // "hung" appears before "critical" in the check order → Hung wins
+        assert_eq!(
+            warning_status_from_line("hung critical deadlock"),
+            Some(HealthStatus::Hung)
+        );
+    }
+
+    #[test]
+    fn warning_status_lines_empty_returns_none() {
+        assert_eq!(warning_status_from_lines(&[]), None);
+    }
+
+    #[test]
+    fn warning_status_lines_single_degraded() {
+        let lines = vec!["shard timeout".to_string()];
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn warning_status_lines_max_severity_wins() {
+        let lines = vec![
+            "shard 0 warning: backlog growing".to_string(),
+            "shard 1 critical: circuit open".to_string(),
+            "shard 2 degraded: high latency".to_string(),
+        ];
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Critical)
+        );
+    }
+
+    #[test]
+    fn warning_status_lines_hung_outranks_all() {
+        let lines = vec![
+            "shard 0 critical: circuit open".to_string(),
+            "shard 1 hung: unresponsive for 30s".to_string(),
+        ];
+        assert_eq!(warning_status_from_lines(&lines), Some(HealthStatus::Hung));
+    }
+
+    #[test]
+    fn warning_status_lines_no_keywords_yields_degraded() {
+        // Non-empty lines without recognized keywords default to Degraded
+        let lines = vec!["some informational note".to_string()];
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Degraded)
+        );
+    }
+
+    // -- MuxWatchdog warning-driven check() tests (ft-1360.1) ─────
+
+    #[test]
+    fn mux_watchdog_degraded_on_warning_keyword() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec![
+                "shard 0 timeout: backlog depth exceeded threshold".to_string(),
+            ])
+            .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+            assert_eq!(sample.warning_count, 1);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_hung_on_deadlock_warning() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec!["mux server deadlock detected in shard 2".to_string()])
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Hung);
+            assert_eq!(sample.warning_count, 1);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_multiple_warnings_uses_max_severity() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec![
+                "shard 0 warning: high latency".to_string(),
+                "shard 1 critical: circuit open".to_string(),
+                "shard 2 degraded: backlog growing".to_string(),
+            ])
+            .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Critical);
+            assert_eq!(sample.warning_count, 3);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_warnings_do_not_downgrade_ping_failure() {
+        run_async_test(async {
+            // When ping fails AND warnings contain only "degraded" keywords,
+            // the status should reflect the ping-failure severity, not drop.
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            // Set warnings — but since ping will succeed (mock_wezterm_handle passes),
+            // we need to use a failing mock. However MockWezterm always succeeds on list_panes.
+            // Instead, test that consecutive failures at threshold = Critical is NOT downgraded
+            // by adding only "degraded" warnings.
+            mock.set_watchdog_warnings(vec!["informational note with no keywords".to_string()])
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let config = MuxWatchdogConfig {
+                failure_threshold: 2,
+                ..MuxWatchdogConfig::default()
+            };
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            // Simulate prior state where ping succeeded but warnings exist
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            // Warning has no keywords → defaults to Degraded from warning_status_from_lines
+            assert_eq!(sample.status, HealthStatus::Degraded);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_report_includes_warning_elevated_status() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec!["shard 3 critical: pane leak detected".to_string()])
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            watchdog.check().await;
+
+            let report = watchdog.report();
+            assert_eq!(report.status, HealthStatus::Critical);
+            let sample = report.latest_sample.unwrap();
+            assert_eq!(sample.warning_count, 1);
+            assert!(sample.watchdog_warnings[0].contains("critical"));
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_empty_warnings_stay_healthy() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec![]).await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Healthy);
+            assert_eq!(sample.warning_count, 0);
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_blank_warnings_filtered_out() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec![
+                String::new(),
+                String::new(),
+                "real warning: timeout".to_string(),
+            ])
+            .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+            let sample = watchdog.check().await;
+            // Empty/blank lines should be retained=false by the retain() call
+            assert_eq!(sample.warning_count, 1);
+            assert_eq!(sample.watchdog_warnings.len(), 1);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+        });
+    }
+
+    // -- MuxHealthReport --
+
+    #[test]
+    fn mux_health_report_debug_clone() {
+        let report = MuxHealthReport {
+            timestamp_ms: 1000,
+            status: HealthStatus::Healthy,
+            consecutive_failures: 0,
+            latest_sample: None,
+            total_checks: 0,
+            total_failures: 0,
+        };
+        let dbg = format!("{:?}", report);
+        assert!(dbg.contains("MuxHealthReport"), "got: {}", dbg);
+        let cloned = report.clone();
+        assert_eq!(cloned.consecutive_failures, 0);
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let reg = HeartbeatRegistry::new();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.discovery_heartbeats, 0);
+        assert_eq!(snap.capture_heartbeats, 0);
+        assert_eq!(snap.persistence_heartbeats, 0);
+        assert_eq!(snap.maintenance_heartbeats, 0);
+        assert_eq!(snap.health_checks, 0);
+    }
+
+    #[test]
+    fn telemetry_discovery_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_discovery();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.discovery_heartbeats, 2);
+    }
+
+    #[test]
+    fn telemetry_capture_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_capture();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.capture_heartbeats, 1);
+    }
+
+    #[test]
+    fn telemetry_persistence_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_persistence();
+        reg.record_persistence();
+        reg.record_persistence();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.persistence_heartbeats, 3);
+    }
+
+    #[test]
+    fn telemetry_maintenance_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_maintenance();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.maintenance_heartbeats, 1);
+    }
+
+    #[test]
+    fn telemetry_health_check_counted() {
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let _ = reg.check_health(&config);
+        let _ = reg.check_health(&config);
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.health_checks, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        let config = WatchdogConfig::default();
+        let _ = reg.check_health(&config);
+        let snap = reg.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: WatchdogTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+}

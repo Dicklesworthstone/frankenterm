@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "bead": "ft-tf6g3.25",
+  "generated_by": "manual-seed-plus-bench-common-artifacts",
+  "time_budget_seconds": 300,
+  "selection_objective": "Greedy submodular set cover over required proof categories, contract families, and claim groups. Marginal gain is the count of newly covered required features divided by the bench estimated runtime.",
+  "auto_update_source": "Criterion benches that call crates/frankenterm-core/benches/bench_common.rs::emit_bench_artifacts already emit target/criterion/wa-bench-meta.jsonl and ft-bench-manifest-*.json. This matrix is the CI selection manifest; future bench-meta passes should update the coverage arrays here instead of hard-coding CI subsets.",
+  "required_categories": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "required_contract_families": [
+    "context_horizon",
+    "capture_fairness",
+    "herd_wave",
+    "blocker_radar",
+    "resource_cockpit"
+  ],
+  "required_claims": [
+    "agent_fleet",
+    "asupersync_doctrine",
+    "attestation",
+    "bench_stats",
+    "blocker_radar",
+    "capture_fairness",
+    "causal_dag",
+    "compression",
+    "context_horizon",
+    "cryptographic_attestation",
+    "cx_propagation",
+    "differential",
+    "formal_methods",
+    "herd_wave",
+    "information_bounds",
+    "loom_concurrency",
+    "mcp_robot",
+    "network",
+    "network_calculus",
+    "pattern_engine",
+    "performance_budget",
+    "redaction",
+    "renderer_parity",
+    "replay",
+    "resource_cockpit",
+    "robot_contracts",
+    "runtime_async",
+    "security_hardening",
+    "semantic_search",
+    "storage_search",
+    "terminal_mux",
+    "type_level_runtime"
+  ],
+  "benches": [
+    {
+      "package": "frankenterm-core",
+      "bench": "cx_propagation",
+      "path": "crates/frankenterm-core/benches/cx_propagation.rs",
+      "estimated_seconds": 10,
+      "proof_categories": [1, 5],
+      "claims": ["runtime_async", "cx_propagation", "type_level_runtime", "asupersync_doctrine"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "sync_primitives",
+      "path": "crates/frankenterm-core/benches/sync_primitives.rs",
+      "estimated_seconds": 10,
+      "proof_categories": [1, 2, 3, 5],
+      "claims": ["runtime_async", "loom_concurrency", "asupersync_doctrine"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "delta_extraction",
+      "path": "crates/frankenterm-core/benches/delta_extraction.rs",
+      "estimated_seconds": 14,
+      "proof_categories": [2, 4, 5],
+      "claims": ["capture_fairness", "context_horizon", "blocker_radar", "pattern_engine"],
+      "contract_families": ["capture_fairness", "context_horizon", "blocker_radar"]
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "backpressure_performance",
+      "path": "crates/frankenterm-core/benches/backpressure_performance.rs",
+      "estimated_seconds": 16,
+      "proof_categories": [5, 8],
+      "claims": ["resource_cockpit", "network_calculus", "performance_budget", "bench_stats"],
+      "contract_families": ["resource_cockpit"]
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "wa_state_fleet",
+      "path": "crates/frankenterm-core/benches/wa_state_fleet.rs",
+      "estimated_seconds": 14,
+      "proof_categories": [4, 5],
+      "claims": ["herd_wave", "agent_fleet", "mcp_robot"],
+      "contract_families": ["herd_wave"]
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "mcp_response",
+      "path": "crates/frankenterm-core/benches/mcp_response.rs",
+      "estimated_seconds": 10,
+      "proof_categories": [4, 5],
+      "claims": ["mcp_robot", "robot_contracts"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "storage_regression",
+      "path": "crates/frankenterm-core/benches/storage_regression.rs",
+      "estimated_seconds": 22,
+      "proof_categories": [4, 5],
+      "claims": ["storage_search", "bench_stats", "performance_budget"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "frankensearch_bench",
+      "path": "crates/frankenterm-core/benches/frankensearch_bench.rs",
+      "estimated_seconds": 18,
+      "proof_categories": [5, 7],
+      "claims": ["semantic_search", "storage_search", "information_bounds"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "semantic_compression",
+      "path": "crates/frankenterm-core/benches/semantic_compression.rs",
+      "estimated_seconds": 12,
+      "proof_categories": [5, 7],
+      "claims": ["semantic_search", "information_bounds", "compression"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "replay_kernel",
+      "path": "crates/frankenterm-core/benches/replay_kernel.rs",
+      "estimated_seconds": 18,
+      "proof_categories": [4, 5],
+      "claims": ["replay", "attestation", "performance_budget"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "replay_diff",
+      "path": "crates/frankenterm-core/benches/replay_diff.rs",
+      "estimated_seconds": 14,
+      "proof_categories": [4, 9],
+      "claims": ["replay", "differential", "attestation"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "differential_snapshot",
+      "path": "crates/frankenterm-core/benches/differential_snapshot.rs",
+      "estimated_seconds": 14,
+      "proof_categories": [4, 9],
+      "claims": ["renderer_parity", "differential", "terminal_mux"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "mux_client_ops",
+      "path": "crates/frankenterm-core/benches/mux_client_ops.rs",
+      "estimated_seconds": 18,
+      "proof_categories": [4, 5, 9],
+      "claims": ["terminal_mux", "network", "robot_contracts"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "causal_dag",
+      "path": "crates/frankenterm-core/benches/causal_dag.rs",
+      "estimated_seconds": 12,
+      "proof_categories": [6, 7],
+      "claims": ["formal_methods", "causal_dag", "information_bounds"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "stream_hash_bench",
+      "path": "crates/frankenterm-core/benches/stream_hash_bench.rs",
+      "estimated_seconds": 8,
+      "proof_categories": [5, 10],
+      "claims": ["cryptographic_attestation", "attestation"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "fork_hardening_benchmarks",
+      "path": "crates/frankenterm-core/benches/fork_hardening_benchmarks.rs",
+      "estimated_seconds": 16,
+      "proof_categories": [4, 5, 10],
+      "claims": ["security_hardening", "redaction"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "quantile_sketch_bench",
+      "path": "crates/frankenterm-core/benches/quantile_sketch_bench.rs",
+      "estimated_seconds": 8,
+      "proof_categories": [5, 7],
+      "claims": ["bench_stats", "information_bounds"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "pdu_pipelining",
+      "path": "crates/frankenterm-core/benches/pdu_pipelining.rs",
+      "estimated_seconds": 14,
+      "proof_categories": [5, 9],
+      "claims": ["network", "terminal_mux"],
+      "contract_families": []
+    },
+    {
+      "package": "frankenterm-core",
+      "bench": "pattern_detection",
+      "path": "crates/frankenterm-core/benches/pattern_detection.rs",
+      "estimated_seconds": 12,
+      "proof_categories": [2, 4, 5],
+      "claims": ["pattern_engine", "blocker_radar"],
+      "contract_families": ["blocker_radar"]
+    }
+  ]
+}

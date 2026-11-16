@@ -1,0 +1,4871 @@
+//! Side-effect-free swarm operating-envelope planning.
+//!
+//! The planner consumes already-collected, redacted coordination facts and
+//! returns ranked admission windows. It does not shell out, claim Beads, mutate
+//! panes, repair services, cancel RCH work, run Cargo, or inspect pane text.
+
+#![allow(clippy::similar_names)]
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+#[cfg(feature = "subprocess-bridge")]
+use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatusCounts};
+use crate::capacity_governor::GovernorDecision;
+
+pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
+pub const OPERATING_ENVELOPE_SCHEMA_VERSION: u16 = 1;
+pub const OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID: &str =
+    "ft.operating_envelope.retained_run_artifact.v1";
+pub const OPERATING_ENVELOPE_MCP_CURRENT_URI: &str = "wa://operating-envelope/current";
+pub const OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE: &str = "wa://operating-envelope/runs/{run_id}";
+pub const OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE: &str = "read-only plan; not permission to mutate panes, claim Beads, repair or restart services, \
+     cancel RCH work, count local Cargo as proof, capture raw pane content, or drain workers";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatingEnvelopeScenario {
+    #[default]
+    Current,
+    Healthy,
+    Degraded,
+    Blocked,
+    Emergency,
+}
+
+impl OperatingEnvelopeScenario {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Blocked => "blocked",
+            Self::Emergency => "emergency",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "" | "current" | "current-unavailable" | "unavailable" => Some(Self::Current),
+            "healthy" | "green" => Some(Self::Healthy),
+            "degraded" | "agent-mail-unavailable" | "yellow" => Some(Self::Degraded),
+            "blocked" | "rch-blocked" | "black" => Some(Self::Blocked),
+            "emergency" | "kill-switch" | "capacity-black" => Some(Self::Emergency),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeSurface {
+    #[default]
+    Status,
+    Explain,
+}
+
+impl OperatingEnvelopeSurface {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Explain => "explain",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "" | "status" | "summary" => Some(Self::Status),
+            "explain" | "reason" | "reason_code" => Some(Self::Explain),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeControllerMode {
+    DryRun,
+    AdmissionPreview,
+    AttestationPreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeTargetProfile {
+    DeveloperLaptop,
+    Target64Core256g,
+    Fixture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeProofState {
+    Measured,
+    Simulated,
+    Stale,
+    Unavailable,
+    SkippedNotProven,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeCapacityPressureTier {
+    Green,
+    Yellow,
+    Red,
+    Black,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeSourceKind {
+    CapacityResource,
+    Rch,
+    Beads,
+    AgentMail,
+    Git,
+    RobotInventory,
+    BlockerRadar,
+    Manual,
+    Fixture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeSourceState {
+    Available,
+    Degraded,
+    Unavailable,
+    Stale,
+    Blocked,
+    NotCollected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeFreshnessState {
+    Fresh,
+    WithinBudget,
+    Stale,
+    Unknown,
+    NotCollected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeEvidenceLevel {
+    LiveCommand,
+    RetainedArtifact,
+    Fixture,
+    ManualNote,
+    NotCollected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeRedactionState {
+    NotCollected,
+    Redacted,
+    RawForbidden,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeEvidenceCategory {
+    CapacityPressure,
+    CapacityGovernor,
+    TargetHardware,
+    RchWorkerSelection,
+    RchActiveProjectExclusion,
+    RchTopologyPreflight,
+    RchCargoReached,
+    BeadsReadyQueue,
+    BeadsBlockedQueue,
+    BeadsInProgress,
+    BeadsStaleCandidate,
+    AgentMailAvailability,
+    GitDirtyTree,
+    GitUntrackedPaths,
+    DeletionRisk,
+    DirtyPathOverlap,
+    RobotInventory,
+    RedactionPosture,
+    ManualNote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeEvidenceState {
+    Pass,
+    Warn,
+    Fail,
+    Blocked,
+    Unavailable,
+    Stale,
+    Unknown,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeOutcome {
+    Admit,
+    Defer,
+    Degrade,
+    Shed,
+    Block,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeTier {
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Black,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeConfidence {
+    Proven,
+    Measured,
+    Mixed,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeDirtyTreeState {
+    Clean,
+    DirtyNonOverlap,
+    DirtyOverlap,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeWindowClass {
+    Open,
+    ReadOnly,
+    StaticOnly,
+    RchProofAllowed,
+    ClaimAllowed,
+    Defer,
+    Wait,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeActionClass {
+    ReadStatus,
+    ClaimBead,
+    AddBeadsComment,
+    CreateBead,
+    EditFiles,
+    RunStaticCheck,
+    RunRchProof,
+    RequestApproval,
+    Wait,
+    AgentMailRepair,
+    BuildCancellation,
+    LocalCargoProof,
+    RawPaneContent,
+    RawPaneContentCapture,
+    RchDaemonRestart,
+    ServiceRestart,
+    WorkerDrain,
+    PaneMutation,
+    ServiceMutation,
+    DestructiveFilesystem,
+    DestructiveGit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeTargetClass {
+    pub profile: OperatingEnvelopeTargetProfile,
+    pub requested_agent_count: u32,
+    pub requested_cpu_cores: u32,
+    pub requested_memory_gib: u32,
+    pub proof_state: OperatingEnvelopeProofState,
+    pub reason_codes: Vec<String>,
+}
+
+impl OperatingEnvelopeTargetClass {
+    #[must_use]
+    pub fn developer_laptop() -> Self {
+        Self {
+            profile: OperatingEnvelopeTargetProfile::DeveloperLaptop,
+            requested_agent_count: 8,
+            requested_cpu_cores: 8,
+            requested_memory_gib: 32,
+            proof_state: OperatingEnvelopeProofState::NotRequired,
+            reason_codes: vec!["target_hardware.not_required".to_string()],
+        }
+    }
+
+    #[must_use]
+    pub fn target_64_core_256g() -> Self {
+        Self {
+            profile: OperatingEnvelopeTargetProfile::Target64Core256g,
+            requested_agent_count: 64,
+            requested_cpu_cores: 64,
+            requested_memory_gib: 256,
+            proof_state: OperatingEnvelopeProofState::SkippedNotProven,
+            reason_codes: vec!["target_hardware.skipped_not_proven".to_string()],
+        }
+    }
+
+    #[must_use]
+    pub fn proof_state(mut self, proof_state: OperatingEnvelopeProofState) -> Self {
+        self.proof_state = proof_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reason_code(mut self, reason_code: impl Into<String>) -> Self {
+        push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRedactionPosture {
+    pub pane_content: OperatingEnvelopeRedactionState,
+    pub secret_material: OperatingEnvelopeRedactionState,
+    pub notes: Vec<String>,
+}
+
+impl Default for OperatingEnvelopeRedactionPosture {
+    fn default() -> Self {
+        Self {
+            pane_content: OperatingEnvelopeRedactionState::NotCollected,
+            secret_material: OperatingEnvelopeRedactionState::NotCollected,
+            notes: vec!["source summary only".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeEvidenceItem {
+    pub evidence_id: String,
+    pub category: OperatingEnvelopeEvidenceCategory,
+    pub state: OperatingEnvelopeEvidenceState,
+    pub subject: String,
+    pub reason_codes: Vec<String>,
+    pub artifact_paths: Vec<String>,
+}
+
+impl OperatingEnvelopeEvidenceItem {
+    #[must_use]
+    pub fn new(
+        category: OperatingEnvelopeEvidenceCategory,
+        state: OperatingEnvelopeEvidenceState,
+        subject: impl Into<String>,
+    ) -> Self {
+        let subject = bounded_string(subject, "unknown");
+        Self {
+            evidence_id: format!("evidence-{}", slug(&subject)),
+            category,
+            state,
+            subject,
+            reason_codes: Vec::new(),
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_reason_code(mut self, reason_code: impl Into<String>) -> Self {
+        push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_path(mut self, path: impl Into<String>) -> Self {
+        push_unique(&mut self.artifact_paths, path);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceSnapshot {
+    pub source_id: String,
+    pub source_kind: OperatingEnvelopeSourceKind,
+    pub state: OperatingEnvelopeSourceState,
+    pub freshness_state: OperatingEnvelopeFreshnessState,
+    pub collected_at_ms: Option<u64>,
+    pub freshness_ms: Option<u64>,
+    pub command_or_api: String,
+    pub evidence_level: OperatingEnvelopeEvidenceLevel,
+    pub redacted: bool,
+    pub redaction_posture: OperatingEnvelopeRedactionPosture,
+    pub raw_pane_content_stored: bool,
+    pub reason_codes: Vec<String>,
+    pub unavailable_reason: Option<String>,
+    pub degraded_reason: Option<String>,
+    pub evidence: Vec<OperatingEnvelopeEvidenceItem>,
+    pub artifact_paths: Vec<String>,
+}
+
+impl OperatingEnvelopeSourceSnapshot {
+    #[must_use]
+    pub fn new(source_id: impl Into<String>, source_kind: OperatingEnvelopeSourceKind) -> Self {
+        let source_id = bounded_string(source_id, "source.unknown");
+        Self {
+            source_id: source_id.clone(),
+            source_kind,
+            state: OperatingEnvelopeSourceState::Available,
+            freshness_state: OperatingEnvelopeFreshnessState::Fresh,
+            collected_at_ms: None,
+            freshness_ms: None,
+            command_or_api: "operating_envelope.core".to_string(),
+            evidence_level: OperatingEnvelopeEvidenceLevel::ManualNote,
+            redacted: true,
+            redaction_posture: OperatingEnvelopeRedactionPosture::default(),
+            raw_pane_content_stored: false,
+            reason_codes: Vec::new(),
+            unavailable_reason: None,
+            degraded_reason: None,
+            evidence: vec![OperatingEnvelopeEvidenceItem::new(
+                OperatingEnvelopeEvidenceCategory::ManualNote,
+                OperatingEnvelopeEvidenceState::Pass,
+                source_id,
+            )],
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn state(mut self, state: OperatingEnvelopeSourceState) -> Self {
+        self.state = state;
+        self
+    }
+
+    #[must_use]
+    pub fn evidence_level(mut self, evidence_level: OperatingEnvelopeEvidenceLevel) -> Self {
+        self.evidence_level = evidence_level;
+        self
+    }
+
+    #[must_use]
+    pub fn unavailable(mut self, reason_code: impl Into<String>) -> Self {
+        self.state = OperatingEnvelopeSourceState::Unavailable;
+        let reason_code = reason_code.into();
+        push_unique(&mut self.reason_codes, reason_code.clone());
+        self.unavailable_reason = Some(reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn degraded(mut self, reason_code: impl Into<String>) -> Self {
+        self.state = OperatingEnvelopeSourceState::Degraded;
+        let reason_code = reason_code.into();
+        push_unique(&mut self.reason_codes, reason_code.clone());
+        self.degraded_reason = Some(reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn blocked(mut self, reason_code: impl Into<String>) -> Self {
+        self.state = OperatingEnvelopeSourceState::Blocked;
+        let reason_code = reason_code.into();
+        push_unique(&mut self.reason_codes, reason_code.clone());
+        self.degraded_reason = Some(reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn stale(mut self, reason_code: impl Into<String>) -> Self {
+        self.state = OperatingEnvelopeSourceState::Stale;
+        self.freshness_state = OperatingEnvelopeFreshnessState::Stale;
+        push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn not_collected(mut self, reason_code: impl Into<String>) -> Self {
+        self.state = OperatingEnvelopeSourceState::NotCollected;
+        self.freshness_state = OperatingEnvelopeFreshnessState::NotCollected;
+        self.evidence_level = OperatingEnvelopeEvidenceLevel::NotCollected;
+        push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reason_code(mut self, reason_code: impl Into<String>) -> Self {
+        push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: OperatingEnvelopeEvidenceItem) -> Self {
+        self.evidence.push(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_path(mut self, path: impl Into<String>) -> Self {
+        push_unique(&mut self.artifact_paths, path);
+        self
+    }
+
+    #[must_use]
+    pub fn raw_pane_content_stored(mut self) -> Self {
+        self.raw_pane_content_stored = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeInputDomains {
+    pub capacity_resource: OperatingEnvelopeSourceSnapshot,
+    pub rch: OperatingEnvelopeSourceSnapshot,
+    pub beads: OperatingEnvelopeSourceSnapshot,
+    pub agent_mail: OperatingEnvelopeSourceSnapshot,
+    pub git: OperatingEnvelopeSourceSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub robot_inventory: Option<OperatingEnvelopeSourceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceProvenance {
+    pub source_id: String,
+    pub command_or_api: String,
+    pub evidence_level: OperatingEnvelopeEvidenceLevel,
+    pub collected_at_ms: Option<u64>,
+    pub freshness_ms: Option<u64>,
+    pub freshness_state: OperatingEnvelopeFreshnessState,
+    pub artifact_paths: Vec<String>,
+}
+
+impl OperatingEnvelopeSourceProvenance {
+    #[must_use]
+    pub fn new(
+        source_id: impl Into<String>,
+        command_or_api: impl Into<String>,
+        evidence_level: OperatingEnvelopeEvidenceLevel,
+    ) -> Self {
+        Self {
+            source_id: bounded_string(source_id, "source.unknown"),
+            command_or_api: bounded_string(command_or_api, "operating_envelope.adapter"),
+            evidence_level,
+            collected_at_ms: None,
+            freshness_ms: None,
+            freshness_state: OperatingEnvelopeFreshnessState::Unknown,
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn retained_artifact(
+        source_id: impl Into<String>,
+        command_or_api: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            source_id,
+            command_or_api,
+            OperatingEnvelopeEvidenceLevel::RetainedArtifact,
+        )
+    }
+
+    #[must_use]
+    pub fn live_command(source_id: impl Into<String>, command_or_api: impl Into<String>) -> Self {
+        Self::new(
+            source_id,
+            command_or_api,
+            OperatingEnvelopeEvidenceLevel::LiveCommand,
+        )
+    }
+
+    #[must_use]
+    pub fn with_freshness(
+        mut self,
+        collected_at_ms: Option<u64>,
+        freshness_ms: Option<u64>,
+        freshness_state: OperatingEnvelopeFreshnessState,
+    ) -> Self {
+        self.collected_at_ms = collected_at_ms;
+        self.freshness_ms = freshness_ms;
+        self.freshness_state = freshness_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_path(mut self, path: impl Into<String>) -> Self {
+        push_unique(
+            &mut self.artifact_paths,
+            bounded_string(path, "artifact.unknown"),
+        );
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeBeadsSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub ready_count: usize,
+    pub blocked_count: usize,
+    pub in_progress_count: usize,
+    pub stale_candidate_count: usize,
+    pub dependency_impact_count: usize,
+    pub graph_cycle_count: usize,
+    pub active_assignee_count: usize,
+    pub dirty_overlap_risk: bool,
+    pub partial_graph_data: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeBeadsSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            ready_count: 0,
+            blocked_count: 0,
+            in_progress_count: 0,
+            stale_candidate_count: 0,
+            dependency_impact_count: 0,
+            graph_cycle_count: 0,
+            active_assignee_count: 0,
+            dirty_overlap_risk: false,
+            partial_graph_data: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(feature = "subprocess-bridge")]
+    pub fn from_readiness_report(
+        provenance: OperatingEnvelopeSourceProvenance,
+        status_counts: &BeadStatusCounts,
+        readiness: &BeadReadinessReport,
+    ) -> Self {
+        let graph_cycle_count = usize::from(
+            readiness
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::CyclicDependencyGraph),
+        );
+        let partial_graph_data = readiness.degraded_reason_codes.iter().any(|reason| {
+            matches!(
+                reason,
+                BeadResolverReasonCode::MissingDependencyNode
+                    | BeadResolverReasonCode::PartialGraphData
+            )
+        });
+        let dependency_impact_count = readiness
+            .candidates
+            .iter()
+            .map(|candidate| candidate.transitive_unblock_count)
+            .sum();
+
+        Self {
+            provenance,
+            ready_count: readiness.ready_count(),
+            blocked_count: status_counts.blocked,
+            in_progress_count: status_counts.in_progress,
+            stale_candidate_count: 0,
+            dependency_impact_count,
+            graph_cycle_count,
+            active_assignee_count: 0,
+            dirty_overlap_risk: false,
+            partial_graph_data,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Beads);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "beads unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        if self.ready_count == 0 {
+            push_unique(&mut snapshot.reason_codes, "beads.ready_empty".to_string());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                "ready=0",
+                "beads.ready_empty",
+            ));
+        } else {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.ready_available".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Pass,
+                format!("ready={}", self.ready_count),
+                "beads.ready_available",
+            ));
+        }
+
+        if self.blocked_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.blocked_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("blocked={}", self.blocked_count),
+                "beads.blocked_present",
+            ));
+        }
+
+        if self.in_progress_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.in_progress_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsInProgress,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("in_progress={}", self.in_progress_count),
+                "beads.in_progress_present",
+            ));
+        }
+
+        if self.active_assignee_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "assignee_overlap.active".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsInProgress,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("active_assignees={}", self.active_assignee_count),
+                "assignee_overlap.active",
+            ));
+        }
+
+        if self.stale_candidate_count > 0 {
+            snapshot = snapshot.stale("beads.stale_candidate");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsStaleCandidate,
+                OperatingEnvelopeEvidenceState::Stale,
+                format!("stale_candidates={}", self.stale_candidate_count),
+                "beads.stale_candidate",
+            ));
+        }
+
+        if self.dependency_impact_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.dependency_impact_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("dependency_impact={}", self.dependency_impact_count),
+                "beads.dependency_impact_present",
+            ));
+        }
+
+        if self.graph_cycle_count > 0 {
+            snapshot = snapshot.degraded("beads.graph_cycles");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Fail,
+                format!("graph_cycles={}", self.graph_cycle_count),
+                "beads.graph_cycles",
+            ));
+        }
+
+        if self.partial_graph_data {
+            snapshot = snapshot.degraded("beads.partial_graph_data");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                "partial graph data",
+                "beads.partial_graph_data",
+            ));
+        }
+
+        if self.dirty_overlap_risk {
+            snapshot = snapshot.blocked("dirty_overlap.present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.dirty_overlap_risk".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DirtyPathOverlap,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "beads dirty overlap",
+                "dirty_overlap.present",
+            ));
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeRchSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub healthy_worker_count: usize,
+    pub active_build_count: usize,
+    pub queued_build_count: usize,
+    pub no_workers_passed_health: bool,
+    pub active_project_exclusion: bool,
+    pub topology_preflight_failed: bool,
+    pub remote_cargo_reached: Option<bool>,
+    pub remote_cargo_verdict_pass: bool,
+    pub critical_pressure: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeRchSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            healthy_worker_count: 0,
+            active_build_count: 0,
+            queued_build_count: 0,
+            no_workers_passed_health: false,
+            active_project_exclusion: false,
+            topology_preflight_failed: false,
+            remote_cargo_reached: None,
+            remote_cargo_verdict_pass: false,
+            critical_pressure: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Rch);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "rch unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        if self.healthy_worker_count > 0 {
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Pass,
+                format!("healthy_workers={}", self.healthy_worker_count),
+                "rch.workers_healthy",
+            ));
+        }
+
+        if self.active_build_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "rch.active_builds_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("active_builds={}", self.active_build_count),
+                "rch.active_builds_present",
+            ));
+        }
+
+        if self.queued_build_count > 0 {
+            push_unique(&mut snapshot.reason_codes, "rch.queue_present".to_string());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("queued_builds={}", self.queued_build_count),
+                "rch.queue_present",
+            ));
+        }
+
+        if self.no_workers_passed_health {
+            snapshot = snapshot.blocked("rch.no_workers_passed_health");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "worker=null",
+                "rch.no_workers_passed_health",
+            ));
+        }
+
+        if self.critical_pressure {
+            snapshot = snapshot.blocked("rch.no_admissible_workers.critical_pressure");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "critical pressure",
+                "rch.no_admissible_workers.critical_pressure",
+            ));
+        }
+
+        if self.active_project_exclusion {
+            snapshot = snapshot.blocked("rch.active_project_exclusion");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchActiveProjectExclusion,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "same project active",
+                "rch.active_project_exclusion",
+            ));
+        }
+
+        if self.topology_preflight_failed {
+            snapshot = snapshot.blocked("rch.topology_preflight_failed");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchTopologyPreflight,
+                OperatingEnvelopeEvidenceState::Fail,
+                "topology preflight",
+                "rch.topology_preflight_failed",
+            ));
+        }
+
+        match self.remote_cargo_reached {
+            Some(true) => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_true".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                    OperatingEnvelopeEvidenceState::Pass,
+                    "remote Cargo reached",
+                    "rch.remote_cargo_reached_true",
+                ));
+            }
+            Some(false) => {
+                snapshot = snapshot.degraded("proof.insufficient");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_false".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                    OperatingEnvelopeEvidenceState::Fail,
+                    "remote Cargo not reached",
+                    "rch.remote_cargo_reached_false",
+                ));
+            }
+            None => {
+                snapshot = snapshot.degraded("proof.insufficient");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_unknown".to_string(),
+                );
+                snapshot.evidence.push(
+                    OperatingEnvelopeEvidenceItem::new(
+                        OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                        OperatingEnvelopeEvidenceState::Unknown,
+                        "remote Cargo reach unknown",
+                    )
+                    .with_reason_code("rch.remote_cargo_reached_unknown"),
+                );
+            }
+        }
+
+        if self.remote_cargo_verdict_pass {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "rch.cargo_verdict.pass".to_string(),
+            );
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeAgentMailSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub available: bool,
+    pub degraded: bool,
+    pub database_error: bool,
+    pub ack_required_count: usize,
+    pub unread_count: usize,
+    pub forbidden_service_remediation_seen: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeAgentMailSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            available: true,
+            degraded: false,
+            database_error: false,
+            ack_required_count: 0,
+            unread_count: 0,
+            forbidden_service_remediation_seen: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot =
+            adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::AgentMail);
+
+        if self.database_error {
+            snapshot = snapshot.unavailable("agent_mail.database_error");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unavailable_after_retry".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "database durability error",
+                "agent_mail.database_error",
+            ));
+        } else if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref())
+        {
+            snapshot = snapshot.unavailable(reason.clone());
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unavailable_after_retry".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "agent mail unavailable",
+                reason,
+            ));
+        } else if self.degraded || !self.available {
+            snapshot = snapshot.degraded("agent_mail.degraded");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Warn,
+                "agent mail degraded",
+                "agent_mail.degraded",
+            ));
+        } else {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.available".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Pass,
+                "agent mail available",
+                "agent_mail.available",
+            ));
+        }
+
+        if self.ack_required_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.ack_required_present".to_string(),
+            );
+        }
+        if self.unread_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unread_present".to_string(),
+            );
+        }
+        if self.forbidden_service_remediation_seen {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.service_remediation_forbidden".to_string(),
+            );
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeGitSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub branch_name: String,
+    pub tracked_dirty_count: usize,
+    pub untracked_count: usize,
+    pub deleted_path_count: usize,
+    pub deleted_frankenterm_core_path_count: usize,
+    pub dirty_overlap_count: usize,
+    pub shared_tracker_dirty: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeGitSourceInput {
+    #[must_use]
+    pub fn new(
+        provenance: OperatingEnvelopeSourceProvenance,
+        branch_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provenance,
+            branch_name: bounded_string(branch_name, "unknown"),
+            tracked_dirty_count: 0,
+            untracked_count: 0,
+            deleted_path_count: 0,
+            deleted_frankenterm_core_path_count: 0,
+            dirty_overlap_count: 0,
+            shared_tracker_dirty: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Git);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "git unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        snapshot.evidence.push(OperatingEnvelopeEvidenceItem::new(
+            OperatingEnvelopeEvidenceCategory::ManualNote,
+            OperatingEnvelopeEvidenceState::Pass,
+            format!("branch={}", self.branch_name),
+        ));
+
+        if self.deleted_frankenterm_core_path_count > 0 {
+            snapshot = snapshot.blocked("deletion_risk.frankenterm_core");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "deletion_risk.present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DeletionRisk,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!(
+                    "deleted_frankenterm_core_paths={}",
+                    self.deleted_frankenterm_core_path_count
+                ),
+                "deletion_risk.frankenterm_core",
+            ));
+        } else if self.deleted_path_count > 0 {
+            snapshot = snapshot.blocked("git.deleted_paths_present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "deletion_risk.present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DeletionRisk,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("deleted_paths={}", self.deleted_path_count),
+                "git.deleted_paths_present",
+            ));
+        }
+
+        if self.dirty_overlap_count > 0 {
+            snapshot = snapshot.blocked("dirty_overlap.present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.dirty_overlap_risk".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DirtyPathOverlap,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("dirty_overlap_paths={}", self.dirty_overlap_count),
+                "dirty_overlap.present",
+            ));
+        }
+
+        if self.tracked_dirty_count > 0 || self.shared_tracker_dirty {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.dirty_non_overlap".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("tracked_dirty={}", self.tracked_dirty_count),
+                "git.dirty_non_overlap",
+            ));
+        }
+
+        if self.shared_tracker_dirty {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.shared_tracker_dirty".to_string(),
+            );
+        }
+
+        if self.untracked_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.untracked_paths_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitUntrackedPaths,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("untracked={}", self.untracked_count),
+                "git.untracked_paths_present",
+            ));
+        }
+
+        if snapshot.reason_codes.is_empty() {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.clean_for_scope".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Pass,
+                "clean",
+                "git.clean_for_scope",
+            ));
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeCapacitySourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub pressure_tier: OperatingEnvelopeCapacityPressureTier,
+    pub target_class_proof_state: OperatingEnvelopeProofState,
+    pub heavy_workload_governor_decision: Option<GovernorDecision>,
+    pub kill_switch_active: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeCapacitySourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            pressure_tier: OperatingEnvelopeCapacityPressureTier::Unknown,
+            target_class_proof_state: OperatingEnvelopeProofState::Unavailable,
+            heavy_workload_governor_decision: None,
+            kill_switch_active: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(
+            &self.provenance,
+            OperatingEnvelopeSourceKind::CapacityResource,
+        );
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::CapacityPressure,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "capacity unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        let (pressure_reason, pressure_state) = match self.pressure_tier {
+            OperatingEnvelopeCapacityPressureTier::Green => {
+                ("capacity.green", OperatingEnvelopeEvidenceState::Pass)
+            }
+            OperatingEnvelopeCapacityPressureTier::Yellow => {
+                ("capacity.yellow", OperatingEnvelopeEvidenceState::Warn)
+            }
+            OperatingEnvelopeCapacityPressureTier::Red => {
+                ("capacity.red", OperatingEnvelopeEvidenceState::Fail)
+            }
+            OperatingEnvelopeCapacityPressureTier::Black => {
+                ("capacity.black", OperatingEnvelopeEvidenceState::Blocked)
+            }
+            OperatingEnvelopeCapacityPressureTier::Unknown => (
+                "capacity.pressure_unknown",
+                OperatingEnvelopeEvidenceState::Unknown,
+            ),
+        };
+        push_unique(&mut snapshot.reason_codes, pressure_reason.to_string());
+        if self.pressure_tier == OperatingEnvelopeCapacityPressureTier::Unknown {
+            snapshot = snapshot.degraded("capacity.pressure_unknown");
+            push_unique(&mut snapshot.reason_codes, "telemetry.stale".to_string());
+        }
+        snapshot.evidence.push(evidence(
+            OperatingEnvelopeEvidenceCategory::CapacityPressure,
+            pressure_state,
+            format!("pressure={:?}", self.pressure_tier),
+            pressure_reason,
+        ));
+
+        match &self.heavy_workload_governor_decision {
+            Some(decision) => {
+                let reason_code = capacity_governor_heavy_reason_code(decision);
+                match decision {
+                    GovernorDecision::Block { .. } => {
+                        snapshot = snapshot.blocked(reason_code);
+                    }
+                    GovernorDecision::Throttle { .. } => {
+                        snapshot = snapshot.degraded(reason_code);
+                    }
+                    GovernorDecision::Allow { .. }
+                    | GovernorDecision::Offload { .. }
+                    | GovernorDecision::Override { .. } => {
+                        push_unique(&mut snapshot.reason_codes, reason_code.to_string());
+                    }
+                }
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::CapacityGovernor,
+                    capacity_governor_heavy_evidence_state(decision),
+                    format!(
+                        "heavy_workload_governor={}",
+                        capacity_governor_heavy_action(decision)
+                    ),
+                    reason_code,
+                ));
+            }
+            None => {
+                snapshot = snapshot.degraded("capacity.governor.missing_heavy");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "telemetry.required_source_missing".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::CapacityGovernor,
+                    OperatingEnvelopeEvidenceState::Unknown,
+                    "heavy workload governor telemetry missing",
+                    "capacity.governor.missing_heavy",
+                ));
+            }
+        }
+
+        if self.kill_switch_active {
+            snapshot = snapshot.blocked("capacity.kill_switch_active");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "policy.kill_switch_active".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::CapacityPressure,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "kill switch active",
+                "capacity.kill_switch_active",
+            ));
+        }
+
+        match self.target_class_proof_state {
+            OperatingEnvelopeProofState::Measured | OperatingEnvelopeProofState::NotRequired => {
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Pass,
+                    "target class proof available",
+                    "target_hardware.proven_or_not_required",
+                ));
+            }
+            OperatingEnvelopeProofState::SkippedNotProven
+            | OperatingEnvelopeProofState::Unavailable => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "capacity.target_class_unproven".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Unavailable,
+                    "target class proof unavailable",
+                    "capacity.target_class_unproven",
+                ));
+            }
+            OperatingEnvelopeProofState::Simulated | OperatingEnvelopeProofState::Stale => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "target_hardware.skipped_not_proven".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Warn,
+                    "target class proof not measured",
+                    "target_hardware.skipped_not_proven",
+                ));
+            }
+        }
+
+        snapshot
+    }
+}
+
+fn capacity_governor_heavy_reason_code(decision: &GovernorDecision) -> &'static str {
+    match decision {
+        GovernorDecision::Allow { .. } => "capacity.governor.allow_heavy",
+        GovernorDecision::Throttle { .. } => "capacity.governor.throttle_heavy",
+        GovernorDecision::Offload { .. } => "capacity.governor.offload_heavy",
+        GovernorDecision::Block { .. } => "capacity.governor.block_heavy",
+        GovernorDecision::Override { .. } => "capacity.governor.override_heavy",
+    }
+}
+
+fn capacity_governor_heavy_action(decision: &GovernorDecision) -> &'static str {
+    match decision {
+        GovernorDecision::Allow { .. } => "allow",
+        GovernorDecision::Throttle { .. } => "throttle",
+        GovernorDecision::Offload { .. } => "offload",
+        GovernorDecision::Block { .. } => "block",
+        GovernorDecision::Override { .. } => "override",
+    }
+}
+
+fn capacity_governor_heavy_evidence_state(
+    decision: &GovernorDecision,
+) -> OperatingEnvelopeEvidenceState {
+    match decision {
+        GovernorDecision::Allow { .. } => OperatingEnvelopeEvidenceState::Pass,
+        GovernorDecision::Throttle { .. }
+        | GovernorDecision::Offload { .. }
+        | GovernorDecision::Override { .. } => OperatingEnvelopeEvidenceState::Warn,
+        GovernorDecision::Block { .. } => OperatingEnvelopeEvidenceState::Blocked,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceAdapterInputs {
+    pub capacity_resource: OperatingEnvelopeCapacitySourceInput,
+    pub rch: OperatingEnvelopeRchSourceInput,
+    pub beads: OperatingEnvelopeBeadsSourceInput,
+    pub agent_mail: OperatingEnvelopeAgentMailSourceInput,
+    pub git: OperatingEnvelopeGitSourceInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub robot_inventory: Option<OperatingEnvelopeSourceSnapshot>,
+}
+
+impl OperatingEnvelopeSourceAdapterInputs {
+    #[must_use]
+    pub fn new(
+        capacity_resource: OperatingEnvelopeCapacitySourceInput,
+        rch: OperatingEnvelopeRchSourceInput,
+        beads: OperatingEnvelopeBeadsSourceInput,
+        agent_mail: OperatingEnvelopeAgentMailSourceInput,
+        git: OperatingEnvelopeGitSourceInput,
+    ) -> Self {
+        Self {
+            capacity_resource,
+            rch,
+            beads,
+            agent_mail,
+            git,
+            robot_inventory: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_robot_inventory(
+        mut self,
+        robot_inventory: OperatingEnvelopeSourceSnapshot,
+    ) -> Self {
+        self.robot_inventory = Some(robot_inventory);
+        self
+    }
+
+    #[must_use]
+    pub fn into_input_domains(self) -> OperatingEnvelopeInputDomains {
+        OperatingEnvelopeInputDomains {
+            capacity_resource: self.capacity_resource.to_source_snapshot(),
+            rch: self.rch.to_source_snapshot(),
+            beads: self.beads.to_source_snapshot(),
+            agent_mail: self.agent_mail.to_source_snapshot(),
+            git: self.git.to_source_snapshot(),
+            robot_inventory: self.robot_inventory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeBudgets {
+    pub interactive_agents: u32,
+    pub long_rch_proof_lanes: u32,
+    pub gui_renderer_stress_jobs: u32,
+    pub docs_static_checks: u32,
+    pub no_mock_e2e_harnesses: u32,
+}
+
+impl OperatingEnvelopeBudgets {
+    #[must_use]
+    pub const fn conservative() -> Self {
+        Self {
+            interactive_agents: 4,
+            long_rch_proof_lanes: 1,
+            gui_renderer_stress_jobs: 0,
+            docs_static_checks: 2,
+            no_mock_e2e_harnesses: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn target_class() -> Self {
+        Self {
+            interactive_agents: 32,
+            long_rch_proof_lanes: 8,
+            gui_renderer_stress_jobs: 2,
+            docs_static_checks: 8,
+            no_mock_e2e_harnesses: 2,
+        }
+    }
+}
+
+impl Default for OperatingEnvelopeBudgets {
+    fn default() -> Self {
+        Self::conservative()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopePlannerInput {
+    pub generated_at_ms: u64,
+    pub envelope_id: String,
+    pub objective_id: String,
+    pub controller_mode: OperatingEnvelopeControllerMode,
+    pub target_class: OperatingEnvelopeTargetClass,
+    pub input_domains: OperatingEnvelopeInputDomains,
+    pub budgets: OperatingEnvelopeBudgets,
+    pub artifact_paths: Vec<String>,
+}
+
+impl OperatingEnvelopePlannerInput {
+    #[must_use]
+    pub fn new(
+        generated_at_ms: u64,
+        envelope_id: impl Into<String>,
+        objective_id: impl Into<String>,
+        input_domains: OperatingEnvelopeInputDomains,
+    ) -> Self {
+        Self {
+            generated_at_ms,
+            envelope_id: bounded_string(envelope_id, "envelope.unknown"),
+            objective_id: bounded_string(objective_id, "objective.unknown"),
+            controller_mode: OperatingEnvelopeControllerMode::DryRun,
+            target_class: OperatingEnvelopeTargetClass::developer_laptop(),
+            input_domains,
+            budgets: OperatingEnvelopeBudgets::default(),
+            artifact_paths: vec!["docs/json-schema/ft-operating-envelope.json".to_string()],
+        }
+    }
+
+    #[must_use]
+    pub fn target_class(mut self, target_class: OperatingEnvelopeTargetClass) -> Self {
+        self.target_class = target_class;
+        self
+    }
+
+    #[must_use]
+    pub fn budgets(mut self, budgets: OperatingEnvelopeBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
+    fn sources(&self) -> Vec<&OperatingEnvelopeSourceSnapshot> {
+        let mut sources = vec![
+            &self.input_domains.capacity_resource,
+            &self.input_domains.rch,
+            &self.input_domains.beads,
+            &self.input_domains.agent_mail,
+            &self.input_domains.git,
+        ];
+        if let Some(robot_inventory) = &self.input_domains.robot_inventory {
+            sources.push(robot_inventory);
+        }
+        sources
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeDecision {
+    pub decision_id: String,
+    pub outcome: OperatingEnvelopeOutcome,
+    pub envelope_tier: OperatingEnvelopeTier,
+    pub confidence: OperatingEnvelopeConfidence,
+    pub target_hardware_state: OperatingEnvelopeProofState,
+    pub rch_proof_state: OperatingEnvelopeProofState,
+    pub agent_mail_state: OperatingEnvelopeSourceState,
+    pub dirty_tree_state: OperatingEnvelopeDirtyTreeState,
+    pub max_parallel_agents: u32,
+    pub max_parallel_proofs: u32,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeAdmissionWindow {
+    pub window_id: String,
+    pub window_class: OperatingEnvelopeWindowClass,
+    pub starts_at_ms: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub max_parallel_agents: u32,
+    pub max_parallel_proofs: u32,
+    pub permitted_action_classes: Vec<OperatingEnvelopeActionClass>,
+    pub forbidden_action_classes: Vec<OperatingEnvelopeActionClass>,
+    pub source_ids: Vec<String>,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeFailClosedPolicy {
+    pub missing_signal_behavior: String,
+    pub stale_signal_behavior: String,
+    pub contradictory_signal_behavior: String,
+    pub privacy_redaction_behavior: String,
+    pub target_hardware_gap_behavior: String,
+    pub reason_codes: Vec<String>,
+}
+
+impl Default for OperatingEnvelopeFailClosedPolicy {
+    fn default() -> Self {
+        Self {
+            missing_signal_behavior: "lower_envelope".to_string(),
+            stale_signal_behavior: "lower_envelope".to_string(),
+            contradictory_signal_behavior: "block".to_string(),
+            privacy_redaction_behavior: "lower_envelope".to_string(),
+            target_hardware_gap_behavior: "defer_target_class_claim".to_string(),
+            reason_codes: vec![
+                "fail_closed.lower_missing".to_string(),
+                "fail_closed.block_contradiction".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeSideEffectPolicy {
+    pub dry_run_only: bool,
+    pub raw_pane_content_allowed: bool,
+    pub pane_mutation_allowed: bool,
+    pub service_mutation_allowed: bool,
+    pub destructive_actions_allowed: bool,
+    pub local_cargo_proof_allowed: bool,
+}
+
+impl Default for OperatingEnvelopeSideEffectPolicy {
+    fn default() -> Self {
+        Self {
+            dry_run_only: true,
+            raw_pane_content_allowed: false,
+            pane_mutation_allowed: false,
+            service_mutation_allowed: false,
+            destructive_actions_allowed: false,
+            local_cargo_proof_allowed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRedactionPolicy {
+    pub policy_id: String,
+    pub raw_pane_content_allowed: bool,
+    pub secret_material_allowed: bool,
+    pub notes: Vec<String>,
+}
+
+impl Default for OperatingEnvelopeRedactionPolicy {
+    fn default() -> Self {
+        Self {
+            policy_id: "ft.redaction.operating_envelope.v1".to_string(),
+            raw_pane_content_allowed: false,
+            secret_material_allowed: false,
+            notes: vec!["Envelope stores source summaries and reason codes only.".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopePlan {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub generated_at_ms: u64,
+    pub envelope_id: String,
+    pub objective_id: String,
+    pub controller_mode: OperatingEnvelopeControllerMode,
+    pub target_class: OperatingEnvelopeTargetClass,
+    pub input_domains: OperatingEnvelopeInputDomains,
+    pub decision: OperatingEnvelopeDecision,
+    pub admission_windows: Vec<OperatingEnvelopeAdmissionWindow>,
+    pub fail_closed_policy: OperatingEnvelopeFailClosedPolicy,
+    pub side_effect_policy: OperatingEnvelopeSideEffectPolicy,
+    pub redaction_policy: OperatingEnvelopeRedactionPolicy,
+    pub raw_pane_content_stored: bool,
+    pub reason_codes: Vec<String>,
+    pub artifact_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRetainedRunCommand {
+    pub command: String,
+    pub exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub target_dir: String,
+    pub remote_cargo_reached: bool,
+    pub cargo_test_reached: bool,
+}
+
+impl OperatingEnvelopeRetainedRunCommand {
+    #[must_use]
+    pub fn new(command: impl Into<String>, exit_code: i32, target_dir: impl Into<String>) -> Self {
+        Self {
+            command: bounded_string(command, "operating_envelope.harness"),
+            exit_code,
+            worker_id: None,
+            target_dir: bounded_string(target_dir, "target.unknown"),
+            remote_cargo_reached: false,
+            cargo_test_reached: false,
+        }
+    }
+
+    #[must_use]
+    pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.worker_id = Some(bounded_string(worker_id, "worker.unknown"));
+        self
+    }
+
+    #[must_use]
+    pub const fn remote_cargo_reached(mut self, reached: bool) -> Self {
+        self.remote_cargo_reached = reached;
+        self
+    }
+
+    #[must_use]
+    pub const fn cargo_test_reached(mut self, reached: bool) -> Self {
+        self.cargo_test_reached = reached;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeInputFixtureHash {
+    pub fixture_id: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeOutputHash {
+    pub output_id: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeGoldenUpdateReceipt {
+    pub bless_required: bool,
+    pub bless_command: String,
+    pub old_output_sha256: String,
+    pub new_output_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceFreshnessReceipt {
+    pub source_id: String,
+    pub source_kind: OperatingEnvelopeSourceKind,
+    pub state: OperatingEnvelopeSourceState,
+    pub freshness_state: OperatingEnvelopeFreshnessState,
+    pub freshness_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeReasonCodeDiff {
+    pub baseline: Vec<String>,
+    pub observed: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRetainedRunArtifact {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub generated_at_ms: u64,
+    pub run_id: String,
+    pub scenario_id: String,
+    pub dry_run: bool,
+    pub read_only: bool,
+    pub external_provider_calls: bool,
+    pub command: OperatingEnvelopeRetainedRunCommand,
+    pub input_fixture_hashes: Vec<OperatingEnvelopeInputFixtureHash>,
+    pub output_hashes: Vec<OperatingEnvelopeOutputHash>,
+    pub scrub_rules: Vec<String>,
+    pub source_freshness: Vec<OperatingEnvelopeSourceFreshnessReceipt>,
+    pub golden_update: OperatingEnvelopeGoldenUpdateReceipt,
+    pub reason_code_diff: OperatingEnvelopeReasonCodeDiff,
+    pub decision: OperatingEnvelopeDecision,
+    pub admission_windows: Vec<OperatingEnvelopeAdmissionWindow>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_operating_envelope_retained_run_artifact(
+    plan: &OperatingEnvelopePlan,
+    scenario_id: impl Into<String>,
+    command: OperatingEnvelopeRetainedRunCommand,
+    input_fixture_body: &str,
+    baseline_reason_codes: &[String],
+    old_golden_body: &str,
+    new_golden_body: &str,
+) -> Result<OperatingEnvelopeRetainedRunArtifact, serde_json::Error> {
+    let scenario_id = bounded_string(scenario_id, "scenario.unknown");
+    let plan_json = serde_json::to_vec(plan)?;
+    let diff = operating_envelope_reason_code_diff(baseline_reason_codes, &plan.reason_codes);
+
+    Ok(OperatingEnvelopeRetainedRunArtifact {
+        schema_version: OPERATING_ENVELOPE_SCHEMA_VERSION,
+        contract_id: OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID.to_string(),
+        generated_at_ms: plan.generated_at_ms,
+        run_id: format!("{}-{scenario_id}", operating_envelope_run_id(plan.generated_at_ms)),
+        scenario_id,
+        dry_run: true,
+        read_only: true,
+        external_provider_calls: false,
+        command,
+        input_fixture_hashes: vec![OperatingEnvelopeInputFixtureHash {
+            fixture_id: "retained_source_snapshot".to_string(),
+            sha256: sha256_prefixed(input_fixture_body.as_bytes()),
+        }],
+        output_hashes: vec![
+            OperatingEnvelopeOutputHash {
+                output_id: "operating_envelope_plan_json".to_string(),
+                sha256: sha256_prefixed(&plan_json),
+            },
+            OperatingEnvelopeOutputHash {
+                output_id: "retained_golden_body".to_string(),
+                sha256: sha256_prefixed(new_golden_body.as_bytes()),
+            },
+        ],
+        scrub_rules: operating_envelope_scrub_rules(plan),
+        source_freshness: operating_envelope_sources(plan)
+            .into_iter()
+            .map(|source| OperatingEnvelopeSourceFreshnessReceipt {
+                source_id: source.source_id.clone(),
+                source_kind: source.source_kind,
+                state: source.state,
+                freshness_state: source.freshness_state,
+                freshness_ms: source.freshness_ms,
+            })
+            .collect(),
+        golden_update: OperatingEnvelopeGoldenUpdateReceipt {
+            bless_required: sha256_prefixed(old_golden_body.as_bytes())
+                != sha256_prefixed(new_golden_body.as_bytes()),
+            bless_command: "FT_OPERATING_ENVELOPE_BLESS=1 bash tests/e2e/test_operating_envelope_fixture_manifest.sh".to_string(),
+            old_output_sha256: sha256_prefixed(old_golden_body.as_bytes()),
+            new_output_sha256: sha256_prefixed(new_golden_body.as_bytes()),
+        },
+        reason_code_diff: diff,
+        decision: plan.decision.clone(),
+        admission_windows: plan.admission_windows.clone(),
+    })
+}
+
+pub fn operating_envelope_retained_run_jsonl_line(
+    artifact: &OperatingEnvelopeRetainedRunArtifact,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(artifact)
+}
+
+#[must_use]
+pub fn operating_envelope_reason_code_diff(
+    baseline: &[String],
+    observed: &[String],
+) -> OperatingEnvelopeReasonCodeDiff {
+    let baseline_set = baseline.iter().cloned().collect::<BTreeSet<_>>();
+    let observed_set = observed.iter().cloned().collect::<BTreeSet<_>>();
+    OperatingEnvelopeReasonCodeDiff {
+        baseline: baseline_set.iter().cloned().collect(),
+        observed: observed_set.iter().cloned().collect(),
+        added: observed_set.difference(&baseline_set).cloned().collect(),
+        removed: baseline_set.difference(&observed_set).cloned().collect(),
+    }
+}
+
+fn operating_envelope_scrub_rules(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut rules = vec![
+        "source_summaries_only".to_string(),
+        "raw_pane_content_forbidden".to_string(),
+        "secret_material_redacted".to_string(),
+        "agent_mail_bodies_not_retained".to_string(),
+        "rch_logs_classified_by_reason_code".to_string(),
+    ];
+    if plan.raw_pane_content_stored {
+        push_unique(
+            &mut rules,
+            "artifact_invalid_raw_pane_content_seen".to_string(),
+        );
+    }
+    rules
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+#[must_use]
+pub fn plan_operating_envelope(input: OperatingEnvelopePlannerInput) -> OperatingEnvelopePlan {
+    let facts = EnvelopeFacts::from_input(&input);
+    let decision = decision_for(&input, &facts);
+    let mut admission_windows = admission_windows_for(&input, &facts, &decision);
+    stable_rank_windows(&mut admission_windows);
+
+    OperatingEnvelopePlan {
+        schema_version: OPERATING_ENVELOPE_SCHEMA_VERSION,
+        contract_id: OPERATING_ENVELOPE_CONTRACT_ID.to_string(),
+        generated_at_ms: input.generated_at_ms,
+        envelope_id: input.envelope_id,
+        objective_id: input.objective_id,
+        controller_mode: input.controller_mode,
+        target_class: input.target_class,
+        input_domains: input.input_domains,
+        decision: decision.clone(),
+        admission_windows,
+        fail_closed_policy: OperatingEnvelopeFailClosedPolicy::default(),
+        side_effect_policy: OperatingEnvelopeSideEffectPolicy::default(),
+        redaction_policy: OperatingEnvelopeRedactionPolicy::default(),
+        raw_pane_content_stored: false,
+        reason_codes: decision.reason_codes,
+        artifact_paths: input.artifact_paths,
+    }
+}
+
+#[must_use]
+pub fn operating_envelope_run_id(generated_at_ms: u64) -> String {
+    format!("operating-envelope-{generated_at_ms}")
+}
+
+#[must_use]
+pub fn operating_envelope_run_uri(run_id: &str) -> String {
+    format!("wa://operating-envelope/runs/{run_id}")
+}
+
+#[must_use]
+pub fn operating_envelope_mcp_resources(generated_at_ms: u64) -> serde_json::Value {
+    let run_id = operating_envelope_run_id(generated_at_ms);
+    serde_json::json!([
+        {
+            "kind": "current",
+            "uri": OPERATING_ENVELOPE_MCP_CURRENT_URI,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        },
+        {
+            "kind": "run_artifact",
+            "uri": operating_envelope_run_uri(&run_id),
+            "uri_template": OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+            "run_id": run_id,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        }
+    ])
+}
+
+#[must_use]
+pub fn operating_envelope_input_for_scenario(
+    generated_at_ms: u64,
+    envelope_id: impl Into<String>,
+    objective_id: impl Into<String>,
+    scenario: OperatingEnvelopeScenario,
+) -> OperatingEnvelopePlannerInput {
+    let input_domains = match scenario {
+        OperatingEnvelopeScenario::Current => current_unavailable_domains(generated_at_ms),
+        OperatingEnvelopeScenario::Healthy => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Degraded => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Blocked => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Emergency => scenario_domains(generated_at_ms, scenario),
+    };
+
+    OperatingEnvelopePlannerInput::new(generated_at_ms, envelope_id, objective_id, input_domains)
+}
+
+// ── ft-7h5da.10.4.4: production reader that flips `target_class_proof_state` ──
+// from the signed resource-cockpit target-class artifact.
+//
+// Before this, the envelope's target-class gate was inert: every setter to
+// `OperatingEnvelopeProofState::Measured` lived in test code and no production
+// path read the W9.4 signed artifact, so signing it (the campaign EXIT
+// criterion) did not flip the live envelope to admit high-scale windows.
+
+/// Repo-relative pointer artifact published into the release attestation bundle.
+pub const TARGET_CLASS_ARTIFACT_POINTER: &str =
+    "docs/attestations/proofs/resource-cockpit-target-class.json";
+
+/// Map a target-class cockpit `summary.json` payload to an envelope proof state.
+///
+/// Fail-closed: maps to [`OperatingEnvelopeProofState::Measured`] only when the
+/// run PASSED and is `ready_to_sign` with
+/// `hardware_predicate.proof_status == "proven_predicate_met"` and
+/// `high_scale_claim_allowed == true`. An explicit `skipped_not_proven` maps to
+/// `SkippedNotProven`; anything else (missing or garbled fields) is
+/// `Unavailable`, keeping the high-scale gate shut.
+///
+/// `high_scale_claim_allowed` is read from `/evidence/high_scale_claim_allowed`
+/// — the location the bench-lane signer (`scripts/run-target-class-cockpit.sh`,
+/// the only producer of a signable artifact) actually writes it. The legacy
+/// `/hardware_predicate/high_scale_claim_allowed` path is accepted as a fallback
+/// for fixtures written before the schema settled. Reading only the latter (the
+/// pre-ft-d7fow behaviour) meant a genuinely-signed artifact mapped to
+/// `Unavailable` — `unwrap_or(false)` on an absent field — so the gate could
+/// never flip via the real harness. See `tests/target_class_signing_flip_e2e.rs`.
+#[must_use]
+pub fn target_class_proof_state_from_summary(
+    summary: &serde_json::Value,
+) -> OperatingEnvelopeProofState {
+    let ready_to_sign = summary
+        .get("ready_to_sign")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let high_scale_allowed = summary
+        .pointer("/evidence/high_scale_claim_allowed")
+        .or_else(|| summary.pointer("/hardware_predicate/high_scale_claim_allowed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match summary
+        .pointer("/hardware_predicate/proof_status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("proven_predicate_met") if ready_to_sign && high_scale_allowed => {
+            OperatingEnvelopeProofState::Measured
+        }
+        Some("skipped_not_proven") => OperatingEnvelopeProofState::SkippedNotProven,
+        _ => OperatingEnvelopeProofState::Unavailable,
+    }
+}
+
+/// Map the committed pointer artifact's own `status` to a proof state, used when
+/// no per-run `summary.json` is present on disk (the common in-repo case).
+#[must_use]
+fn target_class_proof_state_from_pointer(
+    pointer: &serde_json::Value,
+) -> OperatingEnvelopeProofState {
+    match pointer
+        .pointer("/current_artifact/status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| pointer.get("status").and_then(serde_json::Value::as_str))
+    {
+        Some("proven_predicate_met") => OperatingEnvelopeProofState::Measured,
+        Some("skipped_not_proven") => OperatingEnvelopeProofState::SkippedNotProven,
+        _ => OperatingEnvelopeProofState::Unavailable,
+    }
+}
+
+/// Read the latest target-class proof state from the signed artifact rooted at
+/// `repo_root`. Prefers the per-run `summary.json` referenced by the pointer
+/// (authoritative; carries `ready_to_sign`), falling back to the committed
+/// pointer's own status when the run artifact is absent. Any I/O or parse
+/// failure is fail-closed to [`OperatingEnvelopeProofState::Unavailable`].
+#[must_use]
+pub fn read_target_class_proof_state(repo_root: &std::path::Path) -> OperatingEnvelopeProofState {
+    let Ok(pointer_text) = std::fs::read_to_string(repo_root.join(TARGET_CLASS_ARTIFACT_POINTER))
+    else {
+        return OperatingEnvelopeProofState::Unavailable;
+    };
+    let Ok(pointer) = serde_json::from_str::<serde_json::Value>(&pointer_text) else {
+        return OperatingEnvelopeProofState::Unavailable;
+    };
+    if let Some(rel) = pointer
+        .pointer("/current_artifact/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Ok(summary_text) = std::fs::read_to_string(repo_root.join(rel)) {
+            if let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_text) {
+                return target_class_proof_state_from_summary(&summary);
+            }
+        }
+    }
+    target_class_proof_state_from_pointer(&pointer)
+}
+
+/// Resolve the production [`OperatingEnvelopeTargetClass`] from the signed
+/// artifact at `repo_root`.
+///
+/// Non-regressing by design: a high-scale `target_64_core_256g` profile is
+/// claimed ONLY when the artifact is signed + proven (`Measured`). When the
+/// artifact is `skipped_not_proven`, absent, or unreadable, the envelope falls
+/// back to the `developer_laptop` profile (`NotRequired`) — i.e. the default
+/// envelope is unchanged until the W9.4 artifact is actually signed, at which
+/// point the same production path flips the gate to admit high-scale windows.
+#[must_use]
+pub fn operating_envelope_target_class_from_artifact(
+    repo_root: &std::path::Path,
+) -> OperatingEnvelopeTargetClass {
+    match read_target_class_proof_state(repo_root) {
+        OperatingEnvelopeProofState::Measured => {
+            OperatingEnvelopeTargetClass::target_64_core_256g()
+                .proof_state(OperatingEnvelopeProofState::Measured)
+                .with_reason_code("target_hardware.proven_from_signed_artifact")
+        }
+        _ => OperatingEnvelopeTargetClass::developer_laptop(),
+    }
+}
+
+#[must_use]
+pub fn build_operating_envelope_surface_data(
+    plan: &OperatingEnvelopePlan,
+    surface: OperatingEnvelopeSurface,
+    source: &str,
+    explain_reason_code: Option<&str>,
+) -> serde_json::Value {
+    let explain = (surface == OperatingEnvelopeSurface::Explain)
+        .then(|| operating_envelope_explain(plan, explain_reason_code.and_then(non_empty_trimmed)));
+
+    serde_json::json!({
+        "schema_version": plan.schema_version,
+        "contract_id": plan.contract_id,
+        "surface": surface.as_str(),
+        "generated_at_ms": plan.generated_at_ms,
+        "source": source,
+        "dry_run": true,
+        "raw_pane_content_stored": plan.raw_pane_content_stored,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "safety_notice": OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE,
+        "summary": operating_envelope_summary(plan),
+        "decision": plan.decision,
+        "admission_windows": plan.admission_windows,
+        "mcp_resources": operating_envelope_mcp_resources(plan.generated_at_ms),
+        "source_states": operating_envelope_source_states(plan),
+        "proof_requirements": operating_envelope_proof_requirements(plan),
+        "required_approvals": operating_envelope_required_approvals(),
+        "forbidden_action_classes": operating_envelope_forbidden_action_classes(plan),
+        "explain": explain,
+    })
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn current_unavailable_domains(generated_at_ms: u64) -> OperatingEnvelopeInputDomains {
+    OperatingEnvelopeInputDomains {
+        capacity_resource: not_collected_snapshot(
+            "current.capacity_resource",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.current_unavailable",
+            generated_at_ms,
+        ),
+        rch: not_collected_snapshot(
+            "current.rch",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.current_unavailable",
+            generated_at_ms,
+        ),
+        beads: not_collected_snapshot(
+            "current.beads",
+            OperatingEnvelopeSourceKind::Beads,
+            "beads.current_unavailable",
+            generated_at_ms,
+        ),
+        agent_mail: not_collected_snapshot(
+            "current.agent_mail",
+            OperatingEnvelopeSourceKind::AgentMail,
+            "agent_mail.current_unavailable",
+            generated_at_ms,
+        ),
+        git: not_collected_snapshot(
+            "current.git",
+            OperatingEnvelopeSourceKind::Git,
+            "git.current_unavailable",
+            generated_at_ms,
+        ),
+        robot_inventory: None,
+    }
+}
+
+fn not_collected_snapshot(
+    source_id: &'static str,
+    source_kind: OperatingEnvelopeSourceKind,
+    reason_code: &'static str,
+    generated_at_ms: u64,
+) -> OperatingEnvelopeSourceSnapshot {
+    let mut snapshot =
+        OperatingEnvelopeSourceSnapshot::new(source_id, source_kind).not_collected(reason_code);
+    snapshot.command_or_api = "ft swarm envelope --scenario current".to_string();
+    snapshot.collected_at_ms = Some(generated_at_ms);
+    snapshot
+}
+
+fn scenario_domains(
+    generated_at_ms: u64,
+    scenario: OperatingEnvelopeScenario,
+) -> OperatingEnvelopeInputDomains {
+    let mut capacity = OperatingEnvelopeCapacitySourceInput::new(fixture_provenance(
+        "fixture.capacity_resource",
+        "ft robot swarm-capacity status --level 2",
+        generated_at_ms,
+    ));
+    capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+    capacity.target_class_proof_state = OperatingEnvelopeProofState::NotRequired;
+    capacity.heavy_workload_governor_decision = Some(GovernorDecision::Allow {
+        reason: "within capacity".to_string(),
+    });
+
+    let mut rch = OperatingEnvelopeRchSourceInput::new(fixture_provenance(
+        "fixture.rch",
+        "rch status --json",
+        generated_at_ms,
+    ));
+    rch.healthy_worker_count = 2;
+    rch.remote_cargo_reached = Some(true);
+    rch.remote_cargo_verdict_pass = true;
+
+    let mut beads = OperatingEnvelopeBeadsSourceInput::new(fixture_provenance(
+        "fixture.beads",
+        "bv --robot-triage",
+        generated_at_ms,
+    ));
+    beads.ready_count = 4;
+
+    let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(fixture_provenance(
+        "fixture.agent_mail",
+        "mcp.agent_mail.fetch_inbox",
+        generated_at_ms,
+    ));
+
+    let mut git = OperatingEnvelopeGitSourceInput::new(
+        fixture_provenance(
+            "fixture.git",
+            "git status --short --branch",
+            generated_at_ms,
+        ),
+        "main",
+    );
+
+    match scenario {
+        OperatingEnvelopeScenario::Current | OperatingEnvelopeScenario::Healthy => {}
+        OperatingEnvelopeScenario::Degraded => {
+            agent_mail.unavailable_reason = Some("agent_mail.unavailable_after_retry".to_string());
+        }
+        OperatingEnvelopeScenario::Blocked => {
+            rch.healthy_worker_count = 0;
+            rch.remote_cargo_reached = Some(false);
+            rch.topology_preflight_failed = true;
+        }
+        OperatingEnvelopeScenario::Emergency => {
+            capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Black;
+            capacity.kill_switch_active = true;
+            git.deleted_path_count = 1;
+        }
+    }
+
+    OperatingEnvelopeSourceAdapterInputs::new(capacity, rch, beads, agent_mail, git)
+        .into_input_domains()
+}
+
+fn fixture_provenance(
+    source_id: &'static str,
+    command_or_api: &'static str,
+    generated_at_ms: u64,
+) -> OperatingEnvelopeSourceProvenance {
+    OperatingEnvelopeSourceProvenance::live_command(source_id, command_or_api).with_freshness(
+        Some(generated_at_ms),
+        Some(0),
+        OperatingEnvelopeFreshnessState::Fresh,
+    )
+}
+
+fn operating_envelope_summary(plan: &OperatingEnvelopePlan) -> serde_json::Value {
+    let next_safe_window = plan
+        .admission_windows
+        .iter()
+        .find(|window| {
+            !matches!(
+                window.window_class,
+                OperatingEnvelopeWindowClass::Wait | OperatingEnvelopeWindowClass::Blocked
+            ) && (window.max_parallel_agents > 0 || window.max_parallel_proofs > 0)
+        })
+        .map(operating_envelope_window_summary);
+
+    serde_json::json!({
+        "envelope_tier": plan.decision.envelope_tier,
+        "outcome": plan.decision.outcome,
+        "confidence": plan.decision.confidence,
+        "admission_count": {
+            "max_parallel_agents": plan.decision.max_parallel_agents,
+            "max_parallel_proofs": plan.decision.max_parallel_proofs,
+            "window_count": plan.admission_windows.len(),
+        },
+        "paused_action_classes": operating_envelope_paused_action_classes(plan),
+        "blocked_reason_codes": plan.decision.reason_codes,
+        "next_safe_window": next_safe_window,
+        "required_approvals": operating_envelope_required_approvals(),
+        "proof_requirements": operating_envelope_proof_requirements(plan),
+        "forbidden_action_classes": operating_envelope_forbidden_action_classes(plan),
+        "raw_pane_content_stored": plan.raw_pane_content_stored,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+    })
+}
+
+fn operating_envelope_window_summary(
+    window: &OperatingEnvelopeAdmissionWindow,
+) -> serde_json::Value {
+    serde_json::json!({
+        "window_id": window.window_id,
+        "window_class": window.window_class,
+        "starts_at_ms": window.starts_at_ms,
+        "expires_at_ms": window.expires_at_ms,
+        "max_parallel_agents": window.max_parallel_agents,
+        "max_parallel_proofs": window.max_parallel_proofs,
+        "permitted_action_classes": window.permitted_action_classes,
+        "reason_codes": window.reason_codes,
+    })
+}
+
+fn operating_envelope_source_states(plan: &OperatingEnvelopePlan) -> Vec<serde_json::Value> {
+    std::iter::once(plan.input_domains.capacity_resource.clone())
+        .chain(std::iter::once(plan.input_domains.rch.clone()))
+        .chain(std::iter::once(plan.input_domains.beads.clone()))
+        .chain(std::iter::once(plan.input_domains.agent_mail.clone()))
+        .chain(std::iter::once(plan.input_domains.git.clone()))
+        .chain(plan.input_domains.robot_inventory.clone())
+        .map(|source| {
+            serde_json::json!({
+                "source_id": source.source_id,
+                "source_kind": source.source_kind,
+                "state": source.state,
+                "freshness_state": source.freshness_state,
+                "evidence_level": source.evidence_level,
+                "redacted": source.redacted,
+                "raw_pane_content_stored": source.raw_pane_content_stored,
+                "reason_codes": source.reason_codes,
+                "artifact_paths": source.artifact_paths,
+            })
+        })
+        .collect()
+}
+
+fn operating_envelope_paused_action_classes(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    if plan.decision.outcome == OperatingEnvelopeOutcome::Admit {
+        return Vec::new();
+    }
+    operating_envelope_forbidden_action_classes(plan)
+}
+
+fn operating_envelope_forbidden_action_classes(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    for window in &plan.admission_windows {
+        for action_class in &window.forbidden_action_classes {
+            values.insert(action_class_name(*action_class));
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn operating_envelope_proof_requirements(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut requirements = BTreeSet::from([
+        "remote_rch_required_for_cargo_proof".to_string(),
+        "local_cargo_output_not_counted_as_proof".to_string(),
+    ]);
+    if plan.decision.max_parallel_proofs == 0 {
+        requirements.insert("no_remote_proof_lane_admitted_currently".to_string());
+    }
+    if matches!(
+        plan.decision.target_hardware_state,
+        OperatingEnvelopeProofState::Unavailable | OperatingEnvelopeProofState::SkippedNotProven
+    ) {
+        requirements.insert("target_class_claim_requires_non_skipped_artifact".to_string());
+    }
+    requirements.into_iter().collect()
+}
+
+fn operating_envelope_required_approvals() -> Vec<String> {
+    vec![
+        "beads_claim_requires_separate_operator_action".to_string(),
+        "pane_mutation_requires_separate_approval".to_string(),
+        "service_repair_or_restart_is_not_approved".to_string(),
+        "rch_cancellation_is_not_approved".to_string(),
+    ]
+}
+
+fn action_class_name(action_class: OperatingEnvelopeActionClass) -> String {
+    serde_json::to_value(action_class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{action_class:?}"))
+}
+
+fn operating_envelope_explain(
+    plan: &OperatingEnvelopePlan,
+    reason_code: Option<&str>,
+) -> serde_json::Value {
+    let entries = operating_envelope_explain_entries(plan, reason_code);
+    let matched = reason_code.is_none() || !entries.is_empty();
+    serde_json::json!({
+        "matched": matched,
+        "query_reason_code": reason_code,
+        "entries": entries,
+        "operator_action": if matched {
+            "inspect the matched reason-code entries; this explain call executed no mutation"
+        } else {
+            "refresh ft robot swarm envelope --surface status and choose a reason code from data.summary.blocked_reason_codes"
+        },
+    })
+}
+
+fn operating_envelope_explain_entries(
+    plan: &OperatingEnvelopePlan,
+    reason_code: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    if reason_code_matches(&plan.decision.reason_codes, reason_code) {
+        entries.push(serde_json::json!({
+            "scope": "decision",
+            "subject_id": plan.decision.decision_id,
+            "outcome": plan.decision.outcome,
+            "envelope_tier": plan.decision.envelope_tier,
+            "reason_codes": matching_reason_codes(&plan.decision.reason_codes, reason_code),
+        }));
+    }
+    for window in &plan.admission_windows {
+        if reason_code_matches(&window.reason_codes, reason_code) {
+            entries.push(serde_json::json!({
+                "scope": "admission_window",
+                "subject_id": window.window_id,
+                "window_class": window.window_class,
+                "max_parallel_agents": window.max_parallel_agents,
+                "max_parallel_proofs": window.max_parallel_proofs,
+                "reason_codes": matching_reason_codes(&window.reason_codes, reason_code),
+            }));
+        }
+    }
+    for source in operating_envelope_sources(plan) {
+        if reason_code_matches(&source.reason_codes, reason_code) {
+            entries.push(serde_json::json!({
+                "scope": "source",
+                "subject_id": source.source_id,
+                "source_kind": source.source_kind,
+                "state": source.state,
+                "freshness_state": source.freshness_state,
+                "reason_codes": matching_reason_codes(&source.reason_codes, reason_code),
+            }));
+        }
+        for evidence in &source.evidence {
+            if reason_code_matches(&evidence.reason_codes, reason_code) {
+                entries.push(serde_json::json!({
+                    "scope": "evidence",
+                    "subject_id": evidence.evidence_id,
+                    "source_id": source.source_id,
+                    "category": evidence.category,
+                    "state": evidence.state,
+                    "reason_codes": matching_reason_codes(&evidence.reason_codes, reason_code),
+                }));
+            }
+        }
+    }
+    entries
+}
+
+fn operating_envelope_sources(
+    plan: &OperatingEnvelopePlan,
+) -> Vec<&OperatingEnvelopeSourceSnapshot> {
+    let mut sources = vec![
+        &plan.input_domains.capacity_resource,
+        &plan.input_domains.rch,
+        &plan.input_domains.beads,
+        &plan.input_domains.agent_mail,
+        &plan.input_domains.git,
+    ];
+    if let Some(robot_inventory) = &plan.input_domains.robot_inventory {
+        sources.push(robot_inventory);
+    }
+    sources
+}
+
+fn reason_code_matches(reason_codes: &[String], reason_code: Option<&str>) -> bool {
+    reason_code.is_none_or(|needle| reason_codes.iter().any(|reason| reason == needle))
+}
+
+fn matching_reason_codes(reason_codes: &[String], reason_code: Option<&str>) -> Vec<String> {
+    reason_code.map_or_else(
+        || reason_codes.to_vec(),
+        |needle| {
+            reason_codes
+                .iter()
+                .filter(|reason| reason.as_str() == needle)
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvelopeFacts {
+    privacy_violation: bool,
+    capacity_black: bool,
+    capacity_red: bool,
+    capacity_governor_allow_heavy: bool,
+    capacity_governor_throttle_heavy: bool,
+    capacity_governor_offload_heavy: bool,
+    capacity_governor_block_heavy: bool,
+    capacity_governor_missing_heavy: bool,
+    rch_no_worker: bool,
+    rch_topology_failure: bool,
+    rch_active_project_exclusion: bool,
+    rch_recovered: bool,
+    agent_mail_unavailable: bool,
+    agent_mail_degraded: bool,
+    dirty_non_overlap: bool,
+    dirty_overlap: bool,
+    deletion_risk: bool,
+    stale_owner: bool,
+    active_owner: bool,
+    no_ready_work: bool,
+    target_class_unproven: bool,
+    stale_telemetry: bool,
+    insufficient_proof: bool,
+    kill_switch_active: bool,
+    /// A REQUIRED measurement source (capacity_resource or rch) is absent
+    /// (NotCollected / Unavailable). Unlike `capacity.*`/`rch.*` reason-coded
+    /// failures, an absent source may carry no failure reason code, so without
+    /// this fact the decision would fall through to Admit — a fail-OPEN against
+    /// the documented `missing_signal_behavior = "lower_envelope"` contract.
+    required_telemetry_missing: bool,
+}
+
+impl EnvelopeFacts {
+    fn from_input(input: &OperatingEnvelopePlannerInput) -> Self {
+        let sources = input.sources();
+        Self {
+            privacy_violation: sources
+                .iter()
+                .any(|source| !source.redacted || source.raw_pane_content_stored),
+            capacity_black: any_reason(&sources, &["capacity.black", "pressure.black"]),
+            capacity_red: any_reason(&sources, &["capacity.red", "pressure.red"]),
+            capacity_governor_allow_heavy: any_reason(&sources, &["capacity.governor.allow_heavy"]),
+            capacity_governor_throttle_heavy: any_reason(
+                &sources,
+                &["capacity.governor.throttle_heavy"],
+            ),
+            capacity_governor_offload_heavy: any_reason(
+                &sources,
+                &["capacity.governor.offload_heavy"],
+            ),
+            capacity_governor_block_heavy: any_reason(&sources, &["capacity.governor.block_heavy"]),
+            capacity_governor_missing_heavy: any_reason(
+                &sources,
+                &["capacity.governor.missing_heavy"],
+            ),
+            rch_no_worker: any_reason(
+                &sources,
+                &[
+                    "rch.no_workers_passed_health",
+                    "rch.no_admissible_workers",
+                    "rch.no_admissible_workers.critical_pressure",
+                    "rch.critical_pressure",
+                    "rch.worker_selection.no_available_worker",
+                    "rch.worker_selection.no_admissible_workers",
+                    "no_admissible_workers=critical_pressure=1",
+                ],
+            ),
+            rch_topology_failure: any_reason(
+                &sources,
+                &[
+                    "rch.topology_preflight_failed",
+                    "rch.topology_preflight.fail",
+                ],
+            ),
+            rch_active_project_exclusion: any_reason(
+                &sources,
+                &[
+                    "rch.active_project_exclusion",
+                    "rch.active_project_exclusion.active_project_present",
+                ],
+            ),
+            rch_recovered: any_reason(
+                &sources,
+                &[
+                    "rch.remote_cargo_reached_true",
+                    "rch.cargo_verdict.pass",
+                    "rch.remote_proof_available",
+                ],
+            ),
+            agent_mail_unavailable: input.input_domains.agent_mail.state
+                == OperatingEnvelopeSourceState::Unavailable
+                || any_reason(
+                    &sources,
+                    &[
+                        "agent_mail.unavailable_after_retry",
+                        "agent_mail.database_error",
+                    ],
+                ),
+            agent_mail_degraded: input.input_domains.agent_mail.state
+                == OperatingEnvelopeSourceState::Degraded,
+            dirty_non_overlap: any_reason(
+                &sources,
+                &[
+                    "git.dirty_non_overlap",
+                    "git.dirty_nonoverlap",
+                    "dirty_tree.non_overlap",
+                ],
+            ),
+            dirty_overlap: input.input_domains.git.state == OperatingEnvelopeSourceState::Blocked
+                || any_reason(
+                    &sources,
+                    &[
+                        "dirty_overlap.present",
+                        "git.dirty_overlap_risk",
+                        "dirty_overlap.risk",
+                    ],
+                ),
+            deletion_risk: any_reason(
+                &sources,
+                &[
+                    "deletion_risk.present",
+                    "deletion_risk.frankenterm_core",
+                    "git.deleted_paths_present",
+                ],
+            ),
+            stale_owner: any_reason(
+                &sources,
+                &["beads.stale_candidate", "beads.stale_reopen_candidate"],
+            ),
+            active_owner: any_reason(
+                &sources,
+                &["beads.in_progress_active", "assignee_overlap.active"],
+            ),
+            no_ready_work: any_reason(&sources, &["beads.ready_empty", "beads.no_ready_work"]),
+            target_class_unproven: input.target_class.proof_state
+                == OperatingEnvelopeProofState::SkippedNotProven
+                || input.target_class.proof_state == OperatingEnvelopeProofState::Unavailable
+                || any_reason(
+                    &sources,
+                    &[
+                        "target_hardware.skipped_not_proven",
+                        "target_class.hardware_not_available",
+                        "attestation.skipped_not_proven",
+                        "capacity.target_class_unproven",
+                    ],
+                ),
+            stale_telemetry: sources
+                .iter()
+                .any(|source| source.freshness_state == OperatingEnvelopeFreshnessState::Stale)
+                || any_reason(&sources, &["telemetry.stale", "capacity.stale"]),
+            insufficient_proof: any_reason(
+                &sources,
+                &[
+                    "proof.insufficient",
+                    "rch.remote_cargo_reached_false",
+                    "local_cargo.forbidden",
+                ],
+            ),
+            kill_switch_active: any_reason(
+                &sources,
+                &[
+                    "capacity.kill_switch_active",
+                    "policy.kill_switch_active",
+                    "kill_switch.active",
+                ],
+            ),
+            // Fail-closed on ABSENT required telemetry. capacity_resource and rch
+            // are required inputs; if either is NotCollected/Unavailable we must
+            // not admit, even when the source reported no failure reason code.
+            // (agent_mail / git / target_class / stale_telemetry already guard on
+            // their source state above; this closes the same gap for capacity+rch.)
+            required_telemetry_missing: matches!(
+                input.input_domains.capacity_resource.state,
+                OperatingEnvelopeSourceState::NotCollected
+                    | OperatingEnvelopeSourceState::Unavailable
+            ) || matches!(
+                input.input_domains.rch.state,
+                OperatingEnvelopeSourceState::NotCollected
+                    | OperatingEnvelopeSourceState::Unavailable
+            ),
+        }
+    }
+
+    fn rch_unavailable_or_insufficient(&self) -> bool {
+        self.rch_no_worker
+            || self.rch_topology_failure
+            || self.rch_active_project_exclusion
+            || self.insufficient_proof
+    }
+
+    fn rch_contradiction(&self) -> bool {
+        self.rch_recovered && self.rch_unavailable_or_insufficient()
+    }
+}
+
+fn decision_for(
+    input: &OperatingEnvelopePlannerInput,
+    facts: &EnvelopeFacts,
+) -> OperatingEnvelopeDecision {
+    let mut reason_codes = Vec::new();
+    let (outcome, tier, confidence, dirty_tree_state, max_agents, max_proofs) =
+        if facts.privacy_violation {
+            push_unique(&mut reason_codes, "source.raw_content_forbidden");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Unavailable,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.deletion_risk {
+            push_unique(&mut reason_codes, "deletion_risk.present");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.kill_switch_active {
+            push_unique(&mut reason_codes, "capacity.kill_switch_active");
+            push_unique(&mut reason_codes, "policy.kill_switch_active");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.capacity_black {
+            push_unique(&mut reason_codes, "capacity.black");
+            (
+                OperatingEnvelopeOutcome::Shed,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.capacity_governor_block_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.block_heavy");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.rch_contradiction() {
+            push_unique(&mut reason_codes, "fail_closed.block_contradiction");
+            push_unique(&mut reason_codes, "rch.evidence_contradictory");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Unavailable,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.rch_topology_failure {
+            push_unique(&mut reason_codes, "rch.topology_preflight_failed");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Unavailable,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.capacity_red {
+            push_unique(&mut reason_codes, "capacity.red");
+            (
+                OperatingEnvelopeOutcome::Shed,
+                OperatingEnvelopeTier::Red,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.capacity_governor_missing_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.missing_heavy");
+            push_unique(&mut reason_codes, "fail_closed.lower_missing");
+            push_unique(&mut reason_codes, "telemetry.required_source_missing");
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Orange,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.capacity_governor_throttle_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.throttle_heavy");
+            (
+                OperatingEnvelopeOutcome::Degrade,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.dirty_overlap || facts.active_owner {
+            if facts.dirty_overlap {
+                push_unique(&mut reason_codes, "dirty_overlap.present");
+            }
+            if facts.active_owner {
+                push_unique(&mut reason_codes, "assignee_overlap.active");
+            }
+            (
+                OperatingEnvelopeOutcome::Wait,
+                OperatingEnvelopeTier::Orange,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.rch_no_worker || facts.rch_active_project_exclusion {
+            if facts.rch_no_worker {
+                push_unique(&mut reason_codes, "rch.no_workers_passed_health");
+            }
+            if facts.rch_active_project_exclusion {
+                push_unique(&mut reason_codes, "rch.active_project_exclusion");
+            }
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Red,
+                OperatingEnvelopeConfidence::Unavailable,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.target_class_unproven {
+            push_unique(&mut reason_codes, "target_hardware.skipped_not_proven");
+            push_unique(&mut reason_codes, "capacity.target_class_unproven");
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Orange,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.agent_mail_unavailable || facts.agent_mail_degraded {
+            if facts.agent_mail_unavailable {
+                push_unique(&mut reason_codes, "agent_mail.unavailable_after_retry");
+            } else {
+                push_unique(&mut reason_codes, "agent_mail.degraded");
+            }
+            push_unique(&mut reason_codes, "fallback.beads_only");
+            (
+                OperatingEnvelopeOutcome::Degrade,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.interactive_agents.min(4),
+                0,
+            )
+        } else if facts.no_ready_work {
+            push_unique(&mut reason_codes, "beads.ready_empty");
+            (
+                OperatingEnvelopeOutcome::Wait,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.stale_owner || facts.stale_telemetry {
+            if facts.stale_owner {
+                push_unique(&mut reason_codes, "beads.stale_candidate");
+            }
+            if facts.stale_telemetry {
+                push_unique(&mut reason_codes, "telemetry.stale");
+            }
+            (
+                OperatingEnvelopeOutcome::Degrade,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Stale,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.insufficient_proof && !facts.rch_recovered {
+            push_unique(&mut reason_codes, "proof.insufficient");
+            (
+                OperatingEnvelopeOutcome::Degrade,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.required_telemetry_missing {
+            // FND/GA-FND-015: a required telemetry source (capacity_resource or
+            // rch) is absent and none of the reason-coded failure facts fired.
+            // Fail CLOSED — lower the envelope rather than admit on missing
+            // measurement (the documented `missing_signal_behavior` contract).
+            push_unique(&mut reason_codes, "fail_closed.lower_missing");
+            push_unique(&mut reason_codes, "telemetry.required_source_missing");
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Orange,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else {
+            push_unique(&mut reason_codes, "envelope.all_required_sources_available");
+            (
+                OperatingEnvelopeOutcome::Admit,
+                OperatingEnvelopeTier::Green,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                input.budgets.interactive_agents,
+                input.budgets.long_rch_proof_lanes,
+            )
+        };
+
+    push_unique(&mut reason_codes, "policy.no_local_cargo_proof");
+    push_unique(&mut reason_codes, "source.redacted_summary_only");
+    if facts.capacity_governor_allow_heavy {
+        push_unique(&mut reason_codes, "capacity.governor.allow_heavy");
+    }
+    if facts.capacity_governor_offload_heavy {
+        push_unique(&mut reason_codes, "capacity.governor.offload_heavy");
+    }
+
+    OperatingEnvelopeDecision {
+        decision_id: format!("decision-{}", slug(&input.envelope_id)),
+        outcome,
+        envelope_tier: tier,
+        confidence,
+        target_hardware_state: input.target_class.proof_state,
+        rch_proof_state: rch_proof_state(facts),
+        agent_mail_state: input.input_domains.agent_mail.state,
+        dirty_tree_state,
+        max_parallel_agents: max_agents,
+        max_parallel_proofs: max_proofs,
+        reason_codes,
+    }
+}
+
+fn admission_windows_for(
+    input: &OperatingEnvelopePlannerInput,
+    facts: &EnvelopeFacts,
+    decision: &OperatingEnvelopeDecision,
+) -> Vec<OperatingEnvelopeAdmissionWindow> {
+    match decision.outcome {
+        OperatingEnvelopeOutcome::Admit => vec![
+            window(
+                "admit_now",
+                OperatingEnvelopeWindowClass::Open,
+                input.generated_at_ms,
+                Some(input.generated_at_ms.saturating_add(300_000)),
+                decision.max_parallel_agents,
+                decision.max_parallel_proofs,
+                vec![
+                    OperatingEnvelopeActionClass::ReadStatus,
+                    OperatingEnvelopeActionClass::ClaimBead,
+                    OperatingEnvelopeActionClass::AddBeadsComment,
+                    OperatingEnvelopeActionClass::EditFiles,
+                    OperatingEnvelopeActionClass::RunStaticCheck,
+                    OperatingEnvelopeActionClass::RunRchProof,
+                ],
+                vec![
+                    "envelope.admit",
+                    "rch.remote_cargo_reached_true",
+                    "proof.remote_only",
+                ],
+                input,
+            ),
+            proof_window("proof_only", input, input.budgets.long_rch_proof_lanes),
+            static_window("docs_only", input, input.budgets.docs_static_checks),
+        ],
+        OperatingEnvelopeOutcome::Degrade => {
+            // A docs-only static-check window must be bounded by the
+            // static-check budget, not by the interactive-agent cap. The
+            // prior `max(max_parallel_agents, docs_static_checks)` made the
+            // budget a floor rather than a ceiling: under the conservative
+            // default (interactive_agents.min(4) = 4, docs_static_checks = 2)
+            // the degraded window was granted 4 concurrent static checks —
+            // more than the budget of 2, and more than the healthy Admit
+            // state's identical window. Use the budget directly, matching the
+            // Admit and Defer `docs_only` call sites.
+            let mut windows = vec![static_window(
+                "docs_only",
+                input,
+                input.budgets.docs_static_checks,
+            )];
+            if facts.agent_mail_unavailable || facts.agent_mail_degraded {
+                windows.push(wait_window(
+                    "admit_after_agent_mail_recovers",
+                    input,
+                    &["agent_mail.recovery_required", "fallback.beads_only"],
+                ));
+            }
+            if facts.stale_owner {
+                windows.push(read_only_window(
+                    "stale_reopen_status_check",
+                    input,
+                    &["beads.stale_candidate", "coordination.status_check_first"],
+                ));
+            }
+            windows
+        }
+        OperatingEnvelopeOutcome::Defer => vec![
+            static_window("docs_only", input, input.budgets.docs_static_checks),
+            wait_window(
+                "admit_after_rch_recovers",
+                input,
+                &["rch.recovery_required", "proof.remote_unavailable"],
+            ),
+        ],
+        OperatingEnvelopeOutcome::Wait => vec![wait_window(
+            "pause_admission",
+            input,
+            &wait_reason_codes(facts),
+        )],
+        OperatingEnvelopeOutcome::Shed => vec![window(
+            "emergency_stop_recommended",
+            OperatingEnvelopeWindowClass::Blocked,
+            input.generated_at_ms,
+            None,
+            0,
+            0,
+            vec![OperatingEnvelopeActionClass::ReadStatus],
+            vec!["capacity.pressure_shed", "envelope.shed"],
+            input,
+        )],
+        OperatingEnvelopeOutcome::Block => vec![window(
+            "emergency_stop_recommended",
+            OperatingEnvelopeWindowClass::Blocked,
+            input.generated_at_ms,
+            None,
+            0,
+            0,
+            vec![
+                OperatingEnvelopeActionClass::ReadStatus,
+                OperatingEnvelopeActionClass::AddBeadsComment,
+            ],
+            decision
+                .reason_codes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            input,
+        )],
+    }
+}
+
+fn static_window(
+    window_id: &'static str,
+    input: &OperatingEnvelopePlannerInput,
+    max_agents: u32,
+) -> OperatingEnvelopeAdmissionWindow {
+    window(
+        window_id,
+        OperatingEnvelopeWindowClass::StaticOnly,
+        input.generated_at_ms,
+        Some(input.generated_at_ms.saturating_add(300_000)),
+        max_agents,
+        0,
+        vec![
+            OperatingEnvelopeActionClass::ReadStatus,
+            OperatingEnvelopeActionClass::AddBeadsComment,
+            OperatingEnvelopeActionClass::RunStaticCheck,
+        ],
+        vec!["proof.static_only", "policy.no_local_cargo_proof"],
+        input,
+    )
+}
+
+fn proof_window(
+    window_id: &'static str,
+    input: &OperatingEnvelopePlannerInput,
+    max_proofs: u32,
+) -> OperatingEnvelopeAdmissionWindow {
+    window(
+        window_id,
+        OperatingEnvelopeWindowClass::RchProofAllowed,
+        input.generated_at_ms,
+        Some(input.generated_at_ms.saturating_add(300_000)),
+        input.budgets.interactive_agents.min(2),
+        max_proofs,
+        vec![
+            OperatingEnvelopeActionClass::ReadStatus,
+            OperatingEnvelopeActionClass::RunRchProof,
+        ],
+        vec!["proof.remote_only", "rch.remote_cargo_reached_true"],
+        input,
+    )
+}
+
+fn read_only_window(
+    window_id: &'static str,
+    input: &OperatingEnvelopePlannerInput,
+    reason_codes: &[&str],
+) -> OperatingEnvelopeAdmissionWindow {
+    window(
+        window_id,
+        OperatingEnvelopeWindowClass::ReadOnly,
+        input.generated_at_ms,
+        Some(input.generated_at_ms.saturating_add(300_000)),
+        input.budgets.docs_static_checks,
+        0,
+        vec![
+            OperatingEnvelopeActionClass::ReadStatus,
+            OperatingEnvelopeActionClass::AddBeadsComment,
+        ],
+        reason_codes.to_vec(),
+        input,
+    )
+}
+
+fn wait_window(
+    window_id: &'static str,
+    input: &OperatingEnvelopePlannerInput,
+    reason_codes: &[&str],
+) -> OperatingEnvelopeAdmissionWindow {
+    window(
+        window_id,
+        OperatingEnvelopeWindowClass::Wait,
+        input.generated_at_ms,
+        None,
+        0,
+        0,
+        vec![
+            OperatingEnvelopeActionClass::ReadStatus,
+            OperatingEnvelopeActionClass::Wait,
+        ],
+        reason_codes.to_vec(),
+        input,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window(
+    window_id: impl Into<String>,
+    window_class: OperatingEnvelopeWindowClass,
+    starts_at_ms: u64,
+    expires_at_ms: Option<u64>,
+    max_parallel_agents: u32,
+    max_parallel_proofs: u32,
+    permitted_action_classes: Vec<OperatingEnvelopeActionClass>,
+    reason_codes: Vec<&str>,
+    input: &OperatingEnvelopePlannerInput,
+) -> OperatingEnvelopeAdmissionWindow {
+    OperatingEnvelopeAdmissionWindow {
+        window_id: window_id.into(),
+        window_class,
+        starts_at_ms: Some(starts_at_ms),
+        expires_at_ms,
+        max_parallel_agents,
+        max_parallel_proofs,
+        permitted_action_classes,
+        forbidden_action_classes: default_forbidden_action_classes(),
+        source_ids: source_ids(input),
+        reason_codes: reason_codes.into_iter().map(str::to_string).collect(),
+    }
+}
+
+fn default_forbidden_action_classes() -> Vec<OperatingEnvelopeActionClass> {
+    vec![
+        OperatingEnvelopeActionClass::AgentMailRepair,
+        OperatingEnvelopeActionClass::BuildCancellation,
+        OperatingEnvelopeActionClass::DestructiveGit,
+        OperatingEnvelopeActionClass::DestructiveFilesystem,
+        OperatingEnvelopeActionClass::LocalCargoProof,
+        OperatingEnvelopeActionClass::RawPaneContentCapture,
+        OperatingEnvelopeActionClass::RawPaneContent,
+        OperatingEnvelopeActionClass::RchDaemonRestart,
+        OperatingEnvelopeActionClass::ServiceRestart,
+        OperatingEnvelopeActionClass::ServiceMutation,
+        OperatingEnvelopeActionClass::PaneMutation,
+        OperatingEnvelopeActionClass::WorkerDrain,
+    ]
+}
+
+fn stable_rank_windows(windows: &mut [OperatingEnvelopeAdmissionWindow]) {
+    windows.sort_by_key(|window| {
+        let class_rank = match window.window_class {
+            OperatingEnvelopeWindowClass::Open => 0,
+            OperatingEnvelopeWindowClass::RchProofAllowed => 1,
+            OperatingEnvelopeWindowClass::ClaimAllowed => 2,
+            OperatingEnvelopeWindowClass::StaticOnly => 3,
+            OperatingEnvelopeWindowClass::ReadOnly => 4,
+            OperatingEnvelopeWindowClass::Defer => 5,
+            OperatingEnvelopeWindowClass::Wait => 6,
+            OperatingEnvelopeWindowClass::Blocked => 7,
+        };
+        (class_rank, window.window_id.clone())
+    });
+}
+
+fn source_ids(input: &OperatingEnvelopePlannerInput) -> Vec<String> {
+    input
+        .sources()
+        .into_iter()
+        .map(|source| source.source_id.clone())
+        .collect()
+}
+
+fn any_reason(sources: &[&OperatingEnvelopeSourceSnapshot], needles: &[&str]) -> bool {
+    sources.iter().any(|source| {
+        source
+            .reason_codes
+            .iter()
+            .chain(
+                source
+                    .evidence
+                    .iter()
+                    .flat_map(|evidence| evidence.reason_codes.iter()),
+            )
+            .any(|reason| needles.contains(&reason.as_str()))
+    })
+}
+
+fn adapter_snapshot(
+    provenance: &OperatingEnvelopeSourceProvenance,
+    source_kind: OperatingEnvelopeSourceKind,
+) -> OperatingEnvelopeSourceSnapshot {
+    let mut snapshot = OperatingEnvelopeSourceSnapshot::new(&provenance.source_id, source_kind)
+        .evidence_level(provenance.evidence_level);
+    snapshot
+        .command_or_api
+        .clone_from(&provenance.command_or_api);
+    snapshot.collected_at_ms = provenance.collected_at_ms;
+    snapshot.freshness_ms = provenance.freshness_ms;
+    snapshot.freshness_state = provenance.freshness_state;
+    snapshot.evidence.clear();
+    for artifact_path in provenance.artifact_paths.iter().cloned() {
+        snapshot = snapshot.with_artifact_path(artifact_path);
+    }
+    snapshot
+}
+
+fn evidence(
+    category: OperatingEnvelopeEvidenceCategory,
+    state: OperatingEnvelopeEvidenceState,
+    subject: impl Into<String>,
+    reason_code: impl Into<String>,
+) -> OperatingEnvelopeEvidenceItem {
+    OperatingEnvelopeEvidenceItem::new(category, state, subject).with_reason_code(reason_code)
+}
+
+fn normalized_optional_reason(reason: Option<&str>) -> Option<String> {
+    reason
+        .map(|reason| bounded_string(reason, "source.unavailable"))
+        .filter(|reason| !reason.is_empty())
+}
+
+fn dirty_tree_state(facts: &EnvelopeFacts) -> OperatingEnvelopeDirtyTreeState {
+    if facts.dirty_overlap {
+        OperatingEnvelopeDirtyTreeState::DirtyOverlap
+    } else if facts.deletion_risk {
+        OperatingEnvelopeDirtyTreeState::Unknown
+    } else if facts.dirty_non_overlap {
+        OperatingEnvelopeDirtyTreeState::DirtyNonOverlap
+    } else {
+        OperatingEnvelopeDirtyTreeState::Clean
+    }
+}
+
+fn wait_reason_codes(facts: &EnvelopeFacts) -> Vec<&'static str> {
+    let mut reason_codes = Vec::new();
+    if facts.dirty_overlap {
+        reason_codes.push("dirty_overlap.present");
+        reason_codes.push("coordination.wait_for_owner");
+    }
+    if facts.active_owner {
+        reason_codes.push("assignee_overlap.active");
+        reason_codes.push("coordination.wait_for_owner");
+    }
+    if facts.no_ready_work {
+        reason_codes.push("beads.ready_empty");
+        reason_codes.push("coordination.wait_for_ready_work");
+    }
+    if reason_codes.is_empty() {
+        reason_codes.push("coordination.wait");
+    }
+    reason_codes
+}
+
+fn rch_proof_state(facts: &EnvelopeFacts) -> OperatingEnvelopeProofState {
+    if facts.rch_unavailable_or_insufficient() {
+        OperatingEnvelopeProofState::Unavailable
+    } else if facts.rch_recovered {
+        OperatingEnvelopeProofState::Measured
+    } else {
+        OperatingEnvelopeProofState::NotRequired
+    }
+}
+
+fn push_unique<T>(values: &mut Vec<T>, value: impl Into<T>)
+where
+    T: Eq,
+{
+    let value = value.into();
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn bounded_string(value: impl Into<String>, fallback: &str) -> String {
+    let value = value.into();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.chars().take(256).collect()
+    }
+}
+
+fn slug(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW_MS: u64 = 1_778_912_100_000;
+
+    // ── ft-7h5da.10.4.4: target-class artifact reader ──
+
+    #[test]
+    fn summary_proven_and_ready_maps_to_measured() {
+        let summary = serde_json::json!({
+            "status": "passed",
+            "ready_to_sign": true,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": true,
+            },
+        });
+        assert_eq!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_proven_but_not_ready_to_sign_is_not_measured() {
+        // Fail-closed: proof_status proven but ready_to_sign=false must NOT flip.
+        let summary = serde_json::json!({
+            "ready_to_sign": false,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": true,
+            },
+        });
+        assert_ne!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_proven_but_high_scale_not_allowed_is_not_measured() {
+        let summary = serde_json::json!({
+            "ready_to_sign": true,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": false,
+            },
+        });
+        assert_ne!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_skipped_maps_to_skipped_not_proven() {
+        let summary = serde_json::json!({
+            "ready_to_sign": false,
+            "hardware_predicate": { "proof_status": "skipped_not_proven" },
+        });
+        assert_eq!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+    }
+
+    #[test]
+    fn summary_missing_fields_is_unavailable() {
+        assert_eq!(
+            target_class_proof_state_from_summary(&serde_json::json!({})),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn pointer_status_maps_proof_state() {
+        let proven = serde_json::json!({ "status": "proven_predicate_met" });
+        let skipped = serde_json::json!({ "current_artifact": { "status": "skipped_not_proven" } });
+        let unknown = serde_json::json!({ "status": "weird" });
+        assert_eq!(
+            target_class_proof_state_from_pointer(&proven),
+            OperatingEnvelopeProofState::Measured
+        );
+        assert_eq!(
+            target_class_proof_state_from_pointer(&skipped),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+        assert_eq!(
+            target_class_proof_state_from_pointer(&unknown),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn read_proof_state_missing_pointer_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn read_proof_state_falls_back_to_pointer_status_when_summary_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "skipped_not_proven",
+                "current_artifact": {
+                    "path": "tests/e2e/artifacts/target-class/missing/summary.json",
+                    "status": "skipped_not_proven",
+                },
+            }))
+            .expect("ser"),
+        )
+        .expect("write pointer");
+        // summary.json referenced by the pointer is absent on disk → fall back.
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+    }
+
+    #[test]
+    fn read_proof_state_prefers_present_summary_over_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        let summary_rel = "tests/e2e/artifacts/target-class/sku/run/summary.json";
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "skipped_not_proven",
+                "current_artifact": { "path": summary_rel, "status": "skipped_not_proven" },
+            }))
+            .expect("ser"),
+        )
+        .expect("write pointer");
+        let summary_path = dir.path().join(summary_rel);
+        std::fs::create_dir_all(summary_path.parent().expect("parent")).expect("mkdir summary");
+        std::fs::write(
+            &summary_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "passed",
+                "ready_to_sign": true,
+                "hardware_predicate": {
+                    "proof_status": "proven_predicate_met",
+                    "high_scale_claim_allowed": true,
+                },
+            }))
+            .expect("ser"),
+        )
+        .expect("write summary");
+        // A present, signed summary is authoritative over the stale pointer status.
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn target_class_from_artifact_only_claims_high_scale_when_measured() {
+        // Unproven/absent → developer-laptop (NotRequired): default unchanged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unproven = operating_envelope_target_class_from_artifact(dir.path());
+        assert_eq!(
+            unproven.profile,
+            OperatingEnvelopeTargetProfile::DeveloperLaptop
+        );
+        assert_eq!(
+            unproven.proof_state,
+            OperatingEnvelopeProofState::NotRequired
+        );
+
+        // Signed + proven → high-scale target class with Measured proof state.
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({ "status": "proven_predicate_met" }))
+                .expect("ser"),
+        )
+        .expect("write pointer");
+        let proven = operating_envelope_target_class_from_artifact(dir.path());
+        assert_eq!(
+            proven.profile,
+            OperatingEnvelopeTargetProfile::Target64Core256g
+        );
+        assert_eq!(proven.proof_state, OperatingEnvelopeProofState::Measured);
+    }
+
+    #[test]
+    fn signing_artifact_flips_target_class_unproven_gate() {
+        // End-to-end: feeding the artifact-derived target class into the planner
+        // clears the `capacity.target_class_unproven` reason once proven.
+        let unproven_plan = plan_operating_envelope(
+            OperatingEnvelopePlannerInput::new(NOW_MS, "env", "obj", base_domains())
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::SkippedNotProven),
+                )
+                .budgets(OperatingEnvelopeBudgets::target_class()),
+        );
+        assert!(
+            unproven_plan
+                .decision
+                .reason_codes
+                .iter()
+                .any(|r| r == "capacity.target_class_unproven"),
+            "unproven target class must surface the gate reason: {:?}",
+            unproven_plan.decision.reason_codes
+        );
+
+        let proven_plan = plan_operating_envelope(
+            OperatingEnvelopePlannerInput::new(NOW_MS, "env", "obj", base_domains())
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::Measured),
+                )
+                .budgets(OperatingEnvelopeBudgets::target_class()),
+        );
+        assert!(
+            !proven_plan
+                .decision
+                .reason_codes
+                .iter()
+                .any(|r| r == "capacity.target_class_unproven"),
+            "measured target class must clear the gate reason: {:?}",
+            proven_plan.decision.reason_codes
+        );
+    }
+
+    fn source(
+        source_id: &str,
+        source_kind: OperatingEnvelopeSourceKind,
+        reason_code: &str,
+    ) -> OperatingEnvelopeSourceSnapshot {
+        OperatingEnvelopeSourceSnapshot::new(source_id, source_kind)
+            .evidence_level(OperatingEnvelopeEvidenceLevel::Fixture)
+            .with_reason_code(reason_code)
+    }
+
+    fn base_domains() -> OperatingEnvelopeInputDomains {
+        OperatingEnvelopeInputDomains {
+            capacity_resource: source(
+                "capacity-green",
+                OperatingEnvelopeSourceKind::CapacityResource,
+                "capacity.green",
+            ),
+            rch: source(
+                "rch-healthy",
+                OperatingEnvelopeSourceKind::Rch,
+                "rch.remote_cargo_reached_true",
+            ),
+            beads: source(
+                "beads-ready",
+                OperatingEnvelopeSourceKind::Beads,
+                "beads.ready_available",
+            ),
+            agent_mail: source(
+                "agent-mail-healthy",
+                OperatingEnvelopeSourceKind::AgentMail,
+                "agent_mail.available",
+            ),
+            git: source(
+                "git-clean",
+                OperatingEnvelopeSourceKind::Git,
+                "git.clean_for_scope",
+            ),
+            robot_inventory: None,
+        }
+    }
+
+    fn input_with(domains: OperatingEnvelopeInputDomains) -> OperatingEnvelopePlannerInput {
+        OperatingEnvelopePlannerInput::new(NOW_MS, "test-envelope", "test-objective", domains)
+            .target_class(
+                OperatingEnvelopeTargetClass::target_64_core_256g()
+                    .proof_state(OperatingEnvelopeProofState::Measured),
+            )
+            .budgets(OperatingEnvelopeBudgets::target_class())
+    }
+
+    fn provenance(source_id: &str, command_or_api: &str) -> OperatingEnvelopeSourceProvenance {
+        OperatingEnvelopeSourceProvenance::retained_artifact(source_id, command_or_api)
+            .with_freshness(
+                Some(NOW_MS),
+                Some(1_000),
+                OperatingEnvelopeFreshnessState::Fresh,
+            )
+    }
+
+    fn heavy_governor_allow() -> GovernorDecision {
+        GovernorDecision::Allow {
+            reason: "within capacity".to_string(),
+        }
+    }
+
+    fn adapter_domains() -> OperatingEnvelopeInputDomains {
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-resource-retained",
+            "docs/attestations/proofs/resource-cockpit-target-class.json",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
+
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-status-retained",
+            "rch status --json",
+        ));
+        rch.healthy_worker_count = 3;
+        rch.remote_cargo_reached = Some(true);
+        rch.remote_cargo_verdict_pass = true;
+
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-bv-retained",
+            "bv --robot-triage",
+        ));
+        beads.ready_count = 4;
+        beads.blocked_count = 2;
+        beads.dependency_impact_count = 6;
+
+        let agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-inbox-retained",
+            "fetch_inbox",
+        ));
+
+        let git = OperatingEnvelopeGitSourceInput::new(
+            provenance("git-status-retained", "git status --short --branch"),
+            "main",
+        );
+
+        OperatingEnvelopeSourceAdapterInputs::new(capacity, rch, beads, agent_mail, git)
+            .into_input_domains()
+    }
+
+    fn plan_with(domains: OperatingEnvelopeInputDomains) -> OperatingEnvelopePlan {
+        plan_operating_envelope(input_with(domains))
+    }
+
+    fn window_ids(plan: &OperatingEnvelopePlan) -> Vec<&str> {
+        plan.admission_windows
+            .iter()
+            .map(|window| window.window_id.as_str())
+            .collect()
+    }
+
+    struct RetainedHarnessScenario {
+        scenario_id: &'static str,
+        input: OperatingEnvelopePlannerInput,
+        command: OperatingEnvelopeRetainedRunCommand,
+        expected_outcome: OperatingEnvelopeOutcome,
+        required_diff_reason: Option<&'static str>,
+    }
+
+    fn retained_input(
+        envelope_id: &'static str,
+        domains: OperatingEnvelopeInputDomains,
+    ) -> OperatingEnvelopePlannerInput {
+        OperatingEnvelopePlannerInput::new(NOW_MS, envelope_id, envelope_id, domains)
+            .target_class(
+                OperatingEnvelopeTargetClass::target_64_core_256g()
+                    .proof_state(OperatingEnvelopeProofState::Measured),
+            )
+            .budgets(OperatingEnvelopeBudgets::target_class())
+    }
+
+    fn rch_harness_command(
+        exit_code: i32,
+        worker_id: Option<&str>,
+        cargo_reached: bool,
+        test_reached: bool,
+    ) -> OperatingEnvelopeRetainedRunCommand {
+        let mut command = OperatingEnvelopeRetainedRunCommand::new(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-booek-5-cod5-target cargo test -p frankenterm-core --lib operating_envelope",
+            exit_code,
+            "/tmp/ft-booek-5-cod5-target",
+        )
+        .remote_cargo_reached(cargo_reached)
+        .cargo_test_reached(test_reached);
+        if let Some(worker_id) = worker_id {
+            command = command.worker_id(worker_id);
+        }
+        command
+    }
+
+    fn static_harness_command(
+        command: &'static str,
+        exit_code: i32,
+    ) -> OperatingEnvelopeRetainedRunCommand {
+        OperatingEnvelopeRetainedRunCommand::new(command, exit_code, "/tmp/ft-booek-5-cod5-target")
+    }
+
+    fn scenario_no_ready_docs_static() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-docs-static-retained",
+            "br ready --json",
+        ));
+        beads.blocked_count = 3;
+        domains.beads = beads.to_source_snapshot();
+        retained_input("no-ready-docs-static", domains)
+    }
+
+    fn scenario_agent_mail_unavailable() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-unavailable-retained",
+            "fetch_inbox",
+        ));
+        agent_mail.unavailable_reason = Some("agent_mail.unavailable_after_retry".to_string());
+        domains.agent_mail = agent_mail.to_source_snapshot();
+        retained_input("agent-mail-unavailable", domains)
+    }
+
+    fn scenario_rch_no_workers() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-no-workers-retained",
+            "rch diagnose --dry-run --json",
+        ));
+        rch.no_workers_passed_health = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+        retained_input("rch-no-workers", domains)
+    }
+
+    fn scenario_rch_topology_failure() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-topology-failure-retained",
+            "rch diagnose --dry-run --json",
+        ));
+        rch.topology_preflight_failed = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+        retained_input("rch-topology-failure", domains)
+    }
+
+    fn scenario_dirty_overlap_untracked_owner() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-active-owner-retained",
+            "br show ft-booek.5 --json",
+        ));
+        beads.ready_count = 2;
+        beads.active_assignee_count = 1;
+        domains.beads = beads.to_source_snapshot();
+
+        let mut git = OperatingEnvelopeGitSourceInput::new(
+            provenance(
+                "git-overlap-retained",
+                "git status --short --untracked-files=all",
+            ),
+            "main",
+        );
+        git.tracked_dirty_count = 2;
+        git.untracked_count = 1;
+        git.dirty_overlap_count = 1;
+        domains.git = git.to_source_snapshot();
+        retained_input("dirty-overlap-untracked-owner", domains)
+    }
+
+    fn scenario_stale_in_progress_candidate() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-stale-candidate-retained",
+            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+        ));
+        beads.ready_count = 2;
+        beads.stale_candidate_count = 1;
+        domains.beads = beads.to_source_snapshot();
+        retained_input("stale-in-progress-candidate", domains)
+    }
+
+    fn scenario_target_class_skipped() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-target-class-skipped-retained",
+            "docs/attestations/proofs/resource-cockpit-target-class.json",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::SkippedNotProven;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
+        domains.capacity_resource = capacity.to_source_snapshot();
+        retained_input("target-class-skipped", domains)
+            .target_class(OperatingEnvelopeTargetClass::target_64_core_256g())
+    }
+
+    fn scenario_resource_pressure(
+        tier: OperatingEnvelopeCapacityPressureTier,
+    ) -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-pressure-retained",
+            "ft robot swarm-capacity status --level 2",
+        ));
+        capacity.pressure_tier = tier;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
+        domains.capacity_resource = capacity.to_source_snapshot();
+        retained_input("resource-pressure", domains)
+    }
+
+    fn retained_harness_scenarios() -> Vec<RetainedHarnessScenario> {
+        vec![
+            RetainedHarnessScenario {
+                scenario_id: "clean-ready-healthy-rch",
+                input: retained_input("clean-ready-healthy-rch", adapter_domains()),
+                command: rch_harness_command(0, Some("vmi-retained-healthy"), true, true),
+                expected_outcome: OperatingEnvelopeOutcome::Admit,
+                required_diff_reason: None,
+            },
+            RetainedHarnessScenario {
+                scenario_id: "no-ready-docs-static",
+                input: scenario_no_ready_docs_static(),
+                command: static_harness_command(
+                    "bash tests/e2e/test_operating_envelope_fixture_manifest.sh",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Wait,
+                required_diff_reason: Some("beads.ready_empty"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "agent-mail-unavailable",
+                input: scenario_agent_mail_unavailable(),
+                command: static_harness_command("fetch_inbox", 1),
+                expected_outcome: OperatingEnvelopeOutcome::Degrade,
+                required_diff_reason: Some("agent_mail.unavailable_after_retry"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "rch-no-workers",
+                input: scenario_rch_no_workers(),
+                command: rch_harness_command(1, None, false, false),
+                expected_outcome: OperatingEnvelopeOutcome::Defer,
+                required_diff_reason: Some("rch.no_workers_passed_health"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "rch-topology-failure",
+                input: scenario_rch_topology_failure(),
+                command: rch_harness_command(1, None, false, false),
+                expected_outcome: OperatingEnvelopeOutcome::Block,
+                required_diff_reason: Some("rch.topology_preflight_failed"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "dirty-overlap-untracked-owner",
+                input: scenario_dirty_overlap_untracked_owner(),
+                command: static_harness_command("git status --short --untracked-files=all", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Wait,
+                required_diff_reason: Some("dirty_overlap.present"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "stale-in-progress-candidate",
+                input: scenario_stale_in_progress_candidate(),
+                command: static_harness_command(
+                    "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Degrade,
+                required_diff_reason: Some("beads.stale_candidate"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "target-class-skipped",
+                input: scenario_target_class_skipped(),
+                command: static_harness_command(
+                    "jq empty docs/attestations/proofs/resource-cockpit-target-class.json",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Defer,
+                required_diff_reason: Some("target_hardware.skipped_not_proven"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "resource-pressure-red",
+                input: scenario_resource_pressure(OperatingEnvelopeCapacityPressureTier::Red),
+                command: static_harness_command("ft robot swarm-capacity status --level 2", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Shed,
+                required_diff_reason: Some("capacity.red"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "resource-pressure-black",
+                input: scenario_resource_pressure(OperatingEnvelopeCapacityPressureTier::Black),
+                command: static_harness_command("ft robot swarm-capacity status --level 2", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Shed,
+                required_diff_reason: Some("capacity.black"),
+            },
+        ]
+    }
+
+    fn assert_sha256(label: &str, value: &str) {
+        assert!(
+            value.starts_with("sha256:") && value.len() == 71,
+            "{label} must be a prefixed SHA-256 digest, got {value}"
+        );
+    }
+
+    #[test]
+    fn retained_harness_artifacts_cover_required_no_mock_scenarios() {
+        let baseline_plan = plan_operating_envelope(retained_input(
+            "baseline-clean-ready-healthy-rch",
+            adapter_domains(),
+        ));
+        let baseline_reason_codes = baseline_plan.reason_codes.clone();
+        let scenarios = retained_harness_scenarios();
+        assert_eq!(scenarios.len(), 10);
+
+        for scenario in scenarios {
+            let input_fixture_body = match serde_json::to_string(&scenario.input) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained fixture input failed: {error}");
+                    String::new()
+                }
+            };
+            let plan = plan_operating_envelope(scenario.input);
+            assert_eq!(
+                plan.decision.outcome, scenario.expected_outcome,
+                "{}",
+                scenario.scenario_id
+            );
+            let output_body = match serde_json::to_string(&plan) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained plan output failed: {error}");
+                    String::new()
+                }
+            };
+            let retained_golden_body =
+                format!("{output_body}\nretained-run={}", scenario.scenario_id);
+            let artifact = match build_operating_envelope_retained_run_artifact(
+                &plan,
+                scenario.scenario_id,
+                scenario.command,
+                &input_fixture_body,
+                &baseline_reason_codes,
+                "previous retained golden",
+                &retained_golden_body,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "build retained run artifact failed: {error}");
+                    continue;
+                }
+            };
+
+            assert_eq!(
+                artifact.contract_id,
+                OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID
+            );
+            assert!(artifact.dry_run);
+            assert!(artifact.read_only);
+            assert!(!artifact.external_provider_calls);
+            assert_ne!(artifact.command.command, "");
+            assert_eq!(artifact.command.target_dir, "/tmp/ft-booek-5-cod5-target");
+            if artifact.command.remote_cargo_reached || artifact.command.cargo_test_reached {
+                assert!(
+                    artifact.command.worker_id.is_some(),
+                    "{} reached remote Cargo/test without a retained worker id",
+                    artifact.scenario_id
+                );
+            }
+            assert!(
+                artifact
+                    .scrub_rules
+                    .contains(&"raw_pane_content_forbidden".to_string())
+            );
+            assert!(
+                artifact
+                    .scrub_rules
+                    .contains(&"agent_mail_bodies_not_retained".to_string())
+            );
+            assert!(artifact.source_freshness.len() >= 5);
+            assert!(
+                artifact
+                    .source_freshness
+                    .iter()
+                    .any(|source| source.source_kind == OperatingEnvelopeSourceKind::Rch)
+            );
+            for fixture_hash in &artifact.input_fixture_hashes {
+                assert_sha256(&fixture_hash.fixture_id, &fixture_hash.sha256);
+            }
+            for output_hash in &artifact.output_hashes {
+                assert_sha256(&output_hash.output_id, &output_hash.sha256);
+            }
+            let plan_output_hash = artifact
+                .output_hashes
+                .iter()
+                .find(|output_hash| output_hash.output_id == "operating_envelope_plan_json")
+                .map(|output_hash| output_hash.sha256.as_str());
+            let retained_golden_hash = artifact
+                .output_hashes
+                .iter()
+                .find(|output_hash| output_hash.output_id == "retained_golden_body")
+                .map(|output_hash| output_hash.sha256.as_str());
+            let expected_retained_golden_hash = sha256_prefixed(retained_golden_body.as_bytes());
+            assert_eq!(
+                retained_golden_hash,
+                Some(expected_retained_golden_hash.as_str())
+            );
+            assert_ne!(
+                plan_output_hash, retained_golden_hash,
+                "{} retained golden hash must not alias the plan JSON hash",
+                artifact.scenario_id
+            );
+            assert_sha256(
+                "old_output_sha256",
+                &artifact.golden_update.old_output_sha256,
+            );
+            assert_sha256(
+                "new_output_sha256",
+                &artifact.golden_update.new_output_sha256,
+            );
+            assert!(artifact.golden_update.bless_required);
+
+            if let Some(required_reason) = scenario.required_diff_reason {
+                assert!(
+                    artifact
+                        .reason_code_diff
+                        .added
+                        .contains(&required_reason.to_string()),
+                    "{} missing reason-code diff {required_reason}; diff={:?}",
+                    artifact.scenario_id,
+                    artifact.reason_code_diff
+                );
+            }
+
+            let jsonl = match operating_envelope_retained_run_jsonl_line(&artifact) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained run JSONL failed: {error}");
+                    String::new()
+                }
+            };
+            assert!(
+                !jsonl.contains('\n'),
+                "{} JSONL record must be one line",
+                artifact.scenario_id
+            );
+            let decoded: OperatingEnvelopeRetainedRunArtifact = match serde_json::from_str(&jsonl) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "decode retained run JSONL failed: {error}");
+                    continue;
+                }
+            };
+            assert_eq!(decoded, artifact);
+            // Actual planner output for controlled fixtures; embedded command/worker
+            // fields describe fixture inputs, not live service execution receipts.
+            // Retain all ten records with the successful --nocapture test transcript.
+            println!("OPERATING_ENVELOPE_FIXTURE_SCENARIO_V1 {jsonl}");
+        }
+    }
+
+    #[test]
+    fn fixture_manifest_shell_verifier_retains_run_jsonl_contract() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = match manifest_dir.parent().and_then(std::path::Path::parent) {
+            Some(path) => path,
+            None => {
+                assert!(false, "resolve repository root from CARGO_MANIFEST_DIR");
+                return;
+            }
+        };
+        let output = match std::process::Command::new("bash")
+            .arg("tests/e2e/test_operating_envelope_fixture_manifest.sh")
+            .arg("--json")
+            .current_dir(repo_root)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                assert!(
+                    false,
+                    "run operating-envelope fixture manifest verifier: {error}"
+                );
+                return;
+            }
+        };
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                assert!(
+                    false,
+                    "operating-envelope fixture manifest stdout is not UTF-8: {error}"
+                );
+                return;
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "operating-envelope fixture manifest verifier failed; stdout={stdout}; stderr={stderr}"
+        );
+        let payload: serde_json::Value = match serde_json::from_str(&stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                assert!(
+                    false,
+                    "operating-envelope fixture manifest stdout is not JSON: {error}; stdout={stdout}"
+                );
+                return;
+            }
+        };
+        assert_eq!(
+            payload.pointer("/summary/retained_run_case_count"),
+            Some(&serde_json::Value::from(10))
+        );
+    }
+
+    #[test]
+    fn clean_ready_queue_admits_ranked_windows() {
+        let plan = plan_with(base_domains());
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Green);
+        assert_eq!(
+            window_ids(&plan),
+            vec!["admit_now", "proof_only", "docs_only"]
+        );
+        assert_eq!(plan.decision.max_parallel_agents, 32);
+        assert_eq!(plan.decision.max_parallel_proofs, 8);
+        assert!(
+            plan.reason_codes
+                .contains(&"policy.no_local_cargo_proof".to_string())
+        );
+    }
+
+    #[test]
+    fn no_ready_work_keeps_wait_advice_only() {
+        let mut domains = base_domains();
+        domains.beads = source(
+            "beads-empty",
+            OperatingEnvelopeSourceKind::Beads,
+            "beads.ready_empty",
+        );
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Wait);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Yellow);
+        assert_eq!(window_ids(&plan), vec!["pause_admission"]);
+        assert!(
+            plan.admission_windows[0]
+                .reason_codes
+                .contains(&"beads.ready_empty".to_string())
+        );
+        assert!(
+            !plan.admission_windows[0]
+                .reason_codes
+                .contains(&"dirty_overlap.present".to_string())
+        );
+    }
+
+    #[test]
+    fn active_non_stale_owner_waits_without_claiming() {
+        let mut domains = base_domains();
+        domains.beads = source(
+            "beads-owner",
+            OperatingEnvelopeSourceKind::Beads,
+            "beads.in_progress_active",
+        )
+        .with_reason_code("assignee_overlap.active");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Wait);
+        assert_eq!(
+            plan.decision.dirty_tree_state,
+            OperatingEnvelopeDirtyTreeState::Clean
+        );
+        assert_eq!(plan.decision.max_parallel_agents, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"assignee_overlap.active".to_string())
+        );
+        assert!(
+            !plan
+                .decision
+                .reason_codes
+                .contains(&"dirty_overlap.present".to_string())
+        );
+    }
+
+    #[test]
+    fn dirty_non_overlap_is_preserved_without_blocking_claims() {
+        let mut domains = base_domains();
+        domains.git = source(
+            "git-dirty-non-overlap",
+            OperatingEnvelopeSourceKind::Git,
+            "git.dirty_non_overlap",
+        );
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(
+            plan.decision.dirty_tree_state,
+            OperatingEnvelopeDirtyTreeState::DirtyNonOverlap
+        );
+    }
+
+    #[test]
+    fn stale_reopen_candidate_gets_read_only_status_check() {
+        let mut domains = base_domains();
+        domains.beads = source(
+            "beads-stale",
+            OperatingEnvelopeSourceKind::Beads,
+            "beads.stale_candidate",
+        );
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "stale_reopen_status_check"]
+        );
+    }
+
+    #[test]
+    fn dirty_overlap_waits_and_forbids_edits() {
+        let mut domains = base_domains();
+        domains.git = source(
+            "git-dirty-overlap",
+            OperatingEnvelopeSourceKind::Git,
+            "dirty_overlap.present",
+        )
+        .blocked("dirty_overlap.present");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Wait);
+        assert_eq!(
+            plan.decision.dirty_tree_state,
+            OperatingEnvelopeDirtyTreeState::DirtyOverlap
+        );
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::DestructiveFilesystem)
+        );
+    }
+
+    #[test]
+    fn rch_degraded_no_worker_defers_remote_proof() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-no-worker",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.no_workers_passed_health",
+        )
+        .with_reason_code("rch.remote_cargo_reached_false")
+        .blocked("rch.no_workers_passed_health");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_rch_recovers"]
+        );
+    }
+
+    #[test]
+    fn contradictory_rch_evidence_blocks_and_keeps_proof_unavailable() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-contradictory",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.remote_cargo_reached_true",
+        )
+        .with_reason_code("rch.no_workers_passed_health")
+        .blocked("rch.no_workers_passed_health");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"fail_closed.block_contradiction".to_string())
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.evidence_contradictory".to_string())
+        );
+        assert_eq!(window_ids(&plan), vec!["emergency_stop_recommended"]);
+    }
+
+    #[test]
+    fn rch_critical_pressure_defers_remote_proof() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-critical-pressure",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.no_admissible_workers.critical_pressure",
+        )
+        .with_reason_code("rch.remote_cargo_reached_false")
+        .blocked("rch.no_admissible_workers.critical_pressure");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Red);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.no_workers_passed_health".to_string())
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_rch_recovers"]
+        );
+    }
+
+    #[test]
+    fn rch_recovered_allows_proof_window() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-recovered",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.remote_cargo_reached_true",
+        )
+        .with_reason_code("rch.cargo_verdict.pass");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert!(window_ids(&plan).contains(&"proof_only"));
+    }
+
+    #[test]
+    fn target_class_insufficient_proof_defers_claims() {
+        let input = OperatingEnvelopePlannerInput::new(
+            NOW_MS,
+            "target-class",
+            "target-objective",
+            base_domains(),
+        )
+        .target_class(OperatingEnvelopeTargetClass::target_64_core_256g())
+        .budgets(OperatingEnvelopeBudgets::target_class());
+
+        let plan = plan_operating_envelope(input);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"target_hardware.skipped_not_proven".to_string())
+        );
+    }
+
+    #[test]
+    fn source_adapter_bundle_admits_only_with_known_green_evidence() {
+        let domains = adapter_domains();
+
+        for source in [
+            &domains.capacity_resource,
+            &domains.rch,
+            &domains.beads,
+            &domains.agent_mail,
+            &domains.git,
+        ] {
+            assert!(source.redacted);
+            assert!(!source.raw_pane_content_stored);
+            assert_eq!(
+                source.freshness_state,
+                OperatingEnvelopeFreshnessState::Fresh
+            );
+        }
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Green);
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::AgentMailRepair)
+        );
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::RawPaneContent)
+        );
+    }
+
+    #[test]
+    fn beads_adapter_stale_candidate_degrades_to_status_check() {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-stale-retained",
+            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+        ));
+        beads.ready_count = 2;
+        beads.stale_candidate_count = 1;
+        domains.beads = beads.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"beads.stale_candidate".to_string())
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "stale_reopen_status_check"]
+        );
+    }
+
+    #[test]
+    fn rch_adapter_no_workers_and_no_cargo_reach_defers_proof() {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-no-workers-retained",
+            "rch diagnose --json --dry-run",
+        ));
+        rch.no_workers_passed_health = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.no_workers_passed_health".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_mail_adapter_database_error_uses_beads_only_fallback() {
+        let mut domains = adapter_domains();
+        let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-db-error-retained",
+            "fetch_inbox",
+        ));
+        agent_mail.database_error = true;
+        agent_mail.forbidden_service_remediation_seen = true;
+        domains.agent_mail = agent_mail.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"fallback.beads_only".to_string())
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_agent_mail_recovers"]
+        );
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::ServiceRestart)
+        );
+    }
+
+    #[test]
+    fn git_adapter_core_deletion_risk_blocks() {
+        let mut domains = adapter_domains();
+        let mut git = OperatingEnvelopeGitSourceInput::new(
+            provenance("git-core-deletion-retained", "git status --porcelain=v1"),
+            "main",
+        );
+        git.deleted_frankenterm_core_path_count = 1;
+        domains.git = git.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"deletion_risk.present".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_adapter_kill_switch_blocks_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-kill-switch-retained",
+            "policy diagnostics",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.kill_switch_active = true;
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.kill_switch_active".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_block_blocks_heavy_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-block-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Block {
+            reason: "heavy workload over capacity".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.block_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_throttle_degrades_heavy_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-throttle-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Throttle {
+            delay_ms: 2_000,
+            reason: "heavy concurrency limit".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Yellow);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert_eq!(window_ids(&plan), vec!["docs_only"]);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.throttle_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_offload_keeps_remote_proof_window() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-offload-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Offload {
+            reason: "heavy concurrency limit, rch available".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(plan.decision.max_parallel_proofs, 8);
+        assert!(window_ids(&plan).contains(&"proof_only"));
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.offload_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_missing_heavy_telemetry_fails_closed() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-missing-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Orange);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.missing_heavy".to_string())
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"telemetry.required_source_missing".to_string())
+        );
+    }
+
+    #[test]
+    fn source_adapters_fail_closed_on_unknown_required_evidence() {
+        let mut domains = adapter_domains();
+        let mut capacity =
+            OperatingEnvelopeCapacitySourceInput::new(provenance("capacity-unknown", "fixture"));
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        domains.capacity_resource = capacity.to_source_snapshot();
+        domains.rch = OperatingEnvelopeRchSourceInput::new(provenance("rch-unknown", "fixture"))
+            .to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_ne!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"proof.insufficient".to_string())
+                || plan
+                    .decision
+                    .reason_codes
+                    .contains(&"telemetry.stale".to_string())
+                || plan
+                    .decision
+                    .reason_codes
+                    .contains(&"telemetry.required_source_missing".to_string()),
+            "expected fail-closed proof/telemetry reason; got {:?}",
+            plan.decision.reason_codes
+        );
+    }
+
+    #[test]
+    fn missing_capacity_telemetry_fails_closed_not_admit() {
+        // gauntlet GA-FND-015: a REQUIRED source (capacity_resource) that is
+        // NotCollected must NOT admit — the envelope fails closed on absent
+        // telemetry even when the source carries no failure reason code. Before the
+        // fix, this fell through to Admit (Green) — a fail-OPEN.
+        let mut domains = base_domains();
+        domains.capacity_resource = source(
+            "capacity-missing",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.green",
+        )
+        .not_collected("capacity.collector_unreachable");
+        let plan = plan_with(domains);
+        assert_ne!(
+            plan.decision.outcome,
+            OperatingEnvelopeOutcome::Admit,
+            "missing capacity telemetry must NOT admit (fail-closed); outcome={:?} reasons={:?}",
+            plan.decision.outcome,
+            plan.decision.reason_codes
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"telemetry.required_source_missing".to_string()),
+            "expected telemetry.required_source_missing; got {:?}",
+            plan.decision.reason_codes
+        );
+    }
+
+    #[test]
+    fn missing_rch_telemetry_fails_closed_not_admit() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-missing",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.remote_cargo_reached_true",
+        )
+        .not_collected("rch.collector_unreachable");
+        let plan = plan_with(domains);
+        assert_ne!(
+            plan.decision.outcome,
+            OperatingEnvelopeOutcome::Admit,
+            "missing rch telemetry must NOT admit (fail-closed); outcome={:?} reasons={:?}",
+            plan.decision.outcome,
+            plan.decision.reason_codes
+        );
+    }
+
+    #[test]
+    fn red_and_black_pressure_shed() {
+        let mut red = base_domains();
+        red.capacity_resource = source(
+            "capacity-red",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.red",
+        );
+        let red_plan = plan_with(red);
+        assert_eq!(red_plan.decision.outcome, OperatingEnvelopeOutcome::Shed);
+        assert_eq!(red_plan.decision.envelope_tier, OperatingEnvelopeTier::Red);
+
+        let mut black = base_domains();
+        black.capacity_resource = source(
+            "capacity-black",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.black",
+        );
+        let black_plan = plan_with(black);
+        assert_eq!(black_plan.decision.outcome, OperatingEnvelopeOutcome::Shed);
+        assert_eq!(
+            black_plan.decision.envelope_tier,
+            OperatingEnvelopeTier::Black
+        );
+    }
+
+    #[test]
+    fn agent_mail_unavailable_uses_beads_only_static_window() {
+        let mut domains = base_domains();
+        domains.agent_mail = source(
+            "agent-mail-red",
+            OperatingEnvelopeSourceKind::AgentMail,
+            "agent_mail.unavailable_after_retry",
+        )
+        .unavailable("agent_mail.unavailable_after_retry");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Yellow);
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_agent_mail_recovers"]
+        );
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+    }
+
+    #[test]
+    fn degraded_docs_window_never_exceeds_static_budget() {
+        // Regression: under the conservative budget (interactive_agents = 4,
+        // docs_static_checks = 2) the agent-mail-degraded `docs_only` window
+        // must not be granted more concurrent static checks than the budget,
+        // and must not exceed the healthy Admit state's identical window.
+        // The prior `max(max_parallel_agents, docs_static_checks)` granted 4.
+        let mut domains = base_domains();
+        domains.agent_mail = source(
+            "agent-mail-red",
+            OperatingEnvelopeSourceKind::AgentMail,
+            "agent_mail.unavailable_after_retry",
+        )
+        .unavailable("agent_mail.unavailable_after_retry");
+
+        let input =
+            OperatingEnvelopePlannerInput::new(NOW_MS, "test-envelope", "test-objective", domains)
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::Measured),
+                )
+                .budgets(OperatingEnvelopeBudgets::conservative());
+
+        let plan = plan_operating_envelope(input);
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+
+        let docs_window = match plan
+            .admission_windows
+            .iter()
+            .find(|w| w.window_id == "docs_only")
+        {
+            Some(window) => window,
+            None => {
+                assert!(false, "degraded plan must expose a docs_only window");
+                return;
+            }
+        };
+        assert_eq!(
+            docs_window.max_parallel_agents,
+            OperatingEnvelopeBudgets::conservative().docs_static_checks,
+            "degraded docs_only window must be bounded by the static-check budget"
+        );
+    }
+
+    #[test]
+    fn privacy_violation_blocks_even_when_other_sources_are_green() {
+        let mut domains = base_domains();
+        domains.git = domains.git.clone().raw_pane_content_stored();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert_eq!(plan.decision.max_parallel_agents, 0);
+    }
+}

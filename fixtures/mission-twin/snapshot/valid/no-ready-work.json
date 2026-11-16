@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_snapshot.v1",
+  "source_bead": "ft-u7r37.1",
+  "snapshot_id": "no-ready-work",
+  "generated_at_ms": 1771376400000,
+  "raw_pane_content_stored": false,
+  "forbidden_actions": [
+    "agent_mail_service_repair_restart",
+    "rch_service_repair_restart",
+    "worker_mutation",
+    "build_cancellation",
+    "file_deletion",
+    "destructive_git",
+    "local_cargo_proof",
+    "pane_mutation",
+    "raw_pane_content_storage",
+    "beads_mutation"
+  ],
+  "artifact_paths": [
+    "crates/frankenterm-core/src/mission_twin_snapshot.rs",
+    "docs/json-schema/ft-mission-twin-snapshot.json",
+    "docs/robot-contracts/mission-twin-snapshot.md",
+    "fixtures/mission-twin/snapshot/valid/no-ready-work.json",
+    "fixtures/mission-twin/snapshot/invalid/fragments.v1.json",
+    "tests/e2e/test_mission_twin_snapshot_contract.sh"
+  ],
+  "sources": {
+    "beads": {
+      "source_id": "beads",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "mission_twin.no_ready_work"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "ready_count": 0,
+      "blocked_count": 4,
+      "in_progress_count": 1,
+      "dependency_blockers": [
+        {
+          "blocked_bead_id": "ft-u7r37.2",
+          "blocking_bead_id": "ft-u7r37.1",
+          "blocker_status": "in_progress",
+          "reason_codes": [
+            "mission_twin.snapshot_contract_required"
+          ]
+        }
+      ],
+      "owner_states": [],
+      "stale_owner_candidates": []
+    },
+    "rch": {
+      "source_id": "rch",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "admission_state": "ready",
+      "healthy_workers": 8,
+      "total_workers": 8,
+      "critical_pressure_count": 0,
+      "admission_reasons": [],
+      "blocked_proof_lanes": []
+    },
+    "agent_mail": {
+      "source_id": "agent_mail",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "availability_state": "healthy",
+      "active_agents": [],
+      "fallback_reason_codes": []
+    },
+    "git": {
+      "source_id": "git",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "branch": "main",
+      "head": "6666666666666666666666666666666666666666",
+      "remote_heads": [],
+      "dirty_paths": [],
+      "overlap_paths": [],
+      "deletion_paths_present": false
+    },
+    "reservations": {
+      "source_id": "reservations",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "active_reservations": []
+    },
+    "operating_envelope": {
+      "source_id": "operating_envelope",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "mission_twin.no_ready_work"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ],
+      "verdict": "admit",
+      "source_snapshot_artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+      ]
+    }
+  },
+  "validation": {
+    "validation_state": "accepted",
+    "rejected_inputs": [],
+    "destructive_action_hints": [],
+    "ambiguous_timestamps_rejected": true
+  }
+}

@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "codex.session.resume_hint",
+    "agent_type": "codex",
+    "event_type": "session.resume_hint",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "123e4567-e89b-12d3-a456-426614174000"
+    },
+    "matched_text": "codex resume 123e4567-e89b-12d3-a456-426614174000"
+  }
+]

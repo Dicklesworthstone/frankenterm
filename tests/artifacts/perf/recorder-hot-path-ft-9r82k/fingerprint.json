@@ -1,0 +1,31 @@
+{
+  "bead": "ft-9r82k",
+  "scenario": "recorder_hot_path",
+  "git_head_before_commit": "f1c6de4b3e60",
+  "generated_at_ms": 1777374889740,
+  "host": {
+    "os": "macos",
+    "kernel": "Darwin 25.2.0",
+    "arch": "aarch64",
+    "cpu": "Apple M4 Pro"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.97.0-nightly (e9e32aca5 2026-04-17)",
+    "profile": "bench",
+    "command": "scripts/cargo-local.sh bench -p frankenterm-core --bench recorder_hot_path -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.2 --noplot"
+  },
+  "workload": {
+    "pane_count": 10,
+    "events_per_second": 100,
+    "operations": [
+      "RecordingManager::record_event_with_cx",
+      "FrameWriter::flush via flush_threshold=1",
+      "RecordingManager::stop_recording_with_cx final flush"
+    ],
+    "redact_events": true
+  },
+  "criterion": {
+    "sample_size_effective": 20,
+    "plot_backend": "plotters"
+  }
+}

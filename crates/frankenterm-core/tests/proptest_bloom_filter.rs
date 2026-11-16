@@ -1,0 +1,978 @@
+//! Property-based tests for bloom filter invariants.
+//!
+//! Bead: wa-9nyo
+//!
+//! Validates:
+//! 1. No false negatives: inserted elements always found
+//! 2. FP rate bounded: false positive rate stays within theoretical bounds
+//! 3. Counting filter: insert/remove roundtrip preserves membership
+//! 4. Union correctness: union of two filters contains all elements from both
+//! 5. Clear resets: after clear, no elements are found
+//! 6. Sizing: optimal_num_bits/optimal_num_hashes produce reasonable values
+//! 7. Memory: memory_bytes scales with num_bits
+//! 8. BloomStats serde roundtrip and invariants
+//! 9. Union commutativity
+//! 10. Counting filter counter saturation
+//! 11. Idempotent insert, double clear, union self, fill ratio monotone
+//! 12. Counting double insert/remove, counting stats
+
+use proptest::prelude::*;
+
+use frankenterm_core::bloom_filter::{
+    BloomFilter, BloomStats, CountingBloomFilter, optimal_num_bits, optimal_num_hashes,
+    theoretical_fp_rate,
+};
+
+// =============================================================================
+// Strategies
+// =============================================================================
+
+fn arb_item() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(any::<u8>(), 1..32)
+}
+
+fn arb_items(count: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
+    proptest::collection::vec(arb_item(), count)
+}
+
+fn arb_capacity() -> impl Strategy<Value = usize> {
+    100_usize..5000
+}
+
+fn arb_fp_rate() -> impl Strategy<Value = f64> {
+    // FP rates between 0.001 (0.1%) and 0.2 (20%).
+    (1_u32..200).prop_map(|n| n as f64 / 1000.0)
+}
+
+// =============================================================================
+// Property: No false negatives
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn no_false_negatives(
+        items in arb_items(50),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+
+        // Insert all items.
+        for item in &items {
+            bf.insert(item);
+        }
+
+        // Every inserted item MUST be found.
+        for item in &items {
+            prop_assert!(bf.contains(item),
+                "inserted item should always be found (no false negatives)");
+        }
+    }
+
+    #[test]
+    fn no_false_negatives_counting(
+        items in arb_items(50),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+
+        for item in &items {
+            cbf.insert(item);
+        }
+
+        for item in &items {
+            prop_assert!(cbf.contains(item),
+                "inserted item should always be found in counting filter");
+        }
+    }
+}
+
+// =============================================================================
+// Property: FP rate bounded
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn fp_rate_within_bounds(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let mut bf = BloomFilter::with_capacity(capacity, fp_rate);
+
+        // Use a simple mix function to decorrelate sequential keys — raw
+        // sequential `i.to_le_bytes()` creates pathological hash patterns
+        // with the double-hashing scheme (FNV-1a + DJB2 share factors
+        // with certain bit-array sizes).
+        fn mix_key(i: usize) -> [u8; 16] {
+            let mix1 = (i as u64).wrapping_mul(0x9E3779B97F4A7C15); // golden ratio mix
+            let mix2 = mix1 ^ (mix1 >> 30);
+            let mix3 = mix2.wrapping_mul(0xBF58476D1CE4E5B9);
+            let mix4 = mix3 ^ (mix3 >> 27);
+            let mix5 = mix4.wrapping_mul(0x94D049BB133111EB);
+            let hi = mix5;
+            let lo = hi ^ (i as u64);
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&hi.to_le_bytes());
+            out[8..].copy_from_slice(&lo.to_le_bytes());
+            out
+        }
+
+        // Insert exactly `capacity` unique items.
+        for i in 0..capacity {
+            bf.insert(&mix_key(i));
+        }
+
+        // Test 10000 items that were NOT inserted.
+        let test_count = 10_000;
+        let mut false_positives = 0;
+        for i in capacity..(capacity + test_count) {
+            if bf.contains(&mix_key(i)) {
+                false_positives += 1;
+            }
+        }
+
+        let observed_fp = false_positives as f64 / test_count as f64;
+
+        // Allow 8x the target FP rate to account for hash collision variance,
+        // especially at small capacities and low FP targets where statistical
+        // noise is proportionally larger. Still catches gross miscalculation
+        // (100x would pass, 1x would always fail at low capacities).
+        let tolerance = (fp_rate * 8.0).max(0.05);
+        prop_assert!(observed_fp <= tolerance,
+            "observed FP rate {:.4} exceeds tolerance {:.4} (target {:.4}, cap={}, hashes={})",
+            observed_fp, tolerance, fp_rate, bf.num_bits(), bf.num_hashes());
+    }
+}
+
+// =============================================================================
+// Property: Counting filter insert/remove roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn counting_insert_remove_roundtrip(
+        items in arb_items(30),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+
+        // Insert all.
+        for item in &items {
+            cbf.insert(item);
+        }
+
+        // Remove all.
+        for item in &items {
+            cbf.remove(item);
+        }
+
+        // Count should be 0 (assuming unique items, which proptest may not guarantee).
+        // With potential duplicates, count should be 0 since we remove the same set.
+        prop_assert_eq!(cbf.count(), 0,
+            "count should be 0 after inserting and removing the same items");
+    }
+
+    #[test]
+    fn counting_remove_preserves_others(
+        items_a in arb_items(15),
+        items_b in arb_items(15),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(200, 0.01);
+
+        // Insert both sets.
+        for item in &items_a {
+            cbf.insert(item);
+        }
+        for item in &items_b {
+            cbf.insert(item);
+        }
+
+        // Remove set A.
+        for item in &items_a {
+            cbf.remove(item);
+        }
+
+        // Set B items should still be present (with possible false positives
+        // from hash collisions, but no false negatives).
+        for item in &items_b {
+            prop_assert!(cbf.contains(item),
+                "items from set B should still be found after removing set A");
+        }
+    }
+}
+
+// =============================================================================
+// Property: Union correctness
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn union_contains_all_elements(
+        items_a in arb_items(20),
+        items_b in arb_items(20),
+    ) {
+        let mut bf_a = BloomFilter::with_capacity(100, 0.01);
+        let bf_b_clone;
+
+        {
+            let mut bf_b = BloomFilter::with_capacity(100, 0.01);
+
+            for item in &items_a {
+                bf_a.insert(item);
+            }
+            for item in &items_b {
+                bf_b.insert(item);
+            }
+
+            bf_b_clone = bf_b;
+        }
+
+        // Union A U B.
+        bf_a.union(&bf_b_clone);
+
+        // All items from both sets should be found.
+        for item in &items_a {
+            prop_assert!(bf_a.contains(item),
+                "union should contain items from set A");
+        }
+        for item in &items_b {
+            prop_assert!(bf_a.contains(item),
+                "union should contain items from set B");
+        }
+    }
+}
+
+// =============================================================================
+// Property: Clear resets
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn clear_resets_filter(
+        items in arb_items(30),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+
+        for item in &items {
+            bf.insert(item);
+        }
+
+        prop_assert!(bf.count() > 0);
+
+        bf.clear();
+
+        prop_assert_eq!(bf.count(), 0, "count should be 0 after clear");
+
+        // After clear, unique items should generally not be found
+        // (unless they're degenerate hash collisions, which is extremely unlikely).
+        let unique_items: std::collections::HashSet<&Vec<u8>> = items.iter().collect();
+        let mut found = 0;
+        for item in &unique_items {
+            if bf.contains(item) {
+                found += 1;
+            }
+        }
+
+        // With 0 items inserted, theoretical FP rate is 0.
+        prop_assert_eq!(found, 0, "no items should be found after clear");
+    }
+
+    #[test]
+    fn clear_resets_counting_filter(
+        items in arb_items(30),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+
+        for item in &items {
+            cbf.insert(item);
+        }
+
+        cbf.clear();
+        prop_assert_eq!(cbf.count(), 0, "counting filter count should be 0 after clear");
+    }
+}
+
+// =============================================================================
+// Property: Sizing functions produce reasonable values
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn optimal_sizing_reasonable(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bits = optimal_num_bits(capacity, fp_rate);
+        let hashes = optimal_num_hashes(bits, capacity);
+
+        // Bits should be positive and larger than capacity (at least ~7 bits per item for 1% FP).
+        prop_assert!(bits > 0, "num_bits should be positive");
+        prop_assert!(bits >= capacity,
+            "num_bits ({}) should be >= capacity ({})", bits, capacity);
+
+        // Hash count should be reasonable (1 to ~20).
+        prop_assert!(hashes >= 1, "num_hashes should be >= 1");
+        prop_assert!(hashes <= 30,
+            "num_hashes ({}) seems too high for capacity={}, fp_rate={}",
+            hashes, capacity, fp_rate);
+    }
+
+    #[test]
+    fn theoretical_fp_consistent_with_sizing(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bits = optimal_num_bits(capacity, fp_rate);
+        let hashes = optimal_num_hashes(bits, capacity);
+
+        // Theoretical FP rate at capacity should be close to the target.
+        let theoretical = theoretical_fp_rate(bits, hashes, capacity);
+
+        // Should be within 2x of the target (accounting for integer rounding in bits/hashes).
+        let tolerance = (fp_rate * 2.0).max(0.01);
+        prop_assert!(theoretical <= tolerance,
+            "theoretical FP rate {:.4} exceeds tolerance {:.4} for target {:.4}",
+            theoretical, tolerance, fp_rate);
+    }
+}
+
+// =============================================================================
+// Property: Memory scales with bits
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn memory_scales_with_capacity(
+        cap_a in 100_usize..500,
+        cap_b in 1000_usize..5000,
+    ) {
+        let bf_small = BloomFilter::with_capacity(cap_a, 0.01);
+        let bf_large = BloomFilter::with_capacity(cap_b, 0.01);
+
+        prop_assert!(bf_large.memory_bytes() >= bf_small.memory_bytes(),
+            "larger capacity should use more memory: {} (cap={}) >= {} (cap={})",
+            bf_large.memory_bytes(), cap_b, bf_small.memory_bytes(), cap_a);
+    }
+
+    #[test]
+    fn lower_fp_rate_uses_more_memory(
+        capacity in arb_capacity(),
+    ) {
+        let bf_loose = BloomFilter::with_capacity(capacity, 0.1);
+        let bf_tight = BloomFilter::with_capacity(capacity, 0.001);
+
+        prop_assert!(bf_tight.memory_bytes() >= bf_loose.memory_bytes(),
+            "tighter FP rate should use more memory: {} (0.001) >= {} (0.1)",
+            bf_tight.memory_bytes(), bf_loose.memory_bytes());
+    }
+}
+
+// =============================================================================
+// Property: Count tracks insertions
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn count_tracks_insertions(
+        n in 1_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+
+        prop_assert_eq!(bf.count(), n,
+            "count should equal number of insertions");
+    }
+
+    #[test]
+    fn counting_count_tracks_net(
+        n in 1_usize..50,
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(200, 0.01);
+
+        for i in 0..n {
+            cbf.insert(&i.to_le_bytes());
+        }
+        prop_assert_eq!(cbf.count(), n);
+
+        // Remove half.
+        let half = n / 2;
+        for i in 0..half {
+            cbf.remove(&i.to_le_bytes());
+        }
+        prop_assert_eq!(cbf.count(), n - half,
+            "count after removing {} of {} should be {}", half, n, n - half);
+    }
+}
+
+// =============================================================================
+// Property: Estimated FP rate monotonically increases with fill
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn estimated_fp_increases_with_fill(
+        capacity in 500_usize..2000,
+    ) {
+        let mut bf = BloomFilter::with_capacity(capacity, 0.01);
+
+        let mut prev_fp = 0.0;
+        let step = capacity / 10;
+
+        for chunk in 0..10 {
+            for i in (chunk * step)..((chunk + 1) * step) {
+                bf.insert(&i.to_le_bytes());
+            }
+
+            let fp = bf.estimated_fp_rate();
+            prop_assert!(fp >= prev_fp,
+                "estimated FP rate should not decrease: {} -> {} at count {}",
+                prev_fp, fp, bf.count());
+            prev_fp = fp;
+        }
+    }
+}
+
+// =============================================================================
+// BloomStats -- serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_bloom_stats_serde(
+        count in 0_usize..10_000,
+        num_bits in 64_usize..100_000,
+        num_hashes in 1_u32..20,
+        memory_bytes in 8_usize..20_000,
+        estimated_fp_rate in 0.0_f64..1.0,
+        fill_ratio in 0.0_f64..1.0,
+    ) {
+        let stats = BloomStats {
+            count,
+            num_bits,
+            num_hashes,
+            memory_bytes,
+            estimated_fp_rate,
+            fill_ratio,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: BloomStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.count, stats.count);
+        prop_assert_eq!(back.num_bits, stats.num_bits);
+        prop_assert_eq!(back.num_hashes, stats.num_hashes);
+        prop_assert_eq!(back.memory_bytes, stats.memory_bytes);
+        let tol = 1e-10;
+        prop_assert!(
+            (back.estimated_fp_rate - stats.estimated_fp_rate).abs() < tol,
+            "estimated_fp_rate mismatch: {} vs {}",
+            back.estimated_fp_rate,
+            stats.estimated_fp_rate
+        );
+        prop_assert!(
+            (back.fill_ratio - stats.fill_ratio).abs() < tol,
+            "fill_ratio mismatch: {} vs {}",
+            back.fill_ratio,
+            stats.fill_ratio
+        );
+    }
+
+    #[test]
+    fn prop_bloom_stats_deterministic(
+        count in 0_usize..10_000,
+        num_bits in 64_usize..100_000,
+        num_hashes in 1_u32..20,
+    ) {
+        let stats = BloomStats {
+            count,
+            num_bits,
+            num_hashes,
+            memory_bytes: 1024,
+            estimated_fp_rate: 0.01,
+            fill_ratio: 0.5,
+        };
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =============================================================================
+// BloomStats -- consistency with filter state
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_stats_count_matches_filter(
+        n in 0_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        prop_assert_eq!(stats.count, bf.count(), "stats.count should equal filter.count()");
+        prop_assert_eq!(stats.num_bits, bf.num_bits());
+        prop_assert_eq!(stats.num_hashes, bf.num_hashes());
+        prop_assert_eq!(stats.memory_bytes, bf.memory_bytes());
+    }
+
+    #[test]
+    fn prop_stats_fill_ratio_bounded(
+        n in 0_usize..200,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        prop_assert!(
+            stats.fill_ratio >= 0.0 && stats.fill_ratio <= 1.0,
+            "fill_ratio should be in [0, 1], got {}",
+            stats.fill_ratio
+        );
+    }
+
+    #[test]
+    fn prop_stats_fp_rate_matches_estimated(
+        n in 1_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        let tol = 1e-10;
+        prop_assert!(
+            (stats.estimated_fp_rate - bf.estimated_fp_rate()).abs() < tol,
+            "stats.estimated_fp_rate ({}) should match bf.estimated_fp_rate() ({})",
+            stats.estimated_fp_rate,
+            bf.estimated_fp_rate()
+        );
+    }
+
+    #[test]
+    fn prop_stats_empty_filter(_dummy in 0..1_u8) {
+        let bf = BloomFilter::with_capacity(100, 0.01);
+        let stats = bf.stats();
+        prop_assert_eq!(stats.count, 0);
+        prop_assert!((stats.fill_ratio - 0.0).abs() < 1e-10, "empty filter fill_ratio should be 0");
+        prop_assert!((stats.estimated_fp_rate - 0.0).abs() < 1e-10, "empty filter FP rate should be 0");
+    }
+}
+
+// =============================================================================
+// Union commutativity
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_union_commutative(
+        items_a in arb_items(15),
+        items_b in arb_items(15),
+    ) {
+        let mut bf_a1 = BloomFilter::with_capacity(100, 0.01);
+        let mut bf_a2 = BloomFilter::with_capacity(100, 0.01);
+        let mut bf_b1 = BloomFilter::with_capacity(100, 0.01);
+        let mut bf_b2 = BloomFilter::with_capacity(100, 0.01);
+
+        for item in &items_a {
+            bf_a1.insert(item);
+            bf_a2.insert(item);
+        }
+        for item in &items_b {
+            bf_b1.insert(item);
+            bf_b2.insert(item);
+        }
+
+        // A U B
+        bf_a1.union(&bf_b1);
+        // B U A
+        bf_b2.union(&bf_a2);
+
+        // Membership should be identical for all items.
+        let all_items: Vec<_> = items_a.iter().chain(items_b.iter()).collect();
+        for item in &all_items {
+            prop_assert_eq!(
+                bf_a1.contains(item),
+                bf_b2.contains(item),
+                "union commutativity violated for an item"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// Counting filter saturation
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_counting_saturates_at_15(
+        item in arb_item(),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+
+        // Insert the same item 20 times (counters saturate at 15).
+        for _ in 0..20 {
+            cbf.insert(&item);
+        }
+
+        // Should still contain the item.
+        prop_assert!(cbf.contains(&item), "item should be present after 20 inserts");
+
+        // Remove 20 times. Due to saturation, some counters may still be > 0.
+        for _ in 0..20 {
+            cbf.remove(&item);
+        }
+
+        // After saturation, the item might still appear present
+        // because counters saturated at 15 and we only decremented 20 times
+        // (15 - 20 floors at 0, so it's fine).
+        // The key invariant is that the filter doesn't panic or overflow.
+    }
+
+    #[test]
+    fn prop_counting_remove_floors_at_zero(
+        item in arb_item(),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+
+        // Insert once.
+        cbf.insert(&item);
+
+        // Remove more times than inserted.
+        for _ in 0..5 {
+            cbf.remove(&item);
+        }
+
+        // Count should floor at 0.
+        prop_assert_eq!(cbf.count(), 0, "count should floor at 0 after excess removals");
+    }
+}
+
+// =============================================================================
+// with_params constructor
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_with_params_constructor(
+        num_bits in 64_usize..10_000,
+        num_hashes in 1_u32..15,
+    ) {
+        let bf = BloomFilter::with_params(num_bits, num_hashes);
+        prop_assert_eq!(bf.num_bits(), num_bits);
+        prop_assert_eq!(bf.num_hashes(), num_hashes);
+        prop_assert_eq!(bf.count(), 0);
+        prop_assert_eq!(bf.memory_bytes(), num_bits.div_ceil(64) * 8);
+    }
+}
+
+// =============================================================================
+// Structural and trait tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// BloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_bloom_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", bf);
+        prop_assert!(!debug.is_empty(), "BloomFilter Debug should not be empty");
+    }
+
+    /// CountingBloomFilter Debug output is nonempty.
+    #[test]
+    fn prop_counting_debug_nonempty(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let cbf = CountingBloomFilter::with_capacity(capacity, fp_rate);
+        let debug = format!("{:?}", cbf);
+        prop_assert!(!debug.is_empty(), "CountingBloomFilter Debug should not be empty");
+    }
+
+    /// BloomStats Debug output is nonempty.
+    #[test]
+    fn prop_bloom_stats_debug_nonempty(
+        n in 0_usize..50,
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        let debug = format!("{:?}", stats);
+        prop_assert!(!debug.is_empty(), "BloomStats Debug should not be empty");
+    }
+
+    /// Empty bloom filter never contains any item.
+    #[test]
+    fn prop_empty_bloom_contains_nothing(
+        items in arb_items(20),
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        for item in &items {
+            prop_assert!(!bf.contains(item), "empty filter should not contain anything");
+        }
+    }
+
+    /// BloomFilter num_bits and num_hashes are always positive.
+    #[test]
+    fn prop_bloom_params_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.num_bits() > 0, "num_bits should be positive");
+        prop_assert!(bf.num_hashes() > 0, "num_hashes should be positive");
+    }
+}
+
+// =============================================================================
+// Idempotent insert: inserting same item twice still finds it
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Inserting an item twice doesn't break contains.
+    #[test]
+    fn prop_idempotent_insert(
+        item in arb_item(),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        bf.insert(&item);
+        bf.insert(&item);
+        prop_assert!(bf.contains(&item),
+            "item should still be found after double insert");
+        // Count tracks total insertions (not unique)
+        prop_assert_eq!(bf.count(), 2,
+            "count should be 2 after double insert");
+    }
+
+    /// Double clear is idempotent.
+    #[test]
+    fn prop_double_clear_idempotent(
+        items in arb_items(20),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        for item in &items {
+            bf.insert(item);
+        }
+        bf.clear();
+        bf.clear();
+        prop_assert_eq!(bf.count(), 0);
+        prop_assert!((bf.estimated_fp_rate() - 0.0).abs() < 1e-10);
+    }
+}
+
+// =============================================================================
+// Union self: A U A should preserve A's membership
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Union with a copy of self preserves all membership.
+    #[test]
+    fn prop_union_self_preserves(
+        items in arb_items(20),
+    ) {
+        let mut bf = BloomFilter::with_capacity(100, 0.01);
+        let mut bf_copy = BloomFilter::with_capacity(100, 0.01);
+        for item in &items {
+            bf.insert(item);
+            bf_copy.insert(item);
+        }
+
+        bf.union(&bf_copy);
+
+        for item in &items {
+            prop_assert!(bf.contains(item),
+                "A U A should preserve all items from A");
+        }
+    }
+
+    /// Union preserves no-false-negatives: after union, all items
+    /// from both filters are still found.
+    #[test]
+    fn prop_union_preserves_no_false_negatives(
+        items_a in arb_items(15),
+        items_b in arb_items(15),
+    ) {
+        let mut bf_a = BloomFilter::with_capacity(200, 0.01);
+        let mut bf_b = BloomFilter::with_capacity(200, 0.01);
+        for item in &items_a { bf_a.insert(item); }
+        for item in &items_b { bf_b.insert(item); }
+
+        bf_a.union(&bf_b);
+
+        // No false negatives for either set
+        for item in &items_a {
+            prop_assert!(bf_a.contains(item), "union lost item from set A");
+        }
+        for item in &items_b {
+            prop_assert!(bf_a.contains(item), "union lost item from set B");
+        }
+    }
+}
+
+// =============================================================================
+// Counting filter: double insert requires double remove
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Inserting an item twice, then removing once: item should still be present.
+    #[test]
+    fn prop_counting_double_insert_single_remove(
+        item in arb_item(),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+        cbf.insert(&item);
+        cbf.insert(&item);
+        prop_assert_eq!(cbf.count(), 2);
+
+        cbf.remove(&item);
+        prop_assert_eq!(cbf.count(), 1);
+        prop_assert!(cbf.contains(&item),
+            "item should still be present after 2 inserts and 1 remove");
+    }
+
+    /// Counting filter clear then reuse works.
+    #[test]
+    fn prop_counting_clear_reuse(
+        items1 in arb_items(15),
+        items2 in arb_items(15),
+    ) {
+        let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+        for item in &items1 { cbf.insert(item); }
+        cbf.clear();
+        prop_assert_eq!(cbf.count(), 0);
+
+        for item in &items2 { cbf.insert(item); }
+        // All items2 should be found
+        for item in &items2 {
+            prop_assert!(cbf.contains(item),
+                "item should be found after clear+reinsert");
+        }
+    }
+}
+
+// =============================================================================
+// Fill ratio monotone with insertions
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Fill ratio is monotonically non-decreasing as items are inserted.
+    #[test]
+    fn prop_fill_ratio_monotone(
+        n in 10_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        let mut prev_ratio = 0.0f64;
+
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+            let stats = bf.stats();
+            prop_assert!(stats.fill_ratio >= prev_ratio,
+                "fill_ratio should not decrease: {} -> {} at count {}",
+                prev_ratio, stats.fill_ratio, bf.count());
+            prev_ratio = stats.fill_ratio;
+        }
+    }
+
+    /// Theoretical FP rate monotonically increases with item count.
+    #[test]
+    fn prop_theoretical_fp_monotone_with_count(
+        capacity in 200_usize..1000,
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bits = optimal_num_bits(capacity, fp_rate);
+        let hashes = optimal_num_hashes(bits, capacity);
+
+        let mut prev = 0.0;
+        for n in (1..capacity).step_by(capacity / 10 + 1) {
+            let rate = theoretical_fp_rate(bits, hashes, n);
+            prop_assert!(rate >= prev - 1e-15,
+                "theoretical FP should be monotone: {} -> {} at n={}",
+                prev, rate, n);
+            prev = rate;
+        }
+    }
+}
+
+// =============================================================================
+// Memory is always positive
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Memory bytes is always positive for any filter.
+    #[test]
+    fn prop_memory_always_positive(
+        capacity in arb_capacity(),
+        fp_rate in arb_fp_rate(),
+    ) {
+        let bf = BloomFilter::with_capacity(capacity, fp_rate);
+        prop_assert!(bf.memory_bytes() > 0,
+            "memory_bytes should be positive, got 0");
+    }
+
+    /// BloomStats Clone preserves all fields.
+    #[test]
+    fn prop_stats_clone_preserves(
+        n in 0_usize..100,
+    ) {
+        let mut bf = BloomFilter::with_capacity(200, 0.01);
+        for i in 0..n {
+            bf.insert(&i.to_le_bytes());
+        }
+        let stats = bf.stats();
+        let cloned = stats.clone();
+        prop_assert_eq!(cloned.count, stats.count);
+        prop_assert_eq!(cloned.num_bits, stats.num_bits);
+        prop_assert_eq!(cloned.num_hashes, stats.num_hashes);
+        prop_assert_eq!(cloned.memory_bytes, stats.memory_bytes);
+        prop_assert!((cloned.estimated_fp_rate - stats.estimated_fp_rate).abs() < 1e-15);
+        prop_assert!((cloned.fill_ratio - stats.fill_ratio).abs() < 1e-15);
+    }
+}

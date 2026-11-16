@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.session.end",
+    "agent_type": "claude_code",
+    "event_type": "session.end",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {},
+    "matched_text": "Session ended"
+  }
+]

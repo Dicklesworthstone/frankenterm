@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-agents-list.json",
+  "title": "WA Robot Agents List Response",
+  "description": "Schema for the data field when calling 'wa robot agents list'. Returns installed agent inventory from filesystem detection plus a summary rollup.",
+  "type": "object",
+  "required": ["installed_agents", "summary"],
+  "properties": {
+    "installed_agents": {
+      "type": "array",
+      "description": "Detected or candidate installed agents discovered from local filesystem probes",
+      "items": {
+        "$ref": "#/$defs/installed_agent"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary",
+      "description": "Rollup counts for the installed and running inventory"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "installed_agent": {
+      "type": "object",
+      "description": "Single installed-agent inventory record",
+      "required": ["slug", "detected", "evidence", "root_paths"],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Canonical agent/provider slug"
+        },
+        "detected": {
+          "type": "boolean",
+          "description": "Whether detection heuristics found a concrete local installation"
+        },
+        "evidence": {
+          "type": "array",
+          "description": "Human-readable evidence explaining the detection result",
+          "items": {
+            "type": "string"
+          }
+        },
+        "root_paths": {
+          "type": "array",
+          "description": "Filesystem roots considered or discovered for this agent",
+          "items": {
+            "type": "string"
+          }
+        },
+        "config_path": {
+          "type": ["string", "null"],
+          "description": "Resolved configuration path, if any"
+        },
+        "binary_path": {
+          "type": ["string", "null"],
+          "description": "Resolved executable path, if any"
+        },
+        "version": {
+          "type": ["string", "null"],
+          "description": "Detected version string, if available"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "description": "Aggregate counts for installed and running agent inventory",
+      "required": ["installed", "running", "configured", "installed_but_idle"],
+      "properties": {
+        "installed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Installed agents positively detected on disk"
+        },
+        "running": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Running agents currently inferred from panes"
+        },
+        "configured": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Installed agents with an associated configuration path"
+        },
+        "installed_but_idle": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Installed agents not currently inferred as running"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

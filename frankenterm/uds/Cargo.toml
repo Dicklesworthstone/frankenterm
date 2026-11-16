@@ -1,0 +1,22 @@
+[package]
+name = "frankenterm-uds"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/wezterm/wezterm"
+description = "Portable unix domain sockets"
+license-file = "../../LICENSE"
+documentation = "https://docs.rs/frankenterm-uds"
+publish = false
+
+[dependencies]
+async-io = { workspace = true, optional = true }
+asupersync = { workspace = true, optional = true }
+futures.workspace = true
+libc.workspace = true
+uds_windows.workspace = true
+
+[features]
+default = ["async-asupersync"]
+
+async-io = ["dep:async-io"]
+async-asupersync = ["dep:asupersync"]

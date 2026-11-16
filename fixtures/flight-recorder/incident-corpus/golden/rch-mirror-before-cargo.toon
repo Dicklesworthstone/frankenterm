@@ -1,0 +1,9 @@
+schema_version: ft.flight_recorder.incident_golden.v1
+scenario_id: rch_mirror_before_cargo
+incident_id: ft-ogr3n6-rch-mirror-before-cargo
+outcome: infrastructure_block
+proof_admissible: false
+frame_count: 2
+required_reason_codes[2]: rch.cargo_not_reached,proof.source_verdict_unavailable
+source_verdict: unavailable_no_cargo
+local_cargo_counted: false

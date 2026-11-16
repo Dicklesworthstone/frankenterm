@@ -1,0 +1,1 @@
+content : NEAR("a" "b", 999999999) OR {col1 col2} : prefix*

@@ -1,0 +1,327 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "mission-twin-convergence-attestation",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-u7r37.8",
+  "generated_at": "2026-06-06T20:03:43Z",
+  "epic_id": "ft-u7r37",
+  "overall_status": "pass",
+  "proof_categories": [4],
+  "scope": "Release-bundle convergence evidence for the mission-twin snapshot, deterministic replay, counterfactual proof-lane broker, ownership handoff simulator, read-only Robot/MCP/CLI explain surfaces, retained golden replay corpus, and privacy/safety policy.",
+  "contract_ids": [
+    "ft.mission_twin_snapshot.v1",
+    "ft.mission_twin_replay.golden_corpus.v1",
+    "ft.mission_twin_replay.expected_plan.v1",
+    "ft.mission_twin_replay.step_log.v1",
+    "ft.mission_twin_replay.invalid_fragments.v1",
+    "ft.mission_twin_counterfactual_replay.v1",
+    "ft.mission_twin_ownership_handoff.v1",
+    "ft.mission_twin.robot_mcp_cli_surface.v1",
+    "ft.mission_twin_safety_policy.v1"
+  ],
+  "claim_boundaries": {
+    "does_not_claim_live_coordination_authority": true,
+    "does_not_claim_target_class_capacity_proven": true,
+    "does_not_claim_local_cargo_as_proof": true,
+    "does_not_claim_agent_mail_or_rch_repair_authority": true,
+    "material_cargo_proof_requires_remote_rch": true,
+    "simulated_counterfactuals_remain_labeled_simulated": true,
+    "target_class_proof_skipped_not_proven_remains_blocking": true
+  },
+  "forbidden_actions": {
+    "agent_mail_service_repaired": false,
+    "agent_mail_service_restarted": false,
+    "agent_mail_process_killed": false,
+    "rch_service_repaired": false,
+    "rch_worker_mutated": false,
+    "rch_build_cancelled": false,
+    "remote_source_deleted_or_mutated": false,
+    "destructive_git_cleanup": false,
+    "file_deleted": false,
+    "local_heavy_cargo_fallback_counted": false,
+    "live_panes_mutated": false,
+    "beads_mutated_by_simulation": false,
+    "raw_pane_content_stored": false
+  },
+  "retained_corpus": {
+    "snapshot_manifest": {
+      "valid_fixture_count": 6,
+      "invalid_fragment_count": 6,
+      "valid_fixture_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json",
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json",
+        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json",
+        "fixtures/mission-twin/snapshot/valid/healthy.json",
+        "fixtures/mission-twin/snapshot/valid/no-ready-work.json",
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ]
+    },
+    "replay_manifest": {
+      "manifest_path": "fixtures/mission-twin/replay/manifest.json",
+      "case_count": 6,
+      "expected_plan_count": 6,
+      "step_log_path": "fixtures/mission-twin/replay/trace/step-log.v1.jsonl",
+      "step_log_entry_count": 6,
+      "invalid_fragments_path": "fixtures/mission-twin/replay/invalid/fragments.v1.json",
+      "invalid_fragment_count": 5,
+      "counterfactual_case_count": 4,
+      "ownership_case_count": 2,
+      "surface_case_count": 4,
+      "case_ids": [
+        "active-owner",
+        "agent-mail-red",
+        "dirty-overlap",
+        "healthy",
+        "no-ready-work",
+        "rch-critical-pressure-5"
+      ]
+    },
+    "safety_policy": {
+      "policy_path": "fixtures/mission-twin/safety-policy/valid/policy.v1.json",
+      "invalid_fragments_path": "fixtures/mission-twin/safety-policy/invalid/fragments.v1.json",
+      "raw_pane_content_retention_allowed": false,
+      "live_mutation_allowed": false
+    }
+  },
+  "child_acceptance_matrix": [
+    {
+      "bead_id": "ft-u7r37.1",
+      "title": "Snapshot contract for Beads/RCH/Mail/git/envelope facts",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "crates/frankenterm-core/src/mission_twin_snapshot.rs",
+        "docs/json-schema/ft-mission-twin-snapshot.json",
+        "docs/robot-contracts/mission-twin-snapshot.md",
+        "fixtures/mission-twin/snapshot/valid/*.json",
+        "fixtures/mission-twin/snapshot/invalid/fragments.v1.json",
+        "tests/e2e/test_mission_twin_snapshot_contract.sh"
+      ],
+      "proof": {
+        "static_verifier": "bash tests/e2e/test_mission_twin_snapshot_contract.sh",
+        "static_result": "schema/doc ok, 6 valid fixtures, 6 invalid fragments, forbidden_actions=10",
+        "remote_job": "j-29871232832766357",
+        "worker": "vmi1149989",
+        "exit_code": 0,
+        "result": "4 passed, 0 failed, 28989 filtered out"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.2",
+      "title": "Deterministic replay over mission_loop and operating_envelope",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "crates/frankenterm-core/src/mission_twin_replay.rs",
+        "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs",
+        "fixtures/mission-twin/replay/manifest.json"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766388",
+        "clippy_job": "j-29871232832766384",
+        "worker": "vmi1227854",
+        "exit_code": 0,
+        "result": "3 unit tests plus 1 golden corpus test passed; clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.3",
+      "title": "Counterfactual perturbation model and proof-lane broker",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "crates/frankenterm-core/src/mission_twin_replay.rs",
+        "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs",
+        "fixtures/mission-twin/replay/manifest.json"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766422",
+        "clippy_job": "j-29871232832766427",
+        "worker": "vmi1227854",
+        "exit_code": 0,
+        "result": "14 unit tests plus 2 golden corpus tests passed; clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.4",
+      "title": "Ownership dirty-overlap and handoff simulator",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "crates/frankenterm-core/src/mission_twin_replay.rs",
+        "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766433",
+        "clippy_job": "j-29871232832766438",
+        "worker": "vmi1227854",
+        "exit_code": 0,
+        "result": "19 lib mission_twin tests plus 3 golden corpus tests passed; clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.5",
+      "title": "Robot MCP and CLI explain surfaces",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "crates/frankenterm-core/src/mission_twin_replay.rs",
+        "crates/frankenterm-core/src/robot_family_contract.rs",
+        "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766444",
+        "clippy_job": "j-29871232832766447",
+        "worker": "vmi1227854",
+        "exit_code": 0,
+        "result": "mission_twin_replay_golden_corpus plus proptest_robot_family_contract passed; clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.6",
+      "title": "Golden incident corpus and no-mock replay harness",
+      "status": "closed",
+      "evidence_state": "remote_rch_validated",
+      "implementation_surfaces": [
+        "fixtures/mission-twin/replay/manifest.json",
+        "fixtures/mission-twin/replay/expected/*.plan.v1.json",
+        "fixtures/mission-twin/replay/trace/step-log.v1.jsonl",
+        "fixtures/mission-twin/replay/invalid/fragments.v1.json",
+        "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs",
+        "tests/e2e/test_mission_twin_replay_contract.sh"
+      ],
+      "proof": {
+        "static_verifier": "bash tests/e2e/test_mission_twin_replay_contract.sh",
+        "static_result": "mission_twin_replay.manifest status=ok cases=6 ownership_cases=2 surface_cases=4",
+        "remote_job": "29871232832766934",
+        "worker": "vmi1153651",
+        "remote": true,
+        "exit_code": 0,
+        "command": "cargo test -p frankenterm-core --test mission_twin_replay_golden_corpus -- --nocapture",
+        "result": "remote RCH test exited 0"
+      }
+    },
+    {
+      "bead_id": "ft-u7r37.7",
+      "title": "Privacy retention and side-effect safety policy",
+      "status": "closed",
+      "evidence_state": "static_validated",
+      "implementation_surfaces": [
+        "docs/mission-twin-privacy-safety.md",
+        "docs/json-schema/ft-mission-twin-safety-policy.json",
+        "fixtures/mission-twin/safety-policy/valid/policy.v1.json",
+        "fixtures/mission-twin/safety-policy/invalid/fragments.v1.json",
+        "tests/e2e/test_mission_twin_safety_policy.sh"
+      ],
+      "proof": {
+        "static_verifier": "bash tests/e2e/test_mission_twin_safety_policy.sh",
+        "result": "safety policy static verifier, jq checks, and git diff checks passed; no Cargo proof claimed"
+      }
+    }
+  ],
+  "static_verifiers": [
+    {
+      "command": "bash tests/e2e/test_mission_twin_snapshot_contract.sh",
+      "expected_result": "schema/doc ok with 6 valid fixtures, 6 invalid fragments, and forbidden_actions=10"
+    },
+    {
+      "command": "bash tests/e2e/test_mission_twin_replay_contract.sh",
+      "expected_result": "mission_twin_replay.manifest status=ok cases=6 ownership_cases=2 surface_cases=4"
+    },
+    {
+      "command": "bash tests/e2e/test_mission_twin_safety_policy.sh",
+      "expected_result": "mission-twin safety policy contract passes without live mutation"
+    },
+    {
+      "command": "br dep cycles --json",
+      "expected_result": "{\"cycles\":[],\"count\":0}"
+    }
+  ],
+  "source_artifacts": [
+    {
+      "path": "docs/json-schema/ft-mission-twin-snapshot.json",
+      "media_type": "application/schema+json",
+      "sha256": "287b738ee4ed60eef8b10aecbf31f3ed2bbdf29f02c199379648cdee6256b5ed",
+      "size_bytes": 19174
+    },
+    {
+      "path": "docs/json-schema/ft-mission-twin-safety-policy.json",
+      "media_type": "application/schema+json",
+      "sha256": "3256096c6769e0992bc30fd8aa967ed51b868597184e54f7ffb0f1bca8e601a5",
+      "size_bytes": 5495
+    },
+    {
+      "path": "docs/robot-contracts/mission-twin-snapshot.md",
+      "media_type": "text/markdown",
+      "sha256": "3a40ac27cea3df3f4fa95be012f021548342d4c3a9004144c8637ced089a0e09",
+      "size_bytes": 2862
+    },
+    {
+      "path": "docs/mission-twin-privacy-safety.md",
+      "media_type": "text/markdown",
+      "sha256": "8a406ea8e62ba6c03a097e5c172a2622e64cdb3756c827790c97ba174cf5ce75",
+      "size_bytes": 1978
+    },
+    {
+      "path": "fixtures/mission-twin/replay/manifest.json",
+      "media_type": "application/json",
+      "sha256": "d0f1884c574cdf523b0aa7a868bf138dab4004932c73cb016e6c6f77986a5cef",
+      "size_bytes": 17269
+    },
+    {
+      "path": "fixtures/mission-twin/replay/trace/step-log.v1.jsonl",
+      "media_type": "application/x-ndjson",
+      "sha256": "b2fc7e9d3efd6cef84822b8914cc31af39968000b8f9e44a7c94fd9ea839dfd0",
+      "size_bytes": 4038
+    },
+    {
+      "path": "fixtures/mission-twin/replay/invalid/fragments.v1.json",
+      "media_type": "application/json",
+      "sha256": "8dab9ffce0c7fd9268a5951839c67207ad135b455fe519400093b276d55a039f",
+      "size_bytes": 2420
+    },
+    {
+      "path": "crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs",
+      "media_type": "text/plain",
+      "sha256": "1b3b5e9c585bfed55037afdeae1633c3711339d96483778ff5fcfd0c94b6db5e",
+      "size_bytes": 38305
+    },
+    {
+      "path": "tests/e2e/test_mission_twin_snapshot_contract.sh",
+      "media_type": "text/plain",
+      "sha256": "2c6ffd3f4cc035ef2a80abc0e8262875eb5f141dc1685219a8c4f40f74412a2d",
+      "size_bytes": 12963
+    },
+    {
+      "path": "tests/e2e/test_mission_twin_replay_contract.sh",
+      "media_type": "text/plain",
+      "sha256": "6b488092cccc281eeebbe7017fd82c3f2edf38ed520ac3cb97e4e5d07ba75119",
+      "size_bytes": 24931
+    },
+    {
+      "path": "crates/frankenterm-core/src/mission_twin_snapshot.rs",
+      "media_type": "text/plain",
+      "sha256": "da703f95441472567ec6e49200ea051183d472814c3097d7dcf71deb2c391d4f",
+      "size_bytes": 24063
+    },
+    {
+      "path": "crates/frankenterm-core/src/mission_twin_replay.rs",
+      "media_type": "text/plain",
+      "sha256": "d99bb42c7b84ccf4da7685a28113f17f936343a6bc65466e9ce991b14f355d79",
+      "size_bytes": 119031
+    },
+    {
+      "path": "crates/frankenterm-core/src/robot_family_contract.rs",
+      "media_type": "text/plain",
+      "sha256": "2087bf37785508ceaee834b098a7dd8620a4c36fd03f0129fcab6916aa999e1a",
+      "size_bytes": 142913
+    }
+  ],
+  "release_bundle": {
+    "manifest_path": "docs/attestations/manifest.json",
+    "manifest_category": "proofs/robot-contracts",
+    "manifest_slot_path": "docs/attestations/proofs/mission-twin.json",
+    "required_category": true,
+    "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles."
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-state.json",
+  "title": "WA Robot State Response",
+  "description": "Schema for the data field when calling 'wa robot state'. Returns the canonical view of all panes for agent decision-making.",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/pane_state"
+  },
+  "$defs": {
+    "pane_state": {
+      "type": "object",
+      "title": "PaneState",
+      "description": "State information for a single WezTerm pane",
+      "required": ["pane_id", "tab_id", "window_id", "domain", "observed"],
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique pane identifier within WezTerm"
+        },
+        "pane_uuid": {
+          "type": ["string", "null"],
+          "description": "UUID assigned by WezTerm for cross-session pane tracking (may be null if not available)"
+        },
+        "tab_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tab containing this pane"
+        },
+        "window_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Window containing this pane"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain the pane belongs to (e.g., 'local', SSH domain name)"
+        },
+        "title": {
+          "type": ["string", "null"],
+          "description": "Pane title (may be null if not set)"
+        },
+        "cwd": {
+          "type": ["string", "null"],
+          "description": "Current working directory (may be null if unavailable)"
+        },
+        "observed": {
+          "type": "boolean",
+          "description": "Whether this pane is being actively observed by wa"
+        },
+        "ignore_reason": {
+          "type": "string",
+          "description": "If observed=false, explains why the pane is ignored (e.g., 'excluded by domain filter')"
+        },
+        "pane_state": {
+          "$ref": "#/$defs/pane_activity_state",
+          "description": "Activity state inferred from terminal content (optional, may not be present if not yet analyzed)"
+        },
+        "last_activity": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) of last detected activity"
+        },
+        "unhandled_event_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of unhandled events detected on this pane"
+        },
+        "reservation": {
+          "$ref": "#/$defs/reservation_info",
+          "description": "If present, indicates the pane is reserved by an agent or workflow"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor_info",
+          "description": "Cursor position (if available from status updates)"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/dimensions_info",
+          "description": "Pane dimensions in columns/rows (if available)"
+        },
+        "is_active": {
+          "type": "boolean",
+          "description": "Whether this is the currently focused pane"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pane_activity_state": {
+      "type": "object",
+      "description": "Inferred activity state of the pane",
+      "properties": {
+        "prompt_active": {
+          "type": "boolean",
+          "description": "True if a shell prompt appears to be waiting for input"
+        },
+        "command_running": {
+          "type": "boolean",
+          "description": "True if a command appears to be executing"
+        },
+        "alt_screen": {
+          "type": "boolean",
+          "description": "True if the alternate screen buffer is active (e.g., vim, less)"
+        },
+        "recent_gap": {
+          "type": "boolean",
+          "description": "True if a capture gap was recently detected (possible scrollback truncation)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reservation_info": {
+      "type": "object",
+      "description": "Pane reservation details",
+      "required": ["owner_kind", "owner_id", "expires_at"],
+      "properties": {
+        "owner_kind": {
+          "type": "string",
+          "enum": ["human", "robot", "mcp", "workflow"],
+          "description": "Type of actor holding the reservation"
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Identifier of the reservation owner"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the pane was reserved (e.g., issue ID being worked on)"
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when the reservation expires"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cursor_info": {
+      "type": "object",
+      "description": "Cursor position within the pane",
+      "required": ["row", "col"],
+      "properties": {
+        "row": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cursor row (0-indexed)"
+        },
+        "col": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cursor column (0-indexed)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "dimensions_info": {
+      "type": "object",
+      "description": "Pane dimensions",
+      "required": ["cols", "rows"],
+      "properties": {
+        "cols": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of columns"
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of rows"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

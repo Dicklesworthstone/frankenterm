@@ -1,0 +1,17 @@
+Search explain for query: "rate limit"
+  Panes: 1 total (0 observed, 1 ignored)
+  Indexed segments: 0
+
+2 potential issue(s):
+
+  1. [NO_INDEXED_DATA] No terminal output has been captured yet.
+     total_segments: 0
+     Suggestions:
+       - Start the watcher: ft watch
+       - Check that panes are active and not excluded.
+
+  2. [PANES_EXCLUDED] 1 pane(s) excluded from capture. Content in those panes is not searchable.
+     excluded_pane_ids: 7
+     Suggestions:
+       - Review exclusion rules: ft config show --effective
+       - Check pane status: ft list

@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd40db96b0076e6a65e8a86f5f00979573ee0a0e7d254f7a07eb17eb3cfacfea # shrinks to n = 1, dim = 2
+cc dcf0147362d3e5d211195f778486602d8d54a8ec07466d95e6dc7a5bb36a85c7 # shrinks to n = 1, dim = 2
+cc 76c13c168d9e0cf1d25c56305d611eaaffa5228bccd3f11504426568e49e5ef2 # shrinks to n = 2, dim = 2
+cc de35590897f3515a291ab9fad9a3f01f09198f61688c7ac71a34ae83b56eb894 # shrinks to direction = Ingress, dim = 2
+cc 635a985abc58c393e8640b20fd0d07088cc4ff084aa409e4230683ea0b38cd3b # shrinks to hash_suffix = "aaa0", dim = 2
+cc c92c2a1f2aeae8456ac360d3d86143a32abcf74f3b2c1c6baa8616a6b5b51dd3 # shrinks to lex_version = "aaa"
+cc de790b6956c5c088d9704ee55bf15405e191f3fd38f670633f9d23a2b40a616d # shrinks to profile = "aaa", n = 2
+cc c6bc1fe11184b5778fea34caf0879b82c19eeee8d0ff9ac1a62f97cf7cdae25b # shrinks to profile = "aaa"
+cc 873bdbc4b86fc9bfc2679b45cb5147122aad5e9d13bb1660800cf8086a80ef9a # shrinks to profile = "aaa", gen_id = "aaa"
+cc 1cabff865873535f83bce4c9d67e2eb7ab7c151a823d2bc212bcbc09a1337d21 # shrinks to profile = "aaa", gen_id = "aaa"
+cc e4adf3c18884eb5b3657b1b7a8671857accae6158da4deca5e34bed24035d0b8 # shrinks to profile = "aaa", gen_id = "aaa"

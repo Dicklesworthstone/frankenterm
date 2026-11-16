@@ -1,0 +1,4 @@
+{"reason":"compiler-message","message":{"level":"error","message":"this storage diagnostic is unrelated","code":{"code":"clippy::unrelated"},"spans":[{"file_name":"crates/frankenterm-core/src/storage.rs","line_start":10,"line_end":10}],"rendered":"error: this storage diagnostic is unrelated\n"}}
+{"reason":"compiler-message","message":{"level":"error","message":"owned color diagnostic","code":{"code":"clippy::owned_color"},"spans":[{"file_name":"crates/frankenterm-core/src/color_management.rs","line_start":42,"line_end":42}],"rendered":"error: owned color diagnostic\n"}}
+{"reason":"compiler-message","message":{"level":"warning","message":"owned child diagnostic","code":{"code":"unused_imports"},"spans":[],"children":[{"spans":[{"file_name":"crates/frankenterm-core/src/replay_fixture_harvest.rs","line_start":7,"line_end":7}]}],"rendered":"warning: owned child diagnostic\n"}}
+{"reason":"compiler-artifact","package_id":"path+file:///frankenterm#frankenterm-core"}

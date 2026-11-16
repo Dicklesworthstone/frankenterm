@@ -1,0 +1,925 @@
+#![cfg(target_os = "macos")]
+use super::*;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+impl From<u32> for LocalProcessStatus {
+    fn from(s: u32) -> Self {
+        match s {
+            1 => Self::Idle,
+            2 => Self::Run,
+            3 => Self::Sleep,
+            4 => Self::Stop,
+            5 => Self::Zombie,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn process_start_token(seconds: u64, microseconds: u64) -> Option<u64> {
+    if seconds == 0 || microseconds >= 1_000_000 {
+        return None;
+    }
+    seconds.checked_mul(1_000_000)?.checked_add(microseconds)
+}
+
+/// `sizeof(struct kinfo_proc)` on 64-bit Darwin (the same for arm64 and
+/// x86_64), which libc does not declare for Apple targets; then the offsets
+/// in it of `kp_proc.p_starttime` (a timeval: i64 seconds, i32 microseconds)
+/// and of `kp_proc.p_pid` (i32).
+const KINFO_PROC_BYTES: usize = 648;
+const KINFO_PROC_START_SECONDS: usize = 0;
+const KINFO_PROC_START_MICROSECONDS: usize = 8;
+const KINFO_PROC_PID: usize = 40;
+
+/// Decode the start token of `pid` from one `KERN_PROC_PID` record: a
+/// record of another size or for another pid is unknown, and no record
+/// (the pid is free) is absent.
+fn kinfo_proc_start_time(pid: libc::c_int, record: &[u8]) -> ProcessStartTimeObservation {
+    if record.is_empty() {
+        return ProcessStartTimeObservation::Absent;
+    }
+    if record.len() != KINFO_PROC_BYTES {
+        return ProcessStartTimeObservation::Unknown;
+    }
+    kinfo_proc_start_token(pid, record).map_or(
+        ProcessStartTimeObservation::Unknown,
+        ProcessStartTimeObservation::Running,
+    )
+}
+
+fn kinfo_proc_start_token(pid: libc::c_int, record: &[u8]) -> Option<u64> {
+    let field = |offset: usize, bytes: usize| record.get(offset..offset.checked_add(bytes)?);
+    let record_pid = i32::from_ne_bytes(field(KINFO_PROC_PID, 4)?.try_into().ok()?);
+    if record_pid != pid {
+        return None;
+    }
+    let seconds = i64::from_ne_bytes(field(KINFO_PROC_START_SECONDS, 8)?.try_into().ok()?);
+    let microseconds =
+        i32::from_ne_bytes(field(KINFO_PROC_START_MICROSECONDS, 4)?.try_into().ok()?);
+    process_start_token(
+        u64::try_from(seconds).ok()?,
+        u64::try_from(microseconds).ok()?,
+    )
+}
+
+impl LocalProcessInfo {
+    /// Read one process-incarnation token without enumerating the process tree.
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        match Self::observe_process_start_time(pid) {
+            ProcessStartTimeObservation::Running(start_time) => Some(start_time),
+            ProcessStartTimeObservation::Absent | ProcessStartTimeObservation::Unknown => None,
+        }
+    }
+
+    pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        if pid == 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return ProcessStartTimeObservation::Unknown;
+        };
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let wanted_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // `proc_pidinfo` reports failure through the thread-local errno slot.
+        // Clear it immediately before the syscall so a stale ESRCH from an
+        // unrelated operation can never pronounce this owner absent.
+        unsafe { *libc::__error() = 0 };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut _,
+                wanted_size,
+            )
+        };
+        if read == wanted_size {
+            return process_start_token(info.pbi_start_tvsec, info.pbi_start_tvusec).map_or(
+                ProcessStartTimeObservation::Unknown,
+                ProcessStartTimeObservation::Running,
+            );
+        }
+        if read == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            ProcessStartTimeObservation::Absent
+        } else {
+            ProcessStartTimeObservation::Unknown
+        }
+    }
+
+    /// [`Self::observe_process_start_time`] for the caller's own child, which
+    /// may have exited and not yet been reaped. `proc_pidinfo` reports such a
+    /// zombie as absent, while the kernel's process table still holds it with
+    /// the start time it had while running, and its pid cannot be reused
+    /// until the caller reaps it. So a zombie reads as running here, as it
+    /// does on Linux, and only a reaped pid reads as absent.
+    pub fn observe_child_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        match Self::observe_process_start_time(pid) {
+            ProcessStartTimeObservation::Absent => {}
+            observation => return observation,
+        }
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return ProcessStartTimeObservation::Unknown;
+        };
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut record = [0_u8; KINFO_PROC_BYTES];
+        let mut size = record.len();
+        // SAFETY: `mib` names a four-level MIB, and the kernel writes at most
+        // `size` bytes into `record`, then stores the length written in
+        // `size`; no new value is passed.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                record.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
+        record
+            .get(..size)
+            .map_or(ProcessStartTimeObservation::Unknown, |record| {
+                kinfo_proc_start_time(pid, record)
+            })
+    }
+
+    /// Read the kernel-generated UUID that is stable for one boot session.
+    pub fn host_boot_id() -> Option<String> {
+        let mut value = [0_u8; 128];
+        let mut size = value.len();
+        let name = b"kern.bootsessionuuid\0";
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size == 0 || size > value.len() {
+            return None;
+        }
+        let bytes = &value[..size];
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        let boot_id = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+        (!boot_id.is_empty()).then(|| boot_id.to_string())
+    }
+
+    /// Hash the machine UUID into an application-scoped persistent fence.
+    /// `gethostuuid(2)` may wait for the platform identity provider, so keep
+    /// the read bounded; timeout or an invalid sentinel fails closed.
+    pub fn host_machine_fence() -> Option<String> {
+        let mut raw = [0_u8; 16];
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        let result = unsafe { libc::gethostuuid(raw.as_mut_ptr(), &timeout) };
+        if result != 0
+            || raw.iter().all(|byte| *byte == 0)
+            || raw.iter().all(|byte| *byte == u8::MAX)
+        {
+            return None;
+        }
+        app_scoped_machine_fence(&raw)
+    }
+
+    pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        let mut pathinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&pathinfo) as libc::c_int;
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut pathinfo as *mut _ as *mut _,
+                size,
+            )
+        };
+        if ret != size {
+            return None;
+        }
+
+        // Workaround a workaround for an old rustc version supported by libc;
+        // the type of vip_path should just be [c_char; MAXPATHLEN] but it
+        // is defined as a horrible nested array by the libc crate:
+        // `[[c_char; 32]; 32]`.
+        // Urgh.  Let's re-cast it as the correct kind of slice.
+        let vip_path = unsafe {
+            std::slice::from_raw_parts(
+                pathinfo.pvi_cdir.vip_path.as_ptr() as *const u8,
+                libc::MAXPATHLEN as usize,
+            )
+        };
+        let nul = vip_path.iter().position(|&c| c == 0)?;
+        Some(OsStr::from_bytes(&vip_path[0..nul]).into())
+    }
+
+    pub fn executable_path(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        let mut buffer: Vec<u8> = Vec::with_capacity(libc::PROC_PIDPATHINFO_MAXSIZE as _);
+        let x = unsafe {
+            libc::proc_pidpath(
+                pid,
+                buffer.as_mut_ptr() as *mut _,
+                libc::PROC_PIDPATHINFO_MAXSIZE as _,
+            )
+        };
+        if x <= 0 {
+            return None;
+        }
+
+        unsafe { buffer.set_len(x as usize) };
+        Some(OsString::from_vec(buffer).into())
+    }
+
+    pub fn with_root_pid(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None;
+        }
+        if libc::pid_t::try_from(pid).is_err() {
+            return None;
+        }
+
+        /// Enumerate all current process identifiers
+        fn all_pids() -> Vec<libc::pid_t> {
+            let num_pids = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+            if num_pids < 1 {
+                return vec![];
+            }
+
+            // Give a bit of padding to avoid looping if processes are spawning
+            // rapidly while we're trying to collect this info
+            const PADDING: usize = 32;
+            let mut pids: Vec<libc::pid_t> = Vec::with_capacity(num_pids as usize + PADDING);
+            loop {
+                let n = unsafe {
+                    libc::proc_listallpids(
+                        pids.as_mut_ptr() as *mut _,
+                        (pids.capacity() * std::mem::size_of::<libc::pid_t>()) as _,
+                    )
+                };
+
+                if n < 1 {
+                    return vec![];
+                }
+
+                let n = n as usize;
+
+                if n > pids.capacity() {
+                    pids.reserve(n + PADDING);
+                    continue;
+                }
+
+                unsafe { pids.set_len(n) };
+                return pids;
+            }
+        }
+
+        /// Obtain info block for a pid.
+        /// Note that the process could have gone away since we first
+        /// observed the pid and the time we call this, so we must
+        /// be able to tolerate this failing.
+        fn info_for_pid(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let wanted_size = std::mem::size_of::<libc::proc_bsdinfo>() as _;
+            let res = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    &mut info as *mut _ as *mut _,
+                    wanted_size,
+                )
+            };
+
+            if res == wanted_size {
+                Some(info)
+            } else {
+                None
+            }
+        }
+
+        fn cwd_for_pid(pid: libc::pid_t) -> PathBuf {
+            LocalProcessInfo::current_working_dir(pid as _).unwrap_or_else(PathBuf::new)
+        }
+
+        fn exe_and_args_for_pid_sysctl(pid: libc::pid_t) -> Option<(PathBuf, Vec<String>)> {
+            use libc::c_int;
+            let mut size = 64 * 1024;
+            let mut buf: Vec<u8> = Vec::with_capacity(size);
+            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as c_int];
+
+            let res = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as _,
+                    buf.as_mut_ptr() as *mut _,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if res == -1 {
+                return None;
+            }
+            if size < (std::mem::size_of::<c_int>() * 2) {
+                // Not big enough
+                return None;
+            }
+            unsafe { buf.set_len(size) };
+
+            parse_exe_and_argv_sysctl(buf)
+        }
+
+        fn exe_for_pid(pid: libc::pid_t) -> PathBuf {
+            LocalProcessInfo::executable_path(pid as _).unwrap_or_else(PathBuf::new)
+        }
+
+        let procs: Vec<_> = all_pids().into_iter().filter_map(info_for_pid).collect();
+
+        fn build_proc(
+            info: &libc::proc_bsdinfo,
+            procs: &[libc::proc_bsdinfo],
+            ancestry: &mut HashSet<u32>,
+        ) -> LocalProcessInfo {
+            let inserted = ancestry.insert(info.pbi_pid);
+            debug_assert!(inserted);
+            let mut children = HashMap::new();
+
+            for kid in procs {
+                if kid.pbi_ppid == info.pbi_pid && !ancestry.contains(&kid.pbi_pid) {
+                    children.insert(kid.pbi_pid, build_proc(kid, procs, ancestry));
+                }
+            }
+            let removed = ancestry.remove(&info.pbi_pid);
+            debug_assert!(removed);
+
+            let (executable, argv) = exe_and_args_for_pid_sysctl(info.pbi_pid as _)
+                .unwrap_or_else(|| (exe_for_pid(info.pbi_pid as _), vec![]));
+
+            let name = unsafe { std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr() as _) };
+            let name = name.to_str().unwrap_or("").to_string();
+
+            LocalProcessInfo {
+                pid: info.pbi_pid,
+                ppid: info.pbi_ppid,
+                name,
+                executable,
+                cwd: cwd_for_pid(info.pbi_pid as _),
+                argv,
+                start_time: info.pbi_start_tvsec,
+                status: LocalProcessStatus::from(info.pbi_status),
+                children,
+            }
+        }
+
+        if let Some(info) = procs.iter().find(|info| info.pbi_pid == pid) {
+            Some(build_proc(info, &procs, &mut HashSet::new()))
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_exe_and_argv_sysctl(buf: Vec<u8>) -> Option<(PathBuf, Vec<String>)> {
+    use libc::c_int;
+
+    // The data in our buffer is laid out like this:
+    // argc - c_int
+    // exe_path - NUL terminated string
+    // argv[0] - NUL terminated string
+    // argv[1] - NUL terminated string
+    // ...
+    // argv[n] - NUL terminated string
+    // envp[0] - NUL terminated string
+    // ...
+
+    let mut ptr = &buf[0..buf.len()];
+
+    let argc: c_int = unsafe { std::ptr::read(ptr.as_ptr() as *const c_int) };
+    ptr = &ptr[std::mem::size_of::<c_int>()..];
+
+    fn consume_cstr(ptr: &mut &[u8]) -> Option<String> {
+        // Parse to the end of a null terminated string
+        let nul = ptr.iter().position(|&c| c == 0)?;
+        let s = String::from_utf8_lossy(&ptr[0..nul]).to_owned().to_string();
+        *ptr = ptr.get(nul + 1..)?;
+
+        // Find the position of the first non null byte. `.position()`
+        // will return None if we run off the end.
+        if let Some(not_nul) = ptr.iter().position(|&c| c != 0) {
+            // If there are no trailing nulls, not_nul will be 0
+            // and this call will be a noop
+            *ptr = ptr.get(not_nul..)?;
+        }
+
+        Some(s)
+    }
+
+    let exe_path = consume_cstr(&mut ptr)?.into();
+
+    let mut args = vec![];
+    for _ in 0..argc {
+        args.push(consume_cstr(&mut ptr)?);
+    }
+
+    Some((exe_path, args))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        kinfo_proc_start_time, parse_exe_and_argv_sysctl, process_start_token, LocalProcessInfo,
+        ProcessStartTimeObservation, KINFO_PROC_BYTES, KINFO_PROC_PID,
+        KINFO_PROC_START_MICROSECONDS, KINFO_PROC_START_SECONDS,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_exited_unreaped_child_keeps_its_start_time_until_it_is_reaped() {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let pid = child.id();
+        let running = LocalProcessInfo::observe_process_start_time(pid);
+        assert!(
+            matches!(running, ProcessStartTimeObservation::Running(_)),
+            "{running:?}"
+        );
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            running
+        );
+
+        // At end of input cat exits, and stays a zombie until it is reaped.
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while LocalProcessInfo::observe_process_start_time(pid) == running {
+            assert!(Instant::now() < deadline, "cat never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            LocalProcessInfo::observe_process_start_time(pid),
+            ProcessStartTimeObservation::Absent,
+            "proc_pidinfo reports a zombie as absent"
+        );
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            running,
+            "the unreaped child keeps the start time it had while running"
+        );
+
+        assert!(child.wait().expect("reap cat").success());
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            ProcessStartTimeObservation::Absent
+        );
+    }
+
+    #[test]
+    fn a_process_table_record_decodes_only_at_its_exact_size_and_pid() {
+        let pid: libc::c_int = 4321;
+        let mut record = vec![0_u8; KINFO_PROC_BYTES];
+        record[KINFO_PROC_START_SECONDS..KINFO_PROC_START_SECONDS + 8]
+            .copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
+        record[KINFO_PROC_START_MICROSECONDS..KINFO_PROC_START_MICROSECONDS + 4]
+            .copy_from_slice(&654_321_i32.to_ne_bytes());
+        record[KINFO_PROC_PID..KINFO_PROC_PID + 4].copy_from_slice(&pid.to_ne_bytes());
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record),
+            ProcessStartTimeObservation::Running(1_700_000_000_654_321)
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid + 1, &record),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record[..KINFO_PROC_BYTES - 1]),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid, &[]),
+            ProcessStartTimeObservation::Absent
+        );
+        record[KINFO_PROC_START_MICROSECONDS..KINFO_PROC_START_MICROSECONDS + 4]
+            .copy_from_slice(&(-1_i32).to_ne_bytes());
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record),
+            ProcessStartTimeObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn process_start_token_uses_microseconds_and_rejects_invalid_inputs() {
+        assert_eq!(process_start_token(42, 123_456), Some(42_123_456));
+        assert_eq!(process_start_token(0, 1), None);
+        assert_eq!(process_start_token(1, 1_000_000), None);
+        assert_eq!(process_start_token(u64::MAX, 0), None);
+    }
+
+    #[test]
+    fn test_trailing_zeros() {
+        // Example data generated from running 'sleep 5' on the commit author's local machine,
+        let buf = vec![
+            2, 0, 0, 0, 47, 98, 105, 110, 47, 115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 115, 108,
+            101, 101, 112, 0, 53, 0,
+        ];
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+
+        assert_eq!(exe_path, Path::new("/bin/sleep").to_path_buf());
+        assert_eq!(argv, vec!["sleep".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn test_no_trailing_zeros() {
+        // Example data generated from running 'sleep 5' on the commit author's local machine,
+        // then modified to remove the trailing 0s between the exe_path and the argv
+        let buf = vec![
+            2, 0, 0, 0, 47, 98, 105, 110, 47, 115, 108, 101, 101, 112, 0, 115, 108, 101, 101, 112,
+            0, 53, 0,
+        ];
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+
+        assert_eq!(exe_path, Path::new("/bin/sleep").to_path_buf());
+        assert_eq!(argv, vec!["sleep".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn test_multiple_trailing_zeros() {
+        // Example data generated from running 'sleep 5' on the commit author's local machine,
+        // then modified to add trailing 0s between argv items
+        let buf = vec![
+            2, 0, 0, 0, 47, 98, 105, 110, 47, 115, 108, 101, 101, 112, 0, 0, 0, 115, 108, 101, 101,
+            112, 0, 0, 0, 53, 0,
+        ];
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+
+        assert_eq!(exe_path, Path::new("/bin/sleep").to_path_buf());
+        assert_eq!(argv, vec!["sleep".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn test_trailing_zeros_at_end() {
+        // Example data generated from running 'sleep 5' on the commit author's local machine,
+        // then modified to add zeroes to the end of the buffer
+        let buf = vec![
+            2, 0, 0, 0, 47, 98, 105, 110, 47, 115, 108, 101, 101, 112, 0, 0, 0, 115, 108, 101, 101,
+            112, 0, 0, 0, 53, 0, 0, 0, 0, 0,
+        ];
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+
+        assert_eq!(exe_path, Path::new("/bin/sleep").to_path_buf());
+        assert_eq!(argv, vec!["sleep".to_string(), "5".to_string()]);
+    }
+
+    #[test]
+    fn test_malformed() {
+        // Example data generated from running 'sleep 5' on the commit author's local machine,
+        // then modified to remove the last 0, making a malformed null-terminated string
+        let buf = vec![
+            2, 0, 0, 0, 47, 98, 105, 110, 47, 115, 108, 101, 101, 112, 0, 0, 0, 115, 108, 101, 101,
+            112, 0, 0, 0, 53,
+        ];
+
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    #[test]
+    fn test_single_arg() {
+        // argc=1, exe="/bin/ls", argv=["ls"]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes()); // argc = 1
+        buf.extend_from_slice(b"/bin/ls\0"); // exe path
+        buf.extend_from_slice(b"ls\0"); // argv[0]
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/ls").to_path_buf());
+        assert_eq!(argv, vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn test_zero_argc() {
+        // argc=0, exe="/bin/daemon"
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes()); // argc = 0
+        buf.extend_from_slice(b"/bin/daemon\0"); // exe path
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/daemon").to_path_buf());
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn test_many_args() {
+        // argc=4, exe="/usr/bin/gcc", argv=["gcc", "-o", "out", "main.c"]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/gcc\0");
+        buf.extend_from_slice(b"gcc\0");
+        buf.extend_from_slice(b"-o\0");
+        buf.extend_from_slice(b"out\0");
+        buf.extend_from_slice(b"main.c\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/usr/bin/gcc").to_path_buf());
+        assert_eq!(
+            argv,
+            vec![
+                "gcc".to_string(),
+                "-o".to_string(),
+                "out".to_string(),
+                "main.c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_too_small_buffer_for_exe() {
+        // Only argc, no exe path bytes at all (no NUL terminator)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        // No exe path follows — consume_cstr should fail since there's no NUL
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    #[test]
+    fn test_argc_mismatch_fewer_args_than_claimed() {
+        // argc=3 but only 1 argv entry provided
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/test\0");
+        buf.extend_from_slice(b"test\0");
+        // Only 1 arg, but argc says 3 — should fail when trying to read 2nd arg
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    #[test]
+    fn test_padding_between_exe_and_argv() {
+        // Lots of NUL padding between exe and first arg
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/echo\0");
+        buf.extend_from_slice(&[0; 20]); // padding NULs
+        buf.extend_from_slice(b"echo\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/bin/echo").to_path_buf());
+        assert_eq!(argv, vec!["echo".to_string()]);
+    }
+
+    #[test]
+    fn test_arg_with_spaces() {
+        // argv can contain spaces
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/grep\0");
+        buf.extend_from_slice(b"grep\0");
+        buf.extend_from_slice(b"hello world\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/usr/bin/grep").to_path_buf());
+        assert_eq!(argv, vec!["grep".to_string(), "hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_arg_with_equals() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/env\0");
+        buf.extend_from_slice(b"env\0");
+        buf.extend_from_slice(b"FOO=bar\0");
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["env".to_string(), "FOO=bar".to_string()]);
+    }
+
+    #[test]
+    fn test_non_utf8_in_exe_path() {
+        // Non-UTF8 bytes should be handled via from_utf8_lossy
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/\xff\xfe\0"); // non-UTF8 exe path
+        buf.extend_from_slice(b"arg0\0");
+
+        let result = parse_exe_and_argv_sysctl(buf);
+        assert!(result.is_some());
+        let (_, argv) = result.unwrap();
+        assert_eq!(argv.len(), 1);
+    }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn status_from_u32_idle() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(1),
+            super::LocalProcessStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_run() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(2),
+            super::LocalProcessStatus::Run
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_sleep() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(3),
+            super::LocalProcessStatus::Sleep
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_stop() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(4),
+            super::LocalProcessStatus::Stop
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_zombie() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(5),
+            super::LocalProcessStatus::Zombie
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_unknown_for_unrecognized() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(99),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn test_empty_exe_path() {
+        // argc=0 with empty exe path string
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes());
+        buf.extend_from_slice(b"\0"); // empty exe path
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("").to_path_buf());
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn test_long_exe_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes());
+        let long_path = format!("/{}", "a".repeat(200));
+        buf.extend_from_slice(long_path.as_bytes());
+        buf.push(0); // NUL terminator
+
+        let (exe_path, _) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path.to_string_lossy().len(), 201);
+    }
+
+    #[test]
+    fn test_arg_with_unicode() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/echo\0");
+        buf.extend_from_slice("héllo wörld".as_bytes());
+        buf.push(0);
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["héllo wörld".to_string()]);
+    }
+
+    #[test]
+    fn test_buffer_just_argc() {
+        // Buffer with only argc, nothing else
+        let buf = 1i32.to_ne_bytes().to_vec();
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn status_from_u32_zero_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(0),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_six_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(6),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_max_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(u32::MAX),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn test_exe_deeply_nested_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/a/b/c/d/e/f/g/h/i/j/k/binary\0");
+        buf.extend_from_slice(b"binary\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(
+            exe_path,
+            Path::new("/a/b/c/d/e/f/g/h/i/j/k/binary").to_path_buf()
+        );
+        assert_eq!(argv, vec!["binary".to_string()]);
+    }
+
+    #[test]
+    fn test_three_args_with_mixed_padding() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/cmd\0");
+        buf.extend_from_slice(&[0; 5]); // padding after exe
+        buf.extend_from_slice(b"cmd\0");
+        buf.extend_from_slice(&[0; 3]); // padding after arg0
+        buf.extend_from_slice(b"--verbose\0");
+        buf.extend_from_slice(&[0; 2]); // padding after arg1
+        buf.extend_from_slice(b"file.txt\0");
+
+        let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe, Path::new("/bin/cmd").to_path_buf());
+        assert_eq!(
+            argv,
+            vec![
+                "cmd".to_string(),
+                "--verbose".to_string(),
+                "file.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_empty_arg_value() {
+        // An argv entry that is an empty string
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/test\0");
+        buf.extend_from_slice(b"test\0");
+        buf.extend_from_slice(b"\0"); // empty arg
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["test".to_string(), "".to_string()]);
+    }
+
+    #[test]
+    fn test_arg_with_dashes_and_slashes() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/rsync\0");
+        buf.extend_from_slice(b"rsync\0");
+        buf.extend_from_slice(b"--archive\0");
+        buf.extend_from_slice(b"/src/dir/\0");
+
+        let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe, Path::new("/usr/bin/rsync").to_path_buf());
+        assert_eq!(
+            argv,
+            vec![
+                "rsync".to_string(),
+                "--archive".to_string(),
+                "/src/dir/".to_string()
+            ]
+        );
+    }
+}

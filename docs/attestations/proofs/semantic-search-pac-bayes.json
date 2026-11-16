@@ -1,0 +1,164 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "semantic-search-pac-bayes-recall-bound",
+  "category": "proofs/semantic-search-pac-bayes",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T15:40:00Z",
+  "produced_by_bead": "ft-tf6g3.26",
+  "status": "blocked_prerequisites_not_met",
+  "proof_category": 7,
+  "proof_categories": [7],
+  "scope": "PAC-Bayes release contract for semantic/hybrid search recall on future production-like operator queries.",
+  "methodology": {
+    "derivation": "docs/perf/semantic-search-pac-bayes-derivation.md",
+    "confidence": 0.99,
+    "delta": 0.01,
+    "preferred_bound": "pac_bayes_kl_inverse",
+    "audit_fallback_bound": "r_hat + sqrt((KL(Q || P) + ln(2 * sqrt(n) / delta)) / (2n))",
+    "loss": "1 when at least one relevant segment for a query is absent from the retriever top-k results; otherwise 0",
+    "recall_lower_bound": "1 - risk_upper_bound"
+  },
+  "current_bound": {
+    "status": "vacuous",
+    "reason": "No admitted production-realistic held-out semantic-search query set, calibration/test split, or frozen posterior exists yet.",
+    "production_heldout_query_count": 0,
+    "fixture_query_count_not_admitted": 4,
+    "fixture_query_source": "crates/frankenterm-core/src/semantic_quality.rs::default_semantic_eval_queries",
+    "empirical_miss_rate": null,
+    "kl_q_p_nats": null,
+    "recall_lower_bound_99": 0.0
+  },
+  "required_inputs_for_non_vacuous_bound": [
+    "production-realistic held-out query set",
+    "calibration split separate from final test split",
+    "test split evaluated exactly once",
+    "fixed prior over embedder and retriever hyperparameters",
+    "frozen posterior over embedder_id, embedder_tier, dimension, normalization, reranker policy, RRF k, and top-k",
+    "per-query relevance judgments with reviewer provenance"
+  ],
+  "sample_size_floor_zero_miss_delta_0_01": [
+    {
+      "target_recall_lower_bound": 0.9,
+      "epsilon_risk": 0.1,
+      "required_queries_by_kl_nats": {
+        "0": 416,
+        "1": 469,
+        "5": 678,
+        "10": 936,
+        "25": 1701
+      }
+    },
+    {
+      "target_recall_lower_bound": 0.95,
+      "epsilon_risk": 0.05,
+      "required_queries_by_kl_nats": {
+        "0": 1810,
+        "1": 2021,
+        "5": 2856,
+        "10": 3887,
+        "25": 6945
+      }
+    },
+    {
+      "target_recall_lower_bound": 0.99,
+      "epsilon_risk": 0.01,
+      "required_queries_by_kl_nats": {
+        "0": 53721,
+        "1": 58953,
+        "5": 79707,
+        "10": 105406,
+        "25": 181768
+      }
+    }
+  ],
+  "one_point_tightening": {
+    "definition": "Compute the additional held-out queries required to move the risk ceiling down by 0.01 after plugging in the measured KL(Q || P).",
+    "current_status": "not_computable_without_frozen_posterior",
+    "published_planning_floor": "Use sample_size_floor_zero_miss_delta_0_01 for the 0.99 target until the posterior is measured."
+  },
+  "sensitivity": {
+    "confidence": 0.99,
+    "target_recall_lower_bound": 0.99,
+    "zero_miss_required_queries": [
+      {
+        "kl_q_p_nats": 0,
+        "required_queries": 53721
+      },
+      {
+        "kl_q_p_nats": 5,
+        "required_queries": 79707
+      },
+      {
+        "kl_q_p_nats": 25,
+        "required_queries": 181768
+      }
+    ]
+  },
+  "confidence_record": {
+    "proof_id": "semantic-search-pac-bayes-recall.v1",
+    "proof_category": 7,
+    "claim": "With 99% confidence, the currently admitted production-query semantic-search recall lower bound is 0.0 because the required held-out production-like query set and frozen posterior are not present yet.",
+    "confidence_type": "bayesian",
+    "confidence_value": 0.99,
+    "sample_size_or_state_count": {
+      "kind": "sample_size",
+      "value": 0,
+      "unit": "admitted_production_heldout_queries"
+    },
+    "time_budget_consumed": {
+      "seconds": 0,
+      "budget_seconds": null,
+      "status": "not_reported"
+    },
+    "methodology_url": "docs/perf/semantic-search-pac-bayes-derivation.md",
+    "source_artifact_hash": "d1850ce338ccb79cd86136d2df4f6020544e45001c56ea85326194f155b041ff",
+    "source_artifact_path": "docs/perf/semantic-search-pac-bayes-derivation.md"
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/perf/semantic-search-pac-bayes-derivation.md",
+      "media_type": "text/markdown",
+      "sha256": "d1850ce338ccb79cd86136d2df4f6020544e45001c56ea85326194f155b041ff"
+    },
+    {
+      "path": "crates/frankenterm-core/src/semantic_quality.rs",
+      "media_type": "text/x-rust",
+      "role": "current deterministic fixture harness; not admitted as production held-out evidence"
+    }
+  ],
+  "sources": [
+    {
+      "name": "Catoni 2007",
+      "url": "https://arxiv.org/abs/0712.0248"
+    },
+    {
+      "name": "McAllester 1999",
+      "url": "https://doi.org/10.1145/307400.307435"
+    },
+    {
+      "name": "Dziugaite and Roy 2017",
+      "url": "https://arxiv.org/abs/1703.11008"
+    }
+  ],
+  "release_bundle_slot": {
+    "path": "proofs/semantic-search-pac-bayes.json",
+    "status": "proof_artifact_published",
+    "manifest_category": "proofs/semantic-search-pac-bayes",
+    "required_category_status": "optional_until_semantic_search_feature_stabilizes",
+    "note": "The artifact is intentionally not promoted to a required release category while the semantic-search feature lacks admitted production held-out data."
+  },
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/semantic-search-pac-bayes.json",
+      "status": "pass"
+    },
+    {
+      "command": "ruby -e 'require \"json\"; JSON.parse(File.read(\"docs/attestations/proofs/semantic-search-pac-bayes.json\"))'",
+      "status": "pass"
+    },
+    {
+      "command": "jq -e '.confidence_record.proof_id and .confidence_record.proof_category == 7 and .confidence_record.confidence_type == \"bayesian\" and .confidence_record.confidence_value == 0.99 and .current_bound.recall_lower_bound_99 == 0 and (.required_inputs_for_non_vacuous_bound | length) >= 6' docs/attestations/proofs/semantic-search-pac-bayes.json",
+      "status": "pass"
+    }
+  ]
+}

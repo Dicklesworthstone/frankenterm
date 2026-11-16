@@ -1,0 +1,155 @@
+[package]
+name = "frankenterm"
+description = "FrankenTerm CLI - swarm-native terminal platform for AI agent fleets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ft"
+path = "src/main.rs"
+
+[[test]]
+name = "e2e_workflow_trigger"
+path = "../../tests/e2e_workflow_trigger.rs"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+frankenterm-build-identity.workspace = true
+hex = { workspace = true, features = ["alloc"] }
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+
+[dependencies]
+frankenterm-build-identity.workspace = true
+uuid = { workspace = true, features = ["v4", "rng"] }
+frankenterm-core = { workspace = true, default-features = false }
+# GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling; `ft list | head`
+# must not unwind through or crash the shipped process.
+frankenterm-sigpipe = { workspace = true }
+# ft-y0loj.4 / ft-j1qjt.2: 24 replay_* modules moved out of frankenterm-core
+# to this sub-crate. `ft` consumes a handful of them directly (replay diff /
+# inspect / report / artifact-registry CLI subcommands in main.rs), so we
+# depend on the sub-crate as a regular dep here. `frankenterm-core` itself
+# only dev-depends on this crate, so there's no production cycle.
+frankenterm-core-replay = { workspace = true, default-features = false }
+# Always linked: `ft doctor --json` reads the GUI's published GPU resource
+# ledger (ft-yccm0.2.5). Without the `jemalloc` feature it installs no global
+# allocator.
+frankenterm-alloc.workspace = true
+# `config::RUNTIME_DIR`, where the GUI publishes that ledger. Already in the
+# graph through frankenterm-client.
+config.workspace = true
+frankenterm-client.workspace = true
+frankenterm-mux-server-impl.workspace = true
+mux.workspace = true
+codec = { workspace = true, default-features = false }
+# Portable nonblocking socket-pair capture for finite doctor subprocess probes
+# (also used by the EPIPE integration-test substrate).
+filedescriptor.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+clap.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+fancy-regex.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+toon_rust.workspace = true
+rusqlite.workspace = true
+dirs = "7.0.0"
+sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+zstd.workspace = true
+asupersync = { workspace = true, features = ["tls-webpki-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+frankensearch-index-acl.workspace = true
+nix = { workspace = true, features = ["fs", "user", "socket"] }
+rustix.workspace = true
+tempfile.workspace = true
+
+[features]
+# Round-5 test-build convenience: enables the compile-time moonshot optimizations
+# that measured as WINS or neutral — Q4 lazy-captures, Q5 Teddy, M1 ANSI-DFA.
+# DELIBERATELY EXCLUDES the two measured REGRESSIONS: Q6 fingerprint-dedup
+# (+8.8% slower) and M5 MPHF dispatch (+69% slower) — see docs/perf-ledger/
+# round5-negative-results.md. Pair with FT_MOONSHOT_ALL=1 at runtime for the
+# env/config-gated optimizations (all wins/neutral, no regressions in that set).
+# Default-OFF; not part of `default`.
+moonshot-all = [
+    "frankenterm-core/ansi-dfa-table",
+    "frankenterm-core/patterns-lazy-captures",
+    "frankenterm-core/teddy-prefilter",
+]
+# Everything is on by default — ft is a standalone terminal platform with no feature gates.
+default = [
+    "agent-detection",
+    "browser",
+    "distributed",
+    "vendored",
+    "jemalloc",
+    "mcp",
+    "metrics",
+    "native-wezterm",
+    "semantic-search",
+    "session-resume",
+    "subprocess-bridge",
+    "sync",
+    "ftui",
+    "tui-dashboard",
+    "tui-widgets",
+    "web",
+    "redis-session",
+    "asupersync-runtime",
+]
+agent-detection = ["frankenterm-core/agent-detection"]
+frankenterm = ["frankenterm-core/frankenterm"]
+vendored = ["frankenterm", "frankenterm-core/vendored"]  # backward compat alias
+browser = ["frankenterm-core/browser"]
+mcp = ["frankenterm-core/mcp"]
+web = ["frankenterm-core/web"]
+tui = ["frankenterm-core/tui"]
+tui-oracle = ["tui", "frankenterm-core/tui-oracle"]
+ftui = ["frankenterm-core/ftui"]
+tui-widgets = ["frankenterm-core/tui-widgets"]
+tui-dashboard = ["frankenterm-core/tui-dashboard", "tui-widgets"]
+rollout = ["frankenterm-core/rollout", "tui-oracle", "ftui"]
+metrics = ["frankenterm-core/metrics"]
+native-wezterm = ["frankenterm-core/native-wezterm"]
+distributed = ["frankenterm-core/distributed"]
+subprocess-bridge = ["frankenterm-core/subprocess-bridge"]
+sync = ["frankenterm-core/sync"]
+asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
+semantic-search = ["frankenterm-core/semantic-search"]
+session-resume = ["frankenterm-core/session-resume"]
+redis-session = ["frankenterm-core/redis-session"]
+jemalloc = ["frankenterm-alloc/jemalloc"]
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+config.workspace = true
+portable-pty.workspace = true
+promise.workspace = true
+wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
+# Exercise the synchronous outbound client against the actual Cargo-built ft
+# stdio server in the CLI contract suite.
+frankenterm-core = { workspace = true, default-features = false, features = ["mcp-client", "vendored"] }
+memchr.workspace = true
+predicates = "3.1.4"

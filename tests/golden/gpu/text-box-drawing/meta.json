@@ -1,0 +1,17 @@
+{
+  "fixture": "text-box-drawing",
+  "viewport": {
+    "width": 768,
+    "height": 208,
+    "dpi": 96.0
+  },
+  "texture_format": "Rgba8UnormSrgb",
+  "font_set_sha": "synthetic-headless-unicode-v1",
+  "harness_version": 1,
+  "generated_at_runner": "macos-metal-cod_1-2026-04-28",
+  "thresholds": {
+    "min_ssim": 0.99,
+    "max_l_inf": 8,
+    "max_changed_pixel_fraction": 0.001
+  }
+}

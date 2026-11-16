@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "captured_at": 1713734400000,
+  "windows": [
+    {
+      "window_id": 8,
+      "tabs": [
+        {
+          "tab_id": 81,
+          "pane_tree": {
+            "type": "VSplit",
+            "children": "not-an-array"
+          }
+        }
+      ],
+      "active_tab_index": "wrong"
+    }
+  ]
+}

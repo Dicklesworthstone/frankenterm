@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
+mkdir -p "${LOG_DIR}"
+
+RUN_ID="$(date -u +"%Y%m%d_%H%M%S")"
+SCENARIO_ID="ft_124z4"
+CORRELATION_ID="ft-124z4-${RUN_ID}"
+LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
+STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
+
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft124z4-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "124z4"
+ensure_rch_ready
+
+LAST_STEP_LOG=""
+LAST_STEP_QUEUE_LOG=""
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
+LOCAL_RCH_TMPDIR_OVERRIDE=""
+RCH_WORKERS_TOML="${HOME}/.config/rch/workers.toml"
+RCH_CONFIG_FILE="${ROOT_DIR}/.rch/config.toml"
+RCH_REMOTE_BASE_DEFAULT="/home/ubuntu/rch"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
+fi
+
+emit_log() {
+  local component="$1"
+  local decision_path="$2"
+  local input_summary="$3"
+  local outcome="$4"
+  local reason_code="$5"
+  local error_code="$6"
+  local artifact_path="$7"
+  local ts
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  jq -cn \
+    --arg timestamp "${ts}" \
+    --arg component "${component}" \
+    --arg scenario_id "${SCENARIO_ID}" \
+    --arg correlation_id "${CORRELATION_ID}" \
+    --arg decision_path "${decision_path}" \
+    --arg input_summary "${input_summary}" \
+    --arg outcome "${outcome}" \
+    --arg reason_code "${reason_code}" \
+    --arg error_code "${error_code}" \
+    --arg artifact_path "${artifact_path}" \
+    '{
+      timestamp: $timestamp,
+      component: $component,
+      scenario_id: $scenario_id,
+      correlation_id: $correlation_id,
+      decision_path: $decision_path,
+      input_summary: $input_summary,
+      outcome: $outcome,
+      reason_code: $reason_code,
+      error_code: $error_code,
+      artifact_path: $artifact_path
+    }' >> "${LOG_FILE}"
+}
+
+run_step() {
+  local label="$1"
+  shift
+
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  LAST_STEP_QUEUE_LOG=""
+  set +e
+  run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@" 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+    LAST_STEP_QUEUE_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}_rch_queue_timeout.log"
+    if ! run_rch queue > "${LAST_STEP_QUEUE_LOG}" 2>&1; then
+      LAST_STEP_QUEUE_LOG=""
+    fi
+  fi
+  return "${rc}"
+}
+
+run_cargo_step() {
+  local label="$1"
+  shift
+
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  LAST_STEP_QUEUE_LOG=""
+  set +e
+  (run_rch_cargo_logged "${LAST_STEP_LOG}" "$@")
+  local rc=$?
+  set -e
+
+  if [[ -f "${LAST_STEP_LOG}" ]]; then
+    cat "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
+  fi
+
+  LAST_STEP_QUEUE_LOG="${LAST_STEP_LOG%.log}.rch_queue_timeout.log"
+  if [[ ! -f "${LAST_STEP_QUEUE_LOG}" ]]; then
+    LAST_STEP_QUEUE_LOG=""
+  fi
+
+  return "${rc}"
+}
+
+rch_fail_open_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${log_path}"
+}
+
+rch_socket_path_issue_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_SOCKET_PATH_REGEX}" "${log_path}"
+}
+
+run_rch() {
+  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+    TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
+  else
+    rch "$@"
+  fi
+}
+
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    TIMEOUT_BIN=""
+  fi
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
+}
+
+step_timed_out() {
+  local step_rc="$1"
+  local meta_path
+
+  if [[ ${step_rc} -eq 124 || ${step_rc} -eq 137 ]]; then
+    return 0
+  fi
+
+  if [[ -n "${LAST_STEP_LOG}" ]]; then
+    meta_path="$(rch_log_meta_path "${LAST_STEP_LOG}")"
+    if [[ -f "${meta_path}" ]] && jq -e '.timed_out == true' "${meta_path}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+step_timeout_artifact() {
+  local queue_log meta_path
+
+  if [[ -n "${LAST_STEP_QUEUE_LOG}" ]]; then
+    basename "${LAST_STEP_QUEUE_LOG}"
+  elif [[ -n "${LAST_STEP_LOG}" && -f "${LAST_STEP_LOG%.log}.rch_queue_timeout.log" ]]; then
+    queue_log="${LAST_STEP_LOG%.log}.rch_queue_timeout.log"
+    basename "${queue_log}"
+  elif [[ -n "${LAST_STEP_LOG}" ]]; then
+    meta_path="$(rch_log_meta_path "${LAST_STEP_LOG}")"
+    if [[ -f "${meta_path}" ]]; then
+      basename "${meta_path}"
+    else
+      basename "${LAST_STEP_LOG}"
+    fi
+  else
+    basename "${LAST_STEP_LOG}"
+  fi
+}
+
+extract_rch_remote_base() {
+  local configured
+  if command -v rch >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    configured="$(rch config show --json 2>/dev/null | jq -r '.data.transfer.remote_base // empty' 2>/dev/null || true)"
+  else
+    configured=""
+  fi
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+    return
+  fi
+  configured="$(awk -F'"' '/^[[:space:]]*remote_base[[:space:]]*=/{print $2; exit}' "${RCH_CONFIG_FILE}" 2>/dev/null || true)"
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s\n' "${RCH_REMOTE_BASE_DEFAULT}"
+  fi
+}
+
+collect_remote_cargo_required_paths() {
+  python3 - "${ROOT_DIR}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+root = Path(sys.argv[1]).resolve()
+project_parent = root.parent
+found = set()
+
+def iter_workspace_manifests(workspace_root: Path):
+    root_manifest = workspace_root / "Cargo.toml"
+    try:
+        root_doc = tomllib.loads(root_manifest.read_text(encoding="utf-8"))
+    except (FileNotFoundError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return
+
+    workspace = root_doc.get("workspace")
+    if not isinstance(workspace, dict):
+        return
+
+    member_patterns = workspace.get("members", [])
+    exclude_patterns = workspace.get("exclude", [])
+    manifests = {root_manifest.resolve()}
+    excluded = set()
+
+    for pattern in member_patterns:
+        if not isinstance(pattern, str):
+            continue
+        for candidate in workspace_root.glob(pattern):
+            manifest = candidate / "Cargo.toml" if candidate.is_dir() else candidate
+            if manifest.is_file():
+                manifests.add(manifest.resolve())
+
+    for pattern in exclude_patterns:
+        if not isinstance(pattern, str):
+            continue
+        for candidate in workspace_root.glob(pattern):
+            manifest = candidate / "Cargo.toml" if candidate.is_dir() else candidate
+            if manifest.is_file():
+                excluded.add(manifest.resolve())
+
+    for manifest in sorted(manifests - excluded):
+        yield manifest
+
+def iter_dependency_tables(doc: dict):
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = doc.get(key)
+        if isinstance(table, dict):
+            yield table
+
+    workspace = doc.get("workspace")
+    if isinstance(workspace, dict):
+        table = workspace.get("dependencies")
+        if isinstance(table, dict):
+            yield table
+
+    target = doc.get("target")
+    if isinstance(target, dict):
+        for target_cfg in target.values():
+            if not isinstance(target_cfg, dict):
+                continue
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target_cfg.get(key)
+                if isinstance(table, dict):
+                    yield table
+
+    for key in ("patch", "replace"):
+        table = doc.get(key)
+        if not isinstance(table, dict):
+            continue
+        for registry_cfg in table.values():
+            if isinstance(registry_cfg, dict):
+                yield registry_cfg
+
+for manifest in iter_workspace_manifests(root):
+    try:
+        doc = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        continue
+
+    for table in iter_dependency_tables(doc):
+        for spec in table.values():
+            if not isinstance(spec, dict):
+                continue
+            dep_path = spec.get("path")
+            if not isinstance(dep_path, str):
+                continue
+
+            resolved = (manifest.parent / dep_path).resolve()
+            if resolved == root or str(resolved).startswith(str(root) + "/"):
+                continue
+            try:
+                rel = resolved.relative_to(project_parent)
+            except ValueError:
+                continue
+            manifest_path = rel / "Cargo.toml" if resolved.is_dir() else rel
+            found.add(str(manifest_path))
+
+for item in sorted(found):
+    print(item)
+PY
+}
+
+load_worker_topology_tsv() {
+  python3 - "${RCH_WORKERS_TOML}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+path = Path(sys.argv[1]).expanduser()
+if not path.is_file():
+    sys.exit(1)
+
+data = tomllib.loads(path.read_text(encoding="utf-8"))
+for worker in data.get("workers", []):
+    identity_file = worker.get("identity_file", "")
+    if identity_file:
+        identity_file = str(Path(identity_file).expanduser())
+    print(
+        "\t".join(
+            [
+                worker.get("id", ""),
+                worker.get("host", ""),
+                worker.get("user", ""),
+                identity_file,
+            ]
+        )
+    )
+PY
+}
+
+append_topology_report() {
+  local report_path="$1"
+  local worker_id="$2"
+  local host="$3"
+  local outcome="$4"
+  local detail="$5"
+
+  jq -cn \
+    --arg worker_id "${worker_id}" \
+    --arg host "${host}" \
+    --arg outcome "${outcome}" \
+    --arg detail "${detail}" \
+    '{
+      worker_id: $worker_id,
+      host: $host,
+      outcome: $outcome,
+      detail: $detail
+    }' >> "${report_path}"
+}
+
+probe_worker_remote_paths() {
+  local worker_id="$1"
+  local host="$2"
+  local user="$3"
+  local identity_file="$4"
+  local remote_base="$5"
+  local worker_log="$6"
+  shift 6
+
+  set +e
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ControlMaster=no \
+    -i "${identity_file}" \
+    "${user}@${host}" \
+    bash -s -- "${remote_base}" "$@" >"${worker_log}" 2>&1 <<'EOF'
+set -euo pipefail
+remote_base="${1%/}"
+shift
+missing=0
+candidate_prefixes=("/data/projects" "/dp")
+if [[ -n "${remote_base}" ]]; then
+  candidate_prefixes+=("${remote_base}")
+fi
+
+for dep in "$@"; do
+  found_target=""
+  for prefix in "${candidate_prefixes[@]}"; do
+    target="${prefix}/${dep}"
+    if [[ -f "${target}" ]]; then
+      found_target="${target}"
+      break
+    fi
+  done
+
+  if [[ -z "${found_target}" ]]; then
+    echo "missing:${dep}"
+    for prefix in "${candidate_prefixes[@]}"; do
+      echo "checked:${prefix}/${dep}"
+    done
+    missing=12
+  fi
+done
+
+if [[ ${missing} -ne 0 ]]; then
+  exit "${missing}"
+fi
+
+echo "ok"
+EOF
+  local rc=$?
+  set -e
+  return "${rc}"
+}
+
+run_rch_topology_preflight() {
+  local remote_base
+  local required_paths_file topology_report worker_rows_raw worker_row
+  local worker_id host user identity_file worker_log
+  local missing_any="false"
+  local worker_count=0
+  local -a required_paths=() worker_rows=()
+
+  remote_base="$(extract_rch_remote_base)"
+  mapfile -t required_paths < <(collect_remote_cargo_required_paths)
+
+  if [[ ${#required_paths[@]} -eq 0 ]]; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "skipped" "no_remote_cargo_required_paths" "none" "$(basename "${STDOUT_FILE}")"
+    return 0
+  fi
+
+  if [[ ! -f "${RCH_WORKERS_TOML}" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "failed" "missing_workers_toml" "RCH-WORKERS-CONFIG-MISSING" "$(basename "${STDOUT_FILE}")"
+    echo "rch workers config not found: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  required_paths_file="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_remote_required_paths.txt"
+  topology_report="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_worker_topology.jsonl"
+  printf '%s\n' "${required_paths[@]}" > "${required_paths_file}"
+  : > "${topology_report}"
+
+  emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "running" "none" "none" "$(basename "${required_paths_file}")"
+
+  if ! worker_rows_raw="$(load_worker_topology_tsv)"; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "failed" "invalid_workers_toml" "RCH-WORKERS-CONFIG-INVALID" "$(basename "${required_paths_file}")"
+    echo "failed to parse rch workers config: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  if [[ -z "${worker_rows_raw}" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "failed" "no_workers_declared" "RCH-WORKERS-CONFIG-EMPTY" "$(basename "${required_paths_file}")"
+    echo "rch workers config contains no workers: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  mapfile -t worker_rows <<< "${worker_rows_raw}"
+
+  for worker_row in "${worker_rows[@]}"; do
+    IFS=$'\t' read -r worker_id host user identity_file <<< "${worker_row}"
+    [[ -n "${worker_id}" && -n "${host}" && -n "${user}" && -n "${identity_file}" ]] || continue
+    worker_count=$((worker_count + 1))
+    worker_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${worker_id}_topology.log"
+
+    if probe_worker_remote_paths "${worker_id}" "${host}" "${user}" "${identity_file}" "${remote_base}" "${worker_log}" "${required_paths[@]}"; then
+      append_topology_report "${topology_report}" "${worker_id}" "${host}" "ok" "all required cargo paths present"
+    else
+      missing_any="true"
+      append_topology_report "${topology_report}" "${worker_id}" "${host}" "missing" "$(tr '\n' ' ' < "${worker_log}")"
+    fi
+  done
+
+  if [[ ${worker_count} -lt 1 ]]; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "failed" "no_valid_workers_declared" "RCH-WORKERS-CONFIG-EMPTY" "$(basename "${topology_report}")"
+    echo "rch workers config contains no valid worker rows: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  if [[ "${missing_any}" == "true" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "failed" "rch_worker_topology_drift" "RCH-REMOTE-TOPOLOGY" "$(basename "${topology_report}")"
+    echo "rch worker topology drift detected; see ${topology_report}" >&2
+    return 2
+  fi
+
+  emit_log "preflight" "rch_topology_preflight" "remote_cargo_required_paths" "passed" "remote_required_paths_present" "none" "$(basename "${topology_report}")"
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    emit_log "preflight" "prereq_check" "missing:${cmd}" "failed" "missing_prerequisite" "E2E-PREREQ" "${cmd}"
+    echo "missing required command: ${cmd}" >&2
+    exit 1
+  fi
+}
+
+cd "${ROOT_DIR}"
+: > "${STDOUT_FILE}"
+
+require_cmd jq
+require_cmd rch
+require_cmd python3
+require_cmd ssh
+
+resolve_timeout_bin
+if [[ -z "${TIMEOUT_BIN}" ]]; then
+  emit_log "preflight" "preflight_timeout_tool" "missing:timeout_or_gtimeout" "failed" "missing_prerequisite" "E2E-PREREQ" "timeout-or-gtimeout"
+  echo "missing required timeout command: timeout or gtimeout" >&2
+  exit 1
+fi
+
+emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
+emit_log "preflight" "stall_guard_config" "rch_step_timeout_secs=${RCH_STEP_TIMEOUT_SECS}; timeout_bin=${TIMEOUT_BIN}" "applied" "timeout_guard_enabled" "none" "$(basename "${LOG_FILE}")"
+
+if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+  emit_log "preflight" "rch_local_tmpdir_workaround" "TMPDIR=${LOCAL_RCH_TMPDIR_OVERRIDE}" "applied" "darwin_controlmaster_socket_guard" "none" "$(basename "${STDOUT_FILE}")"
+fi
+
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" == /* ]]; then
+  emit_log "preflight" "rch_target_dir_sanitizer" "inherited=${INHERITED_CARGO_TARGET_DIR}" "applied" "absolute_target_dir_rewritten_for_remote_exec" "none" "$(basename "${STDOUT_FILE}")"
+fi
+
+probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
+set +e
+run_rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
+probe_rc=$?
+set -e
+
+if [[ ${probe_rc} -ne 0 ]]; then
+  if rch_socket_path_issue_detected "${STDOUT_FILE}"; then
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${STDOUT_FILE}")"
+    echo "rch workers probe failed due to local SSH control socket path length; try TMPDIR=/tmp" >&2
+  else
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
+    echo "rch workers probe failed" >&2
+  fi
+  exit 2
+fi
+
+healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
+if [[ "${healthy_workers}" -lt 1 ]]; then
+  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable" "RCH-E100" "$(basename "${probe_log}")"
+  echo "no reachable rch workers; refusing local fallback" >&2
+  exit 2
+fi
+
+emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
+
+if ! run_rch_topology_preflight; then
+  exit 2
+fi
+
+emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_cargo_step rch_remote_smoke env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check --help; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+    else
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    fi
+    echo "rch remote smoke check failed-open to local execution; refusing offload policy violation" >&2
+    exit 3
+  fi
+  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
+else
+  step_rc=$?
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+    else
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    fi
+  elif step_timed_out "${step_rc}"; then
+    emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
+  exit 2
+fi
+
+emit_log "validation" "nominal_path" "tailer_labruntime_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_cargo_step nominal_labruntime \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+    exit 3
+  fi
+  emit_log "validation" "nominal_path" "tailer_labruntime_tests" "passed" "tests_passed" "none" "$(basename "${LAST_STEP_LOG}")"
+else
+  step_rc=$?
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+  elif step_timed_out "${step_rc}"; then
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "test_failure" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
+  exit 1
+fi
+
+emit_log "validation" "failure_injection_path" "bench_without_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+set +e
+run_cargo_step failure_missing_feature \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --message-format short
+missing_feature_rc=$?
+set -e
+
+if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+  emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+  echo "rch fell back to local execution; failing per offload-only policy" >&2
+  exit 3
+fi
+
+if step_timed_out "${missing_feature_rc}"; then
+  emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  exit 1
+fi
+
+if [[ ${missing_feature_rc} -eq 0 ]]; then
+  emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "expected_failure_missing" "EXPECTED-FAILURE-NOT-TRIGGERED" "$(basename "${LAST_STEP_LOG}")"
+  exit 1
+fi
+
+if ! grep -q "requires the features: .*asupersync-runtime" "${LAST_STEP_LOG}"; then
+  emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "unexpected_error_signature" "FEATURE-GATE-SIGNATURE-MISSING" "$(basename "${LAST_STEP_LOG}")"
+  exit 1
+fi
+
+emit_log "validation" "failure_injection_path" "bench_without_feature" "passed" "expected_feature_gate_failure" "none" "$(basename "${LAST_STEP_LOG}")"
+
+emit_log "validation" "recovery_path" "bench_with_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_cargo_step recovery_with_feature \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+    exit 3
+  fi
+  emit_log "validation" "recovery_path" "bench_with_feature" "passed" "recovery_success" "none" "$(basename "${LAST_STEP_LOG}")"
+else
+  step_rc=$?
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+  elif step_timed_out "${step_rc}"; then
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "recovery_failed" "CARGO-CHECK-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
+  exit 1
+fi
+
+emit_log "summary" "nominal->failure_injection->recovery" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
+
+echo "ft-124z4 e2e scenario passed. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"

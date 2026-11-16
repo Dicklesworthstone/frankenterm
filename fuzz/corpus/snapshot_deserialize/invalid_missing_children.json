@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "captured_at": 1713730800000,
+  "windows": [
+    {
+      "window_id": 9,
+      "tabs": [
+        {
+          "tab_id": 91,
+          "pane_tree": {
+            "type": "HSplit"
+          },
+          "active_pane_id": 9001
+        }
+      ]
+    }
+  ]
+}

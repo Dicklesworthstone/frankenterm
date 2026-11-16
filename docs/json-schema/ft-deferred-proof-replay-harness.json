@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-replay-harness.json",
+  "title": "FrankenTerm Deferred Proof Replay Harness Decision",
+  "description": "Static contract for the dry-run decision the deferred-proof replay harness records for a single queued receipt. The harness projects retained receipts into a queue, classifies each one fail-closed, and selects at most one next candidate. It never produces material remote proof: live replay still requires a real remote RCH worker (ft-zbnz4.4 -> ft-5xwsu.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "receipt_id",
+    "command_shape_version",
+    "decision",
+    "blockers",
+    "material_remote_required",
+    "target_dir",
+    "selected_worker",
+    "remote_exit_status",
+    "dry_run",
+    "replay_allowed_now",
+    "note"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_replay_harness.decision.v1"
+    },
+    "bead_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "receipt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command_shape_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "description": "Authoritative dry-run classification derived from structural and coordination facts. The receipt's self-declared eligibility is untrusted input and never upgrades this decision. There is no green/proof_complete value: the harness cannot mint material proof.",
+      "enum": [
+        "run_static_now",
+        "would_run_remote",
+        "defer_remote_blocked",
+        "defer_dirty_overlap",
+        "defer_prerequisite",
+        "cancelled",
+        "reject_stale_command",
+        "reject_non_remote_command",
+        "request_triage"
+      ]
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "rch.topology_preflight_failed",
+          "rch.worker_pressure",
+          "overlap.dirty_paths",
+          "prereq.bead_open",
+          "operator.cancelled",
+          "command.stale_shape",
+          "command.not_remote_only",
+          "triage.ambiguous"
+        ]
+      }
+    },
+    "material_remote_required": {
+      "type": "boolean"
+    },
+    "target_dir": {
+      "type": ["string", "null"]
+    },
+    "selected_worker": {
+      "description": "Worker the original capture had already selected when a remote failure occurred. Present only for selected-worker failures so that a topology-preflight failure is never coarsened into no-admissible-workers admission.",
+      "type": ["string", "null"]
+    },
+    "remote_exit_status": {
+      "description": "Always null in the harness. A non-null remote exit status may only be recorded by a real remote RCH replay, never by this dry-run.",
+      "type": "null"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "const": true
+    },
+    "replay_allowed_now": {
+      "description": "True only when the receipt can be proven right now without any RCH worker, i.e. a static verifier. Material remote receipts are always false here because the harness refuses to mint remote proof.",
+      "type": "boolean"
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

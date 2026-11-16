@@ -1,0 +1,8 @@
+ensure_rch_ready (RCH_SKIP_SMOKE_PREFLIGHT=1)
+bash -lc 
+        set -euo pipefail
+        rg -n 'ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown|ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles'             '/Users/jemanuel/projects/frankenterm/crates/frankenterm-core/src/runtime.rs'
+        rg -n 'ft_xbnl0_4_4_tick_keeps_watermarks_bounded_across_churn_cycles'             '/Users/jemanuel/projects/frankenterm/crates/frankenterm-core/src/search/indexing_pipeline.rs'
+    
+rustfmt --edition 2024 --check /Users/jemanuel/projects/frankenterm/crates/frankenterm-core/src/runtime.rs /Users/jemanuel/projects/frankenterm/crates/frankenterm-core/src/search/indexing_pipeline.rs
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-jemanuel-target cargo test -p frankenterm-core --lib ft_xbnl0_4_4_ -- --nocapture

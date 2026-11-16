@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.thinking",
+    "agent_type": "claude_code",
+    "event_type": "session.thinking",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {},
+    "matched_text": "Thinking..."
+  }
+]

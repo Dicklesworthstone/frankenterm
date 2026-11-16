@@ -1,0 +1,4215 @@
+//! TUI views and screen definitions
+//!
+//! Each view represents a distinct screen in the TUI with its own
+//! state, keybindings, and rendering logic.
+
+use ratatui::{
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Tabs, Widget},
+};
+use std::collections::{HashMap, HashSet};
+
+use super::query::{
+    EventView, HealthStatus, HistoryEntryView, PaneBookmarkView, PaneView, RulesetProfileState,
+    SavedSearchView, SearchResultView, TriageItemView, WorkflowProgressView,
+};
+use super::view_adapters::{DashboardModel, TimelineRow, adapt_dashboard};
+use crate::circuit_breaker::CircuitStateKind;
+
+/// Available views in the TUI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// Home/dashboard view showing system overview
+    #[default]
+    Home,
+    /// List of panes with status
+    Panes,
+    /// Event feed
+    Events,
+    /// Triage view (prioritized issues + quick actions)
+    Triage,
+    /// Action history view (audit + undo metadata)
+    History,
+    /// Search interface
+    Search,
+    /// Help screen
+    Help,
+    /// Unified event timeline with cross-pane correlations (wa-6sk.4)
+    Timeline,
+}
+
+impl View {
+    /// Get the display name for this view
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Panes => "Panes",
+            Self::Events => "Events",
+            Self::Triage => "Triage",
+            Self::History => "History",
+            Self::Search => "Search",
+            Self::Help => "Help",
+            Self::Timeline => "Timeline",
+        }
+    }
+
+    /// Get all views in tab order
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Home,
+            Self::Panes,
+            Self::Events,
+            Self::Triage,
+            Self::History,
+            Self::Search,
+            Self::Help,
+            Self::Timeline,
+        ]
+    }
+
+    /// Get the index of this view in the tab order
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Home => 0,
+            Self::Panes => 1,
+            Self::Events => 2,
+            Self::Triage => 3,
+            Self::History => 4,
+            Self::Search => 5,
+            Self::Help => 6,
+            Self::Timeline => 7,
+        }
+    }
+
+    /// Get the next view (wraps around)
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Home => Self::Panes,
+            Self::Panes => Self::Events,
+            Self::Events => Self::Triage,
+            Self::Triage => Self::History,
+            Self::History => Self::Search,
+            Self::Search => Self::Help,
+            Self::Help => Self::Timeline,
+            Self::Timeline => Self::Home,
+        }
+    }
+
+    /// Get the previous view (wraps around)
+    #[must_use]
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Home => Self::Timeline,
+            Self::Panes => Self::Home,
+            Self::Events => Self::Panes,
+            Self::Triage => Self::Events,
+            Self::History => Self::Triage,
+            Self::Search => Self::History,
+            Self::Help => Self::Search,
+            Self::Timeline => Self::Help,
+        }
+    }
+}
+
+/// Coarse search lifecycle shown in the TUI search surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchProgressPhase {
+    /// No active/previous search lifecycle state.
+    #[default]
+    Idle,
+    /// Initial phase is in-flight.
+    RunningInitial,
+    /// Initial phase completed and fast-only mode intentionally skipped refinement.
+    InitialOnly,
+    /// Backend returned a single-pass result set (no refinement stream available yet).
+    RefinementUnavailable,
+    /// Search failed before producing a usable refinement lifecycle.
+    RefinementFailed,
+}
+
+impl SearchProgressPhase {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::RunningInitial => "initializing",
+            Self::InitialOnly => "initial-only",
+            Self::RefinementUnavailable => "refinement-unavailable",
+            Self::RefinementFailed => "refinement-failed",
+        }
+    }
+}
+
+/// State for each view
+#[derive(Debug, Default)]
+pub struct ViewState {
+    /// Panes list for display
+    pub panes: Vec<PaneView>,
+    /// Events list for display
+    pub events: Vec<EventView>,
+    /// Action history entries for display
+    pub history_entries: Vec<HistoryEntryView>,
+    /// Triage items for display
+    pub triage_items: Vec<TriageItemView>,
+    /// Current health status
+    pub health: Option<HealthStatus>,
+    /// Unified dashboard state (cost, rate limits, backpressure).
+    pub dashboard: Option<crate::dashboard::DashboardState>,
+    /// Search query input
+    pub search_query: String,
+    /// Free-text pane filter (matches title/cwd/domain/pane id)
+    pub panes_filter_query: String,
+    /// Only show panes with unhandled events
+    pub panes_unhandled_only: bool,
+    /// Optional agent filter (codex/claude/gemini/unknown)
+    pub panes_agent_filter: Option<String>,
+    /// Optional domain filter (e.g., local/ssh)
+    pub panes_domain_filter: Option<String>,
+    /// Error message to display (if any)
+    pub error_message: Option<String>,
+    /// Selected index in list views
+    pub selected_index: usize,
+    /// Selected index in triage view
+    pub triage_selected_index: usize,
+    /// Events: show only unhandled events
+    pub events_unhandled_only: bool,
+    /// Events: filter by pane id (text)
+    pub events_pane_filter: String,
+    /// Events: selected index (separate from panes)
+    pub events_selected_index: usize,
+    /// History: selected index
+    pub history_selected_index: usize,
+    /// History: free-text filter (pane/workflow/action/audit id)
+    pub history_filter_query: String,
+    /// History: show only currently undoable actions
+    pub history_undoable_only: bool,
+    /// Search: last executed query (for display)
+    pub search_last_query: String,
+    /// Search: results from last query
+    pub search_results: Vec<SearchResultView>,
+    /// Search: selected result index
+    pub search_selected_index: usize,
+    /// Search: current lifecycle phase for progressive delivery status.
+    pub search_phase: SearchProgressPhase,
+    /// Search: run only the fast/initial phase when true.
+    pub search_fast_only: bool,
+    /// Search: measured latency for initial phase (ms), when known.
+    pub search_initial_latency_ms: Option<u64>,
+    /// Search: measured latency for refined phase (ms), when known.
+    pub search_refined_latency_ms: Option<u64>,
+    /// Search: optional status detail shown in the UI.
+    pub search_phase_detail: Option<String>,
+    /// Saved searches for search view.
+    pub saved_searches: Vec<SavedSearchView>,
+    /// Selected saved search index.
+    pub saved_search_selected_index: usize,
+    /// Active workflows for progress display
+    pub workflows: Vec<WorkflowProgressView>,
+    /// Unified timeline rows for the Timeline view.
+    pub timeline_rows: Vec<TimelineRow>,
+    /// Selected timeline row.
+    pub timeline_selected_index: usize,
+    /// Timeline zoom/window level.
+    pub timeline_zoom: u8,
+    /// Timeline viewport offset.
+    pub timeline_scroll: usize,
+    /// Expanded workflow index in triage view (None = collapsed)
+    pub triage_expanded: Option<usize>,
+    /// Bookmark records for panes.
+    pub pane_bookmarks: Vec<PaneBookmarkView>,
+    /// Optional ruleset profile state.
+    pub ruleset_profile_state: Option<RulesetProfileState>,
+    /// Selected profile index in the profile selector.
+    pub selected_ruleset_profile_index: usize,
+    /// Only show panes that have at least one bookmark.
+    pub panes_bookmarked_only: bool,
+    /// Search: inline suggestions based on current query input.
+    pub search_suggestions: Vec<crate::storage::SearchSuggestion>,
+}
+
+impl ViewState {
+    /// Clear any error message
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+    }
+
+    /// Set an error message
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.error_message = Some(msg.into());
+    }
+}
+
+/// Return pane indices that match active pane filters.
+#[must_use]
+pub fn filtered_pane_indices(state: &ViewState) -> Vec<usize> {
+    let query = state.panes_filter_query.trim().to_ascii_lowercase();
+    let bookmarked_panes: HashSet<u64> = state.pane_bookmarks.iter().map(|b| b.pane_id).collect();
+    state
+        .panes
+        .iter()
+        .enumerate()
+        .filter(|(_, pane)| {
+            if state.panes_unhandled_only && pane.unhandled_event_count == 0 {
+                return false;
+            }
+
+            if let Some(agent_filter) = &state.panes_agent_filter {
+                let agent = pane.agent_type.as_deref().unwrap_or("unknown");
+                if !agent.eq_ignore_ascii_case(agent_filter) {
+                    return false;
+                }
+            }
+
+            if let Some(domain_filter) = &state.panes_domain_filter {
+                let domain = pane.domain.to_ascii_lowercase();
+                let filter = domain_filter.to_ascii_lowercase();
+                if filter == "ssh" {
+                    if !domain.contains("ssh") {
+                        return false;
+                    }
+                } else if !domain.contains(&filter) {
+                    return false;
+                }
+            }
+
+            if state.panes_bookmarked_only && !bookmarked_panes.contains(&pane.pane_id) {
+                return false;
+            }
+
+            if query.is_empty() {
+                return true;
+            }
+
+            let pane_id = pane.pane_id.to_string();
+            let title = pane.title.to_ascii_lowercase();
+            let domain = pane.domain.to_ascii_lowercase();
+            let cwd = pane.cwd.as_deref().unwrap_or("").to_ascii_lowercase();
+            pane_id.contains(&query)
+                || title.contains(&query)
+                || domain.contains(&query)
+                || cwd.contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Return event indices that match active event filters.
+#[must_use]
+pub fn filtered_event_indices(state: &ViewState) -> Vec<usize> {
+    let pane_query = state.events_pane_filter.trim();
+    state
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            if state.events_unhandled_only && event.handled {
+                return false;
+            }
+            if !pane_query.is_empty() {
+                let pane_str = event.pane_id.to_string();
+                if !pane_str.contains(pane_query) && !event.rule_id.contains(pane_query) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Return action-history indices that match active history filters.
+#[must_use]
+pub fn filtered_history_indices(state: &ViewState) -> Vec<usize> {
+    let query = state.history_filter_query.trim().to_ascii_lowercase();
+    state
+        .history_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            if state.history_undoable_only && !entry.undoable {
+                return false;
+            }
+
+            if query.is_empty() {
+                return true;
+            }
+
+            let pane = entry
+                .pane_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let workflow = entry.workflow_id.as_deref().unwrap_or("-");
+            let step = entry.step_name.as_deref().unwrap_or("-");
+            let rule = entry.rule_id.as_deref().unwrap_or("-");
+            let audit = entry.audit_id.to_string();
+            let haystack = format!(
+                "{pane} {workflow} {} {} {} {step} {rule} {audit}",
+                entry.action_kind, entry.result, entry.actor_kind
+            )
+            .to_ascii_lowercase();
+            haystack.contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportClass {
+    Compact,
+    Regular,
+    Wide,
+}
+
+#[must_use]
+fn viewport_class(area: Rect) -> ViewportClass {
+    if area.width >= 132 && area.height >= 36 {
+        ViewportClass::Wide
+    } else if area.width < 96 || area.height < 28 {
+        ViewportClass::Compact
+    } else {
+        ViewportClass::Regular
+    }
+}
+
+#[must_use]
+fn home_layout_constraints(has_dashboard: bool, viewport: ViewportClass) -> Vec<Constraint> {
+    match (has_dashboard, viewport) {
+        (true, ViewportClass::Wide) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(9), // Health status detail
+            Constraint::Length(7), // Metrics snapshot
+            Constraint::Min(10),   // Dashboard panels
+            Constraint::Length(4), // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (true, ViewportClass::Regular) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(8), // Health status detail
+            Constraint::Length(6), // Metrics snapshot
+            Constraint::Min(7),    // Dashboard panels
+            Constraint::Length(3), // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (true, ViewportClass::Compact) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(6), // Health status detail
+            Constraint::Length(5), // Metrics snapshot
+            Constraint::Min(4),    // Dashboard panels
+            Constraint::Length(3), // Quick help
+            Constraint::Length(2), // Footer
+        ],
+        (false, ViewportClass::Wide) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(9), // Health status detail
+            Constraint::Length(7), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (false, ViewportClass::Regular) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(8), // Health status detail
+            Constraint::Length(6), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (false, ViewportClass::Compact) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(6), // Health status detail
+            Constraint::Length(5), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(2), // Footer
+        ],
+    }
+}
+
+/// Render the navigation tabs at the top
+pub fn render_tabs(current_view: View, area: Rect, buf: &mut Buffer) {
+    let titles: Vec<Line> = View::all()
+        .iter()
+        .map(|v| {
+            let style = if *v == current_view {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(v.name(), style))
+        })
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::BOTTOM))
+        .select(current_view.index())
+        .highlight_style(Style::default().fg(Color::Yellow));
+
+    tabs.render(area, buf);
+}
+
+/// Compute aggregate health status indicator from `HealthStatus`.
+fn aggregate_health_indicator(health: &HealthStatus) -> (&'static str, Style) {
+    let has_error = !health.watcher_running
+        || !health.db_accessible
+        || matches!(health.wezterm_circuit.state, CircuitStateKind::Open);
+    let has_warning = !health.wezterm_accessible
+        || matches!(health.wezterm_circuit.state, CircuitStateKind::HalfOpen);
+
+    if has_error {
+        (
+            "ERROR",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if has_warning {
+        ("WARNING", Style::default().fg(Color::Yellow))
+    } else {
+        ("OK", Style::default().fg(Color::Green))
+    }
+}
+
+/// Render the home/dashboard view
+pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let has_dashboard = state.dashboard.is_some();
+    let viewport = viewport_class(area);
+    let compact = matches!(viewport, ViewportClass::Compact);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(home_layout_constraints(has_dashboard, viewport))
+        .split(area);
+
+    // Title + aggregate status
+    let (aggregate_label, aggregate_style) = state.health.as_ref().map_or_else(
+        || ("LOADING", Style::default().fg(Color::Yellow)),
+        |h| aggregate_health_indicator(h),
+    );
+    let viewport_label = match viewport {
+        ViewportClass::Compact => "COMPACT",
+        ViewportClass::Regular => "STANDARD",
+        ViewportClass::Wide => "DESKTOP",
+    };
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "FrankenTerm Control Center  ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(aggregate_label, aggregate_style),
+        Span::styled(
+            format!("  [{viewport_label}]"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::NONE));
+    title.render(chunks[0], buf);
+
+    // Health status detail
+    let health_text = state.health.as_ref().map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "Loading...",
+                Style::default().fg(Color::Yellow),
+            ))]
+        },
+        |health| {
+            let watcher_status = if health.watcher_running {
+                Span::styled("RUNNING", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("STOPPED", Style::default().fg(Color::Red))
+            };
+            let db_status = if health.db_accessible {
+                Span::styled("OK", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("NOT FOUND", Style::default().fg(Color::Red))
+            };
+            let wezterm_status = if health.wezterm_accessible {
+                Span::styled("OK", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("ERROR", Style::default().fg(Color::Red))
+            };
+            let (circuit_full, circuit_compact, circuit_style) = match health.wezterm_circuit.state
+            {
+                CircuitStateKind::Closed => (
+                    "CLOSED".to_string(),
+                    "CLOSED".to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+                CircuitStateKind::HalfOpen => (
+                    "HALF-OPEN".to_string(),
+                    "HALF".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                CircuitStateKind::Open => {
+                    let remaining = health.wezterm_circuit.cooldown_remaining_ms.unwrap_or(0);
+                    (
+                        format!("OPEN ({remaining} ms cooldown)"),
+                        "OPEN".to_string(),
+                        Style::default().fg(Color::Red),
+                    )
+                }
+            };
+
+            let capture_lag = health.last_capture_ts.map_or_else(
+                || Span::styled("no captures yet", Style::default().fg(Color::Gray)),
+                |ts| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|d| i64::try_from(d.as_millis()).ok())
+                        .unwrap_or(0);
+                    let lag_ms = now_ms.saturating_sub(ts);
+                    if lag_ms > 10_000 {
+                        Span::styled(format!("{lag_ms} ms"), Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::styled(format!("{lag_ms} ms"), Style::default().fg(Color::Green))
+                    }
+                },
+            );
+            if compact {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Watcher "),
+                        watcher_status,
+                        Span::raw("  DB "),
+                        db_status,
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  WezTerm "),
+                        wezterm_status,
+                        Span::raw("  Circuit "),
+                        Span::styled(circuit_compact, circuit_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Capture "),
+                        capture_lag,
+                        Span::raw("  Failures "),
+                        Span::raw(format!(
+                            "{}/{}",
+                            health.wezterm_circuit.consecutive_failures,
+                            health.wezterm_circuit.failure_threshold
+                        )),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::from(vec![Span::raw("  Watcher:       "), watcher_status]),
+                    Line::from(vec![Span::raw("  Database:      "), db_status]),
+                    Line::from(vec![Span::raw("  WezTerm CLI:   "), wezterm_status]),
+                    Line::from(vec![
+                        Span::raw("  Circuit:       "),
+                        Span::styled(circuit_full, circuit_style),
+                    ]),
+                    Line::from(vec![Span::raw("  Capture lag:   "), capture_lag]),
+                    Line::from(vec![
+                        Span::raw("  Failures:      "),
+                        Span::raw(format!(
+                            "{}/{}",
+                            health.wezterm_circuit.consecutive_failures,
+                            health.wezterm_circuit.failure_threshold
+                        )),
+                    ]),
+                ]
+            }
+        },
+    );
+
+    let health_block = Paragraph::new(health_text).block(
+        Block::default()
+            .title("System Status")
+            .borders(Borders::ALL),
+    );
+    health_block.render(chunks[1], buf);
+
+    // Metrics snapshot
+    let metrics_text = state.health.as_ref().map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "...",
+                Style::default().fg(Color::Gray),
+            ))]
+        },
+        |health| {
+            let pane_count_style = if health.pane_count == 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let event_count_style = if health.event_count > 100 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let unhandled = state.events.iter().filter(|e| !e.handled).count();
+            let unhandled_style = if unhandled > 0 {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let triage_count = state.triage_items.len();
+            let triage_style = if triage_count > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            if compact {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Panes "),
+                        Span::styled(health.pane_count.to_string(), pane_count_style),
+                        Span::raw("  Events "),
+                        Span::styled(health.event_count.to_string(), event_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Unhandled "),
+                        Span::styled(unhandled.to_string(), unhandled_style),
+                        Span::raw("  Triage "),
+                        Span::styled(triage_count.to_string(), triage_style),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Panes:         "),
+                        Span::styled(health.pane_count.to_string(), pane_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Events:        "),
+                        Span::styled(health.event_count.to_string(), event_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Unhandled:     "),
+                        Span::styled(unhandled.to_string(), unhandled_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Triage items:  "),
+                        Span::styled(triage_count.to_string(), triage_style),
+                    ]),
+                ]
+            }
+        },
+    );
+    let metrics_block =
+        Paragraph::new(metrics_text).block(Block::default().title("Metrics").borders(Borders::ALL));
+    metrics_block.render(chunks[2], buf);
+
+    // Dashboard panels (when available)
+    if let Some(ref dashboard_state) = state.dashboard {
+        let model = adapt_dashboard(dashboard_state);
+        render_dashboard_panels(&model, chunks[3], buf);
+    }
+
+    // Quick help — index shifts when dashboard is present
+    let help_idx = if has_dashboard { 4 } else { 3 };
+    let help_lines = match viewport {
+        ViewportClass::Wide => vec![
+            Line::from(Span::styled(
+                "Desktop workflow:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab/Shift+Tab switch views | j/k move | Enter act | / search"),
+            Line::from("  r refresh | u mark handled | p cycle profile | q quit"),
+        ],
+        ViewportClass::Regular => vec![
+            Line::from(Span::styled(
+                "Navigation:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab views | j/k move | Enter action | ? help | q quit"),
+        ],
+        ViewportClass::Compact => vec![
+            Line::from(Span::styled(
+                "Compact controls:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab views | j/k move | Enter | ? help | q quit"),
+        ],
+    };
+    let instructions = Paragraph::new(help_lines)
+        .block(Block::default().title("Quick Help").borders(Borders::ALL));
+    instructions.render(chunks[help_idx], buf);
+
+    // Footer with error if any
+    let footer_idx = if has_dashboard { 5 } else { 4 };
+    let footer_inner_width = usize::from(chunks[footer_idx].width.saturating_sub(2)).max(1);
+    let (footer_msg, footer_style) = if let Some(ref error) = state.error_message {
+        (
+            truncate_str(error, footer_inner_width),
+            Style::default().fg(Color::Red),
+        )
+    } else if compact {
+        (
+            "No active errors | Press r to refresh".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            "Ready | Home shows fleet health, cost, and throttling state".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let footer_widget = Paragraph::new(Span::styled(footer_msg, footer_style))
+        .block(Block::default().borders(Borders::TOP));
+    footer_widget.render(chunks[footer_idx], buf);
+}
+
+/// Render the unified dashboard panels (cost, rate limits, backpressure).
+///
+/// Arranges panels in a 2x2 grid when space permits, or falls back to a single
+/// column for narrow terminals (< 60 columns).
+fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    // Outer block with health-colored title
+    let health_style: Style = model.health_style.into();
+    let title_spans = Line::from(vec![
+        Span::styled("Dashboard", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(&model.health_label, health_style),
+    ]);
+    let outer = Block::default().title(title_spans).borders(Borders::ALL);
+    let inner = outer.inner(area);
+    outer.render(area, buf);
+
+    if inner.height < 6 || inner.width < 28 {
+        // Terminal too small — show summary line only.
+        let summary = Paragraph::new(Span::raw(&model.summary_line))
+            .block(Block::default().borders(Borders::NONE));
+        summary.render(inner, buf);
+        return;
+    }
+
+    // Desktop mode: roomy symmetric grid.
+    if inner.width >= 110 && inner.height >= 12 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+
+        render_cost_panel(model, top_cols[0], buf);
+        render_rate_limit_panel(model, top_cols[1], buf);
+        render_backpressure_panel(model, rows[1], buf);
+    // Tablet/narrow-desktop mode: weighted split keeps dense panels readable.
+    } else if inner.width >= 78 && inner.height >= 10 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(inner);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[0]);
+
+        render_cost_panel(model, top_cols[0], buf);
+        render_rate_limit_panel(model, top_cols[1], buf);
+        render_backpressure_panel(model, rows[1], buf);
+    // Compact mode: single-column stack avoids cramped two-column text.
+    } else {
+        let panels = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(40),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+            ])
+            .split(inner);
+
+        render_cost_panel(model, panels[0], buf);
+        render_rate_limit_panel(model, panels[1], buf);
+        render_backpressure_panel(model, panels[2], buf);
+    }
+}
+
+/// Render cost tracker panel: per-provider cost rows + totals + alerts.
+fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().title("Cost Tracker").borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Header
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "{:<12} {:>10} {:>12} {:>6}",
+            "Provider", "Cost", "Tokens", "Budget"
+        ),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    // Cost rows
+    for row in &model.cost_rows {
+        let budget_style: Style = row.budget_style.into();
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:<12} ", row.agent_type)),
+            Span::styled(
+                format!("{:>10} ", row.cost_label),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(format!("{:>12} ", row.tokens_label)),
+            Span::styled(format!("{:>6}", row.budget_label), budget_style),
+        ]));
+    }
+
+    // Totals
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Total:       ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>10} ", model.total_cost_label),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>12}", model.total_tokens_label),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Alerts (if any)
+    for alert in &model.alert_rows {
+        let alert_style: Style = alert.style.into();
+        lines.push(Line::from(vec![
+            Span::styled("  ! ", alert_style),
+            Span::styled(&alert.message, alert_style),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render rate limit panel: per-provider rate limit status.
+fn render_rate_limit_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let title = format!("Rate Limits ({})", model.limited_provider_label);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    if model.rate_limit_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No rate limit data",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for row in &model.rate_limit_rows {
+            let status_style: Style = row.status_style.into();
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<12} ", row.agent_type)),
+                Span::styled(format!("{:<14} ", row.status_label), status_style),
+                Span::raw(format!("{} ", row.limited_label)),
+                Span::styled(&row.clear_label, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render backpressure panel: tier, queue depths, paused panes.
+fn render_backpressure_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let bp_style: Style = model.bp_tier_style.into();
+    let title_spans = Line::from(vec![
+        Span::raw("Backpressure "),
+        Span::styled(&model.bp_tier_label, bp_style),
+    ]);
+    let block = Block::default().title(title_spans).borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("  Capture queue: "),
+            Span::styled(&model.bp_capture_label, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Write queue:   "),
+            Span::styled(&model.bp_write_label, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Paused panes:  "),
+            Span::styled(&model.bp_paused_label, Style::default().fg(Color::Magenta)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render the panes list view
+pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let chunks = if stacked_mode {
+        let detail_height = if area.height >= 22 { 10 } else { 8 };
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area)
+    };
+
+    let mut bookmarks_by_pane: HashMap<u64, Vec<&PaneBookmarkView>> = HashMap::new();
+    for bookmark in &state.pane_bookmarks {
+        bookmarks_by_pane
+            .entry(bookmark.pane_id)
+            .or_default()
+            .push(bookmark);
+    }
+
+    let filtered_indices = filtered_pane_indices(state);
+    let selected_filtered_index = state
+        .selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_pane = filtered_indices
+        .get(selected_filtered_index)
+        .and_then(|idx| state.panes.get(*idx));
+
+    let list_block = Block::default()
+        .title(format!(
+            "Panes ({}/{}){}",
+            filtered_indices.len(),
+            state.panes.len(),
+            if stacked_mode { " [compact]" } else { "" }
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
+        .split(list_inner);
+
+    let active_profile_name = state
+        .ruleset_profile_state
+        .as_ref()
+        .map(|s| s.active_profile.as_str())
+        .unwrap_or("default");
+    let selected_profile_name = state
+        .ruleset_profile_state
+        .as_ref()
+        .and_then(|s| {
+            s.profiles
+                .get(
+                    state
+                        .selected_ruleset_profile_index
+                        .min(s.profiles.len().saturating_sub(1)),
+                )
+                .map(|p| p.name.as_str())
+        })
+        .unwrap_or("default");
+    let profile_count = state
+        .ruleset_profile_state
+        .as_ref()
+        .map_or(0, |s| s.profiles.len());
+
+    let filter_summary = if stacked_mode {
+        format!(
+            "q='{}' uh={} bm={} ag={} dom={} prof={}/{} ({})",
+            state.panes_filter_query,
+            state.panes_unhandled_only,
+            state.panes_bookmarked_only,
+            state.panes_agent_filter.as_deref().unwrap_or("all"),
+            state.panes_domain_filter.as_deref().unwrap_or("all"),
+            selected_profile_name,
+            active_profile_name,
+            profile_count
+        )
+    } else {
+        // Mirrors the ftui backend (ft-u3989): the side-by-side list is
+        // ~62% of the terminal width, so the verbose one-line summary
+        // truncated away domain/profile state at common widths. Split it
+        // across two header rows instead.
+        format!(
+            "filter='{}' unhandled={} bookmarked={}",
+            state.panes_filter_query, state.panes_unhandled_only, state.panes_bookmarked_only,
+        )
+    };
+    let filter_summary_overflow = (!stacked_mode).then(|| {
+        format!(
+            "agent={} domain={} profile={} active={} ({})",
+            state.panes_agent_filter.as_deref().unwrap_or("all"),
+            state.panes_domain_filter.as_deref().unwrap_or("all"),
+            selected_profile_name,
+            active_profile_name,
+            profile_count
+        )
+    });
+    let header_width = usize::from(list_chunks[0].width.saturating_sub(1)).max(1);
+    let columns = if ultra_compact {
+        "id ag st u title"
+    } else if stacked_mode {
+        "id bm ag state u title"
+    } else {
+        "id  bm      agent    state          unhandled  title"
+    };
+    let mut header_lines = vec![
+        Line::from(truncate_str(columns, header_width)),
+        Line::from(Span::styled(
+            truncate_str(&filter_summary, header_width),
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    if let Some(overflow) = filter_summary_overflow.as_deref() {
+        header_lines.push(Line::from(Span::styled(
+            truncate_str(overflow, header_width),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    Paragraph::new(header_lines).render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        Paragraph::new(Span::styled(
+            "No panes match the current filters.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(list_chunks[1], buf);
+    } else {
+        let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
+        for (pos, pane_index) in filtered_indices.iter().enumerate() {
+            let pane = &state.panes[*pane_index];
+            let bookmark_summary = bookmarks_by_pane.get(&pane.pane_id).map_or_else(
+                || "-".to_string(),
+                |bookmarks| {
+                    if bookmarks.len() == 1 {
+                        truncate_str(&bookmarks[0].alias, 6)
+                    } else {
+                        format!("{}*", bookmarks.len())
+                    }
+                },
+            );
+            let style = if pos == selected_filtered_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if pane.unhandled_event_count > 0 {
+                Style::default().fg(Color::Yellow)
+            } else if pane.pane_state == "AltScreen" {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default()
+            };
+            let agent = pane.agent_type.as_deref().unwrap_or("unknown");
+            let raw_line = if ultra_compact {
+                format!(
+                    "{:>3} {:6} {:4} {:>2} {}",
+                    pane.pane_id,
+                    truncate_str(agent, 6),
+                    truncate_str(&pane.pane_state, 4),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 18)
+                )
+            } else if stacked_mode {
+                format!(
+                    "{:>3} {:4} {:6} {:8} {:>2} {}",
+                    pane.pane_id,
+                    bookmark_summary,
+                    truncate_str(agent, 6),
+                    truncate_str(&pane.pane_state, 8),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 20)
+                )
+            } else {
+                format!(
+                    "{:>3} {:6} {:8} {:12} {:>9}  {}",
+                    pane.pane_id,
+                    bookmark_summary,
+                    truncate_str(agent, 8),
+                    truncate_str(&pane.pane_state, 12),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 24)
+                )
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Pane"
+        } else {
+            "Pane Details"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(pane) = selected_pane {
+        let pane_bookmarks = bookmarks_by_pane
+            .get(&pane.pane_id)
+            .cloned()
+            .unwrap_or_default();
+        let last_activity = pane
+            .last_activity_ts
+            .map_or_else(|| "unknown".to_string(), |ts| ts.to_string());
+        let next_action = if selected_profile_name != active_profile_name {
+            format!("Apply selected profile: ft rules profile apply {selected_profile_name}")
+        } else if pane.unhandled_event_count > 0 {
+            format!("Run: ft events --pane-id {} --unhandled", pane.pane_id)
+        } else {
+            format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
+        };
+        let bookmark_summary = if pane_bookmarks.is_empty() {
+            "none".to_string()
+        } else {
+            pane_bookmarks
+                .iter()
+                .map(|b| {
+                    if b.tags.is_empty() {
+                        b.alias.clone()
+                    } else {
+                        format!("{} [{}]", b.alias, b.tags.join(","))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 34;
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("#{} {}", pane.pane_id, pane.title),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!(
+                    "State {} | Agent {}",
+                    pane.pane_state,
+                    pane.agent_type.as_deref().unwrap_or("unknown")
+                ),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!(
+                    "Domain {} | Unhandled {}",
+                    pane.domain, pane.unhandled_event_count
+                ),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Bookmarks {}", truncate_str(&bookmark_summary, 30)),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset {selected_profile_name}/{active_profile_name}"),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Next best action:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&next_action, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(truncate_str(
+                "Keys: j/k nav | p profile | Enter apply | b bookmarked",
+                detail_width,
+            )));
+        } else {
+            details.push(Line::from(truncate_str(
+                &format!("Pane ID: {}", pane.pane_id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Title: {}", pane.title),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Domain: {}", pane.domain),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent: {}", pane.agent_type.as_deref().unwrap_or("unknown")),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("State: {}", pane.pane_state),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("CWD: {}", pane.cwd.as_deref().unwrap_or("unknown")),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Last Activity: {}", last_activity),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Unhandled Events: {}", pane.unhandled_event_count),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Bookmarks: {}", truncate_str(&bookmark_summary, 80)),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset Active: {}", active_profile_name),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset Selected: {}", selected_profile_name),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Next best action:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&next_action, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str(
+                    "Keys: p=cycle profile, Enter=apply selected profile, b=bookmarked only",
+                    detail_width,
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No pane selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
+/// Render the events feed view
+pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
+
+    let filtered_indices = filtered_event_indices(state);
+    let selected_filtered = state
+        .events_selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_event = filtered_indices
+        .get(selected_filtered)
+        .and_then(|idx| state.events.get(*idx));
+
+    // --- Left/Top: event list ---
+    let list_block = Block::default()
+        .title(format!(
+            "Events ({}/{}){}",
+            filtered_indices.len(),
+            state.events.len(),
+            if stacked_mode { " [compact]" } else { "" }
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
+        .split(list_inner);
+
+    // Filter summary header — responsive columns
+    let columns = if ultra_compact {
+        "sev  pane rule"
+    } else if stacked_mode {
+        "sev       pane  rule              status"
+    } else {
+        "sev       pane  rule                          status"
+    };
+    let filter_summary = if stacked_mode {
+        format!(
+            "u={}  q='{}'",
+            state.events_unhandled_only, state.events_pane_filter,
+        )
+    } else {
+        format!(
+            "unhandled_only={}  pane/rule='{}'",
+            state.events_unhandled_only, state.events_pane_filter,
+        )
+    };
+    Paragraph::new(vec![
+        Line::from(columns),
+        Line::from(Span::styled(
+            filter_summary,
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        let msg = if state.events.is_empty() {
+            "No events yet. Watcher will capture pattern matches here."
+        } else {
+            "No events match the current filters."
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
+            .render(list_chunks[1], buf);
+    } else {
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
+        let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
+        for (pos, event_index) in filtered_indices.iter().enumerate() {
+            let event = &state.events[*event_index];
+            let severity_style = severity_color(&event.severity);
+            let handled_marker = if event.handled { " " } else { "*" };
+
+            let raw_line = if ultra_compact {
+                format!(
+                    "[{:6}] {:>4} {}",
+                    truncate_str(&event.severity, 6),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 14),
+                )
+            } else if stacked_mode {
+                format!(
+                    "[{:8}] {:>4} {:20} {}",
+                    truncate_str(&event.severity, 8),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 20),
+                    handled_marker,
+                )
+            } else {
+                format!(
+                    "[{:8}] {:>4}  {:28} {}",
+                    truncate_str(&event.severity, 8),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 28),
+                    handled_marker,
+                )
+            };
+
+            let style = if pos == selected_filtered {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                severity_style
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    // --- Right/Bottom: event detail panel ---
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Event"
+        } else {
+            "Event Details"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(event) = selected_event {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
+        let severity_style = severity_color(&event.severity);
+        let handled_label = if event.handled {
+            "handled"
+        } else {
+            "UNHANDLED"
+        };
+        let handled_style = if event.handled {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        };
+
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("#{} P{} {}", event.id, event.pane_id, event.timestamp),
+                detail_width,
+            )));
+            details.push(Line::from(vec![
+                Span::styled(truncate_str(&event.severity, 10), severity_style),
+                Span::raw(" | "),
+                Span::styled(handled_label, handled_style),
+            ]));
+            details.push(Line::from(truncate_str(
+                &format!("Rule: {}", event.rule_id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Match: {}", event.message),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("u=unhandled j/k=nav", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            let triage = event.triage_state.as_deref().unwrap_or("unset");
+            let labels = if event.labels.is_empty() {
+                "none".to_string()
+            } else {
+                event.labels.join(",")
+            };
+            let note = event.note.as_deref().unwrap_or("none");
+
+            details.push(Line::from(vec![
+                Span::raw("ID: "),
+                Span::styled(
+                    event.id.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            details.push(Line::from(format!("Pane: {}", event.pane_id)));
+            details.push(Line::from(vec![
+                Span::raw("Severity: "),
+                Span::styled(event.severity.clone(), severity_style),
+            ]));
+            details.push(Line::from(vec![
+                Span::raw("Status: "),
+                Span::styled(handled_label, handled_style),
+            ]));
+            details.push(Line::from(format!("Triage: {triage}")));
+            details.push(Line::from(format!("Labels: {}", truncate_str(&labels, 60))));
+            details.push(Line::from(format!("Note: {}", truncate_str(note, 60))));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Rule:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(format!("  {}", event.rule_id)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Match (redacted):",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(format!(
+                "  {}",
+                truncate_str(&event.message, 60)
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(format!("Captured: {}", event.timestamp)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Actions:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if !event.handled {
+                details.push(Line::from(format!(
+                    "  ft events --pane-id {} --unhandled",
+                    event.pane_id
+                )));
+            }
+            details.push(Line::from(format!(
+                "  ft why --recent --pane {}",
+                event.pane_id
+            )));
+        }
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No event selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
+/// Map severity string to a color style.
+fn severity_color(severity: &str) -> Style {
+    match severity {
+        "critical" | "error" => Style::default().fg(Color::Red),
+        "warning" => Style::default().fg(Color::Yellow),
+        "info" => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn history_group_key(entry: &HistoryEntryView) -> String {
+    if let Some(workflow_id) = &entry.workflow_id {
+        format!("workflow:{workflow_id}")
+    } else if let Some(pane_id) = entry.pane_id {
+        format!("pane:{pane_id}")
+    } else {
+        "global".to_string()
+    }
+}
+
+fn history_group_title(group_key: &str) -> String {
+    if let Some(workflow_id) = group_key.strip_prefix("workflow:") {
+        format!("Workflow {workflow_id}")
+    } else if let Some(pane_id) = group_key.strip_prefix("pane:") {
+        format!("Pane {pane_id}")
+    } else {
+        "Global".to_string()
+    }
+}
+
+fn history_result_style(result: &str) -> Style {
+    match result {
+        "success" | "completed" => Style::default().fg(Color::Green),
+        "denied" | "failed" => Style::default().fg(Color::Red),
+        "timeout" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Render the action-history view.
+pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
+
+    let filtered_indices = filtered_history_indices(state);
+    let selected_filtered = state
+        .history_selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_entry = filtered_indices
+        .get(selected_filtered)
+        .and_then(|idx| state.history_entries.get(*idx));
+
+    // --- Left/Top: grouped history list ---
+    let list_block = Block::default()
+        .title(format!(
+            "History ({}/{}){}",
+            filtered_indices.len(),
+            state.history_entries.len(),
+            if stacked_mode { " [compact]" } else { "" }
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
+        .split(list_inner);
+
+    let columns = if ultra_compact {
+        "audit action         result"
+    } else if stacked_mode {
+        "audit  action           result  undo  actor"
+    } else {
+        "audit     action             result    undo  actor"
+    };
+    let filter_summary = if stacked_mode {
+        format!(
+            "u={}  q='{}'",
+            state.history_undoable_only, state.history_filter_query,
+        )
+    } else {
+        format!(
+            "undoable_only={}  q='{}'",
+            state.history_undoable_only, state.history_filter_query,
+        )
+    };
+    Paragraph::new(vec![
+        Line::from(columns),
+        Line::from(Span::styled(
+            filter_summary,
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        let msg = if state.history_entries.is_empty() {
+            "No action history yet. Run workflows or ft send to populate audit records."
+        } else {
+            "No history entries match the current filters."
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
+            .render(list_chunks[1], buf);
+    } else {
+        let mut lines: Vec<Line> = Vec::new();
+        let mut current_group: Option<String> = None;
+
+        for (pos, entry_idx) in filtered_indices.iter().enumerate() {
+            let entry = &state.history_entries[*entry_idx];
+            let group_key = history_group_key(entry);
+            if current_group.as_deref() != Some(group_key.as_str()) {
+                current_group = Some(group_key.clone());
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("-- {} --", history_group_title(&group_key)),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+
+            let undo_tag = if entry.undoable {
+                "UNDO"
+            } else if entry.undone {
+                "done"
+            } else {
+                "-"
+            };
+            let result_style = history_result_style(&entry.result);
+
+            let line_text = if ultra_compact {
+                format!(
+                    "#{:>5} {:12} {:8}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 12),
+                    entry.result,
+                )
+            } else if stacked_mode {
+                format!(
+                    "#{:>5} {:14} {:8} {:>4} {}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 14),
+                    entry.result,
+                    undo_tag,
+                    truncate_str(&entry.actor_kind, 6),
+                )
+            } else {
+                format!(
+                    "#{:>6} {:18} {:8} {:>5} {}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 18),
+                    entry.result,
+                    undo_tag,
+                    truncate_str(&entry.actor_kind, 8),
+                )
+            };
+
+            let style = if pos == selected_filtered {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.undoable {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                result_style
+            };
+            lines.push(Line::styled(line_text, style));
+        }
+
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    // --- Right/Bottom: selected history detail ---
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Entry"
+        } else {
+            "History Details"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(entry) = selected_entry {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
+        let undo_status = if entry.undoable {
+            "undoable"
+        } else if entry.undone {
+            "undone"
+        } else {
+            "not-undoable"
+        };
+
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            let group = history_group_title(&history_group_key(entry));
+            details.push(Line::from(truncate_str(
+                &format!("#{} {} {}", entry.audit_id, entry.timestamp, group),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("{} | {} | {}", entry.action_kind, entry.result, undo_status),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Actor: {}", entry.actor_kind),
+                detail_width,
+            )));
+            if !entry.summary.is_empty() {
+                details.push(Line::from(truncate_str(&entry.summary, detail_width)));
+            }
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("u=undoable j/k=nav", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            let group = history_group_title(&history_group_key(entry));
+            details.push(Line::from(vec![
+                Span::raw("Audit ID: "),
+                Span::styled(
+                    format!("#{}", entry.audit_id),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            details.push(Line::from(format!("Group: {}", group)));
+            details.push(Line::from(format!("Action: {}", entry.action_kind)));
+            details.push(Line::from(format!("Result: {}", entry.result)));
+            details.push(Line::from(format!("Actor: {}", entry.actor_kind)));
+            details.push(Line::from(format!("Undo: {}", undo_status)));
+            details.push(Line::from(format!("Timestamp: {}", entry.timestamp)));
+
+            if let Some(pane_id) = entry.pane_id {
+                details.push(Line::from(format!("Pane: {}", pane_id)));
+            }
+            if let Some(workflow_id) = &entry.workflow_id {
+                details.push(Line::from(format!("Workflow: {}", workflow_id)));
+            }
+            if let Some(step_name) = &entry.step_name {
+                details.push(Line::from(format!("Step: {}", step_name)));
+            }
+            if let Some(strategy) = &entry.undo_strategy {
+                details.push(Line::from(format!("Undo Strategy: {}", strategy)));
+            }
+            if let Some(hint) = &entry.undo_hint {
+                details.push(Line::from(format!("Undo Hint: {}", truncate_str(hint, 80))));
+            }
+            if !entry.summary.is_empty() {
+                details.push(Line::from(format!(
+                    "Summary: {}",
+                    truncate_str(&entry.summary, 80)
+                )));
+            }
+
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Quick Jumps:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if let Some(workflow_id) = &entry.workflow_id {
+                details.push(Line::from(format!("  ft history --workflow {workflow_id}")));
+                details.push(Line::from(format!("  ft workflow status {workflow_id}")));
+            }
+            if let Some(pane_id) = entry.pane_id {
+                details.push(Line::from(format!(
+                    "  ft history --pane {pane_id} --limit 50"
+                )));
+                details.push(Line::from(format!(
+                    "  ft events --pane-id {pane_id} --limit 20"
+                )));
+                if let Some(rule_id) = &entry.rule_id {
+                    details.push(Line::from(format!(
+                        "  ft events --pane-id {pane_id} --rule-id {rule_id}"
+                    )));
+                }
+            }
+        }
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No history entry selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
+/// Render the search view
+pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let show_suggestions = !state.search_suggestions.is_empty() && state.search_results.is_empty();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if show_suggestions {
+            vec![
+                Constraint::Length(4), // Search input + status
+                Constraint::Length(5), // Suggestions
+                Constraint::Length(8), // Saved searches
+                Constraint::Min(5),    // Results + detail
+            ]
+        } else {
+            vec![
+                Constraint::Length(4), // Search input + status
+                Constraint::Length(0), // No suggestions
+                Constraint::Length(8), // Saved searches
+                Constraint::Min(5),    // Results + detail
+            ]
+        })
+        .split(area);
+
+    // Search input
+    let cursor_indicator = if state.search_query.is_empty() {
+        "Search (FTS5) — type query, Enter to search, Ctrl+F toggle fast-only"
+    } else {
+        "Search (FTS5) — Enter to search, Esc to clear, Ctrl+F toggle fast-only"
+    };
+    let mode_label = if state.search_fast_only {
+        "fast-only"
+    } else {
+        "progressive"
+    };
+    let timing_label = search_timing_label(state);
+    let mut status_spans = vec![
+        Span::styled(
+            format!("mode={mode_label} "),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("phase={} ", state.search_phase.label()),
+            search_phase_style(state.search_phase),
+        ),
+        Span::styled(
+            format!("timing={timing_label}"),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+    if let Some(detail) = state.search_phase_detail.as_deref() {
+        status_spans.push(Span::raw(" "));
+        status_spans.push(Span::styled(
+            truncate_str(detail, 40),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let search_input = Paragraph::new(vec![
+        Line::from(format!("{}_", state.search_query)),
+        Line::from(status_spans),
+    ])
+    .block(
+        Block::default()
+            .title(cursor_indicator)
+            .borders(Borders::ALL),
+    );
+    search_input.render(chunks[0], buf);
+
+    // Inline suggestions (shown while typing, before executing a search)
+    if show_suggestions {
+        let mut suggestion_lines: Vec<Line> = Vec::new();
+        for s in state.search_suggestions.iter().take(4) {
+            let desc = s.description.as_deref().unwrap_or("");
+            suggestion_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", s.text),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {desc}"), Style::default().fg(Color::Gray)),
+            ]));
+        }
+        let suggestions_block = Block::default().title("Suggestions").borders(Borders::ALL);
+        Paragraph::new(suggestion_lines)
+            .block(suggestions_block)
+            .render(chunks[1], buf);
+    }
+
+    // Saved searches list
+    let saved_block = Block::default()
+        .title(format!("Saved Searches ({})", state.saved_searches.len()))
+        .borders(Borders::ALL);
+    let saved_inner = saved_block.inner(chunks[2]);
+    saved_block.render(chunks[2], buf);
+    if state.saved_searches.is_empty() {
+        Paragraph::new(Span::styled(
+            "No saved searches yet. Use `ft search save <name> <query>`.",
+            Style::default().fg(Color::Gray),
+        ))
+        .render(saved_inner, buf);
+    } else {
+        let selected_saved = state
+            .saved_search_selected_index
+            .min(state.saved_searches.len().saturating_sub(1));
+        let saved_header = if area.width < 96 {
+            "name        ena query"
+        } else {
+            "name           ena sched(ms) pane last_run      err query"
+        };
+        let mut saved_lines = vec![Line::from(saved_header)];
+        let search_compact_saved = area.width < 96;
+        for (idx, saved) in state.saved_searches.iter().enumerate() {
+            let enabled = if saved.enabled { "on" } else { "off" };
+            let line = if search_compact_saved {
+                format!(
+                    "{:11} {:3} {}",
+                    truncate_str(&saved.name, 11),
+                    enabled,
+                    truncate_str(&saved.query, 30),
+                )
+            } else {
+                let schedule = saved
+                    .schedule_interval_ms
+                    .map_or_else(|| "-".to_string(), |v| v.to_string());
+                let pane = saved
+                    .pane_id
+                    .map_or_else(|| "-".to_string(), |id| id.to_string());
+                let last_run = saved
+                    .last_run_at
+                    .map_or_else(|| "-".to_string(), |ts| ts.to_string());
+                let err = if saved.last_error.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                };
+                format!(
+                    "{:14} {:3} {:9} {:4} {:12} {:3} {}",
+                    truncate_str(&saved.name, 14),
+                    enabled,
+                    truncate_str(&schedule, 9),
+                    truncate_str(&pane, 4),
+                    truncate_str(&last_run, 12),
+                    err,
+                    truncate_str(&saved.query, 32),
+                )
+            };
+            if idx == selected_saved {
+                saved_lines.push(Line::styled(
+                    line,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                saved_lines.push(Line::raw(line));
+            }
+        }
+        Paragraph::new(saved_lines).render(saved_inner, buf);
+    }
+
+    if state.search_results.is_empty() {
+        let msg = if state.search_last_query.is_empty() {
+            "Type a query + Enter, or Ctrl+N/Ctrl+P to pick a saved search then Ctrl+R to run."
+        } else {
+            "No results found. Try a different query."
+        };
+        let results = Paragraph::new(Span::styled(msg, Style::default().fg(Color::Gray))).block(
+            Block::default()
+                .title(format!(
+                    "Results ({} · phase={} · {})",
+                    if state.search_last_query.is_empty() {
+                        "waiting"
+                    } else {
+                        "0 matches"
+                    },
+                    state.search_phase.label(),
+                    timing_label
+                ))
+                .borders(Borders::ALL),
+        );
+        results.render(chunks[3], buf);
+        return;
+    }
+
+    // Split results area into list + detail — responsive layout
+    let search_stacked = area.width < 96 || area.height < 18;
+    let search_detail_height = if area.height >= 22 { 8 } else { 6 };
+    let result_chunks = if search_stacked {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(chunks[3].height.saturating_sub(search_detail_height)),
+                Constraint::Length(search_detail_height),
+            ])
+            .split(chunks[3])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(chunks[3])
+    };
+
+    let selected = state
+        .search_selected_index
+        .min(state.search_results.len().saturating_sub(1));
+
+    // Results list
+    let list_block = Block::default()
+        .title(format!(
+            "Results ({} matches for '{}' · {} · {})",
+            state.search_results.len(),
+            truncate_str(&state.search_last_query, 20),
+            state.search_phase.label(),
+            timing_label,
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(result_chunks[0]);
+    list_block.render(result_chunks[0], buf);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(state.search_results.len() + 1);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "status: mode={mode_label}, phase={}, timing={timing_label}",
+            state.search_phase.label()
+        ),
+        Style::default().fg(Color::Gray),
+    )));
+    for (pos, result) in state.search_results.iter().enumerate() {
+        let snippet_preview = truncate_str(&result.snippet, 40);
+        if pos == selected {
+            lines.push(Line::styled(
+                format!(
+                    "P{:>3} | {:.2} | {}",
+                    result.pane_id, result.rank, snippet_preview,
+                ),
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("P{:>3}", result.pane_id),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" | {:.2} | {}", result.rank, snippet_preview)),
+            ]));
+        }
+    }
+    Paragraph::new(lines).render(list_inner, buf);
+
+    // Detail panel for selected result
+    let detail_block = Block::default()
+        .title(if search_stacked {
+            "Selected Match"
+        } else {
+            "Match Context"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(result_chunks[1]);
+    detail_block.render(result_chunks[1], buf);
+
+    if let Some(result) = state.search_results.get(selected) {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let details = if search_stacked {
+            vec![
+                Line::from(truncate_str(
+                    &format!(
+                        "P{} rank={:.2} {}",
+                        result.pane_id, result.rank, result.timestamp
+                    ),
+                    detail_width,
+                )),
+                Line::from(truncate_str(&result.snippet, detail_width)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    truncate_str("Ctrl+N/P=saved, Ctrl+R=run", detail_width),
+                    Style::default().fg(Color::Gray),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled("Pane: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(result.pane_id.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Rank: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{:.4}", result.rank)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Captured: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(result.timestamp.to_string()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Snippet (redacted):",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(result.snippet.clone()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Saved search keys:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from("Ctrl+N next, Ctrl+P prev, Ctrl+R run, Ctrl+E toggle enable"),
+            ]
+        };
+        Paragraph::new(details).render(detail_inner, buf);
+    }
+}
+
+fn search_phase_style(phase: SearchProgressPhase) -> Style {
+    match phase {
+        SearchProgressPhase::Idle => Style::default().fg(Color::Gray),
+        SearchProgressPhase::RunningInitial => Style::default().fg(Color::Yellow),
+        SearchProgressPhase::InitialOnly => Style::default().fg(Color::Cyan),
+        SearchProgressPhase::RefinementUnavailable => Style::default().fg(Color::Yellow),
+        SearchProgressPhase::RefinementFailed => Style::default().fg(Color::Red),
+    }
+}
+
+fn search_timing_label(state: &ViewState) -> String {
+    match (
+        state.search_initial_latency_ms,
+        state.search_refined_latency_ms,
+    ) {
+        (Some(initial), Some(refined)) => format!("{initial}ms/{refined}ms"),
+        (Some(initial), None) => format!("{initial}ms"),
+        (None, Some(refined)) => format!("?/{refined}ms"),
+        (None, None) => "-".to_string(),
+    }
+}
+
+/// Render an ASCII progress bar: `[████░░░░] 2/5`
+fn render_progress_bar(current: usize, total: usize, width: usize) -> Vec<Span<'static>> {
+    let bar_width = width.saturating_sub(2); // account for [ ]
+    let filled = current
+        .checked_mul(bar_width)
+        .and_then(|value| value.checked_div(total))
+        .unwrap_or(0);
+    let empty = bar_width.saturating_sub(filled);
+
+    let filled_char = "\u{2588}"; // █
+    let empty_char = "\u{2591}"; // ░
+
+    let bar_style = if current >= total {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+
+    vec![
+        Span::raw("["),
+        Span::styled(filled_char.repeat(filled), bar_style),
+        Span::styled(
+            empty_char.repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!("] {current}/{total}")),
+    ]
+}
+
+/// Color style for a workflow status string.
+fn workflow_status_style(status: &str) -> Style {
+    match status {
+        "running" => Style::default().fg(Color::Cyan),
+        "waiting" => Style::default().fg(Color::Yellow),
+        "failed" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "completed" => Style::default().fg(Color::Green),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Render the triage view
+pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let has_workflows = !state.workflows.is_empty();
+    let constraints = if has_workflows {
+        vec![
+            Constraint::Percentage(50), // Triage list
+            Constraint::Percentage(25), // Workflow progress
+            Constraint::Length(6),      // Details + actions
+        ]
+    } else {
+        vec![
+            Constraint::Min(8),    // Triage list
+            Constraint::Length(6), // Details + actions
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let block = Block::default()
+        .title("Triage (prioritized)")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    block.render(chunks[0], buf);
+
+    if state.triage_items.is_empty() && !has_workflows {
+        let empty_msg = Paragraph::new(Span::styled(
+            "All clear. No items need attention.",
+            Style::default().fg(Color::Green),
+        ));
+        empty_msg.render(inner, buf);
+        return;
+    }
+
+    let triage_compact = area.width < 96;
+    let triage_ultra_compact = area.width < 68;
+    let row_width = usize::from(inner.width.saturating_sub(1)).max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in state.triage_items.iter().enumerate() {
+        let severity_style = match item.severity.as_str() {
+            "error" => Style::default().fg(Color::Red),
+            "warning" => Style::default().fg(Color::Yellow),
+            "info" => Style::default().fg(Color::Blue),
+            _ => Style::default().fg(Color::Gray),
+        };
+
+        let raw_line = if triage_ultra_compact {
+            format!(
+                "[{:5}] {}",
+                truncate_str(&item.severity, 5),
+                truncate_str(&item.title, 40),
+            )
+        } else if triage_compact {
+            format!(
+                "[{:7}] {} | {}",
+                truncate_str(&item.severity, 7),
+                truncate_str(&item.section, 6),
+                truncate_str(&item.title, 50),
+            )
+        } else {
+            format!(
+                "[{:7}] {} | {}",
+                truncate_str(&item.severity, 7),
+                truncate_str(&item.section, 8),
+                truncate_str(&item.title, 80),
+            )
+        };
+
+        let style = if i == state.triage_selected_index {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            severity_style
+        };
+        lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
+    }
+
+    let list = Paragraph::new(lines);
+    list.render(inner, buf);
+
+    // Workflow progress panel (if workflows exist)
+    let detail_chunk_idx = if has_workflows {
+        let wf_block = Block::default()
+            .title(format!("Active Workflows ({})", state.workflows.len()))
+            .borders(Borders::ALL);
+        let wf_inner = wf_block.inner(chunks[1]);
+        wf_block.render(chunks[1], buf);
+
+        let mut wf_lines: Vec<Line> = Vec::new();
+        for (i, wf) in state.workflows.iter().enumerate() {
+            let status_style = workflow_status_style(&wf.status);
+            let is_expanded = state.triage_expanded == Some(i);
+            let expand_marker = if is_expanded { "▼" } else { "▶" };
+
+            // Main workflow line with progress bar
+            let mut spans: Vec<Span> = vec![
+                Span::raw(format!("{expand_marker} ")),
+                Span::styled(
+                    truncate_str(&wf.workflow_name, 20),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" P{} ", wf.pane_id)),
+                Span::styled(format!("{:8}", truncate_str(&wf.status, 8)), status_style),
+                Span::raw(" "),
+            ];
+            spans.extend(render_progress_bar(wf.current_step, wf.total_steps, 12));
+            wf_lines.push(Line::from(spans));
+
+            // Expanded detail: step info + error
+            if is_expanded {
+                wf_lines.push(Line::from(vec![
+                    Span::raw("    ID: "),
+                    Span::styled(&*wf.id, Style::default().fg(Color::Gray)),
+                ]));
+                wf_lines.push(Line::from(format!(
+                    "    Step {}/{} | started {} ms ago",
+                    wf.current_step + 1,
+                    wf.total_steps,
+                    epoch_ms_ago(wf.started_at),
+                )));
+                if let Some(ref error) = wf.error {
+                    wf_lines.push(Line::from(Span::styled(
+                        format!("    ERROR: {}", truncate_str(error, 60)),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                wf_lines.push(Line::from(""));
+            }
+        }
+        Paragraph::new(wf_lines).render(wf_inner, buf);
+        2
+    } else {
+        1
+    };
+
+    // Details + actions panel
+    let detail_block = Block::default()
+        .title(if triage_compact {
+            "Actions (Enter=run, m=mute, e=expand)"
+        } else {
+            "Details / Actions (Enter or 1-9 to run, m to mute, e to expand)"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[detail_chunk_idx]);
+    detail_block.render(chunks[detail_chunk_idx], buf);
+
+    if let Some(item) = state.triage_items.get(state.triage_selected_index) {
+        let mut detail_lines: Vec<Line> = Vec::new();
+        if !item.detail.is_empty() {
+            detail_lines.push(Line::from(Span::raw(truncate_str(&item.detail, 120))));
+        }
+        if !item.actions.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Actions:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for (idx, action) in item.actions.iter().enumerate() {
+                detail_lines.push(Line::from(Span::raw(format!(
+                    "  {}. {} ({})",
+                    idx + 1,
+                    action.label,
+                    truncate_str(&action.command, 40)
+                ))));
+            }
+        }
+        let details = Paragraph::new(detail_lines);
+        details.render(detail_inner, buf);
+    }
+}
+
+/// Compute how many ms ago a timestamp was (for display).
+fn epoch_ms_ago(ts: i64) -> i64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    now_ms.saturating_sub(ts)
+}
+
+#[must_use]
+const fn timeline_zoom_label(zoom: u8) -> &'static str {
+    match zoom {
+        0 => "30m",
+        1 => "1h",
+        2 => "2h",
+        3 => "6h",
+        4 => "12h",
+        _ => "24h",
+    }
+}
+
+/// Render the help view
+pub fn render_help_view(area: Rect, buf: &mut Buffer) {
+    let compact = area.width < 96;
+    let help_text = if compact {
+        vec![
+            Line::from(Span::styled(
+                "FrankenTerm TUI",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Keys:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  q=quit  ?=help  r=refresh"),
+            Line::from("  Tab/S-Tab=views  1-8=jump"),
+            Line::from("  j/k=nav  Enter=action"),
+            Line::from("  m=mute  e=expand"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Per-view:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  Panes: u/b/a/d filter, p=profile"),
+            Line::from("  Events: digits=filter, u=unhandled"),
+            Line::from("  History: text=filter, u=undoable"),
+            Line::from("  Search: C-N/P=saved, C-R=run"),
+            Line::from("  Timeline: +/-=zoom"),
+            Line::from("  Triage: 1-9=action, e=expand"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Views:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  1.Home 2.Panes 3.Events 4.Triage"),
+            Line::from("  5.History 6.Search 7.Help 8.Timeline"),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "FrankenTerm Operator TUI",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Global Keybindings:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  q          Quit"),
+            Line::from("  ?          Show this help"),
+            Line::from("  r          Refresh current view"),
+            Line::from("  Tab        Next view"),
+            Line::from("  Shift+Tab  Previous view"),
+            Line::from("  1-8        Jump to view by number"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "List Navigation:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  j / Down   Move selection down"),
+            Line::from("  k / Up     Move selection up"),
+            Line::from("  Enter      Run primary action (triage)"),
+            Line::from("  1-9        Run action by number (triage)"),
+            Line::from("  m          Mute selected event (triage)"),
+            Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
+            Line::from("  [Panes] u=unhandled-only, b=bookmarked-only, a=agent, d=domain"),
+            Line::from("  [Panes] p=cycle ruleset profile, Enter=apply selected profile"),
+            Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
+            Line::from("  [History] type text to filter, u=undoable-only"),
+            Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
+            Line::from("  [Search] Ctrl+F toggle fast-only mode"),
+            Line::from("  [Timeline] j/k select event, h/l scroll, +/- widen or narrow window"),
+            Line::from("  [Triage] e=expand/collapse workflow progress"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Views:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  1. Home    System overview and health"),
+            Line::from("  2. Panes   List observed panes"),
+            Line::from("  3. Events  Recent detection events"),
+            Line::from("  4. Triage  Prioritized issues + actions"),
+            Line::from("  5. History Audit action timeline"),
+            Line::from("  6. Search  Full-text search"),
+            Line::from("  7. Help    This screen"),
+            Line::from("  8. Timeline Cross-pane event timeline"),
+        ]
+    };
+
+    let help =
+        Paragraph::new(help_text).block(Block::default().title("Help").borders(Borders::ALL));
+    help.render(area, buf);
+}
+
+/// Render the timeline view with a responsive list/detail layout.
+pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
+
+    let selected_index = state
+        .timeline_selected_index
+        .min(state.timeline_rows.len().saturating_sub(1));
+    let selected_row = state.timeline_rows.get(selected_index);
+    let timeline_scroll = state
+        .timeline_scroll
+        .min(state.timeline_rows.len().saturating_sub(1));
+
+    let list_block = Block::default()
+        .title(format!(
+            "Timeline ({}){}",
+            state.timeline_rows.len(),
+            if stacked_mode { " [compact]" } else { "" }
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
+        .split(list_inner);
+
+    let header_width = usize::from(list_chunks[0].width.saturating_sub(1)).max(1);
+    let columns = if ultra_compact {
+        "time pane sev type"
+    } else if stacked_mode {
+        "time pane sev type corr"
+    } else {
+        "time pane sev type handled corr"
+    };
+    let summary = if stacked_mode {
+        format!(
+            "window={}  j/k nav  h/l scroll  +/- zoom  corr=*",
+            timeline_zoom_label(state.timeline_zoom),
+        )
+    } else {
+        format!(
+            "window={}  j/k select  h/l scroll  +/- widen/narrow  corr=*",
+            timeline_zoom_label(state.timeline_zoom),
+        )
+    };
+    Paragraph::new(vec![
+        Line::from(truncate_str(columns, header_width)),
+        Line::from(Span::styled(
+            truncate_str(&summary, header_width),
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if state.timeline_rows.is_empty() {
+        Paragraph::new(Span::styled(
+            "No timeline events in the current window.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(list_chunks[1], buf);
+    } else {
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
+        let visible_count = usize::from(list_chunks[1].height).max(1);
+        let mut lines: Vec<Line> = Vec::with_capacity(visible_count);
+        for (pos, row) in state
+            .timeline_rows
+            .iter()
+            .enumerate()
+            .skip(timeline_scroll)
+            .take(visible_count)
+        {
+            let corr_marker = if row.correlation_label.is_empty() {
+                "-"
+            } else {
+                "*"
+            };
+            let raw_line = if ultra_compact {
+                format!(
+                    "{:>8} {:6} {:7} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 7),
+                    truncate_str(&row.event_type, 14),
+                )
+            } else if stacked_mode {
+                format!(
+                    "{:>8} {:6} {:7} {:12} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 7),
+                    truncate_str(&row.event_type, 12),
+                    corr_marker,
+                )
+            } else {
+                format!(
+                    "{:>8} {:6} {:8} {:12} {:8} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 8),
+                    truncate_str(&row.event_type, 12),
+                    truncate_str(&row.handled_label, 8),
+                    corr_marker,
+                )
+            };
+            let style = if pos == selected_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if row.severity_label.eq_ignore_ascii_case("error") {
+                Style::default().fg(Color::Red)
+            } else if row.severity_label.eq_ignore_ascii_case("warning") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Event"
+        } else {
+            "Event Details"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(row) = selected_row {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
+        let correlation = if row.correlation_label.is_empty() {
+            "none".to_string()
+        } else {
+            row.correlation_label.clone()
+        };
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("{}  {}", row.timestamp, row.pane_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("{} | {}", row.severity_label, row.event_type),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent {} | {}", row.agent_label, row.handled_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Corr {}", correlation),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Summary:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&row.summary, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("Keys: j/k nav | h/l scroll | +/- zoom", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            details.push(Line::from(truncate_str(
+                &format!("Event ID: {}", row.id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Timestamp: {}", row.timestamp),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Pane: {}", row.pane_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent: {}", row.agent_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Type: {}", row.event_type),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Severity: {}", row.severity_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Handled: {}", row.handled_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Correlations: {}", correlation),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Summary:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&row.summary, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str(
+                    "Keys: j/k=select event, h/l=scroll, +/-=widen/narrow timeline window",
+                    detail_width,
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No timeline event selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
+/// Truncate a string to max length, adding ellipsis if needed
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if max_len == 0 {
+        String::new()
+    } else if s.chars().count() <= max_len {
+        s.to_string()
+    } else if max_len > 3 {
+        let mut truncated: String = s.chars().take(max_len - 3).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        s.chars().take(max_len).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit_breaker::CircuitBreakerStatus;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn read_row(area: Rect, buf: &Buffer, row: u16) -> String {
+        let y = area.y + row;
+        let mut text = String::new();
+        for x in area.x..area.x + area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+        text
+    }
+
+    fn buffer_text(area: Rect, buf: &Buffer) -> String {
+        let mut text = String::new();
+        for row in 0..area.height {
+            text.push_str(&read_row(area, buf, row));
+            text.push('\n');
+        }
+        text
+    }
+
+    fn first_row_containing(area: Rect, buf: &Buffer, needle: &str) -> Option<u16> {
+        (0..area.height).find(|row| read_row(area, buf, *row).contains(needle))
+    }
+
+    #[test]
+    fn view_navigation_wraps() {
+        assert_eq!(View::Home.next(), View::Panes);
+        assert_eq!(View::Help.next(), View::Timeline);
+        assert_eq!(View::Timeline.next(), View::Home);
+        assert_eq!(View::Home.prev(), View::Timeline);
+        assert_eq!(View::Timeline.prev(), View::Help);
+        assert_eq!(View::Panes.prev(), View::Home);
+        assert_eq!(View::Triage.prev(), View::Events);
+    }
+
+    #[test]
+    fn view_index_matches_order() {
+        for (i, view) in View::all().iter().enumerate() {
+            assert_eq!(view.index(), i);
+        }
+    }
+
+    #[test]
+    fn truncate_handles_edge_cases() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+        assert_eq!(truncate_str("ab", 2), "ab");
+    }
+
+    #[test]
+    fn truncate_zero_len_is_safe() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn viewport_class_breakpoints_are_stable() {
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 150, 40)),
+            ViewportClass::Wide
+        );
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 100, 30)),
+            ViewportClass::Regular
+        );
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 80, 30)),
+            ViewportClass::Compact
+        );
+    }
+
+    #[test]
+    fn home_layout_constraints_match_dashboard_mode() {
+        assert_eq!(
+            home_layout_constraints(true, ViewportClass::Compact).len(),
+            6
+        );
+        assert_eq!(
+            home_layout_constraints(false, ViewportClass::Regular).len(),
+            5
+        );
+    }
+
+    macro_rules! view_state {
+        ($($field:ident: $value:expr),+ $(,)?) => {
+            ViewState {
+                $($field: $value,)+
+                ..Default::default()
+            }
+        };
+    }
+
+    #[test]
+    fn render_triage_view_handles_empty_and_populated_state() {
+        let empty_state = ViewState::default();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+
+        render_triage_view(&empty_state, area, &mut buf);
+
+        let state = view_state!(triage_items: vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![super::super::query::TriageAction {
+                label: "Explain".to_string(),
+                command: "ft why --recent --pane 0".to_string(),
+            }],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }]);
+
+        render_triage_view(&state, area, &mut buf);
+    }
+
+    fn pane(id: u64, title: &str, agent: Option<&str>, unhandled: u32, domain: &str) -> PaneView {
+        PaneView {
+            pane_id: id,
+            title: title.to_string(),
+            domain: domain.to_string(),
+            cwd: Some(format!("/tmp/{title}")),
+            is_excluded: false,
+            agent_type: agent.map(str::to_string),
+            pane_state: "PromptActive".to_string(),
+            last_activity_ts: Some(1_700_000_000_000),
+            unhandled_event_count: unhandled,
+        }
+    }
+
+    #[test]
+    fn filtered_pane_indices_applies_query_and_toggles() {
+        let mut state = view_state!(
+            panes: vec![
+                pane(1, "codex-main", Some("codex"), 2, "local"),
+                pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+                pane(3, "shell", None, 1, "local"),
+            ],
+            panes_filter_query: "codex".to_string(),
+        );
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0]);
+
+        state.panes_filter_query.clear();
+        state.panes_unhandled_only = true;
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+
+        state.panes_unhandled_only = false;
+        state.panes_agent_filter = Some("claude".to_string());
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+
+        state.panes_agent_filter = None;
+        state.panes_domain_filter = Some("ssh".to_string());
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_is_stable_for_large_lists() {
+        let state = view_state!(
+            panes: (0..1000)
+                .map(|id| pane(id, &format!("pane-{id}"), Some("codex"), 0, "local"))
+                .collect(),
+            panes_filter_query: "pane-9".to_string(),
+        );
+
+        let filtered = filtered_pane_indices(&state);
+        assert!(!filtered.is_empty());
+        assert!(filtered.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Events view tests (wa-nu4.3.7.3)
+    // -----------------------------------------------------------------------
+
+    fn event(id: i64, pane_id: u64, rule: &str, severity: &str, handled: bool) -> EventView {
+        EventView {
+            id,
+            rule_id: rule.to_string(),
+            pane_id,
+            severity: severity.to_string(),
+            message: format!("matched text for {rule}"),
+            timestamp: 1_700_000_000_000 + id,
+            handled,
+            triage_state: None,
+            labels: Vec::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn filtered_event_indices_returns_all_when_no_filters() {
+        let state = view_state!(events: vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ]);
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_unhandled_only() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_unhandled_only: true,
+        );
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_pane_filter() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_pane_filter: "20".to_string(),
+        );
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_event_indices_rule_filter() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_pane_filter: "codex".to_string(),
+        );
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn filtered_event_indices_combined_filters() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_unhandled_only: true,
+            events_pane_filter: "10".to_string(),
+        );
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_empty_events() {
+        let state = ViewState::default();
+        let filtered = filtered_event_indices(&state);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn render_events_view_handles_empty_state() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should not panic with empty events
+    }
+
+    #[test]
+    fn render_events_view_handles_populated_state() {
+        let state = view_state!(events: vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ]);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render without panic
+    }
+
+    #[test]
+    fn render_events_view_with_selection() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_selected_index: 1,
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render detail panel for second event
+    }
+
+    #[test]
+    fn render_events_view_with_filters_active() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_unhandled_only: true,
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Only unhandled events should appear
+    }
+
+    #[test]
+    fn severity_color_maps_correctly() {
+        let critical = severity_color("critical");
+        assert_eq!(critical.fg, Some(Color::Red));
+        let warning = severity_color("warning");
+        assert_eq!(warning.fg, Some(Color::Yellow));
+        let info = severity_color("info");
+        assert_eq!(info.fg, Some(Color::Blue));
+        let unknown = severity_color("other");
+        assert_eq!(unknown.fg, Some(Color::Gray));
+        let error = severity_color("error");
+        assert_eq!(error.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn events_selected_index_clamps_to_filtered() {
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_selected_index: 99, // Beyond range
+        );
+        let filtered = filtered_event_indices(&state);
+        let clamped = state
+            .events_selected_index
+            .min(filtered.len().saturating_sub(1));
+        assert_eq!(clamped, 1); // Clamped to last index
+    }
+
+    // -----------------------------------------------------------------------
+    // History view tests (wa-5em.3)
+    // -----------------------------------------------------------------------
+
+    fn history_entry(
+        id: i64,
+        pane_id: Option<u64>,
+        workflow_id: Option<&str>,
+        action_kind: &str,
+        undoable: bool,
+        undone: bool,
+    ) -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: id,
+            timestamp: 1_700_000_000_000 + id,
+            pane_id,
+            workflow_id: workflow_id.map(str::to_string),
+            action_kind: action_kind.to_string(),
+            result: "success".to_string(),
+            actor_kind: "workflow".to_string(),
+            step_name: Some("step".to_string()),
+            undoable,
+            undone,
+            undo_strategy: Some("manual".to_string()),
+            undo_hint: Some("run manual rollback".to_string()),
+            rule_id: Some("codex.usage".to_string()),
+            summary: "redacted summary".to_string(),
+        }
+    }
+
+    #[test]
+    fn filtered_history_indices_without_filters_returns_all() {
+        let state = view_state!(history_entries: vec![
+            history_entry(1, Some(10), None, "send_text", true, false),
+            history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
+            history_entry(3, Some(20), None, "workflow_completed", false, true),
+        ]);
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_history_indices_applies_query_and_undoable_filter() {
+        let mut state = view_state!(
+            history_entries: vec![
+                history_entry(1, Some(10), None, "send_text", true, false),
+                history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
+                history_entry(3, Some(20), None, "workflow_completed", false, true),
+            ],
+            history_filter_query: "wf-1".to_string(),
+        );
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![1]);
+
+        state.history_filter_query.clear();
+        state.history_undoable_only = true;
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn render_history_view_handles_empty_and_populated_state() {
+        let empty_state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_history_view(&empty_state, area, &mut buf);
+
+        let state = view_state!(
+            history_entries: vec![
+                history_entry(1, Some(10), Some("wf-1"), "workflow_step", true, false),
+                history_entry(2, Some(10), Some("wf-1"), "workflow_completed", false, true),
+                history_entry(3, Some(20), None, "send_text", false, false),
+            ],
+            history_selected_index: 1,
+        );
+        render_history_view(&state, area, &mut buf);
+    }
+
+    // -----------------------------------------------------------------------
+    // Search view rendering tests (wa-nu4.3.7.4)
+    // -----------------------------------------------------------------------
+
+    fn search_result(pane_id: u64, snippet: &str, rank: f64) -> SearchResultView {
+        SearchResultView {
+            pane_id,
+            timestamp: 1_700_000_000_000,
+            snippet: snippet.to_string(),
+            rank,
+        }
+    }
+
+    #[test]
+    fn render_search_view_empty_no_query() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic; shows "type a query" message
+    }
+
+    #[test]
+    fn render_search_view_empty_with_prior_query() {
+        let state = view_state!(search_last_query: "nonexistent".to_string());
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Shows "no results" message
+    }
+
+    #[test]
+    fn render_search_view_with_results() {
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![
+                search_result(10, ">>matched<< text for test", 0.95),
+                search_result(20, "another >>match<< here", 0.75),
+            ],
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should render results list + detail panel
+    }
+
+    #[test]
+    fn render_search_view_with_selection() {
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![
+                search_result(10, "first result", 0.95),
+                search_result(20, "second result", 0.75),
+            ],
+            search_selected_index: 1,
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Detail panel shows second result
+    }
+
+    #[test]
+    fn render_search_view_query_with_cursor() {
+        let state = view_state!(search_query: "hello".to_string());
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should show "hello_" in the input area
+    }
+
+    #[test]
+    fn render_search_view_shows_suggestions() {
+        let state = view_state!(
+            search_query: "err".to_string(),
+            search_suggestions: vec![crate::storage::SearchSuggestion {
+                text: "error".to_string(),
+                description: Some("Common errors".to_string()),
+            }],
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic with suggestions rendered
+    }
+
+    #[test]
+    fn render_search_view_hides_suggestions_with_results() {
+        let state = view_state!(
+            search_query: "err".to_string(),
+            search_suggestions: vec![crate::storage::SearchSuggestion {
+                text: "error".to_string(),
+                description: Some("Common errors".to_string()),
+            }],
+            // Add a result — suggestions should be hidden
+            search_results: vec![crate::tui::query::SearchResultView {
+                pane_id: 1,
+                timestamp: 1_735_689_600_000,
+                snippet: "some error text".to_string(),
+                rank: 1.0,
+            }],
+            search_last_query: "err".to_string(),
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic; suggestions hidden when results present
+    }
+
+    #[test]
+    fn search_progress_phase_labels_are_stable() {
+        assert_eq!(SearchProgressPhase::Idle.label(), "idle");
+        assert_eq!(SearchProgressPhase::RunningInitial.label(), "initializing");
+        assert_eq!(SearchProgressPhase::InitialOnly.label(), "initial-only");
+        assert_eq!(
+            SearchProgressPhase::RefinementUnavailable.label(),
+            "refinement-unavailable"
+        );
+        assert_eq!(
+            SearchProgressPhase::RefinementFailed.label(),
+            "refinement-failed"
+        );
+    }
+
+    #[test]
+    fn render_search_view_with_progressive_status_metadata() {
+        let state = view_state!(
+            search_query: "panic".to_string(),
+            search_last_query: "panic".to_string(),
+            search_phase: SearchProgressPhase::RefinementUnavailable,
+            search_fast_only: false,
+            search_initial_latency_ms: Some(17),
+            search_phase_detail: Some("single-pass backend".to_string()),
+            search_results: vec![search_result(10, "panic in worker", 0.88)],
+        );
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should render status/timing metadata without panicking.
+    }
+
+    // -----------------------------------------------------------------------
+    // Health metrics panel tests (wa-nu4.3.7.6)
+    // -----------------------------------------------------------------------
+
+    fn make_health(watcher: bool, db: bool, wezterm: bool) -> HealthStatus {
+        HealthStatus {
+            watcher_running: watcher,
+            db_accessible: db,
+            wezterm_accessible: wezterm,
+            wezterm_circuit: CircuitBreakerStatus::default(),
+            pane_count: 3,
+            event_count: 10,
+            last_capture_ts: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn aggregate_health_ok_when_all_healthy() {
+        let health = make_health(true, true, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "OK");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_watcher_stopped() {
+        let health = make_health(false, true, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_db_inaccessible() {
+        let health = make_health(true, false, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_warning_when_wezterm_inaccessible() {
+        let health = make_health(true, true, false);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "WARNING");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_circuit_open() {
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::Open;
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_warning_when_circuit_half_open() {
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::HalfOpen;
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "WARNING");
+    }
+
+    #[test]
+    fn render_home_view_healthy() {
+        let state = view_state!(health: Some(make_health(true, true, true)));
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render without panic, show OK status
+    }
+
+    #[test]
+    fn render_home_view_degraded() {
+        let mut health = make_health(true, true, false);
+        health.wezterm_circuit.state = CircuitStateKind::HalfOpen;
+        let state = view_state!(
+            health: Some(health),
+            events: vec![event(1, 10, "codex.error", "critical", false)],
+        );
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show WARNING aggregate with unhandled count
+    }
+
+    #[test]
+    fn render_home_view_no_health() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show "Loading..." gracefully
+    }
+
+    #[test]
+    fn render_home_view_with_error_message() {
+        let mut state = view_state!(health: Some(make_health(true, true, true)));
+        state.set_error("Connection lost");
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render error footer
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow progress panel tests (wa-nu4.3.7.5)
+    // -----------------------------------------------------------------------
+
+    fn workflow(
+        id: &str,
+        name: &str,
+        pane: u64,
+        step: usize,
+        total: usize,
+        status: &str,
+    ) -> WorkflowProgressView {
+        WorkflowProgressView {
+            id: id.to_string(),
+            workflow_name: name.to_string(),
+            pane_id: pane,
+            current_step: step,
+            total_steps: total,
+            status: status.to_string(),
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_001_000,
+        }
+    }
+
+    #[test]
+    fn progress_bar_renders_correctly() {
+        let spans = render_progress_bar(2, 5, 12);
+        // Should produce [, filled, empty, ] N/M
+        assert_eq!(spans.len(), 4);
+        // First span is "["
+        assert_eq!(spans[0].content.as_ref(), "[");
+        // Last span contains "] 2/5"
+        assert!(spans[3].content.contains("2/5"));
+    }
+
+    #[test]
+    fn progress_bar_full() {
+        let spans = render_progress_bar(5, 5, 12);
+        assert!(spans[3].content.contains("5/5"));
+    }
+
+    #[test]
+    fn progress_bar_zero_total() {
+        let spans = render_progress_bar(0, 0, 12);
+        assert!(spans[3].content.contains("0/0"));
+    }
+
+    #[test]
+    fn workflow_status_style_maps_correctly() {
+        let running = workflow_status_style("running");
+        assert_eq!(running.fg, Some(Color::Cyan));
+        let waiting = workflow_status_style("waiting");
+        assert_eq!(waiting.fg, Some(Color::Yellow));
+        let failed = workflow_status_style("failed");
+        assert_eq!(failed.fg, Some(Color::Red));
+        let completed = workflow_status_style("completed");
+        assert_eq!(completed.fg, Some(Color::Green));
+        let unknown = workflow_status_style("other");
+        assert_eq!(unknown.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn render_triage_view_with_workflows() {
+        let state = view_state!(
+            triage_items: vec![TriageItemView {
+                section: "events".to_string(),
+                severity: "warning".to_string(),
+                title: "test event".to_string(),
+                detail: "detail".to_string(),
+                actions: vec![],
+                event_id: Some(1),
+                pane_id: Some(0),
+                workflow_id: None,
+            }],
+            workflows: vec![
+                workflow("wf-1", "notify_user", 10, 1, 3, "running"),
+                workflow("wf-2", "restart_agent", 20, 0, 2, "waiting"),
+            ],
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should render without panic, showing workflow panel
+    }
+
+    #[test]
+    fn render_triage_view_with_expanded_workflow() {
+        let state = view_state!(
+            workflows: vec![workflow("wf-1", "notify_user", 10, 2, 4, "running")],
+            triage_expanded: Some(0),
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should show expanded details for workflow
+    }
+
+    #[test]
+    fn render_triage_view_with_failed_workflow() {
+        let mut wf = workflow("wf-err", "deploy_check", 5, 1, 3, "failed");
+        wf.error = Some("Connection refused to remote host".to_string());
+        let state = view_state!(workflows: vec![wf], triage_expanded: Some(0));
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should show error in red when expanded
+    }
+
+    #[test]
+    fn render_triage_view_no_workflows() {
+        let state = view_state!(triage_items: vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }]);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should render without workflow panel (original layout)
+    }
+
+    #[test]
+    fn render_triage_view_only_workflows_no_triage() {
+        let state = view_state!(
+            workflows: vec![workflow("wf-1", "notify_user", 10, 1, 3, "running")]
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should not panic; shows empty triage + workflow panel
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive TUI tests (wa-nu4.3.7.7)
+    // -----------------------------------------------------------------------
+
+    // --- View state transition tests ---
+
+    #[test]
+    fn view_state_default_is_clean() {
+        let state = ViewState::default();
+        assert!(state.panes.is_empty());
+        assert!(state.events.is_empty());
+        assert!(state.history_entries.is_empty());
+        assert!(state.triage_items.is_empty());
+        assert!(state.workflows.is_empty());
+        assert!(state.health.is_none());
+        assert!(state.search_query.is_empty());
+        assert!(state.history_filter_query.is_empty());
+        assert!(state.error_message.is_none());
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.triage_selected_index, 0);
+        assert_eq!(state.history_selected_index, 0);
+        assert!(!state.panes_unhandled_only);
+        assert!(!state.events_unhandled_only);
+        assert!(!state.history_undoable_only);
+        assert!(state.triage_expanded.is_none());
+    }
+
+    #[test]
+    fn view_state_error_set_and_clear() {
+        let mut state = ViewState::default();
+        assert!(state.error_message.is_none());
+
+        state.set_error("something broke");
+        assert_eq!(state.error_message.as_deref(), Some("something broke"));
+
+        state.clear_error();
+        assert!(state.error_message.is_none());
+    }
+
+    #[test]
+    fn view_all_returns_eight_views() {
+        assert_eq!(View::all().len(), 8);
+    }
+
+    #[test]
+    fn view_next_prev_are_inverse() {
+        for view in View::all() {
+            assert_eq!(view.next().prev(), *view);
+            assert_eq!(view.prev().next(), *view);
+        }
+    }
+
+    #[test]
+    fn view_name_non_empty() {
+        for view in View::all() {
+            assert!(!view.name().is_empty());
+        }
+    }
+
+    // --- Truncation edge cases ---
+
+    #[test]
+    fn truncate_handles_unicode_boundary() {
+        // If truncation hits a multi-byte char boundary, it should not panic
+        let result = truncate_str("héllo wörld", 7);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn truncate_exact_max() {
+        assert_eq!(truncate_str("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_one_over() {
+        assert_eq!(truncate_str("abcdef", 5), "ab...");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_max_three() {
+        // When max_len == 3, should truncate without ellipsis
+        assert_eq!(truncate_str("abcdef", 3), "abc");
+    }
+
+    // --- Pane rendering edge cases ---
+
+    #[test]
+    fn render_panes_view_empty_panes() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+        // Should render "No panes match" gracefully
+    }
+
+    #[test]
+    fn render_panes_view_with_selection_out_of_bounds() {
+        let state = view_state!(
+            panes: vec![pane(1, "test", Some("codex"), 0, "local")],
+            selected_index: 99, // Way out of bounds
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+        // Should clamp and render without panic
+    }
+
+    #[test]
+    fn render_panes_view_alt_screen_pane() {
+        let mut p = pane(1, "vim", None, 0, "local");
+        p.pane_state = "AltScreen".to_string();
+        let state = view_state!(panes: vec![p]);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_panes_view_with_all_filters() {
+        let state = view_state!(
+            panes: vec![
+                pane(1, "codex-main", Some("codex"), 2, "local"),
+                pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+            ],
+            panes_filter_query: "codex".to_string(),
+            panes_unhandled_only: true,
+            panes_agent_filter: Some("codex".to_string()),
+            panes_domain_filter: Some("local".to_string()),
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+    }
+
+    // --- Events rendering edge cases ---
+
+    #[test]
+    fn render_events_view_selected_index_beyond_filtered() {
+        let state = view_state!(
+            events: vec![event(1, 10, "rule1", "warning", true)],
+            events_unhandled_only: true, // Filters out the only event
+            events_selected_index: 5,
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render "No events match" without panic
+    }
+
+    // --- Search rendering edge cases ---
+
+    #[test]
+    fn render_search_view_selected_beyond_results() {
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![search_result(10, "one result", 0.5)],
+            search_selected_index: 99, // Way out of bounds
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should clamp and render without panic
+    }
+
+    // --- Tab rendering ---
+
+    #[test]
+    fn render_tabs_for_each_view() {
+        let area = Rect::new(0, 0, 80, 2);
+        for view in View::all() {
+            let mut buf = Buffer::empty(area);
+            render_tabs(*view, area, &mut buf);
+            // Should not panic for any view
+        }
+    }
+
+    // --- Help view ---
+
+    #[test]
+    fn render_help_view_does_not_panic() {
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_help_view(area, &mut buf);
+    }
+
+    #[test]
+    fn render_help_view_lists_eight_views_and_timeline_controls() {
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_help_view(area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("FrankenTerm Operator TUI"));
+        assert!(text.contains("1-8        Jump to view by number"));
+        assert!(
+            text.contains("[Timeline] j/k select event, h/l scroll, +/- widen or narrow window")
+        );
+        assert!(text.contains("8. Timeline Cross-pane event timeline"));
+    }
+
+    fn timeline_row(id: &str, severity: &str, correlation_label: &str) -> TimelineRow {
+        TimelineRow {
+            id: id.to_string(),
+            timestamp: "2026-03-11 20:15".to_string(),
+            pane_label: "P7".to_string(),
+            agent_label: "codex".to_string(),
+            event_type: "usage_limit".to_string(),
+            severity_label: severity.to_string(),
+            handled_label: "OPEN".to_string(),
+            correlation_label: correlation_label.to_string(),
+            summary: "Rate limit reached while the operator dashboard was open.".to_string(),
+            severity_style: crate::tui::ftui_compat::StyleSpec::new(),
+            agent_style: crate::tui::ftui_compat::StyleSpec::new(),
+            handled_style: crate::tui::ftui_compat::StyleSpec::new(),
+            correlation_style: crate::tui::ftui_compat::StyleSpec::new(),
+        }
+    }
+
+    #[test]
+    fn render_timeline_view_narrow_stacks_detail_below_list() {
+        let state = view_state!(timeline_rows: vec![
+            timeline_row("evt-1", "error", "failover"),
+            timeline_row("evt-2", "warning", ""),
+        ]);
+        let area = Rect::new(0, 0, 80, 22);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let detail_row = first_row_containing(area, &buf, "Selected Event")
+            .expect("compact timeline layout should still show stacked detail title");
+        assert!(
+            detail_row >= 10,
+            "compact timeline detail should stack below list, got row {detail_row}"
+        );
+    }
+
+    #[test]
+    fn render_timeline_view_wide_shows_event_details() {
+        let state = view_state!(timeline_rows: vec![timeline_row("evt-1", "error", "failover")]);
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("Timeline (1)"));
+        assert!(text.contains("Event Details"));
+        assert!(text.contains("Correlations: failover"));
+    }
+
+    #[test]
+    fn render_timeline_view_respects_scroll_offset() {
+        let state = view_state!(
+            timeline_rows: vec![
+                timeline_row("evt-1", "error", "failover"),
+                timeline_row("evt-2", "warning", ""),
+            ],
+            timeline_scroll: 1,
+            timeline_selected_index: 1,
+        );
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("warning"));
+        assert!(!text.contains("error"));
+    }
+
+    // --- Triage edge cases ---
+
+    #[test]
+    fn render_triage_view_selected_beyond_items() {
+        let state = view_state!(
+            triage_items: vec![TriageItemView {
+                section: "events".to_string(),
+                severity: "error".to_string(),
+                title: "test".to_string(),
+                detail: "detail".to_string(),
+                actions: vec![],
+                event_id: None,
+                pane_id: None,
+                workflow_id: None,
+            }],
+            triage_selected_index: 99,
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should not panic; detail panel may be empty
+    }
+
+    #[test]
+    fn render_triage_view_with_multiple_actions() {
+        let state = view_state!(triage_items: vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "error".to_string(),
+            title: "multi-action item".to_string(),
+            detail: "multiple fixes available".to_string(),
+            actions: vec![
+                super::super::query::TriageAction {
+                    label: "Action 1".to_string(),
+                    command: "ft fix --auto".to_string(),
+                },
+                super::super::query::TriageAction {
+                    label: "Action 2".to_string(),
+                    command: "ft restart".to_string(),
+                },
+                super::super::query::TriageAction {
+                    label: "Action 3".to_string(),
+                    command: "ft why --recent".to_string(),
+                },
+            ],
+            event_id: Some(42),
+            pane_id: Some(10),
+            workflow_id: None,
+        }]);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+    }
+
+    // --- Home view edge cases ---
+
+    #[test]
+    fn render_home_view_zero_panes_and_events() {
+        let health = make_health(true, true, true);
+        let mut state = view_state!(health: Some(health));
+        // pane_count=3, event_count=10 from make_health defaults; override
+        state.health.as_mut().unwrap().pane_count = 0;
+        state.health.as_mut().unwrap().event_count = 0;
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_high_event_count() {
+        let mut state = view_state!(health: Some(make_health(true, true, true)));
+        state.health.as_mut().unwrap().event_count = 500;
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show event count in yellow (>100)
+    }
+
+    #[test]
+    fn render_home_view_no_capture_timestamp() {
+        let mut health = make_health(true, true, true);
+        health.last_capture_ts = None;
+        let state = view_state!(health: Some(health));
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show "no captures yet"
+    }
+
+    #[test]
+    fn render_home_view_circuit_open_with_cooldown() {
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::Open;
+        health.wezterm_circuit.cooldown_remaining_ms = Some(5000);
+        let state = view_state!(health: Some(health));
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    // --- Dashboard panel rendering (ft-3hbv9) ---
+
+    fn make_dashboard_state() -> crate::dashboard::DashboardState {
+        use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
+        use crate::cost_tracker::{
+            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
+        };
+        use crate::dashboard::DashboardManager;
+        use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
+
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(CostDashboardSnapshot {
+            providers: vec![
+                ProviderCostSummary {
+                    agent_type: "codex".to_string(),
+                    total_tokens: 50_000,
+                    total_cost_usd: 25.0,
+                    pane_count: 3,
+                    record_count: 100,
+                },
+                ProviderCostSummary {
+                    agent_type: "claude_code".to_string(),
+                    total_tokens: 80_000,
+                    total_cost_usd: 40.0,
+                    pane_count: 5,
+                    record_count: 200,
+                },
+            ],
+            panes: vec![PaneCostSummary {
+                pane_id: 1,
+                agent_type: "codex".to_string(),
+                total_tokens: 10_000,
+                total_cost_usd: 5.0,
+                record_count: 20,
+                last_updated_ms: 1_700_000_000_000,
+            }],
+            alerts: vec![BudgetAlert {
+                agent_type: "codex".to_string(),
+                current_cost_usd: 25.0,
+                budget_limit_usd: 30.0,
+                usage_fraction: 0.83,
+                severity: AlertSeverity::Warning,
+            }],
+            grand_total_cost_usd: 65.0,
+            grand_total_tokens: 130_000,
+        });
+        mgr.update_rate_limits(vec![ProviderRateLimitSummary {
+            agent_type: "codex".to_string(),
+            status: ProviderRateLimitStatus::PartiallyLimited,
+            limited_pane_count: 2,
+            total_pane_count: 5,
+            earliest_clear_secs: 30,
+            total_events: 3,
+        }]);
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Yellow,
+            timestamp_epoch_ms: 1_700_000_000_000,
+            capture_depth: 500,
+            capture_capacity: 1000,
+            write_depth: 200,
+            write_capacity: 1000,
+            duration_in_tier_ms: 5000,
+            transitions: 3,
+            paused_panes: vec![1, 2],
+        });
+        mgr.snapshot()
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard() {
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
+        let area = Rect::new(0, 0, 100, 50);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render without panic, includes dashboard panels
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard_narrow_terminal() {
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
+        // Narrow terminal: single-column layout for dashboard panels
+        let area = Rect::new(0, 0, 50, 40);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard_tiny_terminal() {
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
+        // Very small terminal: falls back to summary line
+        let area = Rect::new(0, 0, 30, 25);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_dashboard_panels_directly() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+        // Should render 2x2 grid at 100 columns
+    }
+
+    #[test]
+    fn render_dashboard_panels_narrow() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+        // Should fall back to vertical stack at 50 columns
+    }
+
+    #[test]
+    fn render_dashboard_panels_minimal() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        // Extremely small area: summary-only fallback
+        let area = Rect::new(0, 0, 25, 4);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_dashboard_with_error() {
+        let mut state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
+        state.set_error("Connection lost");
+        let area = Rect::new(0, 0, 100, 50);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render dashboard panels AND error footer
+    }
+
+    // --- Small terminal size rendering ---
+
+    #[test]
+    fn render_all_views_at_minimum_size() {
+        let area = Rect::new(0, 0, 40, 10);
+        let state = ViewState::default();
+        let mut buf = Buffer::empty(area);
+
+        render_home_view(&state, area, &mut buf);
+        render_panes_view(&state, area, &mut buf);
+        render_events_view(&state, area, &mut buf);
+        render_history_view(&state, area, &mut buf);
+        render_triage_view(&state, area, &mut buf);
+        render_search_view(&state, area, &mut buf);
+        render_help_view(area, &mut buf);
+        render_timeline_view(&state, area, &mut buf);
+        // None should panic at small terminal size
+    }
+
+    // --- Pane filter combinations ---
+
+    #[test]
+    fn filtered_pane_indices_empty_query_returns_all() {
+        let state = view_state!(panes: vec![
+            pane(1, "test", None, 0, "local"),
+            pane(2, "test2", None, 0, "local"),
+        ]);
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0, 1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_by_cwd() {
+        // cwd is "/tmp/{title}" - filter by test2
+        let state = view_state!(
+            panes: vec![
+                pane(1, "test", None, 0, "local"),
+                pane(2, "test2", None, 0, "local"),
+            ],
+            panes_filter_query: "test2".to_string(),
+        );
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_domain_ssh() {
+        let state = view_state!(
+            panes: vec![
+                pane(1, "local-shell", None, 0, "local"),
+                pane(2, "remote", None, 0, "ssh:myhost"),
+            ],
+            panes_domain_filter: Some("ssh".to_string()),
+        );
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    // --- Progress bar edge cases ---
+
+    #[test]
+    fn progress_bar_single_step() {
+        let spans = render_progress_bar(1, 1, 12);
+        assert!(spans[3].content.contains("1/1"));
+    }
+
+    #[test]
+    fn progress_bar_large_values() {
+        let spans = render_progress_bar(50, 100, 22);
+        assert!(spans[3].content.contains("50/100"));
+    }
+
+    #[test]
+    fn progress_bar_minimum_width() {
+        let spans = render_progress_bar(1, 2, 2);
+        // Width 2 means bar_width = 0, should still produce valid output
+        assert_eq!(spans.len(), 4);
+    }
+}

@@ -1,0 +1,6242 @@
+import SwiftUI
+import Observation
+import VisionKit
+import AVFoundation
+import UniformTypeIdentifiers
+import UIKit
+import FrankenTermKit
+import FrankenTermSSH
+import FrankenTermSSHIntegration
+
+@main
+@MainActor
+struct FrankenTermMobileApp: App {
+    @State private var model = MobileWorkspaceModel()
+    var body: some Scene {
+        WindowGroup {
+            MobileWorkspaceRoot(model: model).task { await Self.storageSelfTestIfRequested() }
+        }
+    }
+
+    /// `devicectl device process launch --environment-variables
+    /// '{"FT_STORAGE_SELF_TEST":"1"}'` runs a restore's save against a
+    /// throwaway key and writes Documents/storage-self-test.txt.
+    private static func storageSelfTestIfRequested() async {
+        guard ProcessInfo.processInfo.environment["FT_STORAGE_SELF_TEST"] == "1" else { return }
+        let files = FileManager.default
+        let scratch = files.temporaryDirectory.appendingPathComponent("storage-self-test-" + UUID().uuidString)
+        let report = await WorkspaceStorageSelfTest.run(directory: scratch)
+        try? files.removeItem(at: scratch)
+        guard let documents = files.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        try? Data((report.joined(separator: "\n") + "\n").utf8)
+            .write(to: documents.appendingPathComponent("storage-self-test.txt"), options: .atomic)
+    }
+}
+
+struct LocalCredentialRevocationReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let credentialID: String, algorithm: String, fingerprint: String
+    let workspaceNames: [String]
+    fileprivate let epoch: UUID
+}
+
+struct LocalHostRevocationReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let trustID: String, displayHost: String, host: String, port: UInt16
+    let key: WorkspaceDocument.HostKey
+    let workspaceNames: [String]
+    fileprivate let epoch: UUID
+}
+
+/// The selected credential and foreground visit remain fixed while Files is
+/// open. A late picker callback cannot renew another key or workspace revision.
+struct LocalCertificateFileReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let credentialID: String
+    fileprivate let epoch: UUID
+}
+
+struct LocalCertificateRenewalReview: Identifiable {
+    let core: WorkspaceCertificateRenewalReview
+    fileprivate let epoch: UUID
+    var id: UUID { core.id }
+}
+
+private enum CertificateValidityLabel {
+    static func date(_ seconds: UInt64) -> String {
+        if seconds == UInt64.max { return "No expiry" }
+        guard seconds <= 253_402_300_799 else { return "Unix time \(seconds)" }
+        return Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// A deliberate check of one current destination through the listed, already
+/// trusted accounts. It cannot be replayed after a source or lifecycle change.
+struct LocalHostKeyCheckReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let routeID: String, destination: String
+    let jumpAccounts: [String]
+    let replacingPin: WorkspaceHostKeyPin?
+    fileprivate let epoch: UUID
+
+    static func endpoint(host: String, port: UInt16, user: String? = nil) -> String {
+        let address = host.contains(":") ? "[\(host)]" : host
+        return user.map { "\($0)@\(address):\(port)" } ?? "\(address):\(port)"
+    }
+}
+
+/// A foreground visit to one machine's effective, phone-local route policy.
+/// Choices and public identity data survive only this visit and saved revision.
+struct LocalRouteChoiceContext: Identifiable {
+    let id = UUID()
+    let local: WorkspaceLocalState
+    let document: WorkspaceDocument
+    let machine: WorkspaceDocument.Machine
+    fileprivate let epoch: UUID
+}
+
+@MainActor
+struct LocalRouteConnectionReview: Identifiable {
+    let id = UUID()
+    let contextID: UUID
+    let target: TerminalSessionTarget
+    let selection: WorkspaceSSHConnectionSelection?
+    let purpose: WorkspaceSSHConnectionPurpose
+    fileprivate let epoch: UUID
+    fileprivate let scene: WorkspaceTerminalScene?
+    fileprivate let controllerID: UUID?
+    let disconnectsSession: Bool
+}
+
+/// Use the same target construction for ordinary Connect, the choice review,
+/// and fresh-policy validation immediately before its publication.
+private enum WorkspaceTerminalTargets {
+    static func make(local: WorkspaceLocalState, machineID: String, theme: WorkspaceDocument.Theme?,
+                     selection: WorkspaceSSHConnectionSelection? = nil) throws -> TerminalSessionTarget {
+        let document = try local.workspace.document()
+        guard let machine = document.machines.first(where: { $0.id == machineID }) else { throw FTError.stale }
+        var routes: [TerminalSessionRoute] = []
+        if let selection {
+            let options = try WorkspaceSSHRouteOptions(localState: local, machineID: machineID,
+                routeID: selection.routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            try options.validate(selection)
+            let route = options.destination.route
+            let promptingJump = zip(options.hops, selection.hops).contains { peer, choice in
+                choice.authentication.requiresForegroundPrompt
+                    || peer.route.authenticationMethods.contains(.keyboardInteractive)
+            }
+            routes = [.init(id: route.id, credentialIDs: selection.authentication.credentialID.map { [$0] } ?? [],
+                host: route.host, port: route.port, authenticationChoices: [selection.authentication],
+                selectedConnection: selection,
+                allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
+                promptingJump: promptingJump, mux: route.mode == "frankenterm_mux",
+                sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
+                    : (route.sessionCreation == "manual" ? .manual : .onSelect),
+                jumpHost: options.hops.first?.route.host, jumpPort: options.hops.first?.route.port)]
+        } else {
+            var seen = Set<String>()
+            for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
+                guard let route = document.routes.first(where: { $0.id == id }),
+                      route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
+                      let hops = try? document.orderedJumpRoutes(forRouteID: id),
+                      hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
+                      let readiness = local.routes.first(where: { $0.routeID == id }), readiness.issues.isEmpty else { continue }
+                let choices = WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: readiness.usableCredentialIDs)
+                guard !choices.isEmpty else { continue }
+                let promptingJump = hops.contains { hop in
+                    let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
+                    return hop.authenticationMethods.contains(.keyboardInteractive)
+                        || WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
+                }
+                routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
+                    authenticationChoices: choices,
+                    allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
+                    promptingJump: promptingJump, mux: route.mode == "frankenterm_mux",
+                    sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
+                        : (route.sessionCreation == "manual" ? .manual : .onSelect),
+                    jumpHost: hops.first?.host, jumpPort: hops.first?.port))
+            }
+        }
+        guard !routes.isEmpty else { throw WorkspaceSSHConnectionError.busy }
+        return .init(workspaceID: local.workspace.id, revision: local.workspace.revision,
+            machineID: machine.id, machineName: machine.name, routes: routes, theme: theme)
+    }
+}
+
+/// A deliberate phone-local credential change. The imported manifest and its
+/// source identity remain intact; the review names one exact local revision.
+struct LocalDeviceKeyReview: Identifiable {
+    enum Action {
+        case generate
+        case assign(credentialID: String, routeID: String)
+        case remove(routeID: String)
+        case enrollment(WorkspaceKeyEnrollmentReportReview, routeIDs: Set<String>)
+    }
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let workspaceName: String
+    let action: Action
+    let fingerprint: String?
+    let destination: String?
+    let disconnectsSessions: Bool
+    fileprivate let epoch: UUID
+
+    var title: String {
+        switch action {
+        case .generate: "Create a Phone SSH Key?"
+        case .assign: "Use This Phone Key?"
+        case .remove: "Use Imported Key Choices?"
+        case .enrollment(_, let routes): "Use Phone Key on \(routes.count) Routes?"
+        }
+    }
+    var confirmationTitle: String {
+        switch action {
+        case .generate: "Create Phone Key"
+        case .assign: disconnectsSessions ? "Use Phone Key and Disconnect" : "Use Phone Key"
+        case .remove: disconnectsSessions ? "Use Imported Keys and Disconnect" : "Use Imported Keys"
+        case .enrollment: disconnectsSessions ? "Apply Selected Routes and Disconnect" : "Apply Selected Routes"
+        }
+    }
+    var explanation: String {
+        if case .generate = action {
+            return "Create a new Ed25519 identity for \(workspaceName). Its private key stays in this phone's protected storage. You can copy the public key to authorize it on your servers. Creating it does not connect, change a server, or replace any existing key."
+        }
+        let scope = "\(workspaceName)\n\(destination ?? "")\n\(fingerprint ?? "")\n\n"
+        let effects = disconnectsSessions
+            ? "\n\nEvery session in this workspace will disconnect before the change. Direct SSH shells may end, and input already sent may have executed."
+            : ""
+        switch action {
+        case .assign:
+            return scope + "Use this phone key as this route's only public-key candidate, including when the route is a jump host. Its imported host trust and permitted password or MFA methods still apply. Authorize the public key on this exact server account before using it."
+                + effects + "\n\nThis changes only the phone's route choice. It does not install a key on a server."
+        case .remove:
+            return scope + "Restore this route's imported public-key candidates. The generated private key stays on this phone. Removing the choice does not remove its public key from any server or revoke the server's authorization."
+                + effects
+        case .enrollment(_, let routes):
+            return scope + "Use this phone key as the only public-key candidate on the \(routes.count) selected routes, including their use as jump hosts. The complete selected set is saved together. Host trust and permitted password or MFA methods still apply."
+                + effects + "\n\nThe public report records the Mac's observations; it does not prove this phone can sign in. This workspace stays offline until you choose Connect."
+        case .generate: return ""
+        }
+    }
+}
+
+/// The Files callback retains the exact key-settings visit that requested it.
+struct LocalEnrollmentFileReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    fileprivate let epoch: UUID
+}
+
+/// Read-only public input and a store-issued review. A presentation may identify
+/// a workspace, but cannot select routes or approve a credential change itself.
+@MainActor
+@Observable
+final class LocalEnrollmentResults: Identifiable {
+    let id = UUID()
+    let bytes: Data
+    let key: WorkspaceDeviceKey
+    let requestID: String
+    var presentingWorkspaceID: UUID?
+    let preferredWorkspaceID: UUID?
+    fileprivate let epoch: UUID
+    var review: WorkspaceKeyEnrollmentReportReview?
+    var message: String?
+    var isApplying = false
+    var isFinished = false
+
+    init(bytes: Data, journal: WorkspaceKeyEnrollmentJournal, presentingWorkspaceID: UUID?,
+         preferredWorkspaceID: UUID?, epoch: UUID) {
+        self.bytes = bytes; key = journal.request.key; requestID = journal.request.id
+        self.presentingWorkspaceID = presentingWorkspaceID
+        self.preferredWorkspaceID = preferredWorkspaceID; self.epoch = epoch
+    }
+}
+
+/// Existing verified-page saves remain available alongside the current partial
+/// decoder cache. Each action keeps the original store's exact review witness.
+enum SavedOpticalScan: Identifiable, Sendable {
+    case partial(OpticalDecoderRecoveryReview), verified(OpticalScanRecoveryReview)
+    var id: UUID { switch self { case .partial(let value): value.id; case .verified(let value): value.id } }
+    var identity: OpticalFrame.Identity {
+        switch self { case .partial(let value): value.identity; case .verified(let value): value.identity }
+    }
+    var verifiedPages: Int { switch self { case .partial(let value): value.verifiedPages; case .verified(let value): value.verifiedPages } }
+    var verifiedBytes: Int { switch self { case .partial(let value): value.verifiedBytes; case .verified(let value): value.verifiedBytes } }
+    var independentParts: Int { switch self { case .partial(let value): value.independentParts; case .verified: 0 } }
+}
+
+@MainActor
+@Observable
+final class MobileWorkspaceModel {
+    var workspaces: [InstalledWorkspace] = []
+    var availableCredentials: [UUID: Set<String>] = [:]
+    var localPolicies: [UUID: WorkspaceLocalState] = [:]
+    var connectionPreferenceMessage: String?
+    private var connectionPreferenceBusy = false
+    @ObservationIgnored private var connectionPreferenceUpdate: Task<Void, Never>?
+    @ObservationIgnored private var connectionApproval: (id: UUID, task: Task<WorkspaceLocalState, Error>)?
+    @ObservationIgnored private var routeChoiceID: UUID?
+    @ObservationIgnored private var routeConnectionReviewID: UUID?
+    @ObservationIgnored private var fileSessions: [UUID: WorkspaceFilesSession] = [:]
+    /// A failed durable write cannot revive a terminal in this process. Its
+    /// bookmark is cleared before explicit restore disconnection as well.
+    private var offlineConnectionHolds = Set<UUID>()
+    var locallyRevokedFingerprints: Set<String> = []
+    var unconfirmedCredentialRevocations: Set<String> = []
+    var credentialMessage: String?
+    var credentialImport: WorkspaceKeyImportController?
+    @ObservationIgnored private var credentialImportOperation: UUID?
+    @ObservationIgnored private var deviceKeyReviewID: UUID?
+    @ObservationIgnored private var deviceKeyOperation: (id: UUID, task: Task<Void, Never>)?
+    private(set) var deviceKeyConnectionHolds = Set<UUID>()
+    var enrollmentResults: LocalEnrollmentResults?
+    @ObservationIgnored private var enrollmentFileReviewID: UUID?
+    private var enrollmentResultsOperation: (id: UUID, task: Task<Void, Never>)?
+    var certificateRenewalReview: LocalCertificateRenewalReview?
+    @ObservationIgnored private var certificateFileReviewID: UUID?
+    private var certificateRenewalOperation: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var keysPresentationWorkspaceID: UUID?
+    @ObservationIgnored private var pendingDocumentURL: URL?
+    private var documentRetryURL: URL?
+    private var documentInspection: (id: UUID, task: Task<Void, Never>)?
+    var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
+    var message: String?
+    var showRestore = false {
+        didSet {
+            // Retire remembered launch intent before any actor hop. Existing
+            // live sessions still require the explicit disconnection choice.
+            if showRestore && !oldValue { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
+            updateIdleTimer()
+        }
+    }
+    var cameraRequested = false {
+        didSet {
+            // A restarted camera is a new callback owner, even when the same
+            // encrypted transfer remains selected throughout the interruption.
+            if cameraRequested != oldValue { cameraGeneration = UUID() }
+            updateIdleTimer()
+        }
+    }
+    private(set) var cameraGeneration = UUID()
+    var active = false { didSet { updateIdleTimer() } }
+    /// Not in the background (see setScenePhase): live connections may run.
+    @ObservationIgnored private var connectionsForeground = false
+    private var operationBusy = false
+    /// Import settlement retains its own reservation across scene transitions
+    /// and any older callback that releases the shared operation flag.
+    var busy: Bool {
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || enrollmentResultsOperation != nil || certificateRenewalOperation != nil || documentInspection != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
+        set { operationBusy = newValue }
+    }
+    private(set) var isReadingRecording = false
+    private(set) var recordingProgress: OpticalRecordingProgress?
+    @ObservationIgnored private var recordingRead: (id: UUID, task: Task<Void, Never>)?
+    var requestingCameraAccess = false
+    var offlineModeBlocked = false
+    var savedScans: [SavedOpticalScan] = []
+    var scanProgressMessage: String?
+    private var scanSaveSession: OpticalDecoderSaveSession?
+    private var scanSaveFailure: (data: Data, prior: OpticalDecoderSaveSession, generation: UUID)?
+    var isSavingScanProgress: Bool { scanSaveSession != nil && scanSaveFailure == nil }
+    var canRetryScanSave: Bool { scanSaveFailure != nil }
+    @ObservationIgnored private var scanRecovery: OpticalDecoderRecovery<AppleCryptography>?
+    @ObservationIgnored private var verifiedScanRecovery: OpticalScanRecovery<AppleCryptography>?
+    @ObservationIgnored private var scanSaveEpoch = UUID()
+    @ObservationIgnored private var scanSaveRevision = UUID()
+    @ObservationIgnored private var scanRefreshEpoch = UUID()
+    @ObservationIgnored private var scanSaveGeneration: UUID?
+    @ObservationIgnored private var scanSaveIdentity: OpticalFrame.Identity?
+    @ObservationIgnored private var scanCadence: OpticalDecoderSaveCadence?
+    @ObservationIgnored private var scanLastSaved = ContinuousClock.now
+    @ObservationIgnored private var scanWrite: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var scanSaveTimer: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var store: WorkspaceStore?
+    /// Live direct-SSH services (TerminalSessionScreen.swift), created with the store.
+    @ObservationIgnored private(set) var connections: MobileConnections?
+    @ObservationIgnored private var connectionLifecycle: Task<Void, Never>?
+    @ObservationIgnored private var restore: OfflineRestore<AppleCryptography>?
+    @ObservationIgnored private var bootstrapStarted = false
+    @ObservationIgnored private var restoreDisconnection: (id: UUID, task: Task<Void, Never>)?
+    /// The latest reviewed SSH-key or host-key revocation, and the one admitted;
+    /// at most one runs at a time, and it owns its cleanup.
+    @ObservationIgnored private var keyReviewID: UUID?
+    @ObservationIgnored private var keyRevocation: (id: UUID, task: Task<Void, Never>)?
+    var hostKeyPinReview: WorkspaceHostKeyPinReview?
+    @ObservationIgnored private var hostKeyOperation: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var hostKeyCheckReviewID: UUID?
+    @ObservationIgnored private var hostKeyCheckSource: (workspaceID: UUID, revision: UUID)?
+    private(set) var hostKeyCheckID: UUID?
+    private var pendingImport: PendingFileImport?
+    @ObservationIgnored private var epoch = UUID()
+    @ObservationIgnored private var lifecycle: Task<Void, Never>?
+    @ObservationIgnored private var workspaceRefresh: Task<Void, Never>?
+    @ObservationIgnored private var workspaceRefreshEpoch = UUID()
+    @ObservationIgnored private var observationTask: Task<Void, Never>?
+    @ObservationIgnored private var observations: AsyncStream<CameraObservation>.Continuation?
+    @ObservationIgnored private var lastObservation: String?
+    @ObservationIgnored private var lastObservationTime = ContinuousClock.now
+    @ObservationIgnored private var previousIdleTimerSetting: Bool?
+    private struct CameraObservation: Sendable { let text: String, generation: UUID, epoch: UUID }
+    private struct PendingFileImport: Sendable {
+        let id = UUID()
+        let url: URL
+        var bytes: Data?
+        var needsExplicitRetry = false
+    }
+    var hasPendingImport: Bool { pendingImport != nil }
+    var pendingImportNeedsRetry: Bool { pendingImport?.needsExplicitRetry == true }
+
+    init(restore: OfflineRestore<AppleCryptography>? = nil) {
+        self.restore = restore
+    }
+
+    private func updateIdleTimer() {
+        let needsAwakeDisplay = active && showRestore && state?.isSuspended == false
+            && (cameraRequested || state?.recipientRequest != nil)
+        if needsAwakeDisplay {
+            if previousIdleTimerSetting == nil {
+                previousIdleTimerSetting = UIApplication.shared.isIdleTimerDisabled
+            }
+            UIApplication.shared.isIdleTimerDisabled = true
+        } else if let previousIdleTimerSetting {
+            UIApplication.shared.isIdleTimerDisabled = previousIdleTimerSetting
+            self.previousIdleTimerSetting = nil
+        }
+    }
+
+    func requestCamera() {
+        guard active, !busy, !requestingCameraAccess, state?.requiresRecipientResume != true else { return }
+        if !showRestore { setRestoreVisible(true) }
+        requestingCameraAccess = true
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            // Offline admission precedes both the camera permission prompt and
+            // scanner creation, including the root screen's one-tap entry.
+            await pendingLifecycle?.value
+            guard let self else { return }
+            defer { self.requestingCameraAccess = false }
+            guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked,
+                  self.state?.isSuspended == false else { return }
+            // The next scan starts over from a finished restore.
+            if self.state?.phase == .complete, let restore = self.restore {
+                do {
+                    let fresh = try await self.restartFinished(restore)
+                    guard self.active, self.showRestore, self.epoch == ticket else { return }
+                    self.state = fresh; self.lastObservation = nil
+                } catch { self.report(error); return }
+            }
+            guard DataScannerViewController.isSupported else {
+                self.message = "This device does not support the native scanner. Open a local encrypted file instead."
+                return
+            }
+            let status = AVCaptureDevice.authorizationStatus(for: .video)
+            if status == .authorized {
+                if self.observations == nil, let restore = self.restore { self.startObservations(restore: restore) }
+                self.cameraRequested = true; return
+            }
+            guard status == .notDetermined else {
+                self.message = "Camera access is denied or restricted. Allow it in Settings or use a local encrypted file."
+                return
+            }
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            guard self.showRestore else { return }
+            // The permission sheet can deactivate the scene. Do not restart a
+            // camera in an inactive scene or after the restore sheet was closed.
+            if granted, self.active, self.epoch == ticket, !self.offlineModeBlocked,
+               self.state?.isSuspended == false {
+                if self.observations == nil, let restore = self.restore { self.startObservations(restore: restore) }
+                self.cameraRequested = true
+            }
+            else if granted { self.message = "Camera access is ready. Tap Open Camera or Resume Camera when you return." }
+            else { self.message = "Camera access was not granted. The local encrypted-file import is still available." }
+        }
+    }
+
+    /// An interrupted scanner must leave a visible way to try again. Retain
+    /// ciphertext progress and offline exclusion; retire only this camera.
+    /// Late failures from an old scanner cannot stop a replacement instance.
+    func cameraFailed(_ error: Error, generation: UUID) {
+        guard cameraRequested, cameraGeneration == generation else { return }
+        cameraRequested = false; lastObservation = nil
+        if let failure = error as? FTError, failure == .unsupported("camera.unavailable") {
+            message = "Camera scanning stopped. Your recovered progress is kept. Start the camera again when it is available."
+        } else { report(error) }
+    }
+
+    func bootstrap() async {
+        guard !bootstrapStarted else { return }
+        bootstrapStarted = true
+        do {
+            let created = try await Task.detached(priority: .userInitiated) {
+                guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { throw FTError.storage }
+                return WorkspaceStore(persistence: try FileWorkspacePersistence(directory: support.appendingPathComponent("FrankenTermWorkspaces", isDirectory: true)),
+                                      vault: AppleWorkspaceVault())
+            }.value
+            store = created; restore = OfflineRestore(using: AppleCryptography(), store: created)
+            if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                // A dedicated protected namespace, separate from workspace and
+                // import journals. Opening it does not opt a scan into saving.
+                do {
+                    verifiedScanRecovery = try OpticalScanRecovery(directory: support.appendingPathComponent("FrankenTermScanRecovery", isDirectory: true),
+                                                                   using: AppleCryptography())
+                    scanRecovery = try OpticalDecoderRecovery(directory: support.appendingPathComponent("FrankenTermDecoderRecovery", isDirectory: true),
+                                                              using: AppleCryptography())
+                } catch {
+                    scanProgressMessage = "Saving scan progress is unavailable. You can still scan and restore normally. \(error.localizedDescription)"
+                }
+                connections = try MobileConnections(store: created,
+                    journalDirectory: support.appendingPathComponent("FrankenTermSessions", isDirectory: true))
+                connections?.setAuthenticationForeground(active)
+                updateConnectionLifecycle()
+            }
+            try await refreshWorkspaces(using: created, epoch: epoch)
+            if active, pendingImport != nil { showRestore = true }
+            updateLifecycle()
+            Task { await Self.connectSelfTestIfRequested(using: created) }
+        } catch { report(error); bootstrapStarted = false }
+    }
+
+    /// `FT_CONNECT_SELF_TEST=1` reaches every saved route up to its host key,
+    /// four at a time, without a key or a prompt (WorkspaceRouteProbe), and
+    /// writes Documents/connect-self-test.txt.
+    private static func connectSelfTestIfRequested(using store: WorkspaceStore) async {
+        guard ProcessInfo.processInfo.environment["FT_CONNECT_SELF_TEST"] == "1" else { return }
+        var report = ["tailnet address: \(WorkspaceRouteNetwork.deviceTailnetAddress() ?? "none")"]
+        do {
+            for entry in try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport) {
+                let document = try entry.workspace.document()
+                report.append("workspace \(document.name): keys on device \(entry.credentialIDs.sorted())")
+                var lines: [Int: String] = [:]
+                for start in stride(from: 0, to: document.routes.count, by: 4) {
+                    await withTaskGroup(of: (Int, String).self) { group in
+                        for index in start..<min(start + 4, document.routes.count) {
+                            let route = document.routes[index]
+                            let readiness = entry.routes.first { $0.routeID == route.id }
+                            group.addTask {
+                                let probe = await WorkspaceRouteProbe.run(route: route, document: document)
+                                var line = "\(route.id) \(route.user)@\(route.host):\(route.port) \(probe.network)"
+                                line += " ready=\(readiness?.isLocallyReady ?? false) creds=\(readiness?.usableCredentialIDs ?? [])"
+                                if let issues = readiness?.issues, !issues.isEmpty { line += " issues=\(issues)" }
+                                if let peer = probe.peer {
+                                    line += " kex=\(peer.keyExchange) cipher=\(peer.outboundCipher)/\(peer.inboundCipher)"
+                                    line += " mac=\(peer.outboundMAC)/\(peer.inboundMAC) hostkey=\(peer.hostSignature)"
+                                }
+                                if let decision = probe.hostKey { line += " trust=\(decision)" }
+                                if let failure = probe.failure {
+                                    line += " FAILED \(failure): \((failure as? LocalizedError)?.errorDescription ?? "")"
+                                }
+                                return (index, line)
+                            }
+                        }
+                        for await (index, line) in group { lines[index] = line }
+                    }
+                }
+                report += lines.keys.sorted().compactMap { lines[$0] }
+            }
+        } catch { report.append("FAILED: \(error)") }
+        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        try? Data((report.joined(separator: "\n") + "\n").utf8)
+            .write(to: documents.appendingPathComponent("connect-self-test.txt"), options: .atomic)
+    }
+    /// Inactive (a Face ID sheet, a permission alert, Control Center, the app
+    /// switcher) covers the screen and pauses restore. Live sessions run until
+    /// the user closes them, background included: leaving asks iOS for its
+    /// usual grace period and ends the standing Face ID approval; returning
+    /// reconnects whatever dropped meanwhile (WorkspaceTerminalScene).
+    func setScenePhase(_ phase: ScenePhase) {
+        connections?.setAuthenticationForeground(phase == .active)
+        if phase == .background {
+            closeFileSessions()
+            cancelHostKeyVerification()
+            AppleSSHCredentialSigner.endApproval()
+            beginBackgroundRun()
+        } else { endBackgroundRun() }
+        let foreground = phase != .background
+        if foreground != connectionsForeground {
+            connectionsForeground = foreground
+            if foreground { updateConnectionLifecycle() }
+        }
+        // Scenes run whether or not their screen is showing, so they hear the
+        // app's phase from here, not from their screen.
+        for scene in liveScenes.values {
+            scene.setForeground(phase == .active)
+            if phase == .background { scene.enteredBackground() }
+        }
+        if (phase == .active) != active { setActive(phase == .active) }
+    }
+    @ObservationIgnored private var backgroundRun = UIBackgroundTaskIdentifier.invalid
+    /// Keeps live sessions answering their servers through a quick app switch.
+    private func beginBackgroundRun() {
+        guard backgroundRun == .invalid else { return }
+        backgroundRun = UIApplication.shared.beginBackgroundTask(withName: "FrankenTerm sessions") { [weak self] in
+            MainActor.assumeIsolated { self?.endBackgroundRun() }
+        }
+    }
+    private func endBackgroundRun() {
+        guard backgroundRun != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundRun)
+        backgroundRun = .invalid
+    }
+
+    /// Live workspace scenes outlive their screens: leaving the terminal keeps
+    /// every session running until the user disconnects it. A new revision of
+    /// a workspace (a re-import) or its removal retires its scene.
+    @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
+    func liveScene(workspaceID: UUID, revision: UUID, expectedTarget: TerminalSessionTarget? = nil,
+                   make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
+        guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil, hostKeyOperation == nil,
+              certificateRenewalOperation == nil,
+              !showRestore, !requiresConnectionApproval(workspaceID),
+              !deviceKeyConnectionHolds.contains(workspaceID) else { throw WorkspaceSSHConnectionError.busy }
+        guard workspaces.contains(where: { $0.id == workspaceID && $0.revision == revision }) else {
+            throw WorkspaceSSHConnectionError.stale
+        }
+        if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
+           document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
+            throw SSHAuthenticationError.denied
+        }
+        if let scene = liveScenes[workspaceID], scene.revision == revision, !scene.closed {
+            if let expectedTarget {
+                guard scene.machines.first(where: { $0.id == expectedTarget.machineID })?.target?.routes == expectedTarget.routes
+                else { throw WorkspaceSSHConnectionError.stale }
+            }
+            return scene
+        }
+        if let stale = liveScenes.removeValue(forKey: workspaceID) { retire(stale) }
+        let scene = try make()
+        liveScenes[workspaceID] = scene
+        return scene
+    }
+
+    func requiresConnectionApproval(_ workspaceID: UUID) -> Bool {
+        offlineConnectionHolds.contains(workspaceID)
+            || workspaces.first(where: { $0.id == workspaceID })?.connectLater != false
+    }
+
+    func beginRouteChoice(workspaceID: UUID, machineID: String) throws -> LocalRouteChoiceContext {
+        guard active, !busy, !showRestore, let local = localPolicies[workspaceID] else { throw FTError.stale }
+        let document = try local.workspace.document()
+        guard let machine = document.machines.first(where: { $0.id == machineID }),
+              !document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) else {
+            throw SSHAuthenticationError.denied
+        }
+        let context = LocalRouteChoiceContext(local: local, document: document, machine: machine, epoch: epoch)
+        routeChoiceID = context.id; routeConnectionReviewID = nil
+        return context
+    }
+
+    func routeChoiceIsCurrent(_ context: LocalRouteChoiceContext) -> Bool {
+        active && !showRestore && routeChoiceID == context.id && context.epoch == epoch
+            && localPolicies[context.local.workspace.id]?.workspace.revision == context.local.workspace.revision
+            && workspaces.contains(where: { $0.id == context.local.workspace.id && $0.revision == context.local.workspace.revision })
+    }
+
+    func endRouteChoice(_ contextID: UUID) {
+        guard routeChoiceID == contextID else { return }
+        routeChoiceID = nil; routeConnectionReviewID = nil
+    }
+
+    func selectedTerminalTarget(workspaceID: UUID, revision: UUID, machineID: String) -> TerminalSessionTarget? {
+        guard let scene = liveScenes[workspaceID], !scene.closed, scene.revision == revision,
+              let target = scene.machines.first(where: { $0.id == machineID })?.target,
+              target.routes.contains(where: { $0.selectedConnection != nil }) else { return nil }
+        return target
+    }
+
+    func reviewRouteConnection(_ context: LocalRouteChoiceContext,
+                               selection: WorkspaceSSHConnectionSelection?,
+                               theme: WorkspaceDocument.Theme?,
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal) throws -> LocalRouteConnectionReview {
+        guard !busy, routeChoiceIsCurrent(context), let local = localPolicies[context.local.workspace.id] else { throw FTError.stale }
+        if purpose == .fileTransfer {
+            guard NativeSSHSession.supportsSFTP else { throw WorkspaceSSHConnectionError.filesUnavailable }
+            guard selection != nil else { throw WorkspaceSSHConnectionSelectionError.stale }
+        }
+        let target = try WorkspaceTerminalTargets.make(local: local, machineID: context.machine.id,
+            theme: theme, selection: selection)
+        let scene = purpose == .terminal ? liveScenes[local.workspace.id].flatMap { $0.closed ? nil : $0 } : nil
+        guard scene == nil || scene?.revision == local.workspace.revision else { throw FTError.stale }
+        let controller = scene?.sessions[context.machine.id]
+        let review = LocalRouteConnectionReview(contextID: context.id, target: target, selection: selection, purpose: purpose,
+            epoch: epoch, scene: scene, controllerID: controller?.id, disconnectsSession: controller?.settled == false)
+        routeConnectionReviewID = review.id
+        return review
+    }
+
+    private func validateRouteConnection(_ review: LocalRouteConnectionReview, local: WorkspaceLocalState) throws {
+        let target = review.target
+        let scene = review.purpose == .terminal ? liveScenes[target.workspaceID].flatMap { $0.closed ? nil : $0 } : nil
+        guard active, !showRestore, !Task.isCancelled, epoch == review.epoch,
+              routeChoiceID == review.contextID, routeConnectionReviewID == review.id,
+              local.workspace.id == target.workspaceID, local.workspace.revision == target.revision,
+              scene === review.scene, scene?.sessions[target.machineID]?.id == review.controllerID else { throw FTError.stale }
+        let document = try local.workspace.document()
+        guard !document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) else {
+            throw SSHAuthenticationError.denied
+        }
+        let current = try WorkspaceTerminalTargets.make(local: local, machineID: target.machineID,
+            theme: nil, selection: review.selection)
+        guard current.routes == target.routes else { throw FTError.stale }
+    }
+
+    /// A Files visit consumes the explicit route approval once. Its subsequent
+    /// lifetime is independent of the terminal and survives only brief system
+    /// UI interruptions, never backgrounding, restore or workspace replacement.
+    func makeFilesSession(approval: ConnectionApproval, target: TerminalSessionTarget) throws -> WorkspaceFilesSession {
+        guard connectionApprovalIsCurrent(approval), let connections,
+              target.workspaceID == approval.local.workspace.id,
+              target.revision == approval.local.workspace.revision,
+              target.routes.count == 1, let selection = target.routes.first?.selectedConnection,
+              fileSessions.count < 2, !deviceKeyConnectionHolds.contains(target.workspaceID),
+              keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil,
+              hostKeyOperation == nil, certificateRenewalOperation == nil else { throw FTError.stale }
+        let current = try WorkspaceTerminalTargets.make(local: approval.local, machineID: target.machineID,
+            theme: nil, selection: selection)
+        guard current.routes == target.routes else { throw FTError.stale }
+        let id = UUID()
+        let session = WorkspaceFilesSession(id: id, target: target, connections: connections,
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.fileSessions[id] != nil && self.connectionsForeground && !self.showRestore
+                    && !self.requiresConnectionApproval(target.workspaceID)
+                    && !self.deviceKeyConnectionHolds.contains(target.workspaceID)
+                    && self.workspaces.contains { $0.id == target.workspaceID && $0.revision == target.revision }
+            }, onRetired: { [weak self] in self?.fileSessions[id] = nil })
+        fileSessions[id] = session
+        return session
+    }
+
+    private func closeFileSessions() {
+        for session in fileSessions.values { session.requestClose() }
+    }
+
+    struct ConnectionApproval: Sendable {
+        let local: WorkspaceLocalState
+        fileprivate let generation: UUID
+    }
+
+    func connectionApprovalIsCurrent(_ approval: ConnectionApproval) -> Bool {
+        let workspace = approval.local.workspace
+        return active && !showRestore && epoch == approval.generation
+            && !requiresConnectionApproval(workspace.id)
+            && localPolicies[workspace.id]?.workspace.revision == workspace.revision
+    }
+
+    /// Called only by the user's Connect button. Join publication before
+    /// opening a scene, and retain that operation so entering offline restore
+    /// can join it before arming the durable gate. Remembered navigation and
+    /// imported auto-connect preferences never obtain this approval themselves.
+    func approveConnections(workspaceID: UUID, expectedRevision: UUID,
+                            routeReview: LocalRouteConnectionReview? = nil) async throws -> ConnectionApproval {
+        guard active, !busy, !showRestore, let store else { throw WorkspaceSSHConnectionError.busy }
+        if let routeReview {
+            guard routeReview.target.workspaceID == workspaceID, routeReview.target.revision == expectedRevision,
+                  let local = localPolicies[workspaceID] else { throw FTError.stale }
+            try validateRouteConnection(routeReview, local: local)
+        }
+        let id = UUID(), ticket = epoch, pendingLifecycle = lifecycle
+        let task = Task<WorkspaceLocalState, Error> { [self] in
+            await pendingLifecycle?.value
+            guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+            if let routeReview {
+                guard let local = localPolicies[workspaceID] else { throw FTError.stale }
+                try validateRouteConnection(routeReview, local: local)
+                try await routeReview.scene?.prepareRouteChange(machineID: routeReview.target.machineID,
+                    expectedControllerID: routeReview.controllerID)
+                guard let current = localPolicies[workspaceID] else { throw FTError.stale }
+                try validateRouteConnection(routeReview, local: current)
+            }
+            _ = try await store.approveConnections(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, confirmedByUser: true)
+            guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+            try await refreshWorkspaces(using: store, epoch: ticket)
+            guard active, !showRestore, epoch == ticket,
+                  let local = localPolicies[workspaceID], local.workspace.revision == expectedRevision,
+                  !local.workspace.connectLater else { throw FTError.stale }
+            if let routeReview {
+                try validateRouteConnection(routeReview, local: local)
+                try routeReview.scene?.installRouteChange(routeReview.target, expectedControllerID: routeReview.controllerID)
+            }
+            offlineConnectionHolds.remove(workspaceID)
+            deviceKeyConnectionHolds.remove(workspaceID)
+            return local
+        }
+        connectionApproval = (id, task)
+        defer {
+            if connectionApproval?.id == id { connectionApproval = nil }
+            if let routeReview, routeConnectionReviewID == routeReview.id { routeConnectionReviewID = nil }
+        }
+        let approval = ConnectionApproval(local: try await task.value, generation: ticket)
+        guard connectionApprovalIsCurrent(approval) else { throw FTError.stale }
+        return approval
+    }
+    /// What a machine's live session is doing, once its workspace has a scene.
+    func liveStatus(_ workspaceID: UUID, machineID: String) -> WorkspaceTerminalScene.Status? {
+        liveScenes[workspaceID].flatMap { $0.closed ? nil : $0.status(of: machineID) }
+    }
+    /// The workspace's scene is open: false before its first terminal, and
+    /// once a restore disconnected or replaced it.
+    func hasOpenScene(_ workspaceID: UUID) -> Bool {
+        liveScenes[workspaceID].map { !$0.closed } ?? false
+    }
+    private func retire(_ scene: WorkspaceTerminalScene) {
+        scene.requestClose()
+        Task { await scene.close() }
+    }
+    private func setActive(_ value: Bool) {
+        active = value
+        if !value {
+            credentialImport?.cancel()
+            retireEnrollmentReviews()
+            deviceKeyReviewID = nil
+            deviceKeyOperation?.task.cancel()
+            scannedCode = nil; stopSavingScanProgress()
+            cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
+            locallyRevokedFingerprints = []
+            // A system permission sheet can interrupt a read. Do not turn its
+            // foreground callback into another automatic prompt/read attempt.
+            if busy { pendingImport?.needsExplicitRetry = true }
+        } else if pendingImport != nil { showRestore = true }
+        updateLifecycle()
+    }
+    /// Serialized activations: admit connections and retry failed cleanup.
+    private func updateConnectionLifecycle() {
+        guard let connections else { return }
+        let prior = connectionLifecycle
+        connectionLifecycle = Task {
+            await prior?.value
+            for session in Array(fileSessions.values) { await session.retryCleanup() }
+            await connections.activate()
+        }
+    }
+    func setRestoreVisible(_ value: Bool) {
+        if value { closeFileSessions() }
+        if value { credentialImport?.cancel() }
+        if value { retireEnrollmentReviews() }
+        if value { deviceKeyReviewID = nil; deviceKeyOperation?.task.cancel() }
+        if value { connections?.setAuthenticationScope(nil) }
+        showRestore = value
+        // A just-dismissed request may already be retired. Re-present only the
+        // status returned by the serialized lifecycle transition.
+        state = nil
+        if !value {
+            cameraRequested = false; pendingImport = nil; offlineModeBlocked = false
+            scannedCode = nil; stopSavingScanProgress()
+        }
+        updateLifecycle(discardRecipientRequest: !value)
+    }
+    func retryOfflineMode() {
+        guard active, showRestore, !busy else { return }
+        message = nil
+        updateLifecycle()
+    }
+
+    private var disconnectableScenes: [WorkspaceTerminalScene] {
+        liveScenes.values.filter { scene in
+            !scene.closed || scene.sessions.values.contains { !$0.settled }
+        }.sorted {
+            let order = $0.workspaceName.localizedStandardCompare($1.workspaceName)
+            return order == .orderedSame ? $0.workspaceID.uuidString < $1.workspaceID.uuidString
+                : order == .orderedAscending
+        }
+    }
+
+    /// The workspaces whose live sessions keep offline restore from starting.
+    var workspacesBlockingRestore: [String] {
+        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return [] }
+        return disconnectableScenes.map(\.workspaceName)
+    }
+
+    /// One tap ends every live session so offline restore can begin.
+    func disconnectSessionsAndRestore() {
+        guard active, showRestore, offlineModeBlocked, !busy, restoreDisconnection == nil else { return }
+        let owners = disconnectableScenes, id = UUID(), ticket = epoch
+        guard !owners.isEmpty else { return }
+        busy = true; message = nil; cameraRequested = false
+        // No actor hop may intervene between choosing the owners and sealing
+        // input/reconnect admission for every one of them.
+        for owner in owners { owner.requestClose() }
+        offlineConnectionHolds.formUnion(owners.map(\.workspaceID))
+        returning = nil
+        UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+        let job = Task { [weak self] in
+            // The model retains this task even after leaving restore. Closing
+            // joins each owner's timers, startup, input and transport cleanup;
+            // MobileConnections keeps any failed settlements for a later retry.
+            for owner in owners { await owner.close() }
+            guard let self, self.restoreDisconnection?.id == id else { return }
+            self.restoreDisconnection = nil; self.busy = false
+            guard self.active, self.showRestore, self.epoch == ticket else { return }
+            self.updateLifecycle()
+        }
+        restoreDisconnection = (id, job)
+    }
+
+    /// Waits for the latest restore transition. Dismissing restore releases
+    /// offline exclusion there, so a connection opened after it is admitted.
+    func restoreSettled() async {
+        await lifecycle?.value
+    }
+
+    func requestRecipient() {
+        guard active, !busy else { return }
+        scannedCode = nil; stopSavingScanProgress()
+        pendingImport = nil; cameraRequested = false; setRestoreVisible(true)
+        run { [self] restore, state in
+            let current = state.phase == .complete ? try await self.restartFinished(restore) : state
+            return try await restore.createRecipientRequest(generation: current.generation)
+        }
+    }
+    func resumeRecipientRequest() {
+        guard active, !busy else { return }
+        pendingImport?.needsExplicitRetry = false
+        run { restore, state in try await restore.resumeRecipientRequest(generation: state.generation) }
+    }
+    func resetRestore() {
+        guard active, !busy else { return }
+        scannedCode = nil; stopSavingScanProgress()
+        pendingImport = nil; cameraRequested = false
+        run { restore, _ in try await restore.reset() }
+    }
+    func retryPendingImport() {
+        guard active, !busy, state?.isSuspended == false else { return }
+        pendingImport?.needsExplicitRetry = false
+        openPendingFileIfReady()
+    }
+    private func updateLifecycle(discardRecipientRequest: Bool = false) {
+        epoch = UUID()
+        routeChoiceID = nil; routeConnectionReviewID = nil
+        retireEnrollmentReviews()
+        keyReviewID = nil
+        hostKeyCheckReviewID = nil
+        hostKeyPinReview = nil
+        // Keychain's own Face ID sheet can make the scene briefly inactive.
+        // Keep an explicitly admitted check alive through that interruption;
+        // backgrounding, restore and explicit cancellation still retire it.
+        if hostKeyCheckID != nil {
+            if !connectionsForeground || showRestore { cancelHostKeyVerification() }
+        } else { hostKeyOperation?.task.cancel() }
+        workspaceRefreshEpoch = UUID()
+        workspaceRefresh?.cancel()
+        observations?.finish(); observations = nil
+        observationTask?.cancel(); observationTask = nil; lastObservation = nil
+        let pendingRecording = recordingRead?.task
+        pendingRecording?.cancel()
+        let pendingDocument = documentInspection?.task
+        let pendingEnrollment = enrollmentResultsOperation?.task
+        let pendingCertificate = certificateRenewalOperation?.task
+        guard let restore else { return }
+        let ticket = epoch, visible = active && showRestore, prior = lifecycle
+        let pendingApproval = connectionApproval?.task
+        let pendingHostKey = showRestore || !connectionsForeground ? hostKeyOperation?.task : nil
+        let pendingFiles = showRestore || !connectionsForeground ? Array(fileSessions.values) : []
+        lifecycle = Task { [weak self] in
+            await prior?.value
+            // A Connect admitted just before the restore sheet appeared must
+            // settle before the offline gate is armed, never after it.
+            _ = try? await pendingApproval?.value
+            // A cancelled check still owns its jump path until teardown joins;
+            // let it release the network lease before arming offline restore.
+            await pendingHostKey?.value
+            // Files are foreground-only. Join their admitted owners before
+            // asking the optical restore coordinator for network exclusion.
+            for session in pendingFiles { await session.close() }
+            // The exact reader retires before a lifecycle transition rotates
+            // receive authority. A background callback cannot start more work.
+            await pendingRecording?.value
+            await pendingDocument?.value
+            await pendingEnrollment?.value
+            await pendingCertificate?.value
+            let next: OfflineRestoreStatus
+            do {
+                if visible {
+                    try await restore.enterOfflineMode()
+                    if let self, let store = self.store {
+                        self.offlineConnectionHolds.formUnion(self.workspaces.map(\.id))
+                        _ = try await store.deferConnectionsForOfflineRestore()
+                    }
+                    next = await restore.resume()
+                } else { next = await restore.suspend(discardRecipientRequest: discardRecipientRequest) }
+            } catch {
+                let paused = await restore.suspend()
+                guard let self, self.epoch == ticket else { return }
+                self.cameraRequested = false; self.offlineModeBlocked = true
+                self.state = paused; self.report(error)
+                return
+            }
+            guard let self, self.epoch == ticket else { return }
+            self.offlineModeBlocked = false
+            self.state = next
+            if visible { self.startObservations(restore: restore) }
+            if self.active, let store = self.store {
+                self.scheduleWorkspaceRefresh(using: store, epoch: ticket)
+            }
+            guard self.epoch == ticket else { return }
+            self.openPendingFileIfReady()
+            self.openPendingDocumentIfReady()
+            if self.active { await self.refreshSavedScan(epoch: ticket) }
+        }
+    }
+
+    private func cancelScanSaveTimer() {
+        scanSaveTimer?.task.cancel(); scanSaveTimer = nil
+    }
+
+    /// Retire local admission synchronously, then join the retained writer and
+    /// revoke its storage epoch. A delayed write cannot recreate retired rows.
+    func stopSavingScanProgress() {
+        cancelScanSaveTimer()
+        let ended = scanSaveSession ?? scanSaveFailure?.prior, prior = scanWrite
+        scanSaveEpoch = UUID(); scanSaveSession = nil; scanSaveFailure = nil
+        scanSaveGeneration = nil; scanSaveIdentity = nil; scanCadence = nil
+        guard let ended, let scanRecovery else { return }
+        let id = UUID()
+        let job = Task { [weak self] in
+            await prior?.task.value
+            do { try await scanRecovery.stopSaving(ended) }
+            catch OpticalDecoderRecoveryError.staleWriter { } // already retired
+            catch {
+                self?.scanProgressMessage = "Saving has stopped in this app, but retiring the saved writer could not be confirmed. Review saved progress before saving again. \(error.localizedDescription)"
+            }
+            guard let self, self.scanWrite?.id == id else { return }
+            self.scanWrite = nil
+            if self.active { await self.refreshSavedScan(epoch: self.epoch) }
+        }
+        scanWrite = (id, job)
+    }
+
+    func continueWithoutSaving() {
+        stopSavingScanProgress()
+        scanProgressMessage = "Scanning can continue. Previously saved progress is still available."
+        advanceAutomatically()
+    }
+
+    private func reconcileScanSaving() {
+        guard scanSaveSession != nil else { return }
+        guard let state, !state.isSuspended, state.source == .optical,
+              state.identity == scanSaveIdentity, state.phase != .complete else {
+            stopSavingScanProgress(); return
+        }
+        if scanSaveGeneration != state.generation {
+            cancelScanSaveTimer()
+            // A failed snapshot belongs to its old decoder generation. It may
+            // not become a retry after a page repair or a source transition.
+            if scanSaveFailure != nil { stopSavingScanProgress() }
+            else { scanSaveGeneration = state.generation }
+        }
+    }
+
+    private func publishSavedScan(_ reviewed: OpticalDecoderRecoveryReview) {
+        scanRefreshEpoch = UUID()
+        savedScans.removeAll { if case .partial = $0 { true } else { false } }
+        savedScans.insert(.partial(reviewed), at: 0)
+    }
+
+    private func refreshSavedScan(epoch ticket: UUID) async {
+        let refresh = UUID(); scanRefreshEpoch = refresh
+        var found: [SavedOpticalScan] = [], failures: [String] = []
+        if let scanRecovery {
+            do { if let value = try await scanRecovery.review() { found.append(.partial(value)) } }
+            catch is CancellationError { return }
+            catch { failures.append(error.localizedDescription) }
+        }
+        if let verifiedScanRecovery {
+            do { if let value = try await verifiedScanRecovery.review() { found.append(.verified(value)) } }
+            catch is CancellationError { return }
+            catch { failures.append(error.localizedDescription) }
+        }
+        guard active, epoch == ticket, scanRefreshEpoch == refresh else { return }
+        savedScans = found
+        if !failures.isEmpty { scanProgressMessage = "Some saved progress could not be read. " + failures.joined(separator: " ") }
+    }
+
+    /// User actions join the existing writer. Initial consent failures can have
+    /// published, so read the actual store and require a new exact review.
+    private func scanOperation(advanceWhenFinished: Bool = true, _ operation: @escaping @MainActor
+        (OfflineRestore<AppleCryptography>, OpticalDecoderRecovery<AppleCryptography>, UUID) async throws -> Void) {
+        guard active, showRestore, !busy, !offlineModeBlocked,
+              let restore, let scanRecovery else { return }
+        busy = true; scanProgressMessage = nil; cancelScanSaveTimer()
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            await pendingLifecycle?.value
+            guard let self else { return }
+            await self.scanWrite?.task.value
+            defer {
+                self.busy = false
+                if advanceWhenFinished { self.advanceAutomatically() }
+            }
+            guard self.active, self.showRestore, self.epoch == ticket, !self.offlineModeBlocked else { return }
+            do { try await operation(restore, scanRecovery, ticket) }
+            catch is CancellationError { }
+            catch {
+                guard self.active, self.epoch == ticket else { return }
+                self.stopSavingScanProgress()
+                self.scanProgressMessage = "Saving was not confirmed. Review the saved progress before trying again. \(error.localizedDescription)"
+                let latest = await restore.status()
+                guard self.active, self.epoch == ticket else { return }
+                self.state = latest
+            }
+            if self.active, self.epoch == ticket { await self.refreshSavedScan(epoch: ticket) }
+        }
+    }
+
+    private func adoptScanWriter(_ session: OpticalDecoderSaveSession, generation: UUID) {
+        scanSaveEpoch = UUID(); scanSaveRevision = UUID(); scanSaveSession = session; scanSaveFailure = nil
+        scanSaveGeneration = generation; scanSaveIdentity = session.review.identity
+        scanCadence = .init(receivedParts: session.review.receivedParts, verifiedPages: session.review.verifiedPages)
+        scanLastSaved = .now; publishSavedScan(session.review)
+    }
+
+    func saveScanProgress(generation: UUID, identity: OpticalFrame.Identity,
+                          replacing reviewed: OpticalDecoderRecoveryReview?) {
+        scanOperation { [weak self] restore, recovery, ticket in
+            guard let self, self.state?.generation == generation, self.state?.identity == identity else { throw FTError.stale }
+            let checkpoint = try await restore.exportDecoderCheckpoint(generation: generation)
+            guard self.active, self.epoch == ticket else { throw CancellationError() }
+            let writer = self.scanSaveEpoch
+            let session: OpticalDecoderSaveSession
+            if let reviewed {
+                guard reviewed.identity == identity else { throw FTError.stale }
+                session = try await recovery.continueSaving(reviewed, confirmedByUser: true)
+            } else { session = try await recovery.beginSaving(checkpoint, confirmedByUser: true) }
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else {
+                try? await recovery.stopSaving(session); return
+            }
+            self.adoptScanWriter(session, generation: generation)
+            let latest = await restore.status()
+            guard self.active, self.epoch == ticket else { return }
+            self.state = latest
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+        }
+    }
+
+    func resumeSavedScan(_ reviewed: SavedOpticalScan) {
+        scanOperation { [weak self] restore, recovery, ticket in
+            guard let self else { return }
+            self.scannedCode = nil; self.stopSavingScanProgress(); self.cameraRequested = false
+            await self.scanWrite?.task.value
+            let current = await restore.status()
+            let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
+            guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
+            let resumed: OfflineRestoreStatus, session: OpticalDecoderSaveSession
+            let writer = self.scanSaveEpoch
+            switch reviewed {
+            case .partial(let saved):
+                let checkpoint = try await recovery.load(saved)
+                guard self.active, self.epoch == ticket else { throw CancellationError() }
+                resumed = try await restore.acceptDecoderCheckpoint(checkpoint, generation: ready.generation)
+                guard self.active, self.epoch == ticket else { return }
+                session = try await recovery.continueSaving(saved, confirmedByUser: true)
+            case .verified(let saved):
+                guard let legacy = self.verifiedScanRecovery else { throw FTError.storage }
+                guard try await recovery.review() == nil else { throw OpticalDecoderRecoveryError.savedProgressExists }
+                let checkpoint = try await legacy.load(saved)
+                guard self.active, self.epoch == ticket else { throw CancellationError() }
+                resumed = try await restore.resumeScan(checkpoint, generation: ready.generation)
+                let decoder = try await restore.exportDecoderCheckpoint(generation: resumed.generation)
+                guard self.active, self.epoch == ticket else { return }
+                session = try await recovery.beginSaving(decoder, confirmedByUser: true)
+            }
+            guard self.active, self.epoch == ticket, self.scanSaveEpoch == writer else {
+                try? await recovery.stopSaving(session); return
+            }
+            self.state = resumed; self.lastObservation = nil
+            self.adoptScanWriter(session, generation: resumed.generation)
+        }
+    }
+
+    func discardSavedScan(_ reviewed: SavedOpticalScan) {
+        scanOperation { [weak self] _, recovery, _ in
+            guard let self else { return }
+            // Discard itself rotates the epoch using the exact reviewed bytes;
+            // rotating it with stopSaving first would invalidate this review.
+            switch reviewed {
+            case .partial(let saved): try await recovery.discard(saved, confirmedByUser: true)
+            case .verified(let saved):
+                guard let legacy = self.verifiedScanRecovery else { throw FTError.storage }
+                try await legacy.discard(saved)
+            }
+            self.stopSavingScanProgress()
+        }
+    }
+
+    /// Drain the bounded camera stream before the final snapshot. No suspend or
+    /// source mutation can overtake this explicitly requested save.
+    func saveAndPauseScan() {
+        scanOperation(advanceWhenFinished: false) { [weak self] restore, _, ticket in
+            guard let self else { return }
+            self.cameraRequested = false; self.scannedCode = nil
+            let consumer = self.observationTask
+            self.observations?.finish(); self.observations = nil; self.observationTask = nil
+            await consumer?.value
+            guard self.active, self.epoch == ticket else { return }
+            let current = await restore.status()
+            let priorRevision = self.scanSaveRevision
+            await self.saveScanSnapshot(current, restore: restore, epoch: ticket, force: true)
+            guard self.active, self.epoch == ticket, self.scanSaveFailure == nil,
+                  self.scanSaveSession != nil, self.scanSaveRevision != priorRevision else { return }
+            // Announce only a confirmed write. A later retirement/read failure
+            // can replace this message and must not be hidden by success text.
+            self.scanProgressMessage = "Scan progress saved. Resume the camera when you are ready."
+            self.stopSavingScanProgress()
+            await self.scanWrite?.task.value
+        }
+    }
+
+    func retryScanSave() {
+        scanOperation { [weak self] restore, _, ticket in
+            guard let self, let failed = self.scanSaveFailure,
+                  self.scanSaveGeneration == failed.generation,
+                  self.state?.generation == failed.generation else { throw FTError.stale }
+            await self.writeScanSnapshot(failed.data, after: failed.prior, generation: failed.generation, epoch: ticket)
+            guard self.active, self.epoch == ticket, self.scanSaveFailure == nil else { return }
+            let latest = await restore.status()
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+        }
+    }
+
+    /// One timer coalesces useful frame progress, including a trailing partial
+    /// burst. Complete envelopes and deliberate repairs bypass the interval.
+    private func saveScanSnapshot(_ status: OfflineRestoreStatus, restore: OfflineRestore<AppleCryptography>,
+                                  epoch ticket: UUID, force: Bool = false) async {
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, (!busy || isReadingRecording || force),
+              scanSaveFailure == nil, scanSaveSession != nil else { return }
+        let writer = scanSaveEpoch
+        var current = status
+        // A repair or completion must follow any earlier snapshot, even when
+        // that owner is still exporting its bytes rather than writing them.
+        while let pending = scanWrite {
+            guard force || current.phase == .locked || current.phase == .review else { return }
+            cancelScanSaveTimer()
+            await pending.task.value
+            guard !Task.isCancelled, active, showRestore, epoch == ticket,
+                  scanSaveEpoch == writer, scanSaveFailure == nil else { return }
+            current = await restore.status()
+        }
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              (!busy || isReadingRecording || force), scanSaveFailure == nil, let prior = scanSaveSession, let cadence = scanCadence,
+              scanSaveGeneration == current.generation, scanSaveIdentity == current.identity,
+              [.collecting, .locked, .review].contains(current.phase) else { return }
+        guard let ordinaryDelay = cadence.delay(receivedParts: current.receivedParts, verifiedPages: current.verifiedPages,
+                                                elapsed: scanLastSaved.duration(to: .now), force: force) else { return }
+        // Repeated queued observations of an already-saved locked envelope do
+        // not write again. A newly completed envelope does not wait two seconds.
+        let delay = current.phase == .collecting ? ordinaryDelay : .zero
+        if delay > .zero {
+            scheduleScanSaveTimer(after: delay, restore: restore, epoch: ticket,
+                                  writer: writer, generation: current.generation)
+            return
+        }
+        cancelScanSaveTimer()
+        let id = UUID(), predecessor = scanSaveRevision
+        let generation = current.generation, identity = current.identity
+        let job = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.scanWrite?.id == id { self.scanWrite = nil } }
+            do {
+                let checkpoint = try await restore.exportDecoderCheckpoint(generation: generation)
+                guard !Task.isCancelled, self.active, self.showRestore, self.epoch == ticket,
+                      self.scanWrite?.id == id, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation, self.scanSaveIdentity == identity,
+                      self.scanSaveRevision == predecessor, self.scanSaveFailure == nil else { return }
+                await self.writeScanSnapshot(checkpoint, after: prior, generation: generation, epoch: ticket, ownedBy: id)
+            } catch FTError.stale {
+                // A manual repair may rotate the receiver while this export
+                // waits. Its fresh forced snapshot owns the new generation.
+            } catch is CancellationError { }
+            catch {
+                guard !Task.isCancelled, self.active, self.epoch == ticket, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation, self.scanSaveIdentity == identity,
+                      self.scanSaveRevision == predecessor else { return }
+                self.stopSavingScanProgress()
+                self.scanProgressMessage = "Saving paused before a checkpoint could be made. \(error.localizedDescription)"
+            }
+        }
+        // Reserve before the first actor await: another observation or timer
+        // cannot export against this same predecessor while it is in flight.
+        scanWrite = (id, job)
+        await job.value
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              scanSaveRevision != predecessor, scanSaveFailure == nil, scanWrite == nil else { return }
+        let latest = await restore.status()
+        guard !Task.isCancelled, active, showRestore, epoch == ticket, scanSaveEpoch == writer,
+              scanSaveGeneration == latest.generation, scanSaveIdentity == latest.identity,
+              scanSaveFailure == nil, scanWrite == nil, let latestCadence = scanCadence,
+              [.collecting, .locked, .review].contains(latest.phase),
+              let trailingDelay = latestCadence.delay(receivedParts: latest.receivedParts,
+                  verifiedPages: latest.verifiedPages, elapsed: scanLastSaved.duration(to: .now)) else { return }
+        if latest.phase == .collecting {
+            // Frames can arrive during file I/O. Retain their final partial
+            // burst even if no further camera callback arrives to start a timer.
+            scheduleScanSaveTimer(after: trailingDelay, restore: restore, epoch: ticket,
+                                  writer: writer, generation: latest.generation)
+        } else {
+            // Completion must reach storage before this caller advances to
+            // decryption/import. The changed-count guard above bounds this path.
+            await saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+        }
+    }
+
+    private func scheduleScanSaveTimer(after delay: Duration, restore: OfflineRestore<AppleCryptography>,
+                                       epoch ticket: UUID, writer: UUID, generation: UUID) {
+        guard scanSaveTimer == nil, active, showRestore, epoch == ticket,
+              scanSaveEpoch == writer, scanSaveGeneration == generation, scanSaveFailure == nil else { return }
+        let id = UUID()
+        let job = Task { [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard let self else { return }
+            // A manual action may be finishing when the deadline arrives.
+            // Keep one cancellable timer instead of losing its trailing save.
+            while self.busy && !self.isReadingRecording {
+                guard self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                      self.epoch == ticket, self.scanSaveEpoch == writer,
+                      self.scanSaveGeneration == generation else { return }
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+            }
+            guard !Task.isCancelled, self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                  self.epoch == ticket, self.scanSaveEpoch == writer,
+                  self.scanSaveGeneration == generation, self.scanSaveFailure == nil else { return }
+            let latest = await restore.status()
+            guard !Task.isCancelled, self.scanSaveTimer?.id == id, self.active, self.showRestore,
+                  self.epoch == ticket, self.scanSaveEpoch == writer,
+                  self.scanSaveGeneration == generation else { return }
+            self.scanSaveTimer = nil
+            await self.saveScanSnapshot(latest, restore: restore, epoch: ticket)
+        }
+        scanSaveTimer = (id, job)
+    }
+
+    /// Retain the exact failed payload and predecessor. New frames never replace
+    /// an uncertain write; Retry must reaffirm that same successor first.
+    private func writeScanSnapshot(_ checkpoint: Data, after prior: OpticalDecoderSaveSession,
+                                   generation: UUID, epoch ticket: UUID, ownedBy owner: UUID? = nil) async {
+        guard !Task.isCancelled, active, showRestore, epoch == ticket,
+              scanSaveGeneration == generation, scanSaveIdentity == prior.review.identity,
+              let recovery = scanRecovery else { return }
+        if owner == nil {
+            guard scanWrite == nil else { return }
+            let id = UUID()
+            let job = Task { [weak self] in
+                guard let self else { return }
+                defer { if self.scanWrite?.id == id { self.scanWrite = nil } }
+                await self.writeScanSnapshot(checkpoint, after: prior, generation: generation, epoch: ticket, ownedBy: id)
+            }
+            scanWrite = (id, job)
+            await job.value
+            return
+        }
+        guard scanWrite?.id == owner else { return }
+        let writer = scanSaveEpoch
+        do {
+            let saved = try await recovery.save(checkpoint, after: prior)
+            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
+            scanSaveRevision = UUID(); scanSaveSession = saved; scanSaveFailure = nil
+            scanCadence?.record(receivedParts: saved.review.receivedParts, verifiedPages: saved.review.verifiedPages)
+            scanLastSaved = .now; publishSavedScan(saved.review)
+        } catch {
+            guard active, epoch == ticket, scanSaveEpoch == writer else { return }
+            guard scanSaveGeneration == generation else {
+                stopSavingScanProgress()
+                scanProgressMessage = "Saving could not be confirmed before this scan changed. Review saved progress before saving again."
+                return
+            }
+            scanSaveFailure = (checkpoint, prior, generation)
+            cancelScanSaveTimer()
+            scanProgressMessage = "Saving could not be confirmed. Retry Saving to preserve this exact checkpoint, or continue without saving. \(error.localizedDescription)"
+        }
+    }
+    private func scheduleWorkspaceRefresh(using store: WorkspaceStore, epoch ticket: UUID) {
+        let prior = workspaceRefresh
+        prior?.cancel()
+        // Protected-storage reads must not hold the transition chain that
+        // suspends collection or retires a dismissed request. Serialize these
+        // refreshes separately and fence their eventual public UI results.
+        workspaceRefresh = Task { [weak self] in
+            await prior?.value
+            guard !Task.isCancelled, let self, self.active, self.epoch == ticket else { return }
+            do { try await self.refreshWorkspaces(using: store, epoch: ticket) }
+            catch {
+                guard !Task.isCancelled, self.active, self.epoch == ticket else { return }
+                self.availableCredentials = [:]; self.localPolicies = [:]; self.report(error)
+            }
+        }
+    }
+    private func refreshWorkspaces(using store: WorkspaceStore, epoch ticket: UUID) async throws {
+        guard !Task.isCancelled, active, epoch == ticket else { return }
+        let request = UUID(); workspaceRefreshEpoch = request
+        let snapshot: [WorkspaceLocalState], revoked: Set<String>
+        do {
+            snapshot = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
+            revoked = try await store.locallyRevokedCredentialFingerprints()
+        } catch {
+            guard !Task.isCancelled, active, epoch == ticket, workspaceRefreshEpoch == request else { return }
+            throw error
+        }
+        guard !Task.isCancelled, active, epoch == ticket, workspaceRefreshEpoch == request else { return }
+        workspaces = snapshot.map(\.workspace)
+        if let source = hostKeyCheckSource,
+           !workspaces.contains(where: { $0.id == source.workspaceID && $0.revision == source.revision }) {
+            cancelHostKeyVerification()
+        }
+        for (id, scene) in liveScenes where !workspaces.contains(where: { $0.id == id && $0.revision == scene.revision }) {
+            liveScenes[id] = nil; retire(scene)
+        }
+        for session in fileSessions.values where !workspaces.contains(where: {
+            $0.id == session.target.workspaceID && $0.revision == session.target.revision
+        }) { session.requestClose() }
+        availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
+        localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
+        for local in snapshot {
+            applyConnectionPreferences(local.connectionPreferences, workspace: local.workspace)
+        }
+        locallyRevokedFingerprints = revoked
+        if let report = enrollmentResults, report.review != nil, !report.isApplying, !report.isFinished,
+           !enrollmentResultsAreCurrent(report) {
+            report.review = nil; deviceKeyReviewID = nil
+            report.message = "The workspace or phone key changed. Review its current routes again."
+        }
+        restoreLiveScreen()
+        if let importing = credentialImport, !importing.isCommitting, !importing.isFinished,
+           !credentialImportIsCurrent(importing) {
+            importing.cancel(message: "The workspace or key changed. Select its current key reference again.")
+        }
+        // A first import, or new machines in a replaced one: machines that
+        // look alike get distinct themes before anything shows them.
+        for saved in workspaces {
+            if let document = try? saved.document(), let themes = machineThemes(saved.id, document: document) {
+                setThemeChoices(themes.distinguishingMachines(), for: saved.id)
+            }
+        }
+    }
+
+    func automaticallyConnect(_ machine: WorkspaceDocument.Machine, workspaceID: UUID) -> Bool {
+        localPolicies[workspaceID]?.connectionPreferences.automaticallyConnect(machine) ?? machine.autoConnect
+    }
+
+    /// The saved choice is independent of the imported default and of live
+    /// authentication. A preference write keeps the workspace revision, so no
+    /// session is torn down merely to stop future automatic group connections.
+    func setMachineAutoConnect(_ enabled: Bool?, workspaceID: UUID, machineID: String) {
+        guard active, !busy, !showRestore, let store,
+              let local = localPolicies[workspaceID],
+              let document = try? local.workspace.document(),
+              let machine = document.machines.first(where: { $0.id == machineID }) else { return }
+        connectionPreferenceBusy = true; connectionPreferenceMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        // Stop unsent warm-up immediately when switching off. An admitted
+        // attempt remains owned, and failures below reload the actual choice.
+        if !(enabled ?? machine.autoConnect) {
+            liveScenes[workspaceID]?.setAutomaticConnection(false, machineID: machineID)
+        }
+        connectionPreferenceUpdate = Task { [self] in
+            defer { connectionPreferenceBusy = false; connectionPreferenceUpdate = nil }
+            do {
+                let preferences = try await store.setMachineAutoConnect(workspaceID: workspaceID,
+                    expectedRevision: local.workspace.revision, machineID: machineID, enabled: enabled)
+                applyConnectionPreferences(preferences, workspace: local.workspace)
+            } catch {
+                connectionPreferenceMessage = "This preference could not be confirmed as saved. \(error.localizedDescription)"
+            }
+            // A failed atomic write may already have published. Show only the
+            // read-back state; never flip the switch by guessing at rollback.
+            if active {
+                do { try await refreshWorkspaces(using: store, epoch: epoch) }
+                catch {
+                    availableCredentials = [:]; localPolicies = [:]
+                    connectionPreferenceMessage = "Connection preferences could not be refreshed. Reopen the workspace before changing them again. \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func applyConnectionPreferences(_ preferences: WorkspaceConnectionPreferences, workspace: InstalledWorkspace) {
+        guard let scene = liveScenes[workspace.id], scene.revision == workspace.revision,
+              let document = try? workspace.document() else { return }
+        scene.setAutomaticConnections(Dictionary(uniqueKeysWithValues: document.machines.map {
+            ($0.id, preferences.automaticallyConnect($0))
+        }))
+    }
+
+    func machineOrder(_ group: WorkspaceDocument.Group, workspaceID: UUID) -> [String] {
+        (localPolicies[workspaceID]?.navigationPreferences ?? .init()).machineOrder(for: group)
+    }
+
+    /// Keep a reorder tied to the sheet's exact revision and previous order.
+    /// Reading back the durable catalog also reconciles a write that published
+    /// before reporting a storage failure. A reorder never retires a live scene.
+    func setMachineOrder(_ machineIDs: [String]?, workspaceID: UUID, expectedRevision: UUID,
+                         groupID: String, expectedOrder: [String], completed: @escaping @MainActor (Bool) -> Void) {
+        guard active, !busy, !showRestore, let store,
+              localPolicies[workspaceID]?.workspace.revision == expectedRevision else {
+            connectionPreferenceMessage = "The workspace changed. Close this sheet and review its current order."
+            completed(false); return
+        }
+        connectionPreferenceBusy = true; connectionPreferenceMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let ticket = epoch
+        connectionPreferenceUpdate = Task { [self] in
+            defer { connectionPreferenceBusy = false; connectionPreferenceUpdate = nil }
+            var saved = false
+            do {
+                _ = try await store.setMachineOrder(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                    groupID: groupID, expectedOrder: expectedOrder, machineIDs: machineIDs)
+                saved = true
+            } catch {
+                connectionPreferenceMessage = "This machine order could not be confirmed as saved. Close and reopen the order sheet before retrying. \(error.localizedDescription)"
+            }
+            if active {
+                do { try await refreshWorkspaces(using: store, epoch: epoch) }
+                catch {
+                    availableCredentials = [:]; localPolicies = [:]; saved = false
+                    connectionPreferenceMessage = "The saved order could not be refreshed. Reopen the workspace before changing it again. \(error.localizedDescription)"
+                }
+            }
+            // A callback from a retired foreground visit cannot dismiss a new
+            // presentation after the app has locked, resumed, or changed scenes.
+            completed(saved && active && epoch == ticket)
+        }
+    }
+
+    func reviewDeviceKeyChange(_ action: LocalDeviceKeyReview.Action,
+                               workspaceID: UUID) -> LocalDeviceKeyReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.importedDocument() else { return nil }
+        let fingerprint: String?, destination: String?, disconnects: Bool
+        switch action {
+        case .generate:
+            fingerprint = nil; destination = nil; disconnects = false
+        case .assign(let credentialID, let routeID):
+            guard let key = saved.deviceKeys.first(where: { $0.id == credentialID }),
+                  !locallyRevokedFingerprints.contains(key.fingerprint),
+                  !unconfirmedCredentialRevocations.contains(key.fingerprint),
+                  (try? saved.deviceKeyAssignableRouteIDs().contains(routeID)) == true,
+                  let route = document.routes.first(where: { $0.id == routeID }) else { return nil }
+            fingerprint = key.fingerprint
+            destination = "\(route.user)@\(route.host):\(route.port)"
+            disconnects = hasOpenScene(workspaceID)
+        case .remove(let routeID):
+            guard let assignment = saved.deviceKeyAssignments.first(where: { $0.routeID == routeID }),
+                  let key = saved.deviceKeys.first(where: { $0.id == assignment.credentialID }) else { return nil }
+            fingerprint = key.fingerprint
+            destination = document.routes.first(where: { $0.id == routeID }).map {
+                "\($0.user)@\($0.host):\($0.port)"
+            } ?? "Removed route · \(routeID)"
+            disconnects = hasOpenScene(workspaceID)
+        case .enrollment:
+            // Only the current report presentation may mint a batch approval.
+            return nil
+        }
+        let review = LocalDeviceKeyReview(workspaceID: workspaceID, revision: saved.revision,
+            workspaceName: document.name, action: action, fingerprint: fingerprint,
+            destination: destination, disconnectsSessions: disconnects, epoch: epoch)
+        deviceKeyReviewID = review.id
+        return review
+    }
+
+    func beginKeysPresentation(workspaceID: UUID) {
+        keysPresentationWorkspaceID = workspaceID
+    }
+
+    func endKeysPresentation(workspaceID: UUID) {
+        guard keysPresentationWorkspaceID == workspaceID else { return }
+        keysPresentationWorkspaceID = nil
+        enrollmentFileReviewID = nil
+        retireCertificateRenewal()
+        if let report = enrollmentResults, report.presentingWorkspaceID == workspaceID {
+            if report.isApplying { report.presentingWorkspaceID = nil }
+            else { cancelEnrollmentResults(report.id) }
+        }
+    }
+
+    func reviewEnrollmentFile(workspaceID: UUID) -> LocalEnrollmentFileReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }) else { return nil }
+        let review = LocalEnrollmentFileReview(workspaceID: workspaceID, revision: saved.revision, epoch: epoch)
+        enrollmentFileReviewID = review.id
+        deviceKeyReviewID = nil
+        return review
+    }
+
+    func cancelEnrollmentFile(_ review: LocalEnrollmentFileReview) {
+        if enrollmentFileReviewID == review.id { enrollmentFileReviewID = nil }
+    }
+
+    func reviewCertificateFile(workspaceID: UUID, credentialID: String) -> LocalCertificateFileReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              keysPresentationWorkspaceID == workspaceID,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let credential = document.credentials.first(where: { $0.id == credentialID }),
+              credential.userCertificate != nil,
+              !locallyRevokedFingerprints.contains(credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(credential.fingerprint) else { return nil }
+        let review = LocalCertificateFileReview(workspaceID: workspaceID, revision: saved.revision,
+            credentialID: credentialID, epoch: epoch)
+        certificateFileReviewID = review.id; certificateRenewalReview = nil
+        return review
+    }
+
+    func cancelCertificateFile(_ review: LocalCertificateFileReview) {
+        if certificateFileReviewID == review.id { certificateFileReviewID = nil }
+    }
+
+    func importCertificateFile(_ url: URL, reviewed: LocalCertificateFileReview) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              certificateFileReviewID == reviewed.id, epoch == reviewed.epoch,
+              keysPresentationWorkspaceID == reviewed.workspaceID,
+              workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+            credentialMessage = "The key-settings visit changed. Choose the renewed certificate again."
+            return
+        }
+        certificateFileReviewID = nil; credentialMessage = nil
+        let operation = UUID()
+        let task = Task { [self] in
+            defer {
+                if certificateRenewalOperation?.id == operation { certificateRenewalOperation = nil }
+            }
+            do {
+                let bytes = try await Self.readSelectedDocument(url, limit: WorkspaceCertificateRenewal.maximumFileBytes)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == reviewed.epoch,
+                      certificateRenewalOperation?.id == operation,
+                      keysPresentationWorkspaceID == reviewed.workspaceID else { throw WorkspaceStoreError.staleReview }
+                let core = try await store.reviewCertificateRenewal(workspaceID: reviewed.workspaceID,
+                    expectedRevision: reviewed.revision, credentialID: reviewed.credentialID, certificateFile: bytes)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == reviewed.epoch,
+                      certificateRenewalOperation?.id == operation,
+                      keysPresentationWorkspaceID == reviewed.workspaceID,
+                      workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+                    throw WorkspaceStoreError.staleReview
+                }
+                certificateRenewalReview = .init(core: core, epoch: epoch)
+            } catch {
+                guard !Task.isCancelled, active, epoch == reviewed.epoch,
+                      keysPresentationWorkspaceID == reviewed.workspaceID else { return }
+                credentialMessage = "The certificate could not be renewed. Choose the public OpenSSH certificate issued for this existing key. \(error.localizedDescription)"
+            }
+        }
+        certificateRenewalOperation = (operation, task)
+    }
+
+    func certificateRenewalIsCurrent(_ review: LocalCertificateRenewalReview) -> Bool {
+        guard active, !showRestore, epoch == review.epoch, certificateRenewalReview?.id == review.id,
+              keysPresentationWorkspaceID == review.core.workspaceID,
+              let saved = workspaces.first(where: { $0.id == review.core.workspaceID }),
+              saved.revision == review.core.expectedRevision,
+              let document = try? saved.document(),
+              let credential = document.credentials.first(where: { $0.id == review.core.credentialID }),
+              credential.userCertificate == review.core.currentCertificate,
+              !locallyRevokedFingerprints.contains(credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(credential.fingerprint) else { return false }
+        return true
+    }
+
+    func cancelCertificateRenewal(_ id: UUID) {
+        guard certificateRenewalReview?.id == id, certificateRenewalOperation == nil else { return }
+        certificateRenewalReview = nil
+    }
+
+    private func retireCertificateRenewal() {
+        certificateFileReviewID = nil; certificateRenewalReview = nil
+        // The exact task retains its reservation until the file read or
+        // catalog publication and reconciliation have joined.
+        certificateRenewalOperation?.task.cancel()
+    }
+
+    func acceptCertificateRenewal(_ review: LocalCertificateRenewalReview) {
+        guard !busy, credentialImport == nil, certificateRenewalIsCurrent(review), let store else { return }
+        let core = review.core, operation = UUID()
+        certificateRenewalReview = nil; credentialMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        deviceKeyConnectionHolds.insert(core.workspaceID)
+        if returning?.workspaceID == core.workspaceID { returning = nil }
+        if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+           let screen = try? JSONDecoder().decode(LiveScreen.self, from: data), screen.workspaceID == core.workspaceID {
+            UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+        }
+        let scene = liveScenes[core.workspaceID]
+        scene?.requestClose()
+        let task = Task { [self] in
+            let result: Result<Void, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[core.workspaceID] === scene { liveScenes[core.workspaceID] = nil }
+                }
+                await connections?.manager.invalidate(workspaceID: core.workspaceID)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == review.epoch,
+                      keysPresentationWorkspaceID == core.workspaceID else { throw WorkspaceStoreError.staleReview }
+                _ = try await store.applyCertificateRenewal(core, confirmedByUser: true)
+                result = .success(())
+            } catch { result = .failure(error) }
+            // Cancellation or an error after publication is not rollback.
+            // Reconcile in a fresh task while keeping the connection hold.
+            await Task { [self] in
+                guard certificateRenewalOperation?.id == operation else { return }
+                defer { certificateRenewalOperation = nil }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: core.workspaceID)
+                localPolicies.removeValue(forKey: core.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[core.workspaceID] != nil
+                    } catch { }
+                }
+                switch result {
+                case .success:
+                    credentialMessage = "The renewed certificate is saved on this phone. Choose Connect to use it; the SSH server checks its authorization when you sign in."
+                case .failure(let error):
+                    credentialMessage = "Saving the renewed certificate could not be confirmed. \(error.localizedDescription) Review the saved certificate before trying again."
+                }
+                if !refreshed {
+                    credentialMessage = (credentialMessage ?? "") + " Reopen SSH Keys when the app is active to refresh its saved status."
+                }
+            }.value
+        }
+        certificateRenewalOperation = (operation, task)
+    }
+
+    /// A security-scoped file read owns its worker until cancellation has joined.
+    /// SelectedLocalFile refuses unavailable cloud files instead of fetching them.
+    nonisolated private static func readSelectedDocument(_ url: URL, limit: Int) async throws -> Data {
+        let reader = Task.detached(priority: .userInitiated) { try SelectedLocalFile.read(url, limit: limit) }
+        return try await withTaskCancellationHandler {
+            let bytes = try await reader.value
+            try Task.checkCancellation()
+            return bytes
+        } onCancel: { reader.cancel() }
+    }
+
+    func importEnrollmentFile(_ url: URL, reviewed: LocalEnrollmentFileReview) {
+        guard active, !busy, !showRestore, credentialImport == nil,
+              enrollmentFileReviewID == reviewed.id, epoch == reviewed.epoch,
+              workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+            credentialMessage = "The key-settings visit changed. Open Enrollment Results again."
+            return
+        }
+        enrollmentFileReviewID = nil; deviceKeyReviewID = nil; credentialMessage = nil
+        let id = UUID()
+        let task = Task { [self] in
+            defer { if enrollmentResultsOperation?.id == id { enrollmentResultsOperation = nil } }
+            do {
+                let bytes = try await Self.readSelectedDocument(url, limit: WorkspaceKeyEnrollmentJournal.maximumBytes)
+                let journal = try WorkspaceKeyEnrollmentJournal(data: bytes)
+                guard !Task.isCancelled, active, !showRestore, epoch == reviewed.epoch,
+                      enrollmentResultsOperation?.id == id,
+                      workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else { return }
+                enrollmentResults = LocalEnrollmentResults(bytes: bytes, journal: journal,
+                    presentingWorkspaceID: reviewed.workspaceID, preferredWorkspaceID: reviewed.workspaceID, epoch: epoch)
+            } catch {
+                guard !Task.isCancelled, active, epoch == reviewed.epoch else { return }
+                credentialMessage = "Enrollment results could not be opened. Choose the JSON saved with Save Results in FrankenTerm Export. \(error.localizedDescription)"
+            }
+        }
+        enrollmentResultsOperation = (id, task)
+    }
+
+    func enrollmentWorkspaces(for report: LocalEnrollmentResults) -> [InstalledWorkspace] {
+        workspaces.filter { saved in
+            (report.preferredWorkspaceID == nil || report.preferredWorkspaceID == saved.id)
+                && saved.deviceKeys.contains(report.key)
+        }
+    }
+
+    func prepareEnrollmentResults(_ report: LocalEnrollmentResults, workspaceID: UUID) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              enrollmentResults === report, report.epoch == epoch, !report.isApplying, !report.isFinished,
+              let saved = enrollmentWorkspaces(for: report).first(where: { $0.id == workspaceID }) else { return }
+        report.review = nil; report.message = nil; deviceKeyReviewID = nil
+        let id = UUID(), ticket = epoch
+        let task = Task { [self] in
+            defer { if enrollmentResultsOperation?.id == id { enrollmentResultsOperation = nil } }
+            do {
+                let review = try await store.reviewEnrollmentResults(workspaceID: saved.id,
+                    expectedRevision: saved.revision, credentialID: report.key.id, data: report.bytes)
+                guard !Task.isCancelled, active, !showRestore, epoch == ticket,
+                      enrollmentResults === report, enrollmentResultsOperation?.id == id,
+                      workspaces.first(where: { $0.id == saved.id })?.revision == saved.revision else { return }
+                report.review = review
+            } catch {
+                guard !Task.isCancelled, active, epoch == ticket, enrollmentResults === report else { return }
+                report.message = "These results cannot select routes in this workspace. \(error.localizedDescription)"
+            }
+        }
+        enrollmentResultsOperation = (id, task)
+    }
+
+    func enrollmentResultsAreCurrent(_ report: LocalEnrollmentResults) -> Bool {
+        guard active, !showRestore, enrollmentResults === report, epoch == report.epoch,
+              !report.isApplying, !report.isFinished, let review = report.review,
+              !locallyRevokedFingerprints.contains(report.key.fingerprint),
+              !unconfirmedCredentialRevocations.contains(report.key.fingerprint),
+              let saved = workspaces.first(where: { $0.id == review.workspaceID }),
+              saved.revision == review.expectedRevision, saved.deviceKeys.contains(report.key) else { return false }
+        return true
+    }
+
+    func cancelEnrollmentResults(_ id: UUID) {
+        guard let report = enrollmentResults, report.id == id, !report.isApplying else { return }
+        report.review = nil
+        enrollmentResults = nil; deviceKeyReviewID = nil
+        enrollmentResultsOperation?.task.cancel()
+        // The reservation is released by the exact worker after its read joins.
+    }
+
+    private func retireEnrollmentReviews() {
+        retireCertificateRenewal()
+        enrollmentFileReviewID = nil; deviceKeyReviewID = nil
+        enrollmentResults?.review = nil; enrollmentResults = nil
+        enrollmentResultsOperation?.task.cancel()
+        documentInspection?.task.cancel()
+    }
+
+    func reviewEnrollmentKeyChange(_ report: LocalEnrollmentResults, routeIDs: Set<String>,
+                                   fingerprintConfirmed: Bool) -> LocalDeviceKeyReview? {
+        guard !busy, fingerprintConfirmed, !routeIDs.isEmpty, enrollmentResultsAreCurrent(report),
+              let core = report.review,
+              routeIDs.isSubset(of: Set(core.routes.filter(\.canAssign).map(\.id))) else { return nil }
+        let accounts = core.routes.filter { routeIDs.contains($0.id) }.map { route in
+            let account = LocalHostKeyCheckReview.endpoint(host: route.account.host,
+                port: route.account.port, user: route.account.user)
+            let paths = route.paths.enumerated().map { offset, path in
+                let hosts = path.plan.jumpHosts + [path.plan.destination]
+                return "Path \(offset + 1):\n" + hosts.enumerated().map { index, host in
+                    "  \(index + 1). " + LocalHostKeyCheckReview.endpoint(host: host.target.host,
+                        port: host.target.port, user: host.target.user)
+                        + (host.hostKeyAlias.map { " · host-key alias " + $0 } ?? "")
+                }.joined(separator: "\n")
+            }.joined(separator: "\n")
+            return account + "\nRoute: " + route.id + "\n" + paths
+        }
+        let review = LocalDeviceKeyReview(workspaceID: core.workspaceID, revision: core.expectedRevision,
+            workspaceName: core.workspaceName, action: .enrollment(core, routeIDs: routeIDs),
+            fingerprint: core.key.fingerprint, destination: accounts.joined(separator: "\n\n"),
+            disconnectsSessions: hasOpenScene(core.workspaceID), epoch: epoch)
+        deviceKeyReviewID = review.id
+        return review
+    }
+
+    /// A local key choice is authority for one route, including when that route
+    /// is a jump host. End the old revision's sessions before publishing it, and
+    /// reconcile even a cancelled or ambiguously acknowledged storage write.
+    func performDeviceKeyChange(_ review: LocalDeviceKeyReview,
+                                completed: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              deviceKeyReviewID == review.id, epoch == review.epoch,
+              workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.revision else {
+            credentialMessage = "The workspace changed. Review this phone-key choice again."
+            completed(false); return
+        }
+        let reportOwner: LocalEnrollmentResults?
+        if case .enrollment(let core, let routeIDs) = review.action {
+            guard let owner = enrollmentResults, enrollmentResultsAreCurrent(owner),
+                  owner.review?.id == core.id, !routeIDs.isEmpty,
+                  routeIDs.isSubset(of: Set(core.routes.filter(\.canAssign).map(\.id))) else {
+                credentialMessage = "The enrollment review changed. Open the results and choose routes again."
+                completed(false); return
+            }
+            reportOwner = owner
+            owner.isApplying = true
+        } else { reportOwner = nil }
+        deviceKeyReviewID = nil; keyReviewID = nil; credentialMessage = nil; busy = true
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let changesRoute: Bool
+        if case .generate = review.action { changesRoute = false } else { changesRoute = true }
+        if changesRoute {
+            deviceKeyConnectionHolds.insert(review.workspaceID)
+            if returning?.workspaceID == review.workspaceID { returning = nil }
+            if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+               let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
+               screen.workspaceID == review.workspaceID {
+                UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+            }
+        }
+        let scene = changesRoute ? liveScenes[review.workspaceID] : nil
+        scene?.requestClose()
+        let operation = review.id
+        let task = Task { [self] in
+            let result: Result<String, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[review.workspaceID] === scene { liveScenes[review.workspaceID] = nil }
+                }
+                if changesRoute { await connections?.manager.invalidate(workspaceID: review.workspaceID) }
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == review.epoch,
+                      workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.revision else {
+                    throw WorkspaceStoreError.staleReview
+                }
+                switch review.action {
+                case .generate:
+                    let receipt = try await store.createDeviceKey(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, confirmedByUser: true)
+                    result = .success(receipt.cleanupPending
+                        ? "Your phone key was saved. Protected-storage cleanup will be retried. Copy its public key to authorize it on a server."
+                        : "Your phone key was saved. Copy its public key to authorize it on a server, then choose the route that should use it.")
+                case .assign(let credentialID, let routeID):
+                    _ = try await store.assignDeviceKey(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, credentialID: credentialID,
+                        routeID: routeID, confirmedByUser: true)
+                    result = .success("This route now uses the phone key. Connect when you are ready. Server authorization is checked when you sign in.")
+                case .remove(let routeID):
+                    _ = try await store.removeDeviceKeyAssignment(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, routeID: routeID, confirmedByUser: true)
+                    result = .success("This route uses its imported key choices again. The phone key remains saved, and its public key remains authorized wherever you installed it.")
+                case .enrollment(let core, let routeIDs):
+                    _ = try await store.applyEnrollmentResults(core, routeIDs: routeIDs, confirmedByUser: true)
+                    result = .success("The \(routeIDs.count) selected routes now use this phone key. The workspace remains offline until you choose Connect. The report records public file observations; actual sign-in is checked when you connect.")
+                }
+            } catch { result = .failure(error) }
+            let settlement = Task { [self] in
+                guard deviceKeyOperation?.id == operation else { return false }
+                defer {
+                    if let reportOwner {
+                        reportOwner.isApplying = false; reportOwner.isFinished = true
+                        reportOwner.review = nil; reportOwner.message = credentialMessage
+                    }
+                    deviceKeyOperation = nil; busy = false
+                }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: review.workspaceID)
+                localPolicies.removeValue(forKey: review.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[review.workspaceID] != nil
+                    } catch { }
+                }
+                switch result {
+                case .success(let text):
+                    credentialMessage = text + (refreshed ? "" : " Reopen SSH Keys when the app is active to refresh its saved status.")
+                    return active && epoch == review.epoch && refreshed
+                case .failure(let error):
+                    let reason = error is CancellationError ? "The phone-key operation stopped."
+                        : "The phone-key change could not be confirmed. \(error.localizedDescription)"
+                    credentialMessage = reason + (refreshed
+                        ? " Review the current saved keys and route choices before trying again."
+                        : " Reopen SSH Keys when the app is active to check what was saved before trying again.")
+                    return false
+                }
+            }
+            completed(await settlement.value)
+        }
+        deviceKeyOperation = (operation, task)
+    }
+
+    func beginCredentialImport(workspaceID: UUID, credentialID: String) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let reference = document.credentials.first(where: { $0.id == credentialID }),
+              !locallyRevokedFingerprints.contains(reference.fingerprint),
+              !unconfirmedCredentialRevocations.contains(reference.fingerprint) else { return }
+        keyReviewID = nil; credentialMessage = nil
+        credentialImport = WorkspaceKeyImportController(model: self, store: store,
+            workspaceID: saved.id, revision: saved.revision, credential: reference, epoch: epoch)
+    }
+
+    /// Every Files/passphrase callback belongs to this exact sheet, foreground
+    /// epoch and accepted identity. Finished receipts can show their own result
+    /// after the transaction has changed the saved revision.
+    fileprivate func credentialImportIsCurrent(_ importing: WorkspaceKeyImportController,
+                                               allowChangedRevision: Bool = false) -> Bool {
+        guard credentialImport === importing, active, !showRestore, epoch == importing.epoch,
+              !locallyRevokedFingerprints.contains(importing.credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(importing.credential.fingerprint),
+              let saved = workspaces.first(where: { $0.id == importing.workspaceID }),
+              let document = try? saved.document(), document.credentials.contains(where: {
+            $0.id == importing.credential.id && $0.algorithm == importing.credential.algorithm
+                && $0.fingerprint == importing.credential.fingerprint
+              }) else { return false }
+        return allowChangedRevision || saved.revision == importing.revision
+    }
+
+    /// Final confirmation discloses this workspace's session shutdown. Seal the
+    /// exact scene before awaiting cleanup; no replacement can open meanwhile.
+    fileprivate func prepareCredentialImport(_ importing: WorkspaceKeyImportController) async throws {
+        guard credentialImportIsCurrent(importing), !busy, credentialImportOperation == nil else {
+            throw WorkspaceStoreError.staleReview
+        }
+        credentialImportOperation = importing.id; busy = true; keyReviewID = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let owner = liveScenes[importing.workspaceID]
+        owner?.requestClose()
+        if let owner {
+            await owner.close()
+            if liveScenes[importing.workspaceID] === owner { liveScenes[importing.workspaceID] = nil }
+        }
+        await connections?.manager.invalidate(workspaceID: importing.workspaceID)
+        try Task.checkCancellation()
+        guard credentialImportIsCurrent(importing), credentialImportOperation == importing.id else {
+            throw WorkspaceStoreError.staleReview
+        }
+    }
+
+    /// Runs in a retained, uncancelled settlement task. Even a cancelled caller
+    /// must reconcile a write which may already have published. Inactive scenes
+    /// keep readiness cleared until the normal foreground refresh can run.
+    fileprivate func finishCredentialImport(_ importing: WorkspaceKeyImportController,
+        result: Result<WorkspaceCredentialImportReceipt, Error>) async -> String {
+        guard credentialImportOperation == importing.id else {
+            return "The key import stopped before it could begin."
+        }
+        defer { credentialImportOperation = nil; busy = false }
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        availableCredentials.removeValue(forKey: importing.workspaceID)
+        localPolicies.removeValue(forKey: importing.workspaceID)
+        var refreshed = false
+        if active, let store {
+            do {
+                try await refreshWorkspaces(using: store, epoch: epoch)
+                refreshed = active && localPolicies[importing.workspaceID] != nil
+            } catch { }
+        }
+        let text: String
+        switch result {
+        case .success(let receipt):
+            if !refreshed {
+                text = "The key was imported. Reopen SSH Keys when the app is active to refresh connection readiness."
+            } else if receipt.cleanupPending {
+                text = "The key was imported. Protected-storage cleanup was retried while refreshing its device status. Connect when you are ready."
+            } else {
+                text = "The matching key is available on this phone. Connect when you are ready."
+            }
+        case .failure(let error):
+            if refreshed {
+                let present = availableCredentials[importing.workspaceID]?.contains(importing.credential.id) == true
+                let outcome = present ? "The key is currently present on this phone." : "The key is not currently available on this phone."
+                text = (error is CancellationError ? "Key import stopped. " : "The import reported a problem. "
+                    + WorkspaceKeyImportController.describe(error) + " ") + outcome
+            } else {
+                text = "The key import outcome could not be refreshed. Reopen SSH Keys when the app is active to check its actual device status before trying again."
+            }
+        }
+        credentialMessage = text
+        return text
+    }
+
+    fileprivate func releaseCredentialImport(_ importing: WorkspaceKeyImportController) {
+        if credentialImport === importing { credentialImport = nil }
+    }
+
+    func reviewCredentialRevocation(workspaceID: UUID, credentialID: String) -> LocalCredentialRevocationReview? {
+        guard active, !busy, !showRestore, credentialImportOperation == nil, store != nil, connections != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let key = document.credentials.first(where: { $0.id == credentialID }),
+              !locallyRevokedFingerprints.contains(key.fingerprint)
+                || unconfirmedCredentialRevocations.contains(key.fingerprint) else { return nil }
+        let names = workspaces.compactMap { saved -> String? in
+            guard let document = try? saved.document(),
+                  document.credentials.contains(where: { $0.fingerprint == key.fingerprint }) else { return nil }
+            return document.name
+        }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        let reviewed = LocalCredentialRevocationReview(workspaceID: workspaceID, revision: saved.revision,
+            credentialID: key.id, algorithm: key.algorithm, fingerprint: key.fingerprint,
+            workspaceNames: names, epoch: epoch)
+        keyReviewID = reviewed.id
+        return reviewed
+    }
+
+    /// The fingerprint is device-wide, including aliases in other workspaces.
+    /// Once admitted, this task owns cleanup through suspension or sheet closure.
+    func revokeCredentialLocally(_ reviewed: LocalCredentialRevocationReview) {
+        guard active, !busy, !showRestore, credentialImportOperation == nil,
+              keyRevocation == nil, let store, let connections else { return }
+        guard keyReviewID == reviewed.id, epoch == reviewed.epoch,
+              let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
+              let document = try? saved.document(), document.credentials.contains(where: {
+                  $0.id == reviewed.credentialID && $0.fingerprint == reviewed.fingerprint && $0.algorithm == reviewed.algorithm
+              }) else {
+            credentialMessage = "This key or workspace changed. Review the key again before revoking it."
+            return
+        }
+        keyReviewID = nil; credentialMessage = nil
+        busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        // Seal native attempt loops before the first actor hop. A refusal
+        // already returned by the manager must not authorize the next key
+        // while this confirmed revocation is waiting to persist.
+        let affectedBeforeWrite = Set(workspaces.compactMap { saved -> UUID? in
+            guard let document = try? saved.document(),
+                  document.credentials.contains(where: { $0.fingerprint == reviewed.fingerprint }) else { return nil }
+            return saved.id
+        })
+        let sealedOwners = liveScenes.values.filter { affectedBeforeWrite.contains($0.workspaceID) }
+        for owner in sealedOwners { owner.requestClose() }
+        // The admitted operation retains its owner until exact scene cleanup
+        // finishes, including when the review sheet or app scene disappears.
+        let job = Task { [self] in
+            defer {
+                if self.keyRevocation?.id == reviewed.id {
+                    self.keyRevocation = nil; self.busy = false
+                }
+            }
+            do {
+                // The manager persists denial before retiring grants and native
+                // transports, and retains failed settlement owners for retry.
+                let receipt = try await connections.manager.revokeCredentialLocally(
+                    fingerprint: reviewed.fingerprint, confirmedByUser: true)
+                // Retire any read that overlapped the write. Reflect confirmed
+                // denial immediately, even if the following readback fails.
+                self.workspaceRefreshEpoch = UUID(); self.workspaceRefresh?.cancel()
+                for id in receipt.affectedWorkspaceIDs {
+                    self.availableCredentials.removeValue(forKey: id)
+                    self.localPolicies.removeValue(forKey: id)
+                }
+                if receipt.durableDenialConfirmed {
+                    self.locallyRevokedFingerprints.insert(receipt.fingerprint)
+                    self.unconfirmedCredentialRevocations.remove(receipt.fingerprint)
+                }
+                else { self.unconfirmedCredentialRevocations.insert(receipt.fingerprint) }
+                var owners = sealedOwners
+                for owner in self.liveScenes.values where receipt.affectedWorkspaceIDs.contains(owner.workspaceID)
+                    && !owners.contains(where: { $0 === owner }) { owners.append(owner) }
+                for owner in owners { owner.requestClose() }
+                for owner in owners { await owner.close() }
+                let retained = await connections.manager.connections()
+                let cleanupPending = owners.contains { $0.sessions.values.contains { !$0.settled } }
+                    || retained.contains { receipt.retainedConnectionIDs.contains($0.id) }
+                if receipt.durableDenialConfirmed {
+                    self.credentialMessage = cleanupPending
+                        ? "This key is revoked on this phone. Affected sessions are stopped; local cleanup remains pending and will be retried when the app becomes active."
+                        : "This key is revoked on this phone, and affected workspace sessions have been disconnected. Future imports cannot restore its permission."
+                } else {
+                    self.credentialMessage = "This key is blocked while the app runs, but saving the revocation could not be confirmed. Choose Retry Saving Revocation before closing the app. Affected workspace sessions have been stopped."
+                }
+                if self.active {
+                    do { try await self.refreshWorkspaces(using: store, epoch: self.epoch) }
+                    catch { self.credentialMessage = (self.credentialMessage ?? "") + " Device status could not be refreshed: \(error.localizedDescription)" }
+                }
+            } catch {
+                for owner in sealedOwners { await owner.close() }
+                self.credentialMessage = "Revocation could not be started. \(error.localizedDescription)"
+            }
+        }
+        keyRevocation = (reviewed.id, job)
+    }
+
+    /// The workspaces a host-key refusal reaches: it is saved for the host
+    /// and port, so every workspace naming that endpoint refuses the key.
+    private func workspacesNaming(host: String, port: UInt16) -> [InstalledWorkspace] {
+        workspaces.filter { saved in
+            (try? saved.document())?.hostTrust.contains { $0.host == host && $0.port == port } == true
+        }
+    }
+
+    func reviewHostRevocation(workspaceID: UUID, trustID: String,
+                              key: WorkspaceDocument.HostKey) -> LocalHostRevocationReview? {
+        guard active, !busy, !showRestore, credentialImportOperation == nil, store != nil, connections != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let trust = document.hostTrust.first(where: { $0.id == trustID }),
+              trust.pins.contains(key) || trust.certificateAuthorities.contains(key) else { return nil }
+        let names = workspacesNaming(host: trust.host, port: trust.port).compactMap { try? $0.document().name }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        let reviewed = LocalHostRevocationReview(workspaceID: workspaceID, revision: saved.revision,
+            trustID: trust.id, displayHost: trust.displayHost, host: trust.host, port: trust.port, key: key,
+            workspaceNames: names, epoch: epoch)
+        keyReviewID = reviewed.id
+        return reviewed
+    }
+
+    /// Choose the shortest locally eligible configured path, preserving source
+    /// order between equally short paths. The store repeats authoritative
+    /// policy checks before any network or protected credential is used.
+    func hostKeyVerificationRoute(workspaceID: UUID, trustID: String) -> WorkspaceDocument.Route? {
+        guard let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let trust = document.hostTrust.first(where: { $0.id == trustID }) else { return nil }
+        let local = localPolicies[workspaceID].flatMap { $0.workspace.revision == saved.revision ? $0 : nil }
+        let support = WorkspaceNativeSSHAuthentication.routeSupport
+        var best: (route: WorkspaceDocument.Route, hops: Int)?
+        for route in document.routes where route.trustID == trustID
+            && (route.mode == "direct_ssh" || route.mode == "frankenterm_mux") {
+            // Rotation is offered only for this phone's still-applicable pin.
+            // Imported trust remains under the workspace source's authority.
+            if trust.hasConfiguredIdentity {
+                guard (try? saved.phoneHostKeyPin(forRouteID: route.id)) != nil else { continue }
+            }
+            // Direct checks need no credential inventory. Even if protected
+            // metadata could not refresh, the store can preflight this route
+            // without reading a key; no network opens on the UI's judgment.
+            let state = local?.routes.first(where: { $0.routeID == route.id })
+                ?? (try? document.readiness(forRouteID: route.id, availableCredentialIDs: [], support: support))
+            guard let state,
+                  !state.issues.contains(.unsupportedRequirement), !state.issues.contains(.transportUnavailable),
+                  let hops = try? document.orderedJumpRoutes(forRouteID: route.id), hops.count <= support.maximumJumpHops else { continue }
+            let ready = hops.allSatisfy { hop in
+                guard let local,
+                      local.routes.first(where: { $0.routeID == hop.id })?.issues.contains(.unsupportedRequirement) != true,
+                      let transit = try? document.readiness(forRouteID: hop.id, availableCredentialIDs: local.credentialIDs,
+                        reviewedTrustIDs: Set(document.hostTrust.map(\.id)), revokedCredentialFingerprints: locallyRevokedFingerprints,
+                        support: support, revokedHostKeysByTrustScope: local.revokedHostKeysByTrustScope,
+                        requiredHostCapabilitiesByTrustScope: local.requiredHostCapabilitiesByTrustScope,
+                        hostAlgorithmPoliciesByTrustScope: local.hostAlgorithmPoliciesByTrustScope,
+                        hostRevocationSourcesByTrustScope: local.hostRevocationSourcesByTrustScope,
+                        transitForRouteID: route.id) else { return false }
+                return transit.isLocallyReady
+            }
+            if ready, best.map({ hops.count < $0.hops }) ?? true { best = (route, hops.count) }
+        }
+        return best?.route
+    }
+
+    func reviewHostKeyVerification(workspaceID: UUID, trustID: String) -> LocalHostKeyCheckReview? {
+        guard active, !busy, !showRestore, credentialImport == nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
+              let route = hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trustID),
+              let hops = try? document.orderedJumpRoutes(forRouteID: route.id) else { return nil }
+        let review = LocalHostKeyCheckReview(workspaceID: workspaceID, revision: saved.revision, routeID: route.id,
+            destination: LocalHostKeyCheckReview.endpoint(host: route.host, port: route.port),
+            jumpAccounts: hops.map { LocalHostKeyCheckReview.endpoint(host: $0.host, port: $0.port, user: $0.user) },
+            replacingPin: try? saved.phoneHostKeyPin(forRouteID: route.id), epoch: epoch)
+        hostKeyCheckReviewID = review.id
+        return review
+    }
+
+    func dismissHostKeyCheckReview() { hostKeyCheckReviewID = nil }
+
+    func cancelHostKeyVerification() {
+        hostKeyCheckReviewID = nil; hostKeyPinReview = nil
+        guard hostKeyCheckID != nil else { return }
+        hostKeyCheckID = nil
+        hostKeyOperation?.task.cancel()
+        connections?.cancelHostKeyVerification()
+        credentialMessage = "Stopping the host-key check…"
+    }
+
+    /// A bounded host-key exchange. Trusted jump accounts may authenticate;
+    /// the destination receives no credential. The complete path closes before
+    /// the fingerprint is offered for a separate independent trust decision.
+    func beginHostKeyVerification(_ review: LocalHostKeyCheckReview) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store, let connections,
+              hostKeyCheckReviewID == review.id, epoch == review.epoch,
+              let saved = workspaces.first(where: { $0.id == review.workspaceID }), saved.revision == review.revision else { return }
+        let workspaceID = review.workspaceID, routeID = review.routeID, operation = UUID()
+        hostKeyCheckReviewID = nil; hostKeyCheckID = operation
+        hostKeyCheckSource = (workspaceID, saved.revision)
+        let checkingMessage = review.jumpAccounts.isEmpty ? "Checking the server's public host key…"
+            : "Signing in to the approved jump hosts to check the destination's public host key…"
+        hostKeyPinReview = nil; credentialMessage = checkingMessage; busy = true
+        let task = Task { [self] in
+            defer {
+                if hostKeyOperation?.id == operation {
+                    hostKeyOperation = nil; hostKeyCheckID = nil; hostKeyCheckSource = nil; busy = false
+                    if credentialMessage == checkingMessage || credentialMessage == "Stopping the host-key check…" {
+                        credentialMessage = "The host-key check stopped. Choose Check Host Key to try again."
+                    }
+                }
+            }
+            do {
+                let support = WorkspaceNativeSSHAuthentication.routeSupport
+                _ = try await store.hostKeyVerificationDocument(workspaceID: workspaceID,
+                    expectedRevision: saved.revision, routeID: routeID, support: support, replacing: review.replacingPin)
+                try Task.checkCancellation()
+                guard active, !showRestore, hostKeyCheckID == operation else { throw FTError.stale }
+                let probe = try await connections.checkHostKey(workspaceID: workspaceID, revision: saved.revision,
+                    routeID: routeID, replacing: review.replacingPin)
+                try Task.checkCancellation()
+                if let failure = probe.failure { throw failure }
+                if probe.hostKey == .revoked {
+                    credentialMessage = "This server's host key is revoked. It cannot be trusted on this phone."
+                    return
+                }
+                guard let identity = probe.observedIdentity else { throw FTError.stale }
+                // No network resource remains while an OS authentication sheet
+                // finishes its brief inactive -> active transition.
+                for _ in 0..<100 where !active && connectionsForeground && !showRestore && hostKeyCheckID == operation {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                guard active, !showRestore, hostKeyCheckID == operation,
+                      workspaces.first(where: { $0.id == workspaceID })?.revision == saved.revision else { throw FTError.stale }
+                if review.replacingPin?.key.algorithm == identity.algorithm,
+                   review.replacingPin?.key.fingerprint == identity.fingerprint {
+                    credentialMessage = "The checked server presented the same public key. No trust change was saved."
+                    return
+                }
+                let pinReview = try await store.reviewHostKeyPin(workspaceID: workspaceID,
+                    expectedRevision: saved.revision, routeID: routeID,
+                    key: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support,
+                    replacing: review.replacingPin)
+                try Task.checkCancellation()
+                guard active, !showRestore, hostKeyCheckID == operation,
+                      workspaces.first(where: { $0.id == workspaceID })?.revision == saved.revision else { throw FTError.stale }
+                credentialMessage = nil
+                hostKeyPinReview = pinReview
+            } catch {
+                guard active, hostKeyCheckID == operation else { return }
+                credentialMessage = "The host key could not be checked. \(error.localizedDescription)"
+            }
+        }
+        hostKeyOperation = (operation, task)
+    }
+
+    /// Fingerprint confirmation changes only local trust. Retire live owners
+    /// before publication and retain the connection hold even if saving fails.
+    func acceptVerifiedHostKey(_ review: WorkspaceHostKeyPinReview) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              hostKeyPinReview?.id == review.id,
+              workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.expectedRevision else { return }
+        let ticket = epoch, operation = UUID()
+        hostKeyPinReview = nil; credentialMessage = nil; busy = true
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        deviceKeyConnectionHolds.insert(review.workspaceID)
+        if returning?.workspaceID == review.workspaceID { returning = nil }
+        if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+           let screen = try? JSONDecoder().decode(LiveScreen.self, from: data), screen.workspaceID == review.workspaceID {
+            UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+        }
+        let scene = liveScenes[review.workspaceID]
+        scene?.requestClose()
+        let task = Task { [self] in
+            let result: Result<Void, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[review.workspaceID] === scene { liveScenes[review.workspaceID] = nil }
+                }
+                await connections?.manager.invalidate(workspaceID: review.workspaceID)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == ticket else { throw WorkspaceStoreError.staleReview }
+                _ = try await store.acceptHostKeyPin(review, confirmedByUser: true,
+                    support: WorkspaceNativeSSHAuthentication.routeSupport)
+                result = .success(())
+            } catch { result = .failure(error) }
+            // Readback belongs to a fresh task: cancellation after an atomic
+            // publication must not disguise a saved pin as an undone operation.
+            await Task { [self] in
+                guard hostKeyOperation?.id == operation else { return }
+                defer { hostKeyOperation = nil; busy = false }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: review.workspaceID)
+                localPolicies.removeValue(forKey: review.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[review.workspaceID] != nil
+                    }
+                    catch { }
+                }
+                switch result {
+                case .success:
+                    credentialMessage = "The verified host key is saved on this phone. This workspace stays offline until you choose Connect."
+                case .failure(let error):
+                    credentialMessage = "Saving the host key could not be confirmed. \(error.localizedDescription) Review the saved host keys before trying again."
+                }
+                if !refreshed { credentialMessage = (credentialMessage ?? "") + " Reopen SSH Keys when the app is active to refresh its saved status." }
+            }.value
+        }
+        hostKeyOperation = (operation, task)
+    }
+
+    /// Stop trusting one pinned host key on this phone. Sessions in every
+    /// workspace naming the host and port end first, as for a revoked key.
+    func revokeHostLocally(_ reviewed: LocalHostRevocationReview) {
+        guard active, !busy, !showRestore, credentialImportOperation == nil,
+              keyRevocation == nil, let store, let connections else { return }
+        guard keyReviewID == reviewed.id, epoch == reviewed.epoch,
+              let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
+              let document = try? saved.document(), document.hostTrust.contains(where: {
+                  $0.id == reviewed.trustID && $0.host == reviewed.host && $0.port == reviewed.port
+                      && ($0.pins.contains(reviewed.key) || $0.certificateAuthorities.contains(reviewed.key))
+              }) else {
+            credentialMessage = "This host or workspace changed. Review the host key again before blocking it."
+            return
+        }
+        keyReviewID = nil; credentialMessage = nil
+        busy = true; workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        // Seal the sessions before the first actor hop: none may send input
+        // or reconnect to this host while the refusal is being saved.
+        let affectedBeforeWrite = Set(workspacesNaming(host: reviewed.host, port: reviewed.port).map(\.id))
+        let sealedOwners = liveScenes.values.filter { affectedBeforeWrite.contains($0.workspaceID) }
+        for owner in sealedOwners { owner.requestClose() }
+        let job = Task { [self] in
+            defer {
+                if self.keyRevocation?.id == reviewed.id {
+                    self.keyRevocation = nil; self.busy = false
+                }
+            }
+            do {
+                let receipt = try await connections.manager.revokeHostLocally(workspaceID: reviewed.workspaceID,
+                    trustID: reviewed.trustID, key: reviewed.key, confirmedByUser: true)
+                self.workspaceRefreshEpoch = UUID(); self.workspaceRefresh?.cancel()
+                for id in receipt.affectedWorkspaceIDs { self.localPolicies.removeValue(forKey: id) }
+                var owners = sealedOwners
+                for owner in self.liveScenes.values where receipt.affectedWorkspaceIDs.contains(owner.workspaceID)
+                    && !owners.contains(where: { $0 === owner }) { owners.append(owner) }
+                for owner in owners { owner.requestClose() }
+                for owner in owners { await owner.close() }
+                let retained = await connections.manager.connections()
+                let cleanupPending = owners.contains { $0.sessions.values.contains { !$0.settled } }
+                    || retained.contains { receipt.retainedConnectionIDs.contains($0.id) }
+                self.credentialMessage = cleanupPending
+                    ? "This host key is blocked on this phone. Affected sessions are stopped; local cleanup remains pending and will be retried when the app becomes active."
+                    : "This host key is blocked on this phone, and affected workspace sessions have been disconnected. Imported pins cannot restore trust in it."
+            } catch {
+                for owner in sealedOwners { await owner.close() }
+                // A failed write may still have landed; the refresh below
+                // shows the saved state beside the key.
+                self.credentialMessage = "Saving the block on this host key could not be confirmed. Affected sessions have been stopped, and FrankenTerm refuses the key until it quits. If the key says the block was not saved, tap Save Block. \(error.localizedDescription)"
+            }
+            if self.active {
+                do { try await self.refreshWorkspaces(using: store, epoch: self.epoch) }
+                catch { self.credentialMessage = (self.credentialMessage ?? "") + " Device status could not be refreshed: \(error.localizedDescription)" }
+            }
+        }
+        keyRevocation = (reviewed.id, job)
+    }
+
+    /// Every theme a machine can wear, bundled from `ft mobile themes`.
+    static let themeCatalog: ThemeCatalog? = Bundle.main.url(forResource: "ThemeCatalog", withExtension: "json")
+        .flatMap { try? Data(contentsOf: $0) }.flatMap { try? ThemeCatalog(data: $0) }
+    /// Bumped on every theme change so views read the choices again.
+    private(set) var themeRevision = 0
+    private static func themeKey(_ workspaceID: UUID) -> String { "machine-themes.\(workspaceID.uuidString)" }
+
+    /// This phone's theme choices for a workspace's machines. They are not
+    /// secret, so they live in user defaults, not the protected store.
+    func themeChoices(_ workspaceID: UUID) -> [String: MachineThemeChoice] {
+        _ = themeRevision
+        guard let data = UserDefaults.standard.data(forKey: Self.themeKey(workspaceID)) else { return [:] }
+        return (try? JSONDecoder().decode([String: MachineThemeChoice].self, from: data)) ?? [:]
+    }
+    func machineThemes(_ workspaceID: UUID, document: WorkspaceDocument) -> MachineThemes? {
+        Self.themeCatalog.map { MachineThemes(document: document, catalog: $0, choices: themeChoices(workspaceID)) }
+    }
+    /// The user's pick, which no automatic choice ever replaces.
+    func chooseTheme(_ choice: MachineThemeChoice, machineID: String, workspaceID: UUID) {
+        var choices = themeChoices(workspaceID)
+        choices[machineID] = MachineThemeChoice(name: choice.name, catalog: choice.catalog)
+        setThemeChoices(choices, for: workspaceID)
+    }
+    private func setThemeChoices(_ choices: [String: MachineThemeChoice], for workspaceID: UUID) {
+        guard choices != themeChoices(workspaceID), let data = try? JSONEncoder().encode(choices) else { return }
+        UserDefaults.standard.set(data, forKey: Self.themeKey(workspaceID))
+        themeRevision += 1
+    }
+
+    /// A live terminal on screen: its workspace and machine.
+    struct LiveScreen: Codable, Hashable {
+        let workspaceID: UUID, machineID: String
+    }
+    private static let liveScreenKey = "live-screen"
+    /// Where this launch returns: the live terminal the last one showed. The
+    /// root opens it once, and popping it clears this (plan 2.1, return later).
+    var returning: LiveScreen?
+    /// The terminal screen reports what it shows, nil once the user leaves it
+    /// or disconnects that machine, so a relaunch returns only to a terminal
+    /// the user was still using (plan 12.1: navigation is persisted). Only
+    /// reports while the app is active count: going inactive suspends
+    /// navigation and can rebuild the screen, and the app switcher, where it
+    /// may then be ended, is inactive too.
+    func showing(_ screen: LiveScreen?) {
+        guard active, !showRestore else { return }
+        if let screen, let workspace = workspaces.first(where: { $0.id == screen.workspaceID }),
+           let document = try? workspace.document(), let machine = document.machines.first(where: { $0.id == screen.machineID }) {
+            connections?.setAuthenticationScope(.init(workspaceID: screen.workspaceID, revision: workspace.revision,
+                                                       machineID: screen.machineID,
+                                                       destinationRouteIDs: Set(machine.routeIDs)))
+        } else { connections?.setAuthenticationScope(nil) }
+        if let screen, let data = try? JSONEncoder().encode(screen) {
+            UserDefaults.standard.set(data, forKey: Self.liveScreenKey)
+        } else { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
+    }
+    @ObservationIgnored private var liveScreenChecked = false
+    /// Once per launch, with the first workspaces loaded: a launch that is
+    /// not yet active loads them only after activation.
+    private func restoreLiveScreen() {
+        guard !liveScreenChecked else { return }
+        liveScreenChecked = true
+        guard returning == nil, pendingImport == nil, pendingDocumentURL == nil,
+              documentInspection == nil, documentRetryURL == nil, enrollmentResults == nil,
+              let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+              let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
+              workspaces.contains(where: { $0.id == screen.workspaceID && !$0.connectLater }),
+              !offlineConnectionHolds.contains(screen.workspaceID) else { return }
+        returning = screen
+    }
+    private func startObservations(restore: OfflineRestore<AppleCryptography>) {
+        let channel = AsyncStream<CameraObservation>.makeStream(bufferingPolicy: .bufferingNewest(8))
+        observations = channel.continuation
+        observationTask = Task { [weak self] in
+            for await observation in channel.stream {
+                guard !Task.isCancelled, let self else { break }
+                guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
+                let before = await restore.status()
+                guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
+                do {
+                    let next = try await restore.observe(observation.text, generation: observation.generation)
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    await self.saveScanSnapshot(next, restore: restore, epoch: observation.epoch)
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    let latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    if latest.generation != next.generation { self.lastObservation = nil }
+                    self.state = latest
+                    if !self.keepsCamera(latest) { self.cameraRequested = false }
+                    self.advanceAutomatically()
+                } catch FTError.stale { continue }
+                catch is CancellationError { break }
+                catch {
+                    var latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    // Only receiver resets need an immediate write. Malformed
+                    // framing/checksums leave it unchanged and use the normal
+                    // cadence. Join even a manual writer so a reset cannot be
+                    // lost if later equations restore the same progress count.
+                    let repaired = before.generation == latest.generation
+                        && (latest.receivedParts < before.receivedParts || latest.verifiedPages < before.verifiedPages)
+                    await self.saveScanSnapshot(latest, restore: restore, epoch: observation.epoch, force: repaired)
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    latest = await restore.status()
+                    guard self.active, self.epoch == observation.epoch else { continue }
+                    if self.state?.generation != latest.generation { self.lastObservation = nil }
+                    self.state = latest
+                    if ![.idle, .candidate, .collecting].contains(latest.phase) { self.cameraRequested = false }
+                    self.report(error)
+                }
+            }
+        }
+    }
+    /// A separately revealed code scanned deliberately from the Mac, bound to
+    /// this transfer. Saved recordings never feed this camera-only entry point.
+    @ObservationIgnored private var scannedCode: (digestPrefix: String, code: String)?
+    /// Bounded witness for this receive generation.
+    /// Resetting or resuming the same envelope must not suppress its selection.
+    @ObservationIgnored private var automaticSelection: (generation: UUID, digest: Data)?
+    /// Collect the transfer in view and accept a separately scanned unlock
+    /// code. Installation always stops for the user's source/contents review.
+    private func advanceAutomatically() {
+        guard !busy, !canRetryScanSave, active, showRestore, let state, !state.isSuspended else { return }
+        switch state.phase {
+        case .candidate:
+            guard let digest = state.identity?.envelopeDigest,
+                  automaticSelection?.generation != state.generation || automaticSelection?.digest != digest else { return }
+            automaticSelection = (state.generation, digest)
+            run { restore, state in try await restore.selectCandidate(generation: state.generation, digest: digest) }
+        case .locked where state.encryptionMode == .code:
+            guard let scanned = scannedCode, let digest = state.identity?.envelopeDigest,
+                  scanned.digestPrefix == TransferCodeFrame.digestPrefix(digest) else { return }
+            scannedCode = nil
+            let code = scanned.code
+            run { restore, state in try await restore.unlock(enteredCode: code, generation: state.generation) }
+        default: break
+        }
+    }
+
+    /// Starts over from a finished restore, which gave up offline exclusion:
+    /// resets and takes exclusion back before anything is scanned or read.
+    private func restartFinished(_ restore: OfflineRestore<AppleCryptography>) async throws -> OfflineRestoreStatus {
+        let ticket = epoch
+        scannedCode = nil; stopSavingScanProgress()
+        guard active, showRestore, epoch == ticket else { throw CancellationError() }
+        _ = try await restore.reset()
+        guard active, showRestore, epoch == ticket else { throw CancellationError() }
+        do { try await restore.enterOfflineMode() }
+        catch {
+            // A completed import released exclusion, so starting the next one
+            // may meet sessions opened since then. Offer the same explicit
+            // disconnect choice as initial entry, rather than a stale receipt.
+            let paused = await restore.suspend()
+            if active, showRestore, epoch == ticket {
+                cameraRequested = false; offlineModeBlocked = true
+                state = paused; report(error)
+            }
+            throw error
+        }
+        return await restore.status()
+    }
+    /// Keep the camera while a code-protected transfer still waits for its code.
+    private func keepsCamera(_ status: OfflineRestoreStatus) -> Bool {
+        [.idle, .candidate, .collecting].contains(status.phase)
+            || (status.phase == .locked && status.encryptionMode == .code && scannedCode == nil)
+    }
+
+    /// At most eight bounded strings wait on one consumer. No task-per-frame fanout.
+    func observed(_ text: String, cameraGeneration: UUID) {
+        guard self.cameraGeneration == cameraGeneration else { return }
+        if text.hasPrefix("FTCODE1:") {
+            guard active, showRestore, cameraRequested, let frame = TransferCodeFrame.parse(text) else { return }
+            if scannedCode?.digestPrefix != frame.digestPrefix || scannedCode?.code != frame.code {
+                scannedCode = frame
+                advanceAutomatically()
+            }
+            return
+        }
+        guard active, showRestore, cameraRequested, !busy, let state, !state.isSuspended,
+              [.idle, .candidate, .collecting].contains(state.phase), text.hasPrefix("FTQR1/"),
+              text.utf8.count <= FTLimit.qrText, text != lastObservation else { return }
+        let now = ContinuousClock.now
+        guard lastObservationTime.duration(to: now) >= .milliseconds(35) else { return }
+        lastObservation = text; lastObservationTime = now
+        observations?.yield(.init(text: text, generation: state.generation, epoch: epoch))
+    }
+    func run(_ action: @escaping @Sendable (OfflineRestore<AppleCryptography>, OfflineRestoreStatus) async throws -> OfflineRestoreStatus) {
+        guard !busy, active, let restore else { return }
+        guard !canRetryScanSave else {
+            scanProgressMessage = "Retry Saving or choose Continue Without Saving before changing this scan."
+            return
+        }
+        busy = true; message = nil; cancelScanSaveTimer()
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            await pendingLifecycle?.value
+            guard let self else { return }
+            await self.scanWrite?.task.value
+            defer {
+                self.busy = false
+                self.openPendingFileIfReady()
+                self.advanceAutomatically()
+            }
+            guard self.active, self.epoch == ticket, !self.offlineModeBlocked else { return }
+            guard !self.canRetryScanSave else {
+                self.scanProgressMessage = "Retry Saving or choose Continue Without Saving before changing this scan."
+                return
+            }
+            do {
+                let current = await restore.status()
+                let result = try await action(restore, current)
+                guard self.active, self.epoch == ticket else { return }
+                if current.generation != result.generation { self.lastObservation = nil }
+                self.state = result
+                await self.saveScanSnapshot(result, restore: restore, epoch: ticket, force: true)
+                guard self.active, self.epoch == ticket else { return }
+                if result.phase == .complete, let store = self.store { try await self.refreshWorkspaces(using: store, epoch: ticket) }
+            } catch {
+                let latest = await restore.status()
+                guard self.active, self.epoch == ticket else { return }
+                self.state = latest
+                self.report(error)
+            }
+        }
+    }
+    func importFile(_ url: URL) {
+        guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
+        guard !busy else { message = "Finish the current operation before opening another file."; return }
+        documentRetryURL = nil
+        if OpticalRecordingLimits.accepts(url) { importWorkspaceFile(url); return }
+        // A public result JSON is not a workspace. Identify it before entering
+        // offline restore, which may otherwise ask to end unrelated sessions.
+        retireEnrollmentReviews()
+        pendingDocumentURL = url
+        guard active, store != nil, restore != nil else {
+            if !bootstrapStarted { Task { await bootstrap() } }
+            return
+        }
+        openPendingDocumentIfReady()
+    }
+
+    var canRetryDocument: Bool { documentRetryURL != nil }
+
+    func retrySelectedDocument() {
+        guard active, !busy, let url = documentRetryURL else { return }
+        message = nil
+        importFile(url)
+    }
+
+    func discardSelectedDocument() {
+        documentRetryURL = nil; message = nil
+    }
+
+    private func openPendingDocumentIfReady() {
+        guard active, !busy, store != nil, restore != nil, let url = pendingDocumentURL else { return }
+        pendingDocumentURL = nil
+        let id = UUID(), ticket = epoch, presenter = keysPresentationWorkspaceID
+        let task = Task { [self] in
+            defer { if documentInspection?.id == id { documentInspection = nil } }
+            do {
+                let dedicatedResults = url.pathExtension.lowercased() == "ftkeyresults"
+                let bytes = try await Self.readSelectedDocument(url,
+                    limit: dedicatedResults ? WorkspaceKeyEnrollmentJournal.maximumBytes : FTLimit.envelope)
+                try Task.checkCancellation()
+                guard active, epoch == ticket, documentInspection?.id == id else { throw CancellationError() }
+                let isResults: Bool
+                if bytes.starts(with: Data("FTAG".utf8)) {
+                    isResults = false
+                } else {
+                    let object = try StrictJSON.decode(bytes).object()
+                    isResults = try object["format"]?.string() == "ft-phone-key-enrollment-journal"
+                }
+                if dedicatedResults || isResults {
+                    // A recognized, malformed report always stays a report
+                    // error; it can never fall through to workspace admission.
+                    let journal = try WorkspaceKeyEnrollmentJournal(data: bytes)
+                    guard !showRestore, credentialImport == nil else {
+                        message = "Finish Offline Restore or the current key import, then open these enrollment results again."
+                        return
+                    }
+                    enrollmentResults = LocalEnrollmentResults(bytes: bytes, journal: journal,
+                        presentingWorkspaceID: presenter, preferredWorkspaceID: nil, epoch: ticket)
+                } else {
+                    documentInspection = nil
+                    importWorkspaceFile(url, bytes: bytes)
+                }
+            } catch {
+                guard documentInspection?.id == id else { return }
+                if Task.isCancelled || !active || epoch != ticket {
+                    documentRetryURL = url
+                    message = "Opening the selected file was interrupted. Choose Retry File to read it again, or cancel this selection. No results or workspace were admitted."
+                    return
+                }
+                message = "The selected file could not be opened. Enrollment results must be the complete JSON saved by FrankenTerm Export. \(error.localizedDescription)"
+            }
+        }
+        documentInspection = (id, task)
+    }
+
+    private func importWorkspaceFile(_ url: URL, bytes: Data? = nil) {
+        guard !busy else { return }
+        scannedCode = nil
+        if !OpticalRecordingLimits.accepts(url) { stopSavingScanProgress() }
+        pendingImport = PendingFileImport(url: url, bytes: bytes)
+        guard active, restore != nil else {
+            if !bootstrapStarted { Task { await bootstrap() } }
+            return
+        }
+        cameraRequested = false
+        if OpticalRecordingLimits.accepts(url), showRestore, state?.isSuspended == false {
+            // Keep the active scan generation and its opted-in checkpoint owner
+            // when adding recording frames to an unfinished camera transfer.
+            openPendingFileIfReady()
+        } else { setRestoreVisible(true) }
+        // The serialized lifecycle calls openPendingFileIfReady after obtaining
+        // the actor's current status. A paused phone request keeps its selection.
+    }
+    private func openPendingFileIfReady() {
+        guard active, showRestore, !busy, let restore, let selected = pendingImport,
+              !selected.needsExplicitRetry, state?.isSuspended == false else { return }
+        if OpticalRecordingLimits.accepts(selected.url) {
+            startRecording(selected, restore: restore)
+            return
+        }
+        busy = true; message = nil
+        let ticket = epoch, pendingLifecycle = lifecycle
+        Task { [weak self] in
+            await pendingLifecycle?.value
+            guard let self else { return }
+            defer { self.busy = false }
+            guard self.active, self.showRestore, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                self.markPendingImportInterrupted(selected.id)
+                return
+            }
+            let current = await restore.status()
+            guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                self.markPendingImportInterrupted(selected.id)
+                return
+            }
+            self.state = current
+            guard !current.isSuspended else { return }
+            var submittedDocument = false
+            do {
+                let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
+                guard ready.phase == .idle else { throw WorkspaceStoreError.busy }
+                guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                    self.markPendingImportInterrupted(selected.id)
+                    return
+                }
+                let bytes: Data
+                if let inspected = selected.bytes { bytes = inspected }
+                else { bytes = try await Self.readSelectedDocument(selected.url, limit: FTLimit.envelope) }
+                guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
+                    self.markPendingImportInterrupted(selected.id)
+                    return
+                }
+                let result: OfflineRestoreStatus
+                if bytes.starts(with: Data("FTAG".utf8)) {
+                    result = try await restore.acceptEncryptedFile(bytes, generation: ready.generation)
+                } else {
+                    submittedDocument = true
+                    result = try await restore.acceptWorkspaceDocument(bytes, generation: ready.generation)
+                }
+                // Acceptance owns the selected input even if a later suspension
+                // prevents publishing its result to this view. Never replay it.
+                if self.pendingImport?.id == selected.id { self.pendingImport = nil }
+                guard self.active, self.epoch == ticket else { return }
+                self.state = result
+            } catch {
+                let latest = await restore.status()
+                guard self.pendingImport?.id == selected.id else { return }
+                let interrupted = !self.active || self.epoch != ticket || latest.isSuspended
+                // A public document can be admitted before its awaited preview
+                // is suspended. The actor already owns it and offers fresh review.
+                let ownsDocument = submittedDocument && latest.source == .workspaceDocument
+                    && latest.phase != .idle && latest.phase != .complete
+                if ownsDocument || !interrupted { self.pendingImport = nil }
+                else { self.markPendingImportInterrupted(selected.id) }
+                guard self.active, self.epoch == ticket else { return }
+                self.state = latest
+                if !interrupted { self.report(error) }
+            }
+        }
+    }
+
+    /// The selected reader has one owner until cancellation and native cleanup
+    /// have joined. Each decoded frame is backpressured by the existing receiver
+    /// and optional checkpoint writer; no per-frame tasks or image queue exist.
+    private func startRecording(_ selected: PendingFileImport, restore: OfflineRestore<AppleCryptography>) {
+        guard recordingRead == nil, !canRetryScanSave else {
+            pendingImport?.needsExplicitRetry = true
+            scanProgressMessage = "Retry Saving or Continue Without Saving before reading the selected recording."
+            return
+        }
+        isReadingRecording = true; recordingProgress = nil; message = nil; cameraRequested = false
+        observations?.finish(); observations = nil
+        let priorObservations = observationTask
+        priorObservations?.cancel(); observationTask = nil; lastObservation = nil
+        let ticket = epoch, pendingLifecycle = lifecycle
+        let reader = NativeOpticalRecording()
+        let job = Task { [weak self] in
+            await pendingLifecycle?.value
+            await priorObservations?.value
+            guard let self else { return }
+            defer {
+                if self.recordingRead?.id == selected.id {
+                    self.recordingRead = nil; self.isReadingRecording = false
+                    if self.active, self.showRestore, self.epoch == ticket {
+                        self.advanceAutomatically()
+                    }
+                }
+            }
+            do {
+                try self.checkRecordingOwner(selected.id, epoch: ticket)
+                let current = await restore.status()
+                let ready = current.phase == .complete ? try await self.restartFinished(restore) : current
+                try self.checkRecordingOwner(selected.id, epoch: ticket)
+                guard [.idle, .candidate, .collecting].contains(ready.phase), !ready.isSuspended else {
+                    throw WorkspaceStoreError.busy
+                }
+                self.state = ready
+                let result = try await reader.read(selected.url) { [weak self] texts, progress in
+                    guard let self else { throw CancellationError() }
+                    try await self.checkRecordingOwner(selected.id, epoch: ticket)
+                    let next = try await restore.observeRecordingFrame(texts, generation: ready.generation)
+                    return try await self.receivedRecordingFrame(next, progress: progress,
+                        restore: restore, id: selected.id, epoch: ticket)
+                }
+                try self.checkRecordingOwner(selected.id, epoch: ticket)
+                let latest = await restore.status()
+                await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+                try self.checkRecordingOwner(selected.id, epoch: ticket)
+                self.state = latest; self.pendingImport = nil
+                if latest.phase == .locked {
+                    self.message = "Encrypted transfer recovered. Unlock it using the separately saved code or this phone's active recipient request, then review what will be restored."
+                } else if self.canRetryScanSave {
+                    self.message = "Reading paused because saving progress needs attention. Your recovered pieces remain available."
+                } else if latest.identity == nil {
+                    self.message = "No usable transfer symbols were found in \(result.framesRead) frames. Choose a QR recording exported by FrankenTerm."
+                } else {
+                    self.message = "Read \(result.framesRead) frames. This recording did not complete the transfer. Recovered pieces are kept; read another recording of the same transfer or resume the camera and use Repair Page on your Mac."
+                }
+            } catch {
+                let latest = await restore.status()
+                let interrupted = Task.isCancelled || !self.active || self.epoch != ticket || latest.isSuspended
+                if self.pendingImport?.id == selected.id {
+                    if interrupted { self.markPendingImportInterrupted(selected.id) }
+                    else { self.pendingImport = nil }
+                }
+                guard self.active, self.showRestore, self.epoch == ticket else { return }
+                self.state = latest
+                // A malformed page can reduce receiver progress, and explicit
+                // Stop cancels this reader task. Join a separate settlement so
+                // an opted-in cache records the exact remaining decoder, even
+                // on cancellation. Background/dismissal revokes its authority
+                // through the normal active/epoch/save-owner checks.
+                let settlement = Task { [weak self] in
+                    guard let self, self.recordingRead?.id == selected.id,
+                          self.active, self.showRestore, self.epoch == ticket else { return }
+                    await self.saveScanSnapshot(latest, restore: restore, epoch: ticket, force: true)
+                }
+                await settlement.value
+                guard self.active, self.showRestore, self.epoch == ticket,
+                      self.recordingRead?.id == selected.id else { return }
+                if interrupted { self.message = "Reading stopped. Recovered pieces are kept; continue with another recording or the camera." }
+                else { self.report(error) }
+            }
+        }
+        recordingRead = (selected.id, job)
+    }
+
+    private func checkRecordingOwner(_ id: UUID, epoch ticket: UUID) throws {
+        try Task.checkCancellation()
+        guard active, showRestore, epoch == ticket, recordingRead?.id == id,
+              pendingImport?.id == id else { throw CancellationError() }
+    }
+
+    private func receivedRecordingFrame(_ next: OfflineRestoreStatus, progress: OpticalRecordingProgress,
+        restore: OfflineRestore<AppleCryptography>, id: UUID, epoch ticket: UUID) async throws -> Bool {
+        try checkRecordingOwner(id, epoch: ticket)
+        state = next; recordingProgress = progress
+        await saveScanSnapshot(next, restore: restore, epoch: ticket)
+        try checkRecordingOwner(id, epoch: ticket)
+        return [.idle, .candidate, .collecting].contains(next.phase) && !canRetryScanSave
+    }
+
+    func stopReadingRecording() {
+        guard let current = recordingRead else { return }
+        // Retain and join the reader before allowing another input. Clearing
+        // the pending choice also prevents an automatic replay after Stop.
+        pendingImport = nil
+        current.task.cancel()
+    }
+    private func markPendingImportInterrupted(_ id: UUID) {
+        guard pendingImport?.id == id else { return }
+        pendingImport?.needsExplicitRetry = true
+    }
+    func report(_ error: Error) {
+        if let error = error as? FTError {
+            if error == .authentication, state?.encryptionMode == .recipient || state?.recipientRequest != nil {
+                message = "This transfer could not be verified for the active phone request. Check the recipient value on both screens and create a new export on the Mac."
+            } else if error == .limit("recipient.envelope_limit") {
+                message = "This transfer exceeds the phone request's accepted size. Select fewer groups or identities on the Mac, then prepare a new transfer."
+            } else if error == .unsupported("envelope.requires_recipient_key"), state?.recipientRequest != nil {
+                message = "This receive session is waiting for an export encrypted to its phone request. Ask the Mac to use Only This Phone, or explicitly start a different transfer to use a code."
+            } else if error == .malformed("recording.ambiguous_sources") {
+                message = "This recording shows multiple different transfers at once. No source was selected. Choose a recording with one transfer."
+            } else if error == .unsupported("file.not_local") {
+                message = "This file is not downloaded on this phone. Choose an already-local copy for offline restore."
+            } else { message = error.localizedDescription }
+        }
+        else if let error = error as? WorkspaceStoreError { message = error.localizedDescription }
+        else if let error = error as? WorkspaceNetworkError { message = error.localizedDescription }
+        else if !(error is CancellationError) {
+            // Say what failed: a generic message hid the Keychain status a
+            // person (or a bug report) needs.
+            let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            message = "The restore did not finish. \(detail)"
+        }
+    }
+}
+
+@MainActor
+struct MobileWorkspaceRoot: View {
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var chooseFile = false
+    @State private var showIncludedMac = false
+    private var includedMacURL: URL? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "FTIncludedMacDownloadURL") as? String,
+              let url = URL(string: value), url.scheme == "https", url.host == "github.com",
+              url.path.hasPrefix("/Dicklesworthstone/frankenterm/releases/download/"),
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else { return nil }
+        return url
+    }
+    var body: some View {
+        ZStack {
+            NavigationStack {
+                Group {
+                    if model.workspaces.isEmpty { firstRun } else { savedWorkspaces }
+                }
+                .navigationDestination(item: $model.returning) { screen in
+                    if let saved = model.workspaces.first(where: { $0.id == screen.workspaceID }),
+                       let document = try? saved.document() {
+                        MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model,
+                                             returningMachineID: screen.machineID)
+                    }
+                }
+                .navigationTitle("FrankenTerm")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showIncludedMac = true } label: {
+                            Label(includedMacURL == nil ? "App Information" : "Mac Exporter",
+                                  systemImage: includedMacURL == nil ? "info.circle" : "desktopcomputer")
+                        }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Menu {
+                            Button { model.requestCamera() } label: { Label("Scan My Mac", systemImage: "qrcode.viewfinder") }
+                            Button { chooseFile = true } label: { Label("Open a Workspace or Results File", systemImage: "doc") }
+                            Button { model.requestRecipient() } label: {
+                                Label("Encrypt Only for This Phone", systemImage: "lock.iphone")
+                            }.disabled(model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
+                            if !model.savedScans.isEmpty {
+                                Button { model.setRestoreVisible(true) } label: {
+                                    Label("Saved Scan", systemImage: "qrcode")
+                                }.disabled(model.busy)
+                            }
+                        } label: { Image(systemName: "plus") }
+                            .disabled(model.state == nil)
+                            .accessibilityLabel("Add machines")
+                    }
+                }
+            }
+            if !model.active { Color(.systemBackground).ignoresSafeArea().overlay { Label("FrankenTerm", systemImage: "lock.shield").font(.title2) } }
+        }
+        .task { model.setScenePhase(scenePhase); await model.bootstrap() }
+        .sheet(isPresented: $showIncludedMac) {
+            NavigationStack {
+                Form {
+                    if let url = includedMacURL {
+                        Section("Get the Mac Exporter") {
+                            Text("FrankenTermExport is the small Mac utility for transferring your machines and workspaces to this app. No additional purchase or subscription is required.")
+                            Text("Requires an Apple Silicon Mac with macOS 14 or later.")
+                            ShareLink(item: url) {
+                                Label("Send Download Link to My Mac", systemImage: "square.and.arrow.up")
+                            }
+                            Link("Download Mac Exporter", destination: url)
+                        }
+                        Section("Set Up on Your Mac") {
+                            Text("1. Open the download link on your Mac and unzip the downloaded file.")
+                            Text("2. Open FrankenTermExport.app. You can move it to Applications to keep it handy.")
+                            Text("3. Choose the machines and contents to transfer. If your machines are not listed, use Other Sources to import an SSH config or open a workspace.")
+                            Text("4. Start the transfer on your Mac. On this iPhone or iPad, choose Scan My Mac and scan the displayed codes. Review the imported contents before saving.")
+                        }
+                    }
+                    Section("Support and Privacy") {
+                        if let privacy = URL(string: "https://github.com/Dicklesworthstone/frankenterm/blob/main/docs/ios-privacy.md") {
+                            Link("Privacy Policy", destination: privacy)
+                        }
+                        if let support = URL(string: "https://github.com/Dicklesworthstone/frankenterm/issues") {
+                            Link("Get Support", destination: support)
+                        }
+                    }
+                }
+                .navigationTitle(includedMacURL == nil ? "App Information" : "Mac Exporter")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showIncludedMac = false }
+                    }
+                }
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in model.setScenePhase(phase) }
+        .onOpenURL { showIncludedMac = false; model.importFile($0) }
+        .sheet(item: Binding(get: {
+            model.enrollmentResults.flatMap { $0.presentingWorkspaceID == nil ? $0 : nil }
+        }, set: { value in
+            if value == nil, let report = model.enrollmentResults, report.presentingWorkspaceID == nil {
+                model.cancelEnrollmentResults(report.id)
+            }
+        })) { report in
+            WorkspaceEnrollmentResultsSheet(model: model, report: report)
+        }
+        .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
+            OfflineRestoreSheet(model: model)
+        }
+        .sheet(item: Binding(get: { model.connections?.authenticationPrompt }, set: { _ in })) { request in
+            if let connections = model.connections {
+                switch request {
+                case let .password(value):
+                    MobileSSHPasswordSheet(prompt: connections.passwordPrompt, request: value).id(value.id)
+                case let .keyboardInteractive(value):
+                    MobileSSHKeyboardInteractiveSheet(prompt: connections.keyboardInteractivePrompt, request: value).id(value.id)
+                }
+            }
+        }
+        .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls): if let url = urls.first { model.importFile(url) }
+            case .failure(let error): model.report(error)
+            }
+        }
+        .alert("FrankenTerm", isPresented: Binding(get: { !model.showRestore && model.message != nil }, set: { if !$0 { model.message = nil } })) {
+            if model.canRetryDocument {
+                Button("Retry File") { model.retrySelectedDocument() }.disabled(model.busy || !model.active)
+                Button("Cancel File", role: .cancel) { model.discardSelectedDocument() }
+            } else { Button("OK") { model.message = nil } }
+        } message: { Text(verbatim: model.message ?? "") }
+    }
+
+    /// Nothing saved yet: one sentence and one button.
+    private var firstRun: some View {
+        VStack(spacing: 28) {
+            Spacer()
+            Image(systemName: "laptopcomputer.and.iphone")
+                .font(.system(size: 72, weight: .light)).symbolRenderingMode(.hierarchical).foregroundStyle(.tint)
+            VStack(spacing: 10) {
+                Text("Bring your machines over").font(.title.bold())
+                Text("On your Mac, open FrankenTerm Export and click Send to iPhone. Then scan it here.")
+                    .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            Spacer()
+            Button { model.requestCamera() } label: {
+                Label("Scan My Mac", systemImage: "qrcode.viewfinder")
+                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
+            }.buttonStyle(.borderedProminent).controlSize(.large)
+                .disabled(model.state == nil || model.requestingCameraAccess)
+            if !model.savedScans.isEmpty {
+                Button("Resume a Saved Scan") { model.setRestoreVisible(true) }
+                    .disabled(model.state == nil || model.busy)
+            }
+        }.padding(24).padding(.bottom, 12)
+    }
+
+    private var savedWorkspaces: some View {
+        List(model.workspaces) { saved in
+            if let document = try? saved.document() {
+                NavigationLink { MachineWorkspaceView(initialDocument: document, workspaceID: saved.id, model: model) } label: {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(verbatim: document.name).font(.headline).lineLimit(1)
+                        HStack(spacing: 5) {
+                            ForEach(document.machines.prefix(12)) { machine in
+                                let theme = model.machineThemes(saved.id, document: document)?.theme(for: machine)
+                                    ?? document.themes.first { $0.id == machine.themeID }
+                                Circle().fill(Color(ftHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
+                            }
+                            Text("\(document.machines.count) machines").font(.caption).foregroundStyle(.secondary).padding(.leading, 4)
+                        }
+                    }.padding(.vertical, 6)
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+struct OfflineRestoreSheet: View {
+    @Bindable var model: MobileWorkspaceModel
+    @State private var code = ""
+    @State private var repairPage = 0
+    @State private var chooseFile = false
+    private enum RestoreDecision {
+        case save(generation: UUID, identity: OpticalFrame.Identity, replacing: OpticalDecoderRecoveryReview?)
+        case discard(SavedOpticalScan)
+        var title: String {
+            switch self {
+            case .save: "Save Scan Progress?"
+            case .discard: "Discard Saved Scan?"
+            }
+        }
+    }
+    @State private var restoreDecision: RestoreDecision?
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !model.active { ContentUnavailableView("Locked", systemImage: "lock.shield", description: Text("Return to FrankenTerm to continue.")) }
+                else if model.offlineModeBlocked {
+                    ContentUnavailableView {
+                        Label("Offline Restore Paused", systemImage: "network.slash")
+                    } description: {
+                        Text(model.message ?? "Close active connections before restoring. Cancel to keep your connections open.")
+                    } actions: {
+                        if model.busy { ProgressView("Preparing offline restore…") }
+                        let blocking = model.workspacesBlockingRestore
+                        if !blocking.isEmpty {
+                            // One line names what the button ends; it acts
+                            // with no second confirmation.
+                            Text(verbatim: "Ends the live sessions in "
+                                 + ListFormatter.localizedString(byJoining: blocking.map { "“\($0)”" }) + ".")
+                                .font(.footnote)
+                            Button("Disconnect Sessions and Restore", role: .destructive) {
+                                model.disconnectSessionsAndRestore()
+                            }
+                        }
+                        Button("Retry Offline Restore") { model.retryOfflineMode() }.buttonStyle(.borderedProminent)
+                        Button("Cancel Restore") { model.setRestoreVisible(false) }
+                    }.disabled(model.busy)
+                }
+                else if let state = model.state {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 20) {
+                            Text(title(state.phase)).font(.title2.bold())
+                            if let message = model.message {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label { Text(verbatim: message) } icon: { Image(systemName: "exclamationmark.circle") }
+                                    Button("Dismiss Message") { model.message = nil }
+                                }.font(.callout).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                            if let message = model.scanProgressMessage {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label { Text(verbatim: message) } icon: { Image(systemName: "externaldrive.badge.exclamationmark") }
+                                    Button("Dismiss Scan Message") { model.scanProgressMessage = nil }
+                                }.font(.callout).padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                            if model.isReadingRecording {
+                                recordingProgressContent
+                            }
+                            if state.requiresRecipientResume {
+                                Label("Phone request paused", systemImage: "lock.shield").font(.headline)
+                                Text("Your request key is still held only in this running app. Resume this request deliberately before scanning or decrypting. Closing this restore or terminating the app loses the key.")
+                                if model.hasPendingImport {
+                                    Text("Your selected local file is waiting. It will open after you resume this phone request.")
+                                }
+                                Button("Resume This Phone Request") {
+                                    model.resumeRecipientRequest()
+                                }.buttonStyle(.borderedProminent)
+                            } else {
+                            if model.pendingImportNeedsRetry {
+                                Text("The selected file is still waiting after an interruption. Continue when you are ready; the app will not reopen it automatically.")
+                                Button("Continue Selected File") { model.retryPendingImport() }.buttonStyle(.borderedProminent)
+                            }
+                            if [.idle, .candidate, .collecting, .locked].contains(state.phase), model.cameraRequested, !state.isSuspended {
+                                if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
+                                    let cameraGeneration = model.cameraGeneration
+                                    OpticalCamera(onCode: { model.observed($0, cameraGeneration: cameraGeneration) },
+                                                  onError: { model.cameraFailed($0, generation: cameraGeneration) })
+                                        .id(cameraGeneration)
+                                        .frame(maxWidth: .infinity).frame(height: 380)
+                                        .clipShape(RoundedRectangle(cornerRadius: 24))
+                                        .overlay(alignment: .bottom) {
+                                            Label(state.phase == .locked ? "Scan the separately revealed transfer code" : "Point at the animation on your Mac", systemImage: "viewfinder")
+                                                .font(.footnote.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 7)
+                                                .background(.ultraThinMaterial, in: Capsule()).padding(14)
+                                        }
+                                } else {
+                                    let cameraGeneration = model.cameraGeneration
+                                    Text("Camera scanning is unavailable. Allow Camera access in Settings or open an already-local .ftairgap file.")
+                                        .task(id: cameraGeneration) {
+                                            // No scanner was mounted to report this failure.
+                                            // Retire the request once; retry remains explicit.
+                                            model.cameraFailed(FTError.unsupported("camera.unavailable"), generation: cameraGeneration)
+                                        }
+                                }
+                            }
+                            switch state.phase {
+                            case .idle:
+                                idleContent(state)
+                            case .candidate:
+                                ProgressView("Found your Mac…")
+                            case .collecting:
+                                collectingContent(state)
+                            case .locked:
+                                lockedContent(state)
+                            case .documentReady:
+                                Text("The public workspace is ready for a fresh source and settings review. It contains no private keys and needs no transfer code.")
+                                Button("Review Workspace") {
+                                    model.run { restore, state in try await restore.reviewWorkspaceDocument(generation: state.generation) }
+                                }.buttonStyle(.borderedProminent)
+                            case .preparingReview, .committing:
+                                ProgressView(state.phase == .committing ? "Saving your machines…" : "Unlocking…")
+                                    .frame(maxWidth: .infinity).padding(.vertical, 24)
+                            case .review:
+                                if let review = state.review { reviewSummary(review) }
+                            case .complete:
+                                completeContent(state)
+                            case .recoveryRequired:
+                                Text("The save may have completed. Check the saved result before attempting another import.")
+                                Button("Reconcile Saved Workspace") {
+                                    model.run { restore, state in try await restore.reconcile(generation: state.generation) }
+                                }.buttonStyle(.borderedProminent)
+                            }
+                            }
+                            scanProgressContent(state)
+                            ForEach(model.savedScans) { saved in savedScanContent(saved, state: state) }
+                            if [.candidate, .collecting, .locked, .documentReady, .review].contains(state.phase)
+                                || (state.phase == .idle && state.recipientRequest != nil) {
+                                Button("Start Over", role: .destructive) {
+                                    code = ""; model.cameraRequested = false
+                                    model.resetRestore()
+                                }
+                            }
+                        }.padding(24).disabled(model.busy)
+                            .animation(.smooth, value: state.phase)
+                            .sensoryFeedback(.success, trigger: state.phase == .complete)
+                    }
+                } else { ProgressView("Opening protected workspace…") }
+            }.navigationTitle("Restore").navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        if model.isReadingRecording {
+                            Button("Stop Reading") { model.stopReadingRecording() }
+                        } else {
+                            Button("Close") { model.setRestoreVisible(false) }.disabled(model.busy)
+                        }
+                    }
+                }
+        }
+        .interactiveDismissDisabled(model.busy)
+        .confirmationDialog(restoreDecision?.title ?? "Restore",
+                            isPresented: Binding(get: { restoreDecision != nil }, set: { if !$0 { restoreDecision = nil } }),
+                            titleVisibility: .visible, presenting: restoreDecision) { decision in
+            switch decision {
+            case .save(let generation, let identity, let reviewed):
+                Button("Save Encrypted Progress") { model.saveScanProgress(generation: generation, identity: identity, replacing: reviewed) }
+                    .disabled(model.busy || !model.active)
+            case .discard(let saved):
+                Button("Discard Saved Scan", role: .destructive) { model.discardSavedScan(saved) }
+                    .disabled(model.busy || !model.active)
+            }
+            Button("Cancel", role: .cancel) { restoreDecision = nil }
+        } message: { decision in
+            switch decision {
+            case .save(_, _, let reviewed):
+                Text("Keep this transfer's encrypted pages and unfinished reconstruction progress on this phone. Progress is saved about every two seconds while scanning, and when you choose Save and Pause Scan. Transfer codes and phone request keys are never saved. The cache is device-protected and excluded from backups."
+                     + (reviewed == nil ? "" : " This updates the reviewed saved scan to your current progress, including any page repairs.")
+                     + " Saving stops when you leave restore or the app becomes inactive; a sudden interruption can lose progress since the last save.")
+            case .discard(let saved):
+                Text("Discard the saved pages and unfinished progress for transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))? Your current scan and installed workspaces stay available. Saving further progress will stop.")
+            }
+        }
+        .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data, .movie, .png], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls): if let url = urls.first { model.importFile(url) }
+            case .failure(let error): model.report(error)
+            }
+        }
+        .onChange(of: model.active) { _, active in
+            if !active {
+                code = ""
+                restoreDecision = nil
+            }
+        }
+        .onDisappear {
+            code = ""; model.cameraRequested = false
+            restoreDecision = nil
+        }
+    }
+
+    @ViewBuilder private var recordingProgressContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let progress = model.recordingProgress {
+                if let total = progress.totalFrames {
+                    ProgressView(value: Double(progress.framesRead), total: Double(total)) {
+                        Text("Reading QR recording")
+                    }
+                    Text("\(progress.framesRead) of \(total) frames examined").monospacedDigit()
+                } else if let elapsed = progress.elapsedSeconds, let duration = progress.durationSeconds {
+                    ProgressView(value: elapsed, total: duration) { Text("Reading QR recording") }
+                    Text("\(progress.framesRead) frames examined").monospacedDigit()
+                }
+            } else { ProgressView("Opening local QR recording…") }
+            Text("Recording progress measures frames read. Transfer recovery below measures encrypted pieces recovered. Stop Reading keeps your recovered pieces.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func scanProgressContent(_ state: OfflineRestoreStatus) -> some View {
+        if state.source == .optical, [.collecting, .locked, .review].contains(state.phase),
+           !state.isSuspended, !state.requiresRecipientResume, let identity = state.identity {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.canRetryScanSave {
+                    Label("Saving needs your attention", systemImage: "externaldrive.badge.exclamationmark").font(.headline)
+                    Button("Retry Saving") { model.retryScanSave() }
+                    Button("Continue Without Saving") { model.continueWithoutSaving() }
+                } else if model.isSavingScanProgress {
+                    Label("Keeping scan progress", systemImage: "externaldrive.badge.checkmark").font(.headline)
+                    Text("Encrypted progress is saved about every two seconds, even before a page finishes. Save and pause before leaving to keep the latest progress.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Save and Pause Scan") { model.saveAndPauseScan() }
+                    Button("Continue Without Saving") { model.continueWithoutSaving() }
+                } else {
+                    let existing = model.savedScans.compactMap { saved -> OpticalDecoderRecoveryReview? in
+                        if case .partial(let value) = saved { return value }
+                        return nil
+                    }.first
+                    if existing == nil || existing?.identity == identity {
+                        Button {
+                            restoreDecision = .save(generation: state.generation, identity: identity, replacing: existing)
+                        } label: { Label(existing == nil ? "Save Scan Progress" : "Continue Saving This Scan", systemImage: "square.and.arrow.down") }
+                        Text("Keep encrypted progress so an interrupted scan can continue later, even if no page has finished.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        Text("Another transfer has saved progress. Review or discard that saved scan before saving this one.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func savedScanContent(_ saved: SavedOpticalScan, state: OfflineRestoreStatus) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if case .verified = saved { Label("Saved Pages", systemImage: "qrcode").font(.headline) }
+            else { Label("Saved Scan", systemImage: "qrcode").font(.headline) }
+            Text("\(saved.verifiedPages) of \(saved.identity.pageCount) pages verified · \(ByteCountFormatter.string(fromByteCount: Int64(saved.verifiedBytes), countStyle: .file))")
+                .monospacedDigit()
+            if saved.independentParts > 0 {
+                Text("\(saved.independentParts) recovered pieces of unfinished pages also saved")
+                    .font(.callout).monospacedDigit()
+            }
+            Text(verbatim: "Transfer \(TransferCodeFrame.digestPrefix(saved.identity.envelopeDigest))")
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            if [.idle, .complete].contains(state.phase), !state.requiresRecipientResume {
+                Text("Resume this encrypted progress and keep saving as you scan. The camera opens only when you tap Scan or Resume Camera. A complete saved scan still needs to be unlocked.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Resume Saved Scan") {
+                    code = ""
+                    model.resumeSavedScan(saved)
+                }.buttonStyle(.borderedProminent)
+            } else if state.identity != saved.identity {
+                Text("Start over with the current restore before resuming this saved scan.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Text("Codes and phone request keys are not saved. If an Only This Phone request key was lost when the app closed, create a new request and export again from your Mac.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button("Discard Saved Scan", role: .destructive) { restoreDecision = .discard(saved) }
+        }.padding().frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// The payoff: what arrived, in its colors, and one way out.
+    @ViewBuilder private func completeContent(_ state: OfflineRestoreStatus) -> some View {
+        let document = try? state.receipt?.workspace.document()
+        VStack(spacing: 18) {
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 64)).foregroundStyle(.green)
+                .symbolEffect(.bounce, value: state.phase)
+            Text(document.map { "\($0.machines.count) machines added" } ?? "Machines added").font(.title2.bold())
+            Label("Restored offline — Connect later", systemImage: "network.slash")
+                .font(.callout).accessibilityIdentifier("restore.connect_later")
+            Text("Nothing connects when you close this screen or reopen the app. Choose Connect on a machine when you are ready.")
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if let document {
+                VStack(spacing: 8) {
+                    ForEach(document.machines) { machine in
+                        let theme = document.themes.first { $0.id == machine.themeID }
+                        HStack(spacing: 10) {
+                            Circle().fill(Color(ftHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
+                            Text(verbatim: machine.name).foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF")).lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(Color(ftHex: theme?.background ?? "#1C1C1E"), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+            }
+            if let receipt = state.receipt, !receipt.missingCredentialIDs.isEmpty {
+                Text("\(receipt.missingCredentialIDs.count) keys were not included, so their machines cannot connect yet.")
+                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            Button { model.setRestoreVisible(false) } label: {
+                Text("Done").font(.headline).frame(maxWidth: .infinity).padding(.vertical, 6)
+            }.buttonStyle(.borderedProminent).controlSize(.large)
+        }.frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder private func idleContent(_ state: OfflineRestoreStatus) -> some View {
+        if let request = state.recipientRequest {
+            RecipientRequestCard(request: request)
+            Text("Hold this screen up to your Mac's camera. Then point this phone at the animation on your Mac.")
+            Button("Scan My Mac") { model.requestCamera() }
+                .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
+        } else {
+            Text("On your Mac, click Send to iPhone in FrankenTerm Export. Point this phone at the animation, unlock with the separately revealed code, then review your workspace.")
+            if !model.cameraRequested {
+                Button("Scan My Mac") { model.requestCamera() }
+                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(model.requestingCameraAccess)
+            }
+        }
+        DisclosureGroup("Other ways to restore") {
+            VStack(alignment: .leading, spacing: 12) {
+                if state.recipientRequest == nil {
+                    Button("Encrypt Only for This Phone (uses your Mac's camera)") { model.requestRecipient() }
+                }
+                Button(state.recipientRequest == nil ? "Open a Workspace File" : "Open an Encrypted File") {
+                    chooseFile = true
+                }
+                Button("Restore from QR Recording") { chooseFile = true }
+                Text("Read an already-local MP4 or animated PNG. Keep its transfer code separately; a recording alone cannot unlock the workspace.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }.padding(.top, 8)
+        }
+    }
+
+    @ViewBuilder private func collectingContent(_ state: OfflineRestoreStatus) -> some View {
+        let total = max(state.requiredParts, 1), received = min(state.receivedParts, total)
+        ProgressView(value: Double(received), total: Double(total)) {
+            Text("Recovering encrypted transfer")
+        } currentValueLabel: {
+            Text("\(Int((Double(received) / Double(total) * 100).rounded(.down)))%").monospacedDigit()
+                .contentTransition(.numericText())
+        }.animation(.smooth, value: received)
+        if !model.cameraRequested {
+            Button("Resume Camera") { model.requestCamera() }
+                .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
+        }
+        Button("Read Another QR Recording") { chooseFile = true }
+        if !state.incompletePageIndices.isEmpty {
+            DisclosureGroup("Stuck? Repair a page") {
+                Text("Select the same page in Repair Page on your Mac. Reset only if this page has stopped recovering; verified pages are kept.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Page", selection: $repairPage) {
+                    ForEach(state.incompletePageIndices, id: \.self) { index in
+                        Text("Page \(index + 1)").tag(index)
+                    }
+                }
+                Button("Reset This Unfinished Page") {
+                    let page = state.incompletePageIndices.contains(repairPage) ? repairPage : (state.incompletePageIndices.first ?? 0)
+                    model.run { restore, state in try await restore.resetIncompletePage(page, generation: state.generation) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func lockedContent(_ state: OfflineRestoreStatus) -> some View {
+        if state.encryptionMode == .recipient {
+            if state.canUnlockRecipient {
+                Button("Unlock") {
+                    model.run { restore, state in try await restore.unlockRecipient(generation: state.generation) }
+                }.buttonStyle(.borderedProminent).controlSize(.large)
+            } else {
+                Text("This transfer was encrypted for a phone request that this session no longer holds. Start a different transfer and send it again from your Mac.")
+            }
+        } else if state.recipientRequest != nil {
+            Text("This transfer was not encrypted for this phone. On your Mac, send it again after scanning this phone's request.")
+        } else {
+            Text("On your Mac, choose Show Transfer Code; the animation pauses while the code is visible. Enter that code here or scan its separately revealed QR. For a saved recording, use the code you kept separately.")
+            SecureField("Transfer code", text: $code).textInputAutocapitalization(.characters).autocorrectionDisabled()
+                .textFieldStyle(.roundedBorder).onChange(of: code) { _, value in if value.utf8.count > 128 { code = String(value.prefix(128)) } }
+            Button("Unlock") {
+                let entered = code; code = ""
+                model.run { restore, state in try await restore.unlock(enteredCode: entered, generation: state.generation) }
+            }.buttonStyle(.borderedProminent).disabled(code.isEmpty)
+            if !model.cameraRequested {
+                Button("Scan the Revealed Transfer Code") { model.requestCamera() }
+                    .disabled(model.requestingCameraAccess)
+            }
+        }
+    }
+
+    /// What arrives, in its colors, and one Restore button; everything a
+    /// person might audit is one tap away under Details.
+    @ViewBuilder private func reviewSummary(_ review: OfflineRestoreReview) -> some View {
+        Text(verbatim: review.document.name).font(.headline)
+        let machines = review.document.machines.count, keys = review.includedFingerprints.count
+        Text("\(machines) \(machines == 1 ? "machine" : "machines") · \(keys) \(keys == 1 ? "key" : "keys")")
+            .foregroundStyle(.secondary)
+        if let comparison = model.state?.comparison {
+            Text(verbatim: "Transfer \(comparison)").font(.system(.body, design: .monospaced)).textSelection(.enabled)
+            // Decrypting proves nothing about the sender; this code does.
+            Text("This should match the code your Mac showed for this transfer.").font(.callout)
+        }
+        ForEach(review.document.machines) { machine in
+            let theme = review.document.themes.first { $0.id == machine.themeID }
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 6).fill(Color(ftHex: theme?.background ?? "#000000"))
+                    .overlay(Circle().fill(Color(ftHex: theme?.accent ?? "#777777")).padding(7))
+                    .frame(width: 34, height: 26)
+                Text(verbatim: machine.name).lineLimit(1)
+            }
+        }
+        if let changes = review.changeReview { Text(verbatim: replacementSummary(review, changes)).font(.callout) }
+        // Nothing saved to replace, yet this export was restored here before
+        // (its workspace has since been removed): Restore takes it back.
+        else if review.isRollback { Text(verbatim: "This \(UIDevice.current.model) restored this export before.").font(.callout) }
+        // Replace approves exactly what the line above says: this source
+        // takes over the saved workspace with its changes, removals or
+        // older version. Every changed value is under Details.
+        Button(review.changeReview == nil ? "Restore" : "Replace") {
+            let token = review.token, removal = review.removesMachines, rollback = review.isRollback
+            let association = review.requiresSourceAssociation, security = review.requiresSecurityApproval
+            model.run { restore, state in
+                try await restore.commit(reviewToken: token, generation: state.generation,
+                                         sourceAndContentsConfirmed: true, allowMachineRemoval: removal, allowRollback: rollback,
+                                         associateWithExistingWorkspace: association, securityChangesConfirmed: security)
+            }
+        }.buttonStyle(.borderedProminent).controlSize(.large).frame(maxWidth: .infinity)
+        DisclosureGroup("Details") { reviewDetails(review).padding(.top, 8) }
+    }
+
+    @ViewBuilder private func reviewDetails(_ review: OfflineRestoreReview) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if model.state?.source == .workspaceDocument {
+                Text("This file is not encrypted or signed. Matching keys already on this phone can be reused.")
+                    .font(.caption)
+            }
+            ForEach(review.document.machines) { machine in
+                Text(verbatim: machine.name).font(.caption.bold())
+                ForEach(review.document.routes.filter { machine.routeIDs.contains($0.id) }) { route in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.caption, design: .monospaced))
+                        Text("\(route.credentialIDs.count) permitted identities · \(route.authenticationMethods.map(\.rawValue).joined(separator: ", "))")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let trust = review.document.hostTrust.first(where: { $0.id == route.trustID }) {
+                            ForEach(trust.pins, id: \.self) { key in
+                                Text(verbatim: "Host \(key.algorithm) \(key.fingerprint)").font(.system(.caption2, design: .monospaced))
+                            }
+                            ForEach(trust.certificateAuthorities, id: \.self) { authority in
+                                Text(verbatim: "Host certificate authority \(authority.algorithm) \(authority.fingerprint)")
+                                    .font(.system(.caption2, design: .monospaced))
+                            }
+                            if !trust.revokedKeys.isEmpty { Text("\(trust.revokedKeys.count) host-key revocations apply.").font(.caption) }
+                        }
+                    }
+                }
+            }
+            ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
+                Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+            }
+            ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness,
+                historicalSources: review.preservedHostRevocationSourcesByTrustScope)
+            if let changes = review.changeReview {
+                WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
+            }
+            if review.inactiveSettingCount > 0 { Text("\(review.inactiveSettingCount) desktop-only settings are preserved but inactive.") }
+            ForEach(Array(review.findings.enumerated()), id: \.offset) { _, finding in
+                VStack(alignment: .leading) {
+                    Text(verbatim: finding.setting).font(.caption.bold())
+                    Text(verbatim: finding.reason).font(.caption)
+                }
+            }
+            if review.preservedHostRevocationCount > 0 {
+                Text("\(review.preservedHostRevocationCount) previously accepted host-key denials remain in force.").font(.caption)
+            }
+            if review.preservedHostRevocationSourceCount > 0 {
+                Text("\(review.preservedHostRevocationSourceCount) previously accepted public revocation sources remain in force.").font(.caption)
+            }
+            if review.preservedHostRequirementCount > 0 {
+                Text("\(review.preservedHostRequirementCount) mandatory host-trust requirements remain in force, even if this export omits them.").font(.caption)
+            }
+            if !review.document.diagnostics.isEmpty {
+                Text("Unknown optional extensions were discarded. Only validated public settings will be saved.").font(.caption)
+            }
+        }
+    }
+
+    /// A replacement in one line: the saved workspace it takes over, how many
+    /// settings change, and any removed machines or older version.
+    private func replacementSummary(_ review: OfflineRestoreReview, _ changes: WorkspaceChangeReview) -> String {
+        var effects = ["Replaces your saved “\(review.existingWorkspaceName ?? review.document.name)”"]
+        if !changes.changes.isEmpty {
+            let count = changes.changes.count, security = changes.securityChanges.count
+            let which = security == count ? (count == 1 ? "a connection or host key" : "all connections or host keys")
+                : "\(security) of them connections or host keys"
+            effects.append("changes \(count) \(count == 1 ? "setting" : "settings")" + (security == 0 ? "" : " (\(which))"))
+        }
+        if review.removesMachines { effects.append("removes the machines it no longer has") }
+        if review.isRollback { effects.append("goes back to an older version") }
+        return ListFormatter.localizedString(byJoining: effects) + "."
+    }
+
+    private func title(_ phase: OfflineRestorePhase) -> String {
+        switch phase {
+        case .idle: "Restore from your Mac"
+        case .candidate: "Found your Mac"
+        case .collecting: "Receiving"
+        case .locked: "Unlocking"
+        case .documentReady, .preparingReview, .review: "Ready to restore"
+        case .committing: "Saving"
+        case .complete: "All set"
+        case .recoveryRequired: "Check the save result"
+        }
+    }
+}
+
+@MainActor
+private struct RecipientRequestCard: View {
+    let request: RecipientRequest
+    @State private var image: UIImage?
+    @State private var failed = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Only this phone request").font(.headline)
+            if let image {
+                Image(uiImage: image).resizable().interpolation(.none)
+                    .frame(width: 226, height: 226).background(.white)
+                    .accessibilityLabel("Public recipient request QR. Compare the value below on your Mac.")
+            } else if failed {
+                Text("The phone request QR could not be rendered. Start a different transfer and create a new request.")
+            } else { ProgressView("Preparing public request…") }
+            Text("Recipient comparison").font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: request.comparison(using: AppleCryptography()))
+                .font(.system(.headline, design: .monospaced)).minimumScaleFactor(0.6).lineLimit(1)
+            Text("The request is public. Its private key stays in this app’s memory. Closing this restore or terminating the app loses that key; the Mac must then create a new export. A recording for this request is not a recoverable backup.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .task(id: request.encoded) {
+            image = nil; failed = false
+            do {
+                let symbol = try await NativeOpticalPresentation().recipientSymbol(text: request.text)
+                try Task.checkCancellation()
+                guard let decoded = UIImage(data: symbol.png) else { throw FTError.storage }
+                image = decoded
+            } catch is CancellationError { }
+            catch { failed = true }
+        }
+    }
+}
+
+@MainActor
+private struct WorkspaceReplacementReview: View {
+    let changes: WorkspaceChangeReview
+    let existingName: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Changes to your saved workspace").font(.headline)
+            Text(verbatim: existingName).font(.subheadline)
+            if changes.changes.isEmpty {
+                Text("The public workspace settings are unchanged. The export identity and available private keys may differ.")
+                    .font(.callout)
+            } else {
+                Text("\(changes.changes.count) changed fields · \(changes.securityChanges.count) affect connection or trust policy")
+                    .font(.callout)
+                DisclosureGroup("Review every previous and incoming value") {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(Array(changes.changes.enumerated()), id: \.offset) { _, change in
+                            VStack(alignment: .leading, spacing: 5) {
+                                if change.affectsSecurity {
+                                    Label("Connection or trust change", systemImage: "exclamationmark.shield").font(.caption.bold())
+                                }
+                                Text(verbatim: "\(change.entity.title) · \(change.entityID)").font(.caption.bold())
+                                Text(verbatim: change.fieldTitle).font(.caption)
+                                Text("Saved value").font(.caption2).foregroundStyle(.secondary)
+                                Text(verbatim: WorkspaceChangeReview.Change.description(of: change.previous))
+                                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                                Text("Incoming value").font(.caption2).foregroundStyle(.secondary)
+                                Text(verbatim: WorkspaceChangeReview.Change.description(of: change.incoming))
+                                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                            Divider()
+                        }
+                    }.padding(.top, 8)
+                }
+            }
+            Text("Previously accepted local revocations and mandatory host-trust requirements remain in force.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding().background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// Display the policy the same verifier will enforce. In particular, a saved
+/// empty intersection must remain visibly denied rather than looking unset.
+struct WorkspaceHostAlgorithmPresentation: Sendable {
+    let trustID: String
+    let imported: WorkspaceHostAlgorithmPolicy
+    let effective: WorkspaceHostAlgorithmPolicy
+    let aliasesRestrict: Bool
+    let historicalRestrictionsApply: Bool
+    var isVisible: Bool { imported.isConstrained || effective.isConstrained }
+    var showsEffective: Bool { imported != effective }
+
+    init(document: WorkspaceDocument, trustID: String,
+         historicalPolicies: [String: WorkspaceHostAlgorithmPolicy] = [:]) throws {
+        guard let trust = document.hostTrust.first(where: { $0.id == trustID }) else { throw FTError.stale }
+        self.trustID = trustID; imported = trust.algorithmPolicy
+        let current = try document.hostAlgorithmPolicy(forTrustID: trustID)
+        effective = try document.hostAlgorithmPolicy(forTrustID: trustID, additional: historicalPolicies)
+        aliasesRestrict = current != imported
+        historicalRestrictionsApply = effective != current
+    }
+
+    static func description(_ algorithms: [String]?) -> String {
+        guard let algorithms else { return "No additional restriction" }
+        return algorithms.isEmpty ? "None allowed" : algorithms.joined(separator: ", ")
+    }
+}
+
+/// Resource provenance and the exact current-plus-retained denial policy used
+/// by authentication. A KRL version or timestamp describes a source; neither
+/// removes a denial already accepted on this phone.
+struct WorkspaceHostRevocationPresentation: Sendable {
+    let trustID: String
+    let sources: [WorkspaceHostRevocationSource]
+    let retainedSourceCount: Int
+    let policy: WorkspaceHostRevocationPolicy
+    var isVisible: Bool { !sources.isEmpty }
+
+    init(document: WorkspaceDocument, trustID: String,
+         historicalSources: [String: [WorkspaceHostRevocationSource]] = [:]) throws {
+        self.trustID = trustID
+        let current = try document.hostRevocationSources(forTrustID: trustID)
+        sources = try document.hostRevocationSources(forTrustID: trustID, additional: historicalSources)
+        let currentKeys = Set(current.map { $0.sourceKind + ":" + $0.sourceSHA256 })
+        retainedSourceCount = sources.filter { !currentKeys.contains($0.sourceKind + ":" + $0.sourceSHA256) }.count
+        policy = try document.hostRevocationPolicy(forTrustID: trustID, additional: historicalSources)
+    }
+
+    func deniesKnownKey(_ key: WorkspaceDocument.HostKey) -> Bool { policy.denies(presented: key) }
+}
+
+@MainActor
+private struct WorkspaceHostRevocationPolicyView: View {
+    let presentation: WorkspaceHostRevocationPresentation
+
+    var body: some View {
+        if presentation.isVisible {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Host revocation policy").font(.caption.bold())
+                Text("\(presentation.sources.count) public revocation sources apply before sign-in.").font(.caption)
+                if presentation.retainedSourceCount > 0 {
+                    Text("\(presentation.retainedSourceCount) sources retained from earlier imports still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                DisclosureGroup("Revocation source details") {
+                    ForEach(Array(presentation.sources.enumerated()), id: \.offset) { _, source in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(source.sourceKind == "openssh_krl_v1" ? "OpenSSH key revocation list" : "OpenSSH revoked public keys")
+                                .font(.caption.bold())
+                            Text(verbatim: source.sourceSHA256).font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                            if let version = source.krlVersion { Text("KRL version \(String(version))").font(.caption) }
+                            if let seconds = source.generatedAt {
+                                Text(verbatim: "Source generation timestamp: \(seconds) (Unix seconds)").font(.caption)
+                            }
+                            Text("\(source.policy.revokedSHA256.count + source.policy.revokedSHA1.count) revoked key hashes · \(source.policy.certificates.count) certificate rules")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.padding(.vertical, 4)
+                    }
+                    Text("Source timestamps do not prove freshness. Previously accepted denials remain in force after a replacement or rollback.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.font(.caption)
+            }.accessibilityIdentifier("host.revocations.\(presentation.trustID)")
+        }
+    }
+}
+
+@MainActor
+private struct WorkspaceHostAlgorithmPolicyView: View {
+    let policy: WorkspaceHostAlgorithmPresentation
+
+    var body: some View {
+        if policy.isVisible {
+            VStack(alignment: .leading, spacing: 6) {
+                if policy.showsEffective { Text("Imported restrictions").font(.caption.bold()) }
+                dimensions(policy.imported, prefix: "imported")
+                if policy.showsEffective {
+                    Text("Effective restrictions").font(.caption.bold())
+                    dimensions(policy.effective, prefix: "effective")
+                }
+                if policy.historicalRestrictionsApply {
+                    Text("Earlier approved restrictions on this phone still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if policy.aliasesRestrict {
+                    Text("Other trust records for this host also restrict the algorithms.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Only algorithms supported by this phone can be used. Cipher and message authentication restrictions apply to both traffic directions, independently at each SSH hop.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if policy.imported.caSignatureAlgorithms != nil || policy.effective.caSignatureAlgorithms != nil {
+                    Text("CA signature restrictions apply to the issuer of a host certificate.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func dimensions(_ value: WorkspaceHostAlgorithmPolicy, prefix: String) -> some View {
+        dimension("Host signature algorithms", algorithms: value.hostKeyAlgorithms, id: prefix + ".host")
+        dimension("CA signature algorithms", algorithms: value.caSignatureAlgorithms, id: prefix + ".ca")
+        dimension("Key exchange algorithms", algorithms: value.transport.keyExchangeAlgorithms, id: prefix + ".kex")
+        dimension("Ciphers", algorithms: value.transport.ciphers, id: prefix + ".ciphers")
+        dimension("Message authentication algorithms", algorithms: value.transport.macs, id: prefix + ".macs")
+    }
+
+    private func dimension(_ title: String, algorithms: [String]?, id: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: WorkspaceHostAlgorithmPresentation.description(algorithms))
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                .foregroundStyle(algorithms?.isEmpty == true ? Color.red : Color.primary)
+                .accessibilityIdentifier("host.policy.\(policy.trustID).\(id)")
+        }
+    }
+}
+
+@MainActor
+private struct WorkspacePublicKeyAlgorithmPolicyView: View {
+    let route: WorkspaceDocument.Route
+    var body: some View {
+        if let algorithms = route.publicKeyAlgorithmPolicy.acceptedAlgorithms {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Public-key signing algorithms").font(.caption).foregroundStyle(.secondary)
+                Text(verbatim: algorithms.isEmpty ? "None allowed" : algorithms.joined(separator: ", "))
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .foregroundStyle(algorithms.isEmpty ? Color.red : Color.primary)
+                    .accessibilityIdentifier("route.policy.\(route.id).publickey")
+                Text("Applies to signing in to this account. Other permitted sign-in methods remain available.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+@MainActor
+private struct ImportHostPolicyReview: View {
+    let document: WorkspaceDocument
+    let routeReadiness: [WorkspaceDocument.RouteReadiness]
+    let historicalSources: [String: [WorkspaceHostRevocationSource]]
+    var body: some View {
+        DisclosureGroup("All host identities and jump-route policy") {
+            VStack(alignment: .leading, spacing: 16) {
+                ForEach(document.hostTrust) { trust in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(verbatim: "\(trust.host):\(trust.port)").font(.headline)
+                        if let alias = trust.hostKeyAlias { Text(verbatim: "Host-key alias: \(alias)").font(.caption) }
+                        ForEach(trust.pins, id: \.self) { pin in
+                            Text(verbatim: "\(pin.algorithm) · \(pin.fingerprint)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
+                        ForEach(trust.certificateAuthorities, id: \.self) { authority in
+                            Text(verbatim: "Certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
+                        if !trust.certificateAuthorities.isEmpty {
+                            Text(verbatim: "Host certificates must be signed by a listed authority, be currently valid, and name \(trust.certificatePrincipal). Revoked certificates, host keys, and authorities remain blocked.")
+                                .font(.caption)
+                        }
+                        if let policy = try? WorkspaceHostAlgorithmPresentation(document: document, trustID: trust.id) {
+                            WorkspaceHostAlgorithmPolicyView(policy: policy)
+                        }
+                        if let policy = try? WorkspaceHostRevocationPresentation(document: document, trustID: trust.id,
+                            historicalSources: historicalSources) {
+                            WorkspaceHostRevocationPolicyView(presentation: policy)
+                        }
+                        if !trust.revokedKeys.isEmpty {
+                            Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
+                        }
+                        ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability,
+                            WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.hostRevocationCapability,
+                            WorkspaceDocument.transportAlgorithmPolicyCapability]).sorted(), id: \.self) { requirement in
+                            Text(verbatim: "Required policy: \(requirement)").font(.caption)
+                        }
+                    }
+                }
+                ForEach(document.routes) { route in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
+                        Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes").font(.caption)
+                        WorkspacePublicKeyAlgorithmPolicyView(route: route)
+                        if route.mode == "frankenterm_mux" {
+                            // What this route runs on the machine each time it connects.
+                            Text(verbatim: "Runs on connect: \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
+                        if let state = routeReadiness.first(where: { $0.routeID == route.id }) {
+                            ForEach(Array(state.issues.enumerated()), id: \.offset) { _, issue in
+                                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+                            }
+                        } else {
+                            Label("Local requirements could not be validated.", systemImage: "exclamationmark.shield").font(.caption)
+                        }
+                    }
+                }
+            }.padding(.top, 8)
+        }
+    }
+}
+
+@MainActor
+struct OpticalCamera: UIViewControllerRepresentable {
+    let onCode: (String) -> Void
+    let onError: (Error) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(onCode: onCode, onError: onError) }
+    func makeUIViewController(context: Context) -> DataScannerViewController {
+        let scanner = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])], qualityLevel: .balanced,
+            recognizesMultipleItems: false, isHighFrameRateTrackingEnabled: false,
+            isPinchToZoomEnabled: true, isGuidanceEnabled: true, isHighlightingEnabled: false)
+        scanner.delegate = context.coordinator
+        return scanner
+    }
+    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {
+        guard !scanner.isScanning, context.coordinator.permitsStart else { return }
+        do { try scanner.startScanning() } catch { context.coordinator.failed(error) }
+    }
+    static func dismantleUIViewController(_ scanner: DataScannerViewController, coordinator: Coordinator) {
+        coordinator.retire()
+        scanner.stopScanning(); scanner.delegate = nil
+    }
+    @MainActor
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        private let onCode: (String) -> Void
+        private let onError: (Error) -> Void
+        private var reportedFailure = false
+        private var retired = false
+        private var failureDelivery: Task<Void, Never>?
+        var permitsStart: Bool { !retired && !reportedFailure }
+        init(onCode: @escaping (String) -> Void, onError: @escaping (Error) -> Void) { self.onCode = onCode; self.onError = onError }
+        func failed(_ error: Error) {
+            guard !retired, !reportedFailure else { return }
+            reportedFailure = true
+            // Defer model mutation out of a UIViewRepresentable update callback.
+            failureDelivery = Task { @MainActor [weak self] in
+                guard let self, !self.retired, !Task.isCancelled else { return }
+                self.onError(FTError.unsupported("camera.unavailable"))
+            }
+        }
+        func retire() {
+            retired = true
+            failureDelivery?.cancel(); failureDelivery = nil
+        }
+        private func submit(_ items: [RecognizedItem]) {
+            guard !retired, !reportedFailure else { return }
+            for item in items.prefix(4) {
+                if case .barcode(let barcode) = item, let text = barcode.payloadStringValue,
+                   text.hasPrefix("FTQR1/") || text.hasPrefix("FTCODE1:"), text.utf8.count <= FTLimit.qrText { onCode(text) }
+            }
+        }
+        func dataScanner(_ scanner: DataScannerViewController, didAdd items: [RecognizedItem], allItems: [RecognizedItem]) { submit(items) }
+        func dataScanner(_ scanner: DataScannerViewController, didUpdate items: [RecognizedItem], allItems: [RecognizedItem]) { submit(items) }
+        func dataScanner(_ scanner: DataScannerViewController, didTapOn item: RecognizedItem) { submit([item]) }
+        func dataScanner(_ scanner: DataScannerViewController, becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable) {
+            scanner.stopScanning(); failed(error)
+        }
+    }
+}
+
+typealias WorkspaceKeyPassphraseRequest = OpenSSHSourceKeyUnlocker<AppleCryptography>.Request
+
+/// One bounded file/unlock owner. Private material never enters the observable
+/// app model; file I/O and the synchronous bounded KDF stay off MainActor.
+private actor WorkspaceKeyImportWorker {
+    enum Selection: Sendable { case ready, passphrase(WorkspaceKeyPassphraseRequest) }
+    private let store: WorkspaceStore
+    private let review: WorkspaceCredentialImportReview
+    private var unlocker = OpenSSHSourceKeyUnlocker(using: AppleCryptography())
+    private var selected: UUID?
+    private var key: PrivateKeyRecord?
+    private var retired = false
+
+    init(store: WorkspaceStore, review: WorkspaceCredentialImportReview) {
+        self.store = store; self.review = review
+    }
+
+    func resetSelection(_ id: UUID) throws {
+        try Task.checkCancellation()
+        guard !retired else { throw FTError.stale }
+        try unlocker.cancel(); key = nil; selected = id
+    }
+
+    func selectFile(_ url: URL, selection: UUID) throws -> Selection {
+        try requireSelection(selection)
+        var bytes = try SelectedLocalFile.read(url, limit: FTLimit.key)
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        try requireSelection(selection)
+        do {
+            let result = try unlocker.select(pem: bytes, reference: review.credential)
+            try requireSelection(selection)
+            switch result {
+            case .ready(let key): self.key = key; return .ready
+            case .passphraseRequired(let request): return .passphrase(request)
+            }
+        } catch {
+            try? unlocker.cancel(); key = nil
+            throw error
+        }
+    }
+
+    func unlock(selection: UUID, requestID: UUID, passphrase: Data) throws {
+        try requireSelection(selection)
+        var secret = passphrase
+        defer { secret.resetBytes(in: 0..<secret.count) }
+        let unlocked = try unlocker.unlock(requestID: requestID, passphrase: secret)
+        try requireSelection(selection)
+        key = unlocked
+    }
+
+    func pendingRequest(selection: UUID) -> WorkspaceKeyPassphraseRequest? {
+        guard !retired, selected == selection else { return nil }
+        return unlocker.request
+    }
+
+    func commit(selection: UUID) async throws -> WorkspaceCredentialImportReceipt {
+        try requireSelection(selection)
+        guard let key else { throw FTError.stale }
+        // Final confirmation consumes this selected private value once. A
+        // failed or cancelled write is reconciled by the model, never replayed.
+        self.key = nil; selected = nil; retired = true
+        try unlocker.cancel()
+        return try await store.importCredential(key, review: review, confirmedByUser: true)
+    }
+
+    func retire() {
+        retired = true; key = nil; selected = nil
+        try? unlocker.cancel()
+    }
+
+    private func requireSelection(_ id: UUID) throws {
+        try Task.checkCancellation()
+        guard !retired, selected == id else { throw FTError.stale }
+    }
+}
+
+@MainActor
+@Observable
+final class WorkspaceKeyImportController: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID, epoch: UUID
+    let credential: WorkspaceDocument.Credential
+    private(set) var review: WorkspaceCredentialImportReview?
+    private(set) var passphraseRequest: WorkspaceKeyPassphraseRequest?
+    private(set) var fileRequest: UUID?
+    private(set) var isReady = false
+    private(set) var isWorking = false
+    private(set) var isCommitting = false
+    private(set) var isFinished = false
+    private(set) var isRetired = false
+    private(set) var message: String?
+    @ObservationIgnored private weak var model: MobileWorkspaceModel?
+    @ObservationIgnored private let store: WorkspaceStore
+    @ObservationIgnored private var worker: WorkspaceKeyImportWorker?
+    @ObservationIgnored private var selection: UUID?
+    @ObservationIgnored private var work: Task<Void, Never>?
+    @ObservationIgnored private var retirement: Task<Void, Never>?
+
+    init(model: MobileWorkspaceModel, store: WorkspaceStore, workspaceID: UUID,
+         revision: UUID, credential: WorkspaceDocument.Credential, epoch: UUID) {
+        self.model = model; self.store = store; self.workspaceID = workspaceID
+        self.revision = revision; self.credential = credential; self.epoch = epoch
+    }
+
+    var canChooseFile: Bool {
+        review != nil && !isWorking && !isFinished && !isRetired && fileRequest == nil
+    }
+    var canImport: Bool { isReady && !isWorking && !isFinished && !isRetired }
+
+    func prepare() {
+        guard review == nil, work == nil, !isRetired else { return }
+        start { [self] in
+            do {
+                let reviewed = try await store.reviewCredentialImport(workspaceID: workspaceID,
+                    expectedRevision: revision, credentialID: credential.id)
+                try requireCurrent()
+                review = reviewed; worker = WorkspaceKeyImportWorker(store: store, review: reviewed)
+            } catch { report(error) }
+        }
+    }
+
+    func chooseFile() {
+        guard canChooseFile, let worker else { return }
+        let chosen = UUID()
+        selection = chosen; isReady = false; passphraseRequest = nil; message = nil
+        start { [self] in
+            do {
+                try requireCurrent()
+                try await worker.resetSelection(chosen)
+                try requireCurrent()
+                guard selection == chosen else { throw FTError.stale }
+                fileRequest = chosen
+            } catch { report(error) }
+        }
+    }
+
+    func selectedFile(requestID: UUID, result: Result<[URL], Error>) {
+        guard fileRequest == requestID, selection == requestID, !isRetired, let worker else { return }
+        fileRequest = nil
+        do {
+            try requireCurrent()
+            let urls = try result.get()
+            guard urls.count == 1, let url = urls.first, url.isFileURL else {
+                throw FTError.malformed("file.local_url_required")
+            }
+            start { [self] in
+                do {
+                    try requireCurrent()
+                    let value = try await worker.selectFile(url, selection: requestID)
+                    try requireCurrent()
+                    guard selection == requestID else { throw FTError.stale }
+                    switch value {
+                    case .ready: isReady = true
+                    case .passphrase(let request): passphraseRequest = request
+                    }
+                } catch { report(error) }
+            }
+        } catch {
+            let failure = error as NSError
+            if failure.domain != NSCocoaErrorDomain || failure.code != NSUserCancelledError { report(error) }
+        }
+    }
+
+    func cancelledFile(requestID: UUID) {
+        guard fileRequest == requestID, selection == requestID, !isRetired else { return }
+        // resetSelection already discarded the previous key before this picker
+        // appeared; cancelling it needs no file read or unlock attempt.
+        fileRequest = nil; selection = nil
+    }
+
+    func unlock(requestID: UUID, passphrase: Data) {
+        guard !isWorking, !isRetired, let request = passphraseRequest, request.id == requestID,
+              let selection, let worker, (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.count) else { return }
+        message = nil
+        start { [self] in
+            do {
+                try requireCurrent()
+                try await worker.unlock(selection: selection, requestID: request.id, passphrase: passphrase)
+                try requireCurrent()
+                guard self.selection == selection, passphraseRequest?.id == request.id else { throw FTError.stale }
+                passphraseRequest = nil; isReady = true
+            } catch {
+                let remaining = await worker.pendingRequest(selection: selection)
+                guard !isRetired else { return }
+                if model?.credentialImportIsCurrent(self) == true, self.selection == selection,
+                   passphraseRequest?.id == request.id {
+                    passphraseRequest = remaining
+                    report(error)
+                } else { cancel() }
+            }
+        }
+    }
+
+    func importMatchingKey() {
+        guard canImport, let worker, let selection, let model else { return }
+        isReady = false; isCommitting = true; message = nil
+        start { [self] in
+            let result: Result<WorkspaceCredentialImportReceipt, Error>
+            do {
+                try requireCurrent()
+                try await model.prepareCredentialImport(self)
+                try requireCurrent()
+                result = .success(try await worker.commit(selection: selection))
+            } catch { result = .failure(error) }
+            // An unstructured task does not inherit caller cancellation. Keep
+            // it retained and joined so a published key always gets read back.
+            let settlement = Task { await model.finishCredentialImport(self, result: result) }
+            let outcome = await settlement.value
+            await worker.retire()
+            isCommitting = false; isFinished = true
+            if !isRetired, model.credentialImportIsCurrent(self, allowChangedRevision: true) {
+                message = outcome
+            } else { cancel() }
+        }
+    }
+
+    /// Retain the owner until its current work and secret retirement settle.
+    /// A newer sheet cannot start another KDF while this one is still draining.
+    func cancel(message: String? = nil) {
+        guard !isRetired else { return }
+        isRetired = true; isReady = false; passphraseRequest = nil; fileRequest = nil
+        if let message { model?.credentialMessage = message }
+        let pending = work, worker = worker
+        pending?.cancel()
+        retirement = Task { [self] in
+            await pending?.value
+            await worker?.retire()
+            model?.releaseCredentialImport(self)
+            retirement = nil
+        }
+    }
+
+    private func start(_ operation: @escaping @MainActor () async -> Void) {
+        guard work == nil, !isRetired else { return }
+        isWorking = true
+        work = Task { [self] in
+            defer { work = nil; isWorking = false }
+            await operation()
+        }
+    }
+
+    private func requireCurrent() throws {
+        try Task.checkCancellation()
+        guard !isRetired, model?.credentialImportIsCurrent(self) == true else { throw FTError.stale }
+    }
+
+    private func report(_ error: Error) {
+        guard !isRetired else { return }
+        guard model?.credentialImportIsCurrent(self) == true, !(error is CancellationError) else {
+            cancel(); return
+        }
+        message = Self.describe(error)
+    }
+
+    static func describe(_ error: Error) -> String {
+        if let error = error as? FTError {
+            if error == .unsupported("source_key.encrypted_pem") || error == .unsupported("source_key.legacy_pem_cipher") {
+                return "This PEM protection is not supported. Traditional RSA and EC files must use AES-CBC with 128-, 192- or 256-bit keys. Protected OpenSSH and supported PBES2 PKCS#8 files can also be unlocked."
+            }
+            if error == .limit("source_key.legacy_pem_ciphertext") {
+                return "This encrypted PEM file exceeds the supported single-key size. Choose another matching supported key file."
+            }
+            if [.unsupported("source_key.pkcs8_encryption"), .unsupported("source_key.pkcs8_kdf"),
+                .unsupported("source_key.pkcs8_prf"), .unsupported("source_key.pkcs8_cipher")].contains(error) {
+                return "This PKCS#8 file uses unsupported protection. Supported files use PBES2, PBKDF2 with HMAC-SHA1, SHA256, SHA384 or SHA512, and AES-CBC with 128-, 192- or 256-bit keys."
+            }
+            if error == .limit("source_key.pbkdf2_parameters") {
+                return "This PKCS#8 file exceeds the supported unlock limits: 1–1,000,000 PBKDF2 iterations and an 8–64 byte salt. Choose another matching supported key file."
+            }
+            if error == .limit("source_key.pkcs8_der") {
+                return "This encrypted PKCS#8 file exceeds the supported single-key size. Choose another matching supported key file."
+            }
+        }
+        if error is FTError || error is OpenSSHSourceKeyError || error is WorkspaceStoreError
+            || error is SSHAuthenticationError { return error.localizedDescription }
+        return "The selected key file or protected storage could not be read. Choose a local SSH private-key file and try again."
+    }
+}
+
+/// A distinct view identity captures the picker ticket. A late result from a
+/// dismissed Files controller cannot borrow a subsequent selection's ticket.
+@MainActor
+private struct WorkspaceKeyFilePicker: View {
+    let requestID: UUID
+    let selected: @MainActor (UUID, Result<[URL], Error>) -> Void
+    let cancelled: @MainActor (UUID) -> Void
+    @State private var presented = false
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .fileImporter(isPresented: $presented, allowedContentTypes: [.data], allowsMultipleSelection: false) { [requestID, selected] result in
+                Task { @MainActor in selected(requestID, result) }
+            } onCancellation: { [requestID, cancelled] in
+                Task { @MainActor in cancelled(requestID) }
+            }
+            .task { presented = true }
+    }
+}
+
+@MainActor
+private struct WorkspaceKeyImportSheet: View {
+    @Bindable var controller: WorkspaceKeyImportController
+    @State private var passphrase = ""
+    @State private var passphraseLimit = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if controller.isRetired {
+                    ContentUnavailableView("Import Closed", systemImage: "lock.shield")
+                } else {
+                    Form {
+                        Section("Saved Identity") {
+                            if let name = controller.review?.workspaceName { Text(verbatim: name).font(.headline) }
+                            Text(verbatim: controller.credential.id)
+                            Text(verbatim: controller.credential.algorithm).font(.caption).foregroundStyle(.secondary)
+                            Text(verbatim: controller.credential.fingerprint)
+                                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            if let aliases = controller.review?.credentialIDs, aliases.count > 1 {
+                                Text("This identity also supplies \(aliases.count - 1) matching key references in this workspace.")
+                                    .font(.caption)
+                            }
+                        }
+                        if let message = controller.message {
+                            Section { Text(verbatim: message) }
+                        }
+                        if controller.isWorking {
+                            Section {
+                                ProgressView(controller.isCommitting ? "Saving key and refreshing device status…" : "Reading the selected identity…")
+                            }
+                        }
+                        if let request = controller.passphraseRequest, !controller.isFinished {
+                            Section {
+                                SecureField("Key File Passphrase", text: passphraseBinding(requestID: request.id))
+                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                    .textContentType(.password).submitLabel(.done)
+                                    .privacySensitive().disabled(controller.isWorking)
+                                    .onSubmit { unlock(requestID: request.id) }
+                                if request.protection.hidesPublicIdentity {
+                                    Text("This file keeps its public identity encrypted too. After unlocking, its key must match the saved algorithm and fingerprint above before it can be imported.")
+                                        .font(.callout)
+                                }
+                                if passphraseLimit {
+                                    Text("The passphrase is limited to \(OpenSSHSourceKey.maximumPassphraseBytes) UTF-8 bytes.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Button("Unlock Selected Key") { unlock(requestID: request.id) }
+                                    .disabled(passphrase.isEmpty || controller.isWorking)
+                                Text("\(request.attemptsRemaining) attempts remaining. The passphrase is used only to unlock this selected file on the phone.")
+                                    .font(.caption)
+                            } header: {
+                                switch request.protection {
+                                case .openSSH: Text("Encrypted OpenSSH Key")
+                                case .encryptedPKCS8: Text("Encrypted PKCS#8 Key")
+                                case .legacyPEM: Text("Encrypted PEM Key")
+                                }
+                            }
+                        }
+                        if controller.isReady {
+                            Section {
+                                Label("Private key matches the saved fingerprint", systemImage: "checkmark.shield")
+                                Text("Import this key into protected storage on this phone. Existing sessions in this workspace will disconnect so its connection settings can refresh; their remote shells or programs may end. You choose when to connect again.")
+                                    .font(.callout)
+                                Button("Import Matching Key") { passphrase = ""; controller.importMatchingKey() }
+                                    .disabled(!controller.canImport)
+                                    .accessibilityIdentifier("keys.import.confirm")
+                            }
+                        }
+                        if !controller.isFinished {
+                            Section {
+                                Button(controller.isReady || controller.passphraseRequest != nil ? "Choose Another Key File" : "Choose Key File") {
+                                    passphrase = ""; passphraseLimit = false; controller.chooseFile()
+                                }.disabled(!controller.canChooseFile)
+                                    .accessibilityIdentifier("keys.import.choose")
+                            } footer: {
+                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits) are supported, including bcrypt with AES-CTR or AES-CBC. ECDSA and RSA PKCS#8 files protected with PBES2, PBKDF2 and AES-CBC can also be unlocked here. Clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 files are supported. RSA connections use SHA-2 signatures.")
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Import SSH Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(controller.isFinished ? "Done" : "Cancel") { passphrase = ""; controller.cancel() }
+                }
+            }
+        }
+        .privacySensitive()
+        .interactiveDismissDisabled(controller.isCommitting)
+        .background {
+            if let request = controller.fileRequest {
+                WorkspaceKeyFilePicker(requestID: request, selected: controller.selectedFile,
+                                       cancelled: controller.cancelledFile).id(request)
+            }
+        }
+        .task { controller.prepare() }
+        .onChange(of: controller.passphraseRequest?.id) { _, _ in passphrase = ""; passphraseLimit = false }
+        .onDisappear { passphrase = ""; controller.cancel() }
+    }
+
+    private func passphraseBinding(requestID: UUID) -> Binding<String> {
+        Binding(get: {
+            controller.passphraseRequest?.id == requestID && !controller.isRetired ? passphrase : ""
+        }, set: { value in
+            guard controller.passphraseRequest?.id == requestID, !controller.isRetired, !controller.isWorking else { return }
+            guard value.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else {
+                passphraseLimit = true; return
+            }
+            passphrase = value; passphraseLimit = false
+        })
+    }
+
+    private func unlock(requestID: UUID) {
+        guard controller.passphraseRequest?.id == requestID, !controller.isWorking, !controller.isRetired,
+              !passphrase.isEmpty, passphrase.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else { return }
+        let bytes = Data(passphrase.utf8)
+        passphrase = ""; passphraseLimit = false
+        controller.unlock(requestID: requestID, passphrase: bytes)
+    }
+}
+
+private struct PhoneKeyEnrollmentDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+    let bytes: Data
+    let keyID: String
+
+    init(request: WorkspaceKeyEnrollmentRequest) throws {
+        bytes = try request.encoded(); keyID = request.key.id
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let bytes = configuration.file.regularFileContents else {
+            throw FTError.malformed("enrollment.request_file")
+        }
+        try self.init(request: WorkspaceKeyEnrollmentRequest(data: bytes))
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: bytes)
+    }
+}
+
+@MainActor
+private struct WorkspaceEnrollmentResultsSheet: View {
+    @Bindable var model: MobileWorkspaceModel
+    @Bindable var report: LocalEnrollmentResults
+    @State private var selectedRoutes = Set<String>()
+    @State private var comparedFingerprint = false
+    @State private var approval: LocalDeviceKeyReview?
+
+    private var canChoose: Bool { !model.busy && model.enrollmentResultsAreCurrent(report) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Phone Key") {
+                    Text(verbatim: report.key.fingerprint).font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text(verbatim: report.key.algorithm).font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: "Request: " + report.requestID).font(.caption).textSelection(.enabled)
+                    Text("Compare this fingerprint with the phone key and the results shown on your Mac. This public report may be stale or edited. It records observations of server key files; it does not prove that this phone can sign in.")
+                        .font(.callout)
+                }
+                if let message = report.message {
+                    Section(report.isFinished ? "Saved-State Result" : "Review Status") {
+                        Text(verbatim: message)
+                    }
+                }
+                if report.isApplying {
+                    Section {
+                        ProgressView("Disconnecting and saving selected routes…")
+                        Text("The operation retains ownership until session cleanup and saved-state reconciliation finish.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if let review = report.review {
+                    Section {
+                        Text(verbatim: review.workspaceName).font(.headline)
+                        Text("No route is selected automatically. Select each account that should use this phone key. A route may also be used as a jump host; all of its current paths must have a suitable positive result.")
+                            .font(.callout)
+                    } header: { Text("Current Workspace") }
+                    if review.routes.isEmpty {
+                        Section { Text("This workspace has no SSH routes that can be reviewed from these results.") }
+                    }
+                    ForEach(review.routes) { route in
+                        Section { routeRow(route, key: review.key) }
+                    }
+                    if !review.unmatchedObservations.isEmpty {
+                        Section {
+                            ForEach(review.unmatchedObservations) { observation in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(verbatim: Self.account(observation.target)).font(.headline)
+                                    observationRow(observation)
+                                    if let scope = observation.target.routeScope {
+                                        Text("Saved path identifier; no matching current path")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                        Text(verbatim: scope).font(.system(.caption2, design: .monospaced))
+                                            .textSelection(.enabled)
+                                    } else {
+                                        Text("Direct account without a matching current workspace path")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }.padding(.vertical, 6)
+                            }
+                        } header: { Text("Unmatched Report Accounts") }
+                        footer: { Text("These entries cannot select a route. The report does not provide authority to add a host, trust alias, or jump path to this workspace.") }
+                    }
+                    Section {
+                        Toggle("I compared the fingerprint and reviewed the selected accounts and paths", isOn: $comparedFingerprint)
+                            .disabled(!canChoose)
+                            .accessibilityIdentifier("keys.enrollment.fingerprint-confirmed")
+                        Button("Review \(selectedRoutes.count) Selected Routes…") {
+                            approval = model.reviewEnrollmentKeyChange(report, routeIDs: selectedRoutes,
+                                fingerprintConfirmed: comparedFingerprint)
+                        }.disabled(!canChoose || !comparedFingerprint || selectedRoutes.isEmpty)
+                            .accessibilityIdentifier("keys.enrollment.review-selected")
+                    } footer: {
+                        Text("Applying the selection saves every selected route together, disconnects this workspace's sessions, and leaves it offline until a fresh Connect. Opening or reviewing results never signs in or edits a server.")
+                    }
+                } else if !report.isFinished {
+                    workspaceChoices
+                }
+            }
+            .navigationTitle("Enrollment Results").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(report.isFinished ? "Done" : "Cancel") { model.cancelEnrollmentResults(report.id) }
+                        .disabled(report.isApplying)
+                }
+            }
+        }
+        .privacySensitive()
+        .interactiveDismissDisabled(report.isApplying)
+        .task(id: report.id) {
+            let candidates = model.enrollmentWorkspaces(for: report)
+            if candidates.count == 1, let candidate = candidates.first, report.review == nil {
+                model.prepareEnrollmentResults(report, workspaceID: candidate.id)
+            }
+        }
+        .onChange(of: report.review?.id) { _, _ in clearSelection() }
+        .onChange(of: report.isFinished) { _, _ in clearSelection() }
+        .onChange(of: model.active) { _, active in if !active { clearSelection() } }
+        .sheet(item: $approval) { review in
+            NavigationStack {
+                ScrollView {
+                    Text(verbatim: review.explanation).frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled).padding()
+                }
+                .navigationTitle(review.title).navigationBarTitleDisplayMode(.inline)
+                .safeAreaInset(edge: .bottom) {
+                    Button(review.confirmationTitle) {
+                        approval = nil
+                        model.performDeviceKeyChange(review)
+                    }.buttonStyle(.borderedProminent).disabled(!canChoose).padding()
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { approval = nil }
+                    }
+                }
+            }.privacySensitive()
+        }
+    }
+
+    @ViewBuilder private var workspaceChoices: some View {
+        let candidates = model.enrollmentWorkspaces(for: report)
+        Section("Choose a Saved Workspace") {
+            if model.busy {
+                ProgressView("Reviewing saved key and route policies…")
+            } else if candidates.isEmpty {
+                Text("The exact generated phone key in this report is not saved in this workspace. Open results for a key created on this phone. A matching fingerprint alone does not import or replace a private key.")
+            } else {
+                ForEach(candidates) { saved in
+                    Button {
+                        clearSelection()
+                        model.prepareEnrollmentResults(report, workspaceID: saved.id)
+                    } label: {
+                        Text(verbatim: (try? saved.importedDocument().name) ?? saved.id.uuidString)
+                    }
+                }
+            }
+        }
+    }
+
+    private func routeRow(_ route: WorkspaceKeyEnrollmentReportReview.Route, key: WorkspaceDeviceKey) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: Binding(get: { selectedRoutes.contains(route.id) }, set: { selected in
+                guard canChoose, route.canAssign else { return }
+                approval = nil; comparedFingerprint = false
+                if selected { selectedRoutes.insert(route.id) } else { selectedRoutes.remove(route.id) }
+            })) {
+                Text(verbatim: Self.account(route.account)).font(.headline)
+            }.disabled(!canChoose || !route.canAssign)
+                .accessibilityIdentifier("keys.enrollment.route.\(route.id)")
+            Text(verbatim: "Route: " + route.id).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: "Used by: " + route.machineNames.joined(separator: ", ")).font(.caption)
+            if route.assignedCredentialID == key.id {
+                Text("This phone key is already selected for this route").font(.caption)
+            } else if let assigned = route.assignedCredentialID {
+                Text(verbatim: "Current phone-key choice: " + assigned).font(.caption)
+            } else {
+                Text("Currently uses imported key choices").font(.caption)
+            }
+            ForEach(route.issues, id: \.self) { issue in
+                Label(issue.message, systemImage: "exclamationmark.triangle").font(.callout)
+            }
+            ForEach(route.paths) { path in pathRow(path) }
+        }.padding(.vertical, 6)
+    }
+
+    private func pathRow(_ path: WorkspaceKeyEnrollmentReportReview.Path) -> some View {
+        let accounts = path.plan.jumpHosts + [path.plan.destination]
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(path.plan.jumpHosts.isEmpty ? "Direct Path" : "Ordered Path").font(.subheadline.bold())
+            ForEach(Array(accounts.enumerated()), id: \.offset) { index, host in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: "\(index + 1). " + Self.account(host.target)
+                        + (index == accounts.count - 1 ? " · this account" : " · jump host"))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    if let alias = host.hostKeyAlias {
+                        Text(verbatim: "Host-key alias: " + alias).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let observation = path.observation { observationRow(observation) }
+            else { Label("No observation for this exact path", systemImage: "questionmark.circle").font(.callout) }
+        }.padding(.vertical, 6)
+    }
+
+    private func observationRow(_ observation: WorkspaceKeyEnrollmentReportReview.Observation) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(verbatim: Self.state(observation.state)).font(.callout.bold())
+            Text(verbatim: "Last observation: " + Self.action(observation.action)
+                + " · Last requested change: " + Self.action(observation.lastMutation))
+                .font(.caption).foregroundStyle(.secondary)
+            if let detail = observation.detail, !detail.isEmpty {
+                Text(verbatim: "Reported detail: " + detail).font(.caption).textSelection(.enabled)
+            }
+        }
+    }
+
+    private func clearSelection() {
+        selectedRoutes.removeAll(); comparedFingerprint = false; approval = nil
+    }
+
+    private static func account(_ target: WorkspaceKeyEnrollmentTarget) -> String {
+        LocalHostKeyCheckReview.endpoint(host: target.host, port: target.port, user: target.user)
+    }
+
+    private static func action(_ value: WorkspaceKeyEnrollmentAction?) -> String {
+        switch value {
+        case .inspect?: "Inspect"
+        case .install?: "Install"
+        case .remove?: "Remove"
+        case nil: "Not recorded"
+        }
+    }
+
+    private static func state(_ value: WorkspaceKeyEnrollmentState?) -> String {
+        switch value {
+        case .installed?: "Unrestricted entry reported installed"
+        case .alreadyPresent?: "Unrestricted entry reported present"
+        case .absent?: "Key reported absent"
+        case .restricted?: "Restricted entry reported; cannot select from this result"
+        case .blocked?: "Inspection or change blocked"
+        case .uncertain?: "Outcome uncertain; inspect again on the Mac"
+        case .removed?: "This enrollment's entry removed; no other live copy reported"
+        case .stillAuthorized?: "Another live copy remains; its permissions are not confirmed"
+        case nil: "No result recorded"
+        }
+    }
+}
+
+@MainActor
+private struct WorkspaceKeysSheet: View {
+    let workspaceID: UUID
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var reviewed: LocalCredentialRevocationReview?
+    @State private var hostReview: LocalHostRevocationReview?
+    @State private var hostKeyCheck: LocalHostKeyCheckReview?
+    @State private var deviceReview: LocalDeviceKeyReview?
+    @State private var phoneKey: WorkspaceDeviceKeyChoice?
+    @State private var copiedPhoneKeyID: String?
+    @State private var enrollmentDocument: PhoneKeyEnrollmentDocument?
+    @State private var exportingEnrollment = false
+    @State private var enrollmentFile: LocalEnrollmentFileReview?
+    @State private var choosingEnrollmentFile = false
+    @State private var certificateFile: LocalCertificateFileReview?
+    @State private var choosingCertificateFile = false
+
+    private var saved: InstalledWorkspace? {
+        model.workspaces.first(where: { $0.id == workspaceID })
+    }
+
+    private var document: WorkspaceDocument? {
+        try? model.workspaces.first(where: { $0.id == workspaceID })?.document()
+    }
+
+    private var keysNavigation: some View {
+        NavigationStack {
+            Group {
+                if !model.active {
+                    ContentUnavailableView("Locked", systemImage: "lock.shield",
+                        description: Text("Return to FrankenTerm to manage keys."))
+                } else if let document {
+                    ScrollViewReader { messages in
+                        List {
+                            if let message = model.credentialMessage {
+                                Section {
+                                    Text(verbatim: message)
+                                        .id("keys.result-message")
+                                    Button("Dismiss Message") { model.credentialMessage = nil }
+                                }
+                            }
+                            if let saved {
+                                Section {
+                                    ForEach(saved.deviceKeys) { key in
+                                        phoneKeyRow(key, workspace: saved)
+                                    }
+                                    Button("Create Phone SSH Key", systemImage: "key.horizontal") {
+                                        reviewed = nil; hostReview = nil
+                                        deviceReview = model.reviewDeviceKeyChange(.generate, workspaceID: workspaceID)
+                                    }.disabled(saved.deviceKeys.count >= 16 || model.credentialImport != nil)
+                                        .accessibilityIdentifier("keys.phone.create")
+                                    Button("Open Enrollment Results…", systemImage: "doc.badge.arrow.up") {
+                                        reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil
+                                        enrollmentFile = model.reviewEnrollmentFile(workspaceID: workspaceID)
+                                        choosingEnrollmentFile = enrollmentFile != nil
+                                    }.disabled(saved.deviceKeys.isEmpty || model.credentialImport != nil)
+                                        .accessibilityIdentifier("keys.enrollment.open-results")
+                                } header: {
+                                    Text("Phone Keys")
+                                } footer: {
+                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Export its public enrollment request to FrankenTerm Export on your Mac, compare the fingerprint, and authorize selected server accounts. Use Save Results on the Mac, open that JSON here, then review and select the routes to use. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
+                                }
+                            }
+                            Section {
+                                ForEach(document.credentials.filter { key in saved?.deviceKeys.contains(where: { $0.id == key.id }) != true }) { key in
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        Text(verbatim: key.id).font(.headline)
+                                        Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
+                                        Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                                            .textSelection(.enabled)
+                                        let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+                                        let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+                                        if pending {
+                                            Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
+                                                .font(.callout)
+                                        } else if revoked {
+                                            Label("Revoked on this phone", systemImage: "key.slash").font(.callout)
+                                        } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
+                                            Label("Key present on this phone", systemImage: "key.fill").font(.callout)
+                                        } else {
+                                            Label("Key unavailable on this phone", systemImage: "key").font(.callout)
+                                        }
+                                        let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
+                                        Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
+                                        if let certificate = key.userCertificate {
+                                            certificateRenewalRow(key, certificate: certificate, blocked: revoked || pending)
+                                        }
+                                        Button("Import Matching Key…", systemImage: "square.and.arrow.down") {
+                                            reviewed = nil
+                                            model.beginCredentialImport(workspaceID: workspaceID, credentialID: key.id)
+                                        }.disabled(revoked || pending || model.credentialImport != nil)
+                                            .accessibilityIdentifier("keys.import.\(key.id)")
+                                        Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                                            hostReview = nil
+                                            reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
+                                        }.disabled(revoked && !pending)
+                                    }.padding(.vertical, 6)
+                                }
+                            } header: {
+                                Text(verbatim: document.name)
+                            } footer: {
+                                Text("Revocation blocks this fingerprint in every workspace on this phone, including later imports. It does not erase stored key material or revoke access on your Mac or SSH servers.")
+                            }
+                            if !document.hostTrust.isEmpty {
+                                Section {
+                                    ForEach(Self.endpoints(document)) { endpoint in
+                                        hostRow(endpoint, document: document)
+                                    }
+                                } header: {
+                                    Text("Host Keys")
+                                } footer: {
+                                    Text("Blocking a host key stops every workspace on this phone from accepting it from that host and port, including later imports. Your Mac and the server are unchanged.")
+                                }
+                            }
+                        }.disabled(model.busy)
+                        .onChange(of: model.credentialMessage) { _, message in
+                            // Key operations are often initiated at the bottom of
+                            // this list. Bring their result into view on compact
+                            // iPad sheets as well as on iPhone.
+                            if message != nil {
+                                messages.scrollTo("keys.result-message", anchor: .top)
+                            }
+                        }
+                        .confirmationDialog("Stop Trusting This Host Key?",
+                                            isPresented: Binding(get: { hostReview != nil }, set: { if !$0 { hostReview = nil } }),
+                                            titleVisibility: .visible, presenting: hostReview) { review in
+                            Button("Stop Trusting and Disconnect", role: .destructive) { model.revokeHostLocally(review) }
+                                .disabled(model.busy || !model.active)
+                            Button("Keep Trusting", role: .cancel) { hostReview = nil }
+                        } message: { review in
+                            Text(verbatim: "\(review.displayHost) port \(review.port)\n" + review.key.algorithm + "\n" + review.key.fingerprint
+                                + "\n\nRefuse this key from this host on this phone. All sessions in these workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
+                                + review.workspaceNames.joined(separator: "\n")
+                                + "\n\nImported pins cannot restore trust in it. Your Mac and the server are unchanged.")
+                        }
+                    }
+                } else {
+                    ContentUnavailableView("Workspace Unavailable", systemImage: "key",
+                        description: Text("Open a saved workspace to manage its key references."))
+                }
+            }
+            .navigationTitle("SSH Keys").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if model.hostKeyCheckID != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel Check") { model.cancelHostKeyVerification() }
+                            .accessibilityIdentifier("hostkeys.check.cancel")
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }.disabled(model.busy)
+                }
+            }
+        }
+    }
+
+    private var keysPresentations: some View {
+        let importing = model.credentialImport.flatMap { $0.isRetired ? nil : $0 }
+        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
+        return keysNavigation
+        .interactiveDismissDisabled(model.busy)
+        .sheet(item: Binding(get: { importing }, set: { if $0 == nil { importing?.cancel() } })) { controller in
+            WorkspaceKeyImportSheet(controller: controller)
+        }
+        .sheet(item: Binding(get: { renewal }, set: { value in
+            if value == nil, let renewal { model.cancelCertificateRenewal(renewal.id) }
+        })) { review in
+            WorkspaceCertificateRenewalSheet(review: review, model: model)
+        }
+        .sheet(item: $phoneKey) { choice in
+            WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
+        }
+        .sheet(item: Binding(get: {
+            model.enrollmentResults.flatMap { $0.presentingWorkspaceID == workspaceID ? $0 : nil }
+        }, set: { value in
+            if value == nil, let report = model.enrollmentResults, report.presentingWorkspaceID == workspaceID {
+                model.cancelEnrollmentResults(report.id)
+            }
+        })) { report in
+            WorkspaceEnrollmentResultsSheet(model: model, report: report)
+        }
+        .fileImporter(isPresented: $choosingEnrollmentFile, allowedContentTypes: [.json, .data],
+                      allowsMultipleSelection: false) { result in
+            guard let reviewed = enrollmentFile else { return }
+            enrollmentFile = nil
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.importEnrollmentFile(url, reviewed: reviewed) }
+                else { model.cancelEnrollmentFile(reviewed) }
+            case .failure(let error):
+                model.cancelEnrollmentFile(reviewed)
+                if (error as? CocoaError)?.code != .userCancelled, model.active {
+                    model.credentialMessage = "Enrollment results could not be selected. Open the JSON saved by FrankenTerm Export again."
+                }
+            }
+        }
+        .fileImporter(isPresented: $choosingCertificateFile, allowedContentTypes: [.data, .plainText],
+                      allowsMultipleSelection: false) { result in
+            guard let reviewed = certificateFile else { return }
+            certificateFile = nil
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.importCertificateFile(url, reviewed: reviewed) }
+                else { model.cancelCertificateFile(reviewed) }
+            case .failure(let error):
+                model.cancelCertificateFile(reviewed)
+                if (error as? CocoaError)?.code != .userCancelled, model.active {
+                    model.credentialMessage = "The renewed certificate could not be selected. Choose its public OpenSSH certificate file again."
+                }
+            }
+        }
+        .fileExporter(isPresented: $exportingEnrollment, document: enrollmentDocument,
+                      contentType: .data, defaultFilename: "FrankenTerm-Phone-Key.ftkeyrequest") { result in
+            let keyID = enrollmentDocument?.keyID
+            enrollmentDocument = nil
+            guard model.active, saved?.deviceKeys.contains(where: { $0.id == keyID }) == true else { return }
+            switch result {
+            case .success:
+                model.credentialMessage = "Public enrollment request saved. Open it in FrankenTerm Export on your Mac and compare the fingerprint shown on both devices. Saving this request does not authorize any server or export the private key."
+            case let .failure(error):
+                if (error as? CocoaError)?.code != .userCancelled {
+                    model.credentialMessage = "The public enrollment request could not be saved. Choose another destination and try again."
+                }
+            }
+        }
+        .sheet(item: Binding(get: { model.hostKeyPinReview }, set: { model.hostKeyPinReview = $0 })) { review in
+            WorkspaceHostKeyVerificationSheet(review: review, model: model)
+        }
+        .sheet(item: Binding(get: {
+            model.connections?.hostKeyVerificationPrompt.flatMap { $0.workspaceID == workspaceID ? $0 : nil }
+        }, set: { _ in })) { request in
+            if let connections = model.connections {
+                switch request {
+                case let .password(value):
+                    MobileSSHPasswordSheet(prompt: connections.passwordPrompt, request: value).id(value.id)
+                case let .keyboardInteractive(value):
+                    MobileSSHKeyboardInteractiveSheet(prompt: connections.keyboardInteractivePrompt, request: value).id(value.id)
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
+        keysPresentations
+        .confirmationDialog("Check Through Trusted Jump Hosts?",
+            isPresented: Binding(get: { hostKeyCheck != nil }, set: { if !$0 { hostKeyCheck = nil } }),
+            titleVisibility: .visible, presenting: hostKeyCheck) { review in
+                Button("Sign In and Check Host Key") {
+                    model.beginHostKeyVerification(review)
+                    hostKeyCheck = nil
+                }.disabled(model.busy || !model.active)
+                Button("Cancel", role: .cancel) { hostKeyCheck = nil; model.dismissHostKeyCheckReview() }
+            } message: { review in
+                Text(verbatim: "To reach \(review.destination), this phone will sign in to these already trusted accounts, in order:\n\n"
+                    + review.jumpAccounts.joined(separator: "\n")
+                    + "\n\nThey may request a protected key, password or MFA answer. The destination receives only a public host-key exchange; no credential or terminal is opened there. Connections opened for this check close before fingerprint review. This check does not approve workspace connections.")
+            }
+        .confirmationDialog(deviceReview?.title ?? "Phone SSH Key",
+                            isPresented: Binding(get: { deviceReview != nil }, set: { if !$0 { deviceReview = nil } }),
+                            titleVisibility: .visible, presenting: deviceReview) { review in
+            Button(review.confirmationTitle) { model.performDeviceKeyChange(review) }
+                .disabled(model.busy || !model.active)
+            Button("Cancel", role: .cancel) { deviceReview = nil }
+        } message: { review in
+            Text(verbatim: review.explanation)
+        }
+        .confirmationDialog("Revoke Key on This Phone?",
+                            isPresented: Binding(get: { reviewed != nil }, set: { if !$0 { reviewed = nil } }),
+                            titleVisibility: .visible, presenting: reviewed) { review in
+            Button("Revoke and Disconnect", role: .destructive) { model.revokeCredentialLocally(review) }
+                .disabled(model.busy || !model.active)
+            Button("Keep Key", role: .cancel) { reviewed = nil }
+        } message: { review in
+            Text(verbatim: review.algorithm + "\n" + review.fingerprint
+                + "\n\nBlock every reference to this key on this phone. All sessions in affected workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
+                + review.workspaceNames.joined(separator: "\n")
+                + "\n\nFuture imports cannot restore permission. Your Mac and SSH servers are unchanged.")
+        }
+        .onChange(of: model.active) { _, active in
+            if !active {
+                reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+                enrollmentFile = nil; choosingEnrollmentFile = false
+                certificateFile = nil; choosingCertificateFile = false
+            }
+        }
+        .onChange(of: saved?.revision) { _, _ in
+            if let enrollmentFile { model.cancelEnrollmentFile(enrollmentFile) }
+            enrollmentFile = nil; choosingEnrollmentFile = false
+            if let certificateFile { model.cancelCertificateFile(certificateFile) }
+            certificateFile = nil; choosingCertificateFile = false
+            if let renewal { model.cancelCertificateRenewal(renewal.id) }
+        }
+        .onDisappear {
+            reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+        }
+    }
+
+    private func certificateRenewalRow(_ key: WorkspaceDocument.Credential,
+                                       certificate: SSHUserCertificate, blocked: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("SSH User Certificate", systemImage: "checkmark.seal")
+                .font(.callout)
+            Text(verbatim: "Expires \(CertificateValidityLabel.date(certificate.validBefore))")
+                .font(.caption).foregroundStyle(.secondary)
+                .accessibilityIdentifier("keys.certificate.expiry.\(key.id)")
+            Button("Import Renewed Certificate…", systemImage: "arrow.clockwise") {
+                reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil
+                certificateFile = model.reviewCertificateFile(workspaceID: workspaceID, credentialID: key.id)
+                choosingCertificateFile = certificateFile != nil
+            }.disabled(blocked || model.credentialImport != nil)
+                .accessibilityIdentifier("keys.certificate.renew.\(key.id)")
+            Text("Choose the public certificate renewed by the same authority for this key. Its accounts and permissions must match the current certificate.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func phoneKeyRow(_ key: WorkspaceDeviceKey, workspace: InstalledWorkspace) -> some View {
+        let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+        let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+        let assignments = workspace.deviceKeyAssignments.filter { $0.credentialID == key.id }
+        return VStack(alignment: .leading, spacing: 10) {
+            Label("Ed25519 phone key", systemImage: "iphone.gen3")
+                .font(.headline)
+            Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            if pending {
+                Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
+            } else if revoked {
+                Label("Revoked on this phone", systemImage: "key.slash")
+            } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
+                Label("Private key protected on this phone", systemImage: "lock.shield")
+            } else {
+                Label("Private key unavailable on this phone", systemImage: "exclamationmark.triangle")
+            }
+            Text(assignments.isEmpty ? "Not assigned to a route" : "Chosen for \(assignments.count) routes")
+                .font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("Public Key") {
+                Text(verbatim: key.authorizedKey).font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled).padding(.top, 6)
+            }
+            Button(copiedPhoneKeyID == key.id ? "Public Key Copied" : "Copy Public Key", systemImage: "doc.on.doc") {
+                guard model.active, !model.busy,
+                      saved?.deviceKeys.contains(where: { $0 == key }) == true else { return }
+                // ubs:ignore[swift.crypto.weak-randomness] — Date expires an existing public-key clipboard item; it generates no key or token.
+                UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: key.authorizedKey]],
+                    options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+                copiedPhoneKeyID = key.id
+            }.accessibilityIdentifier("keys.phone.copy.\(key.id)")
+            Button("Export Enrollment Request…", systemImage: "square.and.arrow.up") {
+                guard model.active, !model.busy, !revoked, !pending,
+                      model.credentialImport == nil, enrollmentDocument == nil,
+                      model.availableCredentials[workspaceID]?.contains(key.id) == true,
+                      saved?.deviceKeys.contains(where: { $0 == key }) == true else { return }
+                do {
+                    enrollmentDocument = try PhoneKeyEnrollmentDocument(request: .init(key: key))
+                    exportingEnrollment = true
+                } catch {
+                    model.credentialMessage = "This phone key could not produce a valid public enrollment request."
+                }
+            }.disabled(revoked || pending || model.credentialImport != nil || enrollmentDocument != nil
+                       || model.availableCredentials[workspaceID]?.contains(key.id) != true)
+                .accessibilityIdentifier("keys.phone.enroll.\(key.id)")
+            Button("Choose Routes…", systemImage: "point.3.connected.trianglepath.dotted") {
+                reviewed = nil; hostReview = nil; deviceReview = nil
+                phoneKey = .init(id: key.id)
+            }.disabled(pending || model.credentialImport != nil)
+                .accessibilityIdentifier("keys.phone.routes.\(key.id)")
+            Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                hostReview = nil; deviceReview = nil
+                reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
+            }.disabled(revoked && !pending)
+        }.font(.callout).padding(.vertical, 6)
+    }
+
+    /// One host and port, and each pinned key or authority there, once.
+    private struct HostEndpoint: Identifiable {
+        struct Pin: Identifiable { let trustID: String, key: WorkspaceDocument.HostKey; var id: String { key.fingerprint } }
+        let trusts: [WorkspaceDocument.HostTrust], pins: [Pin]
+        var id: String { trusts[0].id }
+    }
+
+    /// A block covers the host and port, and an export can give each route
+    /// its own trust record for the same host, so one row per endpoint.
+    private static func endpoints(_ document: WorkspaceDocument) -> [HostEndpoint] {
+        var order: [String] = [], groups: [String: [WorkspaceDocument.HostTrust]] = [:]
+        for trust in document.hostTrust {
+            let endpoint = "\(trust.port):\(trust.host)"
+            if groups[endpoint] == nil { order.append(endpoint) }
+            groups[endpoint, default: []].append(trust)
+        }
+        return order.compactMap { groups[$0] }.map { trusts in
+            var seen = Set<String>()
+            let pins = trusts.flatMap { trust in
+                (trust.pins + trust.certificateAuthorities).map { HostEndpoint.Pin(trustID: trust.id, key: $0) }
+            }
+                .filter { seen.insert($0.key.fingerprint).inserted }
+            return HostEndpoint(trusts: trusts, pins: pins)
+        }
+    }
+
+    private func hostRow(_ endpoint: HostEndpoint, document: WorkspaceDocument) -> some View {
+        let scopes = model.localPolicies[workspaceID]?.revokedHostKeysByTrustScope ?? [:]
+        let blocked = Set(endpoint.trusts.flatMap { (scopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
+        let unsavedScopes = model.localPolicies[workspaceID]?.unsavedHostKeysByTrustScope ?? [:]
+        let unsaved = Set(endpoint.trusts.flatMap { (unsavedScopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
+        let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
+        let sourceHistory = model.localPolicies[workspaceID]?.hostRevocationSourcesByTrustScope ?? [:]
+        let sourcePolicies = endpoint.trusts.compactMap {
+            try? WorkspaceHostRevocationPresentation(document: document, trustID: $0.id, historicalSources: sourceHistory)
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
+            ForEach(endpoint.trusts.filter { !$0.hasConfiguredIdentity }) { trust in
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("No verified host key", systemImage: "questionmark.shield").font(.callout)
+                    if let route = model.hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trust.id) {
+                        Button("Check Host Key…", systemImage: "checkmark.shield") {
+                            reviewed = nil; hostReview = nil; deviceReview = nil
+                            guard let review = model.reviewHostKeyVerification(workspaceID: workspaceID, trustID: trust.id) else { return }
+                            if review.jumpAccounts.isEmpty { model.beginHostKeyVerification(review) }
+                            else { hostKeyCheck = review }
+                        }.accessibilityIdentifier("hostkeys.check.\(trust.id)")
+                        Text(route.jumpRoutes.isEmpty
+                            ? "Connects only to read the server's public host key. No credential is offered. Compare the fingerprint independently before trusting it."
+                            : "Uses this route's already trusted jump hosts. Review their accounts before signing in; the destination receives no credential. Compare its fingerprint independently before trusting it.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Make each jump host ready first, including its verified host key and permitted sign-in method, or import verified trust from your Mac.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            ForEach(endpoint.pins) { pin in
+                VStack(alignment: .leading, spacing: 6) {
+                    if endpoint.trusts.contains(where: { $0.certificateAuthorities.contains(pin.key) }) {
+                        Label("Host certificate authority", systemImage: "checkmark.seal").font(.callout)
+                        Text("Certifies host keys for the configured identity. Blocking this authority also blocks certificates it signs for this endpoint.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(verbatim: pin.key.algorithm).font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: pin.key.fingerprint).font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    if unsaved.contains(pin.key.fingerprint) {
+                        // Refused until the app quits; a relaunch would trust it.
+                        Label("Blocked until FrankenTerm quits. The block was not saved.",
+                              systemImage: "exclamationmark.shield").font(.callout)
+                        Button("Save Block", role: .destructive) {
+                            reviewed = nil
+                            hostReview = model.reviewHostRevocation(workspaceID: workspaceID, trustID: pin.trustID,
+                                                                    key: pin.key)
+                        }.accessibilityIdentifier("hostkeys.save.\(pin.trustID)")
+                    } else if blocked.contains(pin.key.fingerprint) {
+                        Label("Blocked on this phone", systemImage: "xmark.shield").font(.callout)
+                    } else if revoked.contains(pin.key.fingerprint) || sourcePolicies.contains(where: {
+                        $0.trustID == pin.trustID && $0.deniesKnownKey(pin.key)
+                    }) {
+                        Label("Revoked by this workspace", systemImage: "xmark.shield").font(.callout)
+                    } else {
+                        Label("Trusted for this host", systemImage: "checkmark.shield").font(.callout)
+                        Button("Stop Trusting on This Phone", role: .destructive) {
+                            reviewed = nil
+                            hostReview = model.reviewHostRevocation(workspaceID: workspaceID, trustID: pin.trustID,
+                                                                    key: pin.key)
+                        }.accessibilityIdentifier("hostkeys.block.\(pin.trustID)")
+                    }
+                }
+            }
+            ForEach(sourcePolicies.filter(\.isVisible), id: \.trustID) { policy in
+                WorkspaceHostRevocationPolicyView(presentation: policy)
+            }
+            ForEach(endpoint.trusts.filter { !$0.pins.isEmpty }) { trust in
+                if let route = model.hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trust.id) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(verbatim: "Phone verification · Route \(route.id)").font(.caption).foregroundStyle(.secondary)
+                        Button("Check for a Changed Host Key…", systemImage: "arrow.triangle.2.circlepath") {
+                            reviewed = nil; hostReview = nil; deviceReview = nil
+                            guard let review = model.reviewHostKeyVerification(workspaceID: workspaceID, trustID: trust.id) else { return }
+                            if review.jumpAccounts.isEmpty { model.beginHostKeyVerification(review) }
+                            else { hostKeyCheck = review }
+                        }.accessibilityIdentifier("hostkeys.replace.\(trust.id)")
+                        Text("For a rebuilt server or a planned key rotation, check its current public key and compare the old and new fingerprints before changing this phone's verification.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }.padding(.vertical, 6)
+    }
+}
+
+@MainActor
+private struct WorkspaceCertificateRenewalSheet: View {
+    let review: LocalCertificateRenewalReview
+    @Bindable var model: MobileWorkspaceModel
+
+    var body: some View {
+        let core = review.core
+        NavigationStack {
+            List {
+                Section("Existing Identity") {
+                    Text(verbatim: core.workspaceName).font(.headline)
+                    Text(verbatim: core.credentialID).font(.callout)
+                    Text(verbatim: core.renewedCertificate.subject.fingerprint)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        .accessibilityIdentifier("keys.certificate.subject")
+                    Text("The renewed certificate has a verified signature from the same issuing authority, for the same key, accounts, and signed permissions.")
+                }
+                Section("Certificate Validity") {
+                    LabeledContent("Current Expiry", value: CertificateValidityLabel.date(core.currentCertificate.validBefore))
+                    LabeledContent("Renewed From", value: CertificateValidityLabel.date(core.renewedCertificate.validAfter))
+                    LabeledContent("Renewed Until", value: CertificateValidityLabel.date(core.renewedCertificate.validBefore))
+                        .accessibilityIdentifier("keys.certificate.renewed-expiry")
+                    LabeledContent("Serial", value: String(core.renewedCertificate.serial))
+                }
+                Section("Routes Using This Certificate") {
+                    ForEach(core.affectedRouteIDs, id: \.self) { routeID in
+                        Text(verbatim: routeID).font(.system(.callout, design: .monospaced))
+                    }
+                }
+                Section {
+                    DisclosureGroup("Public Certificate Details") {
+                        Text("Issuing Authority").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.renewedCertificate.authority.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text("Current Certificate").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.currentCertificate.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text("Renewed Certificate").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.renewedCertificate.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }
+                } footer: {
+                    Text("Only this public certificate is saved. Your private key stays in its existing protected storage. The SSH server checks certificate authorization when you connect.")
+                }
+                Section {
+                    Button("Install Renewal and Disconnect") { model.acceptCertificateRenewal(review) }
+                        .disabled(model.busy || !model.certificateRenewalIsCurrent(review))
+                        .accessibilityIdentifier("keys.certificate.accept")
+                } footer: {
+                    Text(verbatim: "Saving ends any sessions in \(core.workspaceName). Direct SSH shells may end, and input already sent may have executed. The workspace stays offline until you choose Connect.")
+                }
+            }
+            .navigationTitle("Renew SSH Certificate").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.cancelCertificateRenewal(review.id) }
+                        .disabled(model.busy)
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.busy)
+    }
+}
+
+@MainActor
+private struct WorkspaceHostKeyVerificationSheet: View {
+    let review: WorkspaceHostKeyPinReview
+    @Bindable var model: MobileWorkspaceModel
+    @State private var comparedIndependently = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Server Identity") {
+                    Text(verbatim: "\(review.host) port \(review.port)").font(.headline)
+                    Text(verbatim: "Route \(review.routeID)").font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: review.key.algorithm).font(.callout)
+                    Text(verbatim: review.key.fingerprint)
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        .accessibilityIdentifier("hostkeys.observed-fingerprint")
+                }
+                if let previous = review.previousKey {
+                    Section("Previously Verified on This Phone") {
+                        Text(verbatim: previous.algorithm).font(.callout)
+                        Text(verbatim: previous.fingerprint)
+                            .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                            .accessibilityIdentifier("hostkeys.previous-fingerprint")
+                        Text("Saving replaces this phone's verified key for this host trust record, including routes that share it. Compare the new fingerprint using an independent trusted source before accepting the change.")
+                    }
+                }
+                Section {
+                    Text("All connections used for this check have closed. Any jump hosts were authenticated under their existing trust policy; no account, key, password or MFA answer was offered to this destination. Receiving this fingerprint alone does not prove the server's identity. Compare the complete fingerprint with your server administrator or an existing trusted connection.")
+                    Toggle("I checked this fingerprint independently", isOn: $comparedIndependently)
+                        .accessibilityIdentifier("hostkeys.confirm-comparison")
+                }
+                Section {
+                    Button(review.previousKey == nil ? "Trust Verified Host Key" : "Replace Phone-Verified Key") {
+                        model.acceptVerifiedHostKey(review)
+                    }
+                        .disabled(!comparedIndependently || model.busy || !model.active
+                            || model.hostKeyPinReview?.id != review.id)
+                        .accessibilityIdentifier("hostkeys.accept")
+                } footer: {
+                    Text(verbatim: "Saving the key disconnects any sessions in \(review.workspaceName). Direct SSH shells may end, and input already sent may have executed. The workspace stays offline until you choose Connect. This changes only this phone's trust; existing revocations and required policies still apply.")
+                }
+            }
+            .navigationTitle("Verify Host Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.hostKeyPinReview = nil }
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.busy)
+    }
+}
+
+@MainActor
+private struct WorkspaceDeviceKeyRoutesSheet: View {
+    let workspaceID: UUID, credentialID: String
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var authorizedOnServer = false
+    @State private var review: LocalDeviceKeyReview?
+
+    private var saved: InstalledWorkspace? { model.workspaces.first { $0.id == workspaceID } }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !model.active {
+                    ContentUnavailableView("Locked", systemImage: "lock.shield",
+                        description: Text("Return to FrankenTerm to choose where this phone key is used."))
+                } else if let saved, let key = saved.deviceKeys.first(where: { $0.id == credentialID }),
+                          let imported = try? saved.importedDocument() {
+                    let eligible = Set((try? saved.deviceKeyAssignableRouteIDs()) ?? [])
+                    let assigned = saved.deviceKeyAssignments.filter { $0.credentialID == key.id }
+                    let routes = imported.routes.filter { route in
+                        eligible.contains(route.id) || assigned.contains(where: { $0.routeID == route.id })
+                    }
+                    let currentRouteIDs = Set(imported.routes.map(\.id))
+                    let removedChoices = assigned.filter { !currentRouteIDs.contains($0.routeID) }
+                    let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+                        || model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+                    List {
+                        Section {
+                            Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("Install this key's public line in the intended server account's authorized keys using your existing trusted administration method. Preserve that account's other keys and restrictions.")
+                            Toggle("I have authorized this public key on the server account I select", isOn: $authorizedOnServer)
+                                .disabled(revoked)
+                        } header: { Text("Authorize on the Server First") }
+                        if let message = model.credentialMessage {
+                            Section { Text(verbatim: message) }
+                        }
+                        Section {
+                            ForEach(routes) { route in
+                                let chosen = assigned.contains { $0.routeID == route.id }
+                                let needsReview = (try? saved.deviceKeyAssignmentNeedsReview(routeID: route.id)) == true
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)")
+                                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                    let machines = imported.machines.filter { $0.routeIDs.contains(route.id) }.map(\.name)
+                                    Text(verbatim: machines.isEmpty ? "Jump route · \(route.id)" : machines.joined(separator: ", "))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    if chosen {
+                                        Label(needsReview ? "Imported route changed — review required" : "This phone key is selected",
+                                              systemImage: needsReview ? "exclamationmark.shield" : "checkmark.circle")
+                                            .font(.callout)
+                                    }
+                                    if eligible.contains(route.id) {
+                                        Button(needsReview && chosen ? "Review Updated Route" : "Use This Phone Key") {
+                                            review = model.reviewDeviceKeyChange(.assign(credentialID: key.id, routeID: route.id),
+                                                workspaceID: workspaceID)
+                                        }.disabled(!authorizedOnServer || revoked
+                                            || model.availableCredentials[workspaceID]?.contains(key.id) != true
+                                            || (chosen && !needsReview))
+                                            .accessibilityIdentifier("keys.phone.assign.\(route.id)")
+                                    }
+                                    if chosen {
+                                        Button("Use Imported Key Choices") {
+                                            review = model.reviewDeviceKeyChange(.remove(routeID: route.id), workspaceID: workspaceID)
+                                        }.accessibilityIdentifier("keys.phone.unassign.\(route.id)")
+                                    }
+                                }.padding(.vertical, 6)
+                            }
+                            if routes.isEmpty {
+                                Text("No route currently permits this plain Ed25519 identity. Certificate and mandatory identity policies cannot be replaced by a generated key.")
+                            }
+                        } header: { Text("Routes in \(imported.name)") } footer: {
+                            Text("A route choice replaces its imported public-key candidates only on this phone. Host verification, jump-host policies and permitted additional authentication methods still apply. Server authorization is verified during the next sign-in.")
+                        }
+                        if !removedChoices.isEmpty {
+                            Section {
+                                ForEach(removedChoices, id: \.routeID) { choice in
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text(verbatim: choice.routeID).font(.caption.monospaced())
+                                        Button("Forget This Removed Route's Key Choice") {
+                                            review = model.reviewDeviceKeyChange(.remove(routeID: choice.routeID), workspaceID: workspaceID)
+                                        }
+                                    }
+                                }
+                            } header: { Text("Removed Routes") } footer: {
+                                Text("These local choices are retained in case an import brings a route back. Forgetting one allows that route to use its imported key candidates if it returns.")
+                            }
+                        }
+                    }.disabled(model.busy)
+                } else {
+                    ContentUnavailableView("Phone Key Unavailable", systemImage: "key",
+                        description: Text("Reopen SSH Keys to review the current saved workspace."))
+                }
+            }
+            .navigationTitle("Use Phone Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.disabled(model.busy) } }
+        }
+        .interactiveDismissDisabled(model.busy)
+        .confirmationDialog(review?.title ?? "Phone Key Route",
+                            isPresented: Binding(get: { review != nil }, set: { if !$0 { review = nil } }),
+                            titleVisibility: .visible, presenting: review) { reviewed in
+            Button(reviewed.confirmationTitle) {
+                model.performDeviceKeyChange(reviewed) { saved in if saved { authorizedOnServer = false } }
+            }.disabled(model.busy || !model.active)
+            Button("Cancel", role: .cancel) { review = nil }
+        } message: { reviewed in Text(verbatim: reviewed.explanation) }
+        .onChange(of: model.active) { _, active in if !active { review = nil; authorizedOnServer = false } }
+        .onChange(of: saved?.revision) { _, _ in review = nil; authorizedOnServer = false }
+    }
+}
+
+private struct WorkspaceDeviceKeyChoice: Identifiable { let id: String }
+
+@MainActor
+private struct WorkspaceRouteChoiceScreen: View {
+    let context: LocalRouteChoiceContext
+    @Bindable var model: MobileWorkspaceModel
+    let theme: WorkspaceDocument.Theme?
+    var purpose: WorkspaceSSHConnectionPurpose = .terminal
+    let onApproved: (MobileWorkspaceModel.ConnectionApproval, TerminalSessionTarget) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var routeID: String?
+    @State private var options: WorkspaceSSHRouteOptions?
+    @State private var authentication: WorkspaceSSHAuthenticationChoice?
+    @State private var hopAuthentications: [WorkspaceSSHAuthenticationChoice?] = []
+    @State private var review: LocalRouteConnectionReview?
+    @State private var applying = false
+    @State private var message: String?
+
+    private var workspaceID: UUID { context.local.workspace.id }
+    private var complete: Bool {
+        options != nil && authentication != nil && hopAuthentications.count == options?.hops.count
+            && hopAuthentications.allSatisfy { $0 != nil }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let review { connectionReview(review) }
+                else { choices }
+                if let message { Section { Text(message).foregroundStyle(.red).accessibilityIdentifier("routes.error") } }
+                if applying {
+                    Section {
+                        ProgressView(purpose == .fileTransfer ? "Checking the Files connection choice…"
+                            : "Settling the previous connection and checking this choice…")
+                        Text("Keep this screen open until the connection choice is ready.").font(.caption)
+                    }
+                }
+            }
+            .navigationTitle(review == nil ? (purpose == .fileTransfer ? "Files Route and Sign-In" : "Route and Sign-In") : "Review Connection")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(review == nil ? "Cancel" : "Back") {
+                        if review != nil { review = nil; message = nil }
+                        else { dismiss() }
+                    }.disabled(applying)
+                }
+            }
+            .interactiveDismissDisabled(applying)
+        }
+        .onChange(of: model.active) { _, active in if !active { review = nil; dismiss() } }
+        .onChange(of: model.showRestore) { _, restoring in if restoring { review = nil; dismiss() } }
+        .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, revision in
+            if revision != context.local.workspace.revision { review = nil; dismiss() }
+        }
+        .onDisappear { model.endRouteChoice(context.id) }
+    }
+
+    @ViewBuilder private var choices: some View {
+        Section {
+            Text(verbatim: context.machine.name).font(.headline)
+            Text("Choose one route and one sign-in method for every account along its path. Only methods permitted by this workspace and keys available on this phone are offered.")
+            Text(purpose == .fileTransfer
+                ? "This choice opens a separate Files connection for this visit. Passwords and MFA answers are requested during sign-in and are never saved here."
+                : "The choice stays with this machine in its current live workspace. Passwords and MFA answers are requested only by the existing sign-in prompt and are never saved here.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Section("Route") {
+            ForEach(context.machine.routeIDs, id: \.self) { id in
+                if let route = context.document.routes.first(where: { $0.id == id }) {
+                    Button { choose(route) } label: {
+                        HStack(alignment: .top) {
+                            Image(systemName: routeID == id ? "checkmark.circle.fill" : "circle")
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced))
+                                Text(verbatim: "\(route.id) · " + (purpose == .fileTransfer ? "SFTP files"
+                                    : (route.mode == "frankenterm_mux" ? "Existing mux panes" : "SSH terminal"))
+                                    + (id == context.machine.preferredRouteID ? " · Preferred" : ""))
+                                    .font(.caption).foregroundStyle(.secondary)
+                                ForEach(Array((context.local.routes.first { $0.routeID == id }?.issues ?? []).enumerated()), id: \.offset) { _, issue in
+                                    Text(verbatim: issue.message).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }.buttonStyle(.plain).disabled(model.busy).accessibilityIdentifier("routes.choose.\(id)")
+                }
+            }
+        }
+        if let options {
+            ForEach(Array(options.hops.enumerated()), id: \.offset) { index, peer in
+                Section("Jump \(index + 1)") {
+                    peerIdentity(peer.route)
+                    methodPicker(peer, selected: Binding(
+                        get: { hopAuthentications.indices.contains(index) ? hopAuthentications[index] : nil },
+                        set: { if hopAuthentications.indices.contains(index) { hopAuthentications[index] = $0 } }),
+                        identifier: "hop.\(index)")
+                }
+            }
+            Section("Destination") {
+                peerIdentity(options.destination.route)
+                methodPicker(options.destination, selected: $authentication, identifier: "destination")
+                routeBehavior(options.destination.route)
+            }
+        }
+        Section {
+            Button("Review Connection") { prepareReview() }
+                .disabled(!complete || model.busy || !model.routeChoiceIsCurrent(context))
+                .accessibilityIdentifier("routes.review")
+            if purpose == .terminal, model.selectedTerminalTarget(workspaceID: workspaceID, revision: context.local.workspace.revision,
+                machineID: context.machine.id) != nil {
+                Button("Use Configured Choices") {
+                    do { review = try model.reviewRouteConnection(context, selection: nil, theme: theme); message = nil }
+                    catch { message = "The configured paths changed or are not ready. Reopen Route and Sign-In to review them again. \(error.localizedDescription)" }
+                }.disabled(model.busy || !model.routeChoiceIsCurrent(context))
+                    .accessibilityIdentifier("routes.use-configured")
+            }
+        }
+    }
+
+    private func choose(_ route: WorkspaceDocument.Route) {
+        routeID = route.id; options = nil; authentication = nil; hopAuthentications = []; review = nil; message = nil
+        guard model.routeChoiceIsCurrent(context) else { message = "Reopen Route and Sign-In for the current workspace."; return }
+        do {
+            let available = try WorkspaceSSHRouteOptions(localState: context.local, machineID: context.machine.id,
+                routeID: route.id, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            options = available
+            hopAuthentications = Array(repeating: nil, count: available.hops.count)
+        } catch {
+            message = "This path is not ready for sign-in. Resolve its listed key, trust, or capability requirements in the workspace first. \(error.localizedDescription)"
+        }
+    }
+
+    private func prepareReview() {
+        guard let options, let authentication, complete else { return }
+        do {
+            let selected = try options.select(authentication: authentication, hopAuthentications: hopAuthentications.compactMap { $0 })
+            review = try model.reviewRouteConnection(context, selection: selected, theme: theme, purpose: purpose)
+            message = nil
+        } catch { message = "This choice is no longer available. Reopen Route and Sign-In to check the current paths and keys. \(error.localizedDescription)" }
+    }
+
+    @ViewBuilder private func methodPicker(_ peer: WorkspaceSSHRouteOptions.Peer,
+                                          selected: Binding<WorkspaceSSHAuthenticationChoice?>,
+                                          identifier: String) -> some View {
+        Picker("Sign-in method", selection: selected) {
+            Text("Choose sign-in method").tag(nil as WorkspaceSSHAuthenticationChoice?)
+            ForEach(peer.authenticationChoices, id: \.self) { choice in
+                Text(verbatim: methodName(choice)).tag(Optional(choice))
+            }
+        }.accessibilityIdentifier("routes.signin.\(identifier)").disabled(model.busy)
+        if let choice = selected.wrappedValue {
+            Text(verbatim: methodName(choice)).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            continuation(peer.route, choices: [choice])
+        }
+    }
+
+    private func endpoint(_ route: WorkspaceDocument.Route) -> String {
+        LocalHostKeyCheckReview.endpoint(host: route.host, port: route.port, user: route.user)
+    }
+
+    private func methodName(_ choice: WorkspaceSSHAuthenticationChoice) -> String {
+        switch choice {
+        case .publicKey(let id):
+            if let key = context.document.credentials.first(where: { $0.id == id }) {
+                return "Public key · \(key.algorithm) · \(key.fingerprint) · \(id)"
+            }
+            return "Public key · \(id)"
+        case .password: return "SSH password"
+        case .keyboardInteractive: return "Keyboard-interactive / MFA"
+        }
+    }
+
+    @ViewBuilder private func peerIdentity(_ route: WorkspaceDocument.Route) -> some View {
+        Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+        Text(verbatim: "Route: " + route.id).font(.caption).foregroundStyle(.secondary)
+        WorkspacePublicKeyAlgorithmPolicyView(route: route)
+        if let trust = context.document.hostTrust.first(where: { $0.id == route.trustID }) {
+            if let alias = route.hostKeyAlias ?? trust.hostKeyAlias {
+                Text(verbatim: "Host-key alias: " + alias).font(.caption).textSelection(.enabled)
+            }
+            let blocked = Set(trust.revokedKeys.map(\.fingerprint))
+                .union((context.local.revokedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
+                .union((context.local.unsavedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
+            let revocations = try? WorkspaceHostRevocationPresentation(document: context.document, trustID: trust.id,
+                historicalSources: context.local.hostRevocationSourcesByTrustScope)
+            ForEach(trust.pins.filter { !blocked.contains($0.fingerprint) && revocations?.deniesKnownKey($0) != true }, id: \.self) { pin in
+                Text(verbatim: "Trusted host key · \(pin.algorithm) · \(pin.fingerprint)")
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
+            ForEach(trust.certificateAuthorities.filter { !blocked.contains($0.fingerprint) && revocations?.deniesKnownKey($0) != true }, id: \.self) { authority in
+                Text(verbatim: "Trusted host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
+            if let policy = try? WorkspaceHostAlgorithmPresentation(document: context.document, trustID: trust.id,
+                historicalPolicies: context.local.hostAlgorithmPoliciesByTrustScope) {
+                WorkspaceHostAlgorithmPolicyView(policy: policy)
+            }
+            if let revocations { WorkspaceHostRevocationPolicyView(presentation: revocations) }
+        }
+    }
+
+    @ViewBuilder private func continuation(_ route: WorkspaceDocument.Route,
+                                          choices: [WorkspaceSSHAuthenticationChoice]) -> some View {
+        if choices.contains(where: { $0.credentialID != nil }), route.authenticationMethods.contains(.keyboardInteractive) {
+            Text("This account also permits keyboard-interactive MFA after the server partially accepts the selected key. Its challenge will identify this exact account.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func routeBehavior(_ route: WorkspaceDocument.Route) -> some View {
+        if purpose == .fileTransfer {
+            Text("Browse and transfer files using this account's SFTP service. Uploads require a separate destination review. Transfers stop when FrankenTerm enters the background.").font(.caption)
+        } else if route.mode == "frankenterm_mux" {
+            Text("Attach to existing FrankenTerm panes in View Only. A new shell requires its own explicit action.").font(.caption)
+            Text(verbatim: "Mux command: " + (route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand))
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        } else if route.sessionCreation == "manual" {
+            Text("Sign in first, then choose Open Terminal to create this route's shell.").font(.caption)
+        } else {
+            Text("Opening this route may create a new SSH terminal. A previously ended terminal still requires New Session.").font(.caption)
+        }
+    }
+
+    @ViewBuilder private func connectionReview(_ reviewed: LocalRouteConnectionReview) -> some View {
+        Section {
+            Text(verbatim: context.machine.name).font(.headline)
+            if reviewed.selection != nil {
+                Text("Connect through exactly the accounts and methods below. A refusal ends this attempt; another route or sign-in method needs a new choice.")
+            } else {
+                Text("Return this machine to its configured route priority and sign-in choices shown below. Automatic choices keep their existing reachability and key-refusal rules.")
+            }
+            if reviewed.disconnectsSession {
+                Text("This machine's current connection will disconnect before the choice is applied. Its direct SSH shell may end. Input already sent may have executed and will not be replayed.")
+                    .font(.callout)
+            }
+            Text(purpose == .fileTransfer
+                ? "The Files connection closes when you leave Remote Files. Your terminal sessions keep their current routes."
+                : "The choice applies to this machine until its live workspace closes or is replaced. Other machines retain their own connection choices.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if model.requiresConnectionApproval(workspaceID) {
+                Text("Connect also enables this workspace's saved connection preferences on this phone after its offline restore.").font(.footnote)
+            }
+        }
+        ForEach(reviewed.target.routes, id: \.id) { candidate in
+            if let route = context.document.routes.first(where: { $0.id == candidate.id }) {
+                Section("Route \(candidate.id)") {
+                    let hops = (try? context.document.orderedJumpRoutes(forRouteID: route.id)) ?? []
+                    ForEach(Array(hops.enumerated()), id: \.offset) { index, hop in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Jump \(index + 1)").font(.subheadline.bold())
+                            reviewedPeer(hop, choices: reviewed.selection.map { [$0.hops[index].authentication] }
+                                ?? WorkspaceSSHAuthenticationChoice.choices(for: hop,
+                                    usableCredentialIDs: context.local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []))
+                        }.padding(.vertical, 4)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Destination").font(.subheadline.bold())
+                        reviewedPeer(route, choices: candidate.choices)
+                        routeBehavior(route)
+                    }.padding(.vertical, 4)
+                }
+            }
+        }
+        Section {
+            Button(purpose == .fileTransfer ? "Connect to Remote Files" : (reviewed.selection == nil ? "Use Configured Choices and Connect"
+                : (reviewed.disconnectsSession ? "Change Route and Connect" : "Use Route and Connect"))) { connect(reviewed) }
+                .disabled(applying || model.busy || !model.routeChoiceIsCurrent(context))
+                .accessibilityIdentifier("routes.confirm")
+        }
+    }
+
+    @ViewBuilder private func reviewedPeer(_ route: WorkspaceDocument.Route,
+                                         choices: [WorkspaceSSHAuthenticationChoice]) -> some View {
+        peerIdentity(route)
+        ForEach(choices, id: \.self) { choice in
+            Text(verbatim: methodName(choice)).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        }
+        continuation(route, choices: choices)
+    }
+
+    private func connect(_ reviewed: LocalRouteConnectionReview) {
+        guard !applying, review?.id == reviewed.id else { return }
+        applying = true; message = nil
+        Task {
+            defer { applying = false }
+            do {
+                let approval = try await model.approveConnections(workspaceID: workspaceID,
+                    expectedRevision: context.local.workspace.revision, routeReview: reviewed)
+                guard model.connectionApprovalIsCurrent(approval), model.routeChoiceIsCurrent(context) else { return }
+                onApproved(approval, reviewed.target)
+            } catch {
+                review = nil
+                message = purpose == .fileTransfer
+                    ? "The Files connection choice could not be confirmed. Review the current route and sign-in method again. \(error.localizedDescription)"
+                    : "The new connection choice was not opened. The previous connection may remain disconnected while cleanup finishes. Review the current choice and try again. \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+@MainActor
+private struct MachineWorkspaceView: View {
+    let initialDocument: WorkspaceDocument
+    let workspaceID: UUID
+    @Bindable var model: MobileWorkspaceModel
+    /// A relaunch's return: this machine's terminal opens, as Connect would.
+    var returningMachineID: String? = nil
+    /// The open terminal carries the local state it opened with: deactivation
+    /// clears model.localPolicies, and the pushed terminal must not be rebuilt
+    /// for it. Each opening is a new terminal view; it shows the workspace's
+    /// open scene, or a new one once a restore closed it.
+    private struct OpenTerminal: Hashable {
+        let machineID: String, local: WorkspaceLocalState, id = UUID()
+        var selectedTarget: TerminalSessionTarget? = nil
+        static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    }
+    @State private var terminal: OpenTerminal?
+    @State private var returnHandled = false
+    @State private var selection = ""
+    @State private var groupID = ""
+    @State private var themeMachineID: String?
+    @State private var showKeys = false
+    @State private var orderReview: WorkspaceMachineOrderReview?
+    @State private var routeChoice: LocalRouteChoiceContext?
+    @State private var routeChoiceVisitID: UUID?
+    @State private var routeChoicePurpose: WorkspaceSSHConnectionPurpose = .terminal
+    @State private var routeChoiceOpening: (approval: MobileWorkspaceModel.ConnectionApproval, target: TerminalSessionTarget)?
+    @State private var fileSession: WorkspaceFilesSession?
+    /// Read so a return from Tailscale re-evaluates what Connect needs.
+    @Environment(\.scenePhase) private var scenePhase
+    private var document: WorkspaceDocument {
+        (try? model.workspaces.first(where: { $0.id == workspaceID })?.document()) ?? initialDocument
+    }
+    /// The machine's theme on this phone: the user's pick, an automatic
+    /// distinct one, or the workspace's.
+    private func theme(for machine: WorkspaceDocument.Machine) -> WorkspaceDocument.Theme? {
+        model.machineThemes(workspaceID, document: document)?.theme(for: machine)
+            ?? document.themes.first { $0.id == machine.themeID }
+    }
+    private var machines: [WorkspaceDocument.Machine] {
+        let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
+        let ids = document.groups.first(where: { $0.id == selectedGroup }).map {
+            model.machineOrder($0, workspaceID: workspaceID)
+        } ?? []
+        let map = Dictionary(uniqueKeysWithValues: document.machines.map { ($0.id, $0) })
+        return ids.compactMap { map[$0] }
+    }
+    var body: some View {
+        // The navigation bar and the edges past the pages take the shown
+        // machine's colors, as the terminal's do.
+        let shownBackground = machines.first { $0.id == selection }.flatMap { theme(for: $0)?.background } ?? "#10223C"
+        TabView(selection: $selection) {
+            ForEach(machines) { machine in
+                let theme = theme(for: machine)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(verbatim: machine.name).font(.largeTitle.bold()).lineLimit(2)
+                            Spacer(minLength: 8)
+                            if MobileWorkspaceModel.themeCatalog != nil {
+                                Button { themeMachineID = machine.id } label: {
+                                    Label(theme?.name ?? "Theme", systemImage: "paintpalette").lineLimit(1)
+                                }.buttonStyle(.bordered).controlSize(.small).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                                    .accessibilityIdentifier("machine.theme")
+                            }
+                        }
+                        HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }
+                            .frame(height: 10).clipShape(Capsule()).accessibilityHidden(true)
+                        if let font = theme?.font {
+                            let resolution = NativeTerminalFonts.resolve(font)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label("Terminal font", systemImage: "textformat").font(.caption.bold())
+                                Text(verbatim: resolution.primary.familyName).font(.callout)
+                                Text("Uses the text size you choose on this phone.").font(.caption).opacity(0.75)
+                                ForEach(Array(resolution.notices.enumerated()), id: \.offset) { _, notice in
+                                    Text(verbatim: notice).font(.caption)
+                                }
+                            }.accessibilityIdentifier("machine.font.\(machine.id)")
+                        }
+                        connectSection(machine, theme: theme)
+                        Button("Choose Route and Sign-In", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
+                            do {
+                                let context = try model.beginRouteChoice(workspaceID: workspaceID, machineID: machine.id)
+                                returnHandled = true; routeChoicePurpose = .terminal
+                                routeChoiceVisitID = context.id; routeChoice = context
+                            } catch { model.connectionPreferenceMessage = "Route choices are unavailable. \(error.localizedDescription)" }
+                        }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                            .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                            .accessibilityIdentifier("machine.route-choice.\(machine.id)")
+                        Button("Remote Files", systemImage: "folder") {
+                            do {
+                                let context = try model.beginRouteChoice(workspaceID: workspaceID, machineID: machine.id)
+                                returnHandled = true; routeChoicePurpose = .fileTransfer
+                                routeChoiceVisitID = context.id; routeChoice = context
+                            } catch { model.connectionPreferenceMessage = "Remote Files is unavailable. \(error.localizedDescription)" }
+                        }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                            .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil || !NativeSSHSession.supportsSFTP)
+                            .accessibilityIdentifier("machine.files.\(machine.id)")
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Connect with Group", isOn: Binding(
+                                get: { model.automaticallyConnect(machine, workspaceID: workspaceID) },
+                                set: { model.setMachineAutoConnect($0, workspaceID: workspaceID, machineID: machine.id) }))
+                                .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                                .tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                                .accessibilityIdentifier("machine.autoconnect.\(machine.id)")
+                            Text("Connect this machine when an automatic group opens. Saved on this phone across imports. Existing sessions stay connected, and Connect is always available.")
+                                .font(.caption).opacity(0.75)
+                            if model.localPolicies[workspaceID]?.connectionPreferences.autoConnectOverrides[machine.id] != nil {
+                                Button("Use Workspace Default (\(machine.autoConnect ? "On" : "Off"))") {
+                                    model.setMachineAutoConnect(nil, workspaceID: workspaceID, machineID: machine.id)
+                                }.font(.caption).disabled(model.busy || !model.active)
+                            }
+                            if let message = model.connectionPreferenceMessage {
+                                Text(message).font(.caption).accessibilityIdentifier("machine.autoconnect.error")
+                            }
+                        }
+                        DisclosureGroup("Routes") {
+                            VStack(alignment: .leading, spacing: 14) {
+                                ForEach(machine.routeIDs, id: \.self) { id in
+                                    if let route = document.routes.first(where: { $0.id == id }) { routeRow(route, preferred: id == machine.preferredRouteID) }
+                                }
+                            }.padding(.top, 10)
+                        }.tint(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
+                        if let saved = model.workspaces.first(where: { $0.id == workspaceID }), !saved.findings.isEmpty {
+                            DisclosureGroup("Preserved settings and unresolved requirements") {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    ForEach(Array(saved.findings.enumerated()), id: \.offset) { _, finding in
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Label(finding.disposition == 1 ? "Required condition" : "Preserved but inactive",
+                                                  systemImage: finding.disposition == 1 ? "exclamationmark.shield" : "archivebox").font(.caption.bold())
+                                            Text(verbatim: "\(finding.entityID) · \(finding.setting)").font(.caption)
+                                            Text(verbatim: finding.reason).font(.caption)
+                                        }
+                                    }
+                                }.padding(.top, 8)
+                            }
+                        }
+                    }.padding(28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .foregroundStyle(Color(ftHex: theme?.foreground ?? "#FFFFFF"))
+                    .background(Color(ftHex: theme?.background ?? "#10223C"))
+                    // System controls (chevrons, switches) read against the page.
+                    .environment(\.colorScheme, TerminalSessionTarget.isDark(theme?.background ?? "#10223C") ? .dark : .light)
+                    .tag(machine.id)
+            }
+        }.tabViewStyle(.page(indexDisplayMode: .always))
+            .background(Color(ftHex: shownBackground).ignoresSafeArea())
+            .sheet(isPresented: $showKeys, onDismiss: {
+                model.cancelHostKeyVerification()
+                model.endKeysPresentation(workspaceID: workspaceID)
+            }) {
+                WorkspaceKeysSheet(workspaceID: workspaceID, model: model)
+            }
+            .sheet(item: $orderReview) { review in
+                WorkspaceMachineOrderScreen(review: review, model: model)
+            }
+            .sheet(item: $routeChoice, onDismiss: {
+                if let id = routeChoiceVisitID { model.endRouteChoice(id) }
+                routeChoiceVisitID = nil
+                let opening = routeChoiceOpening; routeChoiceOpening = nil
+                if let opening, model.connectionApprovalIsCurrent(opening.approval) {
+                    if routeChoicePurpose == .fileTransfer {
+                        do { fileSession = try model.makeFilesSession(approval: opening.approval, target: opening.target) }
+                        catch { model.connectionPreferenceMessage = "Remote Files could not be opened. \(error.localizedDescription)" }
+                    } else {
+                        terminal = OpenTerminal(machineID: opening.target.machineID, local: opening.approval.local,
+                            selectedTarget: opening.target)
+                    }
+                }
+            }) { context in
+                WorkspaceRouteChoiceScreen(context: context, model: model, theme: theme(for: context.machine),
+                    purpose: routeChoicePurpose) { approval, target in
+                    guard routeChoice?.id == context.id, model.connectionApprovalIsCurrent(approval) else { return }
+                    routeChoiceOpening = (approval, target); routeChoice = nil
+                }
+            }
+            .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
+                if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
+                   let themes = model.machineThemes(workspaceID, document: document) {
+                    MachineThemePicker(machine: machine, themes: themes) { choice in
+                        model.chooseTheme(choice, machineID: id, workspaceID: workspaceID)
+                    }
+                }
+            }
+            .navigationTitle(document.name).navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(ftHex: shownBackground), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(TerminalSessionTarget.isDark(shownBackground) ? .dark : .light, for: .navigationBar)
+            .navigationDestination(item: $terminal) { open in
+                if let connections = model.connections {
+                    // Watched here: this page is not updated while the
+                    // terminal covers it.
+                    liveWorkspace(connections: connections, local: open.local, initial: open.machineID,
+                        selectedTarget: open.selectedTarget).id(open.id)
+                        .onChange(of: model.showRestore) { _, _ in reopenClosedTerminal() }
+                        .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in reopenClosedTerminal() }
+                }
+            }
+            .navigationDestination(item: $fileSession) { session in
+                WorkspaceFilesSessionScreen(session: session)
+            }
+            .onAppear {
+                if selection.isEmpty {
+                    selection = machines.first(where: { $0.id == returningMachineID })?.id ?? document.initialMachineID
+                }
+                returnToTerminal()
+            }
+            .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in
+                if !document.groups.contains(where: { $0.id == groupID }) { groupID = document.initialGroupID }
+                if !machines.contains(where: { $0.id == selection }) { selection = machines.first?.id ?? document.initialMachineID }
+                returnToTerminal()
+            }
+            .toolbar {
+                if !document.credentials.isEmpty || !document.hostTrust.isEmpty {
+                    Button("Keys", systemImage: "key") {
+                        model.beginKeysPresentation(workspaceID: workspaceID)
+                        showKeys = true
+                    }.disabled(model.busy)
+                }
+                Menu("Groups", systemImage: "rectangle.3.group") {
+                    ForEach(document.groups) { group in
+                        Button {
+                            groupID = group.id
+                            let ordered = model.machineOrder(group, workspaceID: workspaceID)
+                            if !ordered.contains(selection) { selection = ordered.first ?? "" }
+                        } label: { Text(verbatim: group.name) }
+                    }
+                }
+                Menu("Machines", systemImage: "list.bullet") {
+                    ForEach(machines) { machine in Button { selection = machine.id } label: { Text(verbatim: machine.name) } }
+                    Divider()
+                    Button("Arrange Machines", systemImage: "arrow.up.arrow.down") {
+                        let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
+                        guard let local = model.localPolicies[workspaceID],
+                              let group = document.groups.first(where: { $0.id == selectedGroup }) else { return }
+                        model.connectionPreferenceMessage = nil
+                        orderReview = .init(workspaceID: workspaceID, revision: local.workspace.revision,
+                            group: group, machines: machines, order: model.machineOrder(group, workspaceID: workspaceID))
+                    }.disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                        .accessibilityIdentifier("machines.arrange")
+                }
+            }
+    }
+
+    /// One Connect for the machine, in its colors, and how it will go: the
+    /// route this phone can reach now, or what it needs first.
+    @ViewBuilder private func connectSection(_ machine: WorkspaceDocument.Machine, theme: WorkspaceDocument.Theme?) -> some View {
+        let _ = scenePhase
+        let accent = Color(ftHex: theme?.accent ?? "#3B82F6")
+        if document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
+            Label("Finish saving the key revocation in Keys before connecting.", systemImage: "exclamationmark.shield")
+                .font(.callout)
+        } else if model.connections != nil, let local = model.localPolicies[workspaceID],
+           let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
+            VStack(alignment: .leading, spacing: 10) {
+                Button {
+                    // The user's choice ends a return still waiting for its machine.
+                    returnHandled = true
+                    Task {
+                        do {
+                            let approved = try await model.approveConnections(workspaceID: workspaceID,
+                                expectedRevision: local.workspace.revision)
+                            guard model.connectionApprovalIsCurrent(approved) else { return }
+                            terminal = OpenTerminal(machineID: machine.id, local: approved.local)
+                        } catch {
+                            model.connectionPreferenceMessage = "Connection approval could not be confirmed. Choose Connect again when the workspace is available. \(error.localizedDescription)"
+                        }
+                    }
+                } label: {
+                    // A session that is already running opens where it is.
+                    let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
+                    // Black or white on the accent, whichever reads better;
+                    // the page's theme foreground would not.
+                    Label(live ? "Open Terminal" : "Connect", systemImage: "terminal.fill").font(.title3.weight(.semibold))
+                        .foregroundStyle(TerminalSessionTarget.isDark(theme?.accent ?? "#3B82F6") ? Color.white : Color.black)
+                        .frame(maxWidth: .infinity).padding(.vertical, 6)
+                }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent).disabled(model.busy)
+                if model.requiresConnectionApproval(workspaceID) {
+                    Text("Restored offline. Connect enables this workspace's saved connection preferences on this phone.")
+                        .font(.footnote).opacity(0.8)
+                }
+                // Tailscale only: say so before the first attempt waits out a timeout.
+                if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.networkHost) == .tailnet }),
+                   WorkspaceRouteNetwork.deviceTailnetAddress() == nil {
+                    HStack {
+                        Label("Needs Tailscale on this \(UIDevice.current.model)", systemImage: "network.badge.shield.half.filled")
+                            .font(.callout)
+                        Spacer(minLength: 8)
+                        Button("Open Tailscale") { WorkspaceTerminalScreen.openTailscale() }.buttonStyle(.bordered).tint(accent)
+                    }
+                } else {
+                    Text(verbatim: WorkspaceTerminalScreen.via(first)).font(.callout).opacity(0.75)
+                }
+                if first.selectedConnection != nil {
+                    Text("Using your route and sign-in choice for this live workspace. Choose Route and Sign-In to change it or return to configured choices.")
+                        .font(.footnote).opacity(0.8).accessibilityIdentifier("machine.route-choice.active")
+                }
+            }
+        } else if model.localPolicies[workspaceID] == nil {
+            Label("Unlock protected storage to connect.", systemImage: "lock.shield").font(.callout)
+        } else {
+            Label("No route to this machine is ready on this \(UIDevice.current.model). Routes below say what each needs.",
+                  systemImage: "exclamationmark.triangle").font(.callout)
+        }
+    }
+
+    /// Opens the returning machine's terminal once, when Connect would be
+    /// offered for it; until then this page shows what it still needs.
+    private func returnToTerminal() {
+        guard !returnHandled, let id = returningMachineID else { return }
+        guard !model.requiresConnectionApproval(workspaceID) else { returnHandled = true; return }
+        guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { returnHandled = true; return }
+        guard let machine = document.machines.first(where: { $0.id == id }) else { returnHandled = true; return }
+        guard !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+              model.connections != nil, let local = model.localPolicies[workspaceID],
+              sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { return }
+        returnHandled = true
+        // A remembered screen is not a new Connect action. An explicit local
+        // off choice also holds when this was the last machine on screen.
+        guard local.connectionPreferences.autoConnectOverrides[id] != false else { return }
+        terminal = OpenTerminal(machineID: id, local: local)
+    }
+
+    /// A restore closes every session under its sheet. Its durable gate gives
+    /// way to the machine page, including on cancellation; a remembered screen
+    /// is never a new Connect action. Unrelated approved scene replacement can
+    /// still return to the same available machine.
+    private func reopenClosedTerminal() {
+        guard let closed = terminal, !model.showRestore, !model.hasOpenScene(workspaceID) else { return }
+        guard !model.requiresConnectionApproval(workspaceID) else { terminal = nil; return }
+        guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
+        Task {
+            // Dismissing restore releases offline exclusion in its lifecycle
+            // step; a connection begun before that would be refused.
+            await model.restoreSettled()
+            guard !model.requiresConnectionApproval(workspaceID) else { terminal = nil; return }
+            guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
+            guard terminal?.id == closed.id, !model.showRestore, !model.hasOpenScene(workspaceID),
+                  let local = model.localPolicies[workspaceID] else { return }
+            guard let machine = document.machines.first(where: { $0.id == closed.machineID }), model.connections != nil,
+                  !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+                  local.connectionPreferences.autoConnectOverrides[closed.machineID] != false,
+                  sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { terminal = nil; return }
+            terminal = OpenTerminal(machineID: closed.machineID, local: local)
+        }
+    }
+
+    /// A saved route: where it goes and anything this phone still needs for it.
+    @ViewBuilder private func routeRow(_ route: WorkspaceDocument.Route, preferred: Bool) -> some View {
+        let hop = route.jumpRoutes.first.flatMap { id in document.routes.first(where: { $0.id == id }) }
+        let network = WorkspaceRouteNetwork(host: hop?.host ?? route.host)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: network == .tailnet ? "network.badge.shield.half.filled" : network == .localNetwork ? "wifi" : "globe")
+                Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.system(.callout, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                if preferred { Text("Preferred").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.white.opacity(0.15), in: Capsule()) }
+            }
+            if let hop, route.jumpRoutes.count == 1, hop.jumpRoutes.isEmpty {
+                Text(verbatim: "Through \(hop.user)@\(hop.host):\(hop.port)")
+                    .font(.system(.caption, design: .monospaced)).opacity(0.75).textSelection(.enabled)
+            } else if let hops = try? document.orderedJumpRoutes(forRouteID: route.id), !hops.isEmpty {
+                Text(verbatim: "Through " + hops.map { "\($0.user)@\($0.host):\($0.port)" }.joined(separator: " → "))
+                    .font(.system(.caption, design: .monospaced)).opacity(0.75).textSelection(.enabled)
+            }
+            if route.mode == "frankenterm_mux" {
+                Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
+                // The exact command this route runs on the machine to reach its mux.
+                Text(verbatim: route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)
+                    .font(.system(.caption2, design: .monospaced)).opacity(0.6)
+                    .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                    .accessibilityLabel("Runs \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
+            }
+            let signingPeers = (((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route])
+                .filter { $0.publicKeyAlgorithmPolicy.isConstrained }
+            if !signingPeers.isEmpty {
+                DisclosureGroup("Public-key signing restrictions") {
+                    ForEach(Array(signingPeers.enumerated()), id: \.offset) { _, peer in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user))
+                                .font(.caption.bold())
+                            WorkspacePublicKeyAlgorithmPolicyView(route: peer)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
+            }
+            let policies = algorithmPolicies(for: route)
+            if !policies.isEmpty {
+                DisclosureGroup("SSH signature restrictions") {
+                    ForEach(Array(policies.enumerated()), id: \.offset) { _, entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: entry.endpoint).font(.caption.bold())
+                            WorkspaceHostAlgorithmPolicyView(policy: entry.policy)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
+            }
+            let revocations = revocationPolicies(for: route)
+            if !revocations.isEmpty {
+                DisclosureGroup("Host revocation sources") {
+                    ForEach(Array(revocations.enumerated()), id: \.offset) { _, entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: entry.endpoint).font(.caption.bold())
+                            WorkspaceHostRevocationPolicyView(presentation: entry.policy)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
+            }
+            ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
+                    id: \.offset) { _, issue in
+                Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
+            }
+        }
+    }
+
+    private struct RouteAlgorithmPolicy {
+        let routeID: String, endpoint: String
+        let policy: WorkspaceHostAlgorithmPresentation
+    }
+
+    private func algorithmPolicies(for route: WorkspaceDocument.Route) -> [RouteAlgorithmPolicy] {
+        let peers = ((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route]
+        let historical = model.localPolicies[workspaceID]?.hostAlgorithmPoliciesByTrustScope ?? [:]
+        return peers.compactMap { peer in
+            guard let policy = try? WorkspaceHostAlgorithmPresentation(document: document, trustID: peer.trustID,
+                historicalPolicies: historical), policy.isVisible else { return nil }
+            return .init(routeID: peer.id,
+                endpoint: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user), policy: policy)
+        }
+    }
+
+    private struct RouteRevocationPolicy {
+        let endpoint: String
+        let policy: WorkspaceHostRevocationPresentation
+    }
+
+    private func revocationPolicies(for route: WorkspaceDocument.Route) -> [RouteRevocationPolicy] {
+        let peers = ((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route]
+        let historical = model.localPolicies[workspaceID]?.hostRevocationSourcesByTrustScope ?? [:]
+        return peers.compactMap { peer in
+            guard let policy = try? WorkspaceHostRevocationPresentation(document: document, trustID: peer.trustID,
+                historicalSources: historical), policy.isVisible else { return nil }
+            return .init(endpoint: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user), policy: policy)
+        }
+    }
+
+    /// The workspace's live scene, kept by the app across visits, opening on
+    /// `initial`. Every machine remains navigable, while only this group's
+    /// opted-in peers prepare authenticated connections in the background.
+    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String,
+                               selectedTarget: TerminalSessionTarget? = nil) -> some View {
+        let themes = SceneThemeSource(
+            themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
+            choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
+        let ordered = machines + document.machines.filter { machine in !machines.contains { $0.id == machine.id } }
+        let selectedGroupID = groupID.isEmpty ? document.initialGroupID : groupID
+        let group = document.groups.first(where: { $0.id == selectedGroupID }).map {
+            TerminalConnectionIntent.Group(id: $0.id, machineIDs: model.machineOrder($0, workspaceID: workspaceID), autoConnect: $0.autoConnect)
+        }
+        return LiveWorkspaceView(initialMachineID: initial, themes: themes, group: group, connectOnOpen: true,
+                                 onShowing: { [model, workspaceID] machineID in
+            model.showing(machineID.map { .init(workspaceID: workspaceID, machineID: $0) })
+        }) { [model, workspaceID, document] in
+            try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision, expectedTarget: selectedTarget) {
+                try WorkspaceTerminalScene(workspaceID: workspaceID, revision: local.workspace.revision,
+                    workspaceName: document.name, machines: ordered.map { machine in
+                        sceneMachine(machine, local: local, selectedTarget: machine.id == initial ? selectedTarget : nil)
+                    },
+                    initialMachineID: initial, connections: connections, initialGroup: group)
+            }
+        }
+    }
+
+    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
+                              selectedTarget: TerminalSessionTarget? = nil) -> SceneMachine {
+        let theme = theme(for: machine)
+        let preferences: WorkspaceConnectionPreferences
+        if let latest = model.localPolicies[workspaceID], latest.workspace.revision == local.workspace.revision {
+            preferences = latest.connectionPreferences
+        } else { preferences = local.connectionPreferences }
+        func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
+            .init(id: machine.id, name: machine.name, target: target,
+                  unavailable: "None of this machine's SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
+                  theme: theme, autoConnect: preferences.automaticallyConnect(machine), tags: machine.tags)
+        }
+        let selected = selectedTarget ?? model.selectedTerminalTarget(workspaceID: workspaceID,
+            revision: local.workspace.revision, machineID: machine.id)
+        if let selected { return scene(theme.map { selected.wearing($0) } ?? selected) }
+        return scene(try? WorkspaceTerminalTargets.make(local: local, machineID: machine.id, theme: theme))
+    }
+}
+
+private struct WorkspaceMachineOrderReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let group: WorkspaceDocument.Group
+    let machines: [WorkspaceDocument.Machine]
+    let order: [String]
+}
+
+/// The native reorder list edits a local draft. Save publishes one complete
+/// permutation; cancelling or dismissing the sheet makes no preference change.
+@MainActor
+private struct WorkspaceMachineOrderScreen: View {
+    let review: WorkspaceMachineOrderReview
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var order: [String]
+    @State private var useImportedOrder = false
+
+    init(review: WorkspaceMachineOrderReview, model: MobileWorkspaceModel) {
+        self.review = review; self.model = model
+        _order = State(initialValue: review.order)
+    }
+
+    var body: some View {
+        let machines = Dictionary(uniqueKeysWithValues: review.machines.map { ($0.id, $0) })
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(order, id: \.self) { id in
+                        if let machine = machines[id] {
+                            Text(verbatim: machine.name)
+                                .accessibilityIdentifier("machines.order.\(id)")
+                                .accessibilityAction(named: Text("Move Up")) { move(id, offset: -1) }
+                                .accessibilityAction(named: Text("Move Down")) { move(id, offset: 1) }
+                        }
+                    }.onMove { source, destination in
+                        order.move(fromOffsets: source, toOffset: destination); useImportedOrder = false
+                    }.moveDisabled(model.busy)
+                } header: { Text(verbatim: review.group.name) } footer: {
+                    Text("Drag machines into the order you want to swipe through. This order is saved on this phone across imports. New machines are appended; existing sessions keep running.")
+                }
+                Section {
+                    Button("Use Workspace Order") {
+                        order = review.group.machineOrder; useImportedOrder = true
+                    }.disabled(model.busy)
+                    if useImportedOrder {
+                        Text("After saving, this group follows the order in future workspace imports.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let message = model.connectionPreferenceMessage {
+                        Text(verbatim: message).font(.callout).foregroundStyle(.orange)
+                            .accessibilityIdentifier("machines.order.error")
+                    }
+                }
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle("Arrange Machines")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.disabled(model.busy)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        model.setMachineOrder(useImportedOrder ? nil : order, workspaceID: review.workspaceID,
+                            expectedRevision: review.revision, groupID: review.group.id, expectedOrder: review.order) { saved in
+                                if saved { dismiss() }
+                            }
+                    }.disabled(model.busy || !model.active).accessibilityIdentifier("machines.order.save")
+                }
+            }
+            .interactiveDismissDisabled(model.busy)
+        }
+    }
+
+    private func move(_ id: String, offset: Int) {
+        guard !model.busy, let index = order.firstIndex(of: id), order.indices.contains(index + offset) else { return }
+        order.swapAt(index, index + offset); useImportedOrder = false
+    }
+}
+
+extension Color {
+    init(ftHex: String) {
+        let raw = String(ftHex.dropFirst())
+        let number = UInt64(raw, radix: 16) ?? 0
+        let rgba = raw.count == 8 ? number : (number << 8) | 255
+        self.init(.sRGB, red: Double((rgba >> 24) & 255) / 255, green: Double((rgba >> 16) & 255) / 255,
+                  blue: Double((rgba >> 8) & 255) / 255, opacity: Double(rgba & 255) / 255)
+    }
+}

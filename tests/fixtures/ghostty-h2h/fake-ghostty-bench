@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fake `ghostty-bench +terminal-stream` for scripts/test_ghostty_headless_h2h.sh.
+# Accepts exactly the pinned flags, reads the data file, then sleeps
+# $FAKE_GHOSTTY_SLEEP seconds (default 0.15).
+set -eu
+
+[ "${1:-}" = "+terminal-stream" ] || { echo "fake ghostty-bench: expected +terminal-stream, got ${1:-}" >&2; exit 2; }
+shift
+data=""
+rows=""
+cols=""
+for arg in "$@"; do
+    case "$arg" in
+        --data=*) data="${arg#--data=}" ;;
+        --terminal-rows=*) rows="${arg#--terminal-rows=}" ;;
+        --terminal-cols=*) cols="${arg#--terminal-cols=}" ;;
+        *) echo "fake ghostty-bench: unknown argument $arg" >&2; exit 2 ;;
+    esac
+done
+[ -f "$data" ] || { echo "fake ghostty-bench: no data file '$data'" >&2; exit 2; }
+[ -n "$rows" ] && [ -n "$cols" ] || { echo "fake ghostty-bench: rows and cols are required" >&2; exit 2; }
+cat "$data" >/dev/null
+sleep "${FAKE_GHOSTTY_SLEEP:-0.15}"

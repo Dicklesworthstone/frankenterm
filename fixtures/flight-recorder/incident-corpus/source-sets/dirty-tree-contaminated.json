@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm.source_adapters.v1",
+  "generated_at_ms": 1780696820000,
+  "source_set_id": "ft-ogr3n6-dirty-tree-contaminated",
+  "workspace_id": "frankenterm",
+  "git": [
+    {
+      "source_id": "git-dirty-unrelated",
+      "head_commit": "21a264542",
+      "branch": "main",
+      "captured_at_ms": 1780696818000,
+      "staged_paths": [
+        ".beads/issues.jsonl"
+      ],
+      "dirty_paths": [
+        "crates/frankenterm-core/src/operating_envelope.rs",
+        "crates/frankenterm-core-replay-types/src/incident_causality.rs"
+      ],
+      "branch_ahead": 1,
+      "branch_behind": 0,
+      "protected_deletion_warnings": [],
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"
+      ],
+      "reason_codes": [
+        "git.unrelated_tracked_dirty",
+        "proof.contaminated_dirty_tree"
+      ],
+      "payload": {
+        "proof_contaminated": true,
+        "summary": "Remote proof exists, but unrelated tracked dirty paths contaminate closeout."
+      }
+    }
+  ],
+  "rch": [
+    {
+      "source_id": "rch-pass-while-dirty",
+      "build_id": "j-29871232832766541",
+      "worker_id": "vmi1293453",
+      "command_argv": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "started_at_ms": 1780696819000,
+      "completed_at_ms": 1780696830000,
+      "location": "remote",
+      "exit_code": 0,
+      "cancellation_reason": null,
+      "preflight_refusal_reason": null,
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+      ],
+      "reason_codes": [
+        "rch.remote_worker_reached",
+        "rch.exit_zero",
+        "proof.requires_clean_git"
+      ],
+      "payload": {
+        "duration_ms": 11000,
+        "target_dir": "/tmp/ft-ogr3n4-workspace-clippy",
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "test_binary_reached": false
+      }
+    }
+  ]
+}

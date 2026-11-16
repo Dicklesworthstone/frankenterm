@@ -1,0 +1,452 @@
+//! Structure-aware fuzz harness for
+//! [`frankenterm_core::ingest::extract_delta`].
+//!
+//! The delta-extraction algorithm is the hot path that turns each
+//! WezTerm scrollback snapshot into an append-only `output_segments`
+//! row. A regression that panics on multi-byte UTF-8 at the overlap
+//! boundary, returns an empty `Content(..)` delta, or emits a delta
+//! that isn't a suffix of `current` would corrupt every pane's
+//! segment history without a loud failure mode. This harness pins
+//! the four correctness contracts the algorithm must satisfy on
+//! arbitrary input:
+//!
+//! 1. **Crash-freedom** — `extract_delta` must return a
+//!    `DeltaResult` for any `(previous, current, overlap_size)`
+//!    triple, including empty strings, interior multi-byte UTF-8,
+//!    mid-codepoint overlap windows, and arbitrary `usize`
+//!    overlap sizes up to the input length.
+//!
+//! 2. **Identity → NoChange** — `extract_delta(x, x, n)` must
+//!    return `NoChange` for any `n`. Regressions that stop
+//!    short-circuiting on equality would flood storage with
+//!    redundant `Content` rows.
+//!
+//! 3. **Content suffix invariant** — when the algorithm returns
+//!    `Content(delta)`, `current.ends_with(delta)` must hold and
+//!    `delta` must be non-empty. Pins the published contract that
+//!    the extracted payload is always a true suffix of the new
+//!    snapshot.
+//!
+//! 4. **Pure-append recoverability** — when `current.starts_with(
+//!    previous)` (a char-aligned append) and `previous != current`,
+//!    the algorithm must return `Content(current[previous.len()..])`.
+//!    This is the fast-path guarantee the comment on line 1665 of
+//!    `ingest.rs` relies on.
+//!
+//! 5. **Determinism** — identical inputs must produce identical
+//!    outputs across repeated calls.
+//!
+//! Domain: ingest delta extraction fuzzing (pane 5).
+
+use frankenterm_core::ingest::{DeltaResult, extract_delta};
+use proptest::prelude::*;
+
+// ── Strategies ──────────────────────────────────────────────────────────
+
+/// Arbitrary UTF-8 text of bounded length. Exercises the full
+/// char-boundary search logic.
+fn arb_text() -> impl Strategy<Value = String> {
+    proptest::collection::vec(any::<char>(), 0..128).prop_map(|chars| chars.into_iter().collect())
+}
+
+/// Narrow strategy: ASCII text with occasional multi-byte codepoints
+/// to focus shrinking on the interesting char-boundary cases.
+fn arb_ascii_with_multibyte() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        prop_oneof![
+            8 => (0x20u32..=0x7eu32).prop_filter_map("ascii", char::from_u32),
+            3 => (0x80u32..=0x4ffu32).prop_filter_map("latin-extended", char::from_u32),
+            1 => (0x2500u32..=0x257fu32).prop_filter_map("box-drawing", char::from_u32),
+        ],
+        0..96,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
+/// Overlap-size strategy — often close to the text length to stress
+/// the bounded-window code, sometimes zero, sometimes huge.
+fn arb_overlap_size() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        1 => Just(0usize),
+        4 => 1usize..=256,
+        1 => Just(usize::MAX / 2),
+    ]
+}
+
+/// Structure-aware strategy: build `(previous, current)` where
+/// `current == previous + suffix` — the pure-append corpus the
+/// fast path is optimized for.
+fn arb_append_pair() -> impl Strategy<Value = (String, String)> {
+    (arb_ascii_with_multibyte(), arb_ascii_with_multibyte()).prop_map(|(previous, suffix)| {
+        let current = format!("{previous}{suffix}");
+        (previous, current)
+    })
+}
+
+/// Structure-aware strategy: build `(previous, current)` where
+/// `current` shares a tail window with `previous` — the sliding-
+/// window scrollback shape. Formally: previous = A + shared;
+/// current = shared + B.
+fn arb_sliding_window_pair() -> impl Strategy<Value = (String, String)> {
+    (
+        arb_ascii_with_multibyte(), // prefix that scrolls off
+        arb_ascii_with_multibyte(), // shared overlap window
+        arb_ascii_with_multibyte(), // newly-scrolled-in suffix
+    )
+        .prop_map(|(prefix, shared, suffix)| {
+            let previous = format!("{prefix}{shared}");
+            let current = format!("{shared}{suffix}");
+            (previous, current)
+        })
+}
+
+// ── Properties ──────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    // ── MR1: crash-freedom ──────────────────────────────────────────
+
+    /// Arbitrary UTF-8 text must never panic the algorithm.
+    #[test]
+    fn extract_delta_never_panics_on_arbitrary_text(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        let _ = extract_delta(&previous, &current, overlap_size);
+    }
+
+    /// Structure-aware append pairs must never panic.
+    #[test]
+    fn extract_delta_never_panics_on_append_shape(
+        (previous, current) in arb_append_pair(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        let _ = extract_delta(&previous, &current, overlap_size);
+    }
+
+    /// Sliding-window pairs with multi-byte UTF-8 must never panic —
+    /// this exercises the char-boundary logic on the overlap search.
+    #[test]
+    fn extract_delta_never_panics_on_sliding_window_shape(
+        (previous, current) in arb_sliding_window_pair(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        let _ = extract_delta(&previous, &current, overlap_size);
+    }
+
+    // ── MR2: identity → NoChange ───────────────────────────────────
+
+    /// `extract_delta(x, x, n)` must always be `NoChange` regardless
+    /// of `overlap_size`.
+    #[test]
+    fn extract_delta_identity_yields_nochange(
+        text in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        let result = extract_delta(&text, &text, overlap_size);
+        prop_assert!(
+            matches!(result, DeltaResult::NoChange),
+            "identity input must yield NoChange, got {:?}",
+            result
+        );
+    }
+
+    // ── MR3: Content suffix invariant ──────────────────────────────
+
+    /// When `Content(delta)` is returned, `delta` must be a non-empty
+    /// suffix of `current`.
+    #[test]
+    fn extract_delta_content_is_nonempty_suffix_of_current(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
+            prop_assert!(
+                !delta.is_empty(),
+                "Content variant must carry a non-empty delta"
+            );
+            prop_assert!(
+                current.ends_with(&delta),
+                "Content delta {:?} must be a suffix of current {:?}",
+                delta,
+                current
+            );
+        }
+    }
+
+    // ── MR3b: overlap-existence invariant ──────────────────────────
+    //
+    // The stronger semantic contract the algorithm actually proves
+    // (but which MR3's suffix-only check doesn't catch): when
+    // Content(delta) returns, the non-delta head of `current` must
+    // itself be a SUFFIX of `previous`. In other words, the "overlap"
+    // that the algorithm claims to have found must actually exist in
+    // previous. Formally:
+    //
+    //     extract_delta(previous, current, _) = Content(delta)
+    //   ⇒ previous.ends_with(&current[..current.len() - delta.len()])
+    //
+    // This is what `search_window[pos..] == current[..overlap_len]`
+    // at ingest.rs:1711 actually proves — and what the pure-append
+    // fast path at :1666-1670 reduces to (previous ends with itself,
+    // which is the whole current[..previous.len()]).
+    //
+    // A regression in the candidate-acceptance logic — say, a
+    // slice-boundary bug that accepted a mismatching window — would
+    // let this property fail while MR3 (suffix-of-current) still
+    // passes. MR3 + MR3b together force the algorithm to prove it
+    // found a REAL overlap, not a fabricated one.
+    //
+    // Overlap len is exactly `current.len() - delta.len()`; when
+    // this is zero (delta IS the entire current), the empty-suffix
+    // check is trivially true, so we don't need a separate case.
+    #[test]
+    fn extract_delta_content_overlap_exists_in_previous(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
+            // The non-delta head of current is what the algorithm
+            // claims was "the overlap" it found in previous.
+            let overlap_len = current.len().saturating_sub(delta.len());
+            let claimed_overlap = &current[..overlap_len];
+            prop_assert!(
+                previous.ends_with(claimed_overlap),
+                "overlap-existence violated: algorithm returned \
+                 Content(delta={:?}), which implies previous ends with {:?}, \
+                 but previous is {:?}",
+                delta,
+                claimed_overlap,
+                previous
+            );
+        }
+    }
+
+    // ── MR4: pure-append recoverability ────────────────────────────
+
+    /// When `current` starts with `previous` on a char boundary and
+    /// `previous != current`, the fast path must return
+    /// `Content(current[previous.len()..])`. This is the documented
+    /// fast-path guarantee.
+    #[test]
+    fn extract_delta_pure_append_returns_exact_suffix(
+        (previous, current) in arb_append_pair(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        prop_assume!(previous != current); // NoChange branch handled by MR2
+        prop_assume!(current.is_char_boundary(previous.len())); // algorithm guard
+
+        let expected_suffix = &current[previous.len()..];
+        prop_assume!(!expected_suffix.is_empty()); // empty suffix means prev == curr
+
+        let result = extract_delta(&previous, &current, overlap_size);
+        match result {
+            DeltaResult::Content(delta) => {
+                prop_assert_eq!(
+                    delta.as_str(),
+                    expected_suffix,
+                    "pure-append fast path must return current[previous.len()..]"
+                );
+                // Reconstruction check: prev + delta == curr.
+                let reconstructed = format!("{}{}", previous, delta);
+                prop_assert_eq!(
+                    reconstructed,
+                    current,
+                    "prev + delta must reconstruct current on the pure-append path"
+                );
+            }
+            other => prop_assert!(
+                false,
+                "pure-append pair must yield Content, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ── MR5: determinism ───────────────────────────────────────────
+
+    /// Two successive calls with identical inputs must produce the
+    /// same DeltaResult shape and payload.
+    #[test]
+    fn extract_delta_is_deterministic(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        let a = extract_delta(&previous, &current, overlap_size);
+        let b = extract_delta(&previous, &current, overlap_size);
+        match (&a, &b) {
+            (DeltaResult::NoChange, DeltaResult::NoChange) => {}
+            (DeltaResult::Content(da), DeltaResult::Content(db)) => {
+                prop_assert_eq!(da, db, "Content payload must match across calls");
+            }
+            (
+                DeltaResult::Gap { reason: ra, content: ca },
+                DeltaResult::Gap { reason: rb, content: cb },
+            ) => {
+                prop_assert_eq!(ra, rb, "Gap reason must match across calls");
+                prop_assert_eq!(ca, cb, "Gap content must match across calls");
+            }
+            _ => prop_assert!(
+                false,
+                "extract_delta variant drift across calls: a={:?} b={:?}",
+                a,
+                b
+            ),
+        }
+    }
+
+    // ── MR7: Gap carries content == current ────────────────────────
+    //
+    // All three Gap return sites in extract_delta (ingest.rs:1675,
+    // :1713, :1724) populate `content` with `current.to_string()` —
+    // the caller treats Gap as a full snapshot reset, so the content
+    // field must be the whole new snapshot, not a truncated slice.
+    // Pin this shipping contract so a future refactor that switches
+    // any return site to (say) the overlap-trimmed tail cannot land
+    // silently. [ft-31kaq]
+    #[test]
+    fn extract_delta_gap_content_equals_current(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Gap { content, .. } =
+            extract_delta(&previous, &current, overlap_size)
+        {
+            prop_assert_eq!(
+                content.as_str(),
+                current.as_str(),
+                "Gap.content must equal current (full-snapshot reset contract)"
+            );
+        }
+    }
+
+    // ── MR8: Content delta is strictly shorter than current ────────
+    //
+    // The algorithm returns Content only when it proved a real overlap
+    // of length >= 1 exists between previous and current (search_window
+    // non-empty + memchr hit + full match). overlap_len = 1 at minimum
+    // (pos == search_window.len() - 1 case), so delta = current[1..]
+    // at longest, i.e. delta.len() <= current.len() - 1. Any Content
+    // with delta.len() == current.len() would mean the algorithm
+    // claims an empty overlap — a fabricated zero-length match that
+    // MR3b would also flag, but it's worth pinning the strict-
+    // shorter form directly because it's the delta-compaction
+    // contract consumers rely on for storage efficiency. [ft-31kaq]
+    #[test]
+    fn extract_delta_content_is_strictly_shorter_than_current(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
+            if previous.is_empty() {
+                // First capture for a pane: there is no baseline to overlap
+                // against, so `extract_delta` returns the whole capture and the
+                // strictly-shorter form cannot hold. The rationale above missed
+                // this branch, so the property failed for any generated or
+                // shrunk `previous = ""` — pinning the branch explicitly instead
+                // of leaving the guard with a hole in it.
+                prop_assert_eq!(
+                    delta.as_str(),
+                    current.as_str(),
+                    "a first capture must return the whole snapshot"
+                );
+            } else {
+                prop_assert!(
+                    delta.len() < current.len(),
+                    "Content delta.len()={} must be strictly < current.len()={} \
+                     (overlap is always >= 1 byte when Content is returned); \
+                     delta={:?}, current={:?}",
+                    delta.len(),
+                    current.len(),
+                    delta,
+                    current
+                );
+            }
+        }
+    }
+
+    /// Zero-overlap degrades to Gap when previous != current and
+    /// previous is non-empty. Pins the branch contract at line 1675.
+    #[test]
+    fn extract_delta_zero_overlap_yields_gap_when_mismatched(
+        previous in arb_ascii_with_multibyte().prop_filter("non-empty", |s| !s.is_empty()),
+        current in arb_text(),
+    ) {
+        prop_assume!(previous != current);
+        // Avoid the fast append path, which is reached before the
+        // overlap_size == 0 check.
+        prop_assume!(
+            !(current.len() > previous.len()
+                && current.starts_with(&previous)
+                && current.is_char_boundary(previous.len()))
+        );
+
+        let result = extract_delta(&previous, &current, 0);
+        prop_assert!(
+            matches!(result, DeltaResult::Gap { .. }),
+            "zero-overlap mismatched pair must yield Gap, got {:?}",
+            result
+        );
+    }
+}
+
+// ── Hand-rolled regressions on known-hard cases ─────────────────────────
+
+#[test]
+fn extract_delta_empty_previous_with_non_empty_current_returns_full_content() {
+    match extract_delta("", "hello", 16) {
+        DeltaResult::Content(delta) => assert_eq!(delta, "hello"),
+        other => panic!("expected Content, got {other:?}"),
+    }
+}
+
+#[test]
+fn extract_delta_both_empty_returns_nochange() {
+    assert!(matches!(extract_delta("", "", 16), DeltaResult::NoChange));
+}
+
+#[test]
+fn extract_delta_pure_append_returns_suffix() {
+    match extract_delta("abc", "abcdef", 32) {
+        DeltaResult::Content(delta) => assert_eq!(delta, "def"),
+        other => panic!("expected Content, got {other:?}"),
+    }
+}
+
+#[test]
+fn extract_delta_multibyte_boundary_does_not_panic() {
+    // Cyrillic char (2B): tests the char_boundary snap on the
+    // fast-append branch.
+    let previous = "привет";
+    let current = "приветмир";
+    let result = extract_delta(previous, current, 32);
+    match result {
+        DeltaResult::Content(delta) => assert_eq!(delta, "мир"),
+        other => panic!("expected Content('мир'), got {other:?}"),
+    }
+}
+
+#[test]
+fn extract_delta_sliding_window_mid_codepoint_does_not_panic() {
+    // Overlap size in the middle of a multi-byte codepoint must
+    // snap forward to the next char boundary, never panic.
+    let previous = "αβγδεζηθ";
+    let current = "γδεζηθικ";
+    // overlap_size chosen so search_start lands mid-codepoint
+    let _ = extract_delta(previous, current, 5);
+}
+
+#[test]
+fn extract_delta_in_place_edit_yields_gap() {
+    // Same length, different middle → overlap_not_found or
+    // content_changed_without_append.
+    let result = extract_delta("aaaaa", "bbbbb", 8);
+    assert!(matches!(result, DeltaResult::Gap { .. }));
+}

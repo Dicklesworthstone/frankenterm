@@ -1,0 +1,6 @@
+Retry case: the provider is called only once, no stored API key gets rotated in.
+`ANTHROPIC_API_KEY` isn't set, so something else satisfies the credential.
+Error: invalid api key - please check your ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY is not set
+API key authentication failed. Please set ANTHROPIC_API_KEY.
+Failed to authenticate telemetry request

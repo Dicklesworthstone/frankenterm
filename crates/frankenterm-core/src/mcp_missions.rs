@@ -1,0 +1,1848 @@
+//! Mission and transaction lifecycle helpers for MCP tools.
+//!
+//! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
+//! Contains file I/O, state resolution, and assignment aggregation helpers
+//! used by the mission/tx tool handlers.
+
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::mcp_error::{
+    MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_STORAGE, MCP_ERR_WORKFLOW, McpToolError,
+};
+
+use super::{
+    McpMissionAssignmentCounters, McpMissionAssignmentData, McpMissionFailureCatalogEntry,
+    McpMissionTransitionInfo, McpTxTransitionInfo, MissionStateParams,
+};
+
+/// A revision is an opaque concurrency authority, not a floating-point counter.
+pub(super) fn mission_revision_token_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Exact revision_token from wa.mission_state. Stale content, revision, or incarnation is rejected. Preserve revision as decimal text.",
+        "additionalProperties": false,
+        "required": ["mission_id", "generation", "revision", "content_sha256"],
+        "properties": {
+            "mission_id": { "type": "string" },
+            "generation": { "type": "string" },
+            "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$", "maxLength": 20 },
+            "content_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64 }
+        }
+    })
+}
+
+// ── Size caps for mission + tx contract file reads ──────────────────────
+//
+// [ft-up6u2] Mission files under `.ft/mission/*.json` have the same
+// trust property as pattern packs under `.ft/patterns/*.{yaml,json,toml}`:
+// a hostile cloned repo can ship them, and they're loaded at MCP tool
+// invocation time. `resolve_workspace_scoped_path` (below) blocks
+// path-traversal OUT of the workspace; these caps block OOM from a
+// malicious IN-workspace file.
+//
+// Mirrors `patterns::MAX_PACK_BYTES = 16 MiB` (ft-05hfm). Real-world
+// missions + tx contracts at the ~100-candidate scale serialize to
+// ~50-100 KiB, so 16 MiB leaves ~200x headroom for legitimate
+// oversize cases (giant assignment fan-out, embedded evidence, etc.)
+// while still rejecting obvious DoS payloads before the allocator or
+// serde_json::from_str sees them.
+const MAX_MISSION_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TX_CONTRACT_BYTES: u64 = 16 * 1024 * 1024;
+/// Read a mission-adjacent JSON file with a hard size cap. Stat-checks
+/// before `read_to_string` to reject oversize files without allocating
+/// the full content; re-checks bytes-read after to catch filesystems
+/// that misreport size (procfs-like pseudo files) or TOCTOU swap.
+///
+/// `error_code` and `hint` are threaded through so callers keep their
+/// existing error envelope shape on cap rejection.
+fn read_capped_file(
+    path: &Path,
+    max_bytes: u64,
+    read_error_code: &'static str,
+    oversize_error_code: &'static str,
+) -> std::result::Result<String, McpToolError> {
+    use std::io::Read;
+
+    // Stage 1: stat-based early rejection when metadata is reliable.
+    // Succeeds on normal filesystems and catches the common hostile-
+    // repo case (a multi-GiB .ft/mission/active.json) before allocating
+    // anything.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            return Err(McpToolError::new(
+                oversize_error_code,
+                format!(
+                    "File {} is {} bytes; max allowed is {} bytes",
+                    path.display(),
+                    meta.len(),
+                    max_bytes
+                ),
+                Some(
+                    "Shrink the file or split its payload — 16 MiB is the ft-up6u2 hostile-repo \
+                     DoS cap."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+    // metadata Err falls through deliberately. The streaming reader in
+    // stage 2 bounds memory at max_bytes + 1 regardless of whether
+    // metadata was available, so we don't need to hard-fail on stat
+    // failure (legitimate network filesystems, some procfs-style mounts).
+
+    // Stage 2: streaming bounded read. `Read::take(max_bytes + 1)` is
+    // the correct DoS defense — it caps the I/O layer itself, so a
+    // filesystem that lies about size via stat (procfs-like pseudo
+    // files, networked FS with untrusted stat) or a TOCTOU swap
+    // between stat and open cannot cause an unbounded allocation.
+    // Using read_to_string without `take()` would allocate the full
+    // content even when we planned to reject it at the post-read
+    // length check — exactly the OOM shape ft-up6u2 exists to prevent.
+    let file = std::fs::File::open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            McpToolError::new(
+                read_error_code,
+                format!("File not found: {}", path.display()),
+                None,
+            )
+        } else {
+            McpToolError::new(
+                read_error_code,
+                format!("Failed to open {}: {err}", path.display()),
+                None,
+            )
+        }
+    })?;
+
+    let mut buf = Vec::with_capacity(max_bytes.min(1 << 20) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|err| {
+            McpToolError::new(
+                read_error_code,
+                format!("Failed to read {}: {err}", path.display()),
+                None,
+            )
+        })?;
+
+    // If read_to_end consumed max_bytes + 1 bytes, the file was AT
+    // LEAST one byte larger than the cap — reject. We can't distinguish
+    // "exactly max_bytes+1" from "5 GiB" from the length alone, but
+    // either case is equally a cap violation.
+    if buf.len() as u64 > max_bytes {
+        return Err(McpToolError::new(
+            oversize_error_code,
+            format!(
+                "File {} exceeds {} byte cap (streaming reader stopped after reading {} bytes)",
+                path.display(),
+                max_bytes,
+                buf.len()
+            ),
+            None,
+        ));
+    }
+
+    // UTF-8 validation — mirrors the shape read_to_string previously
+    // provided. Invalid UTF-8 is a structural error in a JSON file
+    // anyway, so returning the read_error_code (not oversize) matches
+    // how serde_json::from_str would fail downstream.
+    String::from_utf8(buf).map_err(|err| {
+        McpToolError::new(
+            read_error_code,
+            format!("File {} is not valid UTF-8: {err}", path.display()),
+            None,
+        )
+    })
+}
+
+// ── Tx contract file resolution and loading ─────────────────────────────
+
+pub(super) fn mcp_default_mission_tx_file_path(
+    config: &Config,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(McpToolError::from_error)?;
+    resolve_workspace_scoped_path(&layout.root, ".ft/mission/tx-active.json")
+}
+
+pub(super) fn mcp_resolve_mission_tx_file_path(
+    config: &Config,
+    contract_file: Option<&str>,
+) -> std::result::Result<PathBuf, McpToolError> {
+    match contract_file {
+        Some(path) => {
+            let layout = config
+                .workspace_layout(None)
+                .map_err(McpToolError::from_error)?;
+            resolve_workspace_scoped_path(&layout.root, path)
+        }
+        None => mcp_default_mission_tx_file_path(config),
+    }
+}
+
+/// Constrain a user-supplied MCP path argument to the current workspace root.
+///
+/// [ft-security-mcp-path-traversal]
+///
+/// `wa.tx_plan`, `wa.tx_show`, `wa.tx_run`, `wa.tx_rollback`, and the
+/// mission_* tools all accept an optional `contract_file` / `mission_file`
+/// string argument that previously flowed directly into `std::fs::read_to_string`
+/// or `std::fs::write`. An MCP client could supply `/etc/passwd` or
+/// `~/.ssh/id_rsa` and trigger arbitrary-file read, or supply an absolute
+/// path and overwrite anything the watcher UID can write.
+///
+/// This helper enforces four gates:
+/// 1. Reject any `..` component in the user-supplied path.
+/// 2. Relative paths are joined to the workspace root; absolute paths
+///    are accepted only if they canonicalize inside the workspace.
+/// 3. The resolved path's nearest existing ancestor must canonicalize
+///    inside the workspace root (supports save paths where the target
+///    file does not yet exist).
+/// 4. The returned path is rebuilt from that canonical ancestor plus any
+///    unresolved suffix, freezing existing symlink resolution instead of
+///    returning the caller-controlled alias that was merely validated.
+pub(super) fn resolve_workspace_scoped_path(
+    workspace_root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let supplied = Path::new(user_path);
+    for component in supplied.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(McpToolError::new(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "path contains parent-directory component: {}",
+                    supplied.display()
+                ),
+                Some(
+                    "contract_file and mission_file paths must not contain `..` components."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+
+    let candidate = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        workspace_root.join(supplied)
+    };
+
+    let root_canon = workspace_root.canonicalize().map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "failed to canonicalize workspace root {}: {err}",
+                workspace_root.display()
+            ),
+            None,
+        )
+    })?;
+
+    let mut ancestor = candidate.as_path();
+    let ancestor_canon = loop {
+        match ancestor.canonicalize() {
+            Ok(p) => break p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => {
+                    return Err(McpToolError::new(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("path has no accessible ancestor: {}", candidate.display()),
+                        None,
+                    ));
+                }
+                Some(parent) => ancestor = parent,
+                None => {
+                    return Err(McpToolError::new(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("path has no accessible ancestor: {}", candidate.display()),
+                        None,
+                    ));
+                }
+            },
+            Err(err) => {
+                return Err(McpToolError::new(
+                    MCP_ERR_INVALID_ARGS,
+                    format!(
+                        "path {} is not accessible while resolving workspace containment: {err}",
+                        candidate.display()
+                    ),
+                    Some(
+                        "mission_file and contract_file must point to readable paths inside the workspace."
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+    };
+
+    if !ancestor_canon.starts_with(&root_canon) {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "path escapes workspace root: {} is not under {}",
+                candidate.display(),
+                workspace_root.display()
+            ),
+            Some(
+                "contract_file and mission_file must resolve inside the configured workspace root."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let unresolved_suffix = candidate.strip_prefix(ancestor).map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "failed to bind path {} to its canonical ancestor {}: {err}",
+                candidate.display(),
+                ancestor.display()
+            ),
+            Some(
+                "contract_file and mission_file must resolve unambiguously inside the workspace."
+                    .to_string(),
+            ),
+        )
+    })?;
+
+    // [ft-nam3s] When the target itself exists the loop above breaks on its
+    // first iteration, so `ancestor == candidate` and the suffix is empty.
+    // `PathBuf::join("")` does NOT return the receiver unchanged: it pushes
+    // MAIN_SEPARATOR and then nothing, yielding `…/contract.json/`. That path
+    // compares equal to the clean one (`Path`'s `PartialEq` walks components
+    // and discards trailing separators, which is why the regression tests
+    // below could not see this) but `open(2)`/`stat(2)` reject it with
+    // ENOTDIR, breaking every tx/mission tool whose contract file exists.
+    if unresolved_suffix.as_os_str().is_empty() {
+        return Ok(ancestor_canon);
+    }
+    Ok(ancestor_canon.join(unresolved_suffix))
+}
+
+pub(super) fn mcp_load_mission_tx_contract_from_path(
+    path: &Path,
+) -> std::result::Result<crate::plan::MissionTxContract, McpToolError> {
+    // [ft-up6u2] Cap bytes read from a tx contract file to block an
+    // OOM DoS from a hostile `.ft/mission/tx-active.json` shipped in a
+    // cloned repo. See `read_capped_file` docstring.
+    //
+    // Transaction helpers feed MCP tool envelopes, so every failure must use
+    // the stable FT-MCP namespace. Missing workflow state is distinct from
+    // storage I/O, while hostile/invalid payloads are invalid arguments.
+    let raw = match read_capped_file(
+        path,
+        MAX_TX_CONTRACT_BYTES,
+        MCP_ERR_STORAGE,
+        MCP_ERR_INVALID_ARGS,
+    ) {
+        Ok(raw) => raw,
+        Err(err) if err.code == MCP_ERR_STORAGE && err.message.starts_with("File not found: ") => {
+            return Err(McpToolError::new(
+                MCP_ERR_WORKFLOW,
+                format!("Tx contract file not found: {}", path.display()),
+                Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let contract: crate::plan::MissionTxContract = serde_json::from_str(&raw).map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Invalid tx contract JSON in {}: {err}", path.display()),
+            Some("Ensure the file matches the MissionTxContract schema.".to_string()),
+        )
+    })?;
+
+    contract.validate().map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Tx contract validation failed: {err}"),
+            Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
+        )
+    })?;
+
+    Ok(contract)
+}
+
+pub(super) fn mcp_save_mission_tx_contract_to_path(
+    guard: &crate::tx_execution::TxContractLockGuard,
+    path: &Path,
+    contract: &crate::plan::MissionTxContract,
+) -> std::result::Result<(), McpToolError> {
+    crate::tx_execution::save_tx_contract_atomic(guard, path, contract).map_err(|err| {
+        use crate::tx_execution::TxContractStoreErrorKind;
+
+        let code = match err.kind() {
+            TxContractStoreErrorKind::Validation | TxContractStoreErrorKind::Serialization => {
+                MCP_ERR_INTERNAL
+            }
+            TxContractStoreErrorKind::TooLarge
+            | TxContractStoreErrorKind::InProgress
+            | TxContractStoreErrorKind::Conflict
+            | TxContractStoreErrorKind::Lock
+            | TxContractStoreErrorKind::Write
+            | TxContractStoreErrorKind::Sync
+            | TxContractStoreErrorKind::Rename => MCP_ERR_STORAGE,
+        };
+        let message = if code == MCP_ERR_INTERNAL {
+            tracing::error!(
+                error = %err,
+                error_kind = ?err.kind(),
+                "server-generated transaction contract could not be serialized safely"
+            );
+            "Internal transaction contract persistence error".to_string()
+        } else {
+            err.to_string()
+        };
+        let hint = err.recovery_path().map(|recovery_path| {
+            format!(
+                "A transaction recovery artifact was retained through the pinned contract parent; {} is only its last-known display path and may no longer resolve after a namespace change. Validate durable ledger evidence and the artifact's completeness and contents before recovery.",
+                recovery_path.display()
+            )
+        });
+        McpToolError::new(code, message, hint)
+    })
+}
+
+pub(super) fn mcp_parse_mission_kill_switch(
+    raw: Option<&str>,
+) -> std::result::Result<crate::plan::MissionKillSwitchLevel, McpToolError> {
+    match raw.unwrap_or("off").trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(crate::plan::MissionKillSwitchLevel::Off),
+        "safe_mode" | "safe-mode" | "safemode" => Ok(crate::plan::MissionKillSwitchLevel::SafeMode),
+        "hard_stop" | "hard-stop" | "hardstop" => Ok(crate::plan::MissionKillSwitchLevel::HardStop),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Unknown kill_switch value: {other}"),
+            Some("Valid values: off, safe_mode, hard_stop.".to_string()),
+        )),
+    }
+}
+
+pub(super) fn mcp_tx_transition_info(
+    state: crate::plan::MissionTxState,
+) -> Vec<McpTxTransitionInfo> {
+    crate::plan::mission_tx_transition_table()
+        .iter()
+        .filter(|rule| rule.from == state)
+        .map(|rule| McpTxTransitionInfo {
+            kind: rule.via.to_string(),
+            to: rule.to.to_string(),
+        })
+        .collect()
+}
+
+// ── Mission (non-tx) file resolution and loading ─────────────────────────
+
+pub(super) fn mcp_default_mission_file_path(
+    config: &Config,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(McpToolError::from_error)?;
+    resolve_workspace_scoped_path(&layout.root, ".ft/mission/active.json")
+}
+
+pub(super) fn mcp_resolve_mission_file_path(
+    config: &Config,
+    mission_file: Option<&str>,
+) -> std::result::Result<PathBuf, McpToolError> {
+    match mission_file {
+        Some(path) => {
+            // [ft-security-mcp-path-traversal] same containment guard as
+            // mcp_resolve_mission_tx_file_path — reject `..` and require
+            // the resolved path to live inside the workspace root.
+            let layout = config
+                .workspace_layout(None)
+                .map_err(McpToolError::from_error)?;
+            resolve_workspace_scoped_path(&layout.root, path)
+        }
+        None => mcp_default_mission_file_path(config),
+    }
+}
+
+pub(super) fn mcp_load_mission_from_path(
+    path: &Path,
+) -> std::result::Result<crate::plan::Mission, McpToolError> {
+    // [ft-up6u2] Same 16 MiB cap as the tx contract loader. See
+    // `read_capped_file` docstring for the threat model.
+    let raw = match read_capped_file(
+        path,
+        MAX_MISSION_BYTES,
+        "robot.mission_read_failed",
+        "robot.mission_oversize",
+    ) {
+        Ok(raw) => raw,
+        Err(err)
+            if err.code == "robot.mission_read_failed"
+                && err.message.starts_with("File not found: ") =>
+        {
+            return Err(McpToolError::new(
+                "robot.mission_not_found",
+                format!("Mission file not found: {}", path.display()),
+                Some("Pass mission_file or create .ft/mission/active.json.".to_string()),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mission = crate::plan::Mission::from_json_slice(raw.as_bytes()).map_err(|err| {
+        McpToolError::new(
+            "robot.mission_invalid_json",
+            format!("Invalid mission JSON in {}: {err}", path.display()),
+            Some("Ensure the file matches the Mission schema.".to_string()),
+        )
+    })?;
+
+    mission.validate().map_err(|err| {
+        McpToolError::new(
+            "robot.mission_validation_failed",
+            format!("Mission validation failed: {err}"),
+            Some("Use wa.mission_explain to inspect legal transitions.".to_string()),
+        )
+    })?;
+
+    Ok(mission)
+}
+
+pub(super) fn mcp_mission_store_error(
+    error: crate::tx_execution::MissionStoreError,
+) -> McpToolError {
+    McpToolError::new(error.code(), error.to_string(), None)
+}
+
+pub(super) fn mcp_acquire_mission_mutation(
+    config: &Config,
+    path: &Path,
+    expected: Option<&crate::tx_execution::MissionRevisionToken>,
+) -> std::result::Result<crate::tx_execution::MissionMutationGuard, McpToolError> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(McpToolError::from_error)?;
+    crate::tx_execution::MissionMutationGuard::acquire(&layout.root, path, expected)
+        .map_err(mcp_mission_store_error)
+}
+
+pub(super) fn mcp_save_mission_to_path(
+    guard: crate::tx_execution::MissionMutationGuard,
+    mission: &mut crate::plan::Mission,
+) -> std::result::Result<crate::tx_execution::MissionMutationReceipt, McpToolError> {
+    guard.commit(mission).map_err(mcp_mission_store_error)
+}
+
+pub(super) fn mcp_mission_lifecycle_transitions(
+    state: crate::plan::MissionLifecycleState,
+) -> Vec<McpMissionTransitionInfo> {
+    crate::plan::mission_lifecycle_transition_table()
+        .iter()
+        .filter(|rule| rule.from == state)
+        .map(|rule| McpMissionTransitionInfo {
+            kind: rule.via.to_string(),
+            from: rule.from.to_string(),
+            to: rule.to.to_string(),
+        })
+        .collect()
+}
+
+pub(super) fn mcp_mission_failure_catalog() -> Vec<McpMissionFailureCatalogEntry> {
+    // Derived from the canonical `plan::MissionFailureCode` enum rather than a
+    // hand-maintained list, so wa.mission_explain's failure_catalog always
+    // matches the failure modes a mission can actually produce. The previous
+    // hardcoded vec had drifted: it invented codes no variant emits
+    // (DispatchFailed/ExecutionFailed/Timeout), omitted four real modes
+    // (ReservationConflict/RateLimited/StaleState/ApprovalRequired), and used
+    // `mission.failure.*` strings that no production emitter produces — leaving
+    // an agent prepared for codes that never arrive and blind to real ones
+    // (ft-dfnoe).
+    crate::plan::MissionFailureCode::ALL
+        .iter()
+        .map(|&code| McpMissionFailureCatalogEntry {
+            code: format!("{code:?}"),
+            reason_code: code.reason_code().to_string(),
+            error_code: code.error_code().to_string(),
+        })
+        .collect()
+}
+
+/// Build assignment data from a Mission, with optional filtering.
+pub(super) fn mcp_build_mission_assignments(
+    mission: &crate::plan::Mission,
+    filters: &MissionStateParams,
+) -> (
+    Vec<McpMissionAssignmentData>,
+    McpMissionAssignmentCounters,
+    usize,
+) {
+    use crate::plan::{ApprovalState, Outcome};
+
+    let mut counters = McpMissionAssignmentCounters {
+        pending_approval: 0,
+        approved: 0,
+        denied: 0,
+        expired: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        unresolved: 0,
+    };
+
+    let limit = filters.limit.unwrap_or(100);
+
+    let mut matched = Vec::new();
+    for assignment in &mission.assignments {
+        // Compute derived states
+        let run_state = match &assignment.outcome {
+            Some(Outcome::Success { .. }) => "succeeded",
+            Some(Outcome::Failed { .. }) => "failed",
+            Some(Outcome::Cancelled { .. }) => "cancelled",
+            None => "pending",
+        };
+
+        let agent_state = match &assignment.approval_state {
+            ApprovalState::NotRequired => "not_required",
+            ApprovalState::Pending { .. } => "pending",
+            ApprovalState::Approved { .. } => "approved",
+            ApprovalState::Denied { .. } => "denied",
+            ApprovalState::Expired { .. } => "expired",
+        };
+
+        let action_state = if run_state != "pending" {
+            "completed"
+        } else if matches!(
+            assignment.approval_state,
+            ApprovalState::Pending { .. }
+                | ApprovalState::Denied { .. }
+                | ApprovalState::Expired { .. }
+        ) {
+            "blocked"
+        } else {
+            "ready"
+        };
+
+        // Update counters
+        match &assignment.approval_state {
+            ApprovalState::Pending { .. } => counters.pending_approval += 1,
+            ApprovalState::Approved { .. } | ApprovalState::NotRequired => counters.approved += 1,
+            ApprovalState::Denied { .. } => counters.denied += 1,
+            ApprovalState::Expired { .. } => counters.expired += 1,
+        }
+        match &assignment.outcome {
+            Some(Outcome::Success { .. }) => counters.succeeded += 1,
+            Some(Outcome::Failed { .. }) => counters.failed += 1,
+            Some(Outcome::Cancelled { .. }) => counters.cancelled += 1,
+            None => counters.unresolved += 1,
+        }
+
+        // Apply filters
+        if let Some(ref f) = filters.run_state {
+            if run_state != *f {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.agent_state {
+            if agent_state != *f {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.action_state {
+            if action_state != *f {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.assignment_id {
+            if assignment.assignment_id.0 != *f {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.assignee {
+            if assignment.assignee != *f {
+                continue;
+            }
+        }
+
+        let reason_code = assignment.outcome.as_ref().and_then(|o| match o {
+            Outcome::Failed { reason_code, .. } => Some(reason_code.clone()),
+            Outcome::Cancelled { reason_code, .. } => Some(reason_code.clone()),
+            Outcome::Success { .. } => None,
+        });
+        let error_code = assignment.outcome.as_ref().and_then(|o| match o {
+            Outcome::Failed { error_code, .. } => Some(error_code.clone()),
+            Outcome::Success { .. } | Outcome::Cancelled { .. } => None,
+        });
+
+        matched.push(McpMissionAssignmentData {
+            assignment_id: assignment.assignment_id.0.clone(),
+            candidate_id: assignment.candidate_id.0.clone(),
+            assignee: assignment.assignee.clone(),
+            run_state: run_state.to_string(),
+            agent_state: agent_state.to_string(),
+            action_state: action_state.to_string(),
+            reason_code,
+            error_code,
+        });
+    }
+
+    let matched_count = matched.len();
+    matched.truncate(limit);
+
+    (matched, counters, matched_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        MCP_ERR_INVALID_ARGS, MCP_ERR_WORKFLOW, MissionStateParams, mcp_build_mission_assignments,
+        mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
+        mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions,
+        mcp_parse_mission_kill_switch, mcp_resolve_mission_file_path,
+        mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path, mcp_tx_transition_info,
+        resolve_workspace_scoped_path,
+    };
+    use crate::config::Config;
+    use crate::plan::{
+        ApprovalState, Assignment, AssignmentId, CandidateActionId, MissionActorRole, MissionId,
+        MissionKillSwitchLevel, MissionLifecycleState, MissionOwnership, MissionTxContract,
+        MissionTxState, Outcome, StepAction, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep,
+        TxStepId,
+    };
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    fn make_ownership() -> MissionOwnership {
+        MissionOwnership {
+            planner: "planner-a".to_string(),
+            dispatcher: "dispatcher-a".to_string(),
+            operator: "operator-a".to_string(),
+        }
+    }
+
+    fn make_mission_with_assignments(assignments: Vec<Assignment>) -> crate::plan::Mission {
+        let mut mission = crate::plan::Mission::new(
+            MissionId("mission:test".to_string()),
+            "Test Mission",
+            "ws-test",
+            make_ownership(),
+            1_700_000_000_000,
+        );
+        mission.assignments = assignments;
+        mission
+    }
+
+    fn make_assignment(
+        id: &str,
+        assignee: &str,
+        approval: ApprovalState,
+        outcome: Option<Outcome>,
+    ) -> Assignment {
+        Assignment {
+            assignment_id: AssignmentId(id.to_string()),
+            candidate_id: CandidateActionId("candidate:abc".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: assignee.to_string(),
+            reservation_intent: None,
+            approval_state: approval,
+            outcome,
+            escalation: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: None,
+        }
+    }
+
+    fn make_tx_contract(step_count: usize) -> MissionTxContract {
+        let steps: Vec<TxStep> = (0..step_count)
+            .map(|i| TxStep {
+                step_id: TxStepId(format!("step-{i}")),
+                ordinal: i,
+                action: StepAction::SendText {
+                    pane_id: 1,
+                    text: format!("echo step {i}"),
+                    paste_mode: None,
+                },
+                description: String::new(),
+            })
+            .collect();
+        MissionTxContract {
+            tx_version: 1,
+            intent: TxIntent {
+                tx_id: TxId("tx-001".to_string()),
+                requested_by: MissionActorRole::Operator,
+                summary: "test tx".to_string(),
+                correlation_id: "corr-1".to_string(),
+                created_at_ms: 1_700_000_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan-001".to_string()),
+                tx_id: TxId("tx-001".to_string()),
+                steps,
+                preconditions: Vec::new(),
+                compensations: Vec::new(),
+            },
+            lifecycle_state: MissionTxState::Planned,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        }
+    }
+
+    fn empty_filters() -> MissionStateParams {
+        MissionStateParams {
+            mission_file: None,
+            mission_state: None,
+            run_state: None,
+            agent_state: None,
+            action_state: None,
+            assignment_id: None,
+            assignee: None,
+            limit: None,
+        }
+    }
+
+    // ========================================================================
+    // mcp_parse_mission_kill_switch Tests
+    // ========================================================================
+
+    #[test]
+    fn kill_switch_none_defaults_to_off() {
+        let level = mcp_parse_mission_kill_switch(None).unwrap();
+        assert_eq!(level, MissionKillSwitchLevel::Off);
+    }
+
+    #[test]
+    fn kill_switch_off() {
+        let level = mcp_parse_mission_kill_switch(Some("off")).unwrap();
+        assert_eq!(level, MissionKillSwitchLevel::Off);
+    }
+
+    #[test]
+    fn kill_switch_safe_mode_variants() {
+        for variant in &["safe_mode", "safe-mode", "safemode"] {
+            let level = mcp_parse_mission_kill_switch(Some(variant)).unwrap();
+            assert_eq!(
+                level,
+                MissionKillSwitchLevel::SafeMode,
+                "failed for {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_switch_hard_stop_variants() {
+        for variant in &["hard_stop", "hard-stop", "hardstop"] {
+            let level = mcp_parse_mission_kill_switch(Some(variant)).unwrap();
+            assert_eq!(
+                level,
+                MissionKillSwitchLevel::HardStop,
+                "failed for {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_switch_case_insensitive() {
+        let level = mcp_parse_mission_kill_switch(Some("SAFE_MODE")).unwrap();
+        assert_eq!(level, MissionKillSwitchLevel::SafeMode);
+    }
+
+    #[test]
+    fn kill_switch_with_whitespace() {
+        let level = mcp_parse_mission_kill_switch(Some("  hard_stop  ")).unwrap();
+        assert_eq!(level, MissionKillSwitchLevel::HardStop);
+    }
+
+    #[test]
+    fn kill_switch_invalid_returns_error() {
+        let err = mcp_parse_mission_kill_switch(Some("bogus")).unwrap_err();
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("bogus"));
+        assert!(err.hint.as_ref().unwrap().contains("off"));
+    }
+
+    // ========================================================================
+    // mcp_mission_failure_catalog Tests
+    // ========================================================================
+
+    #[test]
+    fn failure_catalog_covers_every_failure_code() {
+        let catalog = mcp_mission_failure_catalog();
+        assert_eq!(
+            catalog.len(),
+            crate::plan::MissionFailureCode::ALL.len(),
+            "catalog must surface exactly one entry per MissionFailureCode variant"
+        );
+    }
+
+    /// Anti-drift guard (ft-dfnoe): the catalog must be a faithful projection of
+    /// the canonical `MissionFailureCode` enum — same variants, same
+    /// reason/error code strings — so wa.mission_explain never advertises a
+    /// failure mode a mission cannot produce, nor omits one it can.
+    #[test]
+    fn failure_catalog_matches_mission_failure_code_contract() {
+        let catalog = mcp_mission_failure_catalog();
+        for (entry, code) in catalog
+            .iter()
+            .zip(crate::plan::MissionFailureCode::ALL.iter().copied())
+        {
+            assert_eq!(entry.code, format!("{code:?}"), "catalog code drifted");
+            assert_eq!(
+                entry.reason_code,
+                code.reason_code(),
+                "catalog reason_code drifted from MissionFailureCode::reason_code()"
+            );
+            assert_eq!(
+                entry.error_code,
+                code.error_code(),
+                "catalog error_code drifted from MissionFailureCode::error_code()"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_catalog_codes_are_unique() {
+        let catalog = mcp_mission_failure_catalog();
+        let mut codes = std::collections::HashSet::new();
+        for entry in &catalog {
+            assert!(codes.insert(&entry.code), "duplicate code: {}", entry.code);
+        }
+    }
+
+    #[test]
+    fn failure_catalog_error_codes_have_prefix() {
+        let catalog = mcp_mission_failure_catalog();
+        for entry in &catalog {
+            assert!(
+                entry.error_code.starts_with("robot.mission_"),
+                "error_code {} missing canonical robot.mission_ prefix",
+                entry.error_code
+            );
+        }
+    }
+
+    #[test]
+    fn failure_catalog_includes_kill_switch() {
+        let catalog = mcp_mission_failure_catalog();
+        assert!(catalog.iter().any(|e| e.code == "KillSwitchActivated"));
+    }
+
+    // ========================================================================
+    // mcp_tx_transition_info Tests
+    // ========================================================================
+
+    #[test]
+    fn tx_transition_from_planned_has_entries() {
+        let transitions = mcp_tx_transition_info(MissionTxState::Planned);
+        assert!(
+            !transitions.is_empty(),
+            "Planned state should have transitions"
+        );
+    }
+
+    #[test]
+    fn tx_transition_committed_includes_compensating() {
+        let transitions = mcp_tx_transition_info(MissionTxState::Committed);
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.kind == "compensate" && t.to == "compensating"),
+            "Committed txs should advertise the rollback path"
+        );
+    }
+
+    #[test]
+    fn tx_transition_compensating_includes_both_success_terminal_states() {
+        let transitions = mcp_tx_transition_info(MissionTxState::Compensating);
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.kind == "complete" && t.to == "compensated"),
+            "Compensating txs should advertise the compensated terminal state"
+        );
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.kind == "complete" && t.to == "rolled_back"),
+            "Compensating txs should advertise the rolled_back terminal state"
+        );
+    }
+
+    // ========================================================================
+    // mcp_mission_lifecycle_transitions Tests
+    // ========================================================================
+
+    #[test]
+    fn lifecycle_transitions_from_planning_has_entries() {
+        let transitions = mcp_mission_lifecycle_transitions(MissionLifecycleState::Planning);
+        assert!(
+            !transitions.is_empty(),
+            "Planning state should have transitions"
+        );
+    }
+
+    #[test]
+    fn lifecycle_transitions_completed_is_terminal() {
+        let transitions = mcp_mission_lifecycle_transitions(MissionLifecycleState::Completed);
+        // Completed is a terminal state - should have no outgoing transitions
+        assert!(
+            transitions.is_empty(),
+            "Completed should be terminal, got {} transitions",
+            transitions.len()
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_entries_have_from_field() {
+        let transitions = mcp_mission_lifecycle_transitions(MissionLifecycleState::Running);
+        for t in &transitions {
+            assert_ne!(t.from, "");
+            assert_ne!(t.to, "");
+            assert_ne!(t.kind, "");
+        }
+    }
+
+    // ========================================================================
+    // mcp_build_mission_assignments Tests
+    // ========================================================================
+
+    #[test]
+    fn assignments_empty_mission() {
+        let mission = make_mission_with_assignments(vec![]);
+        let (matched, counters, total) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert!(matched.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(counters.approved, 0);
+        assert_eq!(counters.unresolved, 0);
+    }
+
+    #[test]
+    fn assignments_single_pending() {
+        let a = make_assignment("a1", "agent-1", ApprovalState::NotRequired, None);
+        let mission = make_mission_with_assignments(vec![a]);
+        let (matched, counters, total) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert_eq!(total, 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].run_state, "pending");
+        assert_eq!(matched[0].agent_state, "not_required");
+        assert_eq!(matched[0].action_state, "ready");
+        assert_eq!(counters.approved, 1); // NotRequired counts as approved
+        assert_eq!(counters.unresolved, 1); // No outcome yet
+    }
+
+    #[test]
+    fn assignments_succeeded_outcome() {
+        let a = make_assignment(
+            "a1",
+            "agent-1",
+            ApprovalState::Approved {
+                approved_by: "op".to_string(),
+                approved_at_ms: 1,
+                approval_code_hash: "hash".to_string(),
+            },
+            Some(Outcome::Success {
+                reason_code: "done".to_string(),
+                completed_at_ms: 2,
+            }),
+        );
+        let mission = make_mission_with_assignments(vec![a]);
+        let (matched, counters, _) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert_eq!(matched[0].run_state, "succeeded");
+        assert_eq!(matched[0].action_state, "completed");
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.approved, 1);
+    }
+
+    #[test]
+    fn assignments_failed_outcome_has_codes() {
+        let a = make_assignment(
+            "a1",
+            "agent-1",
+            ApprovalState::NotRequired,
+            Some(Outcome::Failed {
+                reason_code: "timeout".to_string(),
+                error_code: "E001".to_string(),
+                completed_at_ms: 3,
+            }),
+        );
+        let mission = make_mission_with_assignments(vec![a]);
+        let (matched, counters, _) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert_eq!(matched[0].run_state, "failed");
+        assert_eq!(matched[0].reason_code.as_deref(), Some("timeout"));
+        assert_eq!(matched[0].error_code.as_deref(), Some("E001"));
+        assert_eq!(counters.failed, 1);
+    }
+
+    #[test]
+    fn assignments_pending_approval_is_blocked() {
+        let a = make_assignment(
+            "a1",
+            "agent-1",
+            ApprovalState::Pending {
+                requested_by: "op".to_string(),
+                requested_at_ms: 1,
+            },
+            None,
+        );
+        let mission = make_mission_with_assignments(vec![a]);
+        let (matched, counters, _) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert_eq!(matched[0].action_state, "blocked");
+        assert_eq!(matched[0].agent_state, "pending");
+        assert_eq!(counters.pending_approval, 1);
+    }
+
+    #[test]
+    fn assignments_filter_by_run_state() {
+        let a1 = make_assignment("a1", "agent-1", ApprovalState::NotRequired, None);
+        let a2 = make_assignment(
+            "a2",
+            "agent-2",
+            ApprovalState::NotRequired,
+            Some(Outcome::Success {
+                reason_code: "ok".to_string(),
+                completed_at_ms: 1,
+            }),
+        );
+        let mission = make_mission_with_assignments(vec![a1, a2]);
+        let mut filters = empty_filters();
+        filters.run_state = Some("succeeded".to_string());
+        let (matched, _, total) = mcp_build_mission_assignments(&mission, &filters);
+        assert_eq!(total, 1);
+        assert_eq!(matched[0].assignment_id, "a2");
+    }
+
+    #[test]
+    fn assignments_filter_by_assignee() {
+        let a1 = make_assignment("a1", "agent-1", ApprovalState::NotRequired, None);
+        let a2 = make_assignment("a2", "agent-2", ApprovalState::NotRequired, None);
+        let mission = make_mission_with_assignments(vec![a1, a2]);
+        let mut filters = empty_filters();
+        filters.assignee = Some("agent-2".to_string());
+        let (matched, _, total) = mcp_build_mission_assignments(&mission, &filters);
+        assert_eq!(total, 1);
+        assert_eq!(matched[0].assignee, "agent-2");
+    }
+
+    #[test]
+    fn assignments_limit_truncates() {
+        let assignments: Vec<Assignment> = (0..10)
+            .map(|i| {
+                make_assignment(
+                    &format!("a{i}"),
+                    &format!("agent-{i}"),
+                    ApprovalState::NotRequired,
+                    None,
+                )
+            })
+            .collect();
+        let mission = make_mission_with_assignments(assignments);
+        let mut filters = empty_filters();
+        filters.limit = Some(3);
+        let (matched, _, total) = mcp_build_mission_assignments(&mission, &filters);
+        assert_eq!(total, 10);
+        assert_eq!(matched.len(), 3);
+    }
+
+    #[test]
+    fn assignments_counters_track_all_states() {
+        let a1 = make_assignment(
+            "a1",
+            "ag1",
+            ApprovalState::NotRequired,
+            Some(Outcome::Success {
+                reason_code: "ok".to_string(),
+                completed_at_ms: 1,
+            }),
+        );
+        let a2 = make_assignment(
+            "a2",
+            "ag2",
+            ApprovalState::NotRequired,
+            Some(Outcome::Failed {
+                reason_code: "err".to_string(),
+                error_code: "E1".to_string(),
+                completed_at_ms: 2,
+            }),
+        );
+        let a3 = make_assignment(
+            "a3",
+            "ag3",
+            ApprovalState::Denied {
+                denied_by: "op".to_string(),
+                denied_at_ms: 3,
+                reason_code: "no".to_string(),
+            },
+            None,
+        );
+        let a4 = make_assignment(
+            "a4",
+            "ag4",
+            ApprovalState::NotRequired,
+            Some(Outcome::Cancelled {
+                reason_code: "abort".to_string(),
+                completed_at_ms: 4,
+            }),
+        );
+        let mission = make_mission_with_assignments(vec![a1, a2, a3, a4]);
+        let (_, counters, _) = mcp_build_mission_assignments(&mission, &empty_filters());
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.failed, 1);
+        assert_eq!(counters.denied, 1);
+        assert_eq!(counters.cancelled, 1);
+        assert_eq!(counters.approved, 3); // NotRequired counts as approved
+        assert_eq!(counters.unresolved, 1); // a3 has no outcome
+    }
+
+    // ========================================================================
+    // mission_tx_prepare_gate_inputs Tests
+    // ========================================================================
+
+    #[test]
+    fn prepare_gate_inputs_match_step_count() {
+        let contract = make_tx_contract(3);
+        let inputs = crate::plan::tx_prepare_gate_inputs_allow_all(&contract);
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0].step_id, TxStepId("step-0".to_string()));
+        assert_eq!(inputs[2].step_id, TxStepId("step-2".to_string()));
+    }
+
+    #[test]
+    fn prepare_gate_inputs_all_pass_by_default() {
+        let contract = make_tx_contract(2);
+        let inputs = crate::plan::tx_prepare_gate_inputs_allow_all(&contract);
+        for input in &inputs {
+            assert!(input.policy_passed);
+            assert!(input.reservation_available);
+            assert!(input.approval_satisfied);
+            assert!(input.target_liveness);
+        }
+    }
+
+    // ========================================================================
+    // mission_tx_commit_step_inputs Tests
+    // ========================================================================
+
+    #[test]
+    fn commit_step_inputs_all_succeed() {
+        let contract = make_tx_contract(3);
+        let inputs = crate::plan::mission_tx_commit_step_inputs(&contract, None, 999);
+        assert_eq!(inputs.len(), 3);
+        for input in &inputs {
+            assert!(input.success);
+            assert_eq!(input.reason_code, "commit_step_succeeded");
+            assert!(input.error_code.is_none());
+            assert_eq!(input.completed_at_ms, 999);
+        }
+    }
+
+    #[test]
+    fn commit_step_inputs_one_fails() {
+        let contract = make_tx_contract(3);
+        let inputs = crate::plan::mission_tx_commit_step_inputs(&contract, Some("step-1"), 1000);
+        assert!(inputs[0].success);
+        assert!(!inputs[1].success);
+        assert_eq!(inputs[1].reason_code, "commit_step_failed_injected");
+        assert_eq!(inputs[1].error_code.as_deref(), Some("FTX3999"));
+        assert!(inputs[2].success);
+    }
+
+    // ========================================================================
+    // mission_tx_synthetic_commit_report Tests
+    // ========================================================================
+
+    #[test]
+    fn synthetic_commit_report_basic() {
+        let contract = make_tx_contract(2);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 5000);
+        assert_eq!(report.tx_id, TxId("tx-001".to_string()));
+        assert_eq!(report.plan_id, TxPlanId("plan-001".to_string()));
+        assert_eq!(report.committed_count, 2);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.skipped_count, 0);
+        assert_eq!(report.completed_at_ms, 5000);
+        assert!(report.error_code.is_none());
+    }
+
+    #[test]
+    fn synthetic_commit_report_all_steps_committed() {
+        let contract = make_tx_contract(3);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
+        assert_eq!(report.step_results.len(), 3);
+        for result in &report.step_results {
+            assert!(result.outcome.is_committed());
+            assert_eq!(result.decision_path, "rollback_synthetic_commit_report");
+        }
+    }
+
+    // ========================================================================
+    // mission_tx_compensation_inputs Tests
+    // ========================================================================
+
+    #[test]
+    fn compensation_inputs_from_committed_report() {
+        let contract = make_tx_contract(2);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
+        let inputs = crate::plan::mission_tx_compensation_inputs(&report, None, 200);
+        assert_eq!(inputs.len(), 2);
+        for input in &inputs {
+            assert!(input.success);
+            assert_eq!(input.reason_code, "compensation_succeeded");
+            assert!(input.error_code.is_none());
+            assert_eq!(input.completed_at_ms, 200);
+        }
+    }
+
+    #[test]
+    fn compensation_inputs_one_fails() {
+        let contract = make_tx_contract(3);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
+        let inputs = crate::plan::mission_tx_compensation_inputs(&report, Some("step-1"), 300);
+        assert!(inputs[0].success);
+        assert!(!inputs[1].success);
+        assert_eq!(inputs[1].reason_code, "compensation_failed_injected");
+        assert_eq!(inputs[1].error_code.as_deref(), Some("FTX4999"));
+        assert!(inputs[2].success);
+    }
+
+    // ========================================================================
+    // File I/O functions (temp dir based)
+    // ========================================================================
+
+    #[test]
+    fn load_tx_contract_not_found() {
+        let path = Path::new("/nonexistent/tx-active.json");
+        let err = mcp_load_mission_tx_contract_from_path(path).unwrap_err();
+        assert_eq!(err.code, MCP_ERR_WORKFLOW);
+        assert!(err.hint.is_some());
+    }
+
+    /// [ft-up6u2] Oversize tx contract file must be rejected before
+    /// `read_to_string` buffers the full content. Mirrors the
+    /// pattern-pack `load_pack_from_file_rejects_oversize_yaml`
+    /// regression in patterns.rs.
+    #[test]
+    fn load_tx_contract_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-tx.json");
+        // Fabricate a file that's larger than the 16 MiB cap by
+        // padding JSON with spaces. Shape doesn't matter — parser
+        // never sees the bytes.
+        let target_bytes = (super::MAX_TX_CONTRACT_BYTES as usize) + 64;
+        let mut body = String::with_capacity(target_bytes);
+        body.push_str("{\"comment\":\"");
+        while body.len() < target_bytes - 2 {
+            body.push(' ');
+        }
+        body.push_str("\"}");
+        std::fs::write(&path, &body).unwrap();
+
+        let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message
+                .contains(&format!("{}", super::MAX_TX_CONTRACT_BYTES)),
+            "rejection must cite the cap value, got: {}",
+            err.message
+        );
+    }
+
+    /// [ft-up6u2] Same oversize guard for mission files.
+    #[test]
+    fn load_mission_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-mission.json");
+        let target_bytes = (super::MAX_MISSION_BYTES as usize) + 64;
+        let mut body = String::with_capacity(target_bytes);
+        body.push_str("{\"pad\":\"");
+        while body.len() < target_bytes - 2 {
+            body.push(' ');
+        }
+        body.push_str("\"}");
+        std::fs::write(&path, &body).unwrap();
+
+        let err = mcp_load_mission_from_path(&path).unwrap_err();
+        assert_eq!(err.code, "robot.mission_oversize");
+        assert!(
+            err.message
+                .contains(&format!("{}", super::MAX_MISSION_BYTES)),
+            "rejection must cite the cap value, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn load_tx_contract_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx.json");
+        std::fs::write(&path, "not json").unwrap();
+        let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+    }
+
+    #[test]
+    fn load_tx_contract_empty_steps_fails_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx.json");
+        // Serialize a real contract to get correct serde format, then empty its steps
+        let mut contract = make_tx_contract(1);
+        contract.plan.steps.clear();
+        let json = serde_json::to_string(&contract).unwrap();
+        std::fs::write(&path, json).unwrap();
+        let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+    }
+
+    #[test]
+    fn load_mission_not_found() {
+        let path = Path::new("/nonexistent/active.json");
+        let err = mcp_load_mission_from_path(path).unwrap_err();
+        assert_eq!(err.code, "robot.mission_not_found");
+    }
+
+    #[test]
+    fn load_mission_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        std::fs::write(&path, "garbage").unwrap();
+        let err = mcp_load_mission_from_path(&path).unwrap_err();
+        assert_eq!(err.code, "robot.mission_invalid_json");
+    }
+
+    #[test]
+    fn save_and_load_mission_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let mut mission = make_mission_with_assignments(vec![]);
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        mission.title = "durably changed".to_string();
+        let receipt = mcp_save_mission_to_path(guard, &mut mission).unwrap();
+        assert!(receipt.changed);
+        assert_eq!(receipt.current.revision, 1);
+        let loaded = mcp_load_mission_from_path(&path).unwrap();
+        assert_eq!(loaded.mission_id.0, mission.mission_id.0);
+        assert_eq!(loaded.title, mission.title);
+    }
+
+    // [ft-wxqbt] mcp_save_mission_tx_contract_to_path must use the
+    // tmp+rename atomic-write pattern so a mid-write crash cannot
+    // corrupt the tx contract file. We can't directly simulate a
+    // crash in a unit test, but we CAN assert the observable
+    // consequences of the pattern:
+    //   1. After a successful save, the target file exists and the
+    //      sibling .tmp file does NOT exist (rename consumed it).
+    //   2. An overwrite (save to an existing target) produces the
+    //      new contents, and the .tmp sibling is still absent after
+    //      the rename.
+    //   3. The write is byte-identical to serde_json::to_string_pretty
+    //      of the contract, so no accidental transform slipped in.
+    // Absence of the .tmp sibling is the key invariant: a direct
+    // fs::write would never create it, so its ABSENCE + presence of
+    // the target file together attest that the tmp+rename path ran.
+    #[test]
+    fn save_tx_contract_is_atomic_rename_ft_wxqbt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-active.json");
+        let baseline = make_tx_contract(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&baseline).unwrap()).unwrap();
+        let guard = crate::tx_execution::acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        // The lock names the contract canonically, and saves must name it
+        // the same way, as the tools do. A temporary directory is under a
+        // symlink on macOS (/var), so its own spelling is not that name.
+        let path = guard.authoritative_path().to_path_buf();
+
+        // First save replaces the existing authoritative contract.
+        let contract = make_tx_contract(3);
+        super::mcp_save_mission_tx_contract_to_path(&guard, &path, &contract).unwrap();
+        assert!(path.exists(), "target file must exist after save");
+        assert!(
+            !std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".recovery.tmp")
+            }),
+            "ft-wxqbt: recovery temp must not linger after successful rename: {}",
+            path.display()
+        );
+
+        // Bytes on disk exactly match pretty-serialized contract —
+        // rules out any accidental transform slipped in by the
+        // tmp-write path.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let expected = serde_json::to_string_pretty(&contract).unwrap();
+        assert_eq!(on_disk, expected);
+
+        // Second save with a new contract: overwrite the target
+        // atomically. Old contents must be gone; .tmp must still
+        // be absent.
+        let contract2 = make_tx_contract(5);
+        super::mcp_save_mission_tx_contract_to_path(&guard, &path, &contract2).unwrap();
+        assert!(
+            !std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".recovery.tmp")
+            }),
+            "ft-wxqbt: recovery temp must not linger on overwrite"
+        );
+        let on_disk2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk2,
+            serde_json::to_string_pretty(&contract2).unwrap(),
+            "overwrite must reflect the new contract"
+        );
+        assert_ne!(on_disk2, on_disk, "overwrite must replace contents");
+
+        // Round-trip through the load path to prove the file is
+        // still parseable after the atomic replace — the
+        // validation is what mcp_load_mission_tx_contract_from_path
+        // actually runs in production.
+        let loaded = mcp_load_mission_tx_contract_from_path(&path).unwrap();
+        assert_eq!(loaded.plan.steps.len(), 5);
+    }
+
+    #[test]
+    fn mission_stale_revision_cannot_overwrite_accepted_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mission.json");
+        let mission = make_mission_with_assignments(vec![]);
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let stale = crate::tx_execution::MissionRevisionToken::from_mission(&mission).unwrap();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, Some(&stale))
+                .unwrap();
+        let mut mission = guard.mission().clone();
+        mission
+            .abort_mission("test-operator", "stop", None, mission.created_at_ms, None)
+            .unwrap();
+        let receipt = mcp_save_mission_to_path(guard, &mut mission).unwrap();
+        assert_eq!(
+            receipt.owner_acknowledgement,
+            "unavailable_no_mission_driver"
+        );
+        let accepted = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, Some(&stale))
+                .err()
+                .unwrap(),
+            crate::tx_execution::MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), accepted);
+    }
+
+    // An already-open descriptor must retain the old snapshot after replacement.
+    #[cfg(unix)]
+    #[test]
+    fn save_mission_is_atomic_rename_ft_wxqbt() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.json");
+        let mission = make_mission_with_assignments(vec![]);
+        let original = serde_json::to_vec(&mission).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        let old_inode = old_file.metadata().unwrap().ino();
+        let guard =
+            crate::tx_execution::MissionMutationGuard::acquire(dir.path(), &path, None).unwrap();
+        let mut mission2 = mission.clone();
+        mission2.title = "renamed".to_string();
+        mcp_save_mission_to_path(guard, &mut mission2).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), old_inode);
+        let mut old_bytes = Vec::new();
+        old_file.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, original);
+        let loaded = mcp_load_mission_from_path(&path).unwrap();
+        assert_eq!(loaded.title, "renamed");
+    }
+
+    #[test]
+    fn resolve_tx_file_path_explicit() {
+        // [ft-security-mcp-path-traversal] pre-fix this test expected the
+        // raw path to pass through unchecked. After the fix,
+        // `/tmp/my-tx.json` is outside the workspace root (cwd) and must
+        // be rejected — arbitrary-file read/write via MCP is gone.
+        let result = mcp_resolve_mission_tx_file_path(&Config::default(), Some("/tmp/my-tx.json"));
+        let err = result.expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("escapes workspace root"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_mission_file_path_explicit() {
+        // [ft-security-mcp-path-traversal] same containment check as tx.
+        let result =
+            mcp_resolve_mission_file_path(&Config::default(), Some("/tmp/my-mission.json"));
+        let err = result.expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
+
+    // ── ft-security-mcp-path-traversal regression suite ─────────────
+
+    /// `Path`'s `PartialEq` compares `components()`, which silently discards a
+    /// trailing separator — so `assert_eq!` calls `…/c.json/` equal to
+    /// `…/c.json`. Resolved paths are handed straight to `open(2)`, which
+    /// rejects the former with ENOTDIR. Compare the raw `OsStr` so a resolver
+    /// that emits an unusable path cannot pass (see ft-nam3s).
+    #[track_caller]
+    fn assert_path_identity(actual: &Path, expected: &Path) {
+        assert_eq!(
+            actual.as_os_str(),
+            expected.as_os_str(),
+            "resolved path must match byte-for-byte, not merely component-wise"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_parent_dir_component() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let err = resolve_workspace_scoped_path(root, "../../../etc/passwd")
+            .expect_err("`..` must be rejected before any filesystem touch");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("parent-directory component"),
+            "expected ../ rejection message, got {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_absolute_path_outside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let err = resolve_workspace_scoped_path(root, "/etc/passwd")
+            .expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_relative_under_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir mission/");
+        std::fs::write(root.join("mission/contract.json"), "{}").expect("write fixture");
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
+        assert_path_identity(
+            &resolved,
+            &root.join("mission/contract.json").canonicalize().unwrap(),
+        );
+    }
+
+    /// A resolved path is an I/O identity, not just a containment verdict:
+    /// every caller feeds it straight to `File::open` / `try_exists`. Assert
+    /// the usable property directly so no future normalization slip can
+    /// return a path that authorizes but cannot be opened (ft-nam3s).
+    #[test]
+    fn resolve_workspace_scoped_path_returns_an_openable_path_for_existing_targets() {
+        const FIXTURE_BODY: &str = "{\"marker\":\"ft-nam3s\"}";
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir mission/");
+        std::fs::write(root.join("mission/contract.json"), FIXTURE_BODY).expect("write fixture");
+
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
+
+        let rendered = resolved.as_os_str().to_string_lossy();
+        assert!(
+            !rendered.ends_with(std::path::MAIN_SEPARATOR),
+            "resolved file path must not carry a trailing separator, got {rendered:?}"
+        );
+        // `open(2)` is the operation every caller actually performs, and it is
+        // the one that rejects a trailing separator with ENOTDIR.
+        let body = std::fs::read_to_string(&resolved).expect("resolved path must be openable");
+        assert_eq!(body, FIXTURE_BODY, "resolved path must address the fixture");
+        assert!(
+            resolved.try_exists().expect("try_exists must not error"),
+            "resolved path must stat cleanly"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_save_path_for_nonexistent_target() {
+        // Save paths address a file that does not yet exist; the helper
+        // must canonicalize the nearest existing ancestor and still
+        // enforce containment.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir");
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/not-yet.json").expect("valid save path");
+        assert_path_identity(
+            &resolved,
+            &root
+                .join("mission")
+                .canonicalize()
+                .unwrap()
+                .join("not-yet.json"),
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_absolute_path_inside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir");
+        std::fs::write(root.join("mission/inside.json"), "{}").expect("write");
+        let abs = root.join("mission/inside.json");
+        let resolved = resolve_workspace_scoped_path(root, &abs.to_string_lossy())
+            .expect("absolute path inside root must be accepted");
+        assert_path_identity(&resolved, &abs.canonicalize().unwrap());
+    }
+
+    /// The authorization result is also the I/O identity. Retargeting an
+    /// intermediate symlink after resolution must not redirect a subsequent
+    /// read to a different in-workspace file.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_existing_path_survives_intermediate_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+        let original_dir = workspace_root.join("original");
+        let foreign_dir = workspace_root.join("foreign");
+        std::fs::create_dir_all(&original_dir).expect("create original directory");
+        std::fs::create_dir_all(&foreign_dir).expect("create foreign directory");
+        std::fs::write(original_dir.join("contract.json"), "original")
+            .expect("write original contract");
+        std::fs::write(foreign_dir.join("contract.json"), "foreign")
+            .expect("write foreign contract");
+
+        let active_alias = workspace_root.join("active");
+        let replacement_alias = workspace_root.join("active-next");
+        symlink(&original_dir, &active_alias).expect("create original alias");
+        symlink(&foreign_dir, &replacement_alias).expect("create replacement alias");
+
+        let resolved = resolve_workspace_scoped_path(workspace_root, "active/contract.json")
+            .expect("resolve original alias");
+        assert_eq!(
+            resolved,
+            original_dir.join("contract.json").canonicalize().unwrap()
+        );
+
+        std::fs::rename(&replacement_alias, &active_alias).expect("retarget alias atomically");
+        assert_eq!(
+            std::fs::read_to_string(&resolved).expect("read frozen identity"),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_alias.join("contract.json"))
+                .expect("read retargeted alias"),
+            "foreign"
+        );
+    }
+
+    /// [ft-security-mcp-path-traversal regression — session 2026-04-21]
+    ///
+    /// Victory-lap review of 30988e53 surfaced one branch not yet
+    /// covered: a symlink that lives INSIDE the workspace but points
+    /// OUTSIDE. `Path::canonicalize()` resolves symlinks, so the
+    /// nearest-existing-ancestor walk must notice the escape when the
+    /// canonicalized target is not prefixed by `workspace_root
+    /// .canonicalize()`. This test pins that behavior.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_symlink_escape_to_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+
+        // Target outside the workspace — canonicalize must resolve
+        // the symlink to this, and the containment check must reject.
+        let outside_target = outer.path().join("secret.json");
+        std::fs::write(&outside_target, "{}").expect("write outside target");
+
+        // Attacker-planted symlink INSIDE the workspace pointing out.
+        std::fs::create_dir_all(workspace_root.join("mission"))
+            .expect("mkdir mission/ in workspace");
+        let symlink_path = workspace_root.join("mission/escape.json");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        // User supplies the relative path the symlink lives at — a
+        // path that *looks* workspace-scoped but canonicalizes out.
+        let err = resolve_workspace_scoped_path(workspace_root, "mission/escape.json")
+            .expect_err("symlink pointing outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("escapes workspace root"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+    }
+
+    /// [ft-security-mcp-path-traversal regression — session 2026-04-21]
+    ///
+    /// Confirms the containment check remains tight against an
+    /// absolute path whose canonical form escapes via symlink. Guards
+    /// against a future refactor that might accept absolute paths
+    /// without canonicalizing the target.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_absolute_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+
+        let outside_target = outer.path().join("id_rsa");
+        std::fs::write(&outside_target, "PRIVATE KEY").expect("write target");
+
+        std::fs::create_dir_all(workspace_root.join("mission")).expect("mkdir");
+        let symlink_path = workspace_root.join("mission/link.json");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        // User supplies the ABSOLUTE path of the symlink inside the
+        // workspace. Without canonicalize+containment, an attacker
+        // could exfiltrate arbitrary files.
+        let err = resolve_workspace_scoped_path(workspace_root, &symlink_path.to_string_lossy())
+            .expect_err("absolute symlink escape must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
+
+    /// Existing malformed paths inside the workspace must fail closed.
+    /// A symlink loop is not "a missing target", so the ancestor walk
+    /// must not silently skip upward and accept the parent directory.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_symlink_loop_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+        std::fs::create_dir_all(workspace_root.join("mission")).expect("mkdir mission/");
+
+        let loop_path = workspace_root.join("mission/loop.json");
+        symlink("loop.json", &loop_path).expect("create self-referential symlink");
+
+        let err = resolve_workspace_scoped_path(workspace_root, "mission/loop.json")
+            .expect_err("symlink loop must be rejected instead of treated as missing");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("not accessible")
+                || err.message.contains("Too many levels of symbolic links")
+                || err.message.contains("filesystem loop"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+    }
+}

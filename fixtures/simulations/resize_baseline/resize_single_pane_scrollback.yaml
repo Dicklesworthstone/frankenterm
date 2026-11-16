@@ -1,0 +1,70 @@
+name: resize_single_pane_scrollback
+description: "Single-pane deterministic resize + font churn with very large synthetic scrollback"
+duration: "6s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "1001"
+  scale_profile: single_pane_large_scrollback
+  pane_count: "1"
+  tab_count: "1"
+  scrollback_lines: "20000"
+  font_steps: "5"
+panes:
+  - id: 0
+    title: "resize-lab"
+    domain: local
+    cwd: /tmp/resize-baseline
+    window_id: 0
+    tab_id: 0
+    cols: 140
+    rows: 42
+    initial_content: "$ benchmark\n"
+events:
+  - at: "0.2s"
+    pane: 0
+    action: generate_scrollback
+    content: "20000x120"
+    comment: "Synthetic large scrollback payload"
+  - at: "1.0s"
+    pane: 0
+    action: resize
+    content: "200x60"
+  - at: "1.3s"
+    pane: 0
+    action: set_font_size
+    content: "1.10"
+  - at: "1.6s"
+    pane: 0
+    action: resize
+    content: "80x24"
+  - at: "1.9s"
+    pane: 0
+    action: set_font_size
+    content: "0.95"
+  - at: "2.2s"
+    pane: 0
+    action: resize
+    content: "240x72"
+  - at: "2.5s"
+    pane: 0
+    action: set_font_size
+    content: "1.25"
+  - at: "2.8s"
+    pane: 0
+    action: resize
+    content: "100x28"
+  - at: "3.1s"
+    pane: 0
+    action: marker
+    name: steady_state
+expectations:
+  - contains:
+      pane: 0
+      text: "[scrollback:000000]"
+  - contains:
+      pane: 0
+      text: "[FONT_SIZE:1.25]"
+  - contains:
+      pane: 0
+      text: "[MARKER:steady_state]"

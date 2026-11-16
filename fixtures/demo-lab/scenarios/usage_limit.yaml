@@ -1,0 +1,51 @@
+name: usage_limit
+description: "Usage-limit detection, event emission, and safe recovery guidance demo"
+duration: "4s"
+metadata:
+  suite: demo_lab
+  suite_version: "1"
+  seed: "demo-lab-v1-usage-limit-2002"
+  scenario_id: usage_limit
+  redaction_tier: t1_standard
+  proof_category: golden
+  live_services: "none"
+panes:
+  - id: 2001
+    title: "demo-agent"
+    domain: local
+    cwd: /tmp/frankenterm-demo
+    window_id: 0
+    tab_id: 0
+    cols: 100
+    rows: 28
+    initial_content: "agent: running local fixture only\n"
+events:
+  - at: "0.200s"
+    pane: 2001
+    action: append
+    content: "provider response: usage limit reached; retry after the reset window\n"
+  - at: "0.500s"
+    pane: 2001
+    action: marker
+    name: usage_limit_detected
+  - at: "0.800s"
+    pane: 2001
+    action: append
+    content: "recovery guidance: pause automation, preserve state, and notify the operator without external calls\n"
+  - at: "1.100s"
+    pane: 2001
+    action: marker
+    name: policy_safe_recovery_guidance
+expectations:
+  - contains:
+      pane: 2001
+      text: "usage limit reached"
+  - contains:
+      pane: 2001
+      text: "[MARKER:usage_limit_detected]"
+  - contains:
+      pane: 2001
+      text: "pause automation, preserve state"
+  - contains:
+      pane: 2001
+      text: "[MARKER:policy_safe_recovery_guidance]"

@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.tool_use",
+    "agent_type": "claude_code",
+    "event_type": "session.tool_use",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "tool_name": "Write"
+    },
+    "matched_text": "Tool call: Write"
+  }
+]

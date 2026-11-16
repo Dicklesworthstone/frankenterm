@@ -1,0 +1,223 @@
+import Foundation
+@testable import FrankenTermKit
+#if canImport(CryptoKit)
+typealias TestCryptography = AppleCryptography
+#else
+import CTestOpenSSL
+
+/// Independent, test-only Linux oracle. Never linked into an Apple product.
+struct TestCryptography: AirGapCryptography {
+    func sha256(_ bytes: Data) -> Data {
+        var result = Data(count: 32)
+        _ = result.withUnsafeMutableBytes { output in
+            bytes.withUnsafeBytes { input in SHA256(input.bindMemory(to: UInt8.self).baseAddress, bytes.count, output.bindMemory(to: UInt8.self).baseAddress) }
+        }
+        return result
+    }
+    func hmacSHA1(key: Data, message: Data) throws -> Data {
+        guard key.count == 20, !message.isEmpty, message.count <= FTLimit.text else {
+            throw FTError.limit("known_hosts.hmac_input")
+        }
+        var result = Data(count: 20), length: UInt32 = 20
+        let succeeded = result.withUnsafeMutableBytes { output in
+            key.withUnsafeBytes { salt in
+                message.withUnsafeBytes { input in
+                    HMAC(EVP_sha1(), salt.baseAddress, Int32(key.count), input.bindMemory(to: UInt8.self).baseAddress,
+                         message.count, output.bindMemory(to: UInt8.self).baseAddress, &length) != nil
+                }
+            }
+        }
+        guard succeeded, length == 20 else { throw FTError.storage }
+        return result
+    }
+    func randomBytes(count: Int) throws -> Data { Data((0..<count).map { _ in UInt8.random(in: 0...255) }) }
+    func hmac(_ key: Data, _ input: Data) -> Data {
+        var output = Data(count: 32), length: UInt32 = 32
+        _ = output.withUnsafeMutableBytes { out in
+            key.withUnsafeBytes { key in
+                input.withUnsafeBytes { bytes in
+                    HMAC(EVP_sha256(), key.baseAddress, Int32(key.count), bytes.bindMemory(to: UInt8.self).baseAddress,
+                         input.count, out.bindMemory(to: UInt8.self).baseAddress, &length)
+                }
+            }
+        }
+        return output
+    }
+    private func key(_ secret: Data, _ salt: Data) -> Data {
+        hmac(hmac(salt, secret), Data("FrankenTerm/FTAG/v1/code-key".utf8) + Data([1]))
+    }
+    func seal(_ plaintext: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data {
+        try aeadSeal(plaintext, key: key(secret, salt), nonce: nonce, aad: aad)
+    }
+    func aeadSeal(_ plaintext: Data, key: Data, nonce: Data, aad: Data) throws -> Data {
+        guard key.count == 32, nonce.count == 12 else { throw FTError.authentication }
+        guard let context = EVP_CIPHER_CTX_new() else { throw FTError.storage }
+        defer { EVP_CIPHER_CTX_free(context) }
+        guard key.withUnsafeBytes({ k in nonce.withUnsafeBytes({ n in
+            EVP_EncryptInit_ex(context, EVP_chacha20_poly1305(), nil, k.bindMemory(to: UInt8.self).baseAddress, n.bindMemory(to: UInt8.self).baseAddress)
+        }) }) == 1 else { throw FTError.authentication }
+        var length: Int32 = 0
+        guard aad.withUnsafeBytes({ EVP_EncryptUpdate(context, nil, &length, $0.bindMemory(to: UInt8.self).baseAddress, Int32(aad.count)) }) == 1 else { throw FTError.authentication }
+        var output = Data(count: plaintext.count + 16)
+        guard output.withUnsafeMutableBytes({ out in plaintext.withUnsafeBytes({ input in
+            EVP_EncryptUpdate(context, out.bindMemory(to: UInt8.self).baseAddress, &length, input.bindMemory(to: UInt8.self).baseAddress, Int32(plaintext.count))
+        }) }) == 1 else { throw FTError.authentication }
+        let written = Int(length)
+        guard output.withUnsafeMutableBytes({ EVP_EncryptFinal_ex(context, $0.bindMemory(to: UInt8.self).baseAddress!.advanced(by: written), &length) }) == 1 else { throw FTError.authentication }
+        guard written + Int(length) == plaintext.count else { throw FTError.authentication }
+        var tag = Data(count: 16)
+        guard tag.withUnsafeMutableBytes({ EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_GET_TAG, 16, $0.baseAddress) }) == 1 else { throw FTError.authentication }
+        output.count = plaintext.count
+        return output + tag
+    }
+    func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data {
+        try aeadOpen(ciphertextAndTag, key: key(secret, salt), nonce: nonce, aad: aad)
+    }
+    func aeadOpen(_ ciphertextAndTag: Data, key: Data, nonce: Data, aad: Data) throws -> Data {
+        guard key.count == 32, nonce.count == 12 else { throw FTError.authentication }
+        guard ciphertextAndTag.count >= 16, let context = EVP_CIPHER_CTX_new() else { throw FTError.authentication }
+        defer { EVP_CIPHER_CTX_free(context) }
+        let ciphertext = Data(ciphertextAndTag.dropLast(16))
+        var tag = Data(ciphertextAndTag.suffix(16)), length: Int32 = 0
+        guard key.withUnsafeBytes({ k in nonce.withUnsafeBytes({ n in
+            EVP_DecryptInit_ex(context, EVP_chacha20_poly1305(), nil, k.bindMemory(to: UInt8.self).baseAddress, n.bindMemory(to: UInt8.self).baseAddress)
+        }) }) == 1 else { throw FTError.authentication }
+        guard aad.withUnsafeBytes({ EVP_DecryptUpdate(context, nil, &length, $0.bindMemory(to: UInt8.self).baseAddress, Int32(aad.count)) }) == 1 else { throw FTError.authentication }
+        var output = Data(count: ciphertext.count + 16)
+        guard output.withUnsafeMutableBytes({ out in ciphertext.withUnsafeBytes({ input in
+            EVP_DecryptUpdate(context, out.bindMemory(to: UInt8.self).baseAddress, &length, input.bindMemory(to: UInt8.self).baseAddress, Int32(ciphertext.count))
+        }) }) == 1 else { throw FTError.authentication }
+        let written = Int(length)
+        guard tag.withUnsafeMutableBytes({ EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_TAG, 16, $0.baseAddress) }) == 1 else { throw FTError.authentication }
+        guard output.withUnsafeMutableBytes({ EVP_DecryptFinal_ex(context, $0.bindMemory(to: UInt8.self).baseAddress!.advanced(by: written), &length) }) == 1 else { throw FTError.authentication }
+        output.count = written + Int(length)
+        return output
+    }
+    func ed25519PublicKey(seed: Data) throws -> Data {
+        guard seed.count == 32, let key = seed.withUnsafeBytes({
+            EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nil, $0.bindMemory(to: UInt8.self).baseAddress, seed.count)
+        }) else { throw FTError.malformed("test.ed25519") }
+        defer { EVP_PKEY_free(key) }
+        var result = Data(count: 32), count = 32
+        guard result.withUnsafeMutableBytes({ EVP_PKEY_get_raw_public_key(key, $0.bindMemory(to: UInt8.self).baseAddress, &count) }) == 1,
+              count == 32 else { throw FTError.malformed("test.ed25519") }
+        return result
+    }
+    func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data {
+        guard scalar.count == curve.scalarBytes else { throw FTError.malformed("test.ecdsa") }
+        let nid: Int32
+        switch curve {
+        case .nistp256: nid = NID_X9_62_prime256v1
+        case .nistp384: nid = NID_secp384r1
+        case .nistp521: nid = NID_secp521r1
+        }
+        let count = curve.publicByteCount
+        var result = Data(count: count)
+        guard result.withUnsafeMutableBytes({ output in
+            scalar.withUnsafeBytes { bytes in
+                ft_test_ecdsa_public_key(nid, bytes.bindMemory(to: UInt8.self).baseAddress, scalar.count,
+                                        output.bindMemory(to: UInt8.self).baseAddress, count)
+            }
+        }) == 1 else { throw FTError.malformed("test.ecdsa") }
+        return result
+    }
+    func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data {
+        guard !der.isEmpty, der.count <= LegacyECDSASourceKey.maximumDERBytes else { throw FTError.limit("key.ecdsa_der") }
+        try Task.checkCancellation()
+        let nid: Int32
+        switch curve {
+        case .nistp256: nid = NID_X9_62_prime256v1
+        case .nistp384: nid = NID_secp384r1
+        case .nistp521: nid = NID_secp521r1
+        }
+        var result = Data(count: curve.scalarBytes)
+        let status = result.withUnsafeMutableBytes { output in
+            der.withUnsafeBytes { input in
+                ft_test_import_ecdsa_private_scalar(nid, input.bindMemory(to: UInt8.self).baseAddress, der.count,
+                    output.bindMemory(to: UInt8.self).baseAddress, curve.scalarBytes)
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.malformed("key.ecdsa_der") }
+            try curve.validateScalar(result)
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
+    func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data {
+        try OpenSSHSourcePrimitives.bcryptPBKDF(passphrase: passphrase, salt: salt, rounds: rounds,
+                                              outputByteCount: outputByteCount, sha512: { output, input, count in
+            _ = SHA512(input, count, output)
+        })
+    }
+    /// Independent OpenSSL oracle for protected PKCS#8 source files. The
+    /// production implementation uses the maintained Swift crypto dependency.
+    func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
+                prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
+        guard (1...1024).contains(passphrase.count), (8...64).contains(salt.count),
+              (1...1_000_000).contains(iterations), [16, 24, 32].contains(outputByteCount) else {
+            throw FTError.limit("test.pkcs8_kdf")
+        }
+        try Task.checkCancellation()
+        let digest: OpaquePointer?
+        switch prf {
+        case .hmacSHA1: digest = EVP_sha1()
+        case .hmacSHA256: digest = EVP_sha256()
+        case .hmacSHA384: digest = EVP_sha384()
+        case .hmacSHA512: digest = EVP_sha512()
+        }
+        var result = Data(count: outputByteCount)
+        let status = result.withUnsafeMutableBytes { output in
+            passphrase.withUnsafeBytes { password in
+                salt.withUnsafeBytes { saltBytes in
+                    PKCS5_PBKDF2_HMAC(password.bindMemory(to: CChar.self).baseAddress, Int32(passphrase.count),
+                        saltBytes.bindMemory(to: UInt8.self).baseAddress, Int32(salt.count), Int32(iterations),
+                        digest, Int32(outputByteCount), output.bindMemory(to: UInt8.self).baseAddress)
+                }
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.authentication }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
+    func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: false)
+    }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: true)
+    }
+    private func decryptSourceAES(_ ciphertext: Data, key: Data, iv: Data, cbc: Bool) throws -> Data {
+        try OpenSSHSourcePrimitives.validateAES(ciphertext: ciphertext, key: key, iv: iv)
+        var result = Data(count: ciphertext.count)
+        let status = result.withUnsafeMutableBytes { output in
+            ciphertext.withUnsafeBytes { input in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBytes { ivBytes in
+                        let decrypt = cbc ? ft_test_aes_cbc : ft_test_aes_ctr
+                        return decrypt(input.bindMemory(to: UInt8.self).baseAddress, ciphertext.count,
+                            keyBytes.bindMemory(to: UInt8.self).baseAddress, key.count,
+                            ivBytes.bindMemory(to: UInt8.self).baseAddress, iv.count,
+                            output.bindMemory(to: UInt8.self).baseAddress, ciphertext.count)
+                    }
+                }
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.authentication }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
+}
+#endif

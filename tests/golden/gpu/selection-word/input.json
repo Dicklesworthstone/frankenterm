@@ -1,0 +1,21 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Selection word fixture: double-click should isolate one token.",
+    "alpha beta highlighted_word gamma delta epsilon",
+    "Neighboring words must remain untinted for word selection."
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 27,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 11,
+    "end_row": 1,
+    "end_col": 26
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

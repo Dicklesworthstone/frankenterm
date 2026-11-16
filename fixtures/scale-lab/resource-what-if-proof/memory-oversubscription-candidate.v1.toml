@@ -1,0 +1,19 @@
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "resource what-if memory oversubscription candidate"
+description = "Failure-oriented replay candidate that violates memory-tier safety"
+base_trace = "fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json"
+created_at = "2026-05-06T00:00:00Z"
+author = "fixture"
+
+[[memory_tier]]
+knob_id = "memory.hot_resident_budget_bytes"
+domain = "memory_tier"
+value = "1048576"
+reason = "failure fixture forces hot resident oversubscription"
+
+[[memory_tier]]
+knob_id = "memory.search_cache_budget_bytes"
+domain = "memory_tier"
+value = "1048576"
+reason = "failure fixture removes search cache safety headroom"

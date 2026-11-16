@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-why.json",
+  "title": "WA Robot Why Response",
+  "description": "Schema for the data field when calling 'wa robot why <code>'. Explains error codes, policy denials, and workflow triggers.",
+  "type": "object",
+  "required": ["code", "category", "title", "explanation"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "description": "The code that was looked up (e.g., 'deny.alt_screen', 'robot.policy_denied')"
+    },
+    "category": {
+      "type": "string",
+      "description": "Category extracted from the code (e.g., 'deny', 'robot', 'workflow')"
+    },
+    "title": {
+      "type": "string",
+      "description": "Brief scenario description (e.g., 'Send denied because alt-screen is active')"
+    },
+    "explanation": {
+      "type": "string",
+      "description": "Multi-line detailed explanation"
+    },
+    "suggestions": {
+      "type": "array",
+      "description": "Actionable suggestions for resolution",
+      "items": {
+        "type": "string"
+      }
+    },
+    "see_also": {
+      "type": "array",
+      "description": "Related commands or documentation references",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

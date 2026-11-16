@@ -1,0 +1,11 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "fancy tab bar scene\nthe tab shows the snapshot title\n\u001b[48;5;24m blue row \u001b[0m\u001b[?25l",
+    "config": {
+      "enable_tab_bar": true,
+      "use_fancy_tab_bar": true,
+      "hide_tab_bar_if_only_one_tab": false
+    }
+  }
+}

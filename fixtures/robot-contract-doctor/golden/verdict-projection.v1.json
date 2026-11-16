@@ -1,0 +1,23 @@
+{
+  "contract_id": "ft.robot_contract_doctor.v1",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-7h5da.13.7",
+  "overall_status": "pass_with_tracked_exceptions",
+  "api_surface_count": 38,
+  "matrix_surface_count": 38,
+  "dimensions": ["ENV", "PAR", "POL", "RED", "TOON", "ERR"],
+  "tracked_gap_ids": ["G1", "G3", "G4"],
+  "tracked_gap_beads": ["ft-5puf0", "ft-6mmyp", "ft-7h5da.13.6"],
+  "fail_closed_step_names": [
+    "Robot/MCP Contract Doctor static verdict",
+    "Robot/MCP Contract Doctor attestation slot",
+    "Robot/MCP Contract Doctor cargo verdict"
+  ],
+  "claim_boundaries": [
+    "does_not_claim_all_policy_audit_rows_complete",
+    "does_not_claim_dom_redaction_gap_closed",
+    "does_not_claim_local_cargo_as_remote_proof",
+    "does_not_claim_mission_pause_resume_abort_in_api_surface_all",
+    "does_not_mutate_panes_services_or_beads"
+  ]
+}

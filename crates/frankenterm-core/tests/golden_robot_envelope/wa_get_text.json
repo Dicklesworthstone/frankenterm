@@ -1,0 +1,59 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "escapes": {
+        "default": false,
+        "description": "Include escape sequences",
+        "type": "boolean"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": ["json", "toon"],
+        "maxLength": 16,
+        "type": "string"
+      },
+      "pane_id": {
+        "description": "The pane ID to read from",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "tail": {
+        "default": 500,
+        "description": "Number of lines to return (from end). Server enforces 1..=10000 (ft-ii8ss); requests outside this range return policy_error.",
+        "maximum": 10000,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": ["pane_id"],
+    "type": "object"
+  },
+  "invalid_args_response": {
+    "code": "InvalidParams",
+    "data": null,
+    "kind": "framework_error",
+    "message": "Input validation failed: root.tail: value is below minimum"
+  },
+  "success_envelope": {
+    "data": {
+      "escapes_included": false,
+      "pane_id": 4242,
+      "tail_lines": 2,
+      "text": "gamma\ndelta",
+      "truncated": true,
+      "truncation_info": {
+        "original_bytes": 23,
+        "original_lines": 4,
+        "returned_bytes": 11,
+        "returned_lines": 2
+      }
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.12.0"
+  },
+  "tool": "wa.get_text"
+}

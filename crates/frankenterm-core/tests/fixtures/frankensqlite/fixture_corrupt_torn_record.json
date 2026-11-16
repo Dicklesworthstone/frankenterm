@@ -1,0 +1,251 @@
+{
+  "fixture_schema_version": "ft.fixture.v1",
+  "name": "fixture_corrupt_torn_record",
+  "checksum": 8441365177703005811,
+  "expected_event_count": 11,
+  "events": [
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-0",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000000,
+      "recorded_at_ms": 1700000000001,
+      "sequence": 0,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-0",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-1",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000001,
+      "recorded_at_ms": 1700000000002,
+      "sequence": 1,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-1",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-2",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000002,
+      "recorded_at_ms": 1700000000003,
+      "sequence": 2,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-2",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-3",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000003,
+      "recorded_at_ms": 1700000000004,
+      "sequence": 3,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-3",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-4",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000004,
+      "recorded_at_ms": 1700000000005,
+      "sequence": 4,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-4",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-5",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000005,
+      "recorded_at_ms": 1700000000006,
+      "sequence": 5,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-5",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-6",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000006,
+      "recorded_at_ms": 1700000000007,
+      "sequence": 6,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-6",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-7",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000007,
+      "recorded_at_ms": 1700000000008,
+      "sequence": 7,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-7",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-8",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000008,
+      "recorded_at_ms": 1700000000009,
+      "sequence": 8,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-8",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "fix-1-9",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000009,
+      "recorded_at_ms": 1700000000010,
+      "sequence": 9,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "ok-9",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    },
+    {
+      "schema_version": "ft.recorder.event.v1",
+      "event_id": "",
+      "pane_id": 1,
+      "session_id": "fixture-session",
+      "workflow_id": null,
+      "correlation_id": null,
+      "source": "robot_mode",
+      "occurred_at_ms": 1700000000010,
+      "recorded_at_ms": 1700000000011,
+      "sequence": 10,
+      "causality": {
+        "parent_event_id": null,
+        "trigger_event_id": null,
+        "root_event_id": null
+      },
+      "event_type": "ingress_text",
+      "text": "torn-record",
+      "encoding": "utf8",
+      "redaction": "none",
+      "ingress_kind": "send_text"
+    }
+  ],
+  "checkpoints": []
+}

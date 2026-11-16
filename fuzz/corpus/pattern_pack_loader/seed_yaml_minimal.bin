@@ -1,0 +1,9 @@
+name: test-pack
+version: 0.1.0
+rules:
+  - id: codex.test
+    agent_type: codex
+    severity: warning
+    event_type: usage_limit
+    description: Test rule
+    anchors: ["limit reached"]

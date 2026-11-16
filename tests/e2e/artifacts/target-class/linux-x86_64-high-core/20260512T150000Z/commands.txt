@@ -1,0 +1,2 @@
+rch --json workers capabilities
+scripts/run-target-class-cockpit.sh FT_TARGET_CLASS_SKU=linux-x86_64-high-core

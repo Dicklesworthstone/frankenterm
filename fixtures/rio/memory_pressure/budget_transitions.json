@@ -1,0 +1,32 @@
+{
+  "description": "Memory budget tier transition fixture for R4",
+  "note": "Rio has fixed scrollback allocation. FrankenTerm adds dynamic budget tiers.",
+  "transitions": [
+    {
+      "trigger": "system_memory_available > 70%",
+      "tier": "normal",
+      "scrollback_limit": "unlimited",
+      "cache_policy": "aggressive_prefetch",
+      "queue_depth": "unbounded"
+    },
+    {
+      "trigger": "system_memory_available <= 70%",
+      "tier": "constrained",
+      "scrollback_limit": "50000 lines per pane",
+      "cache_policy": "lru_eviction",
+      "queue_depth": 1000
+    },
+    {
+      "trigger": "system_memory_available <= 30%",
+      "tier": "emergency",
+      "scrollback_limit": "5000 lines per pane",
+      "cache_policy": "aggressive_eviction",
+      "queue_depth": 100
+    }
+  ],
+  "hysteresis": {
+    "upward_delay_ms": 5000,
+    "downward_delay_ms": 1000,
+    "note": "Delay tier escalation to avoid flapping"
+  }
+}

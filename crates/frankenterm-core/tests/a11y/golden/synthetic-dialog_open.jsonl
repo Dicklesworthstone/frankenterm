@@ -1,0 +1,4 @@
+{"kind":"focus_changed","ts_ms":0,"role":"Terminal","name":"pane:42"}
+{"kind":"window_opened","ts_ms":5,"role":"Dialog","name":"Confirm close pane"}
+{"kind":"focus_changed","ts_ms":6,"role":"Dialog","name":"Confirm close pane"}
+{"kind":"announce_message","ts_ms":7,"priority":"assertive","value":"Confirm close pane"}

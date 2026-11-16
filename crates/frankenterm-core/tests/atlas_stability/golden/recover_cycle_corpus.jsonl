@@ -1,0 +1,4 @@
+{"ts_ms":100,"glyph_id":"ascii_A","region_id":10,"eviction_frame":120,"recover_frame":121,"pre_evict_hash":"sha256:ascii-a","post_recover_hash":"sha256:ascii-a","ssim_ppm":1000000,"ssim_floor_ppm":999000}
+{"ts_ms":110,"glyph_id":"emoji_grinning","region_id":11,"eviction_frame":120,"recover_frame":121,"pre_evict_hash":"sha256:emoji-grinning-pre","post_recover_hash":"sha256:emoji-grinning-post","ssim_ppm":999000,"ssim_floor_ppm":999000}
+{"ts_ms":120,"glyph_id":"cjk_water","region_id":12,"eviction_frame":120,"recover_frame":121,"pre_evict_hash":"sha256:cjk-water","post_recover_hash":"sha256:cjk-water","ssim_ppm":1000000,"ssim_floor_ppm":999000}
+{"ts_ms":130,"glyph_id":"latin_combining_acute","region_id":13,"eviction_frame":120,"recover_frame":121,"pre_evict_hash":"sha256:combining-acute","post_recover_hash":"sha256:combining-acute","ssim_ppm":1000000,"ssim_floor_ppm":999000}

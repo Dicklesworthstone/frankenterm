@@ -1,0 +1,170 @@
+[
+  {
+    "scenario": "resize_single_pane_scrollback",
+    "executed_resize_events": 8,
+    "flame_samples": 40,
+    "stage_summary": {
+      "input_intent": {
+        "samples": 8,
+        "avg_duration_ns": 25.875,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "scheduler_queueing": {
+        "samples": 8,
+        "avg_duration_ns": 21.0,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "logical_reflow": {
+        "samples": 8,
+        "avg_duration_ns": 471557.125,
+        "p95_duration_ns": 3000,
+        "max_duration_ns": 3766917
+      },
+      "render_prep": {
+        "samples": 8,
+        "avg_duration_ns": 15.5,
+        "p95_duration_ns": 41,
+        "max_duration_ns": 42
+      },
+      "presentation": {
+        "samples": 8,
+        "avg_duration_ns": 30520.75,
+        "p95_duration_ns": 4458,
+        "max_duration_ns": 234708
+      }
+    },
+    "scheduler_queue_depth": {
+      "max_before": 8,
+      "max_after": 7,
+      "min_after": 0
+    }
+  },
+  {
+    "scenario": "resize_multi_tab_storm",
+    "executed_resize_events": 24,
+    "flame_samples": 120,
+    "stage_summary": {
+      "input_intent": {
+        "samples": 24,
+        "avg_duration_ns": 15.666666666666666,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "scheduler_queueing": {
+        "samples": 24,
+        "avg_duration_ns": 20.75,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "logical_reflow": {
+        "samples": 24,
+        "avg_duration_ns": 96428.66666666667,
+        "p95_duration_ns": 285833,
+        "max_duration_ns": 325917
+      },
+      "render_prep": {
+        "samples": 24,
+        "avg_duration_ns": 20.875,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "presentation": {
+        "samples": 24,
+        "avg_duration_ns": 6503.458333333333,
+        "p95_duration_ns": 12875,
+        "max_duration_ns": 15750
+      }
+    },
+    "scheduler_queue_depth": {
+      "max_before": 24,
+      "max_after": 23,
+      "min_after": 0
+    }
+  },
+  {
+    "scenario": "font_churn_multi_pane",
+    "executed_resize_events": 24,
+    "flame_samples": 120,
+    "stage_summary": {
+      "input_intent": {
+        "samples": 24,
+        "avg_duration_ns": 24.416666666666668,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "scheduler_queueing": {
+        "samples": 24,
+        "avg_duration_ns": 13.875,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "logical_reflow": {
+        "samples": 24,
+        "avg_duration_ns": 48784.875,
+        "p95_duration_ns": 190834,
+        "max_duration_ns": 216084
+      },
+      "render_prep": {
+        "samples": 24,
+        "avg_duration_ns": 15.625,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "presentation": {
+        "samples": 24,
+        "avg_duration_ns": 3781.2083333333335,
+        "p95_duration_ns": 8792,
+        "max_duration_ns": 10708
+      }
+    },
+    "scheduler_queue_depth": {
+      "max_before": 24,
+      "max_after": 23,
+      "min_after": 0
+    }
+  },
+  {
+    "scenario": "mixed_scale_soak",
+    "executed_resize_events": 28,
+    "flame_samples": 140,
+    "stage_summary": {
+      "input_intent": {
+        "samples": 28,
+        "avg_duration_ns": 17.892857142857142,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "scheduler_queueing": {
+        "samples": 28,
+        "avg_duration_ns": 23.857142857142858,
+        "p95_duration_ns": 42,
+        "max_duration_ns": 42
+      },
+      "logical_reflow": {
+        "samples": 28,
+        "avg_duration_ns": 197849.64285714287,
+        "p95_duration_ns": 530000,
+        "max_duration_ns": 671167
+      },
+      "render_prep": {
+        "samples": 28,
+        "avg_duration_ns": 46.142857142857146,
+        "p95_duration_ns": 84,
+        "max_duration_ns": 417
+      },
+      "presentation": {
+        "samples": 28,
+        "avg_duration_ns": 15785.67857142857,
+        "p95_duration_ns": 38875,
+        "max_duration_ns": 118250
+      }
+    },
+    "scheduler_queue_depth": {
+      "max_before": 28,
+      "max_after": 27,
+      "min_after": 0
+    }
+  }
+]

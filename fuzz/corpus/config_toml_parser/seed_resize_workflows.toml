@@ -1,0 +1,28 @@
+[wa]
+watcher_poll_ms = 250
+capture_max_bytes = 131072
+
+[wa.resize]
+scorecard_enabled = true
+gate_enabled = true
+fast_threshold_ms = 500
+slow_threshold_ms = 2000
+max_pending = 20
+
+[wa.patterns]
+enable_builtin = true
+extra_pack_dirs = ["/home/user/.config/frankenterm/packs"]
+
+[[wa.workflows]]
+name = "deploy"
+trigger = "deploy_complete"
+steps = ["notify", "log"]
+
+[[ssh_domains]]
+name = "prod"
+remote_address = "prod.example.com"
+username = "deploy"
+
+[[ssh_domains]]
+name = "staging"
+remote_address = "staging.example.com"

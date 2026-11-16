@@ -1,0 +1,53 @@
+{
+  "collected": 30,
+  "watcher_running_true": 30,
+  "observed_panes": {
+    "p50": 12,
+    "p95": 12,
+    "max": 12
+  },
+  "window_start_ms": 1771050762725,
+  "window_end_ms": 1771050822732,
+  "metrics": {
+    "avg_storage_lock_wait_ms": {
+      "p50": 0.0009748110831234256,
+      "p95": 0.001134638922888617,
+      "max": 0.001134638922888617
+    },
+    "max_storage_lock_wait_ms": {
+      "p50": 0.007,
+      "p95": 0.018,
+      "max": 0.018
+    },
+    "storage_lock_contention_events": {
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "avg_storage_lock_hold_ms": {
+      "p50": 2.4145340050377837,
+      "p95": 2.810253365973072,
+      "max": 2.810253365973072
+    },
+    "max_storage_lock_hold_ms": {
+      "p50": 41.086,
+      "p95": 41.086,
+      "max": 41.086
+    },
+    "cursor_snapshot_bytes_last": {
+      "p50": 196452,
+      "p95": 198308,
+      "max": 198308
+    },
+    "cursor_snapshot_bytes_max": {
+      "p50": 196452,
+      "p95": 198308,
+      "max": 198308
+    },
+    "avg_cursor_snapshot_bytes": {
+      "p50": 98226.0,
+      "p95": 131586.66666666666,
+      "max": 131586.66666666666
+    }
+  }
+}

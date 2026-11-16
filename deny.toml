@@ -1,0 +1,392 @@
+# cargo-deny configuration — bans on forbidden runtime crates.
+#
+# Bead: ft-i2eni.3 (BR-RC-DOCTRINE.G1.3). The doctrine block in
+# AGENTS.md states that direct `tokio` usage is forbidden in
+# first-party crates: the canonical async runtime is asupersync,
+# threaded through the `runtime_async` wrapper. This file enforces
+# the rule at the dependency-graph level — even if a `use tokio::…`
+# slipped past the source-level grep guards in the
+# eradication-tracking modules, a direct `tokio` dependency in a
+# first-party crate's Cargo.toml fails the cargo-deny check.
+#
+# Layered enforcement (each layer catches different escape paths):
+#   1. AGENTS.md doctrine — informs reviewers.
+#   2. wa_22x4r_no_tokio_test_in_supported_paths.rs — catches new
+#      `#[tokio::test]` attributes.
+#   3. dependency_eradication.rs / forbidden_dep_guards.rs —
+#      catches `use tokio::` in source.
+#   4. THIS FILE — catches `tokio = …` in any first-party
+#      Cargo.toml manifest.
+#
+# Reproduce locally:
+#   cargo install cargo-deny
+#   cargo deny check bans
+
+[graph]
+# Restrict the dep-graph audit to one target so transitive resolution
+# stays deterministic. The rule we enforce is structural (any
+# first-party Cargo.toml naming `tokio` as a direct dep) and applies
+# regardless of build target.
+all-features = false
+no-default-features = false
+
+[bans]
+# Multiple versions of the same crate are allowed (the workspace
+# already manages drift through the [workspace.dependencies] table);
+# the doctrine ban is structural, not version-related.
+multiple-versions = "allow"
+
+# Wildcard upper bounds in production dependencies are a separate
+# concern; ft-i2eni.3 only addresses tokio. A future bead can flip
+# this to "deny" once the workspace tightens its ranges.
+wildcards = "allow"
+
+# Highlight which version of a banned crate is the most-used so the
+# eradication target is obvious.
+highlight = "all"
+
+# Direct dependencies on `tokio` are forbidden in every first-party
+# crate. Tokio still reaches the graph transitively through reputable
+# third-party HTTP/embedding stacks (fastembed -> hf-hub -> reqwest ->
+# hyper/h2/tower), which is out of scope for the doctrine.
+#
+# `wrappers` makes the ban edge-sensitive: `tokio` is accepted only as a
+# direct dependency of the listed third-party crates, so any first-party
+# crate declaring `tokio` itself still fails even when it also depends on
+# one of these parents. (`skip-tree` cannot express this: it only affects
+# duplicate-version detection, never `deny` entries.) If a dependency
+# update adds another third-party direct parent, cargo-deny names it; add
+# it here only after confirming it is not first-party.
+# `crates/frankenterm-core/tests/no_direct_tokio_manifest_edges.rs` checks
+# the same rule on declared manifest edges at Cargo-test time (ft-xxfwy.70).
+deny = [
+    { name = "tokio", wrappers = [
+        "h2",
+        "hyper",
+        "hyper-tls",
+        "hyper-util",
+        "reqwest",
+        "tokio-native-tls",
+        "tokio-util",
+        "tower",
+    ], reason = "Direct `tokio` dependency forbidden in first-party crates; use `runtime_async` wrappers backed by asupersync. See AGENTS.md doctrine + ft-i2eni.3 + ft-xxfwy.70." },
+]
+
+[advisories]
+# Bead scope is bans only; advisories audit ships under a separate
+# follow-up bead. Current cargo-deny versions model unmaintained findings as a
+# dependency scope rather than a lint level, and removed the old `notice`
+# setting. Preserve the former all-dependency visibility; the CI action invokes
+# `check bans` and therefore does not grade advisory classes in that lane.
+yanked = "warn"
+unmaintained = "all"
+# Same for unsoundness advisories: the default scope reports only direct
+# dependencies, which hid transitive findings such as faster-hex
+# RUSTSEC-2026-0306 (fixed by aba622a37) and lru RUSTSEC-2026-0253 (lru 0.16
+# via ftui-text and tantivy; open, #119).
+unsound = "all"
+ignore = []
+
+[licenses]
+# Licenses audit configuration for ft-wv4xd.
+# Permissive default allows standard OSI/permissive licenses plus
+# LGPL-2.1-only (used by xcb-imdkit on X11/XCB for IME).
+# First-party workspace crates use the MIT license with custom OpenAI/Anthropic rider.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+    "LGPL-2.1-only",
+    "NCSA",
+    "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+]
+confidence-threshold = 0.4
+
+[licenses.private]
+ignore = true
+
+# Clarifications for custom-rider first-party and git workspace dependencies
+# whose LICENSE files include the OpenAI/Anthropic rider.
+[[licenses.clarify]]
+name = "frankenterm"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-alloc"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-ars"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-atlas-pack-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-audit-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-cass-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-caut-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-config-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-connector-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-connectors"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-error-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-fleet"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-mcp"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-policy-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-replay"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-replay-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-resource-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-tantivy"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-telemetry-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-core-x11-resize-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-flight-recorder"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-gui"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-pty-guardian"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-mux-server"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-mux-server-impl"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-redactor"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-sigpipe"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankenterm-topo"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ft-perf-gate"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ft-test-log"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "fr-config"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "fr-expire"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "fr-persist"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "fr-protocol"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "fr-store"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch-core"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch-embed"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch-fusion"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch-index"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "frankensearch-lexical"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-backend"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-core"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-i18n"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-layout"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-render"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-runtime"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-style"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-text"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+name = "ftui-widgets"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+
+
+
+[sources]
+# Restrict sources to crates.io + the explicit git repos we vendor
+# from. Future bead can tighten this to require allow-list-only
+# sources once we audit every git pin in [patch] sections.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,14 @@
+{
+  "mode": "\u001b[>31;1u",
+  "flags": 31,
+  "events": [
+    {
+      "key": "a",
+      "modifiers": ["SHIFT"]
+    },
+    {
+      "key": "x",
+      "modifiers": ["CTRL", "ALT"]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+[package]
+name = "procinfo-funcs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+config.workspace = true
+procinfo.workspace = true

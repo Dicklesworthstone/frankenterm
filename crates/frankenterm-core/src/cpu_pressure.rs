@@ -1,0 +1,1062 @@
+//! CPU pressure monitoring for adaptive scheduling.
+//!
+//! Samples system CPU utilization and classifies it into pressure tiers
+//! that the runtime uses to throttle capture frequency and shed load.
+//!
+//! - **Linux**: reads `/proc/pressure/cpu` (PSI avg10) for accurate
+//!   pressure stall information.
+//! - **macOS**: reads 1-minute load average via `sysctl` and normalizes
+//!   by CPU count (no PSI equivalent, no unsafe FFI required).
+//! - **Windows**: reads global CPU usage through `sysinfo`.
+//! - **Other**: returns `Green` (no monitoring available).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the CPU pressure monitor.
+///
+/// All counters are `AtomicU64` because `CpuPressureMonitor` methods take `&self`.
+#[derive(Debug, Default)]
+pub struct CpuPressureTelemetry {
+    /// Total sample() calls.
+    samples_taken: AtomicU64,
+    /// Samples that classified as Green.
+    green_samples: AtomicU64,
+    /// Samples that classified as Yellow.
+    yellow_samples: AtomicU64,
+    /// Samples that classified as Orange.
+    orange_samples: AtomicU64,
+    /// Samples that classified as Red.
+    red_samples: AtomicU64,
+}
+
+impl CpuPressureTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CpuPressureTelemetrySnapshot {
+        CpuPressureTelemetrySnapshot {
+            samples_taken: self.samples_taken.load(Ordering::Relaxed),
+            green_samples: self.green_samples.load(Ordering::Relaxed),
+            yellow_samples: self.yellow_samples.load(Ordering::Relaxed),
+            orange_samples: self.orange_samples.load(Ordering::Relaxed),
+            red_samples: self.red_samples.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable snapshot of CPU pressure telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuPressureTelemetrySnapshot {
+    pub samples_taken: u64,
+    pub green_samples: u64,
+    pub yellow_samples: u64,
+    pub orange_samples: u64,
+    pub red_samples: u64,
+}
+
+// =============================================================================
+// Pressure tiers
+// =============================================================================
+
+/// CPU pressure severity tier.
+///
+/// Aligned with [`BackpressureTier`](crate::backpressure::BackpressureTier) for
+/// composable decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuPressureTier {
+    /// CPU utilization below warning threshold.
+    Green,
+    /// Moderate pressure — reduce non-essential work.
+    Yellow,
+    /// High pressure — pause idle panes, reduce capture frequency.
+    Orange,
+    /// Critical — emergency throttling, kill stuck processes.
+    Red,
+}
+
+impl std::fmt::Display for CpuPressureTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Green => write!(f, "GREEN"),
+            Self::Yellow => write!(f, "YELLOW"),
+            Self::Orange => write!(f, "ORANGE"),
+            Self::Red => write!(f, "RED"),
+        }
+    }
+}
+
+impl CpuPressureTier {
+    /// Numeric value for gauge metrics (0-3).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Green => 0,
+            Self::Yellow => 1,
+            Self::Orange => 2,
+            Self::Red => 3,
+        }
+    }
+
+    /// Suggested capture interval multiplier for this tier.
+    #[must_use]
+    pub const fn capture_interval_multiplier(self) -> u32 {
+        match self {
+            Self::Green => 1,
+            Self::Yellow => 2,
+            Self::Orange => 4,
+            Self::Red => 8,
+        }
+    }
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// CPU pressure monitoring configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpuPressureConfig {
+    /// Enable CPU pressure monitoring.
+    pub enabled: bool,
+    /// Sample interval in milliseconds.
+    pub sample_interval_ms: u64,
+    /// PSI avg10 threshold for Yellow (Linux) or CPU% for macOS.
+    pub yellow_threshold: f64,
+    /// PSI avg10 threshold for Orange.
+    pub orange_threshold: f64,
+    /// PSI avg10 threshold for Red.
+    pub red_threshold: f64,
+}
+
+impl Default for CpuPressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_interval_ms: 5000,
+            yellow_threshold: 15.0,
+            orange_threshold: 30.0,
+            red_threshold: 50.0,
+        }
+    }
+}
+
+// =============================================================================
+// CPU sample
+// =============================================================================
+
+/// A single CPU pressure sample.
+#[derive(Debug, Clone)]
+pub struct CpuSample {
+    /// Raw pressure value (PSI avg10 on Linux, load-avg% on macOS).
+    pub pressure: f64,
+    /// Classified tier based on thresholds.
+    pub tier: CpuPressureTier,
+    /// Timestamp of the sample.
+    pub sampled_at: Instant,
+}
+
+// =============================================================================
+// Monitor
+// =============================================================================
+
+/// CPU pressure monitor that samples system CPU utilization.
+///
+/// Thread-safe. Uses atomic operations for the latest tier.
+pub struct CpuPressureMonitor {
+    config: CpuPressureConfig,
+    /// Latest tier as atomic u8 (0=Green, 1=Yellow, 2=Orange, 3=Red).
+    latest_tier: Arc<AtomicU64>,
+    /// Number of logical CPUs (cached at construction).
+    ncpu: u32,
+    /// Operational telemetry counters.
+    telemetry: CpuPressureTelemetry,
+    /// Windows: persisted `sysinfo::System` for delta-based CPU usage. sysinfo
+    /// computes utilization as the delta since the previous `refresh_cpu_usage`,
+    /// so the instance must survive across samples. Safe; zero unsafe (see
+    /// docs/proposals/windows-unsafe-policy.md). Unix reads pressure from /proc
+    /// PSI (Linux) or load average (macOS) and needs no held state.
+    #[cfg(windows)]
+    cpu_system: std::sync::Mutex<Option<sysinfo::System>>,
+}
+
+impl CpuPressureMonitor {
+    /// Create a new monitor with the given configuration.
+    pub fn new(config: CpuPressureConfig) -> Self {
+        Self {
+            config,
+            latest_tier: Arc::new(AtomicU64::new(0)),
+            ncpu: detect_ncpu(),
+            telemetry: CpuPressureTelemetry::default(),
+            #[cfg(windows)]
+            cpu_system: std::sync::Mutex::new(new_windows_cpu_system()),
+        }
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &CpuPressureTelemetry {
+        &self.telemetry
+    }
+
+    /// Get the latest pressure tier (lock-free read).
+    #[must_use]
+    pub fn current_tier(&self) -> CpuPressureTier {
+        match self.latest_tier.load(Ordering::Relaxed) {
+            1 => CpuPressureTier::Yellow,
+            2 => CpuPressureTier::Orange,
+            3 => CpuPressureTier::Red,
+            _ => CpuPressureTier::Green,
+        }
+    }
+
+    /// Get an Arc to the tier atomic for sharing with other tasks.
+    #[must_use]
+    pub fn tier_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.latest_tier)
+    }
+
+    /// Take a single CPU pressure sample.
+    pub fn sample(&self) -> CpuSample {
+        let pressure = self.read_cpu_pressure();
+        let tier = self.classify(pressure);
+        self.latest_tier
+            .store(tier.as_u8() as u64, Ordering::Relaxed);
+        self.telemetry.samples_taken.fetch_add(1, Ordering::Relaxed);
+        match tier {
+            CpuPressureTier::Green => {
+                self.telemetry.green_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Yellow => {
+                self.telemetry
+                    .yellow_samples
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Orange => {
+                self.telemetry
+                    .orange_samples
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Red => {
+                self.telemetry.red_samples.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        CpuSample {
+            pressure,
+            tier,
+            sampled_at: Instant::now(),
+        }
+    }
+
+    /// Run the monitoring loop until the shutdown flag is set.
+    pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, shutdown).await;
+    }
+
+    /// Explicit quarantine for legacy non-asupersync CPU-pressure sampling.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this helper once the workspace no longer supports
+    /// non-`asupersync-runtime` sampling loops.
+    /// Run the monitoring loop against the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Short-circuits before the first sample if `cx` is already cancelled.
+    /// Otherwise each sleep between samples is bound via
+    /// [`crate::runtime_async::sleep_with_cx`], so budget-driven
+    /// cancellation from the outer scope cuts the inter-sample wait
+    /// deterministically under `LabRuntime` virtual time. Both the
+    /// `shutdown` flag and `cx.is_cancel_requested()` are checked each
+    /// iteration so either cancellation path terminates the loop
+    /// promptly without waiting on the full sample interval.
+    ///
+    /// [`run`](Self::run) now prefers the ambient current Cx under
+    /// `asupersync-runtime`; this remains the explicit inherited-Cx sibling.
+    pub async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if cx.is_cancel_requested() {
+            return;
+        }
+
+        let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
+        let mut first_tick = true;
+
+        loop {
+            if !first_tick {
+                // `sleep_with_cx` returns Err on cancellation, which we
+                // treat as "time to exit" so the loop terminates cleanly
+                // without a spurious extra sample after cancellation.
+                if crate::runtime_async::sleep_with_cx(cx, interval)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            first_tick = false;
+
+            if shutdown.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+                break;
+            }
+
+            let sample = self.sample();
+            if sample.tier >= CpuPressureTier::Yellow {
+                tracing::info!(
+                    pressure = sample.pressure,
+                    tier = %sample.tier,
+                    "CPU pressure elevated"
+                );
+            }
+        }
+    }
+
+    /// Classify a raw pressure value into a tier.
+    fn classify(&self, pressure: f64) -> CpuPressureTier {
+        if pressure >= self.config.red_threshold {
+            CpuPressureTier::Red
+        } else if pressure >= self.config.orange_threshold {
+            CpuPressureTier::Orange
+        } else if pressure >= self.config.yellow_threshold {
+            CpuPressureTier::Yellow
+        } else {
+            CpuPressureTier::Green
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Platform-specific sampling
+    // -------------------------------------------------------------------------
+
+    /// Read raw CPU pressure metric from the OS.
+    ///
+    /// - **Linux**: PSI avg10 from `/proc/pressure/cpu`
+    /// - **macOS**: 1-min load average normalized by CPU count (× 100)
+    /// - **Windows**: sysinfo global CPU usage percentage
+    /// - **Other**: always 0.0
+    fn read_cpu_pressure(&self) -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = &self.ncpu;
+            read_linux_psi_avg10()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let load = read_macos_load_avg();
+            // Normalize: load_avg / ncpu * 100 → percentage-like metric
+            (load / self.ncpu.max(1) as f64) * 100.0
+        }
+        #[cfg(windows)]
+        {
+            let _ = self.ncpu; // already per-core-averaged below
+            // sysinfo `global_cpu_usage()` is a 0–100 percentage averaged across
+            // logical CPUs — the same percentage-like scale the macOS/Linux
+            // branches produce. The refresh computes the delta since the
+            // previous refresh (i.e. over the inter-sample interval).
+            match self.cpu_system.lock() {
+                Ok(mut slot) => {
+                    // Retry a failed initialization on the next sample rather
+                    // than permanently disabling CPU monitoring.
+                    if slot.is_none() {
+                        *slot = new_windows_cpu_system();
+                    }
+                    let Some(sys) = slot.as_mut() else {
+                        return 0.0;
+                    };
+                    sys.refresh_cpu_usage();
+                    normalize_sysinfo_cpu_usage(sys.global_cpu_usage())
+                }
+                Err(_) => 0.0,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = self.ncpu; // suppress unused warning
+            0.0
+        }
+    }
+}
+
+#[cfg(windows)]
+fn new_windows_cpu_system() -> Option<sysinfo::System> {
+    match sysinfo::System::new() {
+        Ok(mut system) => {
+            // Persist the baseline for delta-based utilization samples.
+            system.refresh_cpu_usage();
+            Some(system)
+        }
+        Err(error) => {
+            tracing::warn!(?error, "Windows CPU monitoring initialization failed");
+            None
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_sysinfo_cpu_usage(usage: f32) -> f64 {
+    if usage.is_finite() {
+        f64::from(usage.clamp(0.0, 100.0))
+    } else {
+        0.0
+    }
+}
+
+// =============================================================================
+// Linux: /proc/pressure/cpu PSI
+// =============================================================================
+
+/// Read the PSI avg10 value from `/proc/pressure/cpu`.
+///
+/// Format: `some avg10=X.XX avg60=X.XX avg300=X.XX total=XXXX`
+#[cfg(target_os = "linux")]
+fn read_linux_psi_avg10() -> f64 {
+    let Ok(contents) = std::fs::read_to_string("/proc/pressure/cpu") else {
+        return 0.0;
+    };
+
+    // Parse "some avg10=X.XX ..."
+    for line in contents.lines() {
+        if line.starts_with("some") {
+            for part in line.split_whitespace() {
+                if let Some(val) = part.strip_prefix("avg10=") {
+                    return val.parse::<f64>().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+
+    0.0
+}
+
+// =============================================================================
+// macOS: load average via sysctl (safe, no FFI)
+// =============================================================================
+
+/// Read the 1-minute load average from `sysctl -n vm.loadavg` on macOS.
+///
+/// Output format: `{ 2.49 2.15 2.12 }`
+/// We parse the first (1-minute) value and normalize by CPU count to get
+/// a percentage-like pressure metric comparable to Linux PSI.
+#[cfg(target_os = "macos")]
+fn read_macos_load_avg() -> f64 {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok();
+
+    output
+        .and_then(|o| {
+            let s = String::from_utf8(o.stdout).ok()?;
+            let trimmed = s
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            trimmed.split_whitespace().next()?.parse::<f64>().ok()
+        })
+        .unwrap_or(0.0)
+}
+
+// =============================================================================
+// CPU count detection
+// =============================================================================
+
+/// Detect the number of logical CPUs, cached once at monitor creation.
+fn detect_ncpu() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.ncpu"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .map(|s| s.lines().filter(|l| l.starts_with("processor")).count() as u32)
+            .unwrap_or(1)
+            .max(1)
+    }
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism().map_or(1, |count| count.get() as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        1
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> CpuPressureConfig {
+        CpuPressureConfig {
+            enabled: true,
+            sample_interval_ms: 1000,
+            yellow_threshold: 15.0,
+            orange_threshold: 30.0,
+            red_threshold: 50.0,
+        }
+    }
+
+    #[test]
+    fn tier_ordering() {
+        assert!(CpuPressureTier::Green < CpuPressureTier::Yellow);
+        assert!(CpuPressureTier::Yellow < CpuPressureTier::Orange);
+        assert!(CpuPressureTier::Orange < CpuPressureTier::Red);
+    }
+
+    #[test]
+    fn tier_display() {
+        assert_eq!(format!("{}", CpuPressureTier::Green), "GREEN");
+        assert_eq!(format!("{}", CpuPressureTier::Red), "RED");
+    }
+
+    #[test]
+    fn tier_numeric() {
+        assert_eq!(CpuPressureTier::Green.as_u8(), 0);
+        assert_eq!(CpuPressureTier::Yellow.as_u8(), 1);
+        assert_eq!(CpuPressureTier::Orange.as_u8(), 2);
+        assert_eq!(CpuPressureTier::Red.as_u8(), 3);
+    }
+
+    #[test]
+    fn capture_interval_multiplier() {
+        assert_eq!(CpuPressureTier::Green.capture_interval_multiplier(), 1);
+        assert_eq!(CpuPressureTier::Yellow.capture_interval_multiplier(), 2);
+        assert_eq!(CpuPressureTier::Orange.capture_interval_multiplier(), 4);
+        assert_eq!(CpuPressureTier::Red.capture_interval_multiplier(), 8);
+    }
+
+    #[test]
+    fn classify_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(0.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(14.9), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn classify_yellow() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(15.0), CpuPressureTier::Yellow);
+        assert_eq!(monitor.classify(29.9), CpuPressureTier::Yellow);
+    }
+
+    #[test]
+    fn classify_orange() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(30.0), CpuPressureTier::Orange);
+        assert_eq!(monitor.classify(49.9), CpuPressureTier::Orange);
+    }
+
+    #[test]
+    fn classify_red() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(50.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(100.0), CpuPressureTier::Red);
+    }
+
+    #[test]
+    fn current_tier_default_is_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn sample_updates_tier() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let sample = monitor.sample();
+        // Load-average based pressure can exceed 100% on busy systems
+        assert!(sample.pressure >= 0.0);
+        assert_eq!(sample.tier, monitor.current_tier());
+    }
+
+    #[test]
+    fn tier_handle_shares_state() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        // Initially green
+        assert_eq!(handle.load(Ordering::Relaxed), 0);
+
+        // Manually set to Red
+        handle.store(3, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Red);
+    }
+
+    #[test]
+    fn default_config_values() {
+        let cfg = CpuPressureConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.sample_interval_ms, 5000);
+        assert!((cfg.yellow_threshold - 15.0).abs() < f64::EPSILON);
+        assert!((cfg.orange_threshold - 30.0).abs() < f64::EPSILON);
+        assert!((cfg.red_threshold - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = CpuPressureConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: CpuPressureConfig = serde_json::from_str(&json).unwrap();
+        assert!((parsed.yellow_threshold - cfg.yellow_threshold).abs() < f64::EPSILON);
+        assert!((parsed.red_threshold - cfg.red_threshold).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tier_serde_roundtrip() {
+        let tier = CpuPressureTier::Orange;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"orange\"");
+        let parsed: CpuPressureTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, tier);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_psi_parse() {
+        // If /proc/pressure/cpu exists, we should get a valid value
+        let val = read_linux_psi_avg10();
+        assert!(val >= 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_load_avg_readable() {
+        let load = read_macos_load_avg();
+        assert!(load >= 0.0, "load average should be non-negative");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cpu_pressure_normalized() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let pressure = monitor.read_cpu_pressure();
+        // Normalized load average should be non-negative
+        assert!(pressure >= 0.0);
+    }
+
+    #[test]
+    fn detect_ncpu_returns_positive() {
+        let n = detect_ncpu();
+        assert!(n >= 1, "should detect at least 1 CPU");
+    }
+
+    #[test]
+    fn ft_d61gw_sysinfo_cpu_usage_is_finite_percent() {
+        assert!((normalize_sysinfo_cpu_usage(42.5) - 42.5).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(-1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(101.0) - 100.0).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(f32::NAN) - 0.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_at_exact_thresholds() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // Exact threshold values should classify at the tier
+        assert_eq!(monitor.classify(15.0), CpuPressureTier::Yellow);
+        assert_eq!(monitor.classify(30.0), CpuPressureTier::Orange);
+        assert_eq!(monitor.classify(50.0), CpuPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_just_below_thresholds() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // Just below each threshold stays in the lower tier
+        assert_eq!(monitor.classify(14.999), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(29.999), CpuPressureTier::Yellow);
+        assert_eq!(monitor.classify(49.999), CpuPressureTier::Orange);
+    }
+
+    #[test]
+    fn classify_negative_pressure_is_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(-1.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(-100.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(f64::NEG_INFINITY), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn classify_very_high_pressure() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(1000.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(f64::MAX), CpuPressureTier::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom configuration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn custom_tight_thresholds_all_equal() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 10.0,
+            orange_threshold: 10.0,
+            red_threshold: 10.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        // At 10.0, all thresholds match → Red wins (checked first)
+        assert_eq!(monitor.classify(10.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(9.999), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn custom_very_high_thresholds() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 999.0,
+            orange_threshold: 999.0,
+            red_threshold: 999.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        // Everything below 999 is Green
+        assert_eq!(monitor.classify(100.0), CpuPressureTier::Green);
+        assert_eq!(monitor.classify(500.0), CpuPressureTier::Green);
+    }
+
+    #[test]
+    fn custom_zero_thresholds_everything_red() {
+        let config = CpuPressureConfig {
+            yellow_threshold: 0.0,
+            orange_threshold: 0.0,
+            red_threshold: 0.0,
+            ..test_config()
+        };
+        let monitor = CpuPressureMonitor::new(config);
+        assert_eq!(monitor.classify(0.0), CpuPressureTier::Red);
+        assert_eq!(monitor.classify(1.0), CpuPressureTier::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // Monitor state management
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multiple_samples_update_tier_atomically() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        // First sample sets tier based on real system load
+        let s1 = monitor.sample();
+        assert_eq!(s1.tier, monitor.current_tier());
+
+        // Second sample also updates
+        let s2 = monitor.sample();
+        assert_eq!(s2.tier, monitor.current_tier());
+    }
+
+    #[test]
+    fn tier_handle_reflects_manual_updates() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        // Set each tier via handle and verify monitor sees it
+        for (val, expected) in [
+            (0, CpuPressureTier::Green),
+            (1, CpuPressureTier::Yellow),
+            (2, CpuPressureTier::Orange),
+            (3, CpuPressureTier::Red),
+        ] {
+            handle.store(val, Ordering::Relaxed);
+            assert_eq!(monitor.current_tier(), expected);
+        }
+    }
+
+    #[test]
+    fn tier_handle_unknown_value_falls_back_to_green() {
+        let monitor = CpuPressureMonitor::new(test_config());
+        let handle = monitor.tier_handle();
+
+        // Values outside 0-3 should fall back to Green (via _ arm)
+        handle.store(99, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Green);
+
+        handle.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(monitor.current_tier(), CpuPressureTier::Green);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture interval multiplier monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capture_multiplier_increases_monotonically() {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for w in tiers.windows(2) {
+            assert!(
+                w[0].capture_interval_multiplier() < w[1].capture_interval_multiplier(),
+                "multiplier should increase: {:?}={} < {:?}={}",
+                w[0],
+                w[0].capture_interval_multiplier(),
+                w[1],
+                w[1].capture_interval_multiplier(),
+            );
+        }
+    }
+
+    #[test]
+    fn capture_multiplier_doubles_each_tier() {
+        // Green=1, Yellow=2, Orange=4, Red=8 — each doubles
+        assert_eq!(
+            CpuPressureTier::Yellow.capture_interval_multiplier(),
+            CpuPressureTier::Green.capture_interval_multiplier() * 2
+        );
+        assert_eq!(
+            CpuPressureTier::Orange.capture_interval_multiplier(),
+            CpuPressureTier::Yellow.capture_interval_multiplier() * 2
+        );
+        assert_eq!(
+            CpuPressureTier::Red.capture_interval_multiplier(),
+            CpuPressureTier::Orange.capture_interval_multiplier() * 2
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier numeric and display completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_tiers_have_distinct_as_u8() {
+        let values: Vec<u8> = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ]
+        .iter()
+        .map(|t| t.as_u8())
+        .collect();
+        let mut unique = values.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            values.len(),
+            unique.len(),
+            "all tier values must be distinct"
+        );
+    }
+
+    #[test]
+    fn all_tiers_display_uppercase() {
+        assert_eq!(format!("{}", CpuPressureTier::Yellow), "YELLOW");
+        assert_eq!(format!("{}", CpuPressureTier::Orange), "ORANGE");
+    }
+
+    #[test]
+    fn tier_serde_all_variants() {
+        for tier in [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: CpuPressureTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn tier_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Green).unwrap(),
+            "\"green\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Yellow).unwrap(),
+            "\"yellow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Orange).unwrap(),
+            "\"orange\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuPressureTier::Red).unwrap(),
+            "\"red\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serde partial
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_serde_partial_fields_uses_defaults() {
+        let json = r#"{"enabled": false}"#;
+        let parsed: CpuPressureConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.enabled);
+        // Other fields should use defaults
+        assert_eq!(parsed.sample_interval_ms, 5000);
+        assert!((parsed.yellow_threshold - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_with_custom_interval() {
+        let config = CpuPressureConfig {
+            sample_interval_ms: 100,
+            ..Default::default()
+        };
+        assert_eq!(config.sample_interval_ms, 100);
+        // Other values remain default
+        assert!(config.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // as_u8 ordering matches tier ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn as_u8_matches_ord_ordering() {
+        let tiers = [
+            CpuPressureTier::Green,
+            CpuPressureTier::Yellow,
+            CpuPressureTier::Orange,
+            CpuPressureTier::Red,
+        ];
+        for w in tiers.windows(2) {
+            assert!(
+                w[0].as_u8() < w[1].as_u8(),
+                "as_u8 should match Ord: {:?}={} < {:?}={}",
+                w[0],
+                w[0].as_u8(),
+                w[1],
+                w[1].as_u8(),
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first run entry point
+    // (ft-xbnl0.2.x slice).
+    //
+    // Pin that `run_with_cx` responds to Cx-driven cancellation without
+    // ever consuming the real 1s-min sample interval. A Cx-unaware loop
+    // (or a loop that only checks the shutdown flag) would block on the
+    // first `sleep(interval)` call and step-explode LabRuntime's max
+    // scheduling budget; if either happens, the LabRuntime report will
+    // be StuckBailout and the test will fail.
+    // -------------------------------------------------------------------------
+
+    mod labruntime_cpu_pressure {
+        use super::*;
+        use crate::test_fixtures::lab_runtime::{LabConfig, lab_runtime_test_with_config};
+
+        /// br-ft-c8x87 migration: thin shim around the lab_runtime
+        /// fixture preserving this module's worker_count(2) +
+        /// 50_000 step budget. The fixture itself defaults to
+        /// worker_count(1); these tests intentionally exercise
+        /// multi-worker scheduling, so we go through with_config.
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let config = LabConfig::new(seed)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(50_000);
+            lab_runtime_test_with_config(config, move |_cx| async move {
+                f().await;
+            });
+        }
+
+        /// `run_with_cx` must return before entering the loop if the
+        /// caller's Cx is already cancelled. No samples should be taken
+        /// and no sleep should be consumed.
+        #[test]
+        fn run_with_cx_pre_cancelled_exits_without_sampling() {
+            run_lab(0xCF01_1CE1, || async move {
+                let monitor = CpuPressureMonitor::new(test_config());
+                let samples_before = monitor.telemetry().snapshot().samples_taken;
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x cpu_pressure precancel"),
+                );
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                assert_eq!(
+                    monitor.telemetry().snapshot().samples_taken,
+                    samples_before,
+                    "pre-cancelled run_with_cx must not take a sample"
+                );
+                assert!(
+                    !shutdown.load(std::sync::atomic::Ordering::SeqCst),
+                    "run_with_cx must return via the Cx path, not the shutdown flag"
+                );
+            });
+        }
+
+        /// `run_with_cx` with a live Cx takes exactly one sample on the
+        /// first tick, then sleep_with_cx is cancelled mid-interval by
+        /// setting the shutdown flag *after* the first sample. This pins
+        /// the shared shutdown/Cx termination contract: either path
+        /// terminates the loop at the next iteration gate.
+        #[test]
+        fn run_with_cx_takes_first_sample_then_honors_shutdown() {
+            run_lab(0xCF02_1CE2, || async move {
+                let monitor = CpuPressureMonitor::new(test_config());
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let cx = crate::cx::for_request();
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                // First tick: `first_tick=true` skips sleep, then reads
+                // shutdown, which is set — so we should see zero samples
+                // taken (the shutdown check runs before sample()).
+                assert_eq!(
+                    monitor.telemetry().snapshot().samples_taken,
+                    0,
+                    "shutdown flag set before any tick must exit before sampling"
+                );
+            });
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn missing_cpu_sampler_is_reinitialized_on_next_sample() {
+        let monitor = CpuPressureMonitor::new(CpuPressureConfig::default());
+        *monitor.cpu_system.lock().unwrap() = None;
+        let pressure = monitor.read_cpu_pressure();
+        assert!(pressure.is_finite());
+        assert!((0.0..=100.0).contains(&pressure));
+        assert!(monitor.cpu_system.lock().unwrap().is_some());
+        assert!(detect_ncpu() > 0);
+    }
+}

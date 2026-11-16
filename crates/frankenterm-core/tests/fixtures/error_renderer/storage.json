@@ -1,0 +1,40 @@
+{
+  "json": {
+    "category": "storage",
+    "code": "FT-2001",
+    "description": "Failed to initialize the SQLite database. This could be due to permissions, disk space, or a corrupted database file.",
+    "error": "Storage error: Database error: connection refused",
+    "hint": "Database operation failed. Check workspace permissions and retry.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Ensure the workspace directory is writable."
+      ],
+      "commands": [
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Database operation failed. Check workspace permissions and retry."
+    },
+    "title": "Database initialization failed"
+  },
+  "plain_lines": [
+    "Error: Database initialization failed",
+    "",
+    "Storage error: Database error: connection refused",
+    "",
+    "Failed to initialize the SQLite database. This could be due to permissions, disk space, or a corrupted database file.",
+    "",
+    "Suggestions:",
+    "  • Database operation failed. Check workspace permissions and retry.",
+    "  → Diagnostics: `ft doctor`",
+    "  • Ensure the workspace directory is writable.",
+    "",
+    "Error code: FT-2001",
+    "Run `ft why FT-2001` for more details."
+  ]
+}

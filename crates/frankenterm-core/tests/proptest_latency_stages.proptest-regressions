@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ad601f2525bb7afe42468e40e60995a9f39fb26458f90a3d6b028d5e3bed87ed # shrinks to skip_idx = 7
+cc f2add2f1e1b75ac04a7b17acafd169a4baf99f6eae4048c3ab3b5d57fff542f2 # shrinks to values = [3.5635120889253247, 2.058380577213781, 7.852177181272323, 9.210714312488726]
+cc 7b95d6dbd6e014cfa667770405ad10bd3e22a87cda9865b2da6ba4ad238c029b # shrinks to stage = PtyCapture, latency = 98073.78600020817, overflow = false, level_idx = 0
+cc bae32fbcbb383f959d16a71f82094e33f28d920c2bd12ac3fc271d9104ea0360 # shrinks to stage_idx = 0, cost = 981594.3828958337, seq = 1, arrived = 0, deadline = 0
+cc bae84561ff5b08d2a7c7863b6568e39c58a561cd66f70e8cd198077e05931c89 # shrinks to target = 90220.05222181597, percentile = 0.0

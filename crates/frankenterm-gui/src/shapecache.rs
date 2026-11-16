@@ -1,0 +1,1753 @@
+use crate::customglyph::BlockKey;
+use crate::glyphcache::CachedGlyph;
+use ahash::{AHashMap, AHasher};
+use config::TextStyle;
+use frankenterm_font::LoadedFontId;
+use frankenterm_font::shaper::GlyphInfo;
+use frankenterm_font::units::*;
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use termwiz::cell::Presentation;
+use termwiz::cellcluster::CellCluster;
+use wezterm_bidi::Direction;
+
+const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
+const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
+
+thread_local! {
+    static SHAPED_RUN_INTERNER: RefCell<ShapedRunInterner> =
+        RefCell::new(ShapedRunInterner::default());
+}
+
+/// Every input that can change shaping, including the paragraph surrounding a
+/// run. Paint attributes and the run's screen position are deliberately absent.
+/// The native Metal path uses its interned style id; WebGpu uses `TextStyle`.
+#[derive(Clone, Debug)]
+pub struct ShapeCacheKey<S = TextStyle> {
+    pub style: S,
+    pub text: String,
+    font: LoadedFontId,
+    range: Option<(usize, usize)>,
+    emoji: bool,
+    rtl: bool,
+    cells: ShapeCells,
+}
+
+/// Canonical single-width ASCII needs no arrays. Other runs retain only the
+/// maps that differ, rather than padding one `(usize, u8)` pair per UTF-8 byte.
+#[derive(Clone, Debug)]
+struct ShapeCells {
+    len: usize,
+    indices: Vec<usize>,
+    widths: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BorrowedShapeCells<'a> {
+    Implicit(usize),
+    Cluster {
+        cluster: &'a CellCluster,
+        origin: usize,
+    },
+    Stored(&'a ShapeCells),
+}
+
+impl<'a> BorrowedShapeCells<'a> {
+    fn new(cluster: &'a CellCluster) -> Self {
+        if cluster.has_implicit_cell_mapping() {
+            return Self::Implicit(cluster.text.len());
+        }
+        // Only cell identity and ordering affect the shaper. Normalizing by
+        // the smallest index permits reuse at another column, including RTL
+        // runs, without wrapping or conflating distinct cells.
+        let origin = (0..cluster.text.len())
+            .map(|byte| cluster.byte_to_cell_idx(byte))
+            .min()
+            .unwrap_or(0);
+        let cells = Self::Cluster { cluster, origin };
+        if (0..cells.len()).all(|byte| cells.cell(byte) == (byte, 1)) {
+            Self::Implicit(cells.len())
+        } else {
+            cells
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Implicit(len) => len,
+            Self::Cluster { cluster, .. } => cluster.text.len(),
+            Self::Stored(cells) => cells.len,
+        }
+    }
+
+    fn cell(self, byte: usize) -> (usize, u8) {
+        match self {
+            Self::Implicit(_) => (byte, 1),
+            Self::Cluster { cluster, origin } => (
+                cluster.byte_to_cell_idx(byte) - origin,
+                cluster.byte_to_cell_width(byte),
+            ),
+            Self::Stored(cells) => (
+                cells.indices.get(byte).copied().unwrap_or(byte),
+                cells.widths.get(byte).copied().unwrap_or(1),
+            ),
+        }
+    }
+
+    fn is_implicit(self) -> bool {
+        match self {
+            Self::Implicit(_) => true,
+            Self::Cluster { .. } => false,
+            Self::Stored(cells) => cells.indices.is_empty() && cells.widths.is_empty(),
+        }
+    }
+
+    fn to_owned(self) -> ShapeCells {
+        let len = self.len();
+        if self.is_implicit() {
+            return ShapeCells {
+                len,
+                indices: Vec::new(),
+                widths: Vec::new(),
+            };
+        }
+        let indices = if (0..len).all(|byte| self.cell(byte).0 == byte) {
+            Vec::new()
+        } else {
+            (0..len).map(|byte| self.cell(byte).0).collect()
+        };
+        let widths = if (0..len).all(|byte| self.cell(byte).1 == 1) {
+            Vec::new()
+        } else {
+            (0..len).map(|byte| self.cell(byte).1).collect()
+        };
+        ShapeCells {
+            len,
+            indices,
+            widths,
+        }
+    }
+}
+
+impl PartialEq for BorrowedShapeCells<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() || self.is_implicit() != other.is_implicit() {
+            return false;
+        }
+        self.is_implicit() || (0..self.len()).all(|byte| self.cell(byte) == other.cell(byte))
+    }
+}
+
+impl Eq for BorrowedShapeCells<'_> {}
+
+impl Hash for BorrowedShapeCells<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        self.is_implicit().hash(state);
+        if !self.is_implicit() {
+            for byte in 0..self.len() {
+                self.cell(byte).hash(state);
+            }
+        }
+    }
+}
+
+impl<S> ShapeCacheKey<S> {
+    fn borrowed(&self) -> BorrowedShapeCacheKey<'_, S> {
+        BorrowedShapeCacheKey {
+            style: &self.style,
+            text: &self.text,
+            font: self.font,
+            range: self.range,
+            emoji: self.emoji,
+            rtl: self.rtl,
+            cells: BorrowedShapeCells::Stored(&self.cells),
+        }
+    }
+
+    /// Heap storage owned by the key, separate from the shaper output.
+    pub fn heap_bytes(&self) -> usize {
+        self.text.capacity()
+            + self.cells.indices.capacity() * std::mem::size_of::<usize>()
+            + self.cells.widths.capacity()
+    }
+}
+
+impl<S: PartialEq> PartialEq for ShapeCacheKey<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.borrowed() == other.borrowed()
+    }
+}
+
+impl<S: Eq> Eq for ShapeCacheKey<S> {}
+
+impl<S: Hash> Hash for ShapeCacheKey<S> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.borrowed().hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphPosition {
+    pub glyph_idx: u32,
+    pub num_cells: u8,
+    pub x_offset: PixelLength,
+    pub bearing_x: f32,
+    pub bitmap_pixel_width: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShapedInfo {
+    pub glyph: Rc<CachedGlyph>,
+    pub pos: GlyphPosition,
+    pub block_key: Option<BlockKey>,
+}
+
+impl ShapedInfo {
+    /// Process the results from the shaper, stitching together glyph
+    /// and positioning information
+    pub fn process(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
+        if !glyph_run_interning_enabled() || infos.len() != glyphs.len() || infos.len() < 2 {
+            return build_shaped_infos(infos, glyphs);
+        }
+
+        let key = shaped_run_key(infos, glyphs);
+        if let Some(run) =
+            SHAPED_RUN_INTERNER.with(|interner| interner.borrow().lookup(key, infos, glyphs))
+        {
+            return run;
+        }
+
+        let run = build_shaped_infos(infos, glyphs);
+        SHAPED_RUN_INTERNER.with(|interner| interner.borrow_mut().insert(key, infos, glyphs, &run));
+        run
+    }
+}
+
+/// A cached shaping result that survives glyph-atlas rebuilds.
+///
+/// HarfBuzz shaping (`infos`) is **atlas-invariant**: it depends only on the
+/// font + text, not on which atlas generation the glyph sprites currently live
+/// in. The resolved [`ShapedInfo`] sprites are atlas-dependent: each holds an
+/// `Rc<CachedGlyph>` whose sprite owns an `Rc` of the whole atlas texture, so
+/// they are not stored here. The glyph cache binds them to this shape's `id`
+/// (`GlyphCache::bind_shape`), next to the atlas they point into. An atlas
+/// rebuild replaces the glyph cache and drops every binding with it, and a
+/// surviving shape re-resolves its (cheap) sprites from `infos` instead of
+/// re-running (expensive) HarfBuzz shaping. This removes the per-rebuild
+/// full-screen re-shape that drove the progressive GUI slowdown (the render
+/// loop's HarfBuzz time climbing over a session).
+///
+/// **Leak freedom (ft-yccm0.4.3.4):** this type reaches no GPU handle, so a
+/// shape-cache entry cannot pin an atlas however long it stays resident. The
+/// `cache_gpu_handle` lint proves it; before this, every rebuild had to release
+/// a per-entry binding (ft-yccm0.2.5).
+///
+/// **Soundness of "re-resolve, don't re-shape":** the font-fallback and config
+/// invalidation paths always `clear()` the shape cache. Therefore any entry
+/// that *survives* a `shape_generation` bump only ever experienced an *atlas*
+/// rebuild — for which the cached `infos` remain valid and only the sprites
+/// need re-resolving. (A genuine shaping-input change clears the entry, forcing
+/// a real re-shape on the next miss.) Each entry has a process-unique `id`, so a
+/// binding made for a cleared entry never answers for its replacement.
+#[derive(Debug)]
+pub struct CachedShape {
+    /// Process-unique key of this entry's sprite binding in the glyph cache.
+    id: u64,
+    /// Atlas-invariant HarfBuzz output (glyph indices, clusters, advances).
+    infos: Vec<GlyphInfo>,
+}
+
+/// Heap bytes of the per-glyph cluster text that `GlyphInfo` retains only in
+/// builds with debug assertions (for diagnostics); release builds have none.
+#[cfg(debug_assertions)]
+fn glyph_text_bytes(infos: &[GlyphInfo]) -> usize {
+    infos.iter().map(|info| info.text.capacity()).sum()
+}
+
+#[cfg(not(debug_assertions))]
+fn glyph_text_bytes(_infos: &[GlyphInfo]) -> usize {
+    0
+}
+
+impl CachedShape {
+    /// A new entry for `infos`, with an id no other entry in this process has.
+    pub fn new(infos: Vec<GlyphInfo>) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            infos,
+        }
+    }
+
+    /// The key of this entry's sprite binding in the glyph cache.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The HarfBuzz output the sprites are resolved from.
+    pub fn infos(&self) -> &[GlyphInfo] {
+        &self.infos
+    }
+
+    /// Heap bytes this entry owns, for the cache-gauge ledger (ft-yccm0.1.7):
+    /// the struct and the shaping output, with each glyph's cluster text. The
+    /// sprite binding is the glyph cache's (`GlyphCache::shape_binding_bytes`).
+    pub fn accounted_bytes(&self) -> u64 {
+        let infos = self.infos.capacity() * std::mem::size_of::<GlyphInfo>()
+            + glyph_text_bytes(&self.infos);
+        (std::mem::size_of::<Self>() + infos) as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ShapedRunKey {
+    hash: u64,
+    len: usize,
+}
+
+#[derive(Default)]
+struct ShapedRunInterner {
+    runs: AHashMap<ShapedRunKey, Vec<InternedShapedRun>>,
+    entries: usize,
+}
+
+impl ShapedRunInterner {
+    fn lookup(
+        &self,
+        key: ShapedRunKey,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+    ) -> Option<Vec<ShapedInfo>> {
+        self.runs.get(&key).and_then(|runs| {
+            runs.iter()
+                .find(|run| shaped_run_matches(infos, glyphs, run))
+                // Re-attach the CURRENT glyphs (current atlas generation), not
+                // the ones captured at intern time — see `rebuild`. This is what
+                // makes the interner leak-free: it never holds a `Rc<CachedGlyph>`
+                // and so can never keep an old atlas texture alive.
+                .map(|run| run.rebuild(glyphs))
+        })
+    }
+
+    fn insert(
+        &mut self,
+        key: ShapedRunKey,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+        run: &[ShapedInfo],
+    ) {
+        if self.entries >= SHAPED_RUN_INTERNER_MAX_ENTRIES {
+            // Bounded reclamation — the "no silent unbounded growth" discipline.
+            // The interner hard-caps at MAX_ENTRIES and bulk-reclaims; this rare
+            // (cap-only, never per-frame) counter makes that reclamation
+            // observable in `ft`'s stats. A spike means the shaping cache is
+            // thrashing and the cap may want tuning. NB: post the atlas-pinning
+            // fix, an entry is tiny template data (positions/keys) and NEVER a GPU
+            // texture, so a clear is cheap and frees no GPU memory — which is why a
+            // heavyweight runtime surface/texture pool here would be pure overhead
+            // (the leak-freedom guarantee is provided statically by the
+            // `cache_gpu_handle` lint + the reclamation behavior-proof test).
+            metrics::counter!("gui.shaped_run_interner.clear_evictions").increment(1);
+            self.runs.clear();
+            self.entries = 0;
+        }
+
+        let bucket = self.runs.entry(key).or_default();
+        if bucket.len() >= SHAPED_RUN_INTERNER_MAX_COLLISIONS {
+            bucket.swap_remove(0);
+            self.entries = self.entries.saturating_sub(1);
+        }
+
+        bucket.push(InternedShapedRun::new(infos, glyphs, run));
+        self.entries += 1;
+    }
+}
+
+/// The atlas-generation-INVARIANT slice of a `ShapedInfo`: glyph position and
+/// block key. Deliberately excludes `glyph: Rc<CachedGlyph>` (the only
+/// atlas-dependent, GPU-resource-owning field) so the interner cannot pin a
+/// glyph — and therefore cannot pin the ~tens-of-MB atlas texture that glyph's
+/// `Sprite` references. The `GlyphPosition`/`BlockKey` are pure shaping output
+/// (from the shaper's `GlyphInfo` + invariant font metrics) and are identical
+/// across atlas recreations, so caching them is sound and survives recreation.
+#[derive(Clone, Debug)]
+struct ShapedInfoTemplate {
+    pos: GlyphPosition,
+    block_key: Option<BlockKey>,
+}
+
+#[derive(Clone, Debug)]
+struct InternedShapedRun {
+    signature: Vec<ShapedRunGlyph>,
+    /// Invariant per-glyph templates. NO `Rc<CachedGlyph>` is stored here — that
+    /// is the whole point (ft glyph-run-interner atlas-pinning leak fix): the
+    /// shaping cache caches the CPU shaping result, never the GPU residency.
+    templates: Vec<ShapedInfoTemplate>,
+}
+
+impl InternedShapedRun {
+    fn new(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>], shaped: &[ShapedInfo]) -> Self {
+        Self {
+            signature: shaped_run_signature(infos, glyphs),
+            templates: shaped
+                .iter()
+                .map(|s| ShapedInfoTemplate {
+                    pos: s.pos.clone(),
+                    block_key: s.block_key,
+                })
+                .collect(),
+        }
+    }
+
+    /// Materialize a `Vec<ShapedInfo>` for THIS call by zipping the cached
+    /// invariant templates with the caller's CURRENT glyphs (current atlas).
+    /// The matching `signature`/`len` guarantee `glyphs` lines up 1:1 with the
+    /// templates, so each template gets the live glyph at its index.
+    fn rebuild(&self, glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
+        self.templates
+            .iter()
+            .zip(glyphs.iter())
+            .map(|(template, glyph)| ShapedInfo {
+                pos: template.pos.clone(),
+                glyph: Rc::clone(glyph),
+                block_key: template.block_key,
+            })
+            .collect()
+    }
+
+    fn matches(&self, infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> bool {
+        self.signature.len() == infos.len()
+            && glyphs.len() == infos.len()
+            && self
+                .signature
+                .iter()
+                .zip(infos.iter())
+                .zip(glyphs.iter())
+                .all(|((cached, info), glyph)| *cached == ShapedRunGlyph::new(info, glyph))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ShapedRunGlyph {
+    only_char: Option<char>,
+    is_space: bool,
+    num_cells: u8,
+    cluster: u32,
+    font_idx: usize,
+    glyph_pos: u32,
+    x_advance_bits: u64,
+    y_advance_bits: u64,
+    x_offset_bits: u64,
+    y_offset_bits: u64,
+    glyph_ptr: usize,
+    bitmap_pixel_width: u32,
+    bearing_x_bits: u64,
+    block_key: Option<BlockKey>,
+}
+
+impl ShapedRunGlyph {
+    fn new(info: &GlyphInfo, glyph: &Rc<CachedGlyph>) -> Self {
+        Self {
+            only_char: info.only_char,
+            is_space: info.is_space,
+            num_cells: info.num_cells,
+            cluster: info.cluster,
+            font_idx: info.font_idx,
+            glyph_pos: info.glyph_pos,
+            x_advance_bits: info.x_advance.get().to_bits(),
+            y_advance_bits: info.y_advance.get().to_bits(),
+            x_offset_bits: info.x_offset.get().to_bits(),
+            y_offset_bits: info.y_offset.get().to_bits(),
+            glyph_ptr: Rc::as_ptr(glyph) as usize,
+            bitmap_pixel_width: glyph_bitmap_pixel_width(glyph),
+            bearing_x_bits: glyph.bearing_x.get().to_bits(),
+            block_key: info.only_char.and_then(BlockKey::from_char),
+        }
+    }
+}
+
+#[inline]
+fn glyph_run_interning_enabled() -> bool {
+    frankenterm_gui::glyph_run_interning::glyph_run_interning_enabled()
+}
+
+fn build_shaped_infos(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
+    let mut pos: Vec<ShapedInfo> = Vec::with_capacity(infos.len());
+
+    for (info, glyph) in infos.iter().zip(glyphs.iter()) {
+        pos.push(ShapedInfo {
+            pos: GlyphPosition {
+                glyph_idx: info.glyph_pos,
+                bitmap_pixel_width: glyph_bitmap_pixel_width(glyph),
+                num_cells: info.num_cells,
+                x_offset: info.x_offset,
+                bearing_x: glyph.bearing_x.get() as f32,
+            },
+            glyph: Rc::clone(glyph),
+            block_key: info.only_char.and_then(BlockKey::from_char),
+        });
+    }
+    pos
+}
+
+fn shaped_run_key(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> ShapedRunKey {
+    let mut hasher = AHasher::default();
+    infos.len().hash(&mut hasher);
+
+    for (info, glyph) in infos.iter().zip(glyphs.iter()) {
+        ShapedRunGlyph::new(info, glyph).hash(&mut hasher);
+    }
+
+    ShapedRunKey {
+        hash: hasher.finish(),
+        len: infos.len(),
+    }
+}
+
+fn shaped_run_matches(
+    infos: &[GlyphInfo],
+    glyphs: &[Rc<CachedGlyph>],
+    run: &InternedShapedRun,
+) -> bool {
+    run.matches(infos, glyphs)
+}
+
+fn shaped_run_signature(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedRunGlyph> {
+    infos
+        .iter()
+        .zip(glyphs.iter())
+        .map(|(info, glyph)| ShapedRunGlyph::new(info, glyph))
+        .collect()
+}
+
+#[inline]
+fn glyph_bitmap_pixel_width(glyph: &CachedGlyph) -> u32 {
+    glyph
+        .texture
+        .as_ref()
+        .map_or(0, |t| t.coords.width() as u32)
+}
+
+/// We'd like to avoid allocating when resolving from the cache
+/// so this is the borrowed version of ShapeCacheKey.
+/// It's a bit involved to make this work; more details can be
+/// found in the excellent guide here:
+/// <https://github.com/sunshowers-code/borrow-complex-key-example/blob/main/src/lib.rs>
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BorrowedShapeCacheKey<'a, S = TextStyle> {
+    pub style: &'a S,
+    pub text: &'a str,
+    font: LoadedFontId,
+    range: Option<(usize, usize)>,
+    emoji: bool,
+    rtl: bool,
+    cells: BorrowedShapeCells<'a>,
+}
+
+impl<S> Copy for BorrowedShapeCacheKey<'_, S> {}
+
+impl<S> Clone for BorrowedShapeCacheKey<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, S> BorrowedShapeCacheKey<'a, S> {
+    pub fn new(
+        style: &'a S,
+        font: LoadedFontId,
+        cluster: &'a CellCluster,
+        context: Option<(&'a str, Range<usize>)>,
+    ) -> Self {
+        let (text, range) = match context {
+            Some((text, range)) => (text, Some((range.start, range.end))),
+            None => (cluster.text.as_str(), None),
+        };
+        Self {
+            style,
+            text,
+            font,
+            range,
+            emoji: cluster.presentation == Presentation::Emoji,
+            rtl: cluster.direction == Direction::RightToLeft,
+            cells: BorrowedShapeCells::new(cluster),
+        }
+    }
+}
+
+impl<S: Clone> BorrowedShapeCacheKey<'_, S> {
+    pub fn to_owned(&self) -> ShapeCacheKey<S> {
+        ShapeCacheKey {
+            style: self.style.clone(),
+            text: self.text.to_owned(),
+            font: self.font,
+            range: self.range,
+            emoji: self.emoji,
+            rtl: self.rtl,
+            cells: self.cells.to_owned(),
+        }
+    }
+}
+
+pub trait ShapeCacheKeyTrait<S = TextStyle>: std::fmt::Debug {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S>;
+}
+
+impl<S: std::fmt::Debug> ShapeCacheKeyTrait<S> for ShapeCacheKey<S> {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S> {
+        self.borrowed()
+    }
+}
+
+impl<S: std::fmt::Debug> ShapeCacheKeyTrait<S> for BorrowedShapeCacheKey<'_, S> {
+    fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k, S> {
+        *self
+    }
+}
+
+impl<'a, S: std::fmt::Debug + 'a> std::borrow::Borrow<dyn ShapeCacheKeyTrait<S> + 'a>
+    for ShapeCacheKey<S>
+{
+    fn borrow(&self) -> &(dyn ShapeCacheKeyTrait<S> + 'a) {
+        self
+    }
+}
+
+impl<S: PartialEq> PartialEq for dyn ShapeCacheKeyTrait<S> + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key().eq(&other.key())
+    }
+}
+
+impl<S: Eq> Eq for dyn ShapeCacheKeyTrait<S> + '_ {}
+
+impl<S: Hash> Hash for dyn ShapeCacheKeyTrait<S> + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{
+        InternedShapedRun, SHAPED_RUN_INTERNER, SHAPED_RUN_INTERNER_MAX_COLLISIONS,
+        SHAPED_RUN_INTERNER_MAX_ENTRIES, ShapedRunInterner, ShapedRunKey, build_shaped_infos,
+        glyph_run_interning_enabled, shaped_run_key, shaped_run_signature,
+    };
+    use crate::glyphcache::{CachedGlyph, GlyphCache};
+    use crate::shapecache::{GlyphPosition, ShapedInfo};
+    use crate::utilsprites::RenderMetrics;
+    use config::{FontAttributes, TextStyle};
+    use euclid::num::Zero;
+    use frankenterm_font::shaper::{GlyphInfo, PresentationWidth};
+    use frankenterm_font::units::PixelLength;
+    use frankenterm_font::{FontConfiguration, LoadedFont};
+    use std::rc::Rc;
+    use termwiz::cell::CellAttributes;
+    use termwiz::surface::{Line, SEQ_ZERO};
+    use wezterm_bidi::Direction;
+
+    fn key_cluster(text: &str) -> termwiz::cellcluster::CellCluster {
+        let clusters =
+            Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None).cluster(None);
+        termwiz::cellcluster::CellCluster::concat(&clusters.iter().collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn shape_keys_compare_all_inputs_without_paint_or_screen_position() {
+        use super::BorrowedShapeCacheKey;
+
+        let style = 7u32;
+        let cluster = key_cluster("ffi");
+        // Typed parameters make the closure take any borrow, not one
+        // inferred lifetime that would hold `changed` across reassignment.
+        let key = |cluster: &termwiz::cellcluster::CellCluster,
+                   context: Option<(&str, std::ops::Range<usize>)>| {
+            BorrowedShapeCacheKey::new(&style, 11, cluster, context).to_owned()
+        };
+        let base = key(&cluster, Some(("office ffi", 1..4)));
+        assert_ne!(base, key(&cluster, Some(("affice ffi", 1..4))), "neighbors");
+        assert_ne!(base, key(&cluster, Some(("office ffi", 7..10))), "range");
+        assert_ne!(key(&cluster, None), key(&cluster, Some(("ffi", 0..3))));
+        assert_ne!(
+            base,
+            BorrowedShapeCacheKey::new(&8u32, 11, &cluster, Some(("office ffi", 1..4))).to_owned()
+        );
+        assert_ne!(
+            base,
+            BorrowedShapeCacheKey::new(&style, 12, &cluster, Some(("office ffi", 1..4))).to_owned()
+        );
+        let mut changed = cluster.clone();
+        changed.direction = Direction::RightToLeft;
+        assert_ne!(key(&cluster, None), key(&changed, None));
+        changed = cluster.clone();
+        changed.presentation = termwiz::cell::Presentation::Emoji;
+        assert_ne!(key(&cluster, None), key(&changed, None));
+
+        changed = cluster.clone();
+        changed.first_cell_idx = 42;
+        changed
+            .attrs
+            .set_foreground(termwiz::color::ColorAttribute::PaletteIndex(3));
+        assert_eq!(key(&cluster, None), key(&changed, None));
+
+        let narrow = key_cluster("A");
+        let wide = Line::from_cells(
+            vec![termwiz::cell::Cell::new_grapheme_with_width(
+                "A",
+                2,
+                CellAttributes::default(),
+            )],
+            SEQ_ZERO,
+        )
+        .cluster(None);
+        assert_ne!(key(&narrow, None), key(&wide[0], None), "cell widths");
+        let separate = key_cluster("ab");
+        let grouped = Line::from_cells(
+            vec![termwiz::cell::Cell::new_grapheme_with_width(
+                "ab",
+                2,
+                CellAttributes::default(),
+            )],
+            SEQ_ZERO,
+        )
+        .cluster(None);
+        assert_eq!(separate.width, grouped[0].width);
+        assert_ne!(
+            key(&separate, None),
+            key(&grouped[0], None),
+            "cell ownership"
+        );
+    }
+
+    #[test]
+    fn borrowed_and_owned_shape_keys_agree_for_implicit_and_explicit_maps() {
+        use super::{BorrowedShapeCacheKey, BorrowedShapeCells, ShapeCacheKeyTrait};
+        use std::hash::{Hash, Hasher};
+
+        fn hash(value: &(impl Hash + ?Sized)) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let style = TextStyle::default();
+        for text in ["ASCII", "A\u{301}", "界", "😀"] {
+            let cluster = key_cluster(text);
+            let borrowed = BorrowedShapeCacheKey::new(&style, 9, &cluster, None);
+            let owned = borrowed.to_owned();
+            assert_eq!(borrowed, owned.borrowed());
+            assert_eq!(hash(&borrowed), hash(&owned));
+            assert_eq!(hash(&borrowed), hash(&owned as &dyn ShapeCacheKeyTrait));
+            assert_eq!(
+                owned.heap_bytes(),
+                owned.text.capacity()
+                    + owned.cells.indices.capacity() * std::mem::size_of::<usize>()
+                    + owned.cells.widths.capacity()
+            );
+        }
+
+        let ascii = key_cluster("AB");
+        let implicit = BorrowedShapeCacheKey::new(&style, 9, &ascii, None);
+        assert!(matches!(implicit.cells, BorrowedShapeCells::Implicit(2)));
+        assert_eq!(
+            implicit.to_owned().heap_bytes(),
+            2,
+            "ASCII keeps no map arrays"
+        );
+
+        // Bidi extracts an ASCII run from a cluster whose non-ASCII prefix
+        // required explicit maps. Its normalized mapping is still canonical.
+        let bidi = Line::from_text("éאבAB", &CellAttributes::default(), SEQ_ZERO, None)
+            .cluster(Some(wezterm_bidi::ParagraphDirectionHint::LeftToRight));
+        let explicit = bidi.iter().find(|cluster| cluster.text == "AB").unwrap();
+        assert!(!explicit.has_implicit_cell_mapping());
+        let explicit = BorrowedShapeCacheKey::new(&style, 9, explicit, None);
+        assert_eq!(implicit, explicit);
+        assert_eq!(hash(&implicit), hash(&explicit));
+
+        let mut saturated = ascii.clone();
+        saturated.first_cell_idx = usize::MAX;
+        assert!(!saturated.has_implicit_cell_mapping());
+        let saturated = BorrowedShapeCacheKey::new(&style, 9, &saturated, None);
+        assert_ne!(
+            implicit, saturated,
+            "saturation merges cells and changes shaping"
+        );
+        assert_eq!(saturated, saturated.to_owned().borrowed());
+    }
+
+    fn shape_infos_and_glyphs(
+        render_metrics: &RenderMetrics,
+        glyph_cache: &mut GlyphCache,
+        style: &TextStyle,
+        font: &Rc<LoadedFont>,
+        text: &str,
+    ) -> (Vec<GlyphInfo>, Vec<Rc<CachedGlyph>>) {
+        let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None);
+        let mut all_infos = vec![];
+        let mut all_glyphs = vec![];
+
+        for cluster in line.cluster(None) {
+            let presentation_width = PresentationWidth::with_cluster(&cluster);
+            let mut infos = font
+                .shape(
+                    &cluster.text,
+                    || {},
+                    |_| {},
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    Some(&presentation_width),
+                )
+                .unwrap();
+            let mut glyphs = infos
+                .iter()
+                .map(|info| {
+                    let cell_idx = cluster.byte_to_cell_idx(info.cluster as usize);
+                    let num_cells = cluster.byte_to_cell_width(info.cluster as usize);
+
+                    let followed_by_space = match line.get_cell(cell_idx + 1) {
+                        Some(cell) => cell.str() == " ",
+                        None => false,
+                    };
+
+                    glyph_cache
+                        .cached_glyph(
+                            info,
+                            style,
+                            followed_by_space,
+                            font,
+                            render_metrics,
+                            num_cells,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            all_infos.append(&mut infos);
+            all_glyphs.append(&mut glyphs);
+        }
+
+        (all_infos, all_glyphs)
+    }
+
+    fn fake_glyph_info(seed: u32, cluster: u32, only_char: char) -> GlyphInfo {
+        GlyphInfo {
+            // Present only with debug assertions; see GlyphInfo::text.
+            #[cfg(debug_assertions)]
+            text: only_char.to_string(),
+            only_char: Some(only_char),
+            is_space: only_char == ' ',
+            num_cells: 1,
+            cluster,
+            font_idx: 0,
+            glyph_pos: 10_000 + seed,
+            x_advance: PixelLength::new(seed as f64 + 1.0),
+            y_advance: PixelLength::zero(),
+            x_offset: PixelLength::new(seed as f64 / 16.0),
+            y_offset: PixelLength::zero(),
+        }
+    }
+
+    fn fake_cached_glyph(seed: u32) -> Rc<CachedGlyph> {
+        Rc::new(CachedGlyph {
+            has_color: false,
+            brightness_adjust: 1.0,
+            x_offset: PixelLength::new(seed as f64 / 32.0),
+            y_offset: PixelLength::zero(),
+            x_advance: PixelLength::new(seed as f64 + 2.0),
+            bearing_x: PixelLength::new(seed as f64 / 8.0),
+            bearing_y: PixelLength::zero(),
+            texture: None,
+            scale: 1.0,
+        })
+    }
+
+    fn fake_shaped_run(seed: u32) -> (Vec<GlyphInfo>, Vec<Rc<CachedGlyph>>, Vec<ShapedInfo>) {
+        let infos = vec![
+            fake_glyph_info(seed * 2, 0, 'a'),
+            fake_glyph_info(seed * 2 + 1, 1, 'b'),
+        ];
+        let glyphs = vec![fake_cached_glyph(seed * 2), fake_cached_glyph(seed * 2 + 1)];
+        let shaped = build_shaped_infos(&infos, &glyphs);
+        (infos, glyphs, shaped)
+    }
+
+    fn cluster_and_shape(
+        render_metrics: &RenderMetrics,
+        glyph_cache: &mut GlyphCache,
+        style: &TextStyle,
+        font: &Rc<LoadedFont>,
+        text: &str,
+    ) -> Vec<GlyphPosition> {
+        let (all_infos, all_glyphs) =
+            shape_infos_and_glyphs(render_metrics, glyph_cache, style, font, text);
+
+        eprintln!("infos: {:#?}", all_infos);
+        eprintln!("glyphs: {:#?}", all_glyphs);
+        ShapedInfo::process(&all_infos, &all_glyphs)
+            .into_iter()
+            .map(|p| p.pos)
+            .collect()
+    }
+
+    fn assert_shaping_stream_eq(
+        left_infos: &[GlyphInfo],
+        left_glyphs: &[Rc<CachedGlyph>],
+        right_infos: &[GlyphInfo],
+        right_glyphs: &[Rc<CachedGlyph>],
+    ) {
+        assert_eq!(
+            shaped_run_signature(left_infos, left_glyphs),
+            shaped_run_signature(right_infos, right_glyphs)
+        );
+    }
+
+    fn assert_shaped_runs_identical(left: &[ShapedInfo], right: &[ShapedInfo]) {
+        assert_eq!(left.len(), right.len());
+
+        for (idx, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+            assert_eq!(left.pos, right.pos, "glyph position differed at {idx}");
+            assert_eq!(
+                left.block_key, right.block_key,
+                "block glyph key differed at {idx}"
+            );
+            assert!(
+                Rc::ptr_eq(&left.glyph, &right.glyph),
+                "cached glyph identity differed at {idx}"
+            );
+        }
+    }
+
+    fn assert_signature_mismatch_rejects_hit(
+        interned: &InternedShapedRun,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+    ) {
+        let mut wrong_glyph_id = interned.clone();
+        wrong_glyph_id.signature[0].glyph_pos ^= 1;
+        assert!(
+            !wrong_glyph_id.matches(infos, glyphs),
+            "glyph-id mismatch must not be accepted as an interner hit"
+        );
+
+        let mut wrong_advance = interned.clone();
+        wrong_advance.signature[0].x_advance_bits ^= 1;
+        assert!(
+            !wrong_advance.matches(infos, glyphs),
+            "x-advance mismatch must not be accepted as an interner hit"
+        );
+
+        let mut wrong_cluster = interned.clone();
+        wrong_cluster.signature[0].cluster = wrong_cluster.signature[0].cluster.wrapping_add(1);
+        assert!(
+            !wrong_cluster.matches(infos, glyphs),
+            "cluster mismatch must not be accepted as an interner hit"
+        );
+    }
+
+    #[test]
+    fn interner_rejects_forced_key_collision_and_stale_cluster_mapping() {
+        let collision_key = ShapedRunKey {
+            hash: 0xfeed_cafe_dead_beef,
+            len: 2,
+        };
+        let mut interner = ShapedRunInterner::default();
+        let (first_infos, first_glyphs, first_run) = fake_shaped_run(1);
+        let (second_infos, second_glyphs, second_run) = fake_shaped_run(2);
+
+        interner.insert(collision_key, &first_infos, &first_glyphs, &first_run);
+        assert!(
+            interner
+                .lookup(collision_key, &second_infos, &second_glyphs)
+                .is_none(),
+            "same-key collision must not return a different interned run"
+        );
+
+        interner.insert(collision_key, &second_infos, &second_glyphs, &second_run);
+        let first_hit = interner
+            .lookup(collision_key, &first_infos, &first_glyphs)
+            .expect("first colliding run must remain addressable by signature");
+        assert_shaped_runs_identical(&first_run, &first_hit);
+        let second_hit = interner
+            .lookup(collision_key, &second_infos, &second_glyphs)
+            .expect("second colliding run must be addressable by signature");
+        assert_shaped_runs_identical(&second_run, &second_hit);
+
+        let mut stale_cluster_infos = first_infos.clone();
+        stale_cluster_infos[1].cluster = stale_cluster_infos[1].cluster.wrapping_add(17);
+        assert!(
+            interner
+                .lookup(collision_key, &stale_cluster_infos, &first_glyphs)
+                .is_none(),
+            "stale cluster/byte mapping must not hit an interned run for another text"
+        );
+    }
+
+    /// Regression guard for the glyph-run-interner atlas-generation GPU leak.
+    ///
+    /// The interner must cache only the atlas-INVARIANT shaping result
+    /// (`GlyphPosition` + `BlockKey`) and hold ZERO strong refs to
+    /// `Rc<CachedGlyph>`. A `CachedGlyph` transitively owns a GPU atlas texture
+    /// (`CachedGlyph.texture -> Sprite -> Rc<dyn Texture2d>`, ~tens of MB each).
+    /// If the interner ever pins a glyph, every atlas recreation leaks the old
+    /// atlas generation — the ~691 MB IOSurface footprint observed in the field.
+    /// This test fails the moment anyone reintroduces a strong glyph ref.
+    #[test]
+    fn interner_does_not_pin_glyphs_atlas_generation_leak_guard() {
+        let (infos, glyphs, run) = fake_shaped_run(7);
+        let key = shaped_run_key(&infos, &glyphs);
+
+        let mut interner = ShapedRunInterner::default();
+        interner.insert(key, &infos, &glyphs, &run);
+        drop(run); // drop the freshly-built run's own glyph clones
+
+        // After interning, the ONLY strong refs to each glyph must be the local
+        // `glyphs` Vec (count == 1). count > 1 ⇒ the interner pinned the glyph ⇒
+        // its atlas generation can never be reclaimed ⇒ the leak is back.
+        for (idx, glyph) in glyphs.iter().enumerate() {
+            assert_eq!(
+                Rc::strong_count(glyph),
+                1,
+                "interner retained a strong ref to glyph {idx}: this reintroduces the \
+                 atlas-generation GPU-texture leak (the shaping cache must not own GPU \
+                 resources — cache the invariant shaping, re-attach the live glyph on hit)"
+            );
+        }
+
+        // The cache must still resolve, rebuilding against the CURRENT glyphs —
+        // this is exactly what lets it survive atlas recreation WITHOUT leaking.
+        let hit = interner
+            .lookup(key, &infos, &glyphs)
+            .expect("interned run must still resolve by signature");
+        assert_eq!(hit.len(), glyphs.len(), "rebuilt run length must match");
+        for (idx, (hit_info, glyph)) in hit.iter().zip(glyphs.iter()).enumerate() {
+            assert!(
+                Rc::ptr_eq(&hit_info.glyph, glyph),
+                "lookup must re-attach the CURRENT glyph at index {idx}, not a stale one"
+            );
+        }
+    }
+
+    /// Behavior proof (the extreme-software-optimization "prove the behavior"
+    /// discipline): drive many shape+intern cycles across SIMULATED atlas
+    /// recreations and prove the interner reclaims EVERY prior generation's
+    /// glyphs. Each generation uses fresh `Rc<CachedGlyph>` (exactly what a real
+    /// atlas recreation produces) and then drops them; if the interner pinned any
+    /// of them (the leak), that generation's ~49 MB atlas texture could never be
+    /// reclaimed. With the lifetime-decoupled interner, zero past-generation
+    /// glyphs survive — so atlas residency stays flat instead of the observed
+    /// ~691 MB / ~14-generation growth.
+    #[test]
+    fn churn_across_atlas_recreations_reclaims_every_old_generation() {
+        use std::rc::Weak;
+
+        let mut interner = ShapedRunInterner::default();
+        let mut weaks: Vec<Weak<CachedGlyph>> = Vec::new();
+        const GENERATIONS: u32 = 64;
+
+        for generation in 0..GENERATIONS {
+            let (infos, glyphs, run) = fake_shaped_run(generation + 1);
+            for glyph in &glyphs {
+                weaks.push(Rc::downgrade(glyph));
+            }
+            let key = shaped_run_key(&infos, &glyphs);
+            interner.insert(key, &infos, &glyphs, &run);
+            // End of generation: the atlas is "recreated", so this generation's
+            // glyphs are dropped by their owner (the GlyphCache). The interner
+            // must NOT keep any of them alive.
+            drop(run);
+            drop(glyphs);
+        }
+
+        let still_pinned = weaks.iter().filter(|w| w.strong_count() > 0).count();
+        assert_eq!(
+            still_pinned, 0,
+            "{still_pinned} glyphs from past atlas generations are still alive — the \
+             interner is pinning old atlas textures (the GPU-memory leak). Must be 0: \
+             the shaping cache must never own a GPU resource."
+        );
+        assert!(
+            interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "interner entry count must stay bounded across churn"
+        );
+    }
+
+    /// ft-yccm0.4.3.4: a cached shape keeps only HarfBuzz output under an id
+    /// no other entry has, so it owns no glyph and cannot pin an atlas.
+    #[test]
+    fn cached_shape_holds_only_shaping_output_under_a_unique_id() {
+        use super::CachedShape;
+        use std::mem::size_of;
+
+        let (infos, glyphs, run) = fake_shaped_run(5);
+        drop(run);
+        let infos_bytes =
+            infos.capacity() * size_of::<GlyphInfo>() + super::glyph_text_bytes(&infos);
+        let shape = CachedShape::new(infos.clone());
+        let twin = CachedShape::new(infos.clone());
+        assert_ne!(shape.id(), twin.id(), "equal shaping still gets its own id");
+        assert_eq!(shape.infos(), infos.as_slice());
+        assert_eq!(
+            shape.accounted_bytes(),
+            (size_of::<CachedShape>() + infos_bytes) as u64
+        );
+        for glyph in &glyphs {
+            assert_eq!(Rc::strong_count(glyph), 1, "a shape holds no glyph");
+        }
+    }
+
+    /// ft-yccm0.4.3.4: sprite bindings live in the glyph cache, answer only for
+    /// the shape they were bound to, and die with the glyph cache, which is what
+    /// frees the previous atlas texture after a rebuild.
+    #[test]
+    fn shape_bindings_answer_per_shape_and_die_with_their_glyph_cache() {
+        use super::CachedShape;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+        let (infos, glyphs, run) = fake_shaped_run(3);
+        let shape = CachedShape::new(infos.clone());
+        let replacement = CachedShape::new(infos);
+
+        assert!(glyph_cache.shape_binding(shape.id()).is_none());
+        glyph_cache.bind_shape(shape.id(), Rc::new(run));
+        let bound = glyph_cache.shape_binding(shape.id()).expect("bound shape");
+        assert!(Rc::ptr_eq(&bound[0].glyph, &glyphs[0]));
+        assert!(
+            glyph_cache.shape_binding(replacement.id()).is_none(),
+            "a binding never answers for another entry with the same text"
+        );
+        drop(bound);
+        for glyph in &glyphs {
+            assert_eq!(Rc::strong_count(glyph), 2, "the binding holds one ref");
+        }
+
+        drop(glyph_cache);
+        for glyph in &glyphs {
+            assert_eq!(
+                Rc::strong_count(glyph),
+                1,
+                "dropping the glyph cache (an atlas rebuild) must drop every binding"
+            );
+        }
+    }
+
+    #[test]
+    fn interner_enforces_collision_bucket_and_entry_bounds() {
+        let collision_key = ShapedRunKey {
+            hash: 0x1234,
+            len: 2,
+        };
+        let mut interner = ShapedRunInterner::default();
+        for seed in 0..(SHAPED_RUN_INTERNER_MAX_COLLISIONS as u32 + 2) {
+            let (infos, glyphs, run) = fake_shaped_run(100 + seed);
+            interner.insert(collision_key, &infos, &glyphs, &run);
+        }
+        assert_eq!(
+            interner.runs.get(&collision_key).map(Vec::len),
+            Some(SHAPED_RUN_INTERNER_MAX_COLLISIONS),
+            "collision buckets must stay bounded"
+        );
+        assert_eq!(
+            interner.entries, SHAPED_RUN_INTERNER_MAX_COLLISIONS,
+            "entry accounting must follow collision eviction"
+        );
+
+        let mut interner = ShapedRunInterner::default();
+        for seed in 0..=(SHAPED_RUN_INTERNER_MAX_ENTRIES as u32) {
+            let key = ShapedRunKey {
+                hash: u64::from(seed),
+                len: 2,
+            };
+            let (infos, glyphs, run) = fake_shaped_run(1_000 + seed);
+            interner.insert(key, &infos, &glyphs, &run);
+        }
+        assert!(
+            interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "global interner entries must stay bounded"
+        );
+        assert!(
+            interner.runs.len() <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "global interner buckets must stay bounded"
+        );
+    }
+
+    #[test]
+    fn interned_run_matches_fresh_shape_for_same_font_and_attrs() {
+        config::use_test_configuration();
+
+        let config = config::configuration();
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
+            )
+            .unwrap(),
+        );
+        let render_metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+
+        let style = TextStyle::default();
+        let font = fonts.resolve_font(&style).unwrap();
+        let text = "status != ready <= retry";
+
+        assert!(
+            glyph_run_interning_enabled(),
+            "glyph-run interning must be enabled for the equivalence gate"
+        );
+        SHAPED_RUN_INTERNER.with(|interner| {
+            *interner.borrow_mut() = Default::default();
+        });
+
+        let (miss_infos, miss_glyphs) =
+            shape_infos_and_glyphs(&render_metrics, &mut glyph_cache, &style, &font, text);
+        let fresh_miss_run = build_shaped_infos(&miss_infos, &miss_glyphs);
+        let miss_run = ShapedInfo::process(&miss_infos, &miss_glyphs);
+        assert_shaped_runs_identical(&fresh_miss_run, &miss_run);
+
+        let (hit_infos, hit_glyphs) =
+            shape_infos_and_glyphs(&render_metrics, &mut glyph_cache, &style, &font, text);
+        assert_shaping_stream_eq(&miss_infos, &miss_glyphs, &hit_infos, &hit_glyphs);
+
+        let fresh_hit_run = build_shaped_infos(&hit_infos, &hit_glyphs);
+        let hit_key = shaped_run_key(&hit_infos, &hit_glyphs);
+        let lookup_hit = SHAPED_RUN_INTERNER
+            .with(|interner| interner.borrow().lookup(hit_key, &hit_infos, &hit_glyphs))
+            .expect("second identical shape must hit the glyph-run interner");
+        assert_shaped_runs_identical(&fresh_hit_run, &lookup_hit);
+
+        let interned_hit = SHAPED_RUN_INTERNER.with(|interner| {
+            interner
+                .borrow()
+                .runs
+                .get(&hit_key)
+                .and_then(|runs| runs.iter().find(|run| run.matches(&hit_infos, &hit_glyphs)))
+                .cloned()
+        });
+        let interned_hit = interned_hit.expect("matching interned run must be retained");
+        assert_eq!(
+            shaped_run_signature(&hit_infos, &hit_glyphs),
+            interned_hit.signature
+        );
+        assert_signature_mismatch_rejects_hit(&interned_hit, &hit_infos, &hit_glyphs);
+
+        let process_hit = ShapedInfo::process(&hit_infos, &hit_glyphs);
+        assert_shaped_runs_identical(&fresh_hit_run, &process_hit);
+    }
+
+    #[test]
+    fn ligatures_fira() {
+        config::use_test_configuration();
+        let _ = env_logger::Builder::new()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+
+        let config = config::configuration();
+
+        let mut config: config::Config = (*config).clone();
+        config.font = TextStyle {
+            font: vec![FontAttributes::new("Fira Code")],
+            foreground: None,
+        };
+        config.font_rules.clear();
+        config.compute_extra_defaults(None);
+        config::use_this_configuration(config.clone());
+
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
+            )
+            .unwrap(),
+        );
+        let render_metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+
+        let style = TextStyle::default();
+        let font = fonts.resolve_font(&style).unwrap();
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "a..."),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 189,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 896,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -15.0,
+        bitmap_pixel_width: 20,
+    },
+]
+"
+        );
+    }
+
+    #[test]
+    fn bench_shaping() {
+        config::use_test_configuration();
+
+        // let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128, &render_metrics).unwrap();
+        // let render_metrics = RenderMetrics::new(&fonts).unwrap();
+
+        benchmarking::warm_up();
+
+        for &n in &[100, 1000, 10_000] {
+            let bench_result = benchmarking::measure_function(move |measurer| {
+                let text: String = (0..n).map(|_| ' ').collect();
+
+                let fonts = Rc::new(
+                    FontConfiguration::new(
+                        None,
+                        config::configuration()
+                            .dpi
+                            .unwrap_or_else(::window::default_dpi) as usize,
+                    )
+                    .unwrap(),
+                );
+                let style = TextStyle::default();
+                let font = fonts.resolve_font(&style).unwrap();
+                let line = Line::from_text(&text, &CellAttributes::default(), SEQ_ZERO, None);
+                let cell_clusters = line.cluster(None);
+                let cluster = &cell_clusters[0];
+                let presentation_width = PresentationWidth::with_cluster(cluster);
+
+                measurer.measure(|| {
+                    let _x = font
+                        .shape(
+                            &cluster.text,
+                            || {},
+                            |_| {},
+                            None,
+                            Direction::LeftToRight,
+                            None,
+                            Some(&presentation_width),
+                        )
+                        .unwrap();
+                    // println!("{:?}", &x[0..2]);
+                });
+            })
+            .unwrap();
+            println!("{}: {:?}", n, bench_result.elapsed());
+        }
+    }
+
+    #[test]
+    fn ligatures_jetbrains() {
+        config::use_test_configuration();
+        let _ = env_logger::Builder::new()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+        let config = config::configuration();
+
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
+            )
+            .unwrap(),
+        );
+        let render_metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+
+        let style = TextStyle::default();
+        let font = fonts.resolve_font(&style).unwrap();
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "ab"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 189,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 214,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "a b"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 189,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 958,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 214,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "a..."),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 189,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 896,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -15.0,
+        bitmap_pixel_width: 20,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "e_or_"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 225,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 860,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 9,
+    },
+    GlyphPosition {
+        glyph_idx: 290,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 320,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 860,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 9,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "a  b"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 189,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+    GlyphPosition {
+        glyph_idx: 958,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 958,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 214,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 1.0,
+        bitmap_pixel_width: 8,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<-"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1588,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -9.0,
+        bitmap_pixel_width: 17,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<>"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1613,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -8.0,
+        bitmap_pixel_width: 16,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "|=>"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1562,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -18.0,
+        bitmap_pixel_width: 27,
+    },
+]
+"
+        );
+
+        let block_bottom_one_eighth = "\u{2581}";
+        k9::snapshot!(
+            cluster_and_shape(
+                &render_metrics,
+                &mut glyph_cache,
+                &style,
+                &font,
+                block_bottom_one_eighth
+            ),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 1178,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 10,
+    },
+]
+"
+        );
+
+        let powerline_extra_honeycomb = "\u{e0cc}";
+        k9::snapshot!(
+            cluster_and_shape(
+                &render_metrics,
+                &mut glyph_cache,
+                &style,
+                &font,
+                powerline_extra_honeycomb,
+            ),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 58,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -0.8333333,
+        bitmap_pixel_width: 12,
+    },
+]
+"
+        );
+
+        k9::snapshot!(
+            cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<!--"),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1742,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 0,
+    },
+    GlyphPosition {
+        glyph_idx: 1595,
+        num_cells: 1,
+        x_offset: 0.0,
+        bearing_x: -28.0,
+        bitmap_pixel_width: 37,
+    },
+]
+"
+        );
+
+        let deaf_man_medium_light_skin_tone = "\u{1F9CF}\u{1F3FC}\u{200D}\u{2642}\u{FE0F}";
+        println!(
+            "deaf_man_medium_light_skin_tone: {}",
+            deaf_man_medium_light_skin_tone
+        );
+        k9::snapshot!(
+            cluster_and_shape(
+                &render_metrics,
+                &mut glyph_cache,
+                &style,
+                &font,
+                deaf_man_medium_light_skin_tone
+            ),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 2712,
+        num_cells: 2,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 16,
+    },
+]
+"
+        );
+
+        let england_flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        println!("england_flag: {}", england_flag);
+        k9::snapshot!(
+            cluster_and_shape(
+                &render_metrics,
+                &mut glyph_cache,
+                &style,
+                &font,
+                england_flag
+            ),
+            "
+[
+    GlyphPosition {
+        glyph_idx: 3855,
+        num_cells: 2,
+        x_offset: 0.0,
+        bearing_x: 0.0,
+        bitmap_pixel_width: 20,
+    },
+]
+"
+        );
+    }
+}

@@ -1,0 +1,8 @@
+schema_version: ft.flight_recorder.incident_golden.v1
+scenario_id: remote_cargo_pass
+incident_id: ft-ogr3n6-remote-cargo-pass
+outcome: source_pass
+proof_admissible: true
+frame_count: 3
+rch: build_id=j-29871232832766549,worker_id=vmi1293453,exit_code=0,target_dir=/tmp/ft-ogr3n4-workspace-check
+local_cargo_counted: false

@@ -1,0 +1,27 @@
+# Rebuttals and Attacks
+
+## Defenses (The Hills I Will Die On)
+
+### Defense 1: Idea 6 (Time-Travel Debugging: Replay-to-Live Handoff)
+**The claim:** Both CC and COD claim this is merely "context-preloaded recreation," not true time travel, because it fails to restore the underlying OS process memory, network sockets, or the agent CLI's internal state, leading to a misleading synthetic environment.
+**The evidence:** The evaluators completely missed the paradigm shift of the target audience: LLM-based CLI agents. Unlike human engineers or traditional binary processes (like a C++ server), LLMs are mathematically stateless functions. An agent's entire "process memory" is strictly equivalent to its context window: the visible terminal scrollback, the current working directory, and the filesystem state. By leveraging the `DurableStateManager` to check out the exact historical git commit/filesystem state, and injecting the exact historical PTY scrollback via the native event bridge, we reconstruct 100% of the state that the LLM can perceive. For an AI meta-agent, this is indistinguishable from true OS-level snapshotting. Second-order effects: this enables A/B testing of different model versions (e.g., swapping Claude 3.5 for Gemini 1.5) at the exact moment of failure, without needing to recreate the complex multi-hour setup that led to the incident.
+**The verdict:** Confidence 95 percent. The critique applies to traditional debuggers (like `gdb`), but completely fails to account for the stateless, context-bound reality of LLM agents. Replay-to-live is fundamentally sound and transformative for the target audience.
+
+### Defense 2: Idea 8 (Cryptographic Provenance / Agentic SBOM)
+**The claim:** CC claims FrankenTerm cannot provide an Agentic SBOM because it does not mediate or observe filesystem edits made by agent CLIs (which use in-process tools invisible to FT), making scrollback-based provenance impossible.
+**The evidence:** This critique assumes the current loose filesystem access model is immutable, ignoring the explicit purpose of FT's Policy Engine and MCP boundaries. To enforce provenance, we do not scrape scrollback; we configure the Policy Engine to deny raw file modifications via the agent's internal tools (e.g., by intercepting the MCP `write_file` tool call or using OS-level MAC policies). We force the agent to use a newly exposed `wa://file_write` MCP tool, which *is* heavily mediated by the `Tx` engine. Once file writes flow through the `Tx` prepare/commit pipeline, FT absolutely observes the diff, the prompt intent, and the persona, allowing the Sigstore machinery to sign the transaction. The second-order effect is that it closes the massive security gap of agents silently altering files outside the platform's audit ledger.
+**The verdict:** Confidence 90 percent. The evaluators lacked imagination regarding policy enforcement. FT's Policy Engine exists precisely to enforce new mediations like this, turning an "impossible" problem into a simple routing requirement.
+
+---
+
+## Attacks (The Flaws in Their Best Ideas)
+
+### Attack 1: COD Idea 10 (Agent Mail Outage Spool)
+**The claim:** Create a durable local spool for Agent Mail coordination intents when the service is down, allowing agents to queue file reservations and messages for asynchronous replay when it recovers.
+**The evidence:** Agent Mail exists to provide *mutual exclusion* (file reservations) across a concurrent swarm. If the service is down, failing closed is the only mathematically safe option. Creating an asynchronous "spool" means multiple agents will locally queue overlapping locks for the same file, believe they have secured the reservation, and begin mutating. When the service recovers and the spool flushes, it will reveal massive split-brain corruption and catastrophic git conflicts. You cannot queue mutual exclusion locks asynchronously; doing so defeats the entire purpose of a lock. It trades a visible availability failure for a silent, destructive consistency failure.
+**The verdict:** Confidence 100 percent. This idea is fundamentally dangerous and violates basic distributed systems concurrency rules.
+
+### Attack 2: CC Idea 15 (`ft doctor --fix` — Receipted, Reversible Auto-Remediation)
+**The claim:** Provide automated, receipted fixes for common `ft doctor` complaints (like clearing stale locks or rebuilding FTS) using the `Tx` engine to ensure safety.
+**The evidence:** Auto-remediating infrastructure state in a highly concurrent, multi-agent environment is notoriously hazardous. For instance, automatically deleting `watcher.lock` because a liveness probe heuristically decides the PID is dead can easily result in two watchers starting simultaneously if the probe is wrong (e.g., due to temporary I/O stalls or extreme CPU starvation). This would instantly corrupt the single-writer SQLite database. Doctor checks are diagnostic; blindly turning them into automated mutations masks root causes and introduces severe race conditions. Automation here replaces operator judgment with a script that assumes the heuristic probe is infallible.
+**The verdict:** Confidence 95 percent. Automated remediation of distributed or concurrent state is a classic anti-pattern that trades operator convenience for catastrophic data loss.

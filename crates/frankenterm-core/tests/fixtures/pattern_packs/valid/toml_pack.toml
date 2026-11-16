@@ -1,0 +1,11 @@
+# TOML round-trip example — same logical content shape as YAML/JSON.
+name = "example.com:toml-pack"
+version = "0.3.0"
+
+[[rules]]
+id = "example.toml.session_start"
+agent_type = "claude_code"
+event_type = "session_start"
+severity = "info"
+anchors = ["[CLAUDE] Session started"]
+description = "Claude Code session began."

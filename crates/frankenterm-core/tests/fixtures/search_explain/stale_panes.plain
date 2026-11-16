@@ -1,0 +1,11 @@
+Search explain for query: "find"
+  Panes: 1 total (1 observed, 0 ignored)
+  Indexed segments: 200
+
+1 potential issue(s):
+
+  1. [STALE_PANES] 1 observed pane(s) have not been seen recently. They may be closed or disconnected.
+     stale_pane_ids: 5
+     Suggestions:
+       - Check pane status: ft list
+       - Verify the watcher is running: ft status

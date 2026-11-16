@@ -1,0 +1,2 @@
+Go to the following link in your browser to authorize this app:
+https://accounts.google.com/o/oauth2/auth?client_id=123456.apps.googleusercontent.com&scope=openid+email

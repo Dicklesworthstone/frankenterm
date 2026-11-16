@@ -1,0 +1,21 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Selection char fixture: drag begins inside this sentence.",
+    "Only these middle cells should carry the selection tint.",
+    "Cursor remains a beam at the trailing edge of the selected span."
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 31,
+    "shape": "beam"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 5,
+    "end_row": 1,
+    "end_col": 30
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

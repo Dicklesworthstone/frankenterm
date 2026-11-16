@@ -1,0 +1,15 @@
+Search explain for query: "error"
+  Panes: 1 total (1 observed, 0 ignored)
+  Indexed segments: 80
+
+1 potential issue(s):
+
+  1. [CAPTURE_GAPS] 2 capture gap(s) detected across 1 pane(s). ~80 segments may be missing.
+     total_gaps: 2
+     affected_panes: 1
+     estimated_missing_segments: 80
+     gap_reasons: connection reset, shell crashed
+     Suggestions:
+       - Gaps occur during daemon restarts or high load.
+       - Reduce poll interval: ft watch --poll-interval 2000
+       - Check gap details: ft events --rule-id gap

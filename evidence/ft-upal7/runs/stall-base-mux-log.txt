@@ -1,0 +1,6 @@
+[2026-11-06T18:52:54Z INFO  frankenterm_mux_server] frankenterm-mux-server-ready unix_domains=1 tls_servers=0
+[2026-11-06T18:56:34Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 197439 ms with 9 of 50 pane checkpoints taken (slowest: pane Some(1) in 40245 ms)
+[2026-11-06T18:59:47Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 190477 ms with 18 of 50 pane checkpoints taken (slowest: pane Some(10) in 20024 ms)
+[2026-11-06T19:02:57Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 187423 ms with 24 of 50 pane checkpoints taken (slowest: pane Some(20) in 20943 ms)
+[2026-11-06T19:06:06Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 186325 ms with 28 of 50 pane checkpoints taken (slowest: pane Some(26) in 27993 ms)
+[2026-11-06 14:08:40] ERROR: guardian holds 50 live pane(s), but no committed recovery snapshot exists; refusing a fresh mux start

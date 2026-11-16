@@ -1,0 +1,1 @@
+capture-pane -p -t %1

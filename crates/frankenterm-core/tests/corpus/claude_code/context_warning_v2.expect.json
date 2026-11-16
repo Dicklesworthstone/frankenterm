@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.context.warning",
+    "agent_type": "claude_code",
+    "event_type": "context.warning",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "percent": "92"
+    },
+    "matched_text": "92% context remaining"
+  }
+]

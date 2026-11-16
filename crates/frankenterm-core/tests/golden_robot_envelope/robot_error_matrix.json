@@ -1,0 +1,74 @@
+{
+  "schema_version": "ft.robot.error_matrix.v1",
+  "description": "Canonical Robot CLI error envelopes for machine clients. Timing fields are scrubbed to zero.",
+  "cases": [
+    {
+      "id": "get_text_pane_not_found",
+      "command": "ft robot --format json get-text 424242",
+      "family": "get_text",
+      "action": "get_text",
+      "scenario": "pane_not_found",
+      "expected_code": "robot.pane_not_found",
+      "envelope": {
+        "ok": false,
+        "error": "Pane 424242 not found",
+        "error_code": "robot.pane_not_found",
+        "hint": "Use 'ft robot state' to list available panes",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      }
+    },
+    {
+      "id": "send_policy_denied",
+      "command": "ft robot --format json send 7 \"rm -rf /\"",
+      "family": "send",
+      "action": "send",
+      "scenario": "policy_denied",
+      "expected_code": "robot.policy_denied",
+      "envelope": {
+        "ok": false,
+        "error": "Policy denied by rule policy.test.block",
+        "error_code": "robot.policy_denied",
+        "hint": "Run ft policy explain send to inspect the matching rule.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      }
+    },
+    {
+      "id": "send_require_approval",
+      "command": "ft robot --format json send 7 \"deploy\"",
+      "family": "send",
+      "action": "send",
+      "scenario": "require_approval",
+      "expected_code": "robot.require_approval",
+      "envelope": {
+        "ok": false,
+        "error": "Command requires human approval",
+        "error_code": "robot.require_approval",
+        "hint": "Approve via ft approve <id> or retry with the issued approval code.",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      }
+    },
+    {
+      "id": "wait_for_timeout",
+      "command": "ft robot --format json wait-for 7 \"ready>\" --timeout-secs 1",
+      "family": "wait_for",
+      "action": "wait_for",
+      "scenario": "timeout",
+      "expected_code": "robot.timeout",
+      "envelope": {
+        "ok": false,
+        "error": "Timeout waiting for pattern 'ready>' after 1000ms (5 polls)",
+        "error_code": "robot.timeout",
+        "hint": "Increase --timeout-secs or check if the pattern is correct",
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      }
+    }
+  ]
+}

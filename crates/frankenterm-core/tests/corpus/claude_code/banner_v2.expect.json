@@ -1,0 +1,25 @@
+[
+  {
+    "rule_id": "claude_code.banner",
+    "agent_type": "claude_code",
+    "event_type": "session.start",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "version": "2.0.0",
+      "model": "claude-opus-4-5-20251101"
+    },
+    "matched_text": "claude-code/2.0.0 model: claude-opus-4-5-20251101"
+  },
+  {
+    "rule_id": "claude_code.model.selected",
+    "agent_type": "claude_code",
+    "event_type": "session.model",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "model": "claude-opus-4-5-20251101"
+    },
+    "matched_text": "model: claude-opus-4-5-20251101"
+  }
+]

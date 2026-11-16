@@ -1,0 +1,20 @@
+name = "edge:cases"
+version = "0.0.1"
+
+[[rules]]
+id = "edge.unicode"
+agent_type = "any"
+event_type = "info"
+severity = "info"
+anchors = ["\u00e9", "\u4e2d"]
+regex = "[\\u00C0-\\u024F]+"
+description = "Unicode identifier detection"
+
+[[rules]]
+id = "edge.long"
+agent_type = "any"
+event_type = "error"
+severity = "error"
+anchors = ["AAAA"]
+regex = "A{4,100}"
+description = "Repetition range"

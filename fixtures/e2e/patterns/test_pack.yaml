@@ -1,0 +1,79 @@
+# Test Pattern Pack for E2E Testing
+# These patterns are specifically designed for E2E test scenarios
+
+name: e2e_test_pack
+version: "1.0.0"
+description: Pattern pack for E2E test scenarios
+
+patterns:
+  # Compaction detection pattern (for compaction_workflow scenario)
+  - id: codex:compaction
+    name: Codex Compaction Required
+    description: Detects when Codex signals context window is full
+    regex: '\[CODEX\] Compaction required: (.+)'
+    captures:
+      - name: reason
+        group: 1
+    priority: high
+    enabled: true
+    tags:
+      - codex
+      - compaction
+      - e2e-test
+
+  # Session start pattern
+  - id: codex:session_start
+    name: Codex Session Started
+    description: Detects when a Codex session begins
+    regex: '\[CODEX\] Session started'
+    priority: normal
+    enabled: true
+    tags:
+      - codex
+      - session
+      - e2e-test
+
+  # E2E marker pattern (for capture_search scenario)
+  - id: e2e:marker
+    name: E2E Test Marker
+    description: Detects E2E test marker lines for search verification
+    regex: 'Line \d+: (E2E_MARKER_\w+)'
+    captures:
+      - name: marker
+        group: 1
+    priority: low
+    enabled: true
+    tags:
+      - e2e-test
+      - marker
+
+  # E2E done marker
+  - id: e2e:done
+    name: E2E Done Marker
+    description: Detects when E2E test script completes
+    regex: 'Done: (E2E_MARKER_\w+)'
+    captures:
+      - name: marker
+        group: 1
+    priority: normal
+    enabled: true
+    tags:
+      - e2e-test
+      - completion
+
+workflows:
+  # Workflow triggered by compaction pattern
+  - id: e2e:compaction_refresh
+    name: Compaction Refresh Workflow
+    description: Sends refresh command when compaction is detected
+    trigger:
+      pattern_id: codex:compaction
+    steps:
+      - action: send_text
+        params:
+          text: "/compact\n"
+          delay_ms: 100
+    enabled: true
+    tags:
+      - e2e-test
+      - compaction

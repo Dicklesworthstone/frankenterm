@@ -1,0 +1,649 @@
+# FrankenTerm GUI User Guide and WezTerm Migration
+
+This guide covers the current `frankenterm-gui` workflow in this repository:
+
+- first launch and day-to-day command usage
+- `frankenterm.toml` configuration reference (current default keys)
+- migration guidance from WezTerm and from ft v1-style workflows
+- swarm/agent operating guidance
+- extension/plugin entry points
+
+## Quick Start
+
+### 1. Install or build
+
+Option A (app bundle release):
+
+1. Install `FrankenTerm.app`.
+2. Move it to `/Applications`.
+
+Option B (build from source):
+
+```bash
+cargo build --profile release-interactive -p frankenterm-gui
+```
+
+`release-interactive` is required for shipped CLI, GUI, and mux-server builds;
+the ordinary `release` profile also unwinds as a fail-safe default. Only the
+explicit `release-abort-probe` negative-control profile disables recovery.
+
+### 2. Create your GUI config
+
+Start from the repo default:
+
+```bash
+mkdir -p ~/.config/frankenterm
+cp crates/frankenterm-gui/frankenterm.toml ~/.config/frankenterm/frankenterm.toml
+```
+
+### 3. Launch
+
+If installed on `PATH`:
+
+```bash
+frankenterm-gui
+```
+
+From the build tree:
+
+```bash
+./target/release-interactive/frankenterm-gui
+```
+
+### 4. Verify ft integration
+
+Run watcher in one terminal:
+
+```bash
+ft watch --foreground
+```
+
+Launch GUI in another terminal:
+
+```bash
+frankenterm-gui
+```
+
+Then confirm events are flowing:
+
+```bash
+ft events --limit 20
+```
+
+## GUI Command Reference
+
+`frankenterm-gui` subcommands:
+
+- `start`: start GUI and optionally run a command in the initial tab
+- `connect <domain>`: attach to a named mux domain
+- `ssh [user@]host[:port]`: open remote SSH session in GUI
+- `serial <port>`: open serial device session
+- `ls-fonts`: inspect font resolution and font inventory
+- `show-keys`: print effective key assignments
+- `cli`: send one request to a running GUI or mux server (`list`, `spawn`,
+  `move-pane-to-new-tab`), without opening a window
+
+Useful examples:
+
+```bash
+# Start normally
+frankenterm-gui start
+
+# Start in a new process (don't reuse an existing GUI instance)
+frankenterm-gui start --always-new-process
+
+# Start and run a command
+frankenterm-gui start -- bash -lc "htop"
+
+# Connect to an existing domain from config
+frankenterm-gui connect production
+
+# Create/attach to a named session (workspace alias)
+frankenterm-gui start --session agent-fleet
+frankenterm-gui connect production --session agent-fleet
+
+# Open direct SSH session
+frankenterm-gui ssh deploy@10.0.0.5
+
+# Inspect key assignments
+frankenterm-gui show-keys
+frankenterm-gui show-keys --lua
+
+# From inside a pane: open a tab in this window, list panes, move a pane
+frankenterm-gui cli spawn --cwd ~/src -- htop
+frankenterm-gui cli list --format json
+frankenterm-gui cli move-pane-to-new-tab --pane-id 12 --new-window
+```
+
+`frankenterm-gui cli` takes the same arguments as the matching `wezterm cli`
+subcommands and prints the same output (`spawn` prints the new pane id;
+`list --format json` adds an `is_floating` field). It connects to
+`$FRANKENTERM_UNIX_SOCKET` or `$WEZTERM_UNIX_SOCKET`, which FrankenTerm sets
+in every pane, else to a running GUI (`--class` picks one started with
+`--class`), else to the first configured unix domain; `--prefer-mux` skips
+the GUI. It never starts a server. The pane it acts on or from is `--pane-id`, else
+`$WEZTERM_PANE`, else the focused pane of the most recently active client; a
+pane id that does not exist is an error. Without `--workspace`, a new window
+gets the workspace of that pane.
+
+Default session-manager entry point:
+
+- `Cmd+S` opens the session manager launcher (workspace/domain/session switch surface).
+- Session rows include active/current marker plus window and pane counts.
+- Session rows are listed before domain and command-palette rows so the overlay opens session-first.
+- Domain rows surface the current mux connection state (`connected` or `detached`).
+
+Global launch options:
+
+- `--config-file <path>`: force a specific config file
+- `--config name=value`: override individual config values for one run
+- `--skip-config`: run without loading config files
+- `--workspace <name>` / `--session <name>`: select or create named session namespace
+
+### Pane dashboard
+
+Choose **View → Toggle Dashboard**, or find **Toggle Dashboard** in the command
+palette, to browse panes across the current window's tabs. Each row shows its
+tab position, pane ID, domain, and published terminal title; a dot marks the
+focused pane. The list refreshes once per second while the window is focused.
+Missing title metadata is displayed as **Title unavailable**.
+
+| Control | Action |
+|---|---|
+| Type text | Filter by all entered words, ignoring case |
+| Up / Down, or Ctrl+P / Ctrl+N | Select a pane |
+| Enter | Focus the selected pane and its tab, then close the dashboard |
+| Ctrl+R | Refresh immediately |
+| Ctrl+U | Clear the filter |
+| Esc, Ctrl+G, or the configured Toggle Dashboard shortcut | Close the dashboard |
+
+Selection follows the same live pane through row reordering. If that pane closes,
+selection clears; a new pane reusing its numeric ID must be selected explicitly.
+The dashboard retains at most 4,096 rows and adds `+` to the pane count when the
+list is truncated. Navigation is currently by keyboard.
+
+**Agent state unavailable** means that the GUI does not yet receive canonical
+watcher activity classifications. This pane dashboard currently provides pane
+discovery and focus, without live agent, health, or event summaries. The remaining
+agent dashboard integration is tracked in `ft-7h5da.7.10`.
+
+## Config Reference (`frankenterm.toml`)
+
+Primary GUI config location:
+
+- `~/.config/frankenterm/frankenterm.toml`
+
+Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
+
+| Key | Default | Example / Notes |
+|---|---|---|
+| `color_scheme` | `"Builtin Dark"` | `color_scheme = "Dracula"` |
+| `font_size` | `14.0` | `font_size = 12.0` |
+| `font_dirs` | `["fonts"]` | bundled app fonts directory |
+| `[[font.font]].family` | `"Pragmasevka Nerd Font"` | add additional fallback `[[font.font]]` entries |
+| `[[font.font]].harfbuzz_features` | `["calt=0","clig=0","liga=0"]` | tune ligatures per preference |
+| `window_background_opacity` | `1.0` | `0.95` for transparency |
+| `text_background_opacity` | `1.0` | usually keep aligned with window opacity |
+| `scrollback_lines` | `100000` | lower for memory-constrained hosts |
+| `enable_scroll_bar` | `true` | `false` for minimal UI |
+| `initial_rows` | `40` | window startup rows |
+| `initial_cols` | `120` | window startup columns |
+| `window_decorations` | macOS: `"INTEGRATED_BUTTONS | RESIZE"`; other platforms: `"TITLE | RESIZE"` | OS-dependent behavior |
+| `window_close_confirmation` | `"AlwaysPrompt"` | controls tab/window/quit confirmation prompts |
+| `skip_close_confirmation_for_processes_named` | `[]` | keep empty to prompt for ordinary shell-backed tabs |
+| `click_interval_ms` | `500` | accessibility: raise to `1000`-`2000` for a slower double-click cadence |
+| `[window_padding].left/right/top/bottom` | `4` | pixel padding around terminal viewport |
+| `enable_tab_bar` | `true` | show/hide tab bar |
+| `hide_tab_bar_if_only_one_tab` | `false` | keeps the macOS integrated titlebar surface visible |
+| `tab_bar_at_bottom` | `false` | set `true` for bottom tab bar |
+| `[leader]` (optional) | unset | tmux-style leader key chord |
+| `unix_domains` | implicit `"unix"` domain | add custom domains only for non-default mux sockets |
+| `resize_wrap_scorecard_enabled` | `true` | emits resize wrap quality telemetry |
+| `resize_wrap_readability_gate_enabled` | `true` | fallback gate for unreadable wraps |
+| `resize_wrap_readability_max_line_badness_delta` | `500` | stricter = lower |
+| `resize_wrap_readability_max_total_badness_delta` | `2000` | aggregate threshold |
+| `resize_wrap_readability_max_fallback_ratio_percent` | `20` | % of lines allowed to fallback |
+| `resize_wrap_kp_*` (optional) | unset | advanced KP tuning knobs |
+| `[[ssh_domains]]` (optional) | auto-discovered from `~/.ssh/config` | explicit named SSH targets |
+| `max_fps` | `60` | lower on constrained GPUs |
+| `unfocused_max_fps` | unset (`max_fps`) | macOS: repaint limit for windows without keyboard focus, capped at `max_fps`. With many windows showing animated agent output, `10` saves most of their repaint work; stacked translucent windows count as visible to macOS, so nothing else throttles them |
+| `front_end` | `"WebGpu"` | rendering backend; without a config file the built-in default is `"OpenGL"`. Values: `"WebGpu"`, `"OpenGL"`, `"Software"`, `"Metal"` (see below) |
+| `check_for_updates` | `false` | disable update checks by default |
+| `automatically_reload_config` | `true` | hot-reload config changes |
+
+`front_end = "Metal"` selects the native Metal renderer on macOS. It is in
+development. It draws terminal text, colors, the cursor and the tab bar, and
+builds each window's frames on its own render thread, rebuilding only changed
+rows. Pixel parity with WebGpu is still being verified, so keep `"WebGpu"` for
+daily use. When Metal is unavailable
+(not macOS, no Metal device, a GPU older than the Apple7/M1 family, or a window
+without a `CAMetalLayer`), the GUI logs
+`front_end=Metal unavailable (reason=<code>)` and falls back to WebGpu. The
+`Renderer initialized: ...` log line names the backend actually in use.
+
+Swap layouts and floating panes are currently keybinding-driven features, not
+TOML-gated features. The default sample config does not list `swap_layout_*` or
+`floating_pane_*` keys because those fields are not parsed as active GUI config
+fields yet.
+
+SSH domain fields (optional per entry):
+
+- `name`
+- `remote_address`
+- `username`
+- `multiplexing` (`"WezTerm"` or `"None"`)
+- `ssh_backend` (`"LibSsh"` or `"Ssh2"`)
+- `connect_automatically`
+- `default_prog`
+
+### Remembered domain attachments
+
+FrankenTerm remembers an explicit remote-domain attach or detach across GUI
+restarts. This is a desired-attachment preference, not a serialized network
+connection or a promise that an incompatible or unavailable mux can be reached.
+The built-in reconnect supervisor applies three states:
+
+- no remembered record: follow the domain's `connect_automatically` setting;
+- remembered attached: keep retrying the configured domain even when
+  `connect_automatically` is false;
+- remembered detached: do not auto-connect that domain, even when its
+  `connect_automatically` setting is true.
+
+An explicit attach begins its requested transport first, then records the
+attached preference in a detached best-effort task after the transport outcome
+is known; that optional disk work does not block the requested pane spawn. A
+slow or contended manifest can therefore no longer make a direct `trj`/`csd`
+open appear inert on the normally admitted path. If the main-thread scheduler
+rejects the detached persistence task after transport has already succeeded,
+FrankenTerm uses an inline persistence fallback rather than silently losing
+the preference; only that saturation fallback can delay pane creation. This
+includes a tab, window, or split spawn that selects a
+detached client domain, any supported detachable-domain floating spawn, and
+the `frankenterm-gui start --domain`
+handoff to an already-running GUI. All of those implicit attach sites pass
+through the same mux-owned lifecycle hook. The same attached preference is
+attempted after a failed dial so a proven record can authorize retry. Detach uses the stricter
+opposite order: its detached preference must be durable before the live mux is
+mutated, preventing an older attached record from reconnecting behind the
+operator's back. A Lua script that later calls `domain:attach()` is itself an
+explicit attach and changes a remembered detached state back to attached; a
+periodic user-authored Lua watchdog therefore remains authoritative over its
+own actions. If a command-palette or Lua attach cannot reach the mux,
+FrankenTerm advertises an exact automatic-retry handoff only when the requested
+domain is actually retained by durable/configured authority and an admitted
+supervisor frontier. A Lua detach fences the old supervisor generation
+immediately after the detached intent is durable, so a stale retry cannot undo
+the operator's choice. All
+attach, detach, startup, retry, and configuration-reload actions for the same
+domain alias are ticket-ordered through persistence, mux mutation, and retry
+handoff. An uncancellable persistence worker carries a shared hold on the
+exact lifecycle ticket. An implicit-spawn lease holds that ticket through the
+pane transaction while its detached persistence worker publishes or
+invalidates in-memory authority. Cancelling a queued or awaiting GUI/Lua/RPC
+action therefore cannot let its durable effect
+overtake a successor or leave a stale supervisor authorized. Different domains remain independent, with separate
+health discovery and backoff, so an unavailable domain cannot starve a newly
+detached peer. A successful explicit attach refreshes the remembered supervisor
+plan as well as the live connection, preserving automatic recovery if the
+connection's internal retry budget is later exhausted.
+
+If an intent write reports a late failure, FrankenTerm reloads the replicated
+authority before deciding what happened. A two-replica commit is repaired and
+accepted only when the recovered quorum contains the exact requested intent. A
+pre-commit detach failure republishes the proven older quorum and leaves the
+requested live detach unperformed; an explicit attach remains usable but is
+reported as not remembered. If the reload itself cannot establish a quorum, the
+in-memory snapshot is cleared and the reconnect supervisor is cancelled. An
+explicit attach may still continue as a direct operator action, but it is not
+advertised as remembered and cannot inherit stale automatic-reconnect state.
+Fresh authority is created in a dedicated owner-only
+`frankenterm-domain-reconnect-private-v1` leaf beneath the legacy data root, so
+installations whose shared data root has broader directory permissions can use
+automatic reconnect without weakening that parent mode. An existing schema-v1
+authority in the legacy data root is discovered before the private leaf is
+created and is migrated in place; this preserves the exact location that older
+FrankenTerm binaries used instead of silently abandoning remembered domains.
+If both namespaces contain slot evidence, startup fails closed before repairing
+or writing either one.
+
+Hot configuration reload retires an old exact client-domain generation before
+publishing its replacement, but continues adding unrelated domains and a safe
+default while that guard drains. It retries the newest configuration until the
+same-name fence clears, including a client-to-raw domain transition; a stale
+reload generation cannot overwrite a newer one. Reload notification first
+publishes a fail-closed validation gate and revokes both the old scheduler
+request and supervisor epochs. Automatic connection cannot read or dial from
+the new domain configuration until that exact generation passes aggregate
+reconciliation. An invalid or duplicate configuration therefore leaves the
+last live registry intact and automatic reconnect visibly paused; fixing and
+successfully reloading the configuration resumes it. Temporary main-thread
+scheduler saturation is retained by one serialized retry coordinator, and a
+thread that failed to start is never reported as a pending reconnect.
+
+The preference is stored in three replicated, mode-0600 checksummed files. New
+installations use the dedicated mode-0700 private leaf named above; an upgraded
+installation with legacy root-slot evidence keeps those files in the existing
+owner-only root namespace during and after migration. Schema v2 requires two
+exact replicas of the same complete generation before that state is authoritative. A
+higher-generation singleton is an interrupted publication and cannot displace
+the older two-replica quorum. A preference update reports success only after
+all three replicas have been written, synchronized, read back, and verified.
+On load, FrankenTerm repairs a missing, damaged, or stale replica only from an
+already authoritative quorum. If no quorum remains, reconnect is paused and
+the fault is reported; the loader does not select an older generation or fall
+back to `connect_automatically`. Within one GUI lifetime it also retains the
+full content identity of the highest accepted generation. A lower quorum is
+rejected before replica repair or intent writes can overwrite surviving
+high-water evidence; the exact retained quorum may restore service. Two
+different quorums at the same generation poison that generation for the
+process lifetime, however, and reconnect stays paused until a strictly newer
+durable generation is proven.
+
+Existing schema-v1 two-slot state is migrated in place while holding the same
+exclusive authority lock. Migration accepts either two valid legacy slots (the
+newer generation wins, while divergent equal generations fail closed) or the
+canonical first publication in slot 0 at generation 1 with slot 1 absent. A
+single valid legacy slot paired with a damaged or empty slot is ambiguous and
+is never used as authority. Migration publishes schema v2 to the third slot
+first, then the stale legacy slot, and finally the active legacy slot. After a
+crash, it resumes only from an exact cross-schema content quorum or a normal
+schema-v2 quorum; once schema v2 is present, an unrelated older schema-v1 state
+is never a fallback.
+
+The files store only domain-separated SHA-256 fingerprints of domain aliases,
+never raw aliases, addresses, usernames, socket paths, or credentials. The
+directory is pinned as a capability before the lock or any slot is opened;
+every leaf is opened relative to that descriptor without following symlinks,
+constrained to one private regular-file link owned by the same account, and
+revalidated against its name after I/O. Replacing the directory, lock, or slot
+therefore fails the operation instead of splitting lock authority or falsely
+reporting a durable preference. An explicit operator-requested attach still
+proceeds when this optional preference cannot be written, with a persistent
+warning that restart recovery was not remembered. An explicit detach remains
+fail-closed until its durable negative intent commits, preventing an older
+`Attached` record from reconnecting behind the operator's request.
+
+### Accessibility Timing
+
+`click_interval_ms` controls how much time FrankenTerm allows between successive clicks when deciding whether a gesture counts as a double-click or triple-click selection. The default is `500`, which matches common desktop defaults, but operators who need a slower cadence can raise it to `1000`-`2000` in `frankenterm.toml`.
+
+### Text rendering
+
+Six keys shape how glyphs are rasterized and blended. They can be set in
+`frankenterm.toml` or in a Lua config.
+
+FreeType hinting and subpixel text:
+
+- `freetype_load_target` (default `"Normal"`): the hinting, one of `Normal`,
+  `Light`, `Mono`, `HorizontalLcd` or `VerticalLcd`.
+- `freetype_render_target` (default: the value of `freetype_load_target`):
+  how glyphs are rendered. `HorizontalLcd` or `VerticalLcd` gives subpixel
+  (LCD) text.
+- `freetype_lcd_filter` (default `"Default"`): the filter FreeType runs over
+  subpixel glyphs to tame color fringes. `Default` uses the taps
+  `8, 77, 86, 77, 8` (in 1/256), `Light` uses `0, 85, 86, 85, 0` and is
+  crisper with slightly more fringing, and `None` does no filtering. Current
+  FreeType has no `Legacy` filter, so neither does this key. Grayscale text
+  ignores it.
+- `freetype_lcd_filter_weights` (default unset): five taps of your own that
+  replace the filter's, for example `[16, 64, 96, 64, 16]`. Taps that add up
+  to 256 leave the brightness unchanged; a center tap of 0 turns filtering
+  off.
+
+The two filter keys are read when fonts load: a config reload picks up a
+change, a per-window override does not. They only affect text rasterized by
+FreeType. On macOS the default rasterizer is CoreText, so there they need
+`font_rasterizer = "FreeType"`.
+
+Text weight, after kitty's `text_composition_strategy`:
+
+- `text_gamma` (default unset): 0.01 or more. Values above 1 make text
+  heavier, values below 1 lighter.
+- `text_contrast` (default unset): 0 to 100, a percentage by which every
+  glyph pixel's coverage is raised.
+
+With both unset, text renders exactly as before. Setting either one does
+two things. First, glyphs are blended in linear light instead of gamma
+space, which by itself makes light text on a dark background heavier and
+dark text on a light background lighter; `text_gamma = 1` alone gives just
+that. Second, each pixel's coverage `a` is reshaped:
+
+```
+w  = (1 - luminance(text) + luminance(background)) / 2
+a' = clamp(mix(a, a^(1 / text_gamma), w) * (1 + text_contrast / 100), 0, 1)
+```
+
+So `text_gamma` acts fully on black text on white and not at all on white
+text on black, which offsets the lighter dark-on-light text that linear
+blending produces. kitty's macOS default is:
+
+```toml
+text_gamma = 1.7
+text_contrast = 30
+```
+
+The OpenGL front end blends in gamma space, so its glyph shader rescales the
+coverage to give the linear-light result. A shader cannot read the pixel it
+draws over, so it assumes the active pane's default background; text over
+other colors (a selection, a colored cell, the tab bar) comes out slightly
+different from an exact linear blend. The WebGpu front end draws to an sRGB
+surface, which already blends in linear light, so there only the curve
+applies. The Metal front end does not support these two keys yet.
+
+## Migration Guide: WezTerm -> FrankenTerm
+
+### A. Config migration (Lua -> TOML)
+
+1. Back up your current `wezterm.lua`.
+2. Create `~/.config/frankenterm/frankenterm.toml`.
+3. Port common keys directly:
+
+| WezTerm Lua | FrankenTerm TOML |
+|---|---|
+| `config.font_size = 14.0` | `font_size = 14.0` |
+| `config.color_scheme = "Dracula"` | `color_scheme = "Dracula"` |
+| `config.scrollback_lines = 100000` | `scrollback_lines = 100000` |
+| `config.enable_tab_bar = false` | `enable_tab_bar = false` |
+
+4. Port SSH domains:
+
+```toml
+[[ssh_domains]]
+name = "production"
+remote_address = "10.0.0.5:22"
+username = "deploy"
+```
+
+5. Validate runtime config:
+
+```bash
+ft config validate
+```
+
+For a deeper mapping guide, see [docs/extensions/migration-guide.md](./extensions/migration-guide.md).
+
+### B. Keybinding migration
+
+Check effective bindings in GUI:
+
+```bash
+frankenterm-gui show-keys
+```
+
+New GUI actions surfaced in FrankenTerm include:
+
+- swap layout cycling
+- floating pane toggle
+- stack cycle controls
+
+### C. v1 (`ft` + stock WezTerm bridge) -> v2 (`frankenterm-gui`)
+
+Operationally important points:
+
+1. `ft` CLI workflows remain valid.
+2. `ft watch` can consume best-effort GUI state/lifecycle hints when the
+   authenticated native event socket is explicitly enabled. Raw pane-output
+   bytes still use the polling capture path.
+3. Existing workspace state (`ft.toml`, `ft.db`) remains usable.
+4. `FrankenTerm.app` can replace prior wrapper app bundles.
+5. WezTerm can remain installed side-by-side during migration.
+
+### D. Features changed or intentionally different
+
+- FrankenTerm TOML is the primary GUI config path.
+- Lua callbacks/conditional logic from `wezterm.lua` are not 1:1 TOML mappings.
+- Use extension and workflow surfaces for advanced automation patterns.
+
+### E. Current mux and SSH behavior contracts
+
+- `LocalDomain`, `RemoteSshDomain`, and `TermWizTerminalDomain` are intentionally non-detachable. FrankenTerm reports them as not detachable and returns explicit errors instead of pretending those panes can survive a detach operation.
+- `TmuxDomain` detach is supported only for a live launcher pane. FrankenTerm detaches by sending the control-mode detach key to that pane and then reports the domain as detached after tmux exits. Direct `spawn` and `spawn_pane` calls on `TmuxDomain` remain intentionally unsupported because tmux windows and panes materialize asynchronously from control-mode events.
+- SSH domain discovery still auto-loads `~/.ssh/config`, including `Match exec` criteria. FrankenTerm evaluates those commands locally by default during config resolution. Callers that need a no-spawn posture must deny `Match exec` evaluation explicitly and should consume match diagnostics rather than assuming silent fallback.
+- For libssh-backed SFTP files, metadata mutation on an open file is path-based rather than handle-based. Permission changes and modified-time changes are supported; access-time mutation is rejected explicitly so operators do not get a fake success path.
+
+## Agent Fleet Guide (200+ panes)
+
+### Recommended baseline
+
+GUI-side (`frankenterm.toml`):
+
+```toml
+scrollback_lines = 100000
+resize_wrap_scorecard_enabled = true
+resize_wrap_readability_gate_enabled = true
+max_fps = 60
+```
+
+ft runtime-side (`~/.config/ft/ft.toml`):
+
+```toml
+[native]
+enabled = true
+# `socket_path` is optional. When omitted, FrankenTerm resolves a private
+# per-user runtime path under `$TMPDIR` (or `/tmp`).
+# The authenticated bridge is currently available on Apple, Linux, Android,
+# FreeBSD, and DragonFly targets. Other targets fail closed.
+
+[ingest]
+poll_interval_ms = 200
+max_concurrent_captures = 10
+```
+
+### Run sequence
+
+```bash
+# Terminal 1: watcher
+ft watch --foreground
+
+# Terminal 2: GUI
+frankenterm-gui
+
+# Terminal 3: machine control plane (optional)
+ft robot --format toon state
+```
+
+For MCP-based automation:
+
+```bash
+ft mcp serve
+```
+
+### Backpressure and stability tuning
+
+- If memory pressure rises, lower `scrollback_lines`.
+- Scrollback budgets are per pane. Each pane keeps `scrollback_hot_lines`
+  (default 1000) resident and moves older lines to a warm tier capped at
+  `scrollback_warm_max_mb` (default 50 MiB). A swarm host therefore bounds
+  scrollback memory at roughly panes x (hot + warm): 97 panes at the defaults
+  can hold up to about 4.8 GiB of warm scrollback. On many-pane hosts set
+  `scrollback_warm_fleet_max_mb`: the mux shares that budget equally across its
+  live panes (each pane gets the smaller of its own cap and its share), so
+  `scrollback_warm_fleet_max_mb = 1024` bounds warm scrollback at 1 GiB however
+  many panes are open. `ft doctor` reports the panes' combined warm usage and
+  per-pane cap (`mux scrollback`), and names any other config file whose
+  `scrollback_lines` disagrees with the active one.
+- `ft watch` also relieves scrollback pressure itself. When its fleet
+  coordinator reaches critical pressure (a pane over
+  `[fleet_scrollback] per_pane_budget_bytes`, default 1 GiB, or host memory
+  pressure), it asks the mux to move the targeted panes' warm scrollback to the
+  cold tier and logs the bytes the mux reports releasing (maintenance event
+  `fleet_scrollback_coordinator`). This needs a mux of codec 67 or newer; with
+  an older mux the eviction is only logged as a recommendation.
+- If capture load is high, increase `ingest.poll_interval_ms` and/or lower `max_concurrent_captures`.
+- Native state/lifecycle hints use bounded buffering and can be dropped under
+  pressure or an indeterminate socket write. Polling remains the authoritative
+  pane-text path; keep `ft watch` running so the hint queue drains continuously.
+- For release posture, hardware-tier defaults, and fallback expectations, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
+- For exact runtime knob ranges, use `docs/tuning-reference.md`.
+
+### Distributed mode setup (feature-gated)
+
+Distributed mode is optional and off by default.
+
+```bash
+cargo build -p frankenterm --profile release-interactive --features distributed
+```
+
+Follow [docs/distributed-security-spec.md](./distributed-security-spec.md) for TLS/token/mTLS setup and `ft doctor` verification.
+
+## Plugin / Extension Development
+
+Current stable CLI surface for extension management:
+
+```bash
+ft ext list
+ft ext validate ./my-pack.toml
+ft ext install ./my-pack.toml
+ft ext info my-pack
+```
+
+For WASM-oriented extension architecture and packaging details, use:
+
+- [docs/extensions/getting-started.md](./extensions/getting-started.md)
+- [docs/extensions/architecture.md](./extensions/architecture.md)
+- [docs/extensions/api-reference.md](./extensions/api-reference.md)
+
+## Troubleshooting Checklist
+
+```bash
+ft doctor
+ft status --health
+ft events --limit 50
+frankenterm-gui show-keys
+```
+
+If GUI-native events are missing:
+
+1. Ensure `ft watch` is running.
+2. Ensure `[native].enabled = true`; merely creating the default socket or
+   setting `WEZTERM_FT_SOCKET` does not bypass explicit disablement.
+3. Ensure the GUI and watcher resolve the same socket path and that its parent
+   directory is owned by the effective user with mode `0700`.
+4. Check logs for authentication, known queue-drop, indeterminate-write, or
+   reconnect warnings.
+
+If a paste does not arrive:
+
+- A paste larger than 64 MiB is refused whole, never truncated. The GUI shows a
+  "Paste was not sent" notice; split the text or send it to the program as a
+  file instead.
+- Keystrokes, pastes and mouse reports are queued for the program in order and
+  never dropped, even when the program stops reading its input. Only the
+  terminal's own answers to the program's queries (device attributes, cursor
+  position reports and similar) are dropped once 64 KiB of them are waiting
+  unread; the log then says `terminal reply backlog is full`.
+
+If the window stops responding while a pane floods output (0.15.x):
+
+- In 0.15.2 and nearby builds, each row that scrolls out of memory is written
+  to the durable scrollback store, with a full disk sync, while the terminal is
+  locked. A pane printing a large file can then stall the whole window. Newer
+  builds write the store outside the terminal lock, in batches; check what you
+  run with `ft --version` and the app's About box.
+- Until you move to a newer build, set `config.scrollback_tiered_enabled = false`
+  in `frankenterm.lua`. Scrollback then stays in memory and nothing is written to
+  the store. The cost is RAM: every pane keeps all `scrollback_lines` rows in
+  memory, so lower `scrollback_lines` (default 3,500) if you raised it; at
+  100,000 lines, dozens of agent panes can take gigabytes.
+- Remove any oversized `config.mux_output_parser_buffer_size` override; the
+  default is 128 KiB.

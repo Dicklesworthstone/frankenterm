@@ -1,0 +1,12916 @@
+//! Pattern detection engine
+//!
+//! Provides fast, reliable detection of agent state transitions.
+#![allow(unexpected_cfgs)]
+
+#[cfg(not(feature = "patterns-fingerprint-dedup"))]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
+use aho_corasick::AhoCorasick;
+#[cfg(feature = "teddy-prefilter")]
+use aho_corasick::packed;
+use bloomfilter::Bloom;
+use fancy_regex::{Regex, RegexBuilder};
+use sha2::{Digest, Sha256};
+
+/// Per-regex backtrack budget for user-supplied pattern packs.
+///
+/// [ft-xv561] Every `Regex` compiled from rule JSON must go through
+/// `compile_rule_regex` so the same backtrack cap applies everywhere.
+/// `fancy_regex` defaults to 1_000_000; we raise to 10M so legitimate
+/// non-pathological patterns have ample room while still bounding
+/// catastrophic-backtracking attacks on attacker-controlled packs
+/// (e.g. a malicious `.ft/patterns/*.json` dropped via a hostile repo).
+const PATTERN_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
+pub const PATTERN_PACK_SIGNATURE_ALGORITHM: &str = "frankenterm.sha256-attestation.v1";
+pub const PATTERN_PACK_COMPATIBILITY_TARGET: &str = "frankenterm-patterns.v1";
+
+type RuleRegexResult = std::result::Result<Regex, Box<fancy_regex::Error>>;
+
+fn saturating_atomic_add(counter: &AtomicU64, delta: u64) {
+    let _ = crate::try_update_atomic_u64(counter, Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(delta))
+    });
+}
+
+/// Compile a rule regex with the shared backtrack limit. All compile
+/// sites in this module MUST use this helper so the security contract
+/// stays in one place.
+fn compile_rule_regex(pattern: &str) -> RuleRegexResult {
+    RegexBuilder::new(pattern)
+        .backtrack_limit(PATTERN_REGEX_BACKTRACK_LIMIT)
+        .build()
+        .map_err(Box::new)
+}
+use memchr::memchr;
+use serde::{Deserialize, Serialize};
+
+use crate::Result;
+use crate::config::{PackOverride, PatternsConfig};
+use crate::error::PatternError;
+use crate::misra_gries_top_k::{SpaceSavingSnapshot, SpaceSavingTopK};
+use crate::policy::Redactor;
+
+// =============================================================================
+// Pattern Telemetry
+// =============================================================================
+
+const PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY: usize = 128;
+const PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN: usize = 10;
+
+/// Operational telemetry counters for the pattern detection engine.
+///
+/// Uses atomics because `PatternEngine::detect()` takes `&self` and may be
+/// called from multiple threads concurrently. Counters are monotonically
+/// increasing with `Ordering::Relaxed`; the bounded top-K sketch only locks
+/// when a scan actually emits matches.
+pub struct PatternTelemetry {
+    /// Total `detect()` / `detect_with_context()` calls
+    scans_total: AtomicU64,
+    /// Total individual pattern matches produced
+    matches_total: AtomicU64,
+    /// Total scans rejected early by quick_reject (no possible anchor match)
+    quick_rejects: AtomicU64,
+    /// Total Bloom filter checks performed
+    bloom_checks: AtomicU64,
+    /// Total Bloom filter positive results (possible match)
+    bloom_positives: AtomicU64,
+    /// Total scans where Bloom filter rejected all candidates
+    bloom_rejects: AtomicU64,
+    /// Total candidate rules evaluated (post-anchor-match)
+    candidate_rules_evaluated: AtomicU64,
+    /// Total regex evaluations performed
+    regex_evaluations: AtomicU64,
+    /// Total rule scans abandoned because the regex engine returned an error
+    /// (in practice `BacktrackLimitExceeded`) instead of a match.
+    ///
+    /// `fancy_regex`'s `captures_iter` stops on the first error and reports
+    /// end-of-iteration thereafter, so one error discards **every remaining
+    /// match of that rule in that segment**. Without this counter the outcome
+    /// is indistinguishable from "the rule did not match" — the silent
+    /// state-loss class tracked by ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10.
+    regex_scan_errors: AtomicU64,
+    /// Bounded top-K sketch of matched rule IDs for hotspot diagnostics.
+    top_rule_hits: Mutex<SpaceSavingTopK<String>>,
+}
+
+impl PatternTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    fn new() -> Self {
+        Self::with_rule_hit_capacity(PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY)
+    }
+
+    fn with_rule_hit_capacity(rule_hit_capacity: usize) -> Self {
+        Self {
+            scans_total: AtomicU64::new(0),
+            matches_total: AtomicU64::new(0),
+            quick_rejects: AtomicU64::new(0),
+            bloom_checks: AtomicU64::new(0),
+            bloom_positives: AtomicU64::new(0),
+            bloom_rejects: AtomicU64::new(0),
+            candidate_rules_evaluated: AtomicU64::new(0),
+            regex_evaluations: AtomicU64::new(0),
+            regex_scan_errors: AtomicU64::new(0),
+            top_rule_hits: Mutex::new(SpaceSavingTopK::new(rule_hit_capacity)),
+        }
+    }
+
+    /// Record that a rule's regex scan ended in an engine error, discarding
+    /// any matches it had not yet yielded. See [`Self::regex_scan_errors`].
+    fn record_regex_scan_error(&self, rule_id: &str, error: &fancy_regex::Error) {
+        saturating_atomic_add(&self.regex_scan_errors, 1);
+        tracing::warn!(
+            rule_id,
+            %error,
+            "pattern regex scan aborted; remaining matches for this rule in this segment are lost"
+        );
+    }
+
+    fn top_rule_hits_guard(&self) -> MutexGuard<'_, SpaceSavingTopK<String>> {
+        match self.top_rule_hits.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.top_rule_hits.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn record_rule_hit(&self, rule_id: &str) {
+        let mut top_rule_hits = self.top_rule_hits_guard();
+        top_rule_hits.insert(rule_id.to_string());
+    }
+
+    fn record_rule_hits(&self, detections: &[Detection]) {
+        if detections.is_empty() {
+            return;
+        }
+
+        let mut top_rule_hits = self.top_rule_hits_guard();
+        for detection in detections {
+            top_rule_hits.insert(detection.rule_id.clone());
+        }
+    }
+
+    /// Take a serializable snapshot of current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> PatternTelemetrySnapshot {
+        let top_rule_hits = self
+            .top_rule_hits_guard()
+            .snapshot(PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN);
+
+        PatternTelemetrySnapshot {
+            scans_total: self.scans_total.load(Ordering::Relaxed),
+            matches_total: self.matches_total.load(Ordering::Relaxed),
+            quick_rejects: self.quick_rejects.load(Ordering::Relaxed),
+            bloom_checks: self.bloom_checks.load(Ordering::Relaxed),
+            bloom_positives: self.bloom_positives.load(Ordering::Relaxed),
+            bloom_rejects: self.bloom_rejects.load(Ordering::Relaxed),
+            candidate_rules_evaluated: self.candidate_rules_evaluated.load(Ordering::Relaxed),
+            regex_evaluations: self.regex_evaluations.load(Ordering::Relaxed),
+            regex_scan_errors: self.regex_scan_errors.load(Ordering::Relaxed),
+            top_rule_hits,
+        }
+    }
+}
+
+impl std::fmt::Debug for PatternTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatternTelemetry")
+            .field("scans_total", &self.scans_total.load(Ordering::Relaxed))
+            .field("matches_total", &self.matches_total.load(Ordering::Relaxed))
+            .field("quick_rejects", &self.quick_rejects.load(Ordering::Relaxed))
+            .field(
+                "top_rule_hits_monitored",
+                &self.top_rule_hits_guard().monitored_count(),
+            )
+            .finish()
+    }
+}
+
+/// Serializable snapshot of pattern engine telemetry counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternTelemetrySnapshot {
+    pub scans_total: u64,
+    pub matches_total: u64,
+    pub quick_rejects: u64,
+    pub bloom_checks: u64,
+    pub bloom_positives: u64,
+    pub bloom_rejects: u64,
+    pub candidate_rules_evaluated: u64,
+    pub regex_evaluations: u64,
+    /// Rule scans abandoned mid-stream by a regex engine error. Any non-zero
+    /// steady-state rate means detections are being dropped silently.
+    #[serde(default)]
+    pub regex_scan_errors: u64,
+    #[serde(default)]
+    pub top_rule_hits: SpaceSavingSnapshot<String>,
+}
+
+/// Agent types we support
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentType {
+    /// Codex CLI (OpenAI)
+    Codex,
+    /// Claude Code (Anthropic)
+    ClaudeCode,
+    /// Gemini CLI (Google)
+    Gemini,
+    /// WezTerm multiplexer events
+    Wezterm,
+    /// Unknown agent
+    Unknown,
+}
+
+impl std::fmt::Display for AgentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codex => write!(f, "codex"),
+            Self::ClaudeCode => write!(f, "claude_code"),
+            Self::Gemini => write!(f, "gemini"),
+            Self::Wezterm => write!(f, "wezterm"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Detection severity levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Informational
+    Info,
+    /// Warning - attention needed
+    Warning,
+    /// Critical - immediate action needed
+    Critical,
+}
+
+/// Whether an event describes a completed command failure that may contribute
+/// to a retry-loop decision. Provider, authentication and mux errors do not
+/// establish that the command sent to a pane failed.
+#[must_use]
+pub(crate) fn is_command_failure_event(event_type: &str, severity: Severity) -> bool {
+    matches!(severity, Severity::Warning | Severity::Critical)
+        && matches!(
+            event_type,
+            "command.failed" | "build.failed" | "test.failed"
+        )
+}
+
+/// A detected pattern match
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Detection {
+    /// Stable rule identifier (e.g., "core.codex:usage_reached")
+    pub rule_id: String,
+    /// Agent type this detection applies to
+    pub agent_type: AgentType,
+    /// Type of event detected
+    pub event_type: String,
+    /// Severity level
+    pub severity: Severity,
+    /// Confidence score 0.0-1.0
+    #[serde(deserialize_with = "crate::deserialize_finite_f64")]
+    pub confidence: f64,
+    /// Extracted structured data
+    pub extracted: serde_json::Value,
+    /// Original matched text
+    pub matched_text: String,
+    /// Byte offsets in the source text
+    #[serde(skip)]
+    pub span: (usize, usize),
+}
+
+/// Options for explain-match trace generation.
+#[derive(Debug, Clone)]
+pub struct TraceOptions {
+    /// Maximum number of evidence items per trace.
+    pub max_evidence_items: usize,
+    /// Maximum bytes per excerpt in evidence items.
+    pub max_excerpt_bytes: usize,
+    /// Maximum bytes per extracted capture value.
+    pub max_capture_bytes: usize,
+    /// Include traces for rules that did not fully match (e.g., regex miss).
+    pub include_non_matches: bool,
+}
+
+impl Default for TraceOptions {
+    fn default() -> Self {
+        Self {
+            max_evidence_items: 8,
+            max_excerpt_bytes: 160,
+            max_capture_bytes: 120,
+            include_non_matches: false,
+        }
+    }
+}
+
+/// Span information for trace evidence (byte offsets in the original text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSpan {
+    /// Start byte offset (inclusive)
+    pub start: usize,
+    /// End byte offset (exclusive)
+    pub end: usize,
+}
+
+/// Trace evidence item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEvidence {
+    /// Evidence kind (anchor, match, capture)
+    pub kind: String,
+    /// Optional label (anchor text or capture name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional span in the original text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<TraceSpan>,
+    /// Redacted, bounded excerpt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// Whether the excerpt was truncated to bounds
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// Gate evaluation trace for rule eligibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceGate {
+    /// Gate identifier (e.g., "agent_type", "dedupe")
+    pub gate: String,
+    /// Whether the gate passed
+    pub passed: bool,
+    /// Optional explanation for failures
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Boundedness metadata for a trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceBounds {
+    /// Maximum evidence items allowed
+    pub max_evidence_items: usize,
+    /// Maximum bytes per excerpt
+    pub max_excerpt_bytes: usize,
+    /// Maximum bytes per capture value
+    pub max_capture_bytes: usize,
+    /// Total evidence items before truncation
+    pub evidence_total: usize,
+    /// Whether evidence list was truncated
+    pub evidence_truncated: bool,
+    /// Labels of fields that were truncated
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_fields: Vec<String>,
+}
+
+/// Explain-match trace for a single rule match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchTrace {
+    /// Pack identifier (e.g., "builtin:codex")
+    pub pack_id: String,
+    /// Stable rule identifier
+    pub rule_id: String,
+    /// Optional extractor identifier (e.g., "regex")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_id: Option<String>,
+    /// Redacted, bounded matched text (best-effort)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_text: Option<String>,
+    /// Optional confidence (mirrors detection confidence when available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Whether the rule is eligible after state gates
+    pub eligible: bool,
+    /// Gate decisions
+    pub gates: Vec<TraceGate>,
+    /// Evidence list (anchors, matches, captures)
+    pub evidence: Vec<TraceEvidence>,
+    /// Boundedness metadata
+    pub bounds: TraceBounds,
+}
+
+impl Detection {
+    /// Generate a stable dedup key for this detection.
+    ///
+    /// The key is based on rule_id + significant extracted values, allowing
+    /// the same rule to fire multiple times if the extracted values differ.
+    #[must_use]
+    pub fn dedup_key(&self) -> String {
+        build_dedup_key(
+            &self.rule_id,
+            self.extracted.as_object().map_or_else(Vec::new, |obj| {
+                obj.iter()
+                    .map(|(k, v)| match v {
+                        serde_json::Value::String(s) => dedup_key_part(k, s),
+                        other => format!("{k}:{other}"),
+                    })
+                    .collect()
+            }),
+        )
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn dedup_fingerprint(&self) -> u128 {
+        dedup_fingerprint_from_parts(
+            &self.rule_id,
+            self.extracted.as_object().map_or_else(Vec::new, |obj| {
+                obj.iter()
+                    .map(|(name, value)| DedupFingerprintPart {
+                        name: name.as_str(),
+                        value: DedupFingerprintValue::Json(value),
+                    })
+                    .collect()
+            }),
+        )
+    }
+}
+
+/// Render one `name:value` part of a dedup key for a string value.
+///
+/// Shared by [`Detection::dedup_key`] and the pre-materialization key path in
+/// `detect_with_context` (`dedup_key_from_captures`): both feed the SAME
+/// `DetectionContext::seen_keys` store, so the two paths must render string
+/// values byte-identically or cross-path dedup silently stops matching.
+fn dedup_key_part(name: &str, value: &str) -> String {
+    // Intentional fail-fast: serializing a UTF-8 string into JSON cannot
+    // fail, so any error here would be a serde contract break.
+    let rendered =
+        serde_json::to_string(value).expect("serializing dedup key strings should not fail");
+    format!("{name}:{rendered}")
+}
+
+fn build_dedup_key(rule_id: &str, mut extracted_parts: Vec<String>) -> String {
+    extracted_parts.sort();
+    format!("{rule_id}:{}", extracted_parts.join("|"))
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Clone, Copy)]
+enum DedupFingerprintValue<'a> {
+    String(&'a str),
+    Json(&'a serde_json::Value),
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Clone, Copy)]
+struct DedupFingerprintPart<'a> {
+    name: &'a str,
+    value: DedupFingerprintValue<'a>,
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+const DEDUP_FINGERPRINT_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+const DEDUP_FINGERPRINT_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_update(mut hash: u128, bytes: &[u8]) -> u128 {
+    for &byte in bytes {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(DEDUP_FINGERPRINT_PRIME);
+    }
+    hash
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_separator(hash: u128, separator: u8) -> u128 {
+    dedup_fingerprint_update(hash, &[separator])
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_from_parts(rule_id: &str, mut parts: Vec<DedupFingerprintPart<'_>>) -> u128 {
+    parts.sort_by(|left, right| {
+        left.name
+            .cmp(right.name)
+            .then_with(|| dedup_fingerprint_value_cmp(left.value, right.value))
+    });
+
+    let mut hash = dedup_fingerprint_separator(DEDUP_FINGERPRINT_OFFSET, 0x02);
+    hash = dedup_fingerprint_update(hash, rule_id.as_bytes());
+    hash = dedup_fingerprint_separator(hash, 0xff);
+    for part in parts {
+        hash = dedup_fingerprint_update(hash, part.name.as_bytes());
+        hash = dedup_fingerprint_separator(hash, b':');
+        hash = dedup_fingerprint_update_value(hash, part.value);
+        hash = dedup_fingerprint_separator(hash, b'|');
+    }
+    hash
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_value_cmp(
+    left: DedupFingerprintValue<'_>,
+    right: DedupFingerprintValue<'_>,
+) -> std::cmp::Ordering {
+    if let (Some(left), Some(right)) = (
+        dedup_fingerprint_string_value(left),
+        dedup_fingerprint_string_value(right),
+    ) {
+        left.cmp(right)
+    } else {
+        dedup_fingerprint_json_sort_key(left).cmp(&dedup_fingerprint_json_sort_key(right))
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_string_value(value: DedupFingerprintValue<'_>) -> Option<&str> {
+    match value {
+        DedupFingerprintValue::String(value) => Some(value),
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => Some(value.as_str()),
+        DedupFingerprintValue::Json(_) => None,
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_json_sort_key(value: DedupFingerprintValue<'_>) -> String {
+    match value {
+        DedupFingerprintValue::String(value) => value.to_string(),
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => value.to_string(),
+        DedupFingerprintValue::Json(value) => value.to_string(),
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_update_value(hash: u128, value: DedupFingerprintValue<'_>) -> u128 {
+    match value {
+        DedupFingerprintValue::String(value) => {
+            let mut hash = dedup_fingerprint_separator(hash, b's');
+            hash = dedup_fingerprint_update(hash, value.as_bytes());
+            hash
+        }
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => {
+            let mut hash = dedup_fingerprint_separator(hash, b's');
+            hash = dedup_fingerprint_update(hash, value.as_bytes());
+            hash
+        }
+        DedupFingerprintValue::Json(value) => {
+            let mut hash = dedup_fingerprint_separator(hash, b'j');
+            hash = dedup_fingerprint_update(hash, value.to_string().as_bytes());
+            hash
+        }
+    }
+}
+
+// Thread-local like the dedup counter below: a process-wide counter also
+// counted other tests' detections between a test's reset and its read.
+#[cfg(test)]
+thread_local! {
+    static DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn record_detect_with_context_materialization() {
+    #[cfg(test)]
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn reset_detect_with_context_materialization_count() {
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn detect_with_context_materialization_count() -> u64 {
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(std::cell::Cell::get)
+}
+
+// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
+// `seen_order` tokens examined during dedup LRU maintenance (eviction
+// skip-loop + compaction retain). The amortized-O(1) contract is that this
+// grows linearly with the number of marks, not as `marks * MAX_SEEN_KEYS`
+// (the old O(n) string position-scan per mark).
+//
+// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
+// thread) sees only its own counts despite parallel test execution.
+#[cfg(test)]
+thread_local! {
+    static DETECTION_DEDUP_MAINTENANCE_STEPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record `steps` examined dedup-maintenance tokens (no-op outside tests).
+#[inline]
+fn record_detection_dedup_steps(_steps: u64) {
+    #[cfg(test)]
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(|c| c.set(c.get().saturating_add(_steps)));
+}
+
+#[cfg(test)]
+fn detection_dedup_maintenance_steps() -> u64 {
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_detection_dedup_maintenance_steps() {
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(|c| c.set(0));
+}
+
+/// Context for detection with agent filtering and deduplication.
+///
+/// Use this to prevent false positives in non-agent panes and avoid
+/// re-emitting the same detection across overlapping tail windows.
+#[derive(Debug, Clone)]
+pub struct DetectionContext {
+    /// Pane ID for tracking
+    pub pane_id: Option<u64>,
+    /// Inferred agent type for this pane (if known)
+    pub agent_type: Option<AgentType>,
+    /// Previously seen dedup keys with last-seen timestamp and recency
+    /// generation, used to avoid re-emitting (ft-zo4hw).
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    seen_keys: HashMap<String, SeenEntry>,
+    /// Order of seen keys as `(key, generation)` tokens for LRU eviction.
+    /// Refresh is O(1): a new token is pushed and the superseded one is skipped
+    /// lazily, replacing the prior O(n) string position-scan + remove.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    seen_order: VecDeque<(String, u64)>,
+    /// Monotonic recency counter stamping `seen_order` tokens.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    seen_generation: u64,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    /// Fingerprint-indexed dedup table for the default-off Q6 path.
+    seen_fingerprints: HashMap<u128, usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    /// Fixed-node LRU list storage. Live nodes are linked by index; free nodes
+    /// are reused so refresh and eviction stay O(1) without retain scans.
+    fingerprint_nodes: Vec<FingerprintSeenNode>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_free: Vec<usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_head: Option<usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_tail: Option<usize>,
+    /// Time-to-live for deduplication (default: 5 minutes)
+    pub ttl: Duration,
+    /// Tail buffer from previous detection (for cross-segment matching)
+    pub tail_buffer: String,
+    /// A separately retained suffix whose semantic annotation is known. The
+    /// public unscoped tail must never lend an unknown prefix to a scoped rule.
+    zone_tail: String,
+    zone_tail_kind: Option<DetectionZone>,
+}
+
+/// Dedup entry: last-seen timestamp plus the recency generation that stamps
+/// this key's live `seen_order` token (ft-zo4hw).
+#[cfg(not(feature = "patterns-fingerprint-dedup"))]
+#[derive(Debug, Clone, Copy)]
+struct SeenEntry {
+    last_seen: Instant,
+    generation: u64,
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Debug, Clone)]
+struct FingerprintSeenNode {
+    fingerprint: u128,
+    last_seen: Instant,
+    prev: Option<usize>,
+    next: Option<usize>,
+    occupied: bool,
+}
+
+impl Default for DetectionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DetectionContext {
+    // Pattern engine limits — canonical values in TuningConfig::PatternsTuning.
+    // To override: set [tuning.patterns] in ft.toml.
+    const MAX_SEEN_KEYS: usize = crate::tuning_config::PatternsTuning::DEFAULT_MAX_SEEN_KEYS;
+    /// Default deduplication TTL
+    const DEFAULT_TTL: Duration = Duration::from_mins(5);
+    const MAX_TAIL_SIZE: usize = crate::tuning_config::PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES;
+
+    /// Create a new empty detection context
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pane_id: None,
+            agent_type: None,
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
+            ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
+        }
+    }
+
+    /// Create a context with a known agent type
+    #[must_use]
+    pub fn with_agent_type(agent_type: AgentType) -> Self {
+        Self {
+            pane_id: None,
+            agent_type: Some(agent_type),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
+            ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
+        }
+    }
+
+    /// Create a context for a specific pane
+    #[must_use]
+    pub fn with_pane(pane_id: u64, agent_type: Option<AgentType>) -> Self {
+        Self {
+            pane_id: Some(pane_id),
+            agent_type,
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+            seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
+            ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
+        }
+    }
+
+    /// Set the deduplication TTL.
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// End semantic-zone continuity without changing unscoped matching or
+    /// deduplication. Use this for an unknown/mixed zone, a gap, or a new zone
+    /// of the same type whose exact continuity has not been established.
+    pub fn clear_zone_continuity(&mut self) {
+        self.zone_tail.clear();
+        self.zone_tail_kind = None;
+    }
+
+    fn advance_zone_tail(
+        &mut self,
+        input: &str,
+        overlap_len: usize,
+        zone: Option<DetectionZone>,
+    ) -> usize {
+        let Some(zone) = zone else {
+            self.clear_zone_continuity();
+            return input.len();
+        };
+        let prefix = &input[..overlap_len];
+        let continued = self.zone_tail_kind == Some(zone)
+            && !self.zone_tail.is_empty()
+            && prefix.ends_with(&self.zone_tail);
+        let start = if continued {
+            overlap_len - self.zone_tail.len()
+        } else {
+            overlap_len
+        };
+        let scoped = &input[start..];
+        let retained = PatternEngine::bounded_tail_start(scoped, Self::MAX_TAIL_SIZE);
+        self.zone_tail = scoped[retained..].to_string();
+        self.zone_tail_kind = Some(zone);
+        start
+    }
+
+    /// Mark a detection as seen, returning true if it was new (or expired)
+    pub fn mark_seen(&mut self, detection: &Detection) -> bool {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.mark_seen_fingerprint(detection.dedup_fingerprint());
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        self.mark_seen_key(detection.dedup_key())
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    fn mark_seen_key(&mut self, key: String) -> bool {
+        let now = Instant::now();
+
+        // Check if seen and valid (not expired)
+        if let Some(entry) = self.seen_keys.get(&key) {
+            if now.duration_since(entry.last_seen) < self.ttl {
+                return false;
+            }
+        }
+
+        // New or expired key: (re)insert with a fresh recency generation. The
+        // key's prior `seen_order` token (if any) becomes stale and is dropped
+        // lazily on eviction/compaction — no O(n) string position-scan per mark
+        // (ft-zo4hw). The HASH map still holds at most one entry per key, so
+        // re-marking an expired key never inflates `seen_count`.
+        let is_new_key = !self.seen_keys.contains_key(&key);
+
+        // Enforce capacity only when adding a genuinely new key.
+        if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+            self.evict_oldest_seen();
+        }
+
+        let generation = self.next_seen_generation();
+        self.seen_keys.insert(
+            key.clone(),
+            SeenEntry {
+                last_seen: now,
+                generation,
+            },
+        );
+        // Push to back of order for LRU-style eviction.
+        self.seen_order.push_back((key, generation));
+        self.compact_seen_order_if_needed();
+        true
+    }
+
+    /// Next monotonic recency generation. At terminal exhaustion, discard the
+    /// bounded dedup epoch before recycling so no stale ordering token can
+    /// alias a live entry in the new epoch.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    fn next_seen_generation(&mut self) -> u64 {
+        if self.seen_generation == u64::MAX {
+            self.seen_keys.clear();
+            self.seen_order.clear();
+            self.seen_generation = 0;
+        }
+        self.seen_generation += 1;
+        self.seen_generation
+    }
+
+    /// Evict the least-recently-seen live key, skipping superseded tokens in
+    /// O(1) each (ft-zo4hw). The frontmost live token is the true LRU key
+    /// because a key's current-generation token is its most recently pushed.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    fn evict_oldest_seen(&mut self) {
+        while let Some((key, generation)) = self.seen_order.pop_front() {
+            // Count each examined token (ft-wo323 amortized-O(1) guard).
+            record_detection_dedup_steps(1);
+            match self.seen_keys.get(&key) {
+                Some(entry) if entry.generation == generation => {
+                    self.seen_keys.remove(&key);
+                    return;
+                }
+                // Stale (superseded) or already-removed token: skip it.
+                _ => {}
+            }
+        }
+    }
+
+    /// Drop superseded `seen_order` tokens once stale entries exceed ~capacity.
+    /// Amortized O(1) per mark: at most one stale token is added per refresh, so
+    /// this O(n) retain runs at most once per `MAX_SEEN_KEYS` refreshes,
+    /// bounding `seen_order` to <= 2x capacity even under repeated re-marks.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    fn compact_seen_order_if_needed(&mut self) {
+        if self.seen_order.len() <= Self::MAX_SEEN_KEYS.saturating_mul(2) {
+            return;
+        }
+        // The retain pass visits every token once (ft-wo323 amortized-O(1)
+        // guard); fires at most once per ~MAX_SEEN_KEYS refreshes.
+        record_detection_dedup_steps(self.seen_order.len() as u64);
+        let seen_keys = &self.seen_keys;
+        self.seen_order.retain(|(key, generation)| {
+            seen_keys
+                .get(key)
+                .is_some_and(|e| e.generation == *generation)
+        });
+    }
+
+    /// Check if a detection has been seen before and is unexpired
+    #[must_use]
+    pub fn is_seen(&self, detection: &Detection) -> bool {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.is_seen_fingerprint(detection.dedup_fingerprint());
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        self.is_seen_key(&detection.dedup_key())
+    }
+
+    #[must_use]
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    fn is_seen_key(&self, key: &str) -> bool {
+        if let Some(entry) = self.seen_keys.get(key) {
+            Instant::now().duration_since(entry.last_seen) < self.ttl
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn mark_seen_fingerprint(&mut self, fingerprint: u128) -> bool {
+        let now = Instant::now();
+
+        if let Some(slot) = self.seen_fingerprints.get(&fingerprint).copied() {
+            let Some(node) = self.fingerprint_nodes.get(slot) else {
+                self.seen_fingerprints.remove(&fingerprint);
+                return self.insert_new_fingerprint(fingerprint, now);
+            };
+            if !node.occupied {
+                self.seen_fingerprints.remove(&fingerprint);
+                return self.insert_new_fingerprint(fingerprint, now);
+            }
+            if now.duration_since(node.last_seen) < self.ttl {
+                return false;
+            }
+            self.fingerprint_nodes[slot].last_seen = now;
+            self.move_fingerprint_to_tail(slot);
+            return true;
+        }
+
+        self.insert_new_fingerprint(fingerprint, now)
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn insert_new_fingerprint(&mut self, fingerprint: u128, now: Instant) -> bool {
+        if self.seen_fingerprints.len() >= Self::MAX_SEEN_KEYS {
+            self.evict_oldest_fingerprint();
+        }
+
+        let slot = if let Some(slot) = self.fingerprint_free.pop() {
+            self.fingerprint_nodes[slot] = FingerprintSeenNode {
+                fingerprint,
+                last_seen: now,
+                prev: None,
+                next: None,
+                occupied: true,
+            };
+            slot
+        } else {
+            let slot = self.fingerprint_nodes.len();
+            self.fingerprint_nodes.push(FingerprintSeenNode {
+                fingerprint,
+                last_seen: now,
+                prev: None,
+                next: None,
+                occupied: true,
+            });
+            slot
+        };
+
+        self.seen_fingerprints.insert(fingerprint, slot);
+        self.push_fingerprint_tail(slot);
+        true
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn is_seen_fingerprint(&self, fingerprint: u128) -> bool {
+        let Some(slot) = self.seen_fingerprints.get(&fingerprint).copied() else {
+            return false;
+        };
+        let Some(node) = self.fingerprint_nodes.get(slot) else {
+            return false;
+        };
+        node.occupied && Instant::now().duration_since(node.last_seen) < self.ttl
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn evict_oldest_fingerprint(&mut self) {
+        let Some(slot) = self.fingerprint_head else {
+            return;
+        };
+        record_detection_dedup_steps(1);
+        let fingerprint = self.fingerprint_nodes[slot].fingerprint;
+        self.unlink_fingerprint(slot);
+        self.seen_fingerprints.remove(&fingerprint);
+        self.fingerprint_nodes[slot].occupied = false;
+        self.fingerprint_free.push(slot);
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn move_fingerprint_to_tail(&mut self, slot: usize) {
+        if self.fingerprint_tail == Some(slot) {
+            return;
+        }
+        self.unlink_fingerprint(slot);
+        self.push_fingerprint_tail(slot);
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn unlink_fingerprint(&mut self, slot: usize) {
+        let prev = self.fingerprint_nodes[slot].prev;
+        let next = self.fingerprint_nodes[slot].next;
+
+        if let Some(prev) = prev {
+            self.fingerprint_nodes[prev].next = next;
+        } else {
+            self.fingerprint_head = next;
+        }
+
+        if let Some(next) = next {
+            self.fingerprint_nodes[next].prev = prev;
+        } else {
+            self.fingerprint_tail = prev;
+        }
+
+        self.fingerprint_nodes[slot].prev = None;
+        self.fingerprint_nodes[slot].next = None;
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn push_fingerprint_tail(&mut self, slot: usize) {
+        self.fingerprint_nodes[slot].prev = self.fingerprint_tail;
+        self.fingerprint_nodes[slot].next = None;
+
+        if let Some(tail) = self.fingerprint_tail {
+            self.fingerprint_nodes[tail].next = Some(slot);
+        } else {
+            self.fingerprint_head = Some(slot);
+        }
+
+        self.fingerprint_tail = Some(slot);
+    }
+
+    /// Clear the set of seen detections and the tail buffer.
+    ///
+    /// This allows detecting patterns fresh in subsequent calls, as if
+    /// starting from a new context. Both the dedup state and the cross-segment
+    /// matching buffer are reset.
+    pub fn clear_seen(&mut self) {
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        {
+            self.seen_keys.clear();
+            self.seen_order.clear();
+        }
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            self.seen_fingerprints.clear();
+            self.fingerprint_nodes.clear();
+            self.fingerprint_free.clear();
+            self.fingerprint_head = None;
+            self.fingerprint_tail = None;
+        }
+        self.tail_buffer.clear();
+        self.clear_zone_continuity();
+    }
+
+    /// Get the number of seen detections
+    #[must_use]
+    pub fn seen_count(&self) -> usize {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.seen_fingerprints.len();
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        self.seen_keys.len()
+    }
+}
+
+/// Allowed rule ID prefixes for stable naming
+const ALLOWED_RULE_PREFIXES: [&str; 4] = ["codex.", "claude_code.", "gemini.", "wezterm."];
+
+/// OSC 133 semantic annotation accepted by an opt-in pattern rule.
+///
+/// This is a detection filter, not authorization or proof of command origin.
+/// In particular, an agent can quote an error inside a shell output zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionZone {
+    Prompt,
+    Input,
+    Output,
+}
+
+/// Rule definition for pattern detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleDef {
+    /// Stable rule identifier (e.g., "codex.usage_limit")
+    pub id: String,
+    /// Agent type this rule applies to
+    pub agent_type: AgentType,
+    /// Event type emitted on match
+    pub event_type: String,
+    /// Severity level
+    pub severity: Severity,
+    /// Literal anchors for quick-reject and Aho-Corasick
+    pub anchors: Vec<String>,
+    /// Optional extraction regex (named captures preferred)
+    pub regex: Option<String>,
+    /// Human-readable description
+    pub description: String,
+    /// Suggested remediation text (optional)
+    pub remediation: Option<String>,
+    /// Suggested workflow name (optional)
+    pub workflow: Option<String>,
+    /// Manual fix instructions for when workflow is not available or user prefers manual action
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_fix: Option<String>,
+    /// Preview command template supporting {pane}, {event_id}, {agent} interpolation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_command: Option<String>,
+    /// URL for more information about this rule
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learn_more_url: Option<String>,
+    /// Require this semantic zone. Missing or ambiguous annotations do not
+    /// match; omitted rules retain ordinary text and cross-segment behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<DetectionZone>,
+}
+
+impl RuleDef {
+    fn validate(&self) -> Result<()> {
+        self.validate_inner(false)
+    }
+
+    fn validate_user_pack(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, allow_custom_prefix: bool) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(PatternError::InvalidRule("rule id cannot be empty".to_string()).into());
+        }
+
+        if self.id.split('.').any(|segment| segment.trim().is_empty()) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must not contain empty dot-separated segments",
+                self.id
+            ))
+            .into());
+        }
+
+        if self.id.chars().any(char::is_whitespace) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must not contain whitespace",
+                self.id
+            ))
+            .into());
+        }
+
+        if !allow_custom_prefix
+            && !ALLOWED_RULE_PREFIXES
+                .iter()
+                .any(|prefix| self.id.starts_with(prefix))
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must start with one of: {}",
+                self.id,
+                ALLOWED_RULE_PREFIXES.join(", ")
+            ))
+            .into());
+        }
+
+        if let Some(expected_agent_type) = reserved_rule_prefix_agent_type(&self.id) {
+            if self.agent_type != expected_agent_type {
+                return Err(PatternError::InvalidRule(format!(
+                    "rule id '{}' has reserved prefix for agent_type '{}' but declares '{}'",
+                    self.id, expected_agent_type, self.agent_type
+                ))
+                .into());
+            }
+        }
+
+        // Even user packs need a dotted namespace (e.g., "myorg.some_rule")
+        if allow_custom_prefix && !self.id.contains('.') {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must contain a dot-separated namespace (e.g., 'myorg.my_rule')",
+                self.id
+            ))
+            .into());
+        }
+
+        if self.event_type.trim().is_empty() {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must include a non-empty event_type",
+                self.id
+            ))
+            .into());
+        }
+        if self
+            .event_type
+            .split('.')
+            .any(|segment| segment.trim().is_empty())
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has event_type '{}' with an empty dot-separated segment",
+                self.id, self.event_type
+            ))
+            .into());
+        }
+        if self.event_type.chars().any(char::is_whitespace) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has event_type '{}' containing whitespace",
+                self.id, self.event_type
+            ))
+            .into());
+        }
+
+        if self.anchors.is_empty() || self.anchors.iter().any(|a| a.trim().is_empty()) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must include at least one non-empty anchor",
+                self.id
+            ))
+            .into());
+        }
+
+        if self.description.trim().is_empty() {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must include a non-empty description",
+                self.id
+            ))
+            .into());
+        }
+
+        validate_optional_rule_text(&self.id, "remediation", self.remediation.as_deref())?;
+        validate_optional_rule_text(&self.id, "workflow", self.workflow.as_deref())?;
+        validate_optional_rule_text(&self.id, "manual_fix", self.manual_fix.as_deref())?;
+        validate_optional_rule_text(&self.id, "preview_command", self.preview_command.as_deref())?;
+        validate_optional_rule_text(&self.id, "learn_more_url", self.learn_more_url.as_deref())?;
+        if self
+            .workflow
+            .as_deref()
+            .is_some_and(|workflow| workflow.chars().any(char::is_whitespace))
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has workflow target containing whitespace",
+                self.id
+            ))
+            .into());
+        }
+        if self
+            .learn_more_url
+            .as_deref()
+            .is_some_and(|url| url.chars().any(char::is_whitespace))
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has learn_more_url containing whitespace",
+                self.id
+            ))
+            .into());
+        }
+
+        if let Some(ref regex) = self.regex {
+            if allow_custom_prefix {
+                if let Some(backreference) = first_numeric_backreference(regex) {
+                    return Err(PatternError::InvalidRegex(format!(
+                        "rule id '{}' has user-pack regex containing unsupported numeric backreference '{}'",
+                        self.id, backreference
+                    ))
+                    .into());
+                }
+            }
+
+            // [ft-xv561] compile via shared builder so the backtrack
+            // cap applies to validation too — a rule that compiles
+            // here but blows the limit downstream would bypass the
+            // guard. Using `compile_rule_regex` keeps behaviour
+            // identical across validate + build_engine_index.
+            let compiled = compile_rule_regex(regex).map_err(|e| {
+                PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", self.id))
+            })?;
+            if compiled.is_match("").map_err(|e| {
+                PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", self.id))
+            })? {
+                return Err(PatternError::InvalidRegex(format!(
+                    "rule id '{}' has regex that matches empty input",
+                    self.id
+                ))
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Interpolate template variables in a string.
+    ///
+    /// Supported variables:
+    /// - `{pane}`: Pane ID where event was detected
+    /// - `{event_id}`: Event ID for reference
+    /// - `{agent}`: Detected agent type
+    /// - `{rule_id}`: The rule ID that matched
+    #[must_use]
+    pub fn interpolate_template(
+        template: &str,
+        pane_id: u64,
+        event_id_value: Option<i64>,
+        agent_type: &AgentType,
+        rule_id_value: &str,
+    ) -> String {
+        template
+            .replace("{pane}", &pane_id.to_string())
+            .replace(
+                "{event_id}",
+                &event_id_value.map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+            )
+            .replace("{agent}", &agent_type.to_string())
+            .replace("{rule_id}", rule_id_value)
+    }
+
+    /// Get the interpolated preview command for this rule.
+    #[must_use]
+    pub fn get_preview_command(&self, pane_id: u64, event_id: Option<i64>) -> Option<String> {
+        self.preview_command.as_ref().map(|cmd| {
+            Self::interpolate_template(cmd, pane_id, event_id, &self.agent_type, &self.id)
+        })
+    }
+
+    /// Get the interpolated manual fix instructions for this rule.
+    #[must_use]
+    pub fn get_manual_fix(&self, pane_id: u64, event_id: Option<i64>) -> Option<String> {
+        self.manual_fix.as_ref().map(|fix| {
+            Self::interpolate_template(fix, pane_id, event_id, &self.agent_type, &self.id)
+        })
+    }
+}
+
+fn first_numeric_backreference(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+
+        let slash_start = index;
+        while index < bytes.len() && bytes[index] == b'\\' {
+            index += 1;
+        }
+
+        if index < bytes.len()
+            && matches!(bytes[index], b'1'..=b'9')
+            && (index - slash_start) % 2 == 1
+        {
+            return Some(format!("\\{}", char::from(bytes[index])));
+        }
+    }
+    None
+}
+
+fn validate_optional_rule_text(rule_id: &str, field: &str, value: Option<&str>) -> Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(format!(
+            "rule id '{rule_id}' has empty optional field '{field}'"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn reserved_rule_prefix_agent_type(rule_id: &str) -> Option<AgentType> {
+    if rule_id.starts_with("codex.") {
+        Some(AgentType::Codex)
+    } else if rule_id.starts_with("claude_code.") {
+        Some(AgentType::ClaudeCode)
+    } else if rule_id.starts_with("gemini.") {
+        Some(AgentType::Gemini)
+    } else if rule_id.starts_with("wezterm.") {
+        Some(AgentType::Wezterm)
+    } else {
+        None
+    }
+}
+
+/// Data-driven submit verification profile bundled with a pattern pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfile {
+    /// Stable profile identifier, usually `<agent>.default`.
+    pub id: String,
+    /// Agent type this profile applies to.
+    pub agent_type: AgentType,
+    /// Profile data version. This is independent of the pack version so
+    /// downstream receipts can record exactly which submit heuristics ran.
+    pub version: String,
+    /// Anchor sets used by the verified-submit state machine.
+    pub anchors: SubmitProfileAnchors,
+    /// Optional remediation steps for verification failure states.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation: Vec<SubmitProfileRemediation>,
+}
+
+/// Required anchor groups for submit verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfileAnchors {
+    pub composer_nonempty: Vec<String>,
+    pub composer_cleared: Vec<String>,
+    pub working_state: Vec<String>,
+    pub queued_behind_operation: Vec<String>,
+    pub crash_to_shell: Vec<String>,
+}
+
+/// Data-only remediation for a submit profile state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfileRemediation {
+    pub when: String,
+    pub action: String,
+}
+
+impl SubmitProfile {
+    fn validate(&self) -> Result<()> {
+        validate_submit_profile_identity(self)?;
+        validate_submit_anchor_group(
+            &self.id,
+            "composer_nonempty",
+            &self.anchors.composer_nonempty,
+        )?;
+        validate_submit_anchor_group(&self.id, "composer_cleared", &self.anchors.composer_cleared)?;
+        validate_submit_anchor_group(&self.id, "working_state", &self.anchors.working_state)?;
+        validate_submit_anchor_group(
+            &self.id,
+            "queued_behind_operation",
+            &self.anchors.queued_behind_operation,
+        )?;
+        validate_submit_anchor_group(&self.id, "crash_to_shell", &self.anchors.crash_to_shell)?;
+
+        for step in &self.remediation {
+            if step.when.trim().is_empty() || step.action.trim().is_empty() {
+                return Err(PatternError::InvalidRule(format!(
+                    "submit profile '{}' has an empty remediation field",
+                    self.id
+                ))
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_submit_profile_identity(profile: &SubmitProfile) -> Result<()> {
+    if profile.id.trim().is_empty() {
+        return Err(
+            PatternError::InvalidRule("submit profile id cannot be empty".to_string()).into(),
+        );
+    }
+    if profile.id.chars().any(char::is_whitespace) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' cannot contain whitespace",
+            profile.id
+        ))
+        .into());
+    }
+    if profile.id.contains(':') {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' cannot contain the evidence delimiter ':'",
+            profile.id
+        ))
+        .into());
+    }
+    if !profile.id.contains('.')
+        || profile
+            .id
+            .split('.')
+            .any(|segment| segment.trim().is_empty())
+    {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' must contain non-empty dot-separated segments",
+            profile.id
+        ))
+        .into());
+    }
+    if profile.version.trim().is_empty() {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{}' must include a non-empty version",
+            profile.id
+        ))
+        .into());
+    }
+    if matches!(profile.agent_type, AgentType::Unknown | AgentType::Wezterm) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{}' must target a coding agent, not '{}'",
+            profile.id, profile.agent_type
+        ))
+        .into());
+    }
+    if let Some(expected_agent_type) = reserved_rule_prefix_agent_type(&profile.id) {
+        if profile.agent_type != expected_agent_type {
+            return Err(PatternError::InvalidRule(format!(
+                "submit profile '{}' has reserved prefix for agent_type '{}' but declares '{}'",
+                profile.id, expected_agent_type, profile.agent_type
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_submit_anchor_group(
+    profile_id: &str,
+    group_name: &str,
+    anchors: &[String],
+) -> Result<()> {
+    if anchors.is_empty() || anchors.iter().any(|anchor| anchor.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{profile_id}' must include at least one non-empty {group_name} anchor"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Pattern pack containing a set of rules
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternPack {
+    /// Pack name (e.g., "builtin:core")
+    pub name: String,
+    /// Pack version
+    pub version: String,
+    /// Rules in this pack
+    pub rules: Vec<RuleDef>,
+    /// Optional submit verification profiles carried as pack data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submit_profiles: Vec<SubmitProfile>,
+    /// Optional supply-chain manifest for user or extension pattern packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supply_chain: Option<PatternPackSupplyChain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackSupplyChain {
+    pub provenance: PatternPackProvenance,
+    #[serde(default)]
+    pub fixture_hashes: BTreeMap<String, String>,
+    pub lint: PatternPackLintAttestation,
+    pub regex_backtrack_budget: usize,
+    pub redaction_review: PatternPackRedactionReview,
+    pub compatibility_target: String,
+    pub rollout: PatternPackRollout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PatternPackSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackProvenance {
+    pub author: String,
+    pub source: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackLintAttestation {
+    pub passed: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackRedactionReview {
+    pub reviewer: String,
+    pub reviewed_at: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackRollout {
+    pub stage: String,
+    pub dry_run_match_telemetry: bool,
+    pub observe_only_until_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackSignature {
+    pub algorithm: String,
+    pub signer: String,
+    pub payload_sha256: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationPolicy {
+    pub require_signature: bool,
+    pub compatibility_target: String,
+    pub fixture_hashes: BTreeMap<String, String>,
+    pub max_regex_backtrack_budget: usize,
+}
+
+impl Default for PatternPackVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            require_signature: true,
+            compatibility_target: PATTERN_PACK_COMPATIBILITY_TARGET.to_string(),
+            fixture_hashes: BTreeMap::new(),
+            max_regex_backtrack_budget: PATTERN_REGEX_BACKTRACK_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternPackActionMode {
+    ActionTriggering,
+    ObserveOnly,
+}
+
+impl PatternPackActionMode {
+    #[must_use]
+    pub const fn allows_action_triggers(self) -> bool {
+        matches!(self, Self::ActionTriggering)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationIssue {
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationReport {
+    pub pack_name: String,
+    pub verified: bool,
+    pub action_mode: PatternPackActionMode,
+    pub signature_checked: bool,
+    pub fixture_hashes_checked: usize,
+    pub regex_budget_checked: bool,
+    pub issues: Vec<PatternPackVerificationIssue>,
+}
+
+impl PatternPack {
+    /// Create a new pattern pack
+    #[must_use]
+    pub fn new(name: impl Into<String>, version: impl Into<String>, rules: Vec<RuleDef>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            rules,
+            submit_profiles: Vec::new(),
+            supply_chain: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_submit_profiles(mut self, submit_profiles: Vec<SubmitProfile>) -> Self {
+        self.submit_profiles = submit_profiles;
+        self
+    }
+
+    #[must_use]
+    pub fn with_supply_chain(mut self, supply_chain: PatternPackSupplyChain) -> Self {
+        self.supply_chain = Some(supply_chain);
+        self
+    }
+
+    #[must_use]
+    pub fn into_observe_only(mut self) -> Self {
+        for rule in &mut self.rules {
+            rule.workflow = None;
+            rule.preview_command = None;
+        }
+        if let Some(supply_chain) = self.supply_chain.as_mut() {
+            supply_chain.rollout.observe_only_until_verified = true;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn enforce_verification_report(self, report: &PatternPackVerificationReport) -> Self {
+        if report.pack_name == self.name
+            && report.verified
+            && report.issues.is_empty()
+            && report.regex_budget_checked
+            && report.action_mode.allows_action_triggers()
+        {
+            let mut pack = self;
+            if let Some(supply_chain) = pack.supply_chain.as_mut() {
+                supply_chain.rollout.observe_only_until_verified = false;
+            }
+            pack
+        } else {
+            self.into_observe_only()
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_pack_identity(&self.name, &self.version)?;
+
+        let mut seen = HashSet::new();
+        for rule in &self.rules {
+            rule.validate()?;
+            if !seen.insert(rule.id.as_str()) {
+                return Err(PatternError::InvalidRule(format!(
+                    "pack '{}' contains duplicate rule id '{}'",
+                    self.name, rule.id
+                ))
+                .into());
+            }
+        }
+
+        self.validate_submit_profiles()?;
+
+        Ok(())
+    }
+
+    fn validate_as_user_pack(&self) -> Result<()> {
+        validate_pack_identity(&self.name, &self.version)?;
+
+        let mut seen = HashSet::new();
+        for rule in &self.rules {
+            rule.validate_user_pack()?;
+            if !seen.insert(rule.id.as_str()) {
+                return Err(PatternError::InvalidRule(format!(
+                    "pack '{}' contains duplicate rule id '{}'",
+                    self.name, rule.id
+                ))
+                .into());
+            }
+        }
+
+        self.validate_submit_profiles()?;
+
+        Ok(())
+    }
+
+    fn validate_submit_profiles(&self) -> Result<()> {
+        let mut seen = HashSet::new();
+        for profile in &self.submit_profiles {
+            profile.validate()?;
+            if !seen.insert(profile.id.as_str()) {
+                return Err(PatternError::InvalidRule(format!(
+                    "pack '{}' contains duplicate submit profile id '{}'",
+                    self.name, profile.id
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_pack_identity(name: &str, version: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(PatternError::InvalidRule("pack name cannot be empty".to_string()).into());
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Err(
+            PatternError::InvalidRule("pack name cannot contain whitespace".to_string()).into(),
+        );
+    }
+    if name.split(':').any(|segment| segment.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(
+            "pack name cannot contain empty segments".to_string(),
+        )
+        .into());
+    }
+    if version.trim().is_empty() {
+        return Err(PatternError::InvalidRule("pack version cannot be empty".to_string()).into());
+    }
+    if version.chars().any(char::is_whitespace) {
+        return Err(PatternError::InvalidRule(
+            "pack version cannot contain whitespace".to_string(),
+        )
+        .into());
+    }
+    if version.split('.').any(|segment| segment.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(
+            "pack version cannot contain empty segments".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn sign_pattern_pack_supply_chain(pack: &PatternPack, signer: &str) -> PatternPackSignature {
+    let payload = pattern_pack_signature_payload(pack);
+    let payload_sha256 = sha256_hex(&payload);
+    let mut hasher = Sha256::new();
+    hasher.update(PATTERN_PACK_SIGNATURE_ALGORITHM.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(signer.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(payload_sha256.as_bytes());
+    let value = format!("sha256:{}", hex_digest(hasher.finalize()));
+
+    PatternPackSignature {
+        algorithm: PATTERN_PACK_SIGNATURE_ALGORITHM.to_string(),
+        signer: signer.to_string(),
+        payload_sha256,
+        value,
+    }
+}
+
+#[must_use]
+pub fn verify_pattern_pack_supply_chain(
+    pack: &PatternPack,
+    policy: &PatternPackVerificationPolicy,
+) -> PatternPackVerificationReport {
+    let mut issues = Vec::new();
+    let mut signature_checked = false;
+    let mut fixture_hashes_checked = 0usize;
+    let mut regex_budget_checked = false;
+
+    let Some(supply_chain) = pack.supply_chain.as_ref() else {
+        issues.push(PatternPackVerificationIssue {
+            category: "signature".to_string(),
+            message: "pattern pack has no supply-chain manifest; observe-only fallback required"
+                .to_string(),
+        });
+        return PatternPackVerificationReport {
+            pack_name: pack.name.clone(),
+            verified: false,
+            action_mode: PatternPackActionMode::ObserveOnly,
+            signature_checked,
+            fixture_hashes_checked,
+            regex_budget_checked,
+            issues,
+        };
+    };
+
+    regex_budget_checked = true;
+    if let Err(error) = pack.validate_as_user_pack() {
+        issues.push(PatternPackVerificationIssue {
+            category: "validation".to_string(),
+            message: format!("pattern pack validation failed: {error}"),
+        });
+    }
+
+    validate_supply_chain_attestation(supply_chain, &mut issues);
+
+    if supply_chain.compatibility_target != policy.compatibility_target {
+        issues.push(PatternPackVerificationIssue {
+            category: "compatibility".to_string(),
+            message: format!(
+                "pack targets '{}', expected '{}'",
+                supply_chain.compatibility_target, policy.compatibility_target
+            ),
+        });
+    }
+
+    if supply_chain.regex_backtrack_budget > policy.max_regex_backtrack_budget {
+        issues.push(PatternPackVerificationIssue {
+            category: "regex_budget".to_string(),
+            message: format!(
+                "pack regex budget {} exceeds max {}",
+                supply_chain.regex_backtrack_budget, policy.max_regex_backtrack_budget
+            ),
+        });
+    }
+
+    if !supply_chain.lint.passed || !supply_chain.lint.errors.is_empty() {
+        issues.push(PatternPackVerificationIssue {
+            category: "lint".to_string(),
+            message: "pack lint attestation did not pass".to_string(),
+        });
+    }
+
+    if !supply_chain.redaction_review.approved
+        || supply_chain.redaction_review.reviewer.trim().is_empty()
+        || supply_chain.redaction_review.reviewed_at.trim().is_empty()
+    {
+        issues.push(PatternPackVerificationIssue {
+            category: "redaction_review".to_string(),
+            message: "pack redaction review is missing or unapproved".to_string(),
+        });
+    }
+
+    for rule in &pack.rules {
+        if let Some(regex) = rule.regex.as_ref() {
+            if regex.contains(".*.*.*") || regex.contains("(.+)+") || regex.contains("(.*)+") {
+                issues.push(PatternPackVerificationIssue {
+                    category: "regex_safety".to_string(),
+                    message: format!("rule '{}' has unsafe nested wildcard regex", rule.id),
+                });
+            }
+            if regex.len() > 500 {
+                issues.push(PatternPackVerificationIssue {
+                    category: "regex_safety".to_string(),
+                    message: format!("rule '{}' regex is {} bytes", rule.id, regex.len()),
+                });
+            }
+        }
+    }
+
+    for (fixture, expected_hash) in &supply_chain.fixture_hashes {
+        fixture_hashes_checked += 1;
+        match policy.fixture_hashes.get(fixture) {
+            Some(actual_hash) if actual_hash == expected_hash => {}
+            Some(actual_hash) => issues.push(PatternPackVerificationIssue {
+                category: "fixture_hash".to_string(),
+                message: format!(
+                    "fixture '{fixture}' hash drifted: manifest={expected_hash} actual={actual_hash}"
+                ),
+            }),
+            None => issues.push(PatternPackVerificationIssue {
+                category: "fixture_hash".to_string(),
+                message: format!("fixture '{fixture}' was not present in verification inputs"),
+            }),
+        }
+    }
+
+    match supply_chain.signature.as_ref() {
+        Some(signature) => {
+            signature_checked = true;
+            let expected = sign_pattern_pack_supply_chain(pack, &signature.signer);
+            if signature.signer.trim().is_empty() {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: "pattern pack signature signer cannot be empty".to_string(),
+                });
+            }
+            if signature.algorithm != PATTERN_PACK_SIGNATURE_ALGORITHM {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: format!("unsupported signature algorithm '{}'", signature.algorithm),
+                });
+            }
+            if signature.payload_sha256 != expected.payload_sha256
+                || signature.value != expected.value
+            {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: "pattern pack signature does not match canonical payload".to_string(),
+                });
+            }
+        }
+        None if policy.require_signature => {
+            issues.push(PatternPackVerificationIssue {
+                category: "signature".to_string(),
+                message: "pattern pack signature is required but missing".to_string(),
+            });
+        }
+        None => {}
+    }
+
+    let verified = issues.is_empty();
+    PatternPackVerificationReport {
+        pack_name: pack.name.clone(),
+        verified,
+        action_mode: if verified {
+            PatternPackActionMode::ActionTriggering
+        } else {
+            PatternPackActionMode::ObserveOnly
+        },
+        signature_checked,
+        fixture_hashes_checked,
+        regex_budget_checked,
+        issues,
+    }
+}
+
+fn validate_supply_chain_attestation(
+    supply_chain: &PatternPackSupplyChain,
+    issues: &mut Vec<PatternPackVerificationIssue>,
+) {
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.author",
+        &supply_chain.provenance.author,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.source",
+        &supply_chain.provenance.source,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.revision",
+        &supply_chain.provenance.revision,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "compatibility",
+        "compatibility_target",
+        &supply_chain.compatibility_target,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "rollout",
+        "rollout.stage",
+        &supply_chain.rollout.stage,
+    );
+
+    for (fixture, expected_hash) in &supply_chain.fixture_hashes {
+        push_blank_attestation_issue(issues, "fixture_hash", "fixture_hashes key", fixture);
+        push_blank_attestation_issue(
+            issues,
+            "fixture_hash",
+            "fixture_hashes value",
+            expected_hash,
+        );
+    }
+    for error in &supply_chain.lint.errors {
+        push_blank_attestation_issue(issues, "lint", "lint.errors entry", error);
+    }
+    for warning in &supply_chain.lint.warnings {
+        push_blank_attestation_issue(issues, "lint", "lint.warnings entry", warning);
+    }
+}
+
+fn push_blank_attestation_issue(
+    issues: &mut Vec<PatternPackVerificationIssue>,
+    category: &str,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        issues.push(PatternPackVerificationIssue {
+            category: category.to_string(),
+            message: format!("{field} cannot be empty"),
+        });
+    }
+}
+
+fn pattern_pack_signature_payload(pack: &PatternPack) -> Vec<u8> {
+    let mut material = pack.clone();
+    if let Some(supply_chain) = material.supply_chain.as_mut() {
+        supply_chain.signature = None;
+    }
+    serde_json::to_vec(&material).expect("pattern pack signature material serializes")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex_digest(hasher.finalize()))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// Loaded and merged pattern packs with override semantics
+pub struct PatternLibrary {
+    packs: Vec<PatternPack>,
+    merged_rules: Vec<RuleDef>,
+    merged_submit_profiles: Vec<SubmitProfile>,
+    rule_to_pack: HashMap<String, String>,
+}
+
+impl PatternLibrary {
+    /// Build a new library from packs (later packs override earlier packs by rule id)
+    pub fn new(packs: Vec<PatternPack>) -> Result<Self> {
+        for pack in &packs {
+            pack.validate()?;
+        }
+
+        // Track the effective source pack for each rule id. Later packs override earlier packs.
+        let mut rule_to_pack: HashMap<String, String> = HashMap::new();
+        for pack in &packs {
+            for rule in &pack.rules {
+                rule_to_pack.insert(rule.id.clone(), pack.name.clone());
+            }
+        }
+
+        let merged_rules = merge_rules(&packs);
+        let merged_submit_profiles = merge_submit_profiles(&packs);
+
+        Ok(Self {
+            packs,
+            merged_rules,
+            merged_submit_profiles,
+            rule_to_pack,
+        })
+    }
+
+    /// Build a library where user packs use relaxed validation (custom prefixes allowed).
+    pub fn new_with_user_packs(
+        packs: Vec<PatternPack>,
+        user_pack_names: &HashSet<String>,
+    ) -> Result<Self> {
+        for pack in &packs {
+            if user_pack_names.contains(&pack.name) {
+                pack.validate_as_user_pack()?;
+            } else {
+                pack.validate()?;
+            }
+        }
+
+        let mut rule_to_pack: HashMap<String, String> = HashMap::new();
+        for pack in &packs {
+            for rule in &pack.rules {
+                rule_to_pack.insert(rule.id.clone(), pack.name.clone());
+            }
+        }
+
+        let merged_rules = merge_rules(&packs);
+        let merged_submit_profiles = merge_submit_profiles(&packs);
+
+        Ok(Self {
+            packs,
+            merged_rules,
+            merged_submit_profiles,
+            rule_to_pack,
+        })
+    }
+
+    /// Create an empty library
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            packs: Vec::new(),
+            merged_rules: Vec::new(),
+            merged_submit_profiles: Vec::new(),
+            rule_to_pack: HashMap::new(),
+        }
+    }
+
+    /// List all packs in load order
+    #[must_use]
+    pub fn packs(&self) -> &[PatternPack] {
+        &self.packs
+    }
+
+    /// List merged rules in deterministic order
+    #[must_use]
+    pub fn rules(&self) -> &[RuleDef] {
+        &self.merged_rules
+    }
+
+    /// List merged submit profiles in deterministic order.
+    #[must_use]
+    pub fn submit_profiles(&self) -> &[SubmitProfile] {
+        &self.merged_submit_profiles
+    }
+
+    /// Return the first submit profile for an agent type, if any.
+    #[must_use]
+    pub fn submit_profile_for_agent(&self, agent_type: AgentType) -> Option<&SubmitProfile> {
+        self.merged_submit_profiles
+            .iter()
+            .find(|profile| profile.agent_type == agent_type)
+    }
+
+    fn pack_id_for_rule_id(&self, rule_id: &str) -> Option<&str> {
+        self.rule_to_pack.get(rule_id).map(String::as_str)
+    }
+
+    /// Return the pack name that provides a given rule ID, if any.
+    #[must_use]
+    pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
+        self.pack_id_for_rule_id(rule_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRule {
+    def: RuleDef,
+    pack_id: Arc<str>,
+    regex: Option<Regex>,
+    capture_names: Vec<String>,
+}
+
+type AnchorMatchRef = (usize, (usize, usize));
+
+#[derive(Debug, Default, Clone)]
+struct AnchorMatchBucket {
+    first: Option<AnchorMatchRef>,
+    rest: Vec<AnchorMatchRef>,
+}
+
+impl AnchorMatchBucket {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn push(&mut self, anchor_match: AnchorMatchRef) {
+        if self.first.is_none() {
+            self.first = Some(anchor_match);
+        } else {
+            self.rest.push(anchor_match);
+        }
+    }
+
+    fn first(&self) -> Option<AnchorMatchRef> {
+        self.first
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &AnchorMatchRef> {
+        self.first.iter().chain(self.rest.iter())
+    }
+}
+
+/// Target false positive rate for the Bloom filter (1%).
+/// This keeps the filter small (~10KB for 1000 patterns) while providing
+/// effective rejection of non-matching text.
+const BLOOM_FALSE_POSITIVE_RATE: f64 =
+    crate::tuning_config::PatternsTuning::DEFAULT_BLOOM_FALSE_POSITIVE_RATE;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_EMPTY_DISPLACEMENT: usize = usize::MAX;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_BUILD_SEED_ATTEMPTS: usize = 256;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_DISPLACEMENT_FACTOR: usize = 128;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorDispatch {
+    base: MphfAnchorBase,
+    /// Mutable delta route for future hot-reloaded anchors. The round-4 M5
+    /// experiment keeps the shipped pack immutable in `base`; hot reload can
+    /// append here without rebuilding the MPHF.
+    overflow: HashMap<String, Vec<usize>>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorBase {
+    seed: u64,
+    bucket_displacements: Vec<usize>,
+    slots: Vec<Option<MphfAnchorSlot>>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorSlot {
+    anchor: String,
+    rule_indices: Vec<usize>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+impl MphfAnchorDispatch {
+    fn build(anchor_list: &[String], anchor_rule_buckets: &[Vec<usize>]) -> Result<Self> {
+        if anchor_list.len() != anchor_rule_buckets.len() {
+            return Err(PatternError::InvalidRule(format!(
+                "anchor dispatch build saw {} anchors but {} route buckets",
+                anchor_list.len(),
+                anchor_rule_buckets.len()
+            ))
+            .into());
+        }
+
+        let overflow = HashMap::new();
+        if anchor_list.is_empty() {
+            return Ok(Self {
+                base: MphfAnchorBase::empty(),
+                overflow,
+            });
+        }
+
+        for attempt in 0..MPHF_BUILD_SEED_ATTEMPTS {
+            let seed = mphf_seed_for_attempt(attempt);
+            if let Some(base) = MphfAnchorBase::try_build(seed, anchor_list, anchor_rule_buckets) {
+                let dispatch = Self { base, overflow };
+                dispatch.validate_routes(anchor_list, anchor_rule_buckets)?;
+                return Ok(dispatch);
+            }
+        }
+
+        Err(PatternError::InvalidRule(format!(
+            "failed to build collision-free MPHF anchor dispatch for {} anchors after {} seeds",
+            anchor_list.len(),
+            MPHF_BUILD_SEED_ATTEMPTS
+        ))
+        .into())
+    }
+
+    fn rule_indices(&self, anchor: &str) -> Option<&[usize]> {
+        self.base
+            .rule_indices(anchor)
+            .or_else(|| self.overflow.get(anchor).map(Vec::as_slice))
+    }
+
+    fn validate_routes(
+        &self,
+        anchor_list: &[String],
+        anchor_rule_buckets: &[Vec<usize>],
+    ) -> Result<()> {
+        let mut used_slots = HashSet::with_capacity(anchor_list.len());
+        for (anchor_idx, anchor) in anchor_list.iter().enumerate() {
+            let Some(slot_idx) = self.base.slot_index(anchor) else {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch missed anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            };
+            if !used_slots.insert(slot_idx) {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch collision at slot {slot_idx} for anchor {anchor:?}"
+                ))
+                .into());
+            }
+
+            let Some(rule_indices) = self.rule_indices(anchor) else {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch has no route for anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            };
+            if rule_indices != anchor_rule_buckets[anchor_idx].as_slice() {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch route mismatch for anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            }
+        }
+
+        if used_slots.len() != anchor_list.len() {
+            return Err(PatternError::InvalidRule(format!(
+                "MPHF anchor dispatch mapped {} unique slots for {} anchors",
+                used_slots.len(),
+                anchor_list.len()
+            ))
+            .into());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+impl MphfAnchorBase {
+    fn empty() -> Self {
+        Self {
+            seed: 0,
+            bucket_displacements: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    fn try_build(
+        seed: u64,
+        anchor_list: &[String],
+        anchor_rule_buckets: &[Vec<usize>],
+    ) -> Option<Self> {
+        let slot_count = anchor_list.len();
+        let mut buckets = vec![Vec::<usize>::new(); slot_count];
+        for (anchor_idx, anchor) in anchor_list.iter().enumerate() {
+            buckets[mphf_bucket_index(anchor, seed, slot_count)].push(anchor_idx);
+        }
+
+        let mut bucket_order: Vec<usize> = (0..slot_count).collect();
+        bucket_order.sort_by(|left, right| {
+            buckets[*right]
+                .len()
+                .cmp(&buckets[*left].len())
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut bucket_displacements = vec![MPHF_EMPTY_DISPLACEMENT; slot_count];
+        let mut slots = vec![None; slot_count];
+        let displacement_limit = slot_count
+            .saturating_mul(MPHF_DISPLACEMENT_FACTOR)
+            .max(1024);
+
+        for bucket_idx in bucket_order {
+            let bucket = &buckets[bucket_idx];
+            if bucket.is_empty() {
+                continue;
+            }
+
+            let mut chosen = None;
+            'displacement: for displacement in 0..displacement_limit {
+                let mut proposed_slots = Vec::with_capacity(bucket.len());
+                for &anchor_idx in bucket {
+                    let slot_idx =
+                        mphf_slot_index(&anchor_list[anchor_idx], seed, displacement, slot_count);
+                    if slots[slot_idx].is_some() || proposed_slots.contains(&slot_idx) {
+                        continue 'displacement;
+                    }
+                    proposed_slots.push(slot_idx);
+                }
+                chosen = Some((displacement, proposed_slots));
+                break;
+            }
+
+            let (displacement, proposed_slots) = chosen?;
+            bucket_displacements[bucket_idx] = displacement;
+            for (&anchor_idx, slot_idx) in bucket.iter().zip(proposed_slots) {
+                slots[slot_idx] = Some(MphfAnchorSlot {
+                    anchor: anchor_list[anchor_idx].clone(),
+                    rule_indices: anchor_rule_buckets[anchor_idx].clone(),
+                });
+            }
+        }
+
+        if slots.iter().any(Option::is_none) {
+            return None;
+        }
+
+        Some(Self {
+            seed,
+            bucket_displacements,
+            slots,
+        })
+    }
+
+    fn rule_indices(&self, anchor: &str) -> Option<&[usize]> {
+        let slot_idx = self.slot_index(anchor)?;
+        self.slots
+            .get(slot_idx)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.rule_indices.as_slice())
+    }
+
+    fn slot_index(&self, anchor: &str) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let bucket_idx = mphf_bucket_index(anchor, self.seed, self.bucket_displacements.len());
+        let displacement = self.bucket_displacements[bucket_idx];
+        if displacement == MPHF_EMPTY_DISPLACEMENT {
+            return None;
+        }
+        let slot_idx = mphf_slot_index(anchor, self.seed, displacement, self.slots.len());
+        let slot = self.slots.get(slot_idx).and_then(Option::as_ref)?;
+        (slot.anchor == anchor).then_some(slot_idx)
+    }
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_seed_for_attempt(attempt: usize) -> u64 {
+    0x9e37_79b9_7f4a_7c15_u64.wrapping_mul((attempt as u64).wrapping_add(1))
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_bucket_index(anchor: &str, seed: u64, bucket_count: usize) -> usize {
+    (mphf_hash(anchor, seed ^ 0xa24b_aed4_963e_e407) as usize) % bucket_count
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_slot_index(anchor: &str, seed: u64, displacement: usize, slot_count: usize) -> usize {
+    let slot_seed =
+        seed ^ 0x9fb2_1c65_1e98_df25 ^ (displacement as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (mphf_hash(anchor, slot_seed) as usize) % slot_count
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_hash(anchor: &str, seed: u64) -> u64 {
+    let mut hash = MPHF_HASH_OFFSET ^ seed.rotate_left(17);
+    for &byte in anchor.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(MPHF_HASH_PRIME);
+    }
+    hash ^= (anchor.len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    hash
+}
+
+struct EngineIndex {
+    compiled_rules: Vec<CompiledRule>,
+    has_scoped_rules: bool,
+    anchor_list: Vec<String>,
+    anchor_rule_buckets: Vec<Vec<usize>>,
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    anchor_dispatch: MphfAnchorDispatch,
+    anchor_matcher: Option<AhoCorasick>,
+    #[cfg(feature = "teddy-prefilter")]
+    teddy_prefilter: Option<packed::Searcher>,
+    quick_bytes: Vec<u8>,
+    /// Bloom filter for quick rejection of non-matching text.
+    /// Contains all anchor strings for O(1) "definitely not present" checks.
+    bloom: Option<Bloom<str>>,
+    /// Unique anchor lengths (sorted, ascending) for efficient substring checking.
+    anchor_lengths: Vec<usize>,
+}
+
+impl std::fmt::Debug for EngineIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("EngineIndex");
+        debug
+            .field("compiled_rules", &self.compiled_rules.len())
+            .field("anchor_list", &self.anchor_list.len())
+            .field("anchor_rule_buckets", &self.anchor_rule_buckets.len())
+            .field("anchor_matcher", &self.anchor_matcher.is_some());
+        #[cfg(feature = "teddy-prefilter")]
+        debug.field("teddy_prefilter", &self.teddy_prefilter.is_some());
+        debug
+            .field("quick_bytes", &self.quick_bytes.len())
+            .field("bloom", &self.bloom.is_some())
+            .field("anchor_lengths", &self.anchor_lengths);
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        debug.field("anchor_dispatch", &self.anchor_dispatch.base.slots.len());
+        debug.finish()
+    }
+}
+
+/// One per-agent Aho-Corasick shard over a *subset* of the global anchor set.
+///
+/// Part of the `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX` moonshot (round5
+/// EV2, default-OFF). A shard's patterns are the global anchor indices relevant
+/// to one agent (its own rules + WezTerm infrastructure rules), kept in
+/// ascending *global* order so per-shard pattern ids stay monotonic in global
+/// ids. [`AgentShard::pattern_to_global_anchor`] maps every shard pattern back
+/// to its global anchor index, so candidate collection reuses the global
+/// `anchor_rule_buckets` / dispatch and the global `compiled_rules` ordering
+/// verbatim.
+struct AgentShard {
+    matcher: AhoCorasick,
+    /// `pattern_to_global_anchor[shard_pattern_id]` = global anchor index.
+    pattern_to_global_anchor: Vec<usize>,
+}
+
+/// Per-agent anchor shards keyed by agent type.
+///
+/// Equivalence to the global automaton is structural, not approximate: a rule
+/// applies to agent `A` iff all of its anchors are in `A`'s shard, so it
+/// matches in the shard exactly when it matches globally. Because shard
+/// patterns preserve global anchor ordering and map back to global indices, the
+/// post-collection sort, first-anchor fallback, regex evaluation, spans and
+/// dedup are byte-identical to the global path — and the existing
+/// `rule_agent_type_applies` filter still runs to drop shared-anchor
+/// other-agent rules. Proven by the `agent_sharded_index_matches_global_oracle`
+/// property test.
+struct AgentShardedIndex {
+    shards: HashMap<AgentType, AgentShard>,
+}
+
+impl AgentShardedIndex {
+    /// Known agent panes worth sharding. `Unknown` always uses the global
+    /// index (it is the conservative "all rules apply" fallback).
+    const SHARDED_AGENTS: [AgentType; 4] = [
+        AgentType::Codex,
+        AgentType::ClaudeCode,
+        AgentType::Gemini,
+        AgentType::Wezterm,
+    ];
+
+    fn build(index: &EngineIndex) -> Self {
+        let mut shards = HashMap::new();
+        for agent in Self::SHARDED_AGENTS {
+            // Global anchor indices whose bucket holds at least one rule that
+            // applies to `agent`. Iterating the bucket vec in order keeps
+            // `globals` ascending, preserving global pattern ordering.
+            let mut globals: Vec<usize> = Vec::new();
+            for (g, bucket) in index.anchor_rule_buckets.iter().enumerate() {
+                let relevant = bucket.iter().any(|&ri| {
+                    PatternEngine::rule_agent_type_applies(
+                        index.compiled_rules[ri].def.agent_type,
+                        agent,
+                    )
+                });
+                if relevant {
+                    globals.push(g);
+                }
+            }
+            if globals.is_empty() {
+                // No anchors can fire for this agent → leave the shard absent
+                // so the runtime falls back to the (equally empty-result)
+                // global path rather than constructing an empty matcher.
+                continue;
+            }
+            let matcher = AhoCorasick::builder()
+                .build(globals.iter().map(|&g| index.anchor_list[g].as_str()))
+                // Anchors were already validated when the global matcher was
+                // built; a subset of them must also build.
+                .expect("agent shard matcher builds from already-validated anchors");
+            shards.insert(
+                agent,
+                AgentShard {
+                    matcher,
+                    pattern_to_global_anchor: globals,
+                },
+            );
+        }
+        Self { shards }
+    }
+
+    fn shard_for(&self, agent: AgentType) -> Option<&AgentShard> {
+        self.shards.get(&agent)
+    }
+}
+
+#[cfg(test)]
+fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
+    build_engine_index_with_pack_lookup(rules, |_| None::<&'static str>)
+}
+
+fn build_engine_index_for_library(library: &PatternLibrary) -> Result<EngineIndex> {
+    build_engine_index_with_pack_lookup(library.rules(), |rule_id| {
+        library.pack_id_for_rule_id(rule_id)
+    })
+}
+
+fn build_engine_index_with_pack_lookup<'a, F>(
+    rules: &[RuleDef],
+    mut pack_id_for_rule: F,
+) -> Result<EngineIndex>
+where
+    F: FnMut(&str) -> Option<&'a str>,
+{
+    let mut compiled_rules = Vec::with_capacity(rules.len());
+    let mut pack_id_cache: HashMap<String, Arc<str>> = HashMap::new();
+    let mut anchor_list: Vec<String> = Vec::new();
+    let mut anchor_to_index: HashMap<String, usize> = HashMap::new();
+    let mut anchor_rule_buckets: Vec<Vec<usize>> = Vec::new();
+    let mut quick_byte_set: HashSet<u8> = HashSet::new();
+
+    for (idx, rule) in rules.iter().enumerate() {
+        let (regex, capture_names) = match rule.regex.as_ref() {
+            Some(raw) => {
+                // [ft-xv561] same backtrack cap as validate_regex —
+                // build_engine_index is the hot-path compile site, so
+                // funnel through compile_rule_regex to keep the
+                // security contract in one place.
+                let regex = compile_rule_regex(raw).map_err(|e| {
+                    PatternError::InvalidRegex(format!(
+                        "rule id '{}' has invalid regex: {e}",
+                        rule.id
+                    ))
+                })?;
+                let capture_names = regex.capture_names().flatten().map(str::to_owned).collect();
+                (Some(regex), capture_names)
+            }
+            None => (None, Vec::new()),
+        };
+
+        let pack_id_raw = pack_id_for_rule(&rule.id).unwrap_or("unknown");
+        let pack_id = pack_id_cache
+            .entry(pack_id_raw.to_string())
+            .or_insert_with(|| Arc::<str>::from(pack_id_raw))
+            .clone();
+
+        compiled_rules.push(CompiledRule {
+            def: rule.clone(),
+            pack_id,
+            regex,
+            capture_names,
+        });
+
+        for anchor in &rule.anchors {
+            let anchor_idx = if let Some(&anchor_idx) = anchor_to_index.get(anchor) {
+                anchor_idx
+            } else {
+                let anchor_idx = anchor_list.len();
+                anchor_to_index.insert(anchor.clone(), anchor_idx);
+                anchor_list.push(anchor.clone());
+                anchor_rule_buckets.push(Vec::new());
+                anchor_idx
+            };
+            anchor_rule_buckets[anchor_idx].push(idx);
+            if let Some(&byte) = anchor.as_bytes().first() {
+                quick_byte_set.insert(byte);
+            }
+        }
+    }
+
+    let anchor_matcher = if anchor_list.is_empty() {
+        None
+    } else {
+        Some(
+            AhoCorasick::builder()
+                .build(anchor_list.iter().map(String::as_str))
+                .map_err(|e| {
+                    PatternError::InvalidRule(format!("failed to build anchor matcher: {e}"))
+                })?,
+        )
+    };
+
+    #[cfg(feature = "teddy-prefilter")]
+    let teddy_prefilter = if anchor_list.is_empty() {
+        None
+    } else {
+        packed::Searcher::new(anchor_list.iter().map(String::as_str))
+    };
+
+    let mut quick_bytes: Vec<u8> = quick_byte_set.into_iter().collect();
+    quick_bytes.sort_unstable();
+
+    // Build Bloom filter from anchor strings for fast pre-filtering.
+    // Uses 1% false positive rate which keeps the filter small (~10KB)
+    // while providing effective rejection of non-matching text.
+    let bloom = if anchor_list.is_empty() {
+        None
+    } else {
+        // Size the filter for the actual number of anchors, minimum 100 to avoid edge cases
+        let num_items = anchor_list.len().max(100);
+        let mut bloom =
+            Bloom::new_for_fp_rate(num_items, BLOOM_FALSE_POSITIVE_RATE).map_err(|err| {
+                PatternError::InvalidRule(format!("failed to build anchor bloom filter: {err}"))
+            })?;
+        for anchor in &anchor_list {
+            bloom.set(anchor.as_str());
+        }
+        Some(bloom)
+    };
+
+    // Collect unique anchor lengths for efficient sliding window checks.
+    // Sorted ascending to allow early exit on short texts.
+    let mut anchor_lengths: Vec<usize> = anchor_list
+        .iter()
+        .map(String::len)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    anchor_lengths.sort_unstable();
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    let anchor_dispatch = MphfAnchorDispatch::build(&anchor_list, &anchor_rule_buckets)?;
+
+    Ok(EngineIndex {
+        compiled_rules,
+        has_scoped_rules: rules.iter().any(|rule| rule.zone.is_some()),
+        anchor_list,
+        anchor_rule_buckets,
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        anchor_dispatch,
+        anchor_matcher,
+        #[cfg(feature = "teddy-prefilter")]
+        teddy_prefilter,
+        quick_bytes,
+        bloom,
+        anchor_lengths,
+    })
+}
+
+fn merge_rules(packs: &[PatternPack]) -> Vec<RuleDef> {
+    let mut merged: HashMap<String, RuleDef> = HashMap::new();
+
+    for pack in packs {
+        for rule in &pack.rules {
+            merged.insert(rule.id.clone(), rule.clone());
+        }
+    }
+
+    let mut rules: Vec<RuleDef> = merged.into_values().collect();
+    rules.sort_by(|a, b| a.id.cmp(&b.id));
+    rules
+}
+
+fn merge_submit_profiles(packs: &[PatternPack]) -> Vec<SubmitProfile> {
+    let mut merged: HashMap<String, SubmitProfile> = HashMap::new();
+
+    for pack in packs {
+        for profile in &pack.submit_profiles {
+            merged.insert(profile.id.clone(), profile.clone());
+        }
+    }
+
+    let mut profiles: Vec<SubmitProfile> = merged.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    profiles
+}
+
+fn builtin_packs() -> Vec<PatternPack> {
+    vec![
+        builtin_core_pack(),
+        builtin_codex_pack(),
+        builtin_claude_code_pack(),
+        builtin_gemini_pack(),
+        builtin_wezterm_pack(),
+    ]
+}
+
+fn builtin_pack_by_name(name: &str) -> Option<PatternPack> {
+    match name {
+        "core" => Some(builtin_core_pack()),
+        "codex" => Some(builtin_codex_pack()),
+        "claude_code" => Some(builtin_claude_code_pack()),
+        "gemini" => Some(builtin_gemini_pack()),
+        "wezterm" => Some(builtin_wezterm_pack()),
+        _ => None,
+    }
+}
+
+struct LoadedPacks {
+    packs: Vec<PatternPack>,
+    user_pack_names: HashSet<String>,
+}
+
+fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Result<LoadedPacks> {
+    let mut packs = Vec::with_capacity(config.packs.len());
+    let mut user_pack_names = HashSet::new();
+    for pack_id in &config.packs {
+        let pack = load_pack_from_id(pack_id, root)?;
+        if pack_id.starts_with("file:") {
+            user_pack_names.insert(pack.name.clone());
+        }
+        packs.push(pack);
+    }
+
+    // Discover user packs from config dir (e.g. ~/.config/wa/patterns/)
+    //
+    // [ft-qhyfh] Route this branch through `sandbox_resolve_dir` the same
+    // way `.ft/patterns` (the ft-6mxfs fix site below) does. Unlike the
+    // repo-clone case, `user_dir` is under the user's own control, so the
+    // threat model is narrower — the attacker would need the user to
+    // already have write access. However:
+    //
+    //   * Shared-dotfile setups where `~/.config/wa/patterns` is a symlink
+    //     valid on one machine but dangling / redirected on another can
+    //     silently widen a `wa` invocation's read scope on the second
+    //     machine.
+    //   * The inner per-file `sandbox_resolve` uses the passed-in dir as
+    //     its root, so if `user_dir` itself redirects (e.g.
+    //     `~/.config/wa/patterns -> /etc`), every per-file check gets
+    //     rooted at `/etc` and passes — the escape is one level up from
+    //     where the existing gate fires.
+    //
+    // Fix: use the parent of `user_dir` as the sandbox root. A stealth
+    // redirect at the directory boundary (canonical form escapes the
+    // parent) is rejected; an explicit absolute configuration
+    // (`user_packs_dir = /opt/company/patterns`) remains accepted because
+    // the canonical form trivially starts with its own parent. A missing
+    // directory or dangling symlink returns `Ok(None)` and is skipped
+    // silently — matching the prior behavior where
+    // `discover_packs_from_dir` returned an empty vec for the 99% case
+    // where no user_packs_dir is populated.
+    if config.user_packs_enabled {
+        if let Some(user_dir) = config.resolved_user_packs_dir() {
+            let sandbox_root = user_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| user_dir.clone());
+            if let Some(safe_user_dir) = sandbox_resolve_dir(&user_dir, &sandbox_root)? {
+                let discovered = discover_packs_from_dir(&safe_user_dir)?;
+                for pack in discovered {
+                    user_pack_names.insert(pack.name.clone());
+                    packs.push(pack);
+                }
+            }
+        }
+    }
+
+    // Discover workspace-local packs from .ft/patterns/
+    //
+    // [ft-6mxfs] Defend against a top-level symlink replacing the pack
+    // directory itself. ft-fbee5 closed the case of a symlink file *inside*
+    // `.ft/patterns/` escaping the sandbox, but the *parent* path was still
+    // just a `root.join(...)`. A hostile repo can ship
+    //
+    //     .ft/patterns -> /etc
+    //
+    // so `ws_dir` pointed at `/etc`, `discover_packs_from_dir` iterated it,
+    // and every per-file sandbox check passed because the inner loop used
+    // `Some(ws_dir)` — i.e. `/etc` — as its own canonicalized root. The
+    // escape was one level up from where the sandbox gate was applied.
+    //
+    // Fix: canonicalize `ws_dir` *before* walking it, and require the
+    // canonical form to start with the canonical repo root. A missing
+    // directory (the normal case — most repos don't ship `.ft/patterns/`)
+    // is treated as "no packs" without raising an error, matching the old
+    // behavior where `discover_packs_from_dir` early-returned on
+    // `!dir.exists()`.
+    if let Some(root_path) = root {
+        let ws_dir = root_path.join(".ft").join("patterns");
+        if let Some(safe_ws_dir) = sandbox_resolve_dir(&ws_dir, root_path)? {
+            let discovered = discover_packs_from_dir(&safe_ws_dir)?;
+            for pack in discovered {
+                user_pack_names.insert(pack.name.clone());
+                packs.push(pack);
+            }
+        }
+    }
+
+    // ft-yjfke (security): user/workspace packs — config `file:` ids and the
+    // auto-discovered `.ft/patterns` / config-dir packs, i.e. everything in
+    // `user_pack_names` — are attacker-reachable in a cloned repo or a shared
+    // dotfile. Verify each against the supply-chain policy and downgrade it to
+    // observe-only (strip `workflow`/`preview_command` action triggers) unless
+    // it carries a verified, signed manifest. Built-in packs are NOT in
+    // `user_pack_names`, are loaded in-binary via `builtin_pack_by_name`, and
+    // keep their triggers. The gate primitives
+    // (`verify_pattern_pack_supply_chain` / `enforce_verification_report`)
+    // existed but were never called on the production load path, so unsigned
+    // packs previously ran at full action-triggering mode.
+    let verification_policy = PatternPackVerificationPolicy::default();
+    let mut gated_packs = Vec::with_capacity(packs.len());
+    for pack in packs {
+        gated_packs.push(if user_pack_names.contains(&pack.name) {
+            let report = verify_pattern_pack_supply_chain(&pack, &verification_policy);
+            pack.enforce_verification_report(&report)
+        } else {
+            pack
+        });
+    }
+
+    Ok(LoadedPacks {
+        packs: gated_packs,
+        user_pack_names,
+    })
+}
+
+fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> {
+    if let Some(name) = pack_id.strip_prefix("builtin:") {
+        return builtin_pack_by_name(name)
+            .ok_or_else(|| PatternError::PackNotFound(pack_id.to_string()).into());
+    }
+
+    if let Some(path) = pack_id.strip_prefix("file:") {
+        let mut pack = load_pack_from_file(path, root)?;
+        pack.name = file_pack_name_for_id(pack_id);
+        return Ok(pack);
+    }
+
+    Err(PatternError::PackNotFound(pack_id.to_string()).into())
+}
+
+fn file_pack_name_for_id(pack_id: &str) -> String {
+    if pack_id.chars().any(char::is_whitespace) {
+        format!("file:{}", sha256_hex(pack_id.as_bytes()))
+    } else {
+        pack_id.to_string()
+    }
+}
+
+/// [ft-05hfm] Hard cap on pattern-pack file size before parse.
+///
+/// Pattern packs are attacker-reachable via `.ft/patterns/*.{yaml,json,
+/// toml}` in a cloned repo. Without this cap, a hostile pack could
+/// exhaust the allocator (multi-GiB file into `read_to_string`) or
+/// stack-blow the YAML deserializer on deeply-nested input.
+///
+/// 16 MiB is roughly four orders of magnitude larger than the biggest
+/// built-in pack (`builtin_claude_code_pack` serializes to ~10 KiB) so
+/// legitimate packs have ample headroom even for very large user packs
+/// while still rejecting obvious DoS payloads long before they reach
+/// the serde_yaml / serde_json / toml deserializer.
+pub(crate) const MAX_PACK_BYTES: u64 = 16 * 1024 * 1024;
+
+fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
+    load_pack_from_path(Path::new(path), root)
+}
+
+fn load_pack_from_path(raw_path: &Path, root: Option<&Path>) -> Result<PatternPack> {
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        root.map(|r| r.join(raw_path))
+            .unwrap_or_else(|| raw_path.to_path_buf())
+    };
+
+    // Sandbox enforcement: when a `root` is supplied by the caller, every
+    // `file:` pack path — whether the caller wrote it as relative, as
+    // absolute, or disguised with `..` traversal — must canonicalize to a
+    // location inside that root. The earlier revision used the candidate
+    // verbatim, so an attacker who controlled the config's `[patterns]
+    // packs = [...]` list could add `file:/etc/passwd` or
+    // `file:../../../.ssh/id_rsa` and read arbitrary files through the
+    // pack-loading surface. Symlink escape (a link inside root pointing
+    // out) is also blocked because `fs::canonicalize` follows symlinks.
+    //
+    // Callers that pass `root: None` have either already vetted the path
+    // (e.g. a caller that passes an absolute path built from a trusted
+    // config field) or are a test harness. `discover_packs_from_dir` now
+    // passes `Some(dir)` so symlinks inside `.ft/patterns/` cannot escape
+    // the pack root.
+    let resolved = if let Some(root) = root {
+        sandbox_resolve(&candidate, root)?
+    } else {
+        candidate
+    };
+
+    // [ft-05hfm] Stat before read — cheaper to reject oversize packs on
+    // the metadata path than to buffer the whole file into memory first.
+    if let Ok(meta) = std::fs::metadata(&resolved) {
+        if meta.len() > MAX_PACK_BYTES {
+            return Err(PatternError::InvalidRule(format!(
+                "pattern pack {} is {} bytes; max allowed is {} bytes \
+                 (see ft-05hfm — raise MAX_PACK_BYTES if a legitimate pack \
+                 ever exceeds this bound, but audit the source first)",
+                resolved.display(),
+                meta.len(),
+                MAX_PACK_BYTES,
+            ))
+            .into());
+        }
+    }
+
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| PatternError::PackNotFound(format!("{} ({})", resolved.display(), e)))?;
+
+    // [ft-05hfm] Second-line defense: the metadata check can be dodged on
+    // filesystems that misreport size (procfs-like pseudo files) or via a
+    // TOCTOU swap. Verify the actual bytes read fit the cap too.
+    if content.len() as u64 > MAX_PACK_BYTES {
+        return Err(PatternError::InvalidRule(format!(
+            "pattern pack {} read {} bytes; max allowed is {} bytes (ft-05hfm)",
+            resolved.display(),
+            content.len(),
+            MAX_PACK_BYTES,
+        ))
+        .into());
+    }
+
+    let ext = resolved
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let pack = match ext.as_str() {
+        "yaml" | "yml" => serde_yaml::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid YAML pack: {e}")))?,
+        "json" => serde_json::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid JSON pack: {e}")))?,
+        "toml" => toml::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid TOML pack: {e}")))?,
+        other => {
+            return Err(PatternError::InvalidRule(format!(
+                "unsupported pack extension '{other}' (expected .yaml, .yml, .json, .toml)"
+            ))
+            .into());
+        }
+    };
+
+    Ok(pack)
+}
+
+/// Canonicalize `candidate` and `root`, then verify the canonical
+/// candidate is contained within the canonical root.
+///
+/// Both `..` traversal (e.g. `root/../etc/passwd`) and symlink escape
+/// (e.g. `root/link` where `link -> /etc/passwd`) are rejected —
+/// `fs::canonicalize` resolves both in a single syscall sequence, and a
+/// prefix check on the result rejects anything that slipped out.
+///
+/// Fails with `PackNotFound` when the candidate doesn't exist so the
+/// user-facing error family stays stable with the pre-sandbox behavior
+/// (the old code's `read_to_string` also surfaced missing files as
+/// `PackNotFound`). Fails with `InvalidRule` when the candidate exists
+/// but resolves outside `root`.
+fn sandbox_resolve(candidate: &Path, root: &Path) -> Result<PathBuf> {
+    let root_canonical = root.canonicalize().map_err(|e| {
+        PatternError::InvalidRule(format!(
+            "sandbox root {} is not accessible: {e}",
+            root.display()
+        ))
+    })?;
+    let candidate_canonical = candidate
+        .canonicalize()
+        .map_err(|e| PatternError::PackNotFound(format!("{} ({e})", candidate.display())))?;
+    if !candidate_canonical.starts_with(&root_canonical) {
+        return Err(PatternError::InvalidRule(format!(
+            "pack path {} resolves outside sandbox root {}",
+            candidate_canonical.display(),
+            root_canonical.display()
+        ))
+        .into());
+    }
+    Ok(candidate_canonical)
+}
+
+/// Directory-level sibling of [`sandbox_resolve`] for the pack-discovery
+/// entry point.
+///
+/// [ft-6mxfs] `load_packs_from_config` constructs
+/// `root_path.join(".ft").join("patterns")` for each workspace. That path
+/// is attacker-controlled at the directory level: a hostile repo can ship
+/// `.ft/patterns` itself as a symlink pointing anywhere the frankenterm
+/// process can read (e.g. `/etc`, `~/.ssh`). Without canonicalization,
+/// `discover_packs_from_dir` was happy to iterate the target and the
+/// per-file `sandbox_resolve` call treated the *symlinked-to* directory
+/// as its own sandbox root — so every file inside looked "in-sandbox"
+/// even though the whole tree was outside `root_path`.
+///
+/// This helper canonicalizes both the candidate directory and the root,
+/// then requires the candidate to be contained in the root. Semantics:
+///
+/// * **Missing directory** (the 99% case — no `.ft/patterns/` in the
+///   repo) → `Ok(None)`. Callers skip discovery. This matches the old
+///   `discover_packs_from_dir` behavior of returning an empty vec when
+///   the dir doesn't exist, so no legitimate workflow sees a new error.
+/// * **Exists, canonicalizes inside root** → `Ok(Some(canonical))`. The
+///   caller uses the canonical path for discovery, which means every
+///   subsequent `std::fs::read_dir` call operates on the already-resolved
+///   path (no second TOCTOU opportunity to swap in a symlink).
+/// * **Exists, canonicalizes outside root** → `Err(InvalidRule)`. The
+///   symlink escape is refused at the directory boundary, before any
+///   file content is read.
+///
+/// Centralizing this here (rather than inlining it at every workspace-
+/// relative load site) means future callers — workflows, policy files,
+/// other `.ft/**` loaders — can reuse the same gate.
+fn sandbox_resolve_dir(candidate: &Path, root: &Path) -> Result<Option<PathBuf>> {
+    // Cheap early-out: if the candidate doesn't exist even as a symlink,
+    // there's nothing to canonicalize or validate. symlink_metadata (as
+    // opposed to metadata) avoids following a dangling symlink and lets
+    // us distinguish "missing" from "broken link."
+    if std::fs::symlink_metadata(candidate).is_err() {
+        return Ok(None);
+    }
+
+    let root_canonical = root.canonicalize().map_err(|e| {
+        PatternError::InvalidRule(format!(
+            "sandbox root {} is not accessible: {e}",
+            root.display()
+        ))
+    })?;
+    let candidate_canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        // A dangling symlink (symlink_metadata succeeded, but canonicalize
+        // failed because the target is gone) is indistinguishable from a
+        // hostile escape attempt that happens to point at a now-deleted
+        // file. Treat it as "nothing to load" rather than erroring — the
+        // attack surface here is read-side, and a dangling link can't
+        // exfiltrate anything.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(PatternError::InvalidRule(format!(
+                "pack directory {} is not accessible: {e}",
+                candidate.display()
+            ))
+            .into());
+        }
+    };
+    if !candidate_canonical.starts_with(&root_canonical) {
+        return Err(PatternError::InvalidRule(format!(
+            "pack directory {} resolves outside sandbox root {} \
+             (likely a symlink escape — see ft-6mxfs)",
+            candidate_canonical.display(),
+            root_canonical.display()
+        ))
+        .into());
+    }
+    Ok(Some(candidate_canonical))
+}
+
+fn is_pack_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "toml" | "yaml" | "yml" | "json"))
+        .unwrap_or(false)
+}
+
+fn nested_pack_manifest_candidates(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    ["rules.toml", "rules.yaml", "rules.yml", "rules.json"]
+        .into_iter()
+        .map(|name| dir.join(name))
+}
+
+fn is_regular_file_no_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut packs = Vec::new();
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| PatternError::InvalidRule(format!("cannot read {}: {e}", dir.display())))?;
+
+    let mut sorted = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => sorted.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    "Skipping unreadable user pack directory entry in {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    sorted.sort_by_key(|e| e.file_name());
+
+    for entry in sorted {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            tracing::warn!(
+                "Skipping user pack with unreadable file type: {}",
+                path.display()
+            );
+            continue;
+        };
+        // Use non-following metadata for directory discovery so symlinked pack
+        // files are skipped instead of followed by metadata/read paths.
+        if file_type.is_file() && is_pack_file(&path) {
+            match load_pack_from_path(&path, Some(dir)) {
+                Ok(pack) => packs.push(pack),
+                Err(e) => {
+                    tracing::warn!("Skipping invalid user pack {}: {e}", path.display());
+                }
+            }
+        } else if file_type.is_dir() {
+            for rules_file in nested_pack_manifest_candidates(&path) {
+                if !is_regular_file_no_symlink(&rules_file) {
+                    continue;
+                }
+                match load_pack_from_path(&rules_file, Some(dir)) {
+                    Ok(pack) => packs.push(pack),
+                    Err(e) => {
+                        tracing::warn!("Skipping invalid user pack {}: {e}", rules_file.display());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(packs)
+}
+
+fn apply_pack_overrides(
+    packs: Vec<PatternPack>,
+    overrides: &HashMap<String, PackOverride>,
+) -> Result<Vec<PatternPack>> {
+    if overrides.is_empty() {
+        return Ok(packs);
+    }
+
+    let normalized = normalize_pack_overrides(overrides, &packs)?;
+    let mut updated = Vec::with_capacity(packs.len());
+    for mut pack in packs {
+        if let Some(override_cfg) = normalized.get(&pack.name) {
+            apply_pack_override_to_pack(&mut pack, override_cfg)?;
+        }
+        updated.push(pack);
+    }
+    Ok(updated)
+}
+
+fn normalize_pack_overrides(
+    overrides: &HashMap<String, PackOverride>,
+    packs: &[PatternPack],
+) -> Result<HashMap<String, PackOverride>> {
+    let mut normalized: HashMap<String, PackOverride> = HashMap::new();
+    for (key, override_cfg) in overrides {
+        let canonical = normalize_pack_key(key, packs).ok_or_else(|| {
+            PatternError::InvalidRule(format!(
+                "pack override '{}' does not match any enabled pack",
+                key
+            ))
+        })?;
+
+        let entry = normalized.entry(canonical).or_default();
+        *entry = merge_pack_overrides(entry, override_cfg);
+    }
+    Ok(normalized)
+}
+
+fn normalize_pack_key(key: &str, packs: &[PatternPack]) -> Option<String> {
+    if packs.iter().any(|p| p.name == key) {
+        return Some(key.to_string());
+    }
+
+    if key.starts_with("file:") {
+        let candidate = file_pack_name_for_id(key);
+        if packs.iter().any(|p| p.name == candidate) {
+            return Some(candidate);
+        }
+    }
+
+    // Try finding a builtin pack by prefixing with "builtin:" if the key doesn't have it
+    if !key.starts_with("builtin:") {
+        let candidate = format!("builtin:{key}");
+        if packs.iter().any(|p| p.name == candidate) {
+            return Some(candidate);
+        }
+    }
+
+    packs
+        .iter()
+        .find(|p| p.name.strip_prefix("builtin:") == Some(key))
+        .map(|p| p.name.clone())
+}
+
+fn merge_pack_overrides(base: &PackOverride, overlay: &PackOverride) -> PackOverride {
+    let mut merged = base.clone();
+
+    for rule in &overlay.disabled_rules {
+        if !merged.disabled_rules.contains(rule) {
+            merged.disabled_rules.push(rule.clone());
+        }
+    }
+
+    for (rule_id, severity) in &overlay.severity_overrides {
+        merged
+            .severity_overrides
+            .insert(rule_id.clone(), severity.clone());
+    }
+
+    for (key, value) in &overlay.extra {
+        merged.extra.insert(key.clone(), value.clone());
+    }
+
+    merged
+}
+
+fn apply_pack_override_to_pack(pack: &mut PatternPack, override_cfg: &PackOverride) -> Result<()> {
+    if !override_cfg.severity_overrides.is_empty() {
+        for rule in &mut pack.rules {
+            if let Some(severity) = override_cfg.severity_overrides.get(&rule.id) {
+                rule.severity = parse_severity_override(severity)?;
+            }
+        }
+    }
+
+    if !override_cfg.disabled_rules.is_empty() {
+        let disabled: HashSet<&str> = override_cfg
+            .disabled_rules
+            .iter()
+            .map(String::as_str)
+            .collect();
+        pack.rules
+            .retain(|rule| !disabled.contains(rule.id.as_str()));
+    }
+
+    Ok(())
+}
+
+fn parse_severity_override(value: &str) -> Result<Severity> {
+    match value.trim().to_lowercase().as_str() {
+        "info" => Ok(Severity::Info),
+        "warning" => Ok(Severity::Warning),
+        "critical" => Ok(Severity::Critical),
+        _ => Err(PatternError::InvalidRule(format!(
+            "invalid severity override '{value}' (expected info, warning, critical)"
+        ))
+        .into()),
+    }
+}
+
+/// Builtin core pack containing the default shipped ruleset.
+fn builtin_core_pack() -> PatternPack {
+    let mut rules = Vec::new();
+    let mut submit_profiles = Vec::new();
+
+    let codex = builtin_codex_pack();
+    rules.extend(codex.rules);
+    submit_profiles.extend(codex.submit_profiles);
+
+    let claude_code = builtin_claude_code_pack();
+    rules.extend(claude_code.rules);
+    submit_profiles.extend(claude_code.submit_profiles);
+
+    let gemini = builtin_gemini_pack();
+    rules.extend(gemini.rules);
+    submit_profiles.extend(gemini.submit_profiles);
+
+    rules.extend(builtin_wezterm_pack().rules);
+    PatternPack::new("builtin:core", "0.1.0", rules).with_submit_profiles(submit_profiles)
+}
+
+fn builtin_codex_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "codex.default".to_string(),
+        agent_type: AgentType::Codex,
+        // Anchors re-captured from live codex-cli 0.162.1 panes on 2026-10-12.
+        version: "2026-10-12".to_string(),
+        anchors: SubmitProfileAnchors {
+            // 0.162 draws no send/newline hint; the composer is the last
+            // `› ` line (submitted turns are echoed with the same glyph, which
+            // the classifier handles by only reading text after the last one).
+            // The older hints stay for earlier CLI versions.
+            composer_nonempty: vec![
+                "\u{203a}".to_string(),
+                "Press Enter to send".to_string(),
+                "ctrl+j for newline".to_string(),
+                "Type your message".to_string(),
+            ],
+            composer_cleared: vec![
+                "Thinking".to_string(),
+                "working".to_string(),
+                "Token usage:".to_string(),
+            ],
+            // The status line names the reasoning step ("Working", or a
+            // model-written header), but always ends "esc to interrupt".
+            working_state: vec![
+                "esc to interrupt".to_string(),
+                "Thinking".to_string(),
+                "Running".to_string(),
+                "Reading".to_string(),
+                "Editing".to_string(),
+            ],
+            // Approval overlay and the busy-turn message queue in 0.162. No
+            // bare "queued": agent output mentioning a queued job matched it
+            // and held every later send as queued.
+            queued_behind_operation: vec![
+                "Would you like to run the following command?".to_string(),
+                "Press enter to confirm or esc to cancel".to_string(),
+                "Messages to be submitted after next tool call".to_string(),
+                "waiting for approval".to_string(),
+                "operation in progress".to_string(),
+            ],
+            crash_to_shell: vec![
+                "thread 'main' panicked".to_string(),
+                "Traceback (most recent call last)".to_string(),
+                "Segmentation fault".to_string(),
+                "codex resume".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Wait for the current tool call or approval gate before retrying submit verification.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Capture the pane tail and surface verification_unavailable without resending input.".to_string(),
+            },
+        ],
+    }
+}
+
+/// Codex usage warnings: the older "24% of your 4h limit remaining" and the
+/// current CLI's "less than 25% of your 5h limit left" or "... of your weekly
+/// limit left" (codex-cli 0.162).
+const CODEX_USAGE_WARNING_REGEX: &str = r"(?P<remaining>\d+)% of your (?:(?P<limit_hours>\d+)h|(?P<limit_window>[A-Za-z]+)) limit (?:remaining|left)";
+
+/// Codex usage limit: a reset time when the message gives one, else the
+/// limit sentence itself (optionally naming the exhausted model).
+const CODEX_USAGE_REACHED_REGEX: &str = r"(?i)try again at (?P<reset_time>[^.]+)|(?:hit|reached) your usage limit(?:\s+for\s+(?P<model>\S+?))?\.(?=\s|$)(?![\s\S]{0,300}?try again at)";
+
+/// Builtin Codex pack with rules for OpenAI Codex CLI detection
+fn builtin_codex_pack() -> PatternPack {
+    PatternPack::new(
+        "builtin:codex",
+        "0.1.0",
+        vec![
+            // Usage warnings at different thresholds
+            RuleDef {
+                id: "codex.usage.warning_25".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["less than 25%".to_string()],
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
+                description: "Codex usage below 25% remaining".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            RuleDef {
+                id: "codex.usage.warning_10".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["less than 10%".to_string()],
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
+                description: "Codex usage below 10% remaining".to_string(),
+                remediation: Some("Consider pausing work soon".to_string()),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            RuleDef {
+                id: "codex.usage.warning_5".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["less than 5%".to_string()],
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
+                description: "Codex usage below 5% remaining - critical threshold".to_string(),
+                remediation: Some("Save work and prepare for limit".to_string()),
+                // No builtin workflow handles Codex usage warnings (there is
+                // no handle_usage_warning).
+                workflow: None,
+                manual_fix: Some("Finish current task quickly and prepare to switch accounts or wait for reset".to_string()),
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Usage limit reached
+            RuleDef {
+                id: "codex.usage.reached".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "You've hit your usage limit".to_string(),
+                    "You've reached your usage limit".to_string(),
+                    // codex-cli 0.162 prints a typographic apostrophe (U+2019).
+                    "You\u{2019}ve hit your usage limit".to_string(),
+                    "You\u{2019}ve reached your usage limit".to_string(),
+                ],
+                // Case-insensitive: the shipped Codex binary (0.133) prints
+                // "You've hit your usage limit. Try again at 4:32 PM." (capital T
+                // at sentence start) and "... or try again at ..." mid-sentence;
+                // a case-sensitive regex missed the primary form (found by the
+                // headless-mux observe smoke, 2026-09-02).
+                // The second branch is a limit with no reset time (codex-cli
+                // 0.162: "Upgrade to Plus ...", "Visit ... to purchase more
+                // credits", "... for <model>. Switch to another model now");
+                // it stands down when a "try again at" follows, so a message
+                // captured in one segment is one detection (split across
+                // segments, the two halves are two detections).
+                regex: Some(CODEX_USAGE_REACHED_REGEX.to_string()),
+                description: "Codex usage limit reached".to_string(),
+                remediation: Some("Wait for reset or switch account".to_string()),
+                workflow: Some("handle_usage_limits".to_string()),
+                manual_fix: Some("Exit Codex with Ctrl-C, log out, then log in with a different OpenAI account".to_string()),
+                preview_command: Some("ft workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Session token usage summary
+            RuleDef {
+                id: "codex.session.token_usage".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "session.summary".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["Token usage:".to_string()],
+                regex: Some(
+                    r"total=(?P<total>[\d,]+)\s+input=(?P<input>[\d,]+)(?:\s+\(\+\s*(?P<cached>[\d,]+)\s+cached\))?\s+output=(?P<output>[\d,]+)(?:\s+\(reasoning\s+(?P<reasoning>[\d,]+)\))?".to_string()
+                ),
+                description: "Codex session token usage summary".to_string(),
+                remediation: None,
+                workflow: Some("handle_session_end".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Resume session hint
+            RuleDef {
+                id: "codex.session.resume_hint".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "session.resume_hint".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["codex resume".to_string()],
+                regex: Some(
+                    r"codex resume (?P<session_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})".to_string()
+                ),
+                description: "Codex session resume hint with session ID".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Device auth code prompt
+            RuleDef {
+                id: "codex.auth.device_code_prompt".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "auth.device_code".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Enter this one-time code".to_string(),
+                    "enter this one-time code".to_string(),
+                ],
+                regex: Some(r"(?P<code>[A-Z0-9]{4}-[A-Z0-9]{5})".to_string()),
+                description: "Codex device authentication code prompt".to_string(),
+                remediation: Some("User needs to enter the code in browser".to_string()),
+                workflow: Some("handle_auth_required".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Rate limit detection (HTTP 429 / explicit rate limit messages)
+            RuleDef {
+                id: "codex.rate_limit.detected".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "429".to_string(),
+                    "too many requests".to_string(),
+                    "Too Many Requests".to_string(),
+                ],
+                regex: Some(
+                    // ft-fdppm: require the rate-limit anchor phrase within 200
+                    // chars of the retry-duration text. Without the proximity
+                    // bound, a segment containing "rate limit" early and an
+                    // unrelated "wait 5 minutes" elsewhere emits a false
+                    // rate_limit.detected.
+                    //
+                    // ft-y820u: `(?s)` so `.` matches `\n`. Real API errors
+                    // routinely span multiple lines (anchor phrase on one
+                    // line, retry duration on the next); without DOTALL the
+                    // proximity bound silently rejected those messages. The
+                    // 200-char gap still rejects the false-positive case
+                    // (>800 chars of unrelated text).
+                    // Bound BOTH gaps: anchor→retry-phrase ≤ 200 chars,
+                    // retry-phrase→duration ≤ 80 chars. Without the second
+                    // bound, a segment like "rate limit reset at midnight\n
+                    // …800 chars…\nwait 5 minutes" would still pull "5
+                    // minutes" through `.*?` once `(?s)` lets `.` cross
+                    // newlines.
+                    r"(?is)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Codex rate limit detected - provider throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
+                workflow: Some("handle_usage_limits".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch to a different account".to_string()),
+                preview_command: Some("ft workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+        ],
+    )
+    .with_submit_profiles(vec![builtin_codex_submit_profile()])
+}
+
+fn builtin_claude_code_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "claude_code.default".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        version: "2026-10-12".to_string(),
+        anchors: SubmitProfileAnchors {
+            // Claude Code 2.1.296 prompts with `❯` (captured 2026-10-12) and
+            // echoes submitted turns the same way; `>` was the older prompt.
+            composer_nonempty: vec![
+                "\u{276f}".to_string(),
+                ">".to_string(),
+                "shift+enter".to_string(),
+                "Press Enter to send".to_string(),
+            ],
+            composer_cleared: vec![
+                "Thinking".to_string(),
+                "Using tool".to_string(),
+                "Tool call:".to_string(),
+            ],
+            working_state: vec![
+                "Thinking".to_string(),
+                "Using tool".to_string(),
+                "Executing:".to_string(),
+                "Auto-compact".to_string(),
+                // Claude Code 2.1 shows this in the status line while a turn runs.
+                "esc to interrupt".to_string(),
+            ],
+            // Not a bare "Permission": the 2.1 footer "bypass permissions on"
+            // matched it and classified every submit as queued.
+            queued_behind_operation: vec![
+                "Approve?".to_string(),
+                "Allow?".to_string(),
+                "Do you want to proceed?".to_string(),
+            ],
+            crash_to_shell: vec![
+                "Traceback (most recent call last)".to_string(),
+                "thread 'main' panicked".to_string(),
+                "Session ended".to_string(),
+                "Goodbye".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Treat approval prompts as requires_approval evidence instead of re-sending the prompt.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Stop polling and return verification_unavailable with the crash evidence rule id.".to_string(),
+            },
+        ],
+    }
+}
+
+/// Builtin Claude Code pack with rules for Anthropic Claude Code detection
+fn builtin_claude_code_pack() -> PatternPack {
+    PatternPack::new(
+        "builtin:claude_code",
+        "0.1.0",
+        vec![
+            // Context compaction (canonical ID: claude_code.compaction)
+            RuleDef {
+                id: "claude_code.compaction".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.compaction".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Conversation compacted".to_string(),
+                    "Auto-compact".to_string(),
+                    "context compacted".to_string(),
+                    // Claude Code 2.1 also renders "Conversation summarized
+                    // (ctrl+o for history)" and the row "Compacted · 45.2k
+                    // tokens summarized (ctrl+o to see them)".
+                    "Conversation summarized".to_string(),
+                    "tokens summarized (ctrl+o".to_string(),
+                ],
+                regex: Some(
+                    // Token-count notices must contain both counts. The real
+                    // Conversation compacted banner is a separate complete-line
+                    // alternative, not an optional suffix that accepts fragments.
+                    r"(?m)(?:(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*(?:context compacted|summarized)|context compacted)[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>\d(?:[\d,]*\d)?)\s+tokens?\s+to\s+(?P<tokens_after>\d(?:[\d,]*\d)?)\b|Conversation (?:compacted|summarized)(?:[ \t]*\([^\r\n)]+\))?[ \t]*\r?$|Compacted\W{1,5}(?P<tokens_summarized>\d[\d.,]*k?) tokens summarized)".to_string()
+                ),
+                description: "Claude Code context compaction event".to_string(),
+                remediation: Some("Context was reduced - some history may be lost".to_string()),
+                workflow: Some("handle_compaction".to_string()),
+                manual_fix: Some("Ask the agent to re-read AGENTS.md and key project context files".to_string()),
+                preview_command: Some("ft workflow run handle_compaction --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Session banner with version and model info
+            RuleDef {
+                id: "claude_code.banner".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.start".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["Claude Code v".to_string(), "claude-code/".to_string()],
+                regex: Some(
+                    r"(?:Claude Code v|claude-code/)(?P<version>[\d.]+)(?:.*?model[:\s]+(?P<model>claude-[^\s,]+))?".to_string()
+                ),
+                description: "Claude Code session start banner".to_string(),
+                remediation: None,
+                workflow: Some("handle_session_start_context".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Usage warning (evolving patterns)
+            RuleDef {
+                id: "claude_code.usage.warning".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "usage limit".to_string(),
+                    "approaching limit".to_string(),
+                    "token limit".to_string(),
+                    // Claude Code 2.1: "You've used 90% of your session limit
+                    // · resets 3pm" and "Approaching weekly limit · resets ...".
+                    "You've used".to_string(),
+                    "Approaching session limit".to_string(),
+                    "Approaching weekly limit".to_string(),
+                    "Approaching Opus limit".to_string(),
+                    "Approaching Sonnet limit".to_string(),
+                ],
+                regex: Some(
+                    r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)|used (?P<used_percent>\d+)% of your (?P<limit>[\w-]+) limit|Approaching (?P<approaching>session|weekly|Opus|Sonnet) limit".to_string(),
+                ),
+                description: "Claude Code usage warning".to_string(),
+                remediation: Some("Consider saving work soon".to_string()),
+                workflow: Some("handle_claude_code_limits".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Usage limit reached
+            RuleDef {
+                id: "claude_code.usage.reached".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "limit reached".to_string(),
+                    "quota exceeded".to_string(),
+                    "You've hit your limit".to_string(),
+                    // Claude Code 2.1: "You've hit your session limit · resets
+                    // 3pm (America/New_York)". Named limits only: a bare
+                    // "You've hit your" also prefixes Codex's usage limit.
+                    "You've hit your session limit".to_string(),
+                    "You've hit your weekly limit".to_string(),
+                    "You've hit your Opus limit".to_string(),
+                    "You've hit your Sonnet limit".to_string(),
+                    // Claude Code 2.1.312+: "You've hit your 5-hour limit ·
+                    // resets 7:40pm (America/New_York)".
+                    "You've hit your 5-hour limit".to_string(),
+                    // Model limits, which name no reset ("You've reached your
+                    // Fable 5 limit. Run /usage-credits to continue or switch
+                    // models with /model."), and exhausted credits. The
+                    // capitalized model name keeps Codex's "You've reached
+                    // your usage limit" out.
+                    "You've reached your Fable".to_string(),
+                    "You've reached your Opus".to_string(),
+                    "You've reached your Sonnet".to_string(),
+                    "You've reached your Haiku".to_string(),
+                    "You're out of usage credits".to_string(),
+                ],
+                // A weekly reset names its day ("resets Nov 12 at 2pm
+                // (America/New_York)", "resets Oct 12, 9am"); reset_time keeps
+                // the date so the limit-window ledger does not read it as the
+                // next 2pm.
+                regex: Some(
+                    r"(?:retry|reset(?:s)?|try again).*?(?P<reset_time>[A-Z][a-z]{2} \d{1,2}(?:,| at) \d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?|\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC)|\d+(?::\d+)?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?)|You've reached your (?P<limit>[A-Z]\w*(?: \d+(?:\.\d+)?)?) limit|You're out of usage credits".to_string()
+                ),
+                description: "Claude Code usage limit reached".to_string(),
+                remediation: Some("Wait for limit reset or switch session".to_string()),
+                workflow: Some("handle_claude_code_limits".to_string()),
+                manual_fix: Some("Wait for limit reset or start a new Claude Code session".to_string()),
+                preview_command: Some("ft workflow run handle_claude_code_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Session cost summary
+            RuleDef {
+                id: "claude_code.session.cost_summary".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.summary".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["Total cost:".to_string(), "Session cost:".to_string()],
+                regex: Some(r"(?:Total|Session)\s+cost:\s*\$(?P<cost>[\d.]+)".to_string()),
+                description: "Claude Code session cost summary".to_string(),
+                remediation: None,
+                workflow: Some("handle_session_end".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // API key error
+            RuleDef {
+                id: "claude_code.auth.api_key_error".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "auth.error".to_string(),
+                severity: Severity::Critical,
+                // Claude Code frames its API-key failures with a "·": "Your
+                // organization has disabled Claude subscription access for
+                // Claude Code · Use an Anthropic API key instead, or ask your
+                // admin to enable access" (2.1.281), and "Invalid API key ·
+                // Fix external API key" (claude -p, API status 401). A bare
+                // "API key" or "ANTHROPIC_API_KEY" is ordinary coding prose:
+                // 186 of the 190 hits in 461k Claude Code messages were
+                // prose, and handle_auth_required types a recovery prompt
+                // into the pane.
+                anchors: vec![
+                    "Invalid API key ·".to_string(),
+                    "Use an Anthropic API key instead".to_string(),
+                ],
+                regex: None,
+                description: "Claude Code API key authentication error".to_string(),
+                remediation: Some("Check ANTHROPIC_API_KEY environment variable".to_string()),
+                workflow: Some("handle_auth_required".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Rate limit detection (HTTP 429 / Anthropic rate limits)
+            RuleDef {
+                id: "claude_code.rate_limit.detected".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "529".to_string(),
+                    "too many requests".to_string(),
+                ],
+                regex: Some(
+                    // ft-fdppm: same proximity bound as the codex rule above —
+                    // anchor the retry-duration capture to the rate-limit
+                    // phrase to avoid false positives when an unrelated "wait
+                    // 5 minutes" appears later in the same segment.
+                    // ft-y820u: `(?s)` for multi-line API messages.
+                    r"(?is)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
+                workflow: Some("handle_claude_code_limits".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch Anthropic account".to_string()),
+                preview_command: Some("ft workflow run handle_claude_code_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Auth login required (browser auth flow)
+            RuleDef {
+                id: "claude_code.auth.login_required".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "auth.login_required".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "To sign in".to_string(),
+                    "login required".to_string(),
+                    "please authenticate".to_string(),
+                    "auth required".to_string(),
+                    // Claude Code 2.1: "Not logged in · Please run /login",
+                    // "Login expired · Please run /login", "Authentication
+                    // required · Sign in again to continue".
+                    "Please run /login".to_string(),
+                    "Sign in again to continue".to_string(),
+                    // Claude Code 2.1.296+: "Failed to authenticate: OAuth
+                    // session expired and could not be refreshed", "Failed to
+                    // authenticate. API Error: 401 OAuth access token has
+                    // expired. Re-authenticate to continue." and "... API
+                    // Error: 403 Attention Required! | Cloudflare". Framed
+                    // only: other tools print "Failed to authenticate <what>".
+                    "Failed to authenticate: OAuth".to_string(),
+                    "Failed to authenticate. API Error:".to_string(),
+                ],
+                regex: None,
+                description: "Claude Code login/authentication required via browser".to_string(),
+                remediation: Some("Complete authentication in the browser window".to_string()),
+                // handle_auth_required takes only auth.device_code and
+                // auth.error; a browser login needs a person.
+                workflow: None,
+                manual_fix: Some("Open the provided URL in a browser and complete the login flow".to_string()),
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Tool use indicator
+            RuleDef {
+                id: "claude_code.tool_use".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.tool_use".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Using tool".to_string(),
+                    "Tool call:".to_string(),
+                    "Executing:".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Using tool|Tool call|Executing)[:\s]+(?P<tool_name>Bash|Read|Write|Edit|Glob|Grep|Task|WebFetch|WebSearch|TodoWrite|NotebookEdit)".to_string()
+                ),
+                description: "Claude Code tool invocation".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Approval/permission needed
+            RuleDef {
+                id: "claude_code.approval_needed".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.approval_needed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Approve?".to_string(),
+                    "Allow?".to_string(),
+                    "Permission".to_string(),
+                    "Do you want".to_string(),
+                ],
+                // make/create/edit: Claude Code's file prompts ("Do you want to
+                // make this edit to main.rs?", "Do you want to create ...?").
+                regex: Some(
+                    r"(?P<action>run|execute|write|delete|send|allow|proceed|make|create|edit).*?\?".to_string()
+                ),
+                description: "Claude Code approval/permission prompt".to_string(),
+                remediation: Some("User input required for approval".to_string()),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Context window warning
+            RuleDef {
+                id: "claude_code.context.warning".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "context.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "context window".to_string(),
+                    "context limit".to_string(),
+                    "running low on context".to_string(),
+                    // Claude Code 2.1: "Context low (8% remaining) · Run
+                    // /compact ...", "12% until auto-compact", "88% context used".
+                    "Context low".to_string(),
+                    "until auto-compact".to_string(),
+                    "context used".to_string(),
+                ],
+                regex: Some(
+                    r"(?P<percent>\d+)%?\s*(?:of context|context (?:used|remaining))|Context low \((?P<remaining_percent>\d+)% remaining\)|(?P<until_compact_percent>\d+)% until auto-compact".to_string()
+                ),
+                description: "Claude Code context window warning".to_string(),
+                remediation: Some("Consider compacting or starting new session".to_string()),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Extended thinking indicator
+            RuleDef {
+                id: "claude_code.thinking".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.thinking".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Thinking".to_string(),
+                    "Extended thinking".to_string(),
+                    "ultrathink".to_string(),
+                ],
+                // "…": Claude Code 2.1 renders "✻ Thinking…" with a single
+                // ellipsis character (U+2026), not three dots.
+                regex: Some(
+                    r"(?:Thinking|Extended thinking)(?:\.{3}|…|\s+for\s+(?P<duration>\d+)\s*(?:seconds?|s))".to_string()
+                ),
+                description: "Claude Code extended thinking mode".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Network/connection error. Claude Code prints its API failures
+            // as "API Error: <message>" (Claude Code 2.1.201..2.1.322 session
+            // logs: "Connection lost mid-response", "Connection refused — a
+            // firewall or proxy may be blocking it (ECONNREFUSED)", "Can't
+            // reach the API server — ... (ENOTFOUND)", "Unable to connect to
+            // API (ConnectionRefused)", "Connection dropped (ECONNRESET)").
+            // The three error rules require that framing: bare words such as
+            // "timed out" or "connection closed" are common in agent prose and
+            // tool output, and panes of unknown agent type run every rule.
+            RuleDef {
+                id: "claude_code.error.network".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.network".to_string(),
+                severity: Severity::Critical,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?:Connection \w+|Can['’]t reach the API server|Unable to connect to API)"
+                        .to_string(),
+                ),
+                description: "Claude Code network/connection error".to_string(),
+                remediation: Some("Check network connectivity and retry".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Timeout error: "API Error: No response from API (waited 3m, then
+            // 10m on the retry). ..." and "API Error: The response stopped
+            // arriving. ..." in Claude Code's logs; "Request timed out" is the
+            // Anthropic SDK's timeout message under the same framing.
+            RuleDef {
+                id: "claude_code.error.timeout".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.timeout".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?:No response from API(?: \(waited (?P<duration>[^,)]+))?|The response stopped arriving|Request timed out)"
+                        .to_string(),
+                ),
+                description: "Claude Code timeout error".to_string(),
+                remediation: Some("Operation timed out - consider retrying".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Session/conversation end
+            RuleDef {
+                id: "claude_code.session.end".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.end".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Session ended".to_string(),
+                    "Goodbye".to_string(),
+                    "session complete".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Session|Conversation)\s+(?:ended|complete|finished)".to_string()
+                ),
+                description: "Claude Code session ended".to_string(),
+                remediation: None,
+                workflow: Some("handle_session_end".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Model selection/change
+            RuleDef {
+                id: "claude_code.model.selected".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.model".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "model:".to_string(),
+                    "Using model".to_string(),
+                    "claude-".to_string(),
+                ],
+                regex: Some(
+                    r"(?:model[:\s]+|Using model[:\s]+)(?P<model>claude-(?:opus|sonnet|haiku)-?[^\s,\]]+)".to_string()
+                ),
+                description: "Claude Code model selection".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Auto-compaction completed
+            RuleDef {
+                id: "claude_code.compaction.complete".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.compaction_complete".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Compaction complete".to_string(),
+                    "Summary created".to_string(),
+                    "compacted successfully".to_string(),
+                    "Compacted (ctrl+o".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Compaction complete|compacted successfully|Summary created|Compacted(?:\s*\([^)]+\))?)(?:.*?saved\s+(?P<tokens_saved>[\d,]+))?".to_string()
+                ),
+                description: "Claude Code compaction completed".to_string(),
+                remediation: None,
+                workflow: Some("handle_compaction".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Overloaded error (API busy): "API Error: 529 Overloaded. This is
+            // a server-side issue, usually temporary — ..." in Claude Code's
+            // logs. A 529 is Anthropic's overloaded status, so any 529 under
+            // the API Error framing counts, including "Repeated 529".
+            RuleDef {
+                id: "claude_code.error.overloaded".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.overloaded".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(r"API Error: (?:Repeated )?529\b(?: Overloaded)?".to_string()),
+                description: "Claude API is overloaded".to_string(),
+                remediation: Some("API is busy - wait and retry".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Server error: "API Error: 500 Internal server error. This is a
+            // server-side issue, usually temporary — ..." and "API Error:
+            // Server error mid-response. The response above may be
+            // incomplete." in Claude Code's logs (2.1.201 to 2.1.319). The
+            // turn stops either way. 529 stays with the overloaded rule.
+            RuleDef {
+                id: "claude_code.error.server".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.server".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?:(?P<status>50[0-4])\b(?: Internal server error)?|Server error mid-response)"
+                        .to_string(),
+                ),
+                description: "Claude API server error".to_string(),
+                remediation: Some("Server-side error - wait and retry".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Safeguards refusal: "API Error: Opus 5.5's safeguards flagged
+            // this session (...). ... Claude Code can't respond to your last
+            // message with Opus 5.5." and "API Error: Opus 4.8's safeguards
+            // flagged this message." in Claude Code's logs (2.1.308 to
+            // 2.1.319). Retrying does not help: the turn needs rephrasing in
+            // a new session or another model.
+            RuleDef {
+                id: "claude_code.error.safeguards".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.safeguards".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?P<model>[^'’\n]{1,40}?)['’]s safeguards flagged this (?P<scope>message|session)"
+                        .to_string(),
+                ),
+                description: "Claude model safeguards refused the turn".to_string(),
+                remediation: Some(
+                    "Rephrase in a new session or switch models with /model".to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Unusable model: "There's an issue with the selected model
+            // (opus-5.5). It may not exist or you may not have access to it.
+            // Run /model to pick a different model." in Claude Code's logs
+            // (2.1.232 to 2.1.317). Every turn fails until the model changes.
+            RuleDef {
+                id: "claude_code.error.model_unavailable".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.model_unavailable".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["issue with the selected model (".to_string()],
+                regex: Some(
+                    r"There['’]s an issue with the selected model \((?P<model>[^)\n]+)\)"
+                        .to_string(),
+                ),
+                description: "Claude Code's selected model is unavailable".to_string(),
+                remediation: Some("Run /model to pick a model this account can use".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Context overflow: "Prompt is too long" as the whole error
+            // message in Claude Code's logs (2.1.232, API status 400).
+            // code.claude.com/docs/en/errors also lists "Input is too long
+            // for requested model", "Prompt is too long · automatic
+            // compaction failed: ..." and "Context limit reached · /compact
+            // or /clear to continue". Every turn fails until the context
+            // shrinks. The message must be its own complete line (bare or
+            // under the TUI's ⎿ gutter, with an optional "· ..." hint), so
+            // prose that mentions it and a partial capture do not count.
+            RuleDef {
+                id: "claude_code.error.prompt_too_long".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.prompt_too_long".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Prompt is too long".to_string(),
+                    "Input is too long for requested model".to_string(),
+                    "Context limit reached".to_string(),
+                ],
+                regex: Some(
+                    r"(?m)^[ \t]*(?:⎿[ \t]*)?(?:Prompt is too long|Input is too long for requested model\.?|Context limit reached)(?:[ \t]+·[^\r\n]*)?[ \t]*\r?\n"
+                        .to_string(),
+                ),
+                description: "Claude Code's conversation no longer fits the model's context"
+                    .to_string(),
+                remediation: Some(
+                    "Run /compact to summarize the conversation, or /clear to start over"
+                        .to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Exhausted API credits: "Credit balance is too low" as the
+            // whole error message in Claude Code's logs (2.1.219, API status
+            // 400). Every turn fails until the account has credits again.
+            // Its own complete line only, as for prompt_too_long.
+            RuleDef {
+                id: "claude_code.error.credit_balance".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.credit_balance".to_string(),
+                severity: Severity::Critical,
+                anchors: vec!["Credit balance is too low".to_string()],
+                regex: Some(
+                    r"(?m)^[ \t]*(?:⎿[ \t]*)?Credit balance is too low(?:[ \t]+·[^\r\n]*)?[ \t]*\r?\n"
+                        .to_string(),
+                ),
+                description: "The account behind Claude Code is out of API credits".to_string(),
+                remediation: Some(
+                    "Add credits to the account's API billing or switch Claude Code to another account"
+                        .to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+        ],
+    )
+    .with_submit_profiles(vec![builtin_claude_code_submit_profile()])
+}
+
+fn builtin_gemini_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "gemini.default".to_string(),
+        agent_type: AgentType::Gemini,
+        version: "2026-06-08".to_string(),
+        anchors: SubmitProfileAnchors {
+            composer_nonempty: vec![
+                "Gemini".to_string(),
+                "Press Enter to send".to_string(),
+                "Ctrl+J".to_string(),
+            ],
+            composer_cleared: vec![
+                "Responding with gemini-".to_string(),
+                "Using model".to_string(),
+                "Interaction Summary".to_string(),
+            ],
+            working_state: vec![
+                "Responding with gemini-".to_string(),
+                "Using model".to_string(),
+                "Tool Calls:".to_string(),
+            ],
+            queued_behind_operation: vec![
+                "authorize this app".to_string(),
+                "complete authentication".to_string(),
+                "sign in with Google".to_string(),
+            ],
+            crash_to_shell: vec![
+                "UnhandledPromiseRejection".to_string(),
+                "Traceback (most recent call last)".to_string(),
+                "Segmentation fault".to_string(),
+                "gemini resume".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Classify OAuth prompts as requires_approval/auth evidence and wait for the browser flow.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Return verification_unavailable and preserve the resume hint when present.".to_string(),
+            },
+        ],
+    }
+}
+
+/// Builtin Gemini pack with rules for Google Gemini CLI detection
+fn builtin_gemini_pack() -> PatternPack {
+    PatternPack::new(
+        "builtin:gemini",
+        "0.1.0",
+        vec![
+            // Usage warning (approaching limit)
+            RuleDef {
+                id: "gemini.usage.warning".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Usage limit warning".to_string(),
+                    "approaching your usage limit".to_string(),
+                    "usage limit approaching".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Usage limit (?:warning|approaching)|approaching your usage limit|usage limit approaching)[^\n]*?(?P<remaining>\d+)%\s+of\s+your\s+Pro\s+models?\s+quota\s+remaining"
+                        .to_string(),
+                ),
+                description: "Gemini usage limit approaching".to_string(),
+                remediation: Some("Consider switching models or accounts soon".to_string()),
+                workflow: Some("handle_gemini_quota".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Usage limit reached
+            RuleDef {
+                id: "gemini.usage.reached".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "Usage limit reached for all Pro models".to_string(),
+                    "Usage limit reached for Pro models".to_string(),
+                    "Usage limit reached for your Pro models".to_string(),
+                    // Gemini CLI 0.47 names a non-Pro model: "Usage limit
+                    // reached for gemini-3-flash."
+                    "Usage limit reached for gemini-".to_string(),
+                ],
+                regex: None,
+                description: "Gemini usage limit reached".to_string(),
+                remediation: Some("Wait for limit reset or switch model".to_string()),
+                workflow: Some("handle_gemini_quota".to_string()),
+                manual_fix: Some("Switch to a non-Pro model or wait for quota reset".to_string()),
+                preview_command: Some("ft workflow run handle_gemini_quota --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Rate limit detection (Google API rate limits)
+            RuleDef {
+                id: "gemini.rate_limit.detected".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "RESOURCE_EXHAUSTED".to_string(),
+                    "quota exceeded".to_string(),
+                    "too many requests".to_string(),
+                ],
+                regex: Some(
+                    // ft-fdppm: anchor the retry-duration capture to the
+                    // rate-limit phrase. Same proximity bound as the codex
+                    // and claude_code rate-limit rules.
+                    // ft-y820u: `(?s)` for multi-line API messages.
+                    r"(?is)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Gemini rate limit detected - Google API throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
+                workflow: Some("handle_gemini_quota".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch to a different Google account".to_string()),
+                preview_command: Some("ft workflow run handle_gemini_quota --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Session summary
+            RuleDef {
+                id: "gemini.session.summary".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "session.summary".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Interaction Summary".to_string(),
+                    "Session Summary".to_string(),
+                ],
+                regex: Some(
+                    r"Session ID:\s*(?P<session_id>[0-9a-fA-F-]+)[\s\S]*?Tool Calls:\s*(?P<tool_calls>\d+)(?:[\s\S]*?Tokens Used:\s*(?P<tokens_used>[\d,]+))?(?:[\s\S]*?Input Tokens:\s*(?P<input_tokens>[\d,]+))?(?:[\s\S]*?Output Tokens:\s*(?P<output_tokens>[\d,]+))?"
+                        .to_string(),
+                ),
+                description: "Gemini session summary with statistics".to_string(),
+                remediation: None,
+                workflow: Some("handle_session_end".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Session resume hint
+            RuleDef {
+                id: "gemini.session.resume_hint".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "session.resume_hint".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["gemini resume".to_string(), "gemini --resume".to_string()],
+                regex: Some(
+                    r"gemini\s+(?:resume|--resume)\s+(?P<session_id>[0-9a-fA-F-]{8,})"
+                        .to_string(),
+                ),
+                description: "Gemini session resume hint".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Model indicator
+            RuleDef {
+                id: "gemini.model.used".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "session.model".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Responding with gemini-".to_string(),
+                    "Using model".to_string(),
+                    "Model:".to_string(),
+                    "Switched to model".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Responding with\s+|Using model[:\s]+|Model[:\s]+|Switched to model[:\s]+)(?P<model>gemini-[^\s,]+)"
+                        .to_string(),
+                ),
+                description: "Gemini model being used".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // OAuth required (browser auth flow)
+            RuleDef {
+                id: "gemini.auth.oauth_required".to_string(),
+                zone: None,
+                agent_type: AgentType::Gemini,
+                event_type: "auth.oauth_required".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "authorize this app".to_string(),
+                    "complete authentication".to_string(),
+                    "sign in with Google".to_string(),
+                    // Gemini CLI 0.47: "Please visit the following URL to
+                    // authorize the application:" and "Waiting for
+                    // authentication... (Press Esc or Ctrl+C to cancel)".
+                    "authorize the application".to_string(),
+                    "Waiting for authentication".to_string(),
+                ],
+                regex: None,
+                description: "Gemini CLI OAuth authentication required via browser".to_string(),
+                remediation: Some("Complete Google OAuth in the browser window".to_string()),
+                // handle_auth_required takes only auth.device_code and
+                // auth.error; a browser sign-in needs a person.
+                workflow: None,
+                manual_fix: Some("Open the provided Google OAuth URL in a browser and complete sign-in".to_string()),
+                preview_command: None,
+                learn_more_url: None,
+            },
+        ],
+    )
+    .with_submit_profiles(vec![builtin_gemini_submit_profile()])
+}
+
+/// Builtin terminal-wide rules for mux events and completed command failures.
+fn builtin_wezterm_pack() -> PatternPack {
+    PatternPack::new(
+        "builtin:wezterm",
+        "0.1.0",
+        vec![
+            // A diagnostic or provider outage is not a completed command
+            // failure. Require Cargo's complete summary line, including its
+            // terminator, so a partial capture cannot manufacture an event.
+            RuleDef {
+                id: "wezterm.build.cargo_failed".to_string(),
+                zone: None,
+                agent_type: AgentType::Wezterm,
+                event_type: "build.failed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["error: could not compile".to_string()],
+                regex: Some(
+                    r"(?m)^error: could not compile `(?P<package>[A-Za-z0-9_-]+)`(?: \([^()\r\n]+\))? due to (?P<error_count>[1-9][0-9]*) previous errors?(?:; [0-9]+ warnings? emitted)?[ \t]*\r?\n".to_string(),
+                ),
+                description: "Cargo compilation finished with errors".to_string(),
+                remediation: Some(
+                    "Review the compiler diagnostics before retrying the build".to_string(),
+                ),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            RuleDef {
+                id: "wezterm.test.cargo_failed".to_string(),
+                zone: None,
+                agent_type: AgentType::Wezterm,
+                event_type: "test.failed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["test result: FAILED.".to_string()],
+                regex: Some(
+                    r"(?m)^test result: FAILED\. (?P<passed>[0-9]+) passed; (?P<failed>[1-9][0-9]*) failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s[ \t]*\r?\n".to_string(),
+                ),
+                description: "Rust test suite finished with failed tests".to_string(),
+                remediation: Some(
+                    "Review the failing tests before retrying the command".to_string(),
+                ),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Mux server connection lost
+            RuleDef {
+                id: "wezterm.mux.connection_lost".to_string(),
+                zone: None,
+                agent_type: AgentType::Wezterm,
+                event_type: "mux.error".to_string(),
+                severity: Severity::Critical,
+                // WezTerm rules run on every pane. Any "mux server",
+                // "connection lost" or "disconnected" used to raise this
+                // Critical mux.error (hazard snapshot, cass search): 433 of
+                // 461k Claude Code messages did, from "both mux servers
+                // intact" to "the tmux server state". Only a mux server
+                // losing its connection counts now.
+                anchors: vec!["mux server".to_string(), "Mux server".to_string()],
+                regex: Some(
+                    r"\b[Mm]ux server (?:connection lost|disconnected|is unavailable|unavailable)"
+                        .to_string(),
+                ),
+                description: "WezTerm mux server connection lost".to_string(),
+                remediation: Some("Check WezTerm mux server status".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Pane exited
+            RuleDef {
+                id: "wezterm.pane.exited".to_string(),
+                zone: None,
+                agent_type: AgentType::Wezterm,
+                event_type: "pane.exited".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "pane exited".to_string(),
+                    "shell exited".to_string(),
+                    "process exited".to_string(),
+                    // The mux's own exit notice (localpane.rs): "⚠️  Process
+                    // zsh didn't exit cleanly" then "Exited with code 1.", or
+                    // "👍 Process zsh completed.".
+                    "didn't exit cleanly".to_string(),
+                    "👍 Process ".to_string(),
+                ],
+                regex: Some(
+                    r"(?:(?:exit(?:ed)?|status)[:\s]+|Exited with code )(?P<exit_code>\d+)|👍 Process (?P<command>.+?) completed\.".to_string(),
+                ),
+                description: "WezTerm pane process exited".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+        ],
+    )
+}
+
+/// Read the default state of the agent-sharded pattern index moonshot
+/// (`FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX`, round5 EV2). Default-OFF; any of
+/// `1` / `true` / `on` / `yes` (case-insensitive, trimmed) enables it. Read
+/// once per engine construction.
+fn agent_sharded_index_enabled_from_env() -> bool {
+    // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build).
+    if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
+        return true;
+    }
+    std::env::var("FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX")
+        .ok()
+        .map(|raw| {
+            let v = raw.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Pattern engine for detecting agent state transitions
+pub struct PatternEngine {
+    /// Merged rule library
+    library: PatternLibrary,
+    /// Lazily-initialized compiled index (first-use compilation)
+    index: OnceLock<EngineIndex>,
+    /// Enable quick-reject optimization
+    quick_reject_enabled: bool,
+    /// Operational telemetry counters (atomic for concurrent access)
+    telemetry: PatternTelemetry,
+    /// `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX` (default-OFF, round5 EV2):
+    /// when on, known-agent panes scan a per-agent anchor shard instead of the
+    /// global automaton. Read once at construction; the `#[doc(hidden)]`
+    /// `set_agent_sharded_index_enabled` seam overrides it for benches/tests.
+    agent_sharded_index: bool,
+    /// Per-agent shards, lazily built on first known-agent detect when the gate
+    /// is on. Empty/untouched when the gate is off (zero default-path cost).
+    agent_shards: OnceLock<AgentShardedIndex>,
+}
+
+impl Default for PatternEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PatternEngine {
+    /// Create a new pattern engine with default packs (lazy-compiled on first use).
+    #[must_use]
+    pub fn new() -> Self {
+        // Intentional fail-fast: bundled packs are repo-owned defaults, so invalid builtins must abort startup instead of silently degrading detection.
+        let library =
+            PatternLibrary::new(builtin_packs()).expect("builtin pattern packs must be valid");
+        Self {
+            library,
+            index: OnceLock::new(),
+            // `new()` has zero production callers (production builds via
+            // `from_config_with_root`, whose default is OFF per ft-ui1xn round-9 —
+            // the prefilter is net-negative on realistic capture deltas). It is kept
+            // ON here only so the in-crate prefilter-algorithm tests that call
+            // `quick_reject(..)` directly continue to exercise the Bloom path.
+            quick_reject_enabled: true,
+            telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
+        }
+    }
+
+    /// Create a new pattern engine from explicit packs
+    pub fn with_packs(packs: Vec<PatternPack>) -> Result<Self> {
+        Self::with_packs_and_settings(packs, true)
+    }
+
+    /// Create a new pattern engine using a PatternsConfig.
+    pub fn from_config(config: &PatternsConfig) -> Result<Self> {
+        Self::from_config_with_root(config, None)
+    }
+
+    /// Create a new pattern engine using a PatternsConfig and optional root for file packs.
+    pub fn from_config_with_root(config: &PatternsConfig, root: Option<&Path>) -> Result<Self> {
+        let loaded = load_packs_from_config(config, root)?;
+        let packs = apply_pack_overrides(loaded.packs, &config.pack_overrides)?;
+        let library = PatternLibrary::new_with_user_packs(packs, &loaded.user_pack_names)?;
+        Ok(Self {
+            library,
+            index: OnceLock::new(),
+            quick_reject_enabled: config.quick_reject_enabled,
+            telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
+        })
+    }
+
+    fn with_packs_and_settings(
+        packs: Vec<PatternPack>,
+        quick_reject_enabled: bool,
+    ) -> Result<Self> {
+        let library = PatternLibrary::new(packs)?;
+        let index = build_engine_index_for_library(&library)?;
+        let engine = Self {
+            library,
+            index: OnceLock::new(),
+            quick_reject_enabled,
+            telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
+        };
+        engine
+            .index
+            // Intentional fail-fast: this OnceLock was just created locally, so a second initialization would indicate an internal logic regression.
+            .set(index)
+            .expect("pattern engine index should be uninitialized");
+        Ok(engine)
+    }
+
+    /// Check if the engine has been compiled yet.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.index.get().is_some()
+    }
+
+    fn index(&self) -> &EngineIndex {
+        self.index.get_or_init(|| {
+            tracing::debug!("Compiling pattern engine (first use)");
+            // Intentional fail-fast: if validated built-in rules cannot compile at runtime, the shipped matcher set is corrupted and continuing would hide missing detections.
+            build_engine_index_for_library(&self.library)
+                .expect("pattern engine must compile for builtin packs")
+        })
+    }
+
+    /// Whether the agent-sharded pattern index (round5 EV2,
+    /// `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX`) is active for this engine.
+    /// `#[doc(hidden)]` introspector for benches / A-B drivers.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn agent_sharded_index_enabled(&self) -> bool {
+        self.agent_sharded_index
+    }
+
+    /// Force the agent-sharded pattern index on/off, bypassing the env gate.
+    /// `#[doc(hidden)]` test/bench seam (round5 EV2): the production default
+    /// stays env-gated default-OFF. Resets the lazily-built shard cache so a
+    /// subsequent first-use rebuild reflects the new setting.
+    #[doc(hidden)]
+    pub fn set_agent_sharded_index_enabled(&mut self, enabled: bool) {
+        self.agent_sharded_index = enabled;
+        self.agent_shards = OnceLock::new();
+    }
+
+    /// Force the Bloom quick-reject prefilter on/off, bypassing config.
+    /// `#[doc(hidden)]` bench / A-B seam (ft-p4vzl B5 candidate): lets a bench
+    /// compare the default-ON prefilter against Aho-Corasick-direct
+    /// (`quick_reject` disabled) on an *identical* pack set. Disabling is
+    /// byte-equivalent for `detect()` output — a Bloom filter has no false
+    /// negatives, so `quick_reject` never rejects a text the exact anchor
+    /// matcher would match; it only short-circuits guaranteed non-matches.
+    /// The production default stays ON via `new()` / `config`.
+    #[doc(hidden)]
+    pub fn set_quick_reject_enabled(&mut self, enabled: bool) {
+        self.quick_reject_enabled = enabled;
+    }
+
+    /// Per-agent anchor shards, lazily built on first use when the gate is on.
+    /// Returns `None` (so callers use the global automaton) when the gate is
+    /// off — the default — which keeps shard construction off the default path.
+    fn agent_shards(&self) -> Option<&AgentShardedIndex> {
+        if !self.agent_sharded_index {
+            return None;
+        }
+        Some(
+            self.agent_shards
+                .get_or_init(|| AgentShardedIndex::build(self.index())),
+        )
+    }
+
+    /// Detect patterns in text
+    #[must_use]
+    pub fn detect(&self, text: &str) -> Vec<Detection> {
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
+
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        let index = self.index();
+
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        {
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
+            return Vec::new();
+        }
+
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, text) {
+            return Vec::new();
+        }
+
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            return Vec::new();
+        };
+
+        // No cross-segment tail on the context-free entry point, so there is
+        // no overlap window to prefer an anchor outside of.
+        let (mut indices, matched_anchor_by_rule) =
+            Self::collect_candidate_rules(index, text, matcher, 0);
+
+        #[cfg(test)]
+        {
+            let match_count = matcher.find_overlapping_iter(text).count();
+            eprintln!("detect: Aho-Corasick found {match_count} matches in text");
+        }
+
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        indices.sort_unstable();
+
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
+
+        let mut detections = Vec::new();
+        for idx in indices {
+            let compiled = &index.compiled_rules[idx];
+            let rule = &compiled.def;
+            // A context-free read has no semantic annotation. Do not silently
+            // turn a scoped rule into an ordinary text match.
+            if rule.zone.is_some() {
+                continue;
+            }
+            let (fallback_anchor, fallback_span) = matched_anchor_by_rule[idx]
+                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
+                .unwrap_or(("", (0, 0)));
+
+            if let Some(regex) = compiled.regex.as_ref() {
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
+                for capture_result in regex.captures_iter(text) {
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
+                    };
+
+                    let extracted = Self::extract_captures(compiled, &captures);
+
+                    let (matched_text, span) = captures.get(0).map_or_else(
+                        || (fallback_anchor.to_string(), fallback_span),
+                        |m| (m.as_str().to_string(), (m.start(), m.end())),
+                    );
+
+                    detections.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.95,
+                        extracted: serde_json::Value::Object(extracted),
+                        matched_text,
+                        span,
+                    });
+                }
+            } else {
+                detections.push(Detection {
+                    rule_id: rule.id.clone(),
+                    agent_type: rule.agent_type,
+                    event_type: rule.event_type.clone(),
+                    severity: rule.severity,
+                    confidence: 0.6,
+                    extracted: serde_json::Value::Object(serde_json::Map::new()),
+                    matched_text: fallback_anchor.to_string(),
+                    span: fallback_span,
+                });
+            }
+        }
+
+        saturating_atomic_add(
+            &self.telemetry.matches_total,
+            u64::try_from(detections.len()).unwrap_or(u64::MAX),
+        );
+        self.telemetry.record_rule_hits(&detections);
+
+        detections
+    }
+
+    /// Detect patterns in text with agent filtering and deduplication.
+    ///
+    /// This method filters detections based on the context's agent type:
+    /// - Agent-specific rules only fire if the pane is inferred to be that agent
+    /// - WezTerm rules fire for all agent types (they're infrastructure)
+    /// - Unknown agent type allows all rules (conservative fallback)
+    ///
+    /// Detections are also deduplicated based on rule_id + extracted values.
+    ///
+    /// # Cross-Segment Matching
+    ///
+    /// This method automatically handles cross-segment matching by buffering
+    /// the tail of the text in `context.tail_buffer`. The next call will
+    /// prepend this buffer to the input text to catch patterns split across segments.
+    /// Detections that fall entirely within the overlap region are filtered out.
+    #[must_use]
+    pub fn detect_with_context(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+    ) -> Vec<Detection> {
+        self.detect_with_context_in_zone(text, context, None)
+    }
+
+    /// Detect with an optional semantic annotation for the complete segment.
+    /// Unknown or mixed annotations suppress scoped rules. Consecutive calls
+    /// with the same known zone may share a bounded suffix; callers must use
+    /// [`DetectionContext::clear_zone_continuity`] when that continuity is not
+    /// known. Unscoped rules retain their ordinary cross-segment buffer.
+    #[must_use]
+    pub fn detect_with_context_in_zone(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        zone: Option<DetectionZone>,
+    ) -> Vec<Detection> {
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
+
+        if text.is_empty() {
+            // Even an empty unknown/boundary observation ends authority for
+            // the next scoped prefix without disturbing unscoped matching.
+            if zone.is_none() || zone != context.zone_tail_kind {
+                context.clear_zone_continuity();
+            }
+            return Vec::new();
+        }
+
+        // Combine with tail buffer for cross-segment matching
+        let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
+            (std::borrow::Cow::Borrowed(text), 0)
+        } else {
+            let mut s = String::with_capacity(context.tail_buffer.len() + text.len());
+            s.push_str(&context.tail_buffer);
+            s.push_str(text);
+            (std::borrow::Cow::Owned(s), context.tail_buffer.len())
+        };
+
+        let zone_start = context.advance_zone_tail(&input_text, overlap_len, zone);
+
+        // Update tail buffer for next time
+        // We keep the last N chars
+        let full_len = input_text.len();
+        if full_len > DetectionContext::MAX_TAIL_SIZE {
+            let start = Self::bounded_tail_start(&input_text, DetectionContext::MAX_TAIL_SIZE);
+            context.tail_buffer = input_text[start..].to_string();
+        } else {
+            context.tail_buffer = input_text.to_string();
+        }
+
+        let index = self.index();
+
+        if self.quick_reject_enabled
+            && !Self::quick_reject_with_index(index, &input_text, &self.telemetry)
+        {
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
+            return Vec::new();
+        }
+
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, input_text.as_ref()) {
+            return Vec::new();
+        }
+
+        // EV2 (FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX, default-OFF): a
+        // known-agent pane scans only its per-agent anchor shard; Unknown (and
+        // the default-off path) fall back to the global automaton. The shard
+        // maps back to global anchor/rule indices, so the downstream agent
+        // filter, sort, regex evaluation, spans and dedup are unchanged.
+        let agent_shard = context
+            .agent_type
+            .filter(|agent| *agent != AgentType::Unknown)
+            .and_then(|agent| {
+                self.agent_shards()
+                    .and_then(|shards| shards.shard_for(agent))
+            });
+
+        let (mut indices, matched_anchor_by_rule) = if let Some(shard) = agent_shard {
+            Self::collect_candidate_rules_sharded(index, &input_text, shard, overlap_len)
+        } else {
+            let Some(matcher) = index.anchor_matcher.as_ref() else {
+                return Vec::new();
+            };
+            Self::collect_candidate_rules(index, &input_text, matcher, overlap_len)
+        };
+
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        indices.sort_unstable();
+
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
+
+        // Only opted-in packs pay for the second anchor pass. It isolates
+        // both anchors and regex lookarounds from an unknown/other-zone tail.
+        let scoped_anchors = if index.has_scoped_rules && zone.is_some() && zone_start > 0 {
+            index.anchor_matcher.as_ref().map(|matcher| {
+                Self::collect_candidate_rules(
+                    index,
+                    &input_text[zone_start..],
+                    matcher,
+                    overlap_len.saturating_sub(zone_start),
+                )
+                .1
+            })
+        } else {
+            None
+        };
+
+        let mut result = Vec::new();
+        let mut emitted_matches = 0u64;
+        for idx in indices {
+            let compiled = &index.compiled_rules[idx];
+            let rule = &compiled.def;
+            if rule.zone.is_some() && rule.zone != zone {
+                continue;
+            }
+            let scan_start = if rule.zone.is_some() { zone_start } else { 0 };
+            let anchors = if rule.zone.is_some() {
+                scoped_anchors.as_ref().unwrap_or(&matched_anchor_by_rule)
+            } else {
+                &matched_anchor_by_rule
+            };
+            let Some((anchor_idx, anchor_span)) = anchors[idx] else {
+                continue;
+            };
+            let fallback_anchor = index.anchor_list[anchor_idx].as_str();
+            let fallback_span = (anchor_span.0 + scan_start, anchor_span.1 + scan_start);
+
+            if let Some(expected_agent) = context.agent_type {
+                if !Self::rule_agent_type_applies(rule.agent_type, expected_agent) {
+                    continue;
+                }
+            }
+
+            if let Some(regex) = compiled.regex.as_ref() {
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
+
+                for capture_result in regex.captures_iter(&input_text[scan_start..]) {
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
+                    };
+
+                    let span = captures.get(0).map_or(fallback_span, |m| {
+                        (m.start() + scan_start, m.end() + scan_start)
+                    });
+                    if overlap_len > 0 && span.1 <= overlap_len {
+                        continue;
+                    }
+
+                    // A new completed failure is an occurrence, even when
+                    // its summary matches a previous attempt. The overlap
+                    // gate still suppresses text retained from earlier deltas;
+                    // the five-minute status TTL must not hide retry loops.
+                    if is_command_failure_event(&rule.event_type, rule.severity) {
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+                        record_detect_with_context_materialization();
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
+                        continue;
+                    }
+
+                    #[cfg(all(
+                        feature = "patterns-lazy-captures",
+                        feature = "patterns-fingerprint-dedup"
+                    ))]
+                    {
+                        let dedup_fingerprint =
+                            Self::dedup_fingerprint_from_captures(&rule.id, compiled, &captures);
+                        if context.is_seen_fingerprint(dedup_fingerprint) {
+                            continue;
+                        }
+
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+
+                        record_detect_with_context_materialization();
+                        context.mark_seen_fingerprint(dedup_fingerprint);
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
+                    }
+
+                    #[cfg(all(
+                        feature = "patterns-lazy-captures",
+                        not(feature = "patterns-fingerprint-dedup")
+                    ))]
+                    {
+                        let dedup_key =
+                            Self::dedup_key_from_captures(&rule.id, compiled, &captures);
+                        if context.is_seen_key(&dedup_key) {
+                            continue;
+                        }
+
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+
+                        record_detect_with_context_materialization();
+                        context.mark_seen_key(dedup_key);
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
+                    }
+
+                    #[cfg(not(feature = "patterns-lazy-captures"))]
+                    {
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+                        let detection = Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        };
+
+                        record_detect_with_context_materialization();
+                        #[cfg(feature = "patterns-fingerprint-dedup")]
+                        {
+                            let dedup_fingerprint = detection.dedup_fingerprint();
+                            if context.is_seen_fingerprint(dedup_fingerprint) {
+                                continue;
+                            }
+
+                            context.mark_seen_fingerprint(dedup_fingerprint);
+                            result.push(detection);
+                            emitted_matches += 1;
+                        }
+                        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+                        {
+                            let dedup_key = detection.dedup_key();
+                            if context.is_seen_key(&dedup_key) {
+                                continue;
+                            }
+
+                            context.mark_seen_key(dedup_key);
+                            result.push(detection);
+                            emitted_matches += 1;
+                        }
+                    }
+                }
+            } else {
+                if overlap_len > 0 && fallback_span.1 <= overlap_len {
+                    continue;
+                }
+
+                if is_command_failure_event(&rule.event_type, rule.severity) {
+                    record_detect_with_context_materialization();
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
+                    continue;
+                }
+
+                #[cfg(feature = "patterns-fingerprint-dedup")]
+                {
+                    let dedup_fingerprint = dedup_fingerprint_from_parts(&rule.id, Vec::new());
+                    if context.is_seen_fingerprint(dedup_fingerprint) {
+                        continue;
+                    }
+
+                    record_detect_with_context_materialization();
+                    context.mark_seen_fingerprint(dedup_fingerprint);
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
+                }
+                #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+                {
+                    let dedup_key = build_dedup_key(&rule.id, Vec::new());
+                    if context.is_seen_key(&dedup_key) {
+                        continue;
+                    }
+
+                    record_detect_with_context_materialization();
+                    context.mark_seen_key(dedup_key);
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
+                }
+            }
+        }
+
+        saturating_atomic_add(&self.telemetry.matches_total, emitted_matches);
+        self.telemetry.record_rule_hits(&result);
+
+        result
+    }
+
+    /// Detect patterns in text with context filtering/deduplication, and optionally
+    /// generate bounded + redacted explain-match traces.
+    ///
+    /// This method is intentionally separate from `detect_with_context` so that the
+    /// hot path is not penalized when tracing is not needed.
+    #[must_use]
+    pub fn detect_with_context_and_trace(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        self.detect_with_context_and_trace_in_zone(text, context, opts, None)
+    }
+
+    /// Trace the same zone-filtered scan as [`Self::detect_with_context_in_zone`].
+    /// The caller owns zone continuity; call `clear_zone_continuity` before a
+    /// new semantic region even when it has the same zone type.
+    #[must_use]
+    pub fn detect_with_context_and_trace_in_zone(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+        zone: Option<DetectionZone>,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
+
+        if text.is_empty() {
+            if zone.is_none() || context.zone_tail_kind != zone {
+                context.clear_zone_continuity();
+            }
+            return (Vec::new(), Vec::new());
+        }
+
+        // Combine with tail buffer for cross-segment matching (same semantics as detect_with_context).
+        let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
+            (std::borrow::Cow::Borrowed(text), 0)
+        } else {
+            let mut s = String::with_capacity(context.tail_buffer.len() + text.len());
+            s.push_str(&context.tail_buffer);
+            s.push_str(text);
+            (std::borrow::Cow::Owned(s), context.tail_buffer.len())
+        };
+
+        let zone_start = context.advance_zone_tail(&input_text, overlap_len, zone);
+
+        // Update tail buffer for next time; keep last N chars.
+        let full_len = input_text.len();
+        if full_len > DetectionContext::MAX_TAIL_SIZE {
+            let start = Self::bounded_tail_start(&input_text, DetectionContext::MAX_TAIL_SIZE);
+            context.tail_buffer = input_text[start..].to_string();
+        } else {
+            context.tail_buffer = input_text.to_string();
+        }
+
+        self.detect_with_context_and_trace_inner(
+            &input_text,
+            overlap_len,
+            context,
+            opts,
+            zone,
+            zone_start,
+        )
+    }
+
+    fn detect_with_context_and_trace_inner(
+        &self,
+        text: &str,
+        overlap_len: usize,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+        zone: Option<DetectionZone>,
+        zone_start: usize,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        let index = self.index();
+
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        {
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
+            return (Vec::new(), Vec::new());
+        }
+
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, text) {
+            return (Vec::new(), Vec::new());
+        }
+
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let redactor = Redactor::new();
+
+        let (mut indices, matched_anchors_by_rule) =
+            Self::collect_candidate_rules_with_all_anchors(index, text, matcher);
+
+        if indices.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        indices.sort_unstable();
+
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
+
+        let scoped_anchors = if index.has_scoped_rules && zone.is_some() && zone_start > 0 {
+            Some(
+                Self::collect_candidate_rules_with_all_anchors(index, &text[zone_start..], matcher)
+                    .1,
+            )
+        } else {
+            None
+        };
+
+        let mut detections: Vec<Detection> = Vec::new();
+        let mut traces: Vec<MatchTrace> = Vec::new();
+
+        for idx in indices {
+            let compiled = &index.compiled_rules[idx];
+            let rule = &compiled.def;
+
+            let pack_id = compiled.pack_id.as_ref();
+            if rule.zone.is_some() && rule.zone != zone {
+                if opts.include_non_matches {
+                    let mut gates = Self::trace_gates_skeleton();
+                    gates[3].passed = false;
+                    gates[3].reason = Some("zone_constraint_not_satisfied".to_string());
+                    gates.push(TraceGate {
+                        gate: "zone".to_string(),
+                        passed: false,
+                        reason: Some(
+                            "semantic zone is missing or does not match rule constraint"
+                                .to_string(),
+                        ),
+                    });
+                    traces.push(Self::build_match_trace_no_detection(
+                        text,
+                        &redactor,
+                        pack_id,
+                        rule.id.clone(),
+                        None,
+                        false,
+                        gates,
+                        None,
+                        opts,
+                    ));
+                }
+                continue;
+            }
+            let scan_start = if rule.zone.is_some() { zone_start } else { 0 };
+            let anchors_by_rule = if rule.zone.is_some() {
+                scoped_anchors.as_ref().unwrap_or(&matched_anchors_by_rule)
+            } else {
+                &matched_anchors_by_rule
+            };
+            let Some(anchors) = anchors_by_rule.get(idx) else {
+                continue;
+            };
+            if anchors.is_empty() {
+                continue;
+            }
+            let (fallback_anchor, fallback_span) = anchors
+                .first()
+                .map(|(anchor_idx, span)| {
+                    (
+                        index.anchor_list[anchor_idx].as_str(),
+                        (span.0 + scan_start, span.1 + scan_start),
+                    )
+                })
+                .unwrap_or(("", (0, 0)));
+
+            let anchor_evidence =
+                Self::trace_anchor_evidence(text, &redactor, fallback_anchor, fallback_span, opts);
+
+            if let Some(regex) = compiled.regex.as_ref() {
+                let mut any_capture = false;
+
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
+
+                for capture_result in regex.captures_iter(&text[scan_start..]) {
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
+                    };
+                    any_capture = true;
+
+                    let extracted = Self::extract_captures(compiled, &captures);
+
+                    let (raw_matched_text, span) = captures.get(0).map_or_else(
+                        || (fallback_anchor.to_string(), fallback_span),
+                        |m| {
+                            (
+                                m.as_str().to_string(),
+                                (m.start() + scan_start, m.end() + scan_start),
+                            )
+                        },
+                    );
+
+                    let detection = Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.95,
+                        extracted: serde_json::Value::Object(extracted),
+                        matched_text: raw_matched_text.clone(),
+                        span,
+                    };
+
+                    let (eligible, mut gates) =
+                        Self::evaluate_trace_gates(&detection, overlap_len, context);
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
+
+                    if eligible {
+                        if !is_command_failure_event(&detection.event_type, detection.severity) {
+                            context.mark_seen(&detection);
+                        }
+                        detections.push(detection.clone());
+                    }
+
+                    if eligible || opts.include_non_matches {
+                        let trace = Self::build_match_trace(
+                            text,
+                            &redactor,
+                            pack_id,
+                            Some("regex".to_string()),
+                            &detection,
+                            eligible,
+                            gates,
+                            anchor_evidence.as_ref(),
+                            Some((&captures, regex, scan_start)),
+                            opts,
+                        );
+                        traces.push(trace);
+                    }
+                }
+
+                if !any_capture && opts.include_non_matches {
+                    // Anchor hit, but regex didn't produce a match.
+                    let mut gates = Self::trace_gates_skeleton();
+
+                    // Agent-type gate can still be evaluated.
+                    let agent_passed = context.agent_type.is_none_or(|expected_agent| {
+                        expected_agent == AgentType::Unknown
+                            || rule.agent_type == AgentType::Wezterm
+                            || rule.agent_type == expected_agent
+                    });
+                    gates[0].passed = agent_passed;
+                    if !agent_passed {
+                        gates[0].reason =
+                            Some("rule agent_type does not match inferred pane agent".to_string());
+                    }
+
+                    gates[3].passed = false;
+                    gates[3].reason = Some("regex_no_match".to_string());
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
+
+                    let eligible = false;
+
+                    let trace = Self::build_match_trace_no_detection(
+                        text,
+                        &redactor,
+                        pack_id,
+                        rule.id.clone(),
+                        Some("regex".to_string()),
+                        eligible,
+                        gates,
+                        anchor_evidence.as_ref(),
+                        opts,
+                    );
+                    traces.push(trace);
+                }
+            } else {
+                // Anchor-only rule: ALL anchor hits imply matches.
+                for (anchor_idx, span) in anchors.iter() {
+                    let anchor_text = &index.anchor_list[*anchor_idx];
+                    let span = (span.0 + scan_start, span.1 + scan_start);
+                    let detection = Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: anchor_text.clone(),
+                        span,
+                    };
+
+                    let (eligible, mut gates) =
+                        Self::evaluate_trace_gates(&detection, overlap_len, context);
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
+
+                    if eligible {
+                        if !is_command_failure_event(&detection.event_type, detection.severity) {
+                            context.mark_seen(&detection);
+                        }
+                        detections.push(detection.clone());
+                    }
+
+                    if eligible || opts.include_non_matches {
+                        // For anchor-only rules, we trace each anchor occurrence.
+                        // Re-generate evidence for this specific anchor occurrence.
+                        let specific_evidence =
+                            Self::trace_anchor_evidence(text, &redactor, anchor_text, span, opts);
+
+                        let trace = Self::build_match_trace(
+                            text,
+                            &redactor,
+                            pack_id,
+                            Some("anchor".to_string()),
+                            &detection,
+                            eligible,
+                            gates,
+                            specific_evidence.as_ref(),
+                            None,
+                            opts,
+                        );
+                        traces.push(trace);
+                    }
+
+                    // The fast path retains one fresh anchor occurrence per
+                    // rule per delta. Keep trace emission equivalent for
+                    // occurrence-based user rules without a regex.
+                    if eligible
+                        && is_command_failure_event(&detection.event_type, detection.severity)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        saturating_atomic_add(
+            &self.telemetry.matches_total,
+            u64::try_from(detections.len()).unwrap_or(u64::MAX),
+        );
+        self.telemetry.record_rule_hits(&detections);
+
+        (detections, traces)
+    }
+
+    /// Record whether `candidate` should replace the anchor occurrence already
+    /// stored for a rule.
+    ///
+    /// Only one occurrence per rule is retained, and for an anchor-only rule
+    /// (`regex: None`) that single span is what the caller tests against the
+    /// cross-segment overlap window. Keeping the *first* occurrence
+    /// unconditionally meant a rule whose earliest hit lands in the
+    /// carried-over tail was skipped outright — including a genuinely new
+    /// occurrence later in the same input. A rate limit that fires, ages past
+    /// the dedup TTL, and then fires again produced **zero** detections the
+    /// second time.
+    ///
+    /// So an occurrence that ends inside the overlap yields to one that does
+    /// not. Regex-bearing rules were never affected (they iterate every match
+    /// and filter per match), and the trace entry point already walked all
+    /// anchors — this brings the plain entry point in line with both.
+    ///
+    /// With `overlap_len == 0` no stored span can satisfy `prev_end <= 0`, so
+    /// the first-wins behavior is preserved exactly for non-overlap callers.
+    fn anchor_supersedes_recorded(
+        recorded: Option<AnchorMatchRef>,
+        candidate_end: usize,
+        overlap_len: usize,
+    ) -> bool {
+        match recorded {
+            None => true,
+            Some((_, (_, prev_end))) => prev_end <= overlap_len && candidate_end > overlap_len,
+        }
+    }
+
+    fn collect_candidate_rules(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+        overlap_len: usize,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        // Use find_overlapping_iter to detect all anchors, including ones that overlap
+        // (e.g., "limit reached" and "Usage limit reached for all Pro models")
+        for matched in matcher.find_overlapping_iter(text) {
+            #[cfg(test)]
+            {
+                let pattern = matched.pattern().as_usize();
+                let span = matched.span();
+                eprintln!("detect: matched pattern {pattern} at {span:?}");
+            }
+
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = Self::anchor_rule_indices(index, anchor_idx) else {
+                #[cfg(test)]
+                {
+                    eprintln!("detect: pattern {anchor_idx} not found in anchor dispatch");
+                }
+                continue;
+            };
+
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                let recorded = matched_anchor_by_rule[idx];
+                if !Self::anchor_supersedes_recorded(recorded, matched.end(), overlap_len) {
+                    continue;
+                }
+                if recorded.is_none() {
+                    candidate_rules.push(idx);
+                }
+                matched_anchor_by_rule[idx] = Some(anchor_match);
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    /// Candidate collection over a per-agent [`AgentShard`] (round5 EV2).
+    ///
+    /// Identical to [`collect_candidate_rules`] except the matcher scans only
+    /// the agent's anchor subset; each shard pattern id is mapped back to its
+    /// global anchor index so `anchor_rule_indices` and the returned global
+    /// rule / anchor indices match the global path verbatim. The caller's
+    /// `rule_agent_type_applies` filter still drops shared-anchor other-agent
+    /// rules, so the final detection stream is byte-identical to the global
+    /// automaton for the same agent.
+    fn collect_candidate_rules_sharded(
+        index: &EngineIndex,
+        text: &str,
+        shard: &AgentShard,
+        overlap_len: usize,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        for matched in shard.matcher.find_overlapping_iter(text) {
+            let global_anchor_idx = shard.pattern_to_global_anchor[matched.pattern().as_usize()];
+            let Some(rule_indices) = Self::anchor_rule_indices(index, global_anchor_idx) else {
+                continue;
+            };
+
+            let anchor_match = (global_anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                let recorded = matched_anchor_by_rule[idx];
+                if !Self::anchor_supersedes_recorded(recorded, matched.end(), overlap_len) {
+                    continue;
+                }
+                if recorded.is_none() {
+                    candidate_rules.push(idx);
+                }
+                matched_anchor_by_rule[idx] = Some(anchor_match);
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    fn collect_candidate_rules_with_all_anchors(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+    ) -> (Vec<usize>, Vec<AnchorMatchBucket>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchors_by_rule =
+            vec![AnchorMatchBucket::default(); index.compiled_rules.len()];
+
+        for matched in matcher.find_overlapping_iter(text) {
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = Self::anchor_rule_indices(index, anchor_idx) else {
+                continue;
+            };
+
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                let bucket = &mut matched_anchors_by_rule[idx];
+                if bucket.is_empty() {
+                    candidate_rules.push(idx);
+                }
+                bucket.push(anchor_match);
+            }
+        }
+
+        (candidate_rules, matched_anchors_by_rule)
+    }
+
+    fn anchor_rule_indices(index: &EngineIndex, anchor_idx: usize) -> Option<&[usize]> {
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        {
+            let anchor = index.anchor_list.get(anchor_idx)?;
+            return index.anchor_dispatch.rule_indices(anchor);
+        }
+
+        #[cfg(not(feature = "patterns-mphf-dispatch"))]
+        {
+            index.anchor_rule_buckets.get(anchor_idx).map(Vec::as_slice)
+        }
+    }
+
+    #[cfg(feature = "teddy-prefilter")]
+    fn teddy_prefilter_may_match(index: &EngineIndex, text: &str) -> bool {
+        index
+            .teddy_prefilter
+            .as_ref()
+            .is_none_or(|searcher| searcher.find(text.as_bytes()).is_some())
+    }
+
+    fn extract_captures(
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_, str>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut extracted = serde_json::Map::new();
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                extracted.insert(
+                    name.clone(),
+                    serde_json::Value::String(value.as_str().to_string()),
+                );
+            }
+        }
+        extracted
+    }
+
+    #[cfg(all(
+        feature = "patterns-lazy-captures",
+        not(feature = "patterns-fingerprint-dedup")
+    ))]
+    fn dedup_key_from_captures(
+        rule_id: &str,
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_, str>,
+    ) -> String {
+        let mut parts = Vec::with_capacity(compiled.capture_names.len());
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                // dedup_key_part keeps this byte-identical with
+                // Detection::dedup_key — both feed the same seen_keys store.
+                parts.push(dedup_key_part(name, value.as_str()));
+            }
+        }
+        build_dedup_key(rule_id, parts)
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn dedup_fingerprint_from_captures(
+        rule_id: &str,
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_, str>,
+    ) -> u128 {
+        let mut parts = Vec::with_capacity(compiled.capture_names.len());
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                parts.push(DedupFingerprintPart {
+                    name: name.as_str(),
+                    value: DedupFingerprintValue::String(value.as_str()),
+                });
+            }
+        }
+        dedup_fingerprint_from_parts(rule_id, parts)
+    }
+
+    fn trace_gates_skeleton() -> Vec<TraceGate> {
+        vec![
+            TraceGate {
+                gate: "agent_type".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "overlap".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "dedupe".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "match".to_string(),
+                passed: true,
+                reason: None,
+            },
+        ]
+    }
+
+    fn evaluate_trace_gates(
+        detection: &Detection,
+        overlap_len: usize,
+        context: &DetectionContext,
+    ) -> (bool, Vec<TraceGate>) {
+        let mut gates = Self::trace_gates_skeleton();
+
+        // agent_type gate
+        if let Some(expected_agent) = context.agent_type {
+            let applies = Self::rule_applies_to_agent(detection, expected_agent);
+            gates[0].passed = applies;
+            if !applies {
+                gates[0].reason =
+                    Some("rule agent_type does not match inferred pane agent".to_string());
+            }
+        }
+
+        // overlap gate
+        if overlap_len > 0 && detection.span.1 <= overlap_len {
+            gates[1].passed = false;
+            gates[1].reason = Some("match within overlap window".to_string());
+        }
+
+        // Repeated command failures are distinct occurrences; only the
+        // overlap gate suppresses an already consumed occurrence.
+        if !is_command_failure_event(&detection.event_type, detection.severity)
+            && context.is_seen(detection)
+        {
+            gates[2].passed = false;
+            gates[2].reason = Some("already seen within TTL".to_string());
+        }
+
+        // match gate is always true for a constructed Detection.
+        gates[3].passed = true;
+
+        let eligible = gates.iter().all(|g| g.passed);
+        (eligible, gates)
+    }
+
+    fn trace_anchor_evidence(
+        text: &str,
+        redactor: &Redactor,
+        anchor: &str,
+        span: (usize, usize),
+        opts: &TraceOptions,
+    ) -> Option<TraceEvidence> {
+        if anchor.is_empty() && span == (0, 0) {
+            return None;
+        }
+
+        let excerpt_raw = Self::slice_bytes(text, span.0, span.1).unwrap_or(anchor);
+        let excerpt_redacted = redactor.redact(excerpt_raw);
+        let (excerpt, truncated) = Self::bound_utf8(&excerpt_redacted, opts.max_excerpt_bytes);
+
+        Some(TraceEvidence {
+            kind: "anchor".to_string(),
+            label: if anchor.is_empty() {
+                None
+            } else {
+                Some(anchor.to_string())
+            },
+            span: Some(TraceSpan {
+                start: span.0,
+                end: span.1,
+            }),
+            excerpt: Some(excerpt),
+            truncated,
+        })
+    }
+
+    // Match traces intentionally keep pattern, span, policy, and redaction inputs explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn build_match_trace(
+        text: &str,
+        redactor: &Redactor,
+        pack_id: &str,
+        extractor_id: Option<String>,
+        detection: &Detection,
+        eligible: bool,
+        mut gates: Vec<TraceGate>,
+        anchor_evidence: Option<&TraceEvidence>,
+        regex_context: Option<(&fancy_regex::Captures<'_, str>, &Regex, usize)>,
+        opts: &TraceOptions,
+    ) -> MatchTrace {
+        // Ensure gate list includes "match" in stable position.
+        // (evaluate_trace_gates always sets match=true; callers may override for non-detections.)
+        if gates.len() < 4 || gates[3].gate != "match" {
+            gates = Self::trace_gates_skeleton();
+        }
+
+        let mut truncated_fields: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        let matched_text_redacted = redactor.redact(&detection.matched_text);
+        let (matched_text_bounded, matched_text_truncated) =
+            Self::bound_utf8(&matched_text_redacted, opts.max_excerpt_bytes);
+        if matched_text_truncated {
+            truncated_fields.insert("matched_text".to_string());
+        }
+
+        let mut evidence: Vec<TraceEvidence> = Vec::new();
+        if let Some(anchor) = anchor_evidence {
+            if anchor.truncated {
+                truncated_fields.insert("excerpt".to_string());
+            }
+            evidence.push(anchor.clone());
+        }
+
+        // Match evidence (best-effort excerpt from span).
+        let match_excerpt_raw =
+            Self::slice_bytes(text, detection.span.0, detection.span.1).unwrap_or("");
+        let match_excerpt_redacted = redactor.redact(match_excerpt_raw);
+        let (match_excerpt, match_excerpt_truncated) =
+            Self::bound_utf8(&match_excerpt_redacted, opts.max_excerpt_bytes);
+        if match_excerpt_truncated {
+            truncated_fields.insert("excerpt".to_string());
+        }
+
+        evidence.push(TraceEvidence {
+            kind: "match".to_string(),
+            label: None,
+            span: Some(TraceSpan {
+                start: detection.span.0,
+                end: detection.span.1,
+            }),
+            excerpt: if match_excerpt.is_empty() {
+                None
+            } else {
+                Some(match_excerpt)
+            },
+            truncated: match_excerpt_truncated,
+        });
+
+        // Capture evidence (stable ordering by capture name).
+        if let Some((captures, regex, offset)) = regex_context {
+            let mut names: Vec<&str> = regex.capture_names().flatten().collect();
+            names.sort_unstable();
+
+            for name in names {
+                let Some(value) = captures.name(name) else {
+                    continue;
+                };
+
+                let cap_redacted = redactor.redact(value.as_str());
+                let (cap_bounded, cap_truncated) =
+                    Self::bound_utf8(&cap_redacted, opts.max_capture_bytes);
+                if cap_truncated {
+                    truncated_fields.insert(format!("capture.{name}"));
+                }
+
+                evidence.push(TraceEvidence {
+                    kind: "capture".to_string(),
+                    label: Some(name.to_string()),
+                    span: Some(TraceSpan {
+                        start: value.start() + offset,
+                        end: value.end() + offset,
+                    }),
+                    excerpt: Some(cap_bounded),
+                    truncated: cap_truncated,
+                });
+            }
+        }
+
+        let evidence_total = evidence.len();
+        let mut evidence_truncated = false;
+        if evidence.len() > opts.max_evidence_items {
+            evidence.truncate(opts.max_evidence_items);
+            evidence_truncated = true;
+            truncated_fields.insert("evidence".to_string());
+        }
+
+        let bounds = TraceBounds {
+            max_evidence_items: opts.max_evidence_items,
+            max_excerpt_bytes: opts.max_excerpt_bytes,
+            max_capture_bytes: opts.max_capture_bytes,
+            evidence_total,
+            evidence_truncated,
+            truncated_fields: truncated_fields.into_iter().collect(),
+        };
+
+        MatchTrace {
+            pack_id: pack_id.to_string(),
+            rule_id: detection.rule_id.clone(),
+            extractor_id,
+            matched_text: Some(matched_text_bounded),
+            confidence: Some(detection.confidence),
+            eligible,
+            gates,
+            evidence,
+            bounds,
+        }
+    }
+
+    // Negative match traces mirror the positive trace signature for golden parity.
+    #[allow(clippy::too_many_arguments)]
+    fn build_match_trace_no_detection(
+        _text: &str,
+        _redactor: &Redactor,
+        pack_id: &str,
+        rule_id: String,
+        extractor_id: Option<String>,
+        eligible: bool,
+        gates: Vec<TraceGate>,
+        anchor_evidence: Option<&TraceEvidence>,
+        opts: &TraceOptions,
+    ) -> MatchTrace {
+        let mut truncated_fields: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        let mut evidence: Vec<TraceEvidence> = Vec::new();
+        if let Some(anchor) = anchor_evidence {
+            if anchor.truncated {
+                truncated_fields.insert("excerpt".to_string());
+            }
+            evidence.push(anchor.clone());
+        }
+
+        let evidence_total = evidence.len();
+        let mut evidence_truncated = false;
+        if evidence.len() > opts.max_evidence_items {
+            evidence.truncate(opts.max_evidence_items);
+            evidence_truncated = true;
+            truncated_fields.insert("evidence".to_string());
+        }
+
+        let bounds = TraceBounds {
+            max_evidence_items: opts.max_evidence_items,
+            max_excerpt_bytes: opts.max_excerpt_bytes,
+            max_capture_bytes: opts.max_capture_bytes,
+            evidence_total,
+            evidence_truncated,
+            truncated_fields: truncated_fields.into_iter().collect(),
+        };
+
+        MatchTrace {
+            pack_id: pack_id.to_string(),
+            rule_id,
+            extractor_id,
+            matched_text: None,
+            confidence: None,
+            eligible,
+            gates,
+            evidence,
+            bounds,
+        }
+    }
+
+    fn slice_bytes(text: &str, start: usize, end: usize) -> Option<&str> {
+        if start > end || end > text.len() {
+            return None;
+        }
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some(&text[start..end])
+    }
+
+    fn bound_utf8(s: &str, max_bytes: usize) -> (String, bool) {
+        if s.len() <= max_bytes {
+            return (s.to_string(), false);
+        }
+        let mut end = max_bytes.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        (s[..end].to_string(), true)
+    }
+
+    /// Check if a detection's rule applies to the given agent type.
+    ///
+    /// Returns true if:
+    /// - The detection's agent type matches the expected agent
+    /// - The detection is a WezTerm rule (infrastructure rules apply to all)
+    /// - The expected agent is Unknown (conservative fallback)
+    #[must_use]
+    fn rule_applies_to_agent(detection: &Detection, expected_agent: AgentType) -> bool {
+        Self::rule_agent_type_applies(detection.agent_type, expected_agent)
+    }
+
+    #[must_use]
+    fn rule_agent_type_applies(rule_agent: AgentType, expected_agent: AgentType) -> bool {
+        // WezTerm rules are infrastructure and apply to all agent types
+        if rule_agent == AgentType::Wezterm {
+            return true;
+        }
+
+        // Unknown agent type allows all rules (conservative fallback)
+        if expected_agent == AgentType::Unknown {
+            return true;
+        }
+
+        // Otherwise, rule must match the expected agent
+        rule_agent == expected_agent
+    }
+
+    fn bounded_tail_start(text: &str, max_tail_bytes: usize) -> usize {
+        if text.len() <= max_tail_bytes {
+            return 0;
+        }
+
+        let mut start = text.len() - max_tail_bytes;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        start
+    }
+
+    /// Quick reject check - returns false if text definitely has no matches
+    #[must_use]
+    pub fn quick_reject(&self, text: &str) -> bool {
+        if !self.quick_reject_enabled {
+            return true;
+        }
+        if text.is_empty() {
+            return false;
+        }
+        let index = self.index();
+        Self::quick_reject_with_index(index, text, &self.telemetry)
+    }
+
+    fn quick_reject_with_index(
+        index: &EngineIndex,
+        text: &str,
+        telemetry: &PatternTelemetry,
+    ) -> bool {
+        if text.is_empty() || index.quick_bytes.is_empty() {
+            return false;
+        }
+
+        let bytes = text.as_bytes();
+        let text_len = text.len();
+
+        // If we have a Bloom filter, check substrings only at positions where
+        // a first-byte matched. This streams candidates rather than storing every
+        // byte hit, so a pane full of common anchor first-bytes cannot allocate
+        // O(text length) temporary positions.
+        if let Some(ref bloom) = index.bloom {
+            let mut checked_candidate = false;
+            for &byte in &index.quick_bytes {
+                let mut pos = 0;
+                while let Some(offset) = memchr(byte, &bytes[pos..]) {
+                    let start = pos + offset;
+                    pos = start + 1;
+
+                    // Ensure we start at a valid UTF-8 boundary.
+                    if !text.is_char_boundary(start) {
+                        continue;
+                    }
+                    for &anchor_len in &index.anchor_lengths {
+                        let Some(end) = start.checked_add(anchor_len) else {
+                            break;
+                        };
+                        // Skip if this substring extends past the text.
+                        if end > text_len {
+                            break;
+                        }
+                        // Ensure we end at a valid UTF-8 boundary.
+                        if !text.is_char_boundary(end) {
+                            continue;
+                        }
+                        let window = &text[start..end];
+                        checked_candidate = true;
+                        saturating_atomic_add(&telemetry.bloom_checks, 1);
+                        if bloom.check(window) {
+                            saturating_atomic_add(&telemetry.bloom_positives, 1);
+                            // Bloom says "possibly present" - need full matching.
+                            return true;
+                        }
+                    }
+                }
+            }
+            if !checked_candidate {
+                return false;
+            }
+            // Bloom filter rejected all candidate substrings - definitely no match
+            saturating_atomic_add(&telemetry.bloom_rejects, 1);
+            return false;
+        }
+
+        index
+            .quick_bytes
+            .iter()
+            .any(|&byte| memchr(byte, bytes).is_some())
+    }
+
+    /// Access the merged rule library
+    #[must_use]
+    pub fn rules(&self) -> &[RuleDef] {
+        self.library.rules()
+    }
+
+    /// Whether live capture needs a fresh semantic annotation for matching.
+    #[must_use]
+    pub fn has_zone_scoped_rules(&self) -> bool {
+        self.index().has_scoped_rules
+    }
+
+    /// Access merged submit verification profiles.
+    #[must_use]
+    pub fn submit_profiles(&self) -> &[SubmitProfile] {
+        self.library.submit_profiles()
+    }
+
+    /// Return the submit verification profile for an agent type, if one is configured.
+    #[must_use]
+    pub fn submit_profile_for_agent(&self, agent_type: AgentType) -> Option<&SubmitProfile> {
+        self.library.submit_profile_for_agent(agent_type)
+    }
+
+    /// Access the loaded pattern packs.
+    #[must_use]
+    pub fn packs(&self) -> &[PatternPack] {
+        self.library.packs()
+    }
+
+    /// Return the pack name that provides a given rule ID, if any.
+    #[must_use]
+    pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
+        self.library.pack_for_rule(rule_id)
+    }
+
+    /// The workflow a rule declares as its trigger, if any. Packs downgraded
+    /// to observe-only have this stripped, so their rules declare none.
+    #[must_use]
+    pub fn rule_workflow(&self, rule_id: &str) -> Option<&str> {
+        // merge_rules keeps one rule per id, sorted by id.
+        let rules = self.rules();
+        rules
+            .binary_search_by(|rule| rule.id.as_str().cmp(rule_id))
+            .ok()
+            .and_then(|index| rules[index].workflow.as_deref())
+    }
+
+    /// Return a canonical JSON representation of the rule definition for hashing.
+    #[must_use]
+    pub fn rule_definition_text(&self, rule_id: &str) -> Option<String> {
+        self.library
+            .rules()
+            .iter()
+            .find(|rule| rule.id == rule_id)
+            .and_then(|rule| serde_json::to_string(rule).ok())
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &PatternTelemetry {
+        &self.telemetry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PackOverride, PatternsConfig};
+    use proptest::prelude::*;
+    use serde::Deserialize;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn pattern_telemetry_atomic_add_saturates_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        saturating_atomic_add(&counter, 1);
+
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    // ── round5 EV2: agent-sharded pattern index oracle equivalence ──────
+
+    /// Assert two detection streams are byte-identical field-by-field.
+    fn assert_detections_eq(
+        oracle: &[Detection],
+        sharded: &[Detection],
+        text: &str,
+        agent: AgentType,
+    ) {
+        assert_eq!(
+            oracle.len(),
+            sharded.len(),
+            "detection COUNT differs for agent {agent:?} on input {text:?}\n  oracle={oracle:#?}\n  sharded={sharded:#?}"
+        );
+        for (o, s) in oracle.iter().zip(sharded.iter()) {
+            assert_eq!(
+                o.rule_id, s.rule_id,
+                "rule_id/order differs (agent {agent:?}, input {text:?})"
+            );
+            assert_eq!(
+                o.agent_type, s.agent_type,
+                "agent_type differs for {}",
+                o.rule_id
+            );
+            assert_eq!(
+                o.event_type, s.event_type,
+                "event_type differs for {}",
+                o.rule_id
+            );
+            assert_eq!(o.severity, s.severity, "severity differs for {}", o.rule_id);
+            assert!(
+                (o.confidence - s.confidence).abs() < f64::EPSILON,
+                "confidence differs for {}: {} vs {}",
+                o.rule_id,
+                o.confidence,
+                s.confidence
+            );
+            assert_eq!(
+                o.extracted, s.extracted,
+                "extracted captures differ for {} (input {text:?})",
+                o.rule_id
+            );
+            assert_eq!(
+                o.matched_text, s.matched_text,
+                "matched_text differs for {} (input {text:?})",
+                o.rule_id
+            );
+            assert_eq!(
+                o.span, s.span,
+                "span differs for {} (input {text:?})",
+                o.rule_id
+            );
+        }
+    }
+
+    /// Two engines built from the default packs: one with the agent-sharded
+    /// index forced OFF (the oracle = global automaton), one forced ON.
+    fn sharded_oracle_engines() -> (PatternEngine, PatternEngine) {
+        let mut oracle = PatternEngine::new();
+        oracle.set_agent_sharded_index_enabled(false);
+        let mut sharded = PatternEngine::new();
+        sharded.set_agent_sharded_index_enabled(true);
+        assert!(!oracle.agent_sharded_index_enabled());
+        assert!(sharded.agent_sharded_index_enabled());
+        (oracle, sharded)
+    }
+
+    /// Split `s` into two halves at a UTF-8 char boundary at/after the midpoint.
+    fn split_at_char_boundary(s: &str) -> (&str, &str) {
+        let mut mid = s.len() / 2;
+        while mid < s.len() && !s.is_char_boundary(mid) {
+            mid += 1;
+        }
+        s.split_at(mid)
+    }
+
+    /// Deterministic xorshift64 PRNG — reproducible, no external dep.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Exhaustive single-segment oracle test: every real builtin anchor, every
+    /// agent. The sharded path must return a byte-identical detection stream.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle() {
+        let agents = [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ];
+
+        // Harvest the real anchor corpus from the compiled global index so the
+        // test exercises every shard boundary, not a hand-picked subset.
+        let probe = PatternEngine::new();
+        let anchors: Vec<String> = probe.index().anchor_list.clone();
+        assert!(!anchors.is_empty(), "builtin packs must contribute anchors");
+
+        // Corpus: each anchor alone; anchor padded with noise; doubled anchor;
+        // cross-agent anchor pairs concatenated (the collect-then-filter case
+        // the shard must reproduce exactly); plus negatives.
+        let mut corpus: Vec<String> = Vec::new();
+        for a in &anchors {
+            corpus.push(a.clone());
+            corpus.push(format!("noise prefix {a} noise suffix"));
+            corpus.push(format!("{a} {a}"));
+        }
+        for pair in anchors.chunks(2) {
+            if let [first, second] = pair {
+                corpus.push(format!("{first} middle {second}"));
+            }
+        }
+        corpus.push("nothing matches here, just plain text 0123456789".to_string());
+        corpus.push(String::new());
+
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+
+        for text in &corpus {
+            for &agent in &agents {
+                let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+                let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+                let oracle = oracle_engine.detect_with_context(text, &mut oracle_ctx);
+                let sharded = sharded_engine.detect_with_context(text, &mut sharded_ctx);
+                assert_detections_eq(&oracle, &sharded, text, agent);
+            }
+        }
+    }
+
+    /// Cross-segment (tail-buffer) + dedup parity: feed a multi-segment
+    /// sequence through persistent contexts and compare each call's output.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle_cross_segment() {
+        let probe = PatternEngine::new();
+        let anchors: Vec<String> = probe.index().anchor_list.clone();
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+        ] {
+            let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+            let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+
+            // Split anchors across segment boundaries so the tail buffer must
+            // stitch them; then repeat the whole stream to exercise dedup.
+            let mut segments: Vec<String> = Vec::new();
+            for a in anchors.iter().take(48) {
+                if a.len() >= 2 {
+                    let (head, tail) = split_at_char_boundary(a);
+                    segments.push(format!("lead {head}"));
+                    segments.push(format!("{tail} trail"));
+                } else {
+                    segments.push(format!("x{a}x"));
+                }
+            }
+            let repeat = segments.clone();
+            segments.extend(repeat);
+
+            for seg in &segments {
+                let oracle = oracle_engine.detect_with_context(seg, &mut oracle_ctx);
+                let sharded = sharded_engine.detect_with_context(seg, &mut sharded_ctx);
+                assert_detections_eq(&oracle, &sharded, seg, agent);
+            }
+        }
+    }
+
+    /// Randomized property test: thousands of pseudo-random texts mixing real
+    /// anchors with printable-ASCII noise, every agent, single engine pair.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle_randomized() {
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+        let anchors: Vec<String> = oracle_engine.index().anchor_list.clone();
+        let agents = [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ];
+
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..3000 {
+            let agent = agents[(xorshift(&mut state) as usize) % agents.len()];
+            let token_count = (xorshift(&mut state) as usize) % 6;
+            let mut text = String::new();
+            for _ in 0..token_count {
+                let a = &anchors[(xorshift(&mut state) as usize) % anchors.len()];
+                text.push_str(a);
+                let noise_len = (xorshift(&mut state) as usize) % 12;
+                for _ in 0..noise_len {
+                    // Printable ASCII 0x20..=0x7d.
+                    let c = b' '.wrapping_add((xorshift(&mut state) as u8) % 94);
+                    text.push(c as char);
+                }
+            }
+            let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+            let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+            let oracle = oracle_engine.detect_with_context(&text, &mut oracle_ctx);
+            let sharded = sharded_engine.detect_with_context(&text, &mut sharded_ctx);
+            assert_detections_eq(&oracle, &sharded, &text, agent);
+        }
+    }
+
+    #[test]
+    fn engine_can_be_created() {
+        let engine = PatternEngine::new();
+        assert!(!engine.is_initialized());
+        let _ = engine.detect("warmup");
+        assert!(engine.is_initialized());
+    }
+
+    /// [ft-xv561] ReDoS regression.
+    ///
+    /// The classic `(a+)+b` on `aaaa...aaaaX` forces `fancy_regex` into
+    /// catastrophic-backtracking territory. Pre-fix, `Regex::new(raw)`
+    /// in build_engine_index used the default backtrack limit and would
+    /// burn double-digit milliseconds on this pattern. Post-fix,
+    /// compile_rule_regex installs the shared 10M-step backtrack cap so
+    /// the match bails with `Err(BacktrackLimitExceeded)` well inside
+    /// 100ms on any reasonable hardware.
+    #[test]
+    fn compile_rule_regex_ejects_redos_pattern_within_100ms() {
+        use std::time::{Duration, Instant};
+
+        let regex = compile_rule_regex("^(a+)+b$").expect("pattern compiles");
+        let pathological: String = "a".repeat(25) + "X";
+        let start = Instant::now();
+        // `captures_iter` returns an iterator of Result; the backtrack
+        // limit surfaces as `Err(...)` rather than a hang.
+        let outcome: Vec<_> = regex.captures_iter(pathological.as_str()).collect();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "ReDoS pattern should hit backtrack limit in <100ms, took {elapsed:?}"
+        );
+        // The match must not succeed on the pathological input; the
+        // iterator may yield zero items (no match before limit) or a
+        // trailing Err variant (limit exceeded). Either outcome
+        // proves the regex did not match.
+        let matched = outcome.iter().any(|r| r.is_ok());
+        assert!(
+            !matched,
+            "ReDoS pattern must not report a successful match on pathological input"
+        );
+    }
+
+    /// [ft-xv561] compile_rule_regex must accept legitimate patterns
+    /// that the built-in packs rely on (SGR escape shapes, codex/claude
+    /// code anchor suffixes). This guards against over-tightening the
+    /// backtrack cap and regressing real rules.
+    #[test]
+    fn compile_rule_regex_accepts_builtin_pack_patterns() {
+        // Representative shapes pulled from builtin_codex_pack and
+        // builtin_claude_code_pack. Each MUST compile and MUST match
+        // its canonical anchor line.
+        let fixtures: &[(&str, &str)] = &[
+            (
+                r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining",
+                "less than 5% of your 5h limit remaining",
+            ),
+            (
+                r"try again at (?P<reset_time>[^.]+)",
+                "try again at 9:00pm.",
+            ),
+            (
+                r"codex resume (?P<session_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                "codex resume 12345678-1234-1234-1234-123456789012",
+            ),
+        ];
+
+        for (pattern, input) in fixtures {
+            let regex = compile_rule_regex(pattern).unwrap_or_else(|e| {
+                panic!("legitimate pattern {pattern:?} failed to compile: {e}")
+            });
+            let any_match = regex.captures_iter(input).any(|r| r.is_ok());
+            assert!(
+                any_match,
+                "pattern {pattern:?} should match input {input:?}"
+            );
+        }
+    }
+
+    /// [ft-xv561 regression — session 2026-04-21]
+    ///
+    /// Victory-lap review of 070117a0 surfaced one gap in the existing
+    /// test coverage: `compile_rule_regex_accepts_builtin_pack_patterns`
+    /// only matches against short canonical anchor lines, so it
+    /// doesn't prove legitimate patterns have budget headroom when
+    /// applied to realistic pane-scrollback-length input.
+    ///
+    /// The 10M-step backtrack cap must comfortably accommodate a
+    /// legitimate non-pathological regex (`\d+%` style) against a
+    /// 100 KiB input — a realistic cap on a single segment of pane
+    /// output — without exhausting the budget. Regressing toward a
+    /// tighter cap would cause false positives in production: real
+    /// rules would start returning `Err(BacktrackLimitExceeded)` and
+    /// detection would silently stop firing.
+    #[test]
+    fn compile_rule_regex_budget_accommodates_legitimate_large_input() {
+        // Regex from builtin_codex_pack — structurally linear, NOT
+        // susceptible to catastrophic backtracking. Must complete
+        // against a 100 KiB pane-tail-shaped input without running
+        // the backtrack budget dry.
+        let regex = compile_rule_regex(
+            r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining",
+        )
+        .expect("legitimate pattern must compile");
+        let mut padding = "filler content ".repeat(100 * 1024 / 15);
+        padding.push_str("less than 5% of your 5h limit remaining");
+        padding.push_str(&" more filler ".repeat(100));
+
+        // Iterate eagerly; any backtrack-limit hit would surface as
+        // `Err(BacktrackLimitExceeded)` on a `captures_iter` step.
+        // The legitimate pattern MUST produce at least one Ok match
+        // on this large-but-realistic input.
+        let results: Vec<_> = regex.captures_iter(padding.as_str()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let err_count = results.iter().filter(|r| r.is_err()).count();
+        assert!(
+            ok_count > 0,
+            "legitimate pattern must match the canonical anchor embedded in large input"
+        );
+        assert!(
+            err_count == 0,
+            "legitimate pattern must not exhaust backtrack budget on realistic input; got {} errors",
+            err_count
+        );
+    }
+
+    #[test]
+    fn pack_for_rule_returns_pack_name() {
+        let engine = PatternEngine::new();
+        // Force initialization so rules are loaded
+        let _ = engine.detect("warmup");
+        // Built-in rules should have a pack name
+        if let Some(first_rule) = engine.rules().first() {
+            let pack = engine.pack_for_rule(&first_rule.id);
+            assert!(pack.is_some(), "built-in rule should have a pack");
+        }
+        // Non-existent rule should return None
+        assert!(engine.pack_for_rule("nonexistent.rule.id").is_none());
+    }
+
+    #[test]
+    fn rule_definition_text_returns_canonical_json() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        let first_rule = engine.rules().first().expect("builtin rules exist");
+        let text = engine
+            .rule_definition_text(&first_rule.id)
+            .expect("rule definition should be available");
+        let parsed: RuleDef = serde_json::from_str(&text).expect("valid rule json");
+        assert_eq!(parsed.id, first_rule.id);
+    }
+
+    #[test]
+    fn rule_definition_text_missing_rule_returns_none() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        assert!(engine.rule_definition_text("does.not.exist").is_none());
+    }
+
+    #[test]
+    fn from_config_applies_pack_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("test_pack.yaml");
+        let yaml = r#"
+name: "test-pack"
+version: "0.1.0"
+rules:
+  - id: "codex.test"
+    agent_type: "codex"
+    event_type: "usage.warning"
+    severity: "info"
+    anchors: ["hello"]
+    regex: null
+    description: "test rule"
+"#;
+        fs::write(&pack_path, yaml).unwrap();
+
+        let mut config = PatternsConfig::default();
+        let pack_id = format!("file:{}", pack_path.display());
+        config.packs = vec![pack_id.clone()];
+        config.pack_overrides.clear();
+
+        let mut override_cfg = PackOverride::default();
+        override_cfg
+            .severity_overrides
+            .insert("codex.test".to_string(), "critical".to_string());
+        config.pack_overrides.insert(pack_id.clone(), override_cfg);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|r| r.id == "codex.test")
+            .unwrap();
+        assert_eq!(rule.severity, Severity::Critical);
+
+        let mut disabled = PackOverride::default();
+        disabled.disabled_rules.push("codex.test".to_string());
+        config.pack_overrides.insert(pack_id, disabled);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        assert!(engine.rules().iter().all(|r| r.id != "codex.test"));
+    }
+
+    #[test]
+    fn from_config_file_pack_path_with_spaces_loads_and_normalizes_overrides() {
+        let dir = tempfile::Builder::new()
+            .prefix("pattern pack dir ")
+            .tempdir()
+            .unwrap();
+        let pack_path = dir.path().join("test pack.yaml");
+        let yaml = r#"
+name: "test-pack-with-space-path"
+version: "0.1.0"
+rules:
+  - id: "codex.space_path"
+    agent_type: "codex"
+    event_type: "usage.warning"
+    severity: "info"
+    anchors: ["space-path-anchor"]
+    regex: null
+    description: "test rule"
+"#;
+        fs::write(&pack_path, yaml).unwrap();
+
+        let pack_id = format!("file:{}", pack_path.display());
+        assert!(
+            pack_id.chars().any(char::is_whitespace),
+            "test setup must exercise whitespace-bearing file: pack ids"
+        );
+
+        let pack = load_pack_from_id(&pack_id, None).unwrap();
+        assert!(pack.name.starts_with("file:sha256:"));
+        assert!(!pack.name.chars().any(char::is_whitespace));
+
+        let mut config = PatternsConfig {
+            packs: vec![pack_id.clone()],
+            ..PatternsConfig::default()
+        };
+        let mut override_cfg = PackOverride::default();
+        override_cfg
+            .severity_overrides
+            .insert("codex.space_path".to_string(), "critical".to_string());
+        config.pack_overrides.insert(pack_id, override_cfg);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.space_path")
+            .unwrap();
+        assert_eq!(rule.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn from_config_builtin_core_loads_default_rules() {
+        let config = PatternsConfig {
+            packs: vec!["builtin:core".to_string()],
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).expect("builtin:core should load");
+        assert!(
+            !engine.rules().is_empty(),
+            "builtin:core should not resolve to an empty engine"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "codex.usage.warning_25"),
+            "builtin:core should include Codex default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "claude_code.compaction"),
+            "builtin:core should include Claude Code default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "gemini.model.used"),
+            "builtin:core should include Gemini default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "wezterm.mux.connection_lost"),
+            "builtin:core should include WezTerm default rules"
+        );
+    }
+
+    #[test]
+    fn builtin_core_loads_submit_profiles_for_supported_coding_agents() {
+        let config = PatternsConfig {
+            packs: vec!["builtin:core".to_string()],
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).expect("builtin:core should load");
+        let profile_ids = engine
+            .submit_profiles()
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(profile_ids.contains("codex.default"));
+        assert!(profile_ids.contains("claude_code.default"));
+        assert!(profile_ids.contains("gemini.default"));
+        assert_eq!(engine.submit_profiles().len(), 3);
+        assert!(engine.submit_profile_for_agent(AgentType::Codex).is_some());
+        assert!(
+            engine
+                .submit_profile_for_agent(AgentType::ClaudeCode)
+                .is_some()
+        );
+        assert!(engine.submit_profile_for_agent(AgentType::Gemini).is_some());
+        assert!(
+            engine
+                .submit_profile_for_agent(AgentType::Unknown)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn submit_profiles_round_trip_as_pattern_pack_data() {
+        let pack = builtin_codex_pack();
+        let json = serde_json::to_string(&pack).expect("serialize pack");
+        assert!(
+            json.contains("\"submit_profiles\""),
+            "submit profile data must serialize as pack data"
+        );
+
+        let decoded: PatternPack = serde_json::from_str(&json).expect("decode pattern pack");
+        let user_pack_names = HashSet::from([decoded.name.clone()]);
+        let library = PatternLibrary::new_with_user_packs(vec![decoded], &user_pack_names)
+            .expect("submit profile pack should validate");
+
+        let profile = library
+            .submit_profile_for_agent(AgentType::Codex)
+            .expect("codex submit profile");
+        assert_eq!(profile.id, "codex.default");
+        assert!(
+            profile
+                .anchors
+                .queued_behind_operation
+                .iter()
+                .any(|anchor| anchor == "Messages to be submitted after next tool call")
+        );
+    }
+
+    #[test]
+    fn submit_profile_validation_rejects_missing_required_anchor_groups() {
+        let mut profile = builtin_codex_submit_profile();
+        profile.anchors.crash_to_shell.clear();
+        let pack = PatternPack::new("builtin:codex", "0.1.0", Vec::new())
+            .with_submit_profiles(vec![profile]);
+
+        let err = match PatternLibrary::new(vec![pack]) {
+            Ok(_) => panic!("empty crash_to_shell anchors must fail validation"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("crash_to_shell"),
+            "error should name the missing anchor group: {err}"
+        );
+    }
+
+    #[test]
+    fn submit_profile_validation_rejects_evidence_delimiter_in_identity() {
+        let mut profile = builtin_codex_submit_profile();
+        profile.id = "codex.default:working_state".to_string();
+        let pack = PatternPack::new("custom:codex", "0.1.0", Vec::new())
+            .with_submit_profiles(vec![profile]);
+
+        let err = match PatternLibrary::new(vec![pack]) {
+            Ok(_) => panic!("ambiguous submit profile identity must fail validation"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("evidence delimiter"),
+            "error should identify the reserved delimiter: {err}"
+        );
+    }
+
+    #[test]
+    fn lazy_init_from_config_defers_compilation() {
+        let config = PatternsConfig::default();
+        let engine = PatternEngine::from_config(&config).unwrap();
+        assert!(
+            !engine.is_initialized(),
+            "from_config should NOT compile eagerly"
+        );
+        let _ = engine.detect("trigger compilation");
+        assert!(
+            engine.is_initialized(),
+            "detect should trigger lazy compilation"
+        );
+    }
+
+    #[test]
+    fn lazy_init_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let engine = Arc::new(PatternEngine::new());
+        assert!(!engine.is_initialized());
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let eng = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                let _ = eng.detect("concurrent access");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+        assert!(engine.is_initialized());
+    }
+
+    #[test]
+    fn lazy_vs_eager_produce_same_results() {
+        // Lazy path: new() then detect
+        let lazy = PatternEngine::new();
+        let lazy_results = lazy.detect("test content");
+
+        // Eager path: with_packs compiles immediately
+        let eager =
+            PatternEngine::with_packs(builtin_packs()).expect("builtin packs should compile");
+        assert!(eager.is_initialized(), "with_packs should compile eagerly");
+        let eager_results = eager.detect("test content");
+
+        assert_eq!(lazy_results.len(), eager_results.len());
+    }
+
+    #[test]
+    fn with_packs_compiles_eagerly() {
+        let engine =
+            PatternEngine::with_packs(builtin_packs()).expect("builtin packs should compile");
+        assert!(
+            engine.is_initialized(),
+            "with_packs should compile the index immediately"
+        );
+    }
+
+    #[test]
+    fn is_initialized_stays_true_after_multiple_detects() {
+        let engine = PatternEngine::new();
+        assert!(!engine.is_initialized());
+        let _ = engine.detect("first");
+        assert!(engine.is_initialized());
+        let _ = engine.detect("second");
+        assert!(engine.is_initialized());
+        let _ = engine.detect("third");
+        assert!(engine.is_initialized());
+    }
+
+    #[test]
+    fn detect_returns_empty_for_now() {
+        let engine = PatternEngine::new();
+        let detections = engine.detect("some text");
+        assert!(detections.is_empty());
+    }
+
+    fn sample_rule(id: &str) -> RuleDef {
+        RuleDef {
+            id: id.to_string(),
+            zone: None,
+            agent_type: AgentType::Codex,
+            event_type: "usage".to_string(),
+            severity: Severity::Info,
+            anchors: vec!["anchor".to_string()],
+            regex: None,
+            description: "test rule".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
+        }
+    }
+
+    fn sample_supply_chain(fixture_hashes: BTreeMap<String, String>) -> PatternPackSupplyChain {
+        PatternPackSupplyChain {
+            provenance: PatternPackProvenance {
+                author: "ft-test".to_string(),
+                source: "tests/pattern-packs".to_string(),
+                revision: "rev-1".to_string(),
+            },
+            fixture_hashes,
+            lint: PatternPackLintAttestation {
+                passed: true,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            },
+            regex_backtrack_budget: PATTERN_REGEX_BACKTRACK_LIMIT,
+            redaction_review: PatternPackRedactionReview {
+                reviewer: "security".to_string(),
+                reviewed_at: "2026-05-03T00:00:00Z".to_string(),
+                approved: true,
+            },
+            compatibility_target: PATTERN_PACK_COMPATIBILITY_TARGET.to_string(),
+            rollout: PatternPackRollout {
+                stage: "test".to_string(),
+                dry_run_match_telemetry: true,
+                observe_only_until_verified: true,
+            },
+            signature: None,
+        }
+    }
+
+    fn signed_test_pack(rule: RuleDef, fixture_hash: &str) -> PatternPack {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(
+            "tests/corpus/codex/sample.txt".to_string(),
+            fixture_hash.to_string(),
+        );
+        let mut pack = PatternPack::new("test-signed", "1.0.0", vec![rule])
+            .with_supply_chain(sample_supply_chain(fixture_hashes));
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+        pack
+    }
+
+    fn policy_with_fixture_hash(fixture_hash: &str) -> PatternPackVerificationPolicy {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(
+            "tests/corpus/codex/sample.txt".to_string(),
+            fixture_hash.to_string(),
+        );
+        PatternPackVerificationPolicy {
+            fixture_hashes,
+            ..PatternPackVerificationPolicy::default()
+        }
+    }
+
+    fn write_pack_json(dir: &tempfile::TempDir, pack: &PatternPack) -> PathBuf {
+        let path = dir.path().join("pack.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(pack).expect("pack serializes"),
+        )
+        .expect("write pack fixture");
+        path
+    }
+
+    fn rule_with_anchor(id: &str, anchor: &str, regex: Option<&str>) -> RuleDef {
+        RuleDef {
+            id: id.to_string(),
+            zone: None,
+            agent_type: AgentType::Codex,
+            event_type: "test.event".to_string(),
+            severity: Severity::Info,
+            anchors: vec![anchor.to_string()],
+            regex: regex.map(str::to_string),
+            description: "test rule".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
+        }
+    }
+
+    fn engine_with_rules(rules: Vec<RuleDef>) -> PatternEngine {
+        let pack = PatternPack::new("pack", "0.1.0", rules);
+        PatternEngine::with_packs(vec![pack]).expect("engine should build")
+    }
+
+    fn output_scoped_rule(regex: Option<&str>) -> RuleDef {
+        let mut rule = rule_with_anchor("codex.scoped", "ERROR", regex);
+        rule.zone = Some(DetectionZone::Output);
+        rule
+    }
+
+    #[test]
+    fn zone_rule_serialization_preserves_unscoped_packs_and_rejects_unknown_types() {
+        let mut value = serde_json::to_value(sample_rule("codex.zone")).unwrap();
+        assert!(value.get("zone").is_none());
+        assert!(
+            serde_json::from_value::<RuleDef>(value.clone())
+                .unwrap()
+                .zone
+                .is_none()
+        );
+        for (name, zone) in [
+            ("prompt", DetectionZone::Prompt),
+            ("input", DetectionZone::Input),
+            ("output", DetectionZone::Output),
+        ] {
+            value["zone"] = serde_json::json!(name);
+            let rule: RuleDef = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(rule.zone, Some(zone));
+            assert_eq!(serde_json::to_value(rule).unwrap()["zone"], name);
+        }
+        value["zone"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<RuleDef>(value).is_err());
+    }
+
+    #[test]
+    fn scoped_rule_requires_zone_without_poisoning_deduplication() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"ERROR (?P<code>\d+)"))]);
+        assert!(engine.has_zone_scoped_rules());
+        assert!(engine.detect("ERROR 42").is_empty());
+        let mut context = DetectionContext::new();
+        for zone in [
+            None,
+            Some(DetectionZone::Prompt),
+            Some(DetectionZone::Input),
+        ] {
+            assert!(
+                engine
+                    .detect_with_context_in_zone("ERROR 42", &mut context, zone)
+                    .is_empty()
+            );
+        }
+        let detections = engine.detect_with_context_in_zone(
+            "ERROR 42",
+            &mut context,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].extracted["code"], "42");
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERROR 42", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unscoped_rules_keep_cross_zone_matching() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.unscoped", "ERROR", Some(r"ERROR \d+")),
+            output_scoped_rule(Some(r"ERROR \d+")),
+        ]);
+        let mut context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Prompt))
+                .is_empty()
+        );
+        let detections =
+            engine.detect_with_context_in_zone("OR 42", &mut context, Some(DetectionZone::Output));
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.unscoped");
+    }
+
+    #[test]
+    fn scoped_cross_segment_matching_requires_known_continuity() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut contiguous = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut contiguous, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone("OR", &mut contiguous, Some(DetectionZone::Output))
+                .len(),
+            1
+        );
+
+        for boundary in [
+            None,
+            Some(DetectionZone::Prompt),
+            Some(DetectionZone::Output),
+        ] {
+            let mut context = DetectionContext::new();
+            assert!(
+                engine
+                    .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Output))
+                    .is_empty()
+            );
+            if boundary == Some(DetectionZone::Output) {
+                context.clear_zone_continuity();
+            } else {
+                assert!(
+                    engine
+                        .detect_with_context_in_zone("", &mut context, boundary)
+                        .is_empty()
+                );
+            }
+            assert!(
+                engine
+                    .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_regex_cannot_use_lookbehind_in_another_zone() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"(?<=prefix )ERROR"))]);
+        let mut context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("prefix ", &mut context, Some(DetectionZone::Input))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERROR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone(
+                    " prefix ERROR",
+                    &mut context,
+                    Some(DetectionZone::Output)
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scoped_anchor_after_crossing_anchor_is_still_detected() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut fast_context = DetectionContext::new();
+        let mut trace_context = DetectionContext::new();
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..TraceOptions::default()
+        };
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut fast_context, Some(DetectionZone::Prompt))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace_in_zone(
+                    "ERR",
+                    &mut trace_context,
+                    &opts,
+                    Some(DetectionZone::Prompt)
+                )
+                .0
+                .is_empty()
+        );
+        let fast = engine.detect_with_context_in_zone(
+            "OR ERROR",
+            &mut fast_context,
+            Some(DetectionZone::Output),
+        );
+        let (traced, _) = engine.detect_with_context_and_trace_in_zone(
+            "OR ERROR",
+            &mut trace_context,
+            &opts,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0].span, (6, 11));
+        assert_eq!(
+            serde_json::to_value(fast).unwrap(),
+            serde_json::to_value(traced).unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_trace_reports_zone_denial_and_absolute_capture_spans() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"ERROR (?P<code>\d+)"))]);
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..TraceOptions::default()
+        };
+        let (denied, traces) =
+            engine.detect_with_context_and_trace("ERROR 42", &mut DetectionContext::new(), &opts);
+        assert!(denied.is_empty());
+        assert!(
+            traces[0]
+                .gates
+                .iter()
+                .any(|gate| gate.gate == "zone" && !gate.passed)
+        );
+
+        let mut fast_context = DetectionContext::new();
+        let mut trace_context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context("quoted ", &mut fast_context)
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace("quoted ", &mut trace_context, &opts)
+                .0
+                .is_empty()
+        );
+        let fast = engine.detect_with_context_in_zone(
+            "ERROR 42",
+            &mut fast_context,
+            Some(DetectionZone::Output),
+        );
+        let (traced_in_zone, traces) = engine.detect_with_context_and_trace_in_zone(
+            "ERROR 42",
+            &mut trace_context,
+            &opts,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(fast[0].span, (7, 15));
+        assert_eq!(
+            serde_json::to_value(fast).unwrap(),
+            serde_json::to_value(traced_in_zone).unwrap()
+        );
+        assert!(
+            traces[0]
+                .gates
+                .iter()
+                .any(|gate| gate.gate == "zone" && gate.passed)
+        );
+        let evidence = traces[0]
+            .evidence
+            .iter()
+            .find(|item| item.kind == "capture")
+            .unwrap();
+        let span = evidence.span.as_ref().unwrap();
+        assert_eq!((span.start, span.end), (13, 15));
+        assert_eq!(evidence.excerpt.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn scoped_unicode_tail_stays_bounded_and_respects_external_tail_reset() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut context = DetectionContext::new();
+        let text = format!("{} ERR", "é".repeat(DetectionContext::MAX_TAIL_SIZE));
+        assert!(
+            engine
+                .detect_with_context_in_zone(&text, &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert!(context.zone_tail.len() <= DetectionContext::MAX_TAIL_SIZE);
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                .len(),
+            1
+        );
+
+        context.clear_seen();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        context.tail_buffer.clear();
+        assert!(
+            engine
+                .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn signed_pattern_pack_supply_chain_allows_action_triggers() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let pack = signed_test_pack(sample_rule("codex.signed"), &fixture_hash);
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(report.verified, "{report:#?}");
+        assert!(report.action_mode.allows_action_triggers());
+        assert!(report.signature_checked);
+        assert_eq!(report.fixture_hashes_checked, 1);
+        assert!(report.regex_budget_checked);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn pattern_pack_signature_drift_forces_observe_only() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut pack = signed_test_pack(sample_rule("codex.signed"), &fixture_hash);
+        pack.rules[0].anchors.push("tampered".to_string());
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_fixture_drift_and_unsafe_regex_are_rejected() {
+        let mut rule = sample_rule("codex.unsafe");
+        rule.regex = Some(".*.*.*secret".to_string());
+        let pack = signed_test_pack(rule, &sha256_hex(b"old fixture"));
+
+        let report = verify_pattern_pack_supply_chain(
+            &pack,
+            &policy_with_fixture_hash(&sha256_hex(b"new fixture")),
+        );
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "fixture_hash"),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "regex_safety"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_incompatible_target_is_rejected() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut pack = signed_test_pack(sample_rule("codex.incompatible"), &fixture_hash);
+        pack.supply_chain
+            .as_mut()
+            .expect("supply chain")
+            .compatibility_target = "frankenterm-patterns.v0".to_string();
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "compatibility"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_validation_failure_forces_observe_only_even_when_signed() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.invalid_signed");
+        rule.description = " \t ".to_string();
+        let mut pack = signed_test_pack(rule, &fixture_hash);
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "validation"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn blank_pattern_pack_attestation_fields_force_observe_only() {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(" \t ".to_string(), " \t ".to_string());
+        let mut supply_chain = sample_supply_chain(fixture_hashes);
+        supply_chain.provenance.author = " \t ".to_string();
+        supply_chain.lint.warnings.push(" \t ".to_string());
+        supply_chain.rollout.stage = " \t ".to_string();
+        let mut pack = PatternPack::new(
+            "test-blank-attestations",
+            "1.0.0",
+            vec![sample_rule("codex.blank_attestation")],
+        )
+        .with_supply_chain(supply_chain);
+        let signature = sign_pattern_pack_supply_chain(&pack, " \t ");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let mut policy = PatternPackVerificationPolicy::default();
+        policy
+            .fixture_hashes
+            .insert(" \t ".to_string(), " \t ".to_string());
+        let report = verify_pattern_pack_supply_chain(&pack, &policy);
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        for category in ["provenance", "fixture_hash", "lint", "rollout", "signature"] {
+            assert!(
+                report.issues.iter().any(|issue| issue.category == category),
+                "missing {category} issue in {report:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_pattern_pack_file_install_verify_and_use_flow() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.signed_file");
+        rule.anchors = vec!["SIGNED_FILE_FLOW".to_string()];
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let pack = signed_test_pack(rule, &fixture_hash);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pack_json(&dir, &pack);
+
+        let loaded = load_pack_from_file(path.to_str().expect("utf8 path"), None)
+            .expect("signed pack fixture loads");
+        let report =
+            verify_pattern_pack_supply_chain(&loaded, &policy_with_fixture_hash(&fixture_hash));
+        assert!(report.verified, "{report:#?}");
+        assert!(report.action_mode.allows_action_triggers());
+
+        let engine = PatternEngine::with_packs(vec![loaded]).expect("signed pack builds engine");
+        let detections = engine.detect("agent output contains SIGNED_FILE_FLOW");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.signed_file");
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.signed_file")
+            .expect("signed file rule");
+        assert_eq!(rule.workflow.as_deref(), Some("signed_pack_workflow"));
+    }
+
+    #[test]
+    fn successful_verification_clears_observe_only_rollout_flag() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.verified_actions");
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let pack = signed_test_pack(rule, &fixture_hash);
+        assert!(
+            pack.supply_chain
+                .as_ref()
+                .expect("supply chain")
+                .rollout
+                .observe_only_until_verified
+        );
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+        let enforced = pack.enforce_verification_report(&report);
+
+        assert_eq!(
+            enforced.rules[0].workflow.as_deref(),
+            Some("signed_pack_workflow")
+        );
+        assert!(
+            !enforced
+                .supply_chain
+                .as_ref()
+                .expect("supply chain")
+                .rollout
+                .observe_only_until_verified
+        );
+    }
+
+    #[test]
+    fn signed_pattern_pack_file_tamper_verifies_observe_only() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.tampered_file");
+        rule.anchors = vec!["SIGNED_FILE_FLOW".to_string()];
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let mut pack = signed_test_pack(rule, &fixture_hash);
+        pack.rules[0].anchors = vec!["TAMPERED_FLOW".to_string()];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pack_json(&dir, &pack);
+
+        let loaded = load_pack_from_file(path.to_str().expect("utf8 path"), None)
+            .expect("tampered pack fixture loads");
+        let report =
+            verify_pattern_pack_supply_chain(&loaded, &policy_with_fixture_hash(&fixture_hash));
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
+
+        let observe_only = loaded.enforce_verification_report(&report);
+        let engine =
+            PatternEngine::with_packs(vec![observe_only]).expect("observe-only pack builds engine");
+        let detections = engine.detect("agent output contains TAMPERED_FLOW");
+        assert_eq!(detections.len(), 1);
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.tampered_file")
+            .expect("tampered file rule");
+        assert!(rule.workflow.is_none());
+        assert!(rule.preview_command.is_none());
+    }
+
+    #[test]
+    fn unsigned_pattern_pack_is_observe_only() {
+        let pack = PatternPack::new("unsigned", "1.0.0", vec![sample_rule("codex.unsigned")]);
+        let report = verify_pattern_pack_supply_chain(
+            &pack,
+            &PatternPackVerificationPolicy {
+                require_signature: false,
+                ..PatternPackVerificationPolicy::default()
+            },
+        );
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn quick_reject_respects_anchor_bytes() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.quick", "XYZ", None)]);
+        // Text without matching first byte is rejected
+        assert!(!engine.quick_reject("abc"));
+        // Text with matching first byte but no anchor match is now correctly rejected
+        // thanks to the Bloom filter (previously this would return true)
+        assert!(!engine.quick_reject("look: X-ray"));
+        // Text containing the actual anchor passes
+        assert!(engine.quick_reject("check XYZ value"));
+    }
+
+    #[test]
+    fn bloom_filter_rejects_non_matching_text() {
+        // Test that the Bloom filter correctly rejects text that has
+        // matching first bytes but no matching anchors
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_a", "alpha", None),
+            rule_with_anchor("codex.bloom_b", "beta", None),
+            rule_with_anchor("codex.bloom_g", "gamma", None),
+        ]);
+
+        // These have matching first bytes but don't contain the anchors
+        assert!(!engine.quick_reject("arbitrary text"));
+        assert!(!engine.quick_reject("ax")); // 'a' matches but "ax" is shorter than "alpha"
+        assert!(!engine.quick_reject("bx")); // 'b' matches but "bx" is shorter than "beta"
+        assert!(!engine.quick_reject("gx")); // 'g' matches but "gx" is shorter than "gamma"
+        assert!(!engine.quick_reject("alphx")); // close to "alpha" but different
+        assert!(!engine.quick_reject("betx")); // close to "beta" but different
+    }
+
+    #[test]
+    fn quick_reject_rejects_dense_first_byte_streaming_candidates() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.dense_first_byte",
+            "zabcdef",
+            None,
+        )]);
+        let text = "z".repeat(4096);
+
+        assert!(!engine.quick_reject(&text));
+        let snapshot = engine.telemetry().snapshot();
+        assert_eq!(snapshot.bloom_rejects, 1);
+        assert!(
+            snapshot.bloom_checks > 1000,
+            "dense first-byte input should exercise many streamed Bloom checks"
+        );
+    }
+
+    #[test]
+    fn bloom_filter_accepts_matching_text() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_hello", "hello", None),
+            rule_with_anchor("codex.bloom_world", "world", None),
+        ]);
+
+        // These contain the actual anchors
+        assert!(engine.quick_reject("say hello to everyone"));
+        assert!(engine.quick_reject("hello world"));
+        assert!(engine.quick_reject("the world is vast"));
+
+        // This has no matching anchors at all
+        assert!(!engine.quick_reject("greetings and salutations"));
+    }
+
+    #[test]
+    fn bloom_filter_handles_multiple_anchor_lengths() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_short", "ab", None),
+            rule_with_anchor("codex.bloom_medium", "foobar", None),
+            rule_with_anchor("codex.bloom_long", "this_is_a_long_anchor", None),
+        ]);
+
+        // Short anchor match
+        assert!(engine.quick_reject("ab"));
+        assert!(engine.quick_reject("xab"));
+        assert!(engine.quick_reject("abx"));
+
+        // Medium anchor match
+        assert!(engine.quick_reject("foobar"));
+        assert!(engine.quick_reject("xfoobar"));
+        assert!(engine.quick_reject("foobarx"));
+
+        // Long anchor match
+        assert!(engine.quick_reject("this_is_a_long_anchor"));
+
+        // No match (has matching first bytes 'a', 'f', 't' but not the full anchors)
+        assert!(!engine.quick_reject("aX")); // starts with 'a' but "aX" != "ab"
+        assert!(!engine.quick_reject("fooXXX")); // starts with 'f' but "fooXXX" != "foobar"
+        assert!(!engine.quick_reject("this_is_not")); // starts with 't' but doesn't match long anchor
+    }
+
+    #[test]
+    fn detect_matches_anchor_only_rule() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
+        let detections = engine.detect("say hello to the world");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.anchor");
+        assert_eq!(detections[0].matched_text, "hello");
+    }
+
+    #[test]
+    fn detect_requires_regex_match_for_regex_rules() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.regex",
+            "limit",
+            Some(r"limit (?P<value>\d+)"),
+        )]);
+        let detections = engine.detect("limit xx");
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn detect_extracts_named_captures() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.regex",
+            "limit",
+            Some(r"limit (?P<value>\d+)"),
+        )]);
+        let detections = engine.detect("limit 42");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.regex");
+        assert_eq!(
+            detections[0]
+                .extracted
+                .get("value")
+                .and_then(|v| v.as_str()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn rules_are_sorted_deterministically() {
+        let pack = PatternPack::new(
+            "builtin:core",
+            "0.1.0",
+            vec![sample_rule("codex.b"), sample_rule("codex.a")],
+        );
+        let library = PatternLibrary::new(vec![pack]).unwrap();
+        let ids: Vec<&str> = library.rules().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex.a", "codex.b"]);
+    }
+
+    #[test]
+    fn later_packs_override_earlier_rules() {
+        let pack_a = PatternPack::new("pack-a", "0.1.0", vec![sample_rule("codex.test")]);
+        let mut rule_b = sample_rule("codex.test");
+        rule_b.event_type = "compaction".to_string();
+        rule_b.severity = Severity::Critical;
+        let pack_b = PatternPack::new("pack-b", "0.1.0", vec![rule_b]);
+
+        let library = PatternLibrary::new(vec![pack_a, pack_b]).unwrap();
+        let rule = library
+            .rules()
+            .iter()
+            .find(|r| r.id == "codex.test")
+            .unwrap();
+        assert_eq!(rule.event_type, "compaction");
+        assert_eq!(rule.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn invalid_rule_id_is_rejected() {
+        let pack = PatternPack::new("pack-a", "0.1.0", vec![sample_rule("custom.bad")]);
+        let result = PatternLibrary::new(vec![pack]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_regex_is_rejected() {
+        let mut rule = sample_rule("codex.bad_regex");
+        rule.regex = Some("(".to_string());
+        let pack = PatternPack::new("pack-a", "0.1.0", vec![rule]);
+        let result = PatternLibrary::new(vec![pack]);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Builtin pack tests
+    // ========================================================================
+
+    #[test]
+    fn builtin_codex_pack_is_valid() {
+        let pack = builtin_codex_pack();
+        pack.validate().expect("Codex pack should be valid");
+        assert!(!pack.rules.is_empty(), "Codex pack should have rules");
+    }
+
+    /// ft-fdppm: rate-limit rules used to fire on segments where the
+    /// rate-limit anchor and the retry-duration text were unrelated and
+    /// far apart. The fix anchors the duration capture to the rate-limit
+    /// phrase via a `(?i)…(?:rate limit|429|…){0,200}?(?:retry|wait|…)`
+    /// proximity bound. This regression locks the new behavior in for
+    /// all three rate-limit rules (codex, claude_code, gemini).
+    #[test]
+    fn rate_limit_rules_require_anchor_proximity_to_retry_duration() {
+        let packs = vec![
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+        ];
+        let engine = PatternEngine::with_packs(packs).expect("engine should compile");
+
+        // Distant unrelated retry text — rate-limit anchor early, then
+        // 800+ chars of unrelated content, then a "wait 5 minutes"
+        // belonging to a different concern. Pre-fix this fired
+        // rate_limit.detected; post-fix it must NOT.
+        let distant_text = format!(
+            "rate limit reset at midnight\n{}\nplease wait 5 minutes for the manual snapshot to complete",
+            "x".repeat(800)
+        );
+        let detections = engine.detect(&distant_text);
+        let rate_hits: Vec<_> = detections
+            .iter()
+            .filter(|d| d.event_type == "rate_limit.detected")
+            .collect();
+        assert!(
+            rate_hits.is_empty(),
+            "ft-fdppm: distant unrelated retry text must NOT fire \
+             rate_limit.detected; got {rate_hits:?} on text {distant_text:?}"
+        );
+
+        // Positive case — rate-limit phrase + retry duration in close
+        // proximity must still fire. Pin all three providers.
+        for (label, text) in [
+            ("codex", "rate limit reached, retry in 30 seconds"),
+            (
+                "claude_code",
+                "Anthropic rate limit hit (529); please wait 2 minutes and try again",
+            ),
+            (
+                "gemini",
+                "RESOURCE_EXHAUSTED quota exceeded — back off for 60 seconds",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let has_rate_hit = detections
+                .iter()
+                .any(|d| d.event_type == "rate_limit.detected");
+            assert!(
+                has_rate_hit,
+                "{label}: close-proximity rate-limit text must still fire. \
+                 text={text:?} detections={detections:?}"
+            );
+        }
+    }
+
+    /// ft-y820u: real API rate-limit messages routinely span multiple
+    /// lines (anchor phrase on one line, retry duration on the next).
+    /// The ft-fdppm proximity-bound regex used `.{0,200}?` without the
+    /// `(?s)` DOTALL flag, so `.` did not match `\n` and the matcher
+    /// silently rejected multi-line shapes — a false-negative regression.
+    /// This test pins the multi-line positive case for all three rules
+    /// and the negative case (distant 800-char gap with newlines) the
+    /// proximity bound must continue to reject.
+    #[test]
+    fn rate_limit_rules_match_across_newlines_within_proximity_bound() {
+        let packs = vec![
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+        ];
+        let engine = PatternEngine::with_packs(packs).expect("engine should compile");
+
+        // Positive: realistic two-line API error shape. Each agent's
+        // rate-limit rule must surface rate_limit.detected here.
+        for (label, text) in [
+            (
+                "codex multi-line",
+                "ERROR: rate limit exceeded\nPlease retry in 30 seconds",
+            ),
+            (
+                "claude_code multi-line",
+                "Anthropic API: rate limit hit (529)\nback off for 5 minutes\n",
+            ),
+            (
+                "gemini multi-line",
+                "RESOURCE_EXHAUSTED\nretry after 1 hour",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let has_rate_hit = detections
+                .iter()
+                .any(|d| d.event_type == "rate_limit.detected");
+            assert!(
+                has_rate_hit,
+                "{label}: multi-line rate-limit text must fire — \
+                 ft-y820u regression. text={text:?} detections={detections:?}"
+            );
+        }
+
+        // Negative: the 800-char-gap case from the ft-fdppm regression —
+        // adding the (?s) flag must NOT re-introduce the false-positive.
+        // Same shape as `rate_limit_rules_require_anchor_proximity_to_retry_duration`,
+        // re-asserted here so a future edit that drops the {0,200}? bound
+        // doesn't pass the multi-line positive but break the distance one.
+        let distant_text = format!(
+            "rate limit reset at midnight\n{}\nplease wait 5 minutes for the manual snapshot to complete",
+            "x".repeat(800)
+        );
+        let detections = engine.detect(&distant_text);
+        let rate_hits: Vec<_> = detections
+            .iter()
+            .filter(|d| d.event_type == "rate_limit.detected")
+            .collect();
+        assert!(
+            rate_hits.is_empty(),
+            "ft-y820u must keep ft-fdppm's false-positive guard: \
+             distant unrelated retry text must NOT fire rate_limit.detected. \
+             Got {rate_hits:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_core_pack_is_valid() {
+        let pack = builtin_core_pack();
+        pack.validate().expect("Core pack should be valid");
+        assert!(!pack.rules.is_empty(), "Core pack should have rules");
+        let actual: HashSet<_> = pack.rules.iter().map(|rule| rule.id.as_str()).collect();
+        let expected: HashSet<_> = [
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+            builtin_wezterm_pack(),
+        ]
+        .into_iter()
+        .flat_map(|pack| pack.rules.into_iter().map(|rule| rule.id))
+        .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "Core pack should materialize the full built-in ruleset without duplicates"
+        );
+        for rule_id in expected {
+            assert!(
+                actual.contains(rule_id.as_str()),
+                "Core pack should include built-in rule '{rule_id}'"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_claude_code_pack_is_valid() {
+        let pack = builtin_claude_code_pack();
+        pack.validate().expect("Claude Code pack should be valid");
+        assert!(!pack.rules.is_empty(), "Claude Code pack should have rules");
+    }
+
+    #[test]
+    fn builtin_gemini_pack_is_valid() {
+        let pack = builtin_gemini_pack();
+        pack.validate().expect("Gemini pack should be valid");
+        assert!(!pack.rules.is_empty(), "Gemini pack should have rules");
+    }
+
+    #[test]
+    fn builtin_wezterm_pack_is_valid() {
+        let pack = builtin_wezterm_pack();
+        pack.validate().expect("WezTerm pack should be valid");
+        assert!(!pack.rules.is_empty(), "WezTerm pack should have rules");
+    }
+
+    #[test]
+    fn all_builtin_rules_have_valid_ids() {
+        let engine = PatternEngine::new();
+        for rule in engine.rules() {
+            let valid = ALLOWED_RULE_PREFIXES.iter().any(|p| rule.id.starts_with(p));
+            assert!(valid, "Rule '{}' has invalid prefix", rule.id);
+        }
+    }
+
+    #[test]
+    fn all_builtin_rules_have_anchors() {
+        let engine = PatternEngine::new();
+        for rule in engine.rules() {
+            assert!(
+                !rule.anchors.is_empty(),
+                "Rule '{}' must have at least one anchor",
+                rule.id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_rule_enumeration_is_deterministic() {
+        let engine1 = PatternEngine::new();
+        let engine2 = PatternEngine::new();
+
+        let ids1: Vec<&str> = engine1.rules().iter().map(|r| r.id.as_str()).collect();
+        let ids2: Vec<&str> = engine2.rules().iter().map(|r| r.id.as_str()).collect();
+
+        assert_eq!(ids1, ids2, "Rule enumeration should be deterministic");
+    }
+
+    #[test]
+    fn expected_codex_rules_exist() {
+        let engine = PatternEngine::new();
+        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"codex.usage.reached"),
+            "Missing codex.usage.reached"
+        );
+        assert!(
+            ids.contains(&"codex.session.token_usage"),
+            "Missing codex.session.token_usage"
+        );
+        assert!(
+            ids.contains(&"codex.session.resume_hint"),
+            "Missing codex.session.resume_hint"
+        );
+        assert!(
+            ids.contains(&"codex.auth.device_code_prompt"),
+            "Missing codex.auth.device_code_prompt"
+        );
+    }
+
+    #[test]
+    fn expected_claude_code_rules_exist() {
+        let engine = PatternEngine::new();
+        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"claude_code.compaction"),
+            "Missing claude_code.compaction"
+        );
+        assert!(
+            ids.contains(&"claude_code.banner"),
+            "Missing claude_code.banner"
+        );
+        assert!(
+            ids.contains(&"claude_code.usage.warning"),
+            "Missing claude_code.usage.warning"
+        );
+        assert!(
+            ids.contains(&"claude_code.usage.reached"),
+            "Missing claude_code.usage.reached"
+        );
+    }
+
+    #[test]
+    fn expected_gemini_rules_exist() {
+        let engine = PatternEngine::new();
+        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"gemini.usage.warning"),
+            "Missing gemini.usage.warning"
+        );
+        assert!(
+            ids.contains(&"gemini.usage.reached"),
+            "Missing gemini.usage.reached"
+        );
+        assert!(
+            ids.contains(&"gemini.session.summary"),
+            "Missing gemini.session.summary"
+        );
+        assert!(
+            ids.contains(&"gemini.session.resume_hint"),
+            "Missing gemini.session.resume_hint"
+        );
+        assert!(
+            ids.contains(&"gemini.model.used"),
+            "Missing gemini.model.used"
+        );
+    }
+
+    #[test]
+    fn expected_wezterm_rules_exist() {
+        let engine = PatternEngine::new();
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .map(|r| r.id.as_str())
+                .any(|id| id == "wezterm.mux.connection_lost"),
+            "Missing wezterm.mux.connection_lost"
+        );
+    }
+
+    fn assert_rule_extraction(rule_id: &str, text: &str, expected: &[(&str, &str)]) {
+        let engine = PatternEngine::new();
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("Expected detection for rule '{rule_id}'"));
+
+        let map = detection
+            .extracted
+            .as_object()
+            .unwrap_or_else(|| panic!("Expected extracted object for rule '{rule_id}'"));
+
+        assert_eq!(
+            map.len(),
+            expected.len(),
+            "Unexpected extracted keys for rule '{rule_id}'"
+        );
+
+        for (key, value) in expected {
+            let actual = map
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            assert_eq!(
+                actual, *value,
+                "Extraction mismatch for rule '{rule_id}' key '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_regex_rules_extract_expected_fields() {
+        let cases = vec![
+            (
+                "codex.usage.warning_25",
+                "Warning: You have less than 25% of your 24h limit remaining.",
+                vec![("remaining", "25"), ("limit_hours", "24")],
+            ),
+            (
+                "codex.usage.warning_10",
+                "Warning: You have less than 10% of your 8h limit remaining.",
+                vec![("remaining", "10"), ("limit_hours", "8")],
+            ),
+            (
+                "codex.usage.warning_5",
+                "Warning: You have less than 5% of your 12h limit remaining.",
+                vec![("remaining", "5"), ("limit_hours", "12")],
+            ),
+            (
+                "codex.usage.reached",
+                "You've hit your usage limit. Please try again at 2026-01-20 12:34 UTC.",
+                vec![("reset_time", "2026-01-20 12:34 UTC")],
+            ),
+            (
+                "codex.session.token_usage",
+                "Token usage: total=1,234 input=567 (+ 89 cached) output=987 (reasoning 12)",
+                vec![
+                    ("total", "1,234"),
+                    ("input", "567"),
+                    ("cached", "89"),
+                    ("output", "987"),
+                    ("reasoning", "12"),
+                ],
+            ),
+            (
+                "codex.session.resume_hint",
+                "To resume later, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+                vec![("session_id", "123e4567-e89b-12d3-a456-426614174000")],
+            ),
+            (
+                "codex.auth.device_code_prompt",
+                "Enter this one-time code: ABCD-12345",
+                vec![("code", "ABCD-12345")],
+            ),
+            (
+                "claude_code.compaction",
+                "Auto-compact: context compacted 12,345 tokens to 3,210",
+                vec![("tokens_before", "12,345"), ("tokens_after", "3,210")],
+            ),
+            (
+                "claude_code.session.cost_summary",
+                "Session cost: $2.50",
+                vec![("cost", "2.50")],
+            ),
+            (
+                "gemini.session.summary",
+                "Interaction Summary: Session ID: abcdef12-3456-7890-abcd-ef1234567890 Tool Calls: 7",
+                vec![
+                    ("session_id", "abcdef12-3456-7890-abcd-ef1234567890"),
+                    ("tool_calls", "7"),
+                ],
+            ),
+            (
+                "gemini.model.used",
+                "Responding with gemini-1.5-pro",
+                vec![("model", "gemini-1.5-pro")],
+            ),
+            (
+                "wezterm.pane.exited",
+                "pane exited with status 1",
+                vec![("exit_code", "1")],
+            ),
+        ];
+
+        for (rule_id, text, expected) in cases {
+            assert_rule_extraction(rule_id, text, &expected);
+        }
+    }
+
+    // ========================================================================
+    // AgentType tests
+    // ========================================================================
+
+    #[test]
+    fn agent_type_display() {
+        assert_eq!(AgentType::Codex.to_string(), "codex");
+        assert_eq!(AgentType::ClaudeCode.to_string(), "claude_code");
+        assert_eq!(AgentType::Gemini.to_string(), "gemini");
+        assert_eq!(AgentType::Wezterm.to_string(), "wezterm");
+        assert_eq!(AgentType::Unknown.to_string(), "unknown");
+    }
+
+    // ========================================================================
+    // Rule validation edge cases
+    // ========================================================================
+
+    #[test]
+    fn empty_rule_id_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.id = String::new();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_event_type_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.event_type = " \t".to_string();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_anchor_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.anchors = vec![String::new()];
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_anchors_list_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.anchors = Vec::new();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_description_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.description = " \n".to_string();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn duplicate_rule_ids_in_same_pack_rejected() {
+        let pack = PatternPack::new(
+            "pack",
+            "0.1.0",
+            vec![sample_rule("codex.dup"), sample_rule("codex.dup")],
+        );
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_pack_name_is_rejected() {
+        let pack = PatternPack::new("", "0.1.0", vec![sample_rule("codex.test")]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_pack_version_is_rejected() {
+        let pack = PatternPack::new("pack", "", vec![sample_rule("codex.test")]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    // ========================================================================
+    // Real-world detection tests for builtin rules
+    // ========================================================================
+
+    #[test]
+    fn detect_codex_usage_reached() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit for the 3h window. Please try again at 2:30 PM.";
+        let detections = engine.detect(text);
+        assert!(!detections.is_empty(), "Should detect usage limit");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.reached");
+        assert!(detection.is_some(), "Should match codex.usage.reached");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Critical);
+        assert_eq!(
+            d.extracted.get("reset_time").and_then(|v| v.as_str()),
+            Some("2:30 PM")
+        );
+    }
+
+    /// The shipped Codex binary prints the limit message with a capital "Try"
+    /// at sentence start ("You've hit your usage limit. Try again at 4:32 PM.");
+    /// the rule regex must be case-insensitive or the primary real-world form
+    /// is missed (observed on the headless-mux observe smoke, 2026-09-02).
+    #[test]
+    fn detect_codex_usage_reached_real_binary_casing() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit. Try again at 4:32 PM.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.reached")
+            .expect("capitalized 'Try again at' must match codex.usage.reached");
+        assert_eq!(
+            detection
+                .extracted
+                .get("reset_time")
+                .and_then(|v| v.as_str()),
+            Some("4:32 PM")
+        );
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_25() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 25% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_25");
+        assert!(detection.is_some(), "Should match codex.usage.warning_25");
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_10() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 10% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_10");
+        assert!(detection.is_some(), "Should match codex.usage.warning_10");
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_5() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 5% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_5");
+        assert!(detection.is_some(), "Should match codex.usage.warning_5");
+    }
+
+    #[test]
+    fn detect_codex_token_usage() {
+        let engine = PatternEngine::new();
+        let text = "Token usage: total=125,432 input=50,000 (+ 20,000 cached) output=55,432";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.token_usage"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("total").and_then(|v| v.as_str()),
+            Some("125,432")
+        );
+        assert_eq!(
+            d.extracted.get("input").and_then(|v| v.as_str()),
+            Some("50,000")
+        );
+        assert_eq!(
+            d.extracted.get("cached").and_then(|v| v.as_str()),
+            Some("20,000")
+        );
+        assert_eq!(
+            d.extracted.get("output").and_then(|v| v.as_str()),
+            Some("55,432")
+        );
+    }
+
+    #[test]
+    fn detect_codex_token_usage_with_reasoning() {
+        let engine = PatternEngine::new();
+        let text = "Token usage: total=200,000 input=80,000 (+ 30,000 cached) output=90,000 (reasoning 10,000)";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.token_usage with reasoning"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("reasoning").and_then(|v| v.as_str()),
+            Some("10,000")
+        );
+    }
+
+    #[test]
+    fn detect_codex_resume_hint() {
+        let engine = PatternEngine::new();
+        let text = "To resume this session, run: codex resume a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.resume_hint");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.resume_hint"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn detect_codex_device_auth() {
+        let engine = PatternEngine::new();
+        let text = "Enter this one-time code at https://auth.openai.com: ABCD-12345";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.auth.device_code_prompt");
+        assert!(
+            detection.is_some(),
+            "Should match codex.auth.device_code_prompt"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("code").and_then(|v| v.as_str()),
+            Some("ABCD-12345")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction() {
+        let engine = PatternEngine::new();
+        let text = "Conversation compacted 150,000 tokens to 25,000 tokens";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
+        assert!(detection.is_some(), "Should match claude_code.compaction");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("tokens_before").and_then(|v| v.as_str()),
+            Some("150,000")
+        );
+        assert_eq!(
+            d.extracted.get("tokens_after").and_then(|v| v.as_str()),
+            Some("25,000")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_summarized_variant() {
+        let engine = PatternEngine::new();
+        let text = "context compacted: summarized 100,000 tokens to 15,000 tokens";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction with summarized variant"
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_banner_variant() {
+        let engine = PatternEngine::new();
+        let text = "Conversation compacted (ctrl+o for history)";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction banner variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("tokens_before").and_then(|v| v.as_str()),
+            None
+        );
+        assert_eq!(
+            d.extracted.get("tokens_after").and_then(|v| v.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_complete_ctrl_o_variant() {
+        let engine = PatternEngine::new();
+        let text = "Compacted (ctrl+o to see full summary)";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction.complete");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction.complete ctrl+o variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(
+            d.extracted.get("tokens_saved").and_then(|v| v.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_cost_summary() {
+        let engine = PatternEngine::new();
+        let text = "Session complete. Total cost: $1.25";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.session.cost_summary");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.session.cost_summary"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("cost").and_then(|v| v.as_str()),
+            Some("1.25")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_api_key_error() {
+        let engine = PatternEngine::new();
+        let text = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.auth.api_key_error");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.auth.api_key_error"
+        );
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn claude_code_auth_rules_follow_real_failures_not_prose() {
+        // handle_auth_required types a recovery prompt into the pane on
+        // auth.error, so prose must not reach it.
+        let engine = PatternEngine::new();
+        let rule_ids = |text: &str| -> Vec<String> {
+            engine
+                .detect(text)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.auth."))
+                .collect()
+        };
+        for (text, rule) in [
+            (
+                "Invalid API key · Fix external API key",
+                "claude_code.auth.api_key_error",
+            ),
+            (
+                "Failed to authenticate: OAuth session expired and could not be refreshed",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Login expired · Please run /login",
+                "claude_code.auth.login_required",
+            ),
+        ] {
+            assert_eq!(rule_ids(text), vec![rule.to_string()], "{text:?}");
+        }
+        for text in [
+            "Retry case: the provider is called only once, no stored API key gets rotated in.",
+            "`ANTHROPIC_API_KEY` isn't set, so something else satisfies the credential.",
+            "Error: invalid api key - please check your ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY is not set",
+            "API key authentication failed. Please set ANTHROPIC_API_KEY.",
+            "Failed to authenticate telemetry request",
+        ] {
+            assert!(rule_ids(text).is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn detect_claude_code_banner() {
+        let engine = PatternEngine::new();
+        let text = "Claude Code v1.2.3 starting session with model: claude-opus-4-5-20251101";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.banner");
+        assert!(detection.is_some(), "Should match claude_code.banner");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("version").and_then(|v| v.as_str()),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_usage_reached_resets_variant() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your limit · resets 2pm (America/New_York)\n/extra-usage to finish what you're working on.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.usage.reached");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.usage.reached for resets variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("reset_time").and_then(|v| v.as_str()),
+            Some("2pm (America/New_York)")
+        );
+        assert_eq!(d.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn claude_code_usage_reached_follows_real_limit_messages() {
+        // Limit messages copied from Claude Code 2.1.x sessions. A weekly
+        // reset keeps its day: cut to "2pm", the limit-window ledger read it
+        // as the next 2pm, up to six days early.
+        let engine = PatternEngine::new();
+        let cases = [
+            (
+                "You've hit your session limit · resets 10:10pm (America/New_York)",
+                "reset_time",
+                "10:10pm (America/New_York)",
+            ),
+            (
+                "You've hit your 5-hour limit · resets 7:40pm (America/New_York)",
+                "reset_time",
+                "7:40pm (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets 6am (America/New_York)",
+                "reset_time",
+                "6am (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets Nov 12 at 2pm (America/New_York)",
+                "reset_time",
+                "Nov 12 at 2pm (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets Nov 9, 8pm (America/New_York)",
+                "reset_time",
+                "Nov 9, 8pm (America/New_York)",
+            ),
+            (
+                "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+                "limit",
+                "Fable 5",
+            ),
+            (
+                "You've reached your Fable limit. Switch to another model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+                "limit",
+                "Fable",
+            ),
+        ];
+        for (text, key, value) in cases {
+            let detections = engine.detect(text);
+            let detection = detections
+                .iter()
+                .find(|d| d.rule_id == "claude_code.usage.reached")
+                .unwrap_or_else(|| panic!("no claude_code.usage.reached for {text:?}"));
+            assert_eq!(
+                detection.extracted.get(key).and_then(|v| v.as_str()),
+                Some(value),
+                "{text:?}"
+            );
+        }
+
+        let credits = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+        assert!(
+            engine
+                .detect(credits)
+                .iter()
+                .any(|d| d.rule_id == "claude_code.usage.reached"),
+            "out-of-credits message must reach the limit workflow"
+        );
+
+        // Codex's message is Codex's alone.
+        let codex = "You've reached your usage limit. Please try again at 2026-02-15 08:00 UTC.";
+        let rule_ids: Vec<_> = engine
+            .detect(codex)
+            .into_iter()
+            .map(|d| d.rule_id)
+            .collect();
+        assert_eq!(rule_ids, vec!["codex.usage.reached".to_string()]);
+    }
+
+    #[test]
+    fn detect_gemini_usage_warning() {
+        let engine = PatternEngine::new();
+        let text = "Usage limit warning: 10% of your Pro models quota remaining.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.usage.warning");
+        assert!(detection.is_some(), "Should match gemini.usage.warning");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("remaining").and_then(|v| v.as_str()),
+            Some("10")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_usage_reached() {
+        let engine = PatternEngine::new();
+        let text = "Usage limit reached for all Pro models. Please wait before continuing.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.usage.reached");
+        assert!(detection.is_some(), "Should match gemini.usage.reached");
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn detect_gemini_session_summary() {
+        let engine = PatternEngine::new();
+        let text = "Interaction Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTool Calls: 42\nTokens Used: 10000";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.session.summary");
+        assert!(detection.is_some(), "Should match gemini.session.summary");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("abc12345-def6-7890-abcd-0123456789ab")
+        );
+        assert_eq!(
+            d.extracted.get("tool_calls").and_then(|v| v.as_str()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_session_summary_near_miss_without_tool_calls() {
+        let engine = PatternEngine::new();
+        let text =
+            "Session Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTokens Used: 10000";
+        let detections = engine.detect(text);
+        assert!(
+            detections
+                .iter()
+                .all(|d| d.rule_id != "gemini.session.summary"),
+            "gemini.session.summary should not match when Tool Calls is missing"
+        );
+    }
+
+    #[test]
+    fn detect_gemini_session_resume_hint() {
+        let engine = PatternEngine::new();
+        let text =
+            "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.session.resume_hint");
+        assert!(
+            detection.is_some(),
+            "Should match gemini.session.resume_hint"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("abcdef12-3456-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_model_used() {
+        let engine = PatternEngine::new();
+        let text = "Responding with gemini-2.0-flash-exp model";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.model.used");
+        assert!(detection.is_some(), "Should match gemini.model.used");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("model").and_then(|v| v.as_str()),
+            Some("gemini-2.0-flash-exp")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_model_used_alt() {
+        let engine = PatternEngine::new();
+        let text = "Using model: gemini-1.5-pro";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.model.used");
+        assert!(detection.is_some(), "Should match gemini.model.used");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("model").and_then(|v| v.as_str()),
+            Some("gemini-1.5-pro")
+        );
+    }
+
+    #[test]
+    fn detect_wezterm_mux_connection_lost() {
+        let engine = PatternEngine::new();
+        let text = "Error: mux server connection lost, attempting reconnect...";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.mux.connection_lost");
+        assert!(
+            detection.is_some(),
+            "Should match wezterm.mux.connection_lost"
+        );
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn wezterm_mux_connection_lost_ignores_prose() {
+        // WezTerm rules run on every pane; these lines are from Claude Code
+        // sessions (the last is the catalog's SSH false positive).
+        let engine = PatternEngine::new();
+        for text in [
+            "Let me diagnose the tmux server state and recover.",
+            "All 57 agents and both mux servers intact.",
+            "So nothing was missing: the sidecar was disconnected before the pull could be asked for.",
+            "An engine indicator shows connected, working, \"Still working · 12 s\", offline or connection lost.",
+            "SSH connection lost: remote host not responding",
+            "the tmux server disconnected",
+        ] {
+            assert!(
+                !engine
+                    .detect(text)
+                    .iter()
+                    .any(|d| d.rule_id == "wezterm.mux.connection_lost"),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_wezterm_pane_exited() {
+        let engine = PatternEngine::new();
+        let text = "shell exited with exit status: 0";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.pane.exited");
+        assert!(detection.is_some(), "Should match wezterm.pane.exited");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("exit_code").and_then(|v| v.as_str()),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn detect_wezterm_pane_exited_nonzero() {
+        let engine = PatternEngine::new();
+        let text = "process exited with status 1";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.pane.exited");
+        assert!(
+            detection.is_some(),
+            "Should match wezterm.pane.exited with non-zero exit"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("exit_code").and_then(|v| v.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn command_failure_summaries_ship_in_the_default_production_pack() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for (text, rule_id, event_type, field, value) in [
+            (
+                "error: could not compile `example` (lib) due to 1 previous error\n",
+                "wezterm.build.cargo_failed",
+                "build.failed",
+                "error_count",
+                "1",
+            ),
+            (
+                "error: could not compile `example-cli` (bin \"example-cli\") due to 2 previous errors; 3 warnings emitted\r\n",
+                "wezterm.build.cargo_failed",
+                "build.failed",
+                "package",
+                "example-cli",
+            ),
+            (
+                "test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+                "wezterm.test.cargo_failed",
+                "test.failed",
+                "failed",
+                "2",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let failures: Vec<_> = detections
+                .iter()
+                .filter(|d| is_command_failure_event(&d.event_type, d.severity))
+                .collect();
+            assert_eq!(
+                failures.len(),
+                1,
+                "expected one completed failure: {text:?}"
+            );
+            assert_eq!(failures[0].rule_id, rule_id);
+            assert_eq!(failures[0].event_type, event_type);
+            assert_eq!(failures[0].severity, Severity::Warning);
+            assert_eq!(failures[0].extracted[field].as_str(), Some(value));
+        }
+    }
+
+    #[test]
+    fn command_failure_summaries_reject_prose_partial_success_and_provider_errors() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for text in [
+            "> error: could not compile `example` (lib) due to 1 previous error\n",
+            "\"error: could not compile `example` (lib) due to 1 previous error\"\n",
+            "The message was error: could not compile `example` due to 1 previous error\n",
+            "error: could not compile `example` due to 0 previous errors\n",
+            "error: could not compile `example` due to 1 previous error (quoted example)\n",
+            "error: could not compile `example` due to 1 previous error",
+            "error[E0382]: borrow of moved value\n",
+            "test result: FAILED.\n",
+            "test result: FAILED. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "> test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "Error: connection failed to API server\n",
+            "Request timed out after 30 seconds\n",
+            "Server overloaded, please retry in 30 seconds\n",
+        ] {
+            assert!(
+                engine
+                    .detect(text)
+                    .iter()
+                    .all(|d| !is_command_failure_event(&d.event_type, d.severity)),
+                "non-command failure must not contribute to retry history: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_failure_summaries_wait_for_complete_lines_across_every_split() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for text in [
+            "error: could not compile `example` (lib test) due to 2 previous errors; 1 warning emitted\r\n",
+            "test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+        ] {
+            for split in 0..=text.len() {
+                let mut plain = DetectionContext::new();
+                let first = engine.detect_with_context(&text[..split], &mut plain);
+                let second = engine.detect_with_context(&text[split..], &mut plain);
+                assert_eq!(
+                    first.len() + second.len(),
+                    1,
+                    "completed failure must emit once across split {split}: {text:?}"
+                );
+                assert!(
+                    engine
+                        .detect_with_context("next output\n", &mut plain)
+                        .is_empty()
+                );
+
+                let mut traced = DetectionContext::new();
+                let opts = TraceOptions::default();
+                let (first, _) =
+                    engine.detect_with_context_and_trace(&text[..split], &mut traced, &opts);
+                let (second, _) =
+                    engine.detect_with_context_and_trace(&text[split..], &mut traced, &opts);
+                assert_eq!(
+                    first.len() + second.len(),
+                    1,
+                    "trace path must preserve split-line occurrence at {split}"
+                );
+                assert!(
+                    engine
+                        .detect_with_context_and_trace("next output\n", &mut traced, &opts)
+                        .0
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_failure_occurrences_repeat_but_status_deduplication_remains() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        let failure = "error: could not compile `example` (lib) due to 1 previous error\n";
+        let status = "You've hit your usage limit, try again at 3pm.\n";
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Unknown,
+        ] {
+            let mut plain = DetectionContext::with_agent_type(agent);
+            let mut traced = DetectionContext::with_agent_type(agent);
+            let opts = TraceOptions::default();
+            for attempt in 0..3 {
+                let ordinary = engine.detect_with_context(failure, &mut plain);
+                let (explained, explanations) =
+                    engine.detect_with_context_and_trace(failure, &mut traced, &opts);
+                assert_eq!(ordinary.len(), 1, "attempt {attempt} with {agent:?}");
+                assert_eq!(explained.len(), 1);
+                assert_eq!(ordinary[0].dedup_key(), explained[0].dedup_key());
+                assert_eq!(explanations.len(), 1);
+                assert!(explanations[0].eligible);
+            }
+            assert_eq!(
+                plain.seen_count(),
+                0,
+                "failure occurrences do not occupy the TTL cache"
+            );
+            assert_eq!(traced.seen_count(), 0);
+        }
+
+        let mut plain = DetectionContext::with_agent_type(AgentType::Codex);
+        let mut traced = DetectionContext::with_agent_type(AgentType::Codex);
+        let opts = TraceOptions::default();
+        assert_eq!(engine.detect_with_context(status, &mut plain).len(), 1);
+        assert!(engine.detect_with_context(status, &mut plain).is_empty());
+        assert_eq!(
+            engine
+                .detect_with_context_and_trace(status, &mut traced, &opts)
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace(status, &mut traced, &opts)
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anchor_only_command_failure_occurrences_match_trace_behavior() {
+        let mut rule = rule_with_anchor("codex.command.failure", "COMMAND FAILED", None);
+        rule.event_type = "command.failed".to_string();
+        rule.severity = Severity::Warning;
+        let engine =
+            PatternEngine::with_packs(vec![PatternPack::new("test:command", "1.0.0", vec![rule])])
+                .unwrap();
+        let mut plain = DetectionContext::new();
+        let mut traced = DetectionContext::new();
+        let opts = TraceOptions::default();
+        for _ in 0..3 {
+            let ordinary =
+                engine.detect_with_context("COMMAND FAILED COMMAND FAILED\n", &mut plain);
+            let (explained, _) = engine.detect_with_context_and_trace(
+                "COMMAND FAILED COMMAND FAILED\n",
+                &mut traced,
+                &opts,
+            );
+            assert_eq!(ordinary.len(), 1);
+            assert_eq!(explained.len(), 1);
+            assert_eq!(ordinary[0].span, explained[0].span);
+        }
+    }
+
+    #[test]
+    fn no_false_positives_on_unrelated_text() {
+        let engine = PatternEngine::new();
+        let text = "This is just some regular text about coding and programming.";
+        let detections = engine.detect(text);
+        assert!(
+            detections.is_empty(),
+            "Should not detect patterns in unrelated text"
+        );
+    }
+
+    #[test]
+    fn no_false_positives_on_similar_keywords() {
+        let engine = PatternEngine::new();
+        // Text that contains substrings of anchors but shouldn't match full rules
+        let text = "The less work we do, the better. Try again later with a 10% discount.";
+        let detections = engine.detect(text);
+        // Should not match usage warnings because the full anchor isn't present
+        let usage_warning = detections
+            .iter()
+            .find(|d| d.rule_id.contains("usage.warning"));
+        assert!(
+            usage_warning.is_none(),
+            "Should not have false positive on partial matches"
+        );
+    }
+
+    // ========================================================================
+    // Fixture corpus regression harness
+    // ========================================================================
+
+    #[derive(Debug, Deserialize)]
+    struct PatternFixture {
+        name: String,
+        text: String,
+        expected_rule_ids: Vec<String>,
+        #[serde(default)]
+        expected_extracted: Option<HashMap<String, String>>,
+        #[serde(default)]
+        negative_for: Option<String>,
+    }
+
+    fn fixtures_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("patterns")
+            .join("builtin.json")
+    }
+
+    fn load_fixtures() -> Vec<PatternFixture> {
+        let path = fixtures_path();
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
+        serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
+    }
+
+    #[test]
+    fn fixture_corpus_matches_expected() {
+        let engine = PatternEngine::new();
+        let fixtures = load_fixtures();
+
+        for fixture in fixtures {
+            let detections = engine.detect(&fixture.text);
+            let mut actual: Vec<String> = detections.iter().map(|d| d.rule_id.clone()).collect();
+            let mut expected = fixture.expected_rule_ids.clone();
+            actual.sort();
+            expected.sort();
+
+            assert_eq!(
+                actual, expected,
+                "fixture '{}' mismatch (text: {})",
+                fixture.name, fixture.text
+            );
+
+            if let Some(expected_extracted) = fixture.expected_extracted.as_ref() {
+                assert_eq!(
+                    fixture.expected_rule_ids.len(),
+                    1,
+                    "fixture '{}' extraction expects a single rule id",
+                    fixture.name
+                );
+                let rule_id = fixture.expected_rule_ids[0].as_str();
+                let detection = detections
+                    .iter()
+                    .find(|d| d.rule_id == rule_id)
+                    .expect("expected detection missing");
+                for (key, expected_value) in expected_extracted {
+                    let actual_value = detection
+                        .extracted
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert_eq!(
+                        actual_value, expected_value,
+                        "fixture '{}' extraction mismatch for {}",
+                        fixture.name, key
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixtures_cover_all_builtin_rules() {
+        let engine = PatternEngine::new();
+        let fixtures = load_fixtures();
+
+        let mut positives = HashSet::new();
+        let mut negatives = HashSet::new();
+
+        for fixture in fixtures {
+            for rule_id in &fixture.expected_rule_ids {
+                positives.insert(rule_id.clone());
+            }
+            if let Some(rule_id) = fixture.negative_for {
+                negatives.insert(rule_id);
+            }
+        }
+
+        for rule in engine.rules() {
+            assert!(
+                positives.contains(&rule.id),
+                "Missing positive fixture for rule {}",
+                rule.id
+            );
+            assert!(
+                negatives.contains(&rule.id),
+                "Missing negative fixture for rule {}",
+                rule.id
+            );
+        }
+    }
+
+    // ========== State Gating & Deduplication Tests ==========
+
+    #[test]
+    fn state_gating_filters_by_agent_type() {
+        let engine = PatternEngine::new();
+
+        // Codex usage limit text - use actual anchor from rule
+        let codex_text = "You've hit your usage limit, try again at 3pm";
+
+        // With Codex context - should detect
+        let mut codex_ctx = DetectionContext::with_agent_type(AgentType::Codex);
+        let detections = engine.detect_with_context(codex_text, &mut codex_ctx);
+        assert!(
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Should detect codex.usage.reached with Codex context"
+        );
+
+        // With Claude context - should NOT detect codex rules
+        let mut claude_ctx = DetectionContext::with_agent_type(AgentType::ClaudeCode);
+        let detections = engine.detect_with_context(codex_text, &mut claude_ctx);
+        assert!(
+            !detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Should NOT detect codex.usage.reached with Claude context"
+        );
+    }
+
+    #[test]
+    fn state_gating_allows_wezterm_rules_for_all_agents() {
+        let engine = PatternEngine::new();
+
+        // WezTerm mux connection lost - use actual anchor from rule
+        let wezterm_text = "mux server connection lost - please reconnect";
+
+        // Should fire regardless of agent type
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Unknown,
+        ] {
+            let mut ctx = DetectionContext::with_agent_type(agent);
+            let detections = engine.detect_with_context(wezterm_text, &mut ctx);
+            assert!(
+                detections
+                    .iter()
+                    .any(|d| d.rule_id == "wezterm.mux.connection_lost"),
+                "WezTerm rules should fire for {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_gating_unknown_agent_allows_all() {
+        let engine = PatternEngine::new();
+
+        // With Unknown agent type, all rules should pass through
+        let codex_text = "You've hit your usage limit, try again at 3pm";
+        let mut ctx = DetectionContext::with_agent_type(AgentType::Unknown);
+        let detections = engine.detect_with_context(codex_text, &mut ctx);
+        assert!(
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Unknown agent should allow all rules"
+        );
+    }
+
+    #[test]
+    fn dedup_prevents_repeated_detections() {
+        let engine = PatternEngine::new();
+        // Include trailing period to prevent greedy regex from matching across
+        // concatenated text boundaries (the period stops `[^.]+` in the regex)
+        let text = "You've hit your usage limit, try again at 3pm.";
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection should succeed
+        let first = engine.detect_with_context(text, &mut ctx);
+        assert!(!first.is_empty(), "First detection should find matches");
+
+        // Second detection with same text should be empty (deduped)
+        let second = engine.detect_with_context(text, &mut ctx);
+        assert!(
+            second.is_empty(),
+            "Repeated detection should be deduped, but got {second:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_drop_path_allocations_do_not_scale_with_matched_text_ft_0wnq3() {
+        let rule = rule_with_anchor(
+            "codex.alloc_guard",
+            "TOKEN",
+            Some(r"TOKEN (?:A+) (?P<id>\d+)"),
+        );
+        let pack = PatternPack::new("alloc-pack", "0.1.0", vec![rule]);
+        let engine = PatternEngine::with_packs(vec![pack]).unwrap();
+
+        let short_text = "TOKEN A 7";
+        let long_text = format!("TOKEN {} 7", "A".repeat(32 * 1024));
+
+        let mut short_ctx = DetectionContext::new();
+        let mut long_ctx = DetectionContext::new();
+
+        assert_eq!(
+            engine.detect_with_context(short_text, &mut short_ctx).len(),
+            1
+        );
+        assert_eq!(
+            engine.detect_with_context(&long_text, &mut long_ctx).len(),
+            1
+        );
+
+        reset_detect_with_context_materialization_count();
+        let short_repeat = engine.detect_with_context(short_text, &mut short_ctx);
+        let short_materializations = detect_with_context_materialization_count();
+
+        reset_detect_with_context_materialization_count();
+        let long_repeat = engine.detect_with_context(&long_text, &mut long_ctx);
+        let long_materializations = detect_with_context_materialization_count();
+
+        assert!(
+            short_repeat.is_empty(),
+            "repeat short detection should be dropped by dedupe"
+        );
+        assert!(
+            long_repeat.is_empty(),
+            "repeat long detection should be dropped by dedupe"
+        );
+        #[cfg(feature = "patterns-lazy-captures")]
+        assert_eq!(
+            (short_materializations, long_materializations),
+            (0, 0),
+            "lazy-capture dedupe drop-path should not materialize allocation-heavy detections"
+        );
+        #[cfg(not(feature = "patterns-lazy-captures"))]
+        assert!(
+            short_materializations > 0 && long_materializations > 0,
+            "default eager path should materialize before dedupe: short={short_materializations} long={long_materializations}"
+        );
+    }
+
+    #[test]
+    fn overlap_drop_path_skips_detection_materialization_ft_0wnq3() {
+        let rule = rule_with_anchor(
+            "codex.overlap_guard",
+            "TOKEN",
+            Some(r"TOKEN (?:A+) (?P<id>\d+)"),
+        );
+        let pack = PatternPack::new("overlap-pack", "0.1.0", vec![rule]);
+        let engine = PatternEngine::with_packs(vec![pack]).unwrap();
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "TOKEN A 7".to_string();
+
+        reset_detect_with_context_materialization_count();
+        let repeat = engine.detect_with_context(" trailing", &mut ctx);
+        let materializations = detect_with_context_materialization_count();
+
+        assert!(
+            repeat.is_empty(),
+            "overlap-only detection should be dropped, but got {repeat:?}"
+        );
+        assert_eq!(
+            materializations, 0,
+            "overlap drop-path should not materialize detections"
+        );
+    }
+
+    #[test]
+    fn dedup_allows_different_extracted_values() {
+        let engine = PatternEngine::new();
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection with one token count (matches codex.session.token_usage regex)
+        let text1 = "Token usage: total=94212 input=2115 (+ 1000 cached) output=1000";
+        let first = engine.detect_with_context(text1, &mut ctx);
+        assert!(!first.is_empty(), "First detection should succeed");
+
+        // Second detection with different token count should NOT be deduped
+        let text2 = "Token usage: total=100000 input=3000 (+ 2000 cached) output=5000";
+        let second = engine.detect_with_context(text2, &mut ctx);
+        assert!(
+            !second.is_empty(),
+            "Different extracted values should not be deduped"
+        );
+    }
+
+    #[test]
+    fn dedup_clear_seen_resets() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit, try again at 3pm.";
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection
+        let first = engine.detect_with_context(text, &mut ctx);
+        assert!(!first.is_empty());
+
+        // Clear seen state
+        ctx.clear_seen();
+        assert_eq!(ctx.seen_count(), 0);
+
+        // Should detect again after clear
+        let after_clear = engine.detect_with_context(text, &mut ctx);
+        assert!(!after_clear.is_empty(), "Should detect after clearing seen");
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn clear_seen_resets_seen_order_and_tail_buffer() {
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "partial anchor".to_string();
+        assert!(ctx.mark_seen_key("codex.test:one".to_string()));
+        assert!(ctx.mark_seen_key("codex.test:two".to_string()));
+        assert_eq!(ctx.seen_count(), 2);
+        assert_eq!(ctx.seen_order.len(), 2);
+
+        ctx.clear_seen();
+
+        assert_eq!(ctx.seen_count(), 0);
+        assert!(ctx.seen_order.is_empty());
+        assert_eq!(ctx.tail_buffer, "");
+
+        assert!(ctx.mark_seen_key("codex.test:one".to_string()));
+        assert_eq!(ctx.seen_count(), 1);
+        assert_eq!(ctx.seen_order.len(), 1);
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn seen_generation_recycles_only_after_discarding_the_prior_dedup_epoch() {
+        let mut ctx = DetectionContext::new();
+        assert!(ctx.mark_seen_key("codex.test:old".to_string()));
+        ctx.seen_generation = u64::MAX;
+
+        assert!(ctx.mark_seen_key("codex.test:new".to_string()));
+
+        assert_eq!(ctx.seen_generation, 1);
+        assert_eq!(ctx.seen_count(), 1);
+        assert!(!ctx.seen_keys.contains_key("codex.test:old"));
+        assert!(ctx.seen_keys.contains_key("codex.test:new"));
+        assert_eq!(ctx.seen_order.len(), 1);
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn mark_seen_key_refreshes_expired_key_without_unbounded_order_growth() {
+        // ft-zo4hw: refresh is now O(1) (lazy token invalidation) rather than
+        // an O(n) position-scan + remove. Re-marking an expired key must still
+        // keep at most one entry in the key map, and `seen_order` must stay
+        // bounded (<= 2x capacity) via lazy compaction rather than growing
+        // without limit.
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::ZERO);
+
+        for _ in 0..(DetectionContext::MAX_SEEN_KEYS * 4) {
+            assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        }
+
+        assert_eq!(ctx.seen_count(), 1);
+        assert!(
+            ctx.seen_order.len() <= DetectionContext::MAX_SEEN_KEYS * 2,
+            "seen_order must stay bounded by lazy compaction, got {}",
+            ctx.seen_order.len()
+        );
+        // The single live key is still resolvable and unexpired-checks aside,
+        // remains the one tracked key.
+        assert!(ctx.seen_keys.contains_key("codex.test:repeat"));
+    }
+
+    // ft-wo323: perf-regression guards for the ft-zo4hw amortized-O(1) dedup.
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn mark_seen_key_does_no_scan_below_compaction_threshold() {
+        // Marking distinct new keys below the eviction/compaction thresholds
+        // must examine ZERO seen_order tokens — no string position scan (the
+        // old code scanned the whole deque on every mark, even new ones).
+        reset_detection_dedup_maintenance_steps();
+        let mut ctx = DetectionContext::new();
+
+        let n = DetectionContext::MAX_SEEN_KEYS / 2;
+        for i in 0..n {
+            assert!(ctx.mark_seen_key(format!("codex.test:{i}")));
+        }
+        assert_eq!(
+            detection_dedup_maintenance_steps(),
+            0,
+            "marking below capacity/compaction thresholds must scan zero tokens"
+        );
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn mark_seen_key_is_amortized_o1_under_repeated_expired_marks() {
+        // Re-marking one expired key N times: total maintenance work must be
+        // linear in N (compaction amortizes the stale-token cleanup). The old
+        // code paid an O(deque) position scan per mark.
+        reset_detection_dedup_maintenance_steps();
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::ZERO);
+
+        let n = (DetectionContext::MAX_SEEN_KEYS * 8) as u64;
+        for _ in 0..n {
+            assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        }
+        let steps = detection_dedup_maintenance_steps();
+        assert!(
+            steps <= 4 * n,
+            "maintenance steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(ctx.seen_count(), 1);
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn mark_seen_key_eviction_churn_is_amortized_o1() {
+        // Marking N distinct new keys into a full dedup set forces N evictions;
+        // total work must stay linear (each eviction pops O(1) live tokens).
+        let mut ctx = DetectionContext::new();
+        for i in 0..DetectionContext::MAX_SEEN_KEYS {
+            assert!(ctx.mark_seen_key(format!("fill:{i}")));
+        }
+
+        reset_detection_dedup_maintenance_steps();
+        let n = (DetectionContext::MAX_SEEN_KEYS * 8) as u64;
+        for i in 0..n {
+            assert!(ctx.mark_seen_key(format!("churn:{i}")));
+        }
+        let steps = detection_dedup_maintenance_steps();
+        assert!(
+            steps <= 6 * n,
+            "eviction-churn steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn mark_seen_key_matches_reference_model_under_random_marks() {
+        // Property test: with a TTL long enough that nothing expires, dedup is
+        // an insert-only LRU (a valid re-mark returns false and does NOT refresh
+        // recency). Against a deterministic pseudo-random mark stream the
+        // new/seen decision and live count must match a reference model, and
+        // seen_order must stay bounded.
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::from_secs(3600));
+        let cap = DetectionContext::MAX_SEEN_KEYS;
+
+        let key_space = (cap as u64) * 3 / 2; // > cap so evictions happen
+        let mut order: Vec<u64> = Vec::new(); // front = oldest-inserted (FIFO)
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+
+        for step in 0..5_000u64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let idx = seed % key_space;
+
+            // Reference: insert-only LRU. Seen -> false (no recency change);
+            // new -> insert at MRU, evicting the oldest if full.
+            let ref_new = if order.contains(&idx) {
+                false
+            } else {
+                if order.len() >= cap {
+                    order.remove(0);
+                }
+                order.push(idx);
+                true
+            };
+
+            let is_new = ctx.mark_seen_key(format!("k:{idx}"));
+            assert_eq!(
+                is_new, ref_new,
+                "step {step} idx {idx}: new/seen disagrees with reference model"
+            );
+            assert_eq!(
+                ctx.seen_count(),
+                order.len(),
+                "step {step}: live key count diverged from reference model"
+            );
+            assert!(
+                ctx.seen_order.len() <= cap * 2,
+                "step {step}: seen_order exceeded 2x capacity ({})",
+                ctx.seen_order.len()
+            );
+        }
+    }
+
+    #[test]
+    fn detection_dedup_key_includes_extracted() {
+        let d1 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "1000"}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+
+        let d2 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "2000"}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+
+        assert_ne!(
+            d1.dedup_key(),
+            d2.dedup_key(),
+            "Different extracted values should produce different dedup keys"
+        );
+
+        // Same rule with same extracted should match
+        let d3 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "1000"}),
+            matched_text: "different text".into(),
+            span: (0, 0),
+        };
+
+        assert_eq!(
+            d1.dedup_key(),
+            d3.dedup_key(),
+            "Same rule+extracted should produce same dedup key"
+        );
+    }
+
+    #[test]
+    fn context_with_pane_works() {
+        let ctx = DetectionContext::with_pane(42, Some(AgentType::ClaudeCode));
+        assert_eq!(ctx.pane_id, Some(42));
+        assert_eq!(ctx.agent_type, Some(AgentType::ClaudeCode));
+        assert_eq!(ctx.seen_count(), 0);
+    }
+
+    #[test]
+    fn rule_applies_to_agent_logic() {
+        // Create a mock detection for Codex
+        let codex_detection = Detection {
+            rule_id: "codex.usage_reached".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+
+        // Codex rule should apply to Codex agent
+        assert!(PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::Codex
+        ));
+
+        // Codex rule should NOT apply to Claude agent
+        assert!(!PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::ClaudeCode
+        ));
+
+        // Codex rule should apply to Unknown agent (fallback)
+        assert!(PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::Unknown
+        ));
+
+        // WezTerm rules should apply to all agents
+        let wezterm_detection = Detection {
+            rule_id: "wezterm.pane_exited".into(),
+            agent_type: AgentType::Wezterm,
+            event_type: "lifecycle".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::Codex
+        ));
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::ClaudeCode
+        ));
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::Gemini
+        ));
+    }
+
+    #[test]
+    fn state_gating_prevents_false_positives_in_non_agent_panes() {
+        let engine = PatternEngine::new();
+
+        // Text that might appear in a non-agent pane (e.g., log file output)
+        // but contains Codex-specific keywords
+        let log_text = "Usage limit reached for all Pro models";
+
+        // With Gemini context (wrong agent) - should NOT detect Codex rules
+        let mut ctx = DetectionContext::with_pane(1, Some(AgentType::Gemini));
+        let detections = engine.detect_with_context(log_text, &mut ctx);
+
+        // Should not contain Codex-specific detections
+        for d in &detections {
+            assert!(
+                d.agent_type != AgentType::Codex,
+                "Codex rule {} should not fire in Gemini pane",
+                d.rule_id
+            );
+        }
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_includes_pack_id_for_emitted_detection() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("say hello to the world", &mut ctx, &opts);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].pack_id, "pack");
+        assert_eq!(traces[0].rule_id, "codex.anchor");
+        assert!(traces[0].eligible);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_emits_regex_miss_trace_when_enabled() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.regex",
+            "limit",
+            Some(r"limit (?P<value>\d+)"),
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..Default::default()
+        };
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("limit xx", &mut ctx, &opts);
+
+        assert!(detections.is_empty());
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].pack_id, "pack");
+        assert_eq!(traces[0].rule_id, "codex.regex");
+        assert!(!traces[0].eligible);
+
+        let match_gate = traces[0]
+            .gates
+            .iter()
+            .find(|g| g.gate == "match")
+            .expect("match gate should exist");
+        assert!(!match_gate.passed);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_reports_dedupe_gate_failure_on_second_run() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
+
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..Default::default()
+        };
+
+        let (detections1, traces1) = engine.detect_with_context_and_trace("hello", &mut ctx, &opts);
+        assert_eq!(detections1.len(), 1);
+        assert_eq!(traces1.len(), 1);
+        assert!(traces1[0].eligible);
+
+        let (detections2, traces2) = engine.detect_with_context_and_trace("hello", &mut ctx, &opts);
+        assert!(detections2.is_empty());
+        // The tail buffer prepends the previous "hello", so the combined input is
+        // "hellohello". This yields two anchor hits: one inside the overlap window
+        // (blocked by the overlap gate) and one outside the window (blocked by the
+        // dedupe gate). Both are reported as non-matching traces.
+        assert!(!traces2.is_empty());
+        assert!(traces2.iter().all(|t| !t.eligible));
+
+        let dedupe_trace = traces2
+            .iter()
+            .find(|t| t.gates.iter().any(|g| g.gate == "dedupe" && !g.passed))
+            .expect("a trace with dedupe gate failure should exist");
+
+        let dedupe_gate = dedupe_trace
+            .gates
+            .iter()
+            .find(|g| g.gate == "dedupe")
+            .expect("dedupe gate should exist");
+        assert!(!dedupe_gate.passed);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_redacts_matched_text_and_captures() {
+        let p1 = "sk";
+        let p2 = "-";
+        let p3 = "abc123";
+        let p4 = "456789012345678901234567890123456789012345678901";
+        let secret = format!("{p1}{p2}{p3}{p4}");
+
+        // Ensure the secret is detectable by the redactor before asserting on output.
+        let redactor = Redactor::new();
+        assert!(redactor.contains_secrets(&secret));
+
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.secret",
+            "Key:",
+            Some(r"Key: (?P<key>.+)"),
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions {
+            include_non_matches: true,
+            max_excerpt_bytes: 1024,
+            max_capture_bytes: 1024,
+            ..Default::default()
+        };
+
+        let text = format!("Key: {secret}");
+        let (_detections, traces) = engine.detect_with_context_and_trace(&text, &mut ctx, &opts);
+
+        assert_eq!(traces.len(), 1);
+        let trace = &traces[0];
+        let mt = trace
+            .matched_text
+            .as_ref()
+            .expect("matched_text should exist");
+        assert!(!mt.contains(&secret), "matched_text must not leak secrets");
+        assert!(mt.contains("[REDACTED]"), "expected redaction marker");
+
+        let capture = trace
+            .evidence
+            .iter()
+            .find(|ev| ev.kind == "capture" && ev.label.as_deref() == Some("key"))
+            .expect("capture evidence should exist");
+        let cap_excerpt = capture
+            .excerpt
+            .as_ref()
+            .expect("capture excerpt should exist");
+        assert!(
+            !cap_excerpt.contains(&secret),
+            "capture excerpt must not leak secrets"
+        );
+        assert!(
+            cap_excerpt.contains("[REDACTED]"),
+            "expected redaction marker in capture"
+        );
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_updates_telemetry() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.telemetry",
+            "hello",
+            Some(r"hello (?P<target>world)"),
+        )]);
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("hello world", &mut ctx, &opts);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(traces.len(), 1);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+        assert_eq!(snap.matches_total, 1);
+        assert_eq!(snap.candidate_rules_evaluated, 1);
+        assert_eq!(snap.regex_evaluations, 1);
+        assert_eq!(snap.top_rule_hits.total_inserts, 1);
+        assert_eq!(
+            snap.top_rule_hits
+                .top_items
+                .first()
+                .map(|item| item.key.as_str()),
+            Some("codex.telemetry")
+        );
+    }
+
+    // ========== User Pattern Pack Tests ==========
+
+    #[test]
+    fn user_pack_toml_loads_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("my-rules.toml");
+        fs::write(
+            &pack_path,
+            r#"
+name = "user:my-rules"
+version = "1.0.0"
+
+[[rules]]
+id = "myorg.custom_alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[MY-ORG] Alert:"]
+description = "Custom org alert"
+"#,
+        )
+        .unwrap();
+
+        let pack = load_pack_from_file(pack_path.to_str().unwrap(), Some(dir.path())).unwrap();
+        assert_eq!(pack.rules.len(), 1);
+        assert_eq!(pack.rules[0].id, "myorg.custom_alert");
+    }
+
+    #[test]
+    fn config_file_pack_validates_as_user_pack_with_custom_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("config-rules.toml");
+        fs::write(
+            &pack_path,
+            r#"
+name = "user:config-rules"
+version = "1.0.0"
+
+[[rules]]
+id = "myorg.config_alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[MY-CONFIG] Alert:"]
+description = "Custom config alert"
+"#,
+        )
+        .unwrap();
+        let config = PatternsConfig {
+            packs: vec![format!("file:{}", pack_path.display())],
+            user_packs_enabled: false,
+            ..PatternsConfig::default()
+        };
+
+        let engine =
+            PatternEngine::from_config(&config).expect("file: pack should use user validation");
+        let detections = engine.detect("prefix [MY-CONFIG] Alert: suffix");
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "myorg.config_alert");
+    }
+
+    #[test]
+    fn user_pack_validates_with_custom_prefix() {
+        let pack = PatternPack::new(
+            "user:test",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.custom_rule".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["custom anchor".to_string()],
+                regex: None,
+                description: "Custom rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+        assert!(pack.validate().is_err());
+        assert!(pack.validate_as_user_pack().is_ok());
+    }
+
+    #[test]
+    fn user_pack_rejects_rule_without_dot() {
+        let pack = PatternPack::new(
+            "user:bad",
+            "1.0.0",
+            vec![RuleDef {
+                id: "noruleid".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["anchor".to_string()],
+                regex: None,
+                description: "Bad rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+        assert!(pack.validate_as_user_pack().is_err());
+    }
+
+    #[test]
+    fn user_pack_rejects_numeric_backreference_regex() {
+        let pack = PatternPack::new(
+            "user:backref",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.backref".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["repeat".to_string()],
+                regex: Some(r"(repeat)\s+\1".to_string()),
+                description: "Backreference rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+
+        let error = pack
+            .validate_as_user_pack()
+            .expect_err("user pack regex backreferences must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported numeric backreference"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn user_pack_allows_escaped_numeric_literal_regex() {
+        let pack = PatternPack::new(
+            "user:escaped-backref",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.escaped_backref".to_string(),
+                zone: None,
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["literal".to_string()],
+                regex: Some(r"literal \\1".to_string()),
+                description: "Escaped numeric literal rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+
+        pack.validate_as_user_pack()
+            .expect("escaped numeric literals are not backreferences");
+    }
+
+    #[test]
+    fn discover_packs_finds_toml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("alerts.toml"),
+            r#"
+name = "user:alerts"
+version = "1.0.0"
+[[rules]]
+id = "myorg.alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[ALERT]"]
+description = "Alert rule"
+"#,
+        )
+        .unwrap();
+
+        let sub = dir.path().join("monitoring");
+        fs::create_dir(&sub).unwrap();
+        fs::write(
+            sub.join("rules.toml"),
+            r#"
+name = "user:monitoring"
+version = "2.0.0"
+[[rules]]
+id = "monitor.health_check"
+agent_type = "codex"
+event_type = "health.check"
+severity = "info"
+anchors = ["Health check"]
+description = "Health check rule"
+"#,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("readme.txt"), "not a pack").unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert_eq!(packs.len(), 2);
+        let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"user:alerts"));
+        assert!(names.contains(&"user:monitoring"));
+    }
+
+    #[test]
+    fn discover_packs_finds_nested_rules_yaml_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml_dir = dir.path().join("yaml-pack");
+        fs::create_dir(&yaml_dir).unwrap();
+        fs::write(
+            yaml_dir.join("rules.yaml"),
+            r#"
+name: "user:yaml_nested"
+version: "1.0.0"
+rules:
+  - id: "myorg.yaml_nested"
+    agent_type: "codex"
+    event_type: "custom.yaml_nested"
+    severity: "info"
+    anchors: ["yaml nested"]
+    description: "YAML nested rule"
+"#,
+        )
+        .unwrap();
+
+        let json_dir = dir.path().join("json-pack");
+        fs::create_dir(&json_dir).unwrap();
+        fs::write(
+            json_dir.join("rules.json"),
+            r#"{
+  "name": "user:json_nested",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "myorg.json_nested",
+      "agent_type": "codex",
+      "event_type": "custom.json_nested",
+      "severity": "warning",
+      "anchors": ["json nested"],
+      "description": "JSON nested rule"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert_eq!(packs.len(), 2);
+        let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"user:yaml_nested"));
+        assert!(names.contains(&"user:json_nested"));
+    }
+
+    #[test]
+    fn discover_packs_nonexistent_dir_returns_empty() {
+        let packs = discover_packs_from_dir(Path::new("/nonexistent/path")).unwrap();
+        assert!(packs.is_empty());
+    }
+
+    #[test]
+    fn discover_packs_skips_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("broken.toml"), "this is not valid TOML{{{").unwrap();
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert!(packs.is_empty());
+    }
+
+    /// [ft-05hfm follow-up] A symlink inside `.ft/patterns/` pointing
+    /// outside the pack root must be rejected by `sandbox_resolve`,
+    /// not followed into the user's home directory. Pre-fix,
+    /// `discover_packs_from_dir` passed `root: None`, so a hostile
+    /// repo could place `patterns/config.yaml -> ~/.ssh/id_rsa` and
+    /// have its contents fed to `serde_yaml`, leaking excerpts via
+    /// the parse-error `tracing::warn!`.
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_rejects_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.yaml");
+        fs::write(&target, "secret: exfiltrated\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert!(
+            packs.is_empty(),
+            "symlink escape must be rejected, got {} packs",
+            packs.len()
+        );
+    }
+
+    // ── ft-6mxfs regression: sandbox_resolve_dir ────────────────────
+
+    /// [ft-6mxfs] A missing `.ft/patterns` directory (normal case — most
+    /// repos don't ship one) must return `Ok(None)` so the caller skips
+    /// discovery silently. No error, no panic.
+    #[test]
+    fn sandbox_resolve_dir_missing_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join(".ft").join("patterns");
+        let resolved = sandbox_resolve_dir(&missing, root.path()).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// [ft-6mxfs] A real directory inside the sandbox root canonicalizes
+    /// and returns `Ok(Some(canonical))`. The canonical form is what the
+    /// caller should walk to close the TOCTOU window.
+    #[test]
+    fn sandbox_resolve_dir_inside_returns_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join(".ft").join("patterns");
+        fs::create_dir_all(&inside).unwrap();
+
+        let resolved = sandbox_resolve_dir(&inside, root.path()).unwrap();
+        let resolved = resolved.expect("existing in-sandbox dir should resolve");
+        assert!(resolved.starts_with(root.path().canonicalize().unwrap()));
+    }
+
+    /// [ft-6mxfs] The headline vector: `.ft/patterns` itself is a symlink
+    /// to a directory outside the workspace (e.g. `/etc`). The per-file
+    /// `sandbox_resolve` gate in `discover_packs_from_dir` does NOT catch
+    /// this because it uses the symlinked-to path as its own root — so
+    /// every file inside looks in-sandbox. `sandbox_resolve_dir` must
+    /// reject the directory itself before any walk happens.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_resolve_dir_rejects_toplevel_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        // Create some content in the "attacker-pointed-at" directory so
+        // a canonicalize() on the symlink doesn't fail for a reason
+        // other than the one we're testing.
+        fs::write(outside.path().join("decoy.yaml"), "x: 1\n").unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        let ws_dir = ft_dir.join("patterns");
+        std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
+
+        let err = sandbox_resolve_dir(&ws_dir, root.path())
+            .expect_err("symlink-escaped pack dir must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolves outside sandbox root") || msg.contains("ft-6mxfs"),
+            "error should cite sandbox escape: {msg}"
+        );
+    }
+
+    /// Non-dangling canonicalize failures must fail closed. A symlink
+    /// loop is malformed input, not "no packs configured", and silently
+    /// treating it as `Ok(None)` would mask both operator mistakes and
+    /// hostile path tricks.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_resolve_dir_symlink_loop_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        let ws_dir = ft_dir.join("patterns");
+        std::os::unix::fs::symlink("patterns", &ws_dir).unwrap();
+
+        let err = sandbox_resolve_dir(&ws_dir, root.path())
+            .expect_err("symlink loop must not be treated as a missing pack dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not accessible")
+                || msg.contains("Too many levels of symbolic links")
+                || msg.contains("filesystem loop"),
+            "error should surface the canonicalize failure: {msg}"
+        );
+    }
+
+    /// [ft-qhyfh] The sibling vector on the user-packs branch: if the
+    /// configured `user_packs_dir` is itself a symlink whose canonical
+    /// form escapes its parent directory (the dotfile-sharing gotcha —
+    /// `~/.config/wa/patterns` valid on one machine, redirected on
+    /// another), `load_packs_from_config` must refuse the load rather
+    /// than silently widen its read scope. The parent of `user_dir` is
+    /// used as the sandbox root so an explicit absolute configuration
+    /// (`user_packs_dir = /opt/company/patterns`) still passes while a
+    /// cross-parent escape is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_refuses_user_packs_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        // Stage a pack inside `outside`. If the sandbox gate fails open,
+        // the pack would load and `LoadedPacks.packs.len()` would be > 0,
+        // so a false negative is unambiguous.
+        fs::write(
+            outside.path().join("escape.toml"),
+            r#"
+name = "user:escape"
+version = "1.0.0"
+[[rules]]
+id = "exfil.escape"
+agent_type = "codex"
+event_type = "exfil.event"
+severity = "info"
+anchors = ["[escape]"]
+description = "escape"
+"#,
+        )
+        .unwrap();
+
+        // Build a separate "user config home" dir and place a symlink
+        // inside it pointing at `outside`. The symlink path is what the
+        // user has configured as `user_packs_dir`. Canonicalizing the
+        // symlink path follows the redirect to `outside`, which is
+        // NOT under the symlink's parent — so sandbox_resolve_dir must
+        // reject it.
+        let user_home = tempfile::tempdir().unwrap();
+        let user_packs_symlink = user_home.path().join("patterns");
+        std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(user_packs_symlink.to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        match load_packs_from_config(&config, None) {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("outside sandbox root") || msg.contains("ft-6mxfs"),
+                    "error should cite sandbox escape at the user_packs dir \
+                     boundary: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "symlinked user_packs_dir that escapes its parent must cause \
+                 load to fail, but load_packs_from_config returned Ok — \
+                 ft-qhyfh regression"
+            ),
+        }
+    }
+
+    /// [ft-qhyfh] Companion test: a user_packs_dir that is a real
+    /// directory (no symlink at the boundary) still loads successfully
+    /// after the gate is added. Guards against an over-tight fix that
+    /// breaks the 99% case where users just drop files into a normal
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_accepts_normal_user_packs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("normal.toml"),
+            r#"
+name = "user:normal"
+version = "1.0.0"
+[[rules]]
+id = "myorg.normal"
+agent_type = "codex"
+event_type = "normal.event"
+severity = "info"
+anchors = ["[normal]"]
+description = "normal"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded = load_packs_from_config(&config, None)
+            .expect("[ft-qhyfh] normal user_packs_dir must still load after the sandbox gate");
+        assert!(
+            loaded.packs.iter().any(|p| p.name == "user:normal"),
+            "[ft-qhyfh] user:normal pack must be present in loaded packs"
+        );
+    }
+
+    /// ft-yjfke: an UNSIGNED user pack (no supply-chain manifest) loaded via the
+    /// production path must be downgraded to observe-only — its action triggers
+    /// (workflow / preview_command) are stripped — rather than running at full
+    /// action mode. The pack is still loaded (gated, not rejected) so detection
+    /// keeps working; only the action surface is removed.
+    #[test]
+    fn load_packs_from_config_downgrades_unsigned_user_pack_to_observe_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("evil.toml"),
+            r#"
+name = "user:evil"
+version = "1.0.0"
+[[rules]]
+id = "myorg.attack"
+agent_type = "codex"
+event_type = "attack.event"
+severity = "info"
+anchors = ["[ATTACK-ANCHOR]"]
+description = "unsigned pack carrying an action trigger"
+workflow = "attacker_workflow"
+preview_command = "do_something_dangerous"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded = load_packs_from_config(&config, None)
+            .expect("unsigned pack loads (gated, not rejected)");
+        assert!(
+            loaded.user_pack_names.contains("user:evil"),
+            "the unsigned pack must be classified as a user pack"
+        );
+        let pack = loaded
+            .packs
+            .iter()
+            .find(|p| p.name == "user:evil")
+            .expect("unsigned user pack must still load");
+
+        // ft-yjfke: the action triggers must be stripped to observe-only.
+        let rule = &pack.rules[0];
+        assert!(
+            rule.workflow.is_none(),
+            "unsigned user-pack workflow trigger must be stripped (ft-yjfke), got {:?}",
+            rule.workflow
+        );
+        assert!(
+            rule.preview_command.is_none(),
+            "unsigned user-pack preview_command must be stripped (ft-yjfke), got {:?}",
+            rule.preview_command
+        );
+    }
+
+    /// [ft-qhyfh] Missing / never-populated user_packs_dir is the 99%
+    /// case. It must continue to return Ok with no user packs — matching
+    /// the prior behavior where `discover_packs_from_dir` early-returned
+    /// on `!dir.exists()`.
+    #[test]
+    fn load_packs_from_config_missing_user_packs_dir_is_silent() {
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some("/nonexistent/path/for/ft-qhyfh/test".to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded = load_packs_from_config(&config, None)
+            .expect("[ft-qhyfh] missing user_packs_dir must not error");
+        assert!(
+            !loaded.packs.iter().any(|p| p.name.starts_with("user:")),
+            "[ft-qhyfh] missing user_packs_dir should yield no user packs"
+        );
+    }
+
+    /// [ft-6mxfs] End-to-end: `load_packs_from_config` must refuse a
+    /// repo that ships `.ft/patterns -> /elsewhere`. This is the real
+    /// entry point that attacker-controlled repos reach.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_refuses_symlinked_patterns_dir() {
+        let outside = tempfile::tempdir().unwrap();
+        // Stage a pack that WOULD load if the symlink check failed,
+        // so a false negative (packs.len() > 0) is unambiguous.
+        fs::write(
+            outside.path().join("exfil.toml"),
+            r#"
+name = "user:exfil"
+version = "1.0.0"
+[[rules]]
+id = "exfil.rule"
+agent_type = "codex"
+event_type = "exfil.event"
+severity = "info"
+anchors = ["[exfil]"]
+description = "exfil"
+"#,
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            ..PatternsConfig::default()
+        };
+        // `LoadedPacks` has no Debug impl, so we can't call `.expect_err`
+        // directly — match the Result by hand instead.
+        match load_packs_from_config(&config, Some(root.path())) {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("outside sandbox root") || msg.contains("ft-6mxfs"),
+                    "error should cite sandbox escape: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "symlinked .ft/patterns must cause load to fail, but load_packs_from_config \
+                 returned Ok — ft-6mxfs regression"
+            ),
+        }
+    }
+
+    #[test]
+    fn user_pack_rules_detected_by_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("custom.toml"),
+            r#"
+name = "user:custom"
+version = "1.0.0"
+[[rules]]
+id = "myorg.deploy_alert"
+agent_type = "codex"
+event_type = "deploy.alert"
+severity = "critical"
+anchors = ["[DEPLOY-ALERT]"]
+description = "Deployment alert"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("[DEPLOY-ALERT] Production deployment failed");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "myorg.deploy_alert");
+    }
+
+    #[test]
+    fn user_packs_disabled_skips_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("custom.toml"),
+            r#"
+name = "user:custom"
+version = "1.0.0"
+[[rules]]
+id = "myorg.deploy_alert"
+agent_type = "codex"
+event_type = "deploy.alert"
+severity = "critical"
+anchors = ["[DEPLOY-ALERT]"]
+description = "Deployment alert"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("[DEPLOY-ALERT] Production deployment failed");
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn user_pack_overrides_builtin_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("override.toml"),
+            r#"
+name = "user:override"
+version = "1.0.0"
+[[rules]]
+id = "codex.usage.reached"
+agent_type = "codex"
+event_type = "usage.reached"
+severity = "info"
+anchors = ["custom usage reached"]
+description = "Overridden usage reached"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("custom usage reached alert");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.usage.reached");
+    }
+
+    #[test]
+    fn workspace_local_packs_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_dir = root.path().join(".ft").join("patterns");
+        fs::create_dir_all(&ws_dir).unwrap();
+        fs::write(
+            ws_dir.join("local.toml"),
+            r#"
+name = "user:local"
+version = "1.0.0"
+[[rules]]
+id = "project.lint_warning"
+agent_type = "codex"
+event_type = "lint.warning"
+severity = "info"
+anchors = ["[LINT-WARN]"]
+description = "Project lint warning"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            user_packs_dir: None,
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config_with_root(&config, Some(root.path())).unwrap();
+        let detections = engine.detect("[LINT-WARN] unused variable");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "project.lint_warning");
+    }
+
+    // ========================================================================
+    // Batch 2: RubyBeaver wa-1u90p.7.1 — expanded coverage
+    // ========================================================================
+
+    // --- AgentType serde round-trip ---
+
+    #[test]
+    fn agent_type_serde_round_trip() {
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ] {
+            let json = serde_json::to_string(&agent).unwrap();
+            let back: AgentType = serde_json::from_str(&json).unwrap();
+            assert_eq!(agent, back);
+        }
+    }
+
+    #[test]
+    fn agent_type_deserialize_snake_case() {
+        let cc: AgentType = serde_json::from_str("\"claude_code\"").unwrap();
+        assert_eq!(cc, AgentType::ClaudeCode);
+        let wez: AgentType = serde_json::from_str("\"wezterm\"").unwrap();
+        assert_eq!(wez, AgentType::Wezterm);
+    }
+
+    // --- Severity serde round-trip ---
+
+    #[test]
+    fn severity_serde_round_trip() {
+        for sev in [Severity::Info, Severity::Warning, Severity::Critical] {
+            let json = serde_json::to_string(&sev).unwrap();
+            let back: Severity = serde_json::from_str(&json).unwrap();
+            assert_eq!(sev, back);
+        }
+    }
+
+    // --- Detection serde (span is skipped) ---
+
+    #[test]
+    fn detection_serde_skips_span() {
+        let d = Detection {
+            rule_id: "codex.test".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.95,
+            extracted: serde_json::json!({"key": "val"}),
+            matched_text: "hello".into(),
+            span: (10, 20),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("span"),
+            "span should be skipped in serialization"
+        );
+        let back: Detection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rule_id, "codex.test");
+        assert_eq!(
+            back.span,
+            (0, 0),
+            "deserialized span should default to (0,0)"
+        );
+    }
+
+    // --- TraceSpan serde ---
+
+    #[test]
+    fn trace_span_serde_round_trip() {
+        let span = TraceSpan { start: 5, end: 42 };
+        let json = serde_json::to_string(&span).unwrap();
+        let back: TraceSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(span, back);
+    }
+
+    // --- TraceEvidence serde (skip_serializing_if) ---
+
+    #[test]
+    fn trace_evidence_serde_omits_none_fields() {
+        let ev = TraceEvidence {
+            kind: "anchor".into(),
+            label: None,
+            span: None,
+            excerpt: None,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("label"), "None label should be omitted");
+        assert!(!json.contains("span"), "None span should be omitted");
+        assert!(!json.contains("excerpt"), "None excerpt should be omitted");
+        assert!(
+            !json.contains("truncated"),
+            "false truncated should be omitted"
+        );
+    }
+
+    #[test]
+    fn trace_evidence_serde_includes_present_fields() {
+        let ev = TraceEvidence {
+            kind: "match".into(),
+            label: Some("test_label".into()),
+            span: Some(TraceSpan { start: 0, end: 10 }),
+            excerpt: Some("hello".into()),
+            truncated: true,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: TraceEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    // --- TraceGate serde ---
+
+    #[test]
+    fn trace_gate_serde_round_trip() {
+        let gate = TraceGate {
+            gate: "agent_type".into(),
+            passed: false,
+            reason: Some("mismatch".into()),
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: TraceGate = serde_json::from_str(&json).unwrap();
+        assert_eq!(gate, back);
+    }
+
+    // --- TraceBounds serde ---
+
+    #[test]
+    fn trace_bounds_serde_round_trip() {
+        let bounds = TraceBounds {
+            max_evidence_items: 8,
+            max_excerpt_bytes: 160,
+            max_capture_bytes: 120,
+            evidence_total: 5,
+            evidence_truncated: false,
+            truncated_fields: vec!["matched_text".into()],
+        };
+        let json = serde_json::to_string(&bounds).unwrap();
+        let back: TraceBounds = serde_json::from_str(&json).unwrap();
+        assert_eq!(bounds, back);
+    }
+
+    #[test]
+    fn trace_bounds_omits_empty_truncated_fields() {
+        let bounds = TraceBounds {
+            max_evidence_items: 4,
+            max_excerpt_bytes: 80,
+            max_capture_bytes: 60,
+            evidence_total: 2,
+            evidence_truncated: false,
+            truncated_fields: Vec::new(),
+        };
+        let json = serde_json::to_string(&bounds).unwrap();
+        assert!(
+            !json.contains("truncated_fields"),
+            "empty truncated_fields should be omitted"
+        );
+    }
+
+    // --- TraceOptions defaults ---
+
+    #[test]
+    fn trace_options_default_values() {
+        let opts = TraceOptions::default();
+        assert_eq!(opts.max_evidence_items, 8);
+        assert_eq!(opts.max_excerpt_bytes, 160);
+        assert_eq!(opts.max_capture_bytes, 120);
+        assert!(!opts.include_non_matches);
+    }
+
+    // --- PatternLibrary::empty ---
+
+    #[test]
+    fn pattern_library_empty_has_no_rules() {
+        let lib = PatternLibrary::empty();
+        assert!(lib.rules().is_empty());
+        assert!(lib.packs().is_empty());
+        assert!(lib.pack_for_rule("codex.test").is_none());
+    }
+
+    // --- RuleDef::interpolate_template ---
+
+    #[test]
+    fn interpolate_template_all_placeholders() {
+        let result = RuleDef::interpolate_template(
+            "ft events --pane {pane} --event {event_id} --agent {agent} --rule {rule_id}",
+            42,
+            Some(100),
+            &AgentType::Codex,
+            "codex.usage.reached",
+        );
+        assert_eq!(
+            result,
+            "ft events --pane 42 --event 100 --agent codex --rule codex.usage.reached"
+        );
+    }
+
+    #[test]
+    fn interpolate_template_none_event_id() {
+        let result = RuleDef::interpolate_template(
+            "event={event_id}",
+            1,
+            None,
+            &AgentType::Gemini,
+            "gemini.test",
+        );
+        assert_eq!(result, "event=unknown");
+    }
+
+    // --- RuleDef::get_preview_command ---
+
+    #[test]
+    fn get_preview_command_with_template() {
+        let rule = RuleDef {
+            id: "codex.test".into(),
+            zone: None,
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            anchors: vec!["anchor".into()],
+            regex: None,
+            description: "test".into(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: Some("ft preview --pane {pane}".into()),
+            learn_more_url: None,
+        };
+        let cmd = rule.get_preview_command(7, Some(99));
+        assert_eq!(cmd, Some("ft preview --pane 7".to_string()));
+    }
+
+    #[test]
+    fn get_preview_command_none_when_missing() {
+        let rule = sample_rule("codex.test");
+        assert!(rule.get_preview_command(1, None).is_none());
+    }
+
+    // --- RuleDef::get_manual_fix ---
+
+    #[test]
+    fn get_manual_fix_with_template() {
+        let mut rule = sample_rule("codex.test");
+        rule.manual_fix = Some("Check pane {pane} for {agent}".into());
+        let fix = rule.get_manual_fix(5, Some(10));
+        assert_eq!(fix, Some("Check pane 5 for codex".to_string()));
+    }
+
+    #[test]
+    fn get_manual_fix_none_when_missing() {
+        let rule = sample_rule("codex.test");
+        assert!(rule.get_manual_fix(1, None).is_none());
+    }
+
+    // --- parse_severity_override ---
+
+    #[test]
+    fn parse_severity_override_all_valid() {
+        assert_eq!(parse_severity_override("info").unwrap(), Severity::Info);
+        assert_eq!(
+            parse_severity_override("warning").unwrap(),
+            Severity::Warning
+        );
+        assert_eq!(
+            parse_severity_override("critical").unwrap(),
+            Severity::Critical
+        );
+        // Case-insensitive
+        assert_eq!(parse_severity_override("INFO").unwrap(), Severity::Info);
+        assert_eq!(
+            parse_severity_override("  Warning  ").unwrap(),
+            Severity::Warning
+        );
+    }
+
+    #[test]
+    fn parse_severity_override_invalid() {
+        assert!(parse_severity_override("error").is_err());
+        assert!(parse_severity_override("").is_err());
+        assert!(parse_severity_override("debug").is_err());
+    }
+
+    // --- bound_utf8 ---
+
+    #[test]
+    fn bound_utf8_within_limit() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello", 10);
+        assert_eq!(s, "hello");
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn bound_utf8_at_exact_limit() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello", 5);
+        assert_eq!(s, "hello");
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn bound_utf8_truncates() {
+        let (s, trunc) = PatternEngine::bound_utf8("hello world", 5);
+        assert_eq!(s, "hello");
+        assert!(trunc);
+    }
+
+    #[test]
+    fn bound_utf8_respects_char_boundary() {
+        // Multi-byte character: "é" is 2 bytes in UTF-8
+        let (s, trunc) = PatternEngine::bound_utf8("café", 4);
+        assert_eq!(s, "caf");
+        assert!(trunc);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_bound_utf8_preserves_valid_prefix_and_limit(
+            input in ".*",
+            max_bytes in 0usize..256,
+        ) {
+            let (bounded, truncated) = PatternEngine::bound_utf8(&input, max_bytes);
+
+            prop_assert!(bounded.len() <= max_bytes);
+            prop_assert!(input.starts_with(&bounded));
+            prop_assert!(input.is_char_boundary(bounded.len()));
+            prop_assert_eq!(truncated, bounded.len() < input.len());
+
+            if !truncated {
+                prop_assert_eq!(bounded, input);
+            }
+        }
+    }
+
+    // --- slice_bytes ---
+
+    #[test]
+    fn slice_bytes_valid_range() {
+        assert_eq!(
+            PatternEngine::slice_bytes("hello world", 6, 11),
+            Some("world")
+        );
+    }
+
+    #[test]
+    fn slice_bytes_invalid_range() {
+        assert!(PatternEngine::slice_bytes("hello", 3, 2).is_none()); // start > end
+        assert!(PatternEngine::slice_bytes("hello", 0, 10).is_none()); // end > len
+    }
+
+    #[test]
+    fn slice_bytes_empty_range() {
+        assert_eq!(PatternEngine::slice_bytes("hello", 2, 2), Some(""));
+    }
+
+    // --- DetectionContext::set_ttl ---
+
+    #[test]
+    fn context_set_ttl_changes_ttl() {
+        let mut ctx = DetectionContext::new();
+        assert_eq!(ctx.ttl, Duration::from_secs(300)); // default 5 min
+        ctx.set_ttl(Duration::from_secs(60));
+        assert_eq!(ctx.ttl, Duration::from_secs(60));
+    }
+
+    // --- DetectionContext MAX_SEEN_KEYS eviction ---
+
+    #[test]
+    fn context_evicts_oldest_when_at_capacity() {
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::from_secs(3600)); // long TTL
+
+        // Fill to capacity
+        for i in 0..DetectionContext::MAX_SEEN_KEYS {
+            let d = Detection {
+                rule_id: format!("test.rule_{i}"),
+                agent_type: AgentType::Codex,
+                event_type: "test".into(),
+                severity: Severity::Info,
+                confidence: 0.9,
+                extracted: serde_json::json!({"i": i}),
+                matched_text: "test".into(),
+                span: (0, 0),
+            };
+            assert!(ctx.mark_seen(&d), "should be new at index {i}");
+        }
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+
+        // Add one more — should evict oldest
+        let overflow = Detection {
+            rule_id: "test.overflow".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        assert!(ctx.mark_seen(&overflow));
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+
+        // The first item should have been evicted
+        let first = Detection {
+            rule_id: "test.rule_0".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"i": 0}),
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        assert!(!ctx.is_seen(&first), "oldest should have been evicted");
+    }
+
+    // --- Cross-segment matching (tail buffer) ---
+
+    #[test]
+    fn cross_segment_tail_buffer_catches_split_pattern() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.split", "SPLIT_MATCH", None)]);
+
+        let mut ctx = DetectionContext::new();
+
+        // First segment ends with partial anchor
+        let seg1 = "some text SPLIT_";
+        let d1 = engine.detect_with_context(seg1, &mut ctx);
+        assert!(d1.is_empty(), "partial anchor should not match");
+
+        // Second segment completes it
+        let seg2 = "MATCH more text";
+        let d2 = engine.detect_with_context(seg2, &mut ctx);
+        assert!(
+            d2.iter().any(|d| d.rule_id == "codex.split"),
+            "cross-segment match should fire"
+        );
+    }
+
+    #[test]
+    fn tail_buffer_does_not_reemit_old_matches() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.tail", "TAILTEST", None)]);
+
+        let mut ctx = DetectionContext::new();
+
+        // First segment has the match
+        let seg1 = "xTAILTESTx";
+        let d1 = engine.detect_with_context(seg1, &mut ctx);
+        assert!(!d1.is_empty(), "should match in first segment");
+
+        // Second segment with overlap — match is in overlap and deduped
+        let seg2 = "new text after";
+        let d2 = engine.detect_with_context(seg2, &mut ctx);
+        // The overlap region contains the old match, but dedup prevents re-emission
+        let reemitted = d2.iter().any(|d| d.rule_id == "codex.tail");
+        assert!(!reemitted, "should not re-emit from overlap/dedup");
+    }
+
+    /// A rule whose earliest anchor hit lands in the carried-over overlap must
+    /// still fire on a genuinely new occurrence later in the same input.
+    ///
+    /// `collect_candidate_rules` keeps one anchor span per rule, and the
+    /// anchor-only branch tests that single span against the overlap window.
+    /// Recording the *first* hit unconditionally made the second occurrence
+    /// invisible — the whole rule was skipped. Concretely: an agent hits its
+    /// usage limit, the detection ages past the dedup TTL, the agent hits the
+    /// limit again, and the second event is never emitted. Regex-bearing rules
+    /// were never affected because they filter per match.
+    #[test]
+    fn anchor_only_rule_fires_on_new_occurrence_after_one_in_overlap() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.usage.reached",
+            "LIMIT_REACHED",
+            None,
+        )]);
+
+        // The state after a prior scan that already reported this anchor,
+        // with the dedup entry aged out by TTL. Seeded directly because
+        // `clear_seen` also drops the tail buffer, which would remove the
+        // overlap window this regression is about.
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "LIMIT_REACHED\n".to_string();
+
+        let detections = engine.detect_with_context("LIMIT_REACHED\n", &mut ctx);
+        assert!(
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "a genuinely new occurrence must fire even though an earlier hit \
+             sits inside the overlap window"
+        );
+    }
+
+    /// The complement: when *every* occurrence is inside the overlap there is
+    /// nothing new, and the rule must stay silent.
+    #[test]
+    fn anchor_only_rule_stays_silent_when_all_occurrences_are_in_overlap() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.usage.reached",
+            "LIMIT_REACHED",
+            None,
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "LIMIT_REACHED\n".to_string();
+
+        let detections = engine.detect_with_context("nothing interesting here\n", &mut ctx);
+        assert!(
+            !detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "an occurrence carried only by the overlap must not re-fire"
+        );
+    }
+
+    #[test]
+    fn tail_buffer_utf8_trim_respects_byte_cap() {
+        let mut text = None;
+        for prefix in ["", "x", "xy", "xyz"] {
+            let candidate = format!(
+                "{}{}",
+                prefix,
+                "€".repeat((DetectionContext::MAX_TAIL_SIZE / 3) + 8)
+            );
+            let nominal_start = candidate.len() - DetectionContext::MAX_TAIL_SIZE;
+            if candidate.len() > DetectionContext::MAX_TAIL_SIZE
+                && !candidate.is_char_boundary(nominal_start)
+            {
+                text = Some(candidate);
+                break;
+            }
+        }
+        let text = text.expect("fixture should place nominal tail start inside a UTF-8 codepoint");
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.no_match", "NO_MATCH", None)]);
+
+        let mut ctx = DetectionContext::new();
+        let detections = engine.detect_with_context(&text, &mut ctx);
+        assert!(detections.is_empty());
+        assert!(ctx.tail_buffer.len() <= DetectionContext::MAX_TAIL_SIZE);
+
+        let mut traced_ctx = DetectionContext::new();
+        let (detections, traces) =
+            engine.detect_with_context_and_trace(&text, &mut traced_ctx, &TraceOptions::default());
+        assert!(detections.is_empty());
+        assert!(traces.is_empty());
+        assert!(traced_ctx.tail_buffer.len() <= DetectionContext::MAX_TAIL_SIZE);
+    }
+
+    // --- builtin_pack_by_name ---
+
+    #[test]
+    fn builtin_pack_by_name_known() {
+        assert!(builtin_pack_by_name("core").is_some());
+        assert!(builtin_pack_by_name("codex").is_some());
+        assert!(builtin_pack_by_name("claude_code").is_some());
+        assert!(builtin_pack_by_name("gemini").is_some());
+        assert!(builtin_pack_by_name("wezterm").is_some());
+    }
+
+    #[test]
+    fn builtin_pack_by_name_unknown() {
+        assert!(builtin_pack_by_name("unknown_pack").is_none());
+        assert!(builtin_pack_by_name("").is_none());
+    }
+
+    // --- builtin_packs count ---
+
+    #[test]
+    fn builtin_packs_count() {
+        let packs = builtin_packs();
+        assert_eq!(packs.len(), 5, "expected 5 builtin packs");
+    }
+
+    // --- is_pack_file ---
+
+    #[test]
+    fn is_pack_file_accepts_valid_extensions() {
+        assert!(is_pack_file(Path::new("rules.toml")));
+        assert!(is_pack_file(Path::new("rules.yaml")));
+        assert!(is_pack_file(Path::new("rules.yml")));
+        assert!(is_pack_file(Path::new("rules.json")));
+        assert!(is_pack_file(Path::new("rules.TOML")));
+        assert!(is_pack_file(Path::new("rules.YAML")));
+    }
+
+    #[test]
+    fn is_pack_file_rejects_invalid_extensions() {
+        assert!(!is_pack_file(Path::new("rules.txt")));
+        assert!(!is_pack_file(Path::new("rules.rs")));
+        assert!(!is_pack_file(Path::new("rules")));
+        assert!(!is_pack_file(Path::new(".toml")));
+    }
+
+    // --- load_pack_from_id ---
+
+    #[test]
+    fn load_pack_from_id_builtin() {
+        let pack = load_pack_from_id("builtin:codex", None).unwrap();
+        assert_eq!(pack.name, "builtin:codex");
+    }
+
+    #[test]
+    fn load_pack_from_id_unknown_builtin() {
+        assert!(load_pack_from_id("builtin:nonexistent", None).is_err());
+    }
+
+    #[test]
+    fn load_pack_from_id_unknown_scheme() {
+        assert!(load_pack_from_id("unknown:something", None).is_err());
+    }
+
+    #[test]
+    fn load_pack_from_id_file_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("test.json");
+        let json = r#"{"name":"test","version":"1.0","rules":[{"id":"codex.t","agent_type":"codex","event_type":"t","severity":"info","anchors":["a"],"description":"t"}]}"#;
+        fs::write(&pack_path, json).unwrap();
+
+        let pack_id = format!("file:{}", pack_path.display());
+        let pack = load_pack_from_id(&pack_id, None).unwrap();
+        assert_eq!(pack.name, pack_id);
+    }
+
+    // --- normalize_pack_key ---
+
+    #[test]
+    fn normalize_pack_key_exact_match() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert_eq!(
+            normalize_pack_key("builtin:codex", &packs),
+            Some("builtin:codex".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_pack_key_strips_builtin_prefix() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert_eq!(
+            normalize_pack_key("codex", &packs),
+            Some("builtin:codex".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_pack_key_no_match() {
+        let packs = vec![PatternPack::new("builtin:codex", "1.0", Vec::new())];
+        assert!(normalize_pack_key("nonexistent", &packs).is_none());
+    }
+
+    // --- merge_pack_overrides ---
+
+    #[test]
+    fn merge_pack_overrides_combines_disabled_rules() {
+        let base = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let overlay = PackOverride {
+            disabled_rules: vec!["rule_b".into()],
+            ..PackOverride::default()
+        };
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert!(merged.disabled_rules.contains(&"rule_a".to_string()));
+        assert!(merged.disabled_rules.contains(&"rule_b".to_string()));
+    }
+
+    #[test]
+    fn merge_pack_overrides_no_duplicate_disabled_rules() {
+        let base = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let overlay = PackOverride {
+            disabled_rules: vec!["rule_a".into()],
+            ..PackOverride::default()
+        };
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert_eq!(
+            merged
+                .disabled_rules
+                .iter()
+                .filter(|r| r.as_str() == "rule_a")
+                .count(),
+            1,
+            "should not duplicate disabled rules"
+        );
+    }
+
+    #[test]
+    fn merge_pack_overrides_severity_overlay_wins() {
+        let mut base = PackOverride::default();
+        base.severity_overrides
+            .insert("rule_a".into(), "info".into());
+        let mut overlay = PackOverride::default();
+        overlay
+            .severity_overrides
+            .insert("rule_a".into(), "critical".into());
+        let merged = merge_pack_overrides(&base, &overlay);
+        assert_eq!(
+            merged.severity_overrides.get("rule_a").map(String::as_str),
+            Some("critical")
+        );
+    }
+
+    // --- apply_pack_overrides empty ---
+
+    #[test]
+    fn apply_pack_overrides_empty_is_noop() {
+        let packs = vec![PatternPack::new(
+            "test",
+            "1.0",
+            vec![sample_rule("codex.test")],
+        )];
+        let overrides = HashMap::new();
+        let result = apply_pack_overrides(packs.clone(), &overrides).unwrap();
+        assert_eq!(result.len(), packs.len());
+        assert_eq!(result[0].rules.len(), 1);
+    }
+
+    // --- PatternEngine::quick_reject with disabled ---
+
+    #[test]
+    fn quick_reject_returns_true_when_disabled() {
+        let engine = PatternEngine::with_packs_and_settings(
+            vec![PatternPack::new(
+                "pack",
+                "1.0",
+                vec![rule_with_anchor("codex.q", "XYZ", None)],
+            )],
+            false, // quick_reject_enabled = false
+        )
+        .unwrap();
+        // When disabled, quick_reject always returns true
+        assert!(engine.quick_reject("no match here"));
+    }
+
+    // --- detect empty text ---
+
+    #[test]
+    fn detect_empty_text_returns_empty() {
+        let engine = PatternEngine::new();
+        assert!(engine.detect("").is_empty());
+    }
+
+    // --- detect_with_context empty text ---
+
+    #[test]
+    fn detect_with_context_empty_text_returns_empty() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        assert!(engine.detect_with_context("", &mut ctx).is_empty());
+    }
+
+    // --- detect_with_context_and_trace empty text ---
+
+    #[test]
+    fn detect_with_context_and_trace_empty_text() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+        let (d, t) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
+        assert!(d.is_empty());
+        assert!(t.is_empty());
+    }
+
+    // --- Detection::dedup_key with non-object extracted ---
+
+    #[test]
+    fn dedup_key_non_object_extracted() {
+        let d = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+            span: (0, 0),
+        };
+        // Non-object extracted should produce empty hash part
+        assert_eq!(d.dedup_key(), "test.rule:");
+    }
+
+    // --- PatternEngine::packs / rules accessors ---
+
+    #[test]
+    fn engine_packs_returns_all_builtin_packs() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        assert_eq!(engine.packs().len(), 5);
+    }
+
+    #[test]
+    fn engine_rules_non_empty_for_builtins() {
+        let engine = PatternEngine::new();
+        assert!(
+            !engine.rules().is_empty(),
+            "builtin engine should have rules"
+        );
+    }
+
+    // --- load_pack_from_file with various formats ---
+
+    #[test]
+    fn load_pack_from_file_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        let yaml = r#"
+name: "test-yaml"
+version: "1.0.0"
+rules:
+  - id: "codex.yaml_test"
+    agent_type: "codex"
+    event_type: "test"
+    severity: "info"
+    anchors: ["yaml_anchor"]
+    description: "YAML test rule"
+"#;
+        fs::write(&path, yaml).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(pack.name, "test-yaml");
+        assert_eq!(pack.rules.len(), 1);
+    }
+
+    #[test]
+    fn load_pack_from_file_accepts_uppercase_yaml_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.YAML");
+        let yaml = r#"
+name: "test-uppercase-yaml"
+version: "1.0.0"
+rules:
+  - id: "codex.uppercase_yaml_test"
+    agent_type: "codex"
+    event_type: "test"
+    severity: "info"
+    anchors: ["uppercase_yaml_anchor"]
+    description: "Uppercase YAML extension test rule"
+"#;
+        fs::write(&path, yaml).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(pack.name, "test-uppercase-yaml");
+        assert_eq!(pack.rules.len(), 1);
+    }
+
+    #[test]
+    fn load_pack_from_file_unsupported_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.xml");
+        fs::write(&path, "<rules/>").unwrap();
+        assert!(load_pack_from_file(path.to_str().unwrap(), None).is_err());
+    }
+
+    // ── Sandbox hardening regressions ───────────────────────────────
+    //
+    // These lock down the fix to a concrete vulnerability: before the
+    // sandbox check was added, `load_pack_from_file` let any config-
+    // controllable `file:` pack escape the project root via absolute
+    // paths, `..` traversal, or symlinks pointing out. Each test below
+    // builds the exact escape shape and asserts the loader refuses it
+    // with an InvalidRule/PackNotFound error, while the happy case (a
+    // legitimate pack inside the root) still loads.
+
+    fn minimal_yaml_pack() -> &'static str {
+        "name: sandbox_test\nversion: 1.0.0\nrules: []\n"
+    }
+
+    #[test]
+    fn sandbox_accepts_relative_path_inside_root() {
+        // Baseline: a normal relative path under the sandbox root loads
+        // fine. If this regresses, the sandbox check has become
+        // too restrictive.
+        let root = tempfile::tempdir().unwrap();
+        let pack_path = root.path().join("pack.yaml");
+        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+
+        let pack = load_pack_from_file("pack.yaml", Some(root.path()))
+            .expect("legitimate relative path inside root must load");
+        assert_eq!(pack.name, "sandbox_test");
+    }
+
+    #[test]
+    fn sandbox_rejects_relative_traversal_outside_root() {
+        // The classic attack: `file:../secret.yaml` with a sandbox root
+        // set must not escape. Place the target one level above the
+        // sandbox so a traversal would hit it.
+        let parent = tempfile::tempdir().unwrap();
+        let secret = parent.path().join("secret.yaml");
+        fs::write(&secret, minimal_yaml_pack()).unwrap();
+
+        let root = parent.path().join("sandbox");
+        fs::create_dir(&root).unwrap();
+
+        let err = load_pack_from_file("../secret.yaml", Some(&root))
+            .expect_err("..-traversal must be rejected by the sandbox check");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sandbox_rejects_absolute_path_outside_root() {
+        // Absolute-path bypass: earlier the loader used an absolute
+        // caller-supplied path as-is, ignoring `root` entirely. An
+        // absolute path to a file that exists but lives outside the
+        // sandbox must now be rejected.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_pack = outside.path().join("elsewhere.yaml");
+        fs::write(&outside_pack, minimal_yaml_pack()).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let err = load_pack_from_file(outside_pack.to_str().unwrap(), Some(root.path()))
+            .expect_err("absolute path outside sandbox must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_rejects_symlink_pointing_outside_root() {
+        // Symlink escape: a symlink sitting inside the sandbox pointing
+        // at a file outside. `fs::canonicalize` resolves the link
+        // target, and the prefix check rejects the final resolved path.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target.yaml");
+        fs::write(&target, minimal_yaml_pack()).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let link_path = root.path().join("pack.yaml");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let err = load_pack_from_file("pack.yaml", Some(root.path()))
+            .expect_err("symlink pointing outside sandbox must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_from_dir_skips_symlinked_pack_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("linked.yaml");
+        fs::write(&target, minimal_yaml_pack()).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
+
+        let packs = discover_packs_from_dir(root.path()).unwrap();
+        assert!(packs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_from_dir_loads_non_utf8_pack_files() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let filename = OsString::from_vec(b"non-utf8-\xFF.yaml".to_vec());
+        let pack_path = root.path().join(filename);
+        // APFS and HFS+ refuse names that are not valid UTF-8 (EILSEQ), so the
+        // pack this test is about cannot exist on them.
+        if let Err(error) = fs::write(&pack_path, minimal_yaml_pack()) {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+            return;
+        }
+
+        let packs = discover_packs_from_dir(root.path()).unwrap();
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].name, "sandbox_test");
+    }
+
+    #[test]
+    fn sandbox_absolute_path_inside_root_accepted() {
+        // An absolute path that happens to point inside the sandbox
+        // root is legitimate — reject only the out-of-root shapes.
+        let root = tempfile::tempdir().unwrap();
+        let pack_path = root.path().join("inside.yaml");
+        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+
+        let pack = load_pack_from_file(pack_path.to_str().unwrap(), Some(root.path()))
+            .expect("absolute path inside sandbox must be accepted");
+        assert_eq!(pack.name, "sandbox_test");
+    }
+
+    // ── ft-05hfm size-cap regressions ───────────────────────────────
+
+    #[test]
+    fn load_pack_from_file_rejects_oversize_yaml() {
+        // [ft-05hfm] A hostile `.ft/patterns/huge.yaml` in a cloned
+        // repo must not be inhaled into memory. Stat-based reject
+        // before the allocator sees the bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.yaml");
+        // Write MAX_PACK_BYTES + 1 bytes of a valid-shaped YAML
+        // prefix followed by filler. The filler makes the body
+        // exceed the cap; shape doesn't matter because we never
+        // reach the parser.
+        let mut body = String::from(
+            "name: test\nversion: 1.0.0\nrules:\n  - id: x\n    agent_type: codex\n    event_type: e\n    severity: info\n    anchors: [\"",
+        );
+        body.push_str(&"a".repeat((MAX_PACK_BYTES as usize) + 64));
+        body.push_str("\"]\n");
+        fs::write(&path, body).unwrap();
+
+        let err = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect_err("oversize pack must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max allowed"),
+            "unexpected rejection message: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{MAX_PACK_BYTES}")),
+            "rejection must cite MAX_PACK_BYTES: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_pack_from_file_accepts_pack_at_cap_boundary() {
+        // At the boundary: a pack of exactly MAX_PACK_BYTES should
+        // pass the cap check and reach the parser (which may then
+        // reject for other reasons — that's out of scope here).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.yaml");
+        // Build a valid minimal pack padded with YAML comment bytes
+        // to land just under the cap.
+        let base = "name: boundary\nversion: 1.0.0\nrules: []\n";
+        let filler_count = (MAX_PACK_BYTES as usize) - base.len() - 10;
+        let mut body = String::from(base);
+        body.push_str(&format!(
+            "# {}\n",
+            "f".repeat(filler_count.saturating_sub(3))
+        ));
+        assert!(
+            body.len() as u64 <= MAX_PACK_BYTES,
+            "test fixture mis-sized: {} > {}",
+            body.len(),
+            MAX_PACK_BYTES
+        );
+        fs::write(&path, body).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect("pack at the cap boundary must parse");
+        assert_eq!(pack.name, "boundary");
+    }
+
+    #[test]
+    fn load_pack_from_file_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        let payload =
+            "{".to_string() + &"\"x\":0,".repeat((MAX_PACK_BYTES as usize) / 6 + 1024) + "\"y\":0}";
+        assert!(payload.len() as u64 > MAX_PACK_BYTES);
+        fs::write(&path, payload).unwrap();
+        let err = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect_err("oversize JSON pack must be rejected");
+        assert!(format!("{err}").contains("max allowed"));
+    }
+
+    // --- MatchTrace serde round-trip ---
+
+    #[test]
+    fn match_trace_serde_round_trip() {
+        let trace = MatchTrace {
+            pack_id: "builtin:codex".into(),
+            rule_id: "codex.test".into(),
+            extractor_id: Some("regex".into()),
+            matched_text: Some("test match".into()),
+            confidence: Some(0.95),
+            eligible: true,
+            gates: vec![TraceGate {
+                gate: "agent_type".into(),
+                passed: true,
+                reason: None,
+            }],
+            evidence: vec![TraceEvidence {
+                kind: "anchor".into(),
+                label: Some("test".into()),
+                span: Some(TraceSpan { start: 0, end: 4 }),
+                excerpt: Some("test".into()),
+                truncated: false,
+            }],
+            bounds: TraceBounds {
+                max_evidence_items: 8,
+                max_excerpt_bytes: 160,
+                max_capture_bytes: 120,
+                evidence_total: 1,
+                evidence_truncated: false,
+                truncated_fields: vec!["matched_text".into()],
+            },
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: MatchTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(trace.pack_id, back.pack_id);
+        assert_eq!(trace.rule_id, back.rule_id);
+        assert_eq!(trace.confidence, back.confidence);
+        assert_eq!(trace.eligible, back.eligible);
+    }
+
+    // --- RuleDef serde round-trip ---
+
+    #[test]
+    fn rule_def_serde_round_trip() {
+        let rule = RuleDef {
+            id: "codex.serde_test".into(),
+            zone: None,
+            agent_type: AgentType::Codex,
+            event_type: "test".into(),
+            severity: Severity::Warning,
+            anchors: vec!["anchor1".into(), "anchor2".into()],
+            regex: Some(r"test (?P<val>\d+)".into()),
+            description: "serde test rule".into(),
+            remediation: Some("fix it".into()),
+            workflow: Some("handle_test".into()),
+            manual_fix: Some("do it manually".into()),
+            preview_command: Some("ft preview --pane {pane}".into()),
+            learn_more_url: Some("https://example.com".into()),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: RuleDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "codex.serde_test");
+        assert_eq!(back.anchors.len(), 2);
+        assert_eq!(back.severity, Severity::Warning);
+        assert!(back.regex.is_some());
+        assert!(back.remediation.is_some());
+        assert!(back.workflow.is_some());
+        assert!(back.manual_fix.is_some());
+        assert!(back.preview_command.is_some());
+        assert!(back.learn_more_url.is_some());
+    }
+
+    // --- PatternPack serde round-trip ---
+
+    #[test]
+    fn pattern_pack_serde_round_trip() {
+        let pack = PatternPack::new("test-pack", "2.0.0", vec![sample_rule("codex.serde")]);
+        let json = serde_json::to_string(&pack).unwrap();
+        let back: PatternPack = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test-pack");
+        assert_eq!(back.version, "2.0.0");
+        assert_eq!(back.rules.len(), 1);
+    }
+
+    // --- EngineIndex debug ---
+
+    #[test]
+    fn engine_index_debug_does_not_panic() {
+        let index = build_engine_index(&[sample_rule("codex.debug")]).unwrap();
+        let debug = format!("{index:?}");
+        assert!(debug.contains("EngineIndex"));
+    }
+
+    // --- trace_gates_skeleton ---
+
+    #[test]
+    fn trace_gates_skeleton_has_four_gates() {
+        let gates = PatternEngine::trace_gates_skeleton();
+        assert_eq!(gates.len(), 4);
+        assert_eq!(gates[0].gate, "agent_type");
+        assert_eq!(gates[1].gate, "overlap");
+        assert_eq!(gates[2].gate, "dedupe");
+        assert_eq!(gates[3].gate, "match");
+        assert!(gates.iter().all(|g| g.passed));
+    }
+
+    // --- Claude Code specific rule detection ---
+
+    #[test]
+    fn detect_claude_code_tool_use() {
+        let engine = PatternEngine::new();
+        let text = "Using tool: Bash to run tests";
+        let detections = engine.detect(text);
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.tool_use");
+        assert!(d.is_some(), "Should match claude_code.tool_use");
+        assert_eq!(
+            d.unwrap()
+                .extracted
+                .get("tool_name")
+                .and_then(|v| v.as_str()),
+            Some("Bash")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_overloaded() {
+        let engine = PatternEngine::new();
+        let text = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.";
+        let detections = engine.detect(text);
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.error.overloaded");
+        assert!(d.is_some(), "Should match claude_code.error.overloaded");
+    }
+
+    /// Claude Code's own API failures, as its session logs record them
+    /// (Claude Code 2.1.201..2.1.322) and as its TUI renders them under a
+    /// tool-result gutter, each raise exactly their error rule. Agent prose
+    /// and tool output that merely mention a timeout, a closed connection, an
+    /// overloaded server, a server error, safeguards or a selected model raise
+    /// none of the error rules.
+    #[test]
+    fn claude_code_error_rules_follow_real_api_errors_not_prose() {
+        let engine = PatternEngine::new();
+        for (text, rule) in [
+            (
+                "API Error: Connection lost mid-response. The response above may be incomplete.",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Unable to connect to API (ConnectionRefused)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection dropped (ECONNRESET)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection closed mid-response. The response above may be incomplete.",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: No response from API (waited 3m, then 10m on the retry).",
+                "claude_code.error.timeout",
+            ),
+            (
+                "API Error: The response stopped arriving. The response above may be incomplete.",
+                "claude_code.error.timeout",
+            ),
+            (
+                "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+                "claude_code.error.overloaded",
+            ),
+            (
+                "API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.",
+                "claude_code.error.server",
+            ),
+            (
+                "API Error: Server error mid-response. The response above may be incomplete.",
+                "claude_code.error.server",
+            ),
+            (
+                "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time: Opus 5.5 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Opus 5.5.\n\nTry rephrasing the request in a new session or change your model.",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "API Error: Sonnet 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time on a Sonnet model.",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "API Error: Opus 4.8's safeguards flagged this message. Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate cybersecurity work. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it. Run /model to pick a different model.",
+                "claude_code.error.model_unavailable",
+            ),
+        ] {
+            for rendered in [text.to_string(), format!("  ⎿  {text}\n")] {
+                let ids: Vec<String> = engine
+                    .detect(&rendered)
+                    .into_iter()
+                    .map(|d| d.rule_id)
+                    .collect();
+                assert_eq!(ids, vec![rule.to_string()], "{rendered:?}");
+            }
+        }
+
+        // The refused model and the model to replace are extracted.
+        for (text, rule, model, scope) in [
+            (
+                "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup).",
+                "claude_code.error.safeguards",
+                "Opus 5.5",
+                Some("session"),
+            ),
+            (
+                "API Error: Opus 4.8's safeguards flagged this message. Our intentionally broad safeguards",
+                "claude_code.error.safeguards",
+                "Opus 4.8",
+                Some("message"),
+            ),
+            // A model named differently, with a typographic apostrophe.
+            (
+                "API Error: Claude Opus 6’s safeguards flagged this session.",
+                "claude_code.error.safeguards",
+                "Claude Opus 6",
+                Some("session"),
+            ),
+            (
+                "There's an issue with the selected model (opus-5). It may not exist or you may not have access to it.",
+                "claude_code.error.model_unavailable",
+                "opus-5",
+                None,
+            ),
+        ] {
+            let detection = engine
+                .detect(text)
+                .into_iter()
+                .find(|d| d.rule_id == rule)
+                .unwrap_or_else(|| panic!("{text:?} raised no {rule}"));
+            assert_eq!(detection.extracted["model"], model, "{text:?}");
+            if let Some(scope) = scope {
+                assert_eq!(detection.extracted["scope"], scope, "{text:?}");
+            }
+        }
+
+        for prose in [
+            "Prior historical CASS searches timed out in earlier block; no new historical-clean claim here.",
+            "The RCH lane timed out after 600 seconds, so I reran it on ts1.",
+            "ssh: connect to host 10.0.0.5 port 22: Connection timed out",
+            "Error: connection failed - ECONNREFUSED",
+            "Database overloaded: connection pool exhausted, try reducing concurrency",
+            "Test suite timed out after 30 seconds waiting for database response",
+            "The websocket connection closed before the handshake finished.",
+            "Server overloaded, please retry in 30 seconds",
+            "I grepped for API Error handling in the client.",
+            "The upstream returned HTTP 500 Internal Server Error twice.",
+            "curl: (22) The requested URL returned error: 500",
+            "Hit a server error mid-run, so I restarted the lane.",
+            "Error: 500 Internal server error from the registry.",
+            "The new safeguards flagged this message as spam, so the mail bounced.",
+            "Opus 5.5's safeguards flagged this session last week; I switched models.",
+            "There is an issue with the selected model in the config loader.",
+            "Check the selected model (opus-5.5) in settings.json before the run.",
+        ] {
+            let errors: Vec<String> = engine
+                .detect(prose)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.error."))
+                .collect();
+            assert!(errors.is_empty(), "{prose:?} raised {errors:?}");
+        }
+    }
+
+    /// "Prompt is too long" and "Credit balance is too low" are the whole
+    /// error message, so they count only as their own complete line.
+    #[test]
+    fn claude_code_whole_line_errors_need_their_own_complete_line() {
+        let engine = PatternEngine::new();
+        for (text, rule) in [
+            // Claude Code's logs (2.1.232 and 2.1.219, API status 400).
+            ("Prompt is too long", "claude_code.error.prompt_too_long"),
+            (
+                "Credit balance is too low",
+                "claude_code.error.credit_balance",
+            ),
+            // Variants listed at code.claude.com/docs/en/errors.
+            (
+                "Prompt is too long · automatic compaction failed: the summary did not fit",
+                "claude_code.error.prompt_too_long",
+            ),
+            (
+                "Input is too long for requested model.",
+                "claude_code.error.prompt_too_long",
+            ),
+            (
+                "Context limit reached · /compact or /clear to continue",
+                "claude_code.error.prompt_too_long",
+            ),
+        ] {
+            for rendered in [
+                format!("{text}\n"),
+                format!("  ⎿  {text}\n"),
+                format!("earlier output\n  ⎿  {text}  \r\n\n"),
+            ] {
+                let ids: Vec<String> = engine
+                    .detect(&rendered)
+                    .into_iter()
+                    .map(|d| d.rule_id)
+                    .collect();
+                assert_eq!(ids, vec![rule.to_string()], "{rendered:?}");
+            }
+            // Without its line end the line may still be arriving.
+            assert!(
+                engine.detect(text).iter().all(|d| d.rule_id != rule),
+                "{text:?}"
+            );
+        }
+
+        for prose in [
+            // Claude Code's docs, quoted in a session's tool output (excerpt).
+            "For runtime API errors such as `429`, or `Prompt is too long`, see the [Error reference](/docs/en/errors).\n",
+            "Prompt is too long for the summarizer, so I split it in two.\n",
+            "The prompt is too long\n",
+            // Typed into the composer.
+            "> Prompt is too long\n",
+            "Credit balance is too low to run the nightly batch, per the billing page.\n",
+            "If the credit balance is too low, every turn fails.\n",
+            "Context limit reached at 200k tokens, so I ran /compact.\n",
+        ] {
+            let errors: Vec<String> = engine
+                .detect(prose)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.error."))
+                .collect();
+            assert!(errors.is_empty(), "{prose:?} raised {errors:?}");
+        }
+    }
+
+    #[test]
+    fn detect_gemini_oauth_required() {
+        let engine = PatternEngine::new();
+        let text = "Please authorize this app to access your Google account";
+        let detections = engine.detect(text);
+        let d = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.auth.oauth_required");
+        assert!(d.is_some(), "Should match gemini.auth.oauth_required");
+    }
+
+    #[test]
+    fn detect_multiple_anchor_matches() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.multi", "foo", None)]);
+        let text = "foo bar foo baz foo";
+        let detections = engine.detect(text);
+
+        // The engine deduplicates by rule_id (one detection per matching rule,
+        // not per anchor occurrence), so 3 anchor hits → 1 detection.
+        assert_eq!(
+            detections.len(),
+            1,
+            "Should produce 1 detection (deduplicated by rule)"
+        );
+        assert_eq!(detections[0].matched_text, "foo");
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DetectionFingerprint {
+        rule_id: String,
+        matched_text: String,
+        span: (usize, usize),
+        captures: Vec<(String, String)>,
+    }
+
+    fn detection_fingerprints(detections: &[Detection]) -> Vec<DetectionFingerprint> {
+        detections
+            .iter()
+            .map(|detection| {
+                let mut captures = detection
+                    .extracted
+                    .as_object()
+                    .map(|extracted| {
+                        extracted
+                            .iter()
+                            .filter_map(|(key, value)| {
+                                value.as_str().map(|value| (key.clone(), value.to_string()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                captures.sort();
+
+                DetectionFingerprint {
+                    rule_id: detection.rule_id.clone(),
+                    matched_text: detection.matched_text.clone(),
+                    span: detection.span,
+                    captures,
+                }
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_context_trace_matches_plain_context_detection(
+            prefix in "[a-z0-9 _.,:-]{0,40}",
+            code in 0u16..10_000,
+            suffix in "[a-z0-9 _.,:-]{0,40}",
+        ) {
+            let rule_id = "codex.trace_plain_mr";
+            let anchor = "TRACE_EQUIV";
+            let regex = r"TRACE_EQUIV (?P<code>\d{1,5})";
+            let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+            let text = format!("{prefix}{anchor} {code}{suffix}");
+
+            let mut plain_context = DetectionContext::with_agent_type(AgentType::Codex);
+            let plain = engine.detect_with_context(&text, &mut plain_context);
+
+            let mut trace_context = DetectionContext::with_agent_type(AgentType::Codex);
+            let (traced, traces) = engine.detect_with_context_and_trace(
+                &text,
+                &mut trace_context,
+                &TraceOptions::default(),
+            );
+
+            prop_assert_eq!(detection_fingerprints(&traced), detection_fingerprints(&plain));
+            prop_assert_eq!(traces.len(), traced.len());
+            prop_assert!(traces.iter().all(|trace| trace.eligible));
+        }
+    }
+
+    #[test]
+    fn conformance_anchor_only_dedupes_across_pattern_engine_entrypoints() {
+        let rule_id = "codex.anchor_conformance";
+        let anchor = "ANCHOR_OK";
+        let text = "pre ANCHOR_OK mid ANCHOR_OK post";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, None)]);
+
+        let aho = AhoCorasick::new([anchor]).expect("anchor reference matcher must compile");
+        let aho_spans: Vec<_> = aho
+            .find_overlapping_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(aho_spans, vec![(4, 13), (18, 27)]);
+
+        let direct = engine.detect(text);
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![DetectionFingerprint {
+            rule_id: rule_id.to_string(),
+            matched_text: anchor.to_string(),
+            span: aho_spans[0],
+            captures: Vec::new(),
+        }];
+
+        assert_eq!(detection_fingerprints(&direct), expected);
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), 1);
+
+        let repeated_context = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeated_context.is_empty(),
+            "context path must dedupe an already-seen anchor-only detection"
+        );
+    }
+
+    #[test]
+    fn conformance_regex_captures_match_fancy_regex_regex_and_aho_paths() {
+        let rule_id = "codex.regex_conformance";
+        let anchor = "ERROR";
+        let regex = r"ERROR code (?P<code>\d+)";
+        let text = "ERROR code 42\nnoise\nERROR code 99";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let std_regex = regex::Regex::new(regex).expect("std regex reference must compile");
+        let std_codes: Vec<_> = std_regex
+            .captures_iter(text)
+            .map(|captures| captures["code"].to_string())
+            .collect();
+        assert_eq!(std_codes, vec!["42", "99"]);
+
+        let fancy = compile_rule_regex(regex).expect("fancy regex reference must compile");
+        let fancy_codes: Vec<_> = fancy
+            .captures_iter(text)
+            .map(|captures| {
+                let captures = captures.expect("reference fancy regex capture must succeed");
+                captures
+                    .name("code")
+                    .expect("code capture should be present")
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(fancy_codes, std_codes);
+
+        let aho = AhoCorasick::new([anchor]).expect("anchor reference matcher must compile");
+        let aho_span_count = aho.find_overlapping_iter(text).count();
+        assert_eq!(aho_span_count, std_codes.len());
+
+        let direct = engine.detect(text);
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![
+            DetectionFingerprint {
+                rule_id: rule_id.to_string(),
+                matched_text: "ERROR code 42".to_string(),
+                span: (0, 13),
+                captures: vec![("code".to_string(), "42".to_string())],
+            },
+            DetectionFingerprint {
+                rule_id: rule_id.to_string(),
+                matched_text: "ERROR code 99".to_string(),
+                span: (20, 33),
+                captures: vec![("code".to_string(), "99".to_string())],
+            },
+        ];
+
+        assert_eq!(detection_fingerprints(&direct), expected);
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), expected.len());
+    }
+
+    #[test]
+    fn conformance_context_paths_dedupe_repeated_regex_captures() {
+        let rule_id = "codex.regex_dedupe_conformance";
+        let anchor = "ERROR";
+        let regex = r"ERROR code (?P<code>\d+)";
+        let text = "ERROR code 42\nagain\nERROR code 42";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let std_regex = regex::Regex::new(regex).expect("std regex reference must compile");
+        assert_eq!(std_regex.captures_iter(text).count(), 2);
+
+        let direct = engine.detect(text);
+        assert_eq!(
+            detection_fingerprints(&direct).len(),
+            2,
+            "raw detect path reports every regex capture"
+        );
+
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![DetectionFingerprint {
+            rule_id: rule_id.to_string(),
+            matched_text: "ERROR code 42".to_string(),
+            span: (0, 13),
+            captures: vec![("code".to_string(), "42".to_string())],
+        }];
+
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), 1);
+
+        let repeated_context = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeated_context.is_empty(),
+            "context path must dedupe repeated extracted values across calls"
+        );
+    }
+
+    #[cfg(feature = "teddy-prefilter")]
+    #[test]
+    fn teddy_prefilter_matches_aho_candidate_oracle() {
+        let rules = vec![
+            rule_with_anchor(
+                "codex.teddy.error",
+                "TERROR",
+                Some(r"TERROR code (?P<code>\d+)"),
+            ),
+            rule_with_anchor("codex.teddy.ready", "READY_OK", None),
+            rule_with_anchor(
+                "codex.teddy.limit",
+                "LIMIT_NOW",
+                Some(r"LIMIT_NOW (?P<window>[A-Za-z0-9_-]+)"),
+            ),
+        ];
+        let engine = engine_with_rules(rules);
+        let index = engine.index();
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            panic!("test rules must build an anchor matcher");
+        };
+
+        if index.teddy_prefilter.is_none() {
+            return;
+        }
+
+        let corpus = [
+            ("plain miss with no anchors", false),
+            ("prefix TERROR code 42 suffix", true),
+            ("READY_OK and unrelated text", true),
+            ("LIMIT_NOW window_a\nTERROR code 7", true),
+            ("TERROX code 99 READY_NO LIMIT_LATER", false),
+        ];
+
+        for (text, should_match) in corpus {
+            let (candidate_rules, _) =
+                PatternEngine::collect_candidate_rules(index, text, matcher, 0);
+            assert_eq!(
+                !candidate_rules.is_empty(),
+                should_match,
+                "Aho candidate oracle mismatch for {text:?}"
+            );
+            assert_eq!(
+                PatternEngine::teddy_prefilter_may_match(index, text),
+                should_match,
+                "Teddy prefilter must agree with Aho candidate presence for {text:?}"
+            );
+
+            let direct = engine.detect(text);
+            let mut trace_context = DetectionContext::new();
+            let (traced, traces) = engine.detect_with_context_and_trace(
+                text,
+                &mut trace_context,
+                &TraceOptions::default(),
+            );
+            assert_eq!(
+                detection_fingerprints(&direct),
+                detection_fingerprints(&traced),
+                "prefiltered direct and traced paths must remain byte-equivalent for {text:?}"
+            );
+            assert_eq!(traces.len(), traced.len());
+        }
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    fn collect_candidate_rules_hashmap_oracle(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        for matched in matcher.find_overlapping_iter(text) {
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
+                continue;
+            };
+
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                if matched_anchor_by_rule[idx].is_none() {
+                    candidate_rules.push(idx);
+                    matched_anchor_by_rule[idx] = Some(anchor_match);
+                }
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    fn assert_mphf_route_matches_hashmap_oracle(
+        index: &EngineIndex,
+        matcher: &AhoCorasick,
+        text: &str,
+        label: &str,
+    ) {
+        let (mphf_indices, mphf_anchors) =
+            PatternEngine::collect_candidate_rules(index, text, matcher, 0);
+        let (oracle_indices, oracle_anchors) =
+            collect_candidate_rules_hashmap_oracle(index, text, matcher);
+        assert_eq!(
+            mphf_indices, oracle_indices,
+            "candidate rule order diverged for {label}"
+        );
+        assert_eq!(
+            mphf_anchors, oracle_anchors,
+            "matched anchor fallback diverged for {label}"
+        );
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    #[test]
+    fn mphf_anchor_dispatch_matches_hashmap_route_oracle() {
+        let engine = PatternEngine::new();
+        let index = engine.index();
+        let matcher = index
+            .anchor_matcher
+            .as_ref()
+            .expect("builtin rules must build an anchor matcher");
+
+        index
+            .anchor_dispatch
+            .validate_routes(&index.anchor_list, &index.anchor_rule_buckets)
+            .expect("MPHF dispatch must be collision-free over the full anchor keyset");
+        assert_eq!(
+            index.anchor_dispatch.base.slots.len(),
+            index.anchor_list.len(),
+            "MPHF base must use exactly one slot per immutable anchor"
+        );
+
+        for (anchor_idx, anchor) in index.anchor_list.iter().enumerate() {
+            assert_eq!(
+                PatternEngine::anchor_rule_indices(index, anchor_idx)
+                    .expect("MPHF dispatch must route every Aho anchor"),
+                index.anchor_rule_buckets[anchor_idx].as_slice(),
+                "route bucket diverged for anchor {anchor_idx}: {anchor:?}"
+            );
+
+            let text = format!("prefix\n{anchor}\nsuffix");
+            assert_mphf_route_matches_hashmap_oracle(
+                index,
+                matcher,
+                &text,
+                &format!("single anchor {anchor_idx}: {anchor:?}"),
+            );
+        }
+
+        let full_anchor_corpus = index
+            .anchor_list
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_mphf_route_matches_hashmap_oracle(
+            index,
+            matcher,
+            &full_anchor_corpus,
+            "full anchor corpus",
+        );
+
+        let conformance_corpus = concat!(
+            "You've hit your usage limit, try again at 3pm.\n",
+            "Usage limit reached for all Pro models. Please wait before continuing.\n",
+            "ERROR code 42\nREADY_OK\nLIMIT_NOW window_a\n",
+            "mux server connection lost - please reconnect"
+        );
+        assert_mphf_route_matches_hashmap_oracle(
+            index,
+            matcher,
+            conformance_corpus,
+            "mixed conformance corpus",
+        );
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    #[test]
+    fn fingerprint_dedup_matches_string_key_oracle_and_uses_o1_lru() {
+        let rule_id = "codex.fingerprint_dedup";
+        let anchor = "FP_DEDUP";
+        let regex = r"FP_DEDUP code=(?P<code>\d+) name=(?P<name>[A-Za-z_]+)";
+        let text = concat!(
+            "prefix FP_DEDUP code=7 name=alpha\n",
+            "FP_DEDUP code=7 name=alpha\n",
+            "FP_DEDUP code=8 name=beta suffix"
+        );
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let direct = engine.detect(text);
+        assert_eq!(direct.len(), 3);
+        let mut seen_keys = HashSet::new();
+        let string_key_oracle = direct
+            .iter()
+            .filter(|detection| seen_keys.insert(detection.dedup_key()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut context = DetectionContext::new();
+        let fingerprint_detections = engine.detect_with_context(text, &mut context);
+        assert_eq!(
+            detection_fingerprints(&fingerprint_detections),
+            detection_fingerprints(&string_key_oracle),
+            "fingerprint dedup must emit the same first-seen detections as the string-key oracle"
+        );
+        assert_eq!(context.seen_count(), string_key_oracle.len());
+        assert_eq!(
+            context.seen_fingerprints.len(),
+            string_key_oracle.len(),
+            "fingerprint mode must store exactly one fingerprint per oracle key"
+        );
+
+        let repeat = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeat.is_empty(),
+            "fingerprint path must drop already-seen detections"
+        );
+
+        let mut churn = DetectionContext::new();
+        reset_detection_dedup_maintenance_steps();
+        let churn_count = DetectionContext::MAX_SEEN_KEYS * 8;
+        for i in 0..churn_count {
+            assert!(churn.mark_seen_fingerprint(0xfeed_0000_u128 + i as u128));
+        }
+        assert_eq!(churn.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+        assert_eq!(
+            churn.fingerprint_nodes.len(),
+            DetectionContext::MAX_SEEN_KEYS,
+            "fingerprint LRU must reuse slots instead of growing past capacity"
+        );
+        assert!(churn.fingerprint_free.is_empty());
+        assert!(
+            detection_dedup_maintenance_steps() <= churn_count as u64,
+            "fingerprint eviction must stay one O(1) step per overflow insert"
+        );
+
+        let mut expired = DetectionContext::new();
+        expired.set_ttl(Duration::ZERO);
+        for _ in 0..(DetectionContext::MAX_SEEN_KEYS * 4) {
+            assert!(expired.mark_seen_fingerprint(0xfeed_dead_beef));
+        }
+        assert_eq!(expired.seen_count(), 1);
+        assert_eq!(
+            expired
+                .fingerprint_nodes
+                .iter()
+                .filter(|node| node.occupied)
+                .count(),
+            1,
+            "refreshing one expired fingerprint must not leak duplicate live nodes"
+        );
+        assert_eq!(expired.fingerprint_nodes.len(), 1);
+    }
+
+    #[cfg(feature = "patterns-lazy-captures")]
+    #[test]
+    fn lazy_capture_materialization_matches_trace_oracle_after_dedup_gate() {
+        let rule_id = "codex.lazy_capture_equivalence";
+        let anchor = "LAZY";
+        let regex = r"LAZY code=(?P<code>\d+) name=(?P<name>[A-Za-z_]+)";
+        let text = concat!(
+            "prefix LAZY code=7 name=alpha\n",
+            "LAZY code=7 name=alpha\n",
+            "LAZY code=8 name=beta suffix"
+        );
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        reset_detect_with_context_materialization_count();
+        let mut lazy_context = DetectionContext::new();
+        let lazy_detections = engine.detect_with_context(text, &mut lazy_context);
+        let lazy_materializations = detect_with_context_materialization_count();
+
+        let mut trace_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut trace_context,
+            &TraceOptions::default(),
+        );
+
+        assert_eq!(
+            detection_fingerprints(&lazy_detections),
+            detection_fingerprints(&trace_detections),
+            "lazy capture path must be byte-equivalent to the traced eager oracle"
+        );
+        assert_eq!(
+            detection_fingerprints(&lazy_detections).len(),
+            2,
+            "duplicate extracted values should dedupe before materialization"
+        );
+        assert_eq!(traces.len(), 2);
+        assert_eq!(
+            lazy_materializations, 2,
+            "lazy path should only materialize the two emitted detections"
+        );
+
+        reset_detect_with_context_materialization_count();
+        let repeat = engine.detect_with_context(text, &mut lazy_context);
+        assert!(
+            repeat.is_empty(),
+            "repeated lazy path scan should drop every duplicate detection"
+        );
+        assert_eq!(
+            detect_with_context_materialization_count(),
+            0,
+            "lazy path should defer capture materialization past the dedup gate"
+        );
+    }
+
+    // -- Telemetry ----------------------------------------------------------
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = PatternEngine::new();
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 0);
+        assert_eq!(snap.matches_total, 0);
+        assert_eq!(snap.quick_rejects, 0);
+        assert_eq!(snap.bloom_checks, 0);
+        assert_eq!(snap.bloom_positives, 0);
+        assert_eq!(snap.bloom_rejects, 0);
+        assert_eq!(snap.candidate_rules_evaluated, 0);
+        assert_eq!(snap.regex_evaluations, 0);
+        assert_eq!(
+            snap.top_rule_hits.capacity,
+            PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY as u32
+        );
+        assert_eq!(snap.top_rule_hits.total_inserts, 0);
+        assert!(snap.top_rule_hits.top_items.is_empty());
+    }
+
+    #[test]
+    fn telemetry_scan_counted() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("hello world");
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_context_empty_scan_counted() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+
+        let detections = engine.detect_with_context("", &mut ctx);
+
+        assert!(detections.is_empty());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_trace_empty_scan_counted() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
+
+        assert!(detections.is_empty());
+        assert!(traces.is_empty());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_multiple_scans_counted() {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("hello");
+        let _ = engine.detect("world");
+        let _ = engine.detect("test");
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 3);
+    }
+
+    #[test]
+    fn telemetry_records_top_rule_hits_from_production_detect_path() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.hot", "HOT", None),
+            rule_with_anchor("codex.cold", "COLD", None),
+        ]);
+
+        for _ in 0..3 {
+            let detections = engine.detect("HOT");
+            assert_eq!(detections.len(), 1);
+        }
+        let detections = engine.detect("COLD");
+        assert_eq!(detections.len(), 1);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.matches_total, 4);
+        assert_eq!(
+            snap.top_rule_hits.capacity,
+            PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY as u32
+        );
+        assert_eq!(snap.top_rule_hits.total_inserts, 4);
+        assert_eq!(snap.top_rule_hits.max_error, 0);
+        assert_eq!(
+            snap.top_rule_hits
+                .top_items
+                .first()
+                .map(|item| item.key.as_str()),
+            Some("codex.hot")
+        );
+        assert_eq!(snap.top_rule_hits.top_items[0].count, 3);
+    }
+
+    #[test]
+    fn telemetry_rule_hit_sketch_preserves_heavy_hitter_guarantee() {
+        let telemetry = PatternTelemetry::with_rule_hit_capacity(5);
+        for _ in 0..30 {
+            telemetry.record_rule_hit("codex.frequent");
+        }
+        for idx in 0..70 {
+            telemetry.record_rule_hit(&format!("codex.unique_{idx}"));
+        }
+
+        let snap = telemetry.snapshot().top_rule_hits;
+        assert_eq!(snap.capacity, 5);
+        assert_eq!(snap.total_inserts, 100);
+        assert_eq!(snap.max_error, 20);
+
+        let frequent = snap
+            .top_items
+            .iter()
+            .find(|item| item.key == "codex.frequent")
+            .expect("true frequency 30/100 is above N/capacity=20 and must be captured");
+        assert!(
+            (30..=50).contains(&frequent.count),
+            "estimated count {} outside [30, 50]",
+            frequent.count
+        );
+    }
+
+    #[test]
+    fn telemetry_rule_hit_sketch_recovers_from_poison() {
+        let telemetry = PatternTelemetry::with_rule_hit_capacity(3);
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = telemetry.top_rule_hits.lock().unwrap();
+            panic!("poison telemetry sketch");
+        }));
+        assert!(poison.is_err());
+
+        telemetry.record_rule_hit("codex.recovered");
+
+        let snap = telemetry.snapshot().top_rule_hits;
+        assert_eq!(snap.capacity, 3);
+        assert_eq!(snap.total_inserts, 1);
+        assert_eq!(snap.top_items.len(), 1);
+        assert_eq!(snap.top_items[0].key, "codex.recovered");
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = PatternTelemetrySnapshot {
+            scans_total: 100,
+            matches_total: 50,
+            quick_rejects: 20,
+            bloom_checks: 80,
+            bloom_positives: 30,
+            bloom_rejects: 50,
+            candidate_rules_evaluated: 45,
+            regex_evaluations: 40,
+            regex_scan_errors: 0,
+            top_rule_hits: SpaceSavingSnapshot::default(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PatternTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_snapshot_accepts_older_json_without_top_rule_hits() {
+        let json = r#"{
+            "scans_total": 100,
+            "matches_total": 50,
+            "quick_rejects": 20,
+            "bloom_checks": 80,
+            "bloom_positives": 30,
+            "bloom_rejects": 50,
+            "candidate_rules_evaluated": 45,
+            "regex_evaluations": 40
+        }"#;
+        let back: PatternTelemetrySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(back.top_rule_hits, SpaceSavingSnapshot::default());
+    }
+}

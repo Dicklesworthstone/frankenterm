@@ -1,0 +1,34 @@
+[package]
+name = "cairo-sys-rs"
+description = "FFI bindings to libcairo, built from vendored cairo and pixman sources"
+version = "0.22.0"
+edition = "2021"
+license = "MIT AND (LGPL-2.1-only OR MPL-1.1)"
+build = "build.rs"
+
+[lib]
+name = "cairo_sys"
+
+# Same feature names as the published 0.22 crate. The vendored build compiles
+# only cairo's image backend, so the backend features are accepted but add
+# nothing; FrankenTerm enables none of them.
+[features]
+v1_16 = []
+v1_18 = ["v1_16"]
+xlib = []
+png = []
+pdf = []
+svg = []
+ps = []
+freetype = []
+script = []
+xcb = []
+use_glib = []
+quartz-surface = []
+win32-surface = []
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

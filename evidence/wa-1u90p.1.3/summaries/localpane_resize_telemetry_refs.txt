@@ -1,0 +1,16 @@
+135:    replaced_seq: Option<u64>,
+167:        let replaced_seq = self.pending.as_ref().map(|pending| pending.seq);
+184:            replaced_seq,
+1163:            "LocalPane::resize enqueue pane_id={} seq={} target={}x{} replaced_seq={:?} queue_depth_hint={} worker_spawned={}",
+1168:            outcome.replaced_seq,
+1217:                                        "LocalPane::resize cancelled pane_id={} seq={} superseded_by_seq={} stage={} queue_wait_us={} completion_us={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+1238:                                        "LocalPane::resize complete pane_id={} seq={} queue_wait_us={} completion_us={} noop={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+1603:                "intent seq={} target={}x{} replaced_seq={:?} spawn_worker={}",
+1604:                outcome.seq, cols, rows, outcome.replaced_seq, outcome.spawn_worker
+1737:        assert_eq!(first.replaced_seq, None);
+1748:        assert_eq!(second.replaced_seq, None);
+1754:        assert_eq!(third.replaced_seq, Some(2));
+1841:        assert_eq!(second.replaced_seq, None);
+1843:        assert_eq!(third.replaced_seq, Some(2));
+1857:        assert!(replay.causality_contains("replaced_seq=Some(2)"));
+1912:                .any(|line| line.contains("replaced_seq=Some(")),

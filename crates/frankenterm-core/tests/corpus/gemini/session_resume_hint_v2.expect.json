@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "gemini.session.resume_hint",
+    "agent_type": "gemini",
+    "event_type": "session.resume_hint",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "98765432-abcd-ef01-2345-6789abcdef01"
+    },
+    "matched_text": "gemini --resume 98765432-abcd-ef01-2345-6789abcdef01"
+  }
+]

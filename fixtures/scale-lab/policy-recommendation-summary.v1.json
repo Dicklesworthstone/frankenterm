@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "total_candidates": 6,
+  "allow": 1,
+  "deny": 1,
+  "require_approval": 1,
+  "delay": 1,
+  "degrade": 1,
+  "ask_human": 1,
+  "policy_gated_receipts": 4,
+  "approval_previews": 1,
+  "issued_approval_tokens": 0,
+  "executed_actions": 0,
+  "redacted_evidence_fields": 2,
+  "operator_summary": "policy_recommendations: allow=1 deny=1 require_approval=1 delay=1 degrade=1 ask_human=1; policy_gated=4; previews=1; tokens_issued=0; executed=0; redacted_fields=2"
+}

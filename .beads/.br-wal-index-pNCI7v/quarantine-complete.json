@@ -1,0 +1,5 @@
+{
+  "schema_version": "br.wal_index.quarantine.v1",
+  "stage": "complete",
+  "retained_index": "/Users/jemanuel/projects/frankenterm/.beads/.br-wal-index-pNCI7v/poisoned-shm"
+}

@@ -1,0 +1,18 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "selection scene\nthe second line is selected here\nand the third line partly\nunselected tail\u001b[?25l",
+    "config": {
+      "front_end": "Metal"
+    },
+    "snapshot": {
+      "selection": [
+        1,
+        4,
+        2,
+        12
+      ]
+    }
+  },
+  "parity_golden": "real/selection"
+}

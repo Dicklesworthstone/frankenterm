@@ -1,0 +1,570 @@
+{
+  "$schema": "https://frankenterm.dev/schemas/swarm-capacity-readiness/v1.json",
+  "schema_version": "1.0.0",
+  "kind": "swarm-capacity-readiness",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-b94bx.10",
+  "generated_at": "2026-06-05T16:20:00Z",
+  "epic_id": "ft-b94bx",
+  "contract_id": "ft.robot.swarm_capacity.operator.v1",
+  "overall_status": "blocked_target_class_not_proven",
+  "raw_pane_content_stored": false,
+  "live_mutation_allowed": false,
+  "side_effects_executed": false,
+  "checklist_states": [
+    {
+      "state": "measured",
+      "meaning": "Checked-in source, tests, or retained artifacts provide direct evidence for the claim."
+    },
+    {
+      "state": "simulated",
+      "meaning": "Deterministic fixtures or synthetic scenarios exercise the behavior without claiming production capacity."
+    },
+    {
+      "state": "skipped",
+      "meaning": "The proof is intentionally retained as skipped or not proven, and downstream claims must stay blocked."
+    },
+    {
+      "state": "stale",
+      "meaning": "An artifact exists but must not be reused without a fresh producing run."
+    },
+    {
+      "state": "unavailable",
+      "meaning": "A signal, proof lane, or runtime source is missing and the operator surface must fail closed."
+    },
+    {
+      "state": "production_proven",
+      "meaning": "A release-retained artifact proves the production target predicate for the claim."
+    }
+  ],
+  "claim_matrix": [
+    {
+      "claim_id": "capacity.signal_inventory",
+      "bead_id": "ft-b94bx.1",
+      "title": "Signal inventory and missing-telemetry map",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/swarm-capacity-signal-inventory.md",
+          "role": "operator signal inventory"
+        },
+        {
+          "path": "docs/json-schema/ft-swarm-capacity-signal-inventory.json",
+          "role": "schema"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_signal_inventory_schema.rs",
+          "kind": "rust_parser"
+        },
+        {
+          "path": "tests/e2e/test_swarm_capacity_signal_inventory.sh",
+          "kind": "e2e_static_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "crates/frankenterm-core/tests/fixtures/swarm_capacity_signal_inventory/complete.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": false,
+        "state": "unavailable",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Signal inventory does not assert target-class production capacity."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "Inventory is support evidence, not a release bundle slot."
+      }
+    },
+    {
+      "claim_id": "capacity.workload_admission_model",
+      "bead_id": "ft-b94bx.2",
+      "title": "Workload-class admission model",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/swarm-capacity-workload-admission-model.md",
+          "role": "operator workload-class model"
+        },
+        {
+          "path": "crates/frankenterm-core/src/runtime_telemetry.rs",
+          "role": "typed workload-class planner"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_workload_admission_model.rs",
+          "kind": "rust_unit"
+        },
+        {
+          "path": "tests/e2e/test_swarm_capacity_workload_admission_model.sh",
+          "kind": "e2e_json_toon"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/swarm-capacity-workload-admission-model.md",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": false,
+        "state": "unavailable",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Admission model decisions are bounded dry runs and do not claim high-core production proof."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "The model feeds later capacity envelope attestations."
+      }
+    },
+    {
+      "claim_id": "capacity.resource_budget_model",
+      "bead_id": "ft-b94bx.3",
+      "title": "Core-aware CPU and memory budget model",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/swarm-capacity-resource-budget-model.md",
+          "role": "budget model contract"
+        },
+        {
+          "path": "crates/frankenterm-core/src/runtime_telemetry.rs",
+          "role": "budget planner implementation"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_resource_budget_model.rs",
+          "kind": "rust_unit"
+        },
+        {
+          "path": "tests/e2e/test_swarm_capacity_resource_budget_model.sh",
+          "kind": "e2e_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/swarm-capacity-resource-budget-model.md",
+          "evidence_state": "measured"
+        },
+        {
+          "path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+          "evidence_state": "skipped"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Current target-class gate attestation is skipped_not_proven."
+      },
+      "release_attestation": {
+        "state": "skipped",
+        "category": "perf/headline-claims",
+        "manifest_path": "docs/attestations/perf/swarm-capacity-envelope.json",
+        "reason": "Capacity envelope remains blocked_target_class_not_proven."
+      }
+    },
+    {
+      "claim_id": "capacity.simulation_corpus",
+      "bead_id": "ft-b94bx.4",
+      "title": "Deterministic high-scale simulation corpus",
+      "readiness_state": "simulated",
+      "implementation_surfaces": [
+        {
+          "path": "docs/swarm-capacity-simulation-corpus.md",
+          "role": "simulation corpus contract"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_simulation_corpus.rs",
+          "kind": "rust_golden"
+        },
+        {
+          "path": "tests/e2e/test_swarm_capacity_simulation_corpus.sh",
+          "kind": "e2e_static_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/swarm-capacity-simulation-corpus.md",
+          "evidence_state": "simulated"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Synthetic high-scale simulations do not prove target-class hardware."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "Simulation corpus is support evidence until paired with target-class proof."
+      }
+    },
+    {
+      "claim_id": "capacity.rch_target_class_gauntlet",
+      "bead_id": "ft-b94bx.5",
+      "title": "RCH target-class capacity gauntlet",
+      "readiness_state": "skipped",
+      "implementation_surfaces": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_gauntlet.sh",
+          "role": "remote-only gauntlet harness"
+        },
+        {
+          "path": "docs/perf/target-class-hardware.md",
+          "role": "target-class hardware predicate"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_gauntlet.sh",
+          "kind": "e2e_rch_optional"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+          "evidence_state": "skipped"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Target-class gate status is skipped_not_proven."
+      },
+      "release_attestation": {
+        "state": "skipped",
+        "category": "perf/headline-claims",
+        "manifest_path": "docs/attestations/perf/swarm-capacity-envelope.json",
+        "reason": "No 64 CPU / 256 GiB production claim may graduate."
+      }
+    },
+    {
+      "claim_id": "capacity.operator_surfaces",
+      "bead_id": "ft-b94bx.6",
+      "title": "Operator surfaces for capacity plan/status/explain",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/robot-contracts/swarm-capacity.md",
+          "role": "Robot/MCP operator contract"
+        },
+        {
+          "path": "crates/frankenterm/src/main.rs",
+          "role": "CLI/Robot surface"
+        },
+        {
+          "path": "crates/frankenterm-core/src/mcp_resources.rs",
+          "role": "MCP resource surface"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_operator_surfaces.sh",
+          "kind": "e2e_json_toon"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "crates/frankenterm/tests/fixtures/golden_artifacts/swarm_capacity_operator/status.json",
+          "evidence_state": "measured"
+        },
+        {
+          "path": "crates/frankenterm/tests/fixtures/golden_artifacts/swarm_capacity_operator/plan.json",
+          "evidence_state": "measured"
+        },
+        {
+          "path": "crates/frankenterm/tests/fixtures/golden_artifacts/swarm_capacity_operator/explain.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": false,
+        "state": "unavailable",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Operator surfaces expose read-only dry-run payloads."
+      },
+      "release_attestation": {
+        "state": "measured",
+        "category": "proofs/robot-contracts",
+        "manifest_path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+        "reason": "This dashboard hashes the operator contract evidence into the robot-contracts category."
+      }
+    },
+    {
+      "claim_id": "capacity.fail_closed_telemetry",
+      "bead_id": "ft-b94bx.7",
+      "title": "Fail-closed telemetry gaps and kill-switch behavior",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/swarm-capacity-signal-inventory.md",
+          "role": "telemetry-gap behavior map"
+        },
+        {
+          "path": "crates/frankenterm-core/src/runtime_telemetry.rs",
+          "role": "fail-closed operator summary"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/proptest_swarm_capacity_admission_safety.rs",
+          "kind": "property"
+        },
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_workload_admission.rs",
+          "kind": "rust_unit"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/swarm-capacity-signal-inventory.md",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": false,
+        "state": "unavailable",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Fail-closed behavior is a safety gate, not target-class proof."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "Safety behavior is folded into operator and envelope artifacts."
+      }
+    },
+    {
+      "claim_id": "capacity.envelope_attestation",
+      "bead_id": "ft-b94bx.8",
+      "title": "Capacity envelope attestation and regression gate",
+      "readiness_state": "skipped",
+      "implementation_surfaces": [
+        {
+          "path": "docs/attestations/perf/swarm-capacity-envelope.json",
+          "role": "fail-closed capacity envelope"
+        },
+        {
+          "path": "docs/attestations/manifest.json",
+          "role": "release bundle manifest"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_resource_budget_model.rs",
+          "kind": "rust_schema"
+        },
+        {
+          "path": "crates/frankenterm-core/tests/attestation_manifest_completeness.rs",
+          "kind": "manifest_guard"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/attestations/perf/swarm-capacity-envelope.json",
+          "evidence_state": "skipped"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Envelope status is blocked_target_class_not_proven."
+      },
+      "release_attestation": {
+        "state": "skipped",
+        "category": "perf/headline-claims",
+        "manifest_path": "docs/attestations/perf/swarm-capacity-envelope.json",
+        "reason": "Manifest hashes the envelope while preserving blocked release wording."
+      }
+    },
+    {
+      "claim_id": "capacity.operator_runbook_doctor",
+      "bead_id": "ft-b94bx.9",
+      "title": "Operator runbook and doctor remediation",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/operator-runbook.md",
+          "role": "operator remediation runbook"
+        },
+        {
+          "path": "docs/robot-contracts/swarm-capacity.md",
+          "role": "doctor contract"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_doctor_remediation.sh",
+          "kind": "e2e_static_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "crates/frankenterm/tests/fixtures/golden_artifacts/swarm_capacity_operator/doctor-remediation.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Doctor must surface target_class_unavailable until a non-skipped proof exists."
+      },
+      "release_attestation": {
+        "state": "measured",
+        "category": "proofs/robot-contracts",
+        "manifest_path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+        "reason": "Doctor evidence is included in this readiness audit."
+      }
+    },
+    {
+      "claim_id": "capacity.completion_dashboard",
+      "bead_id": "ft-b94bx.10",
+      "title": "Completion dashboard and proof audit",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+          "role": "machine-readable readiness summary"
+        },
+        {
+          "path": "docs/attestations/manifest.json",
+          "role": "release bundle manifest slot"
+        }
+      ],
+      "tests": [
+        {
+          "path": "crates/frankenterm-core/tests/swarm_capacity_completion_readiness.rs",
+          "kind": "rust_parser"
+        },
+        {
+          "path": "tests/e2e/test_swarm_capacity_completion_audit.sh",
+          "kind": "e2e_static_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Dashboard records the blocked target-class state rather than promoting it."
+      },
+      "release_attestation": {
+        "state": "measured",
+        "category": "proofs/robot-contracts",
+        "manifest_path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+        "reason": "Readiness summary is hash-attested as robot-contract evidence."
+      }
+    },
+    {
+      "claim_id": "capacity.resource_what_if_static_manifest",
+      "bead_id": "ft-b94bx.11",
+      "title": "Static proof manifest verifier",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "fixtures/scale-lab/resource-what-if-proof/manifest.v1.json",
+          "role": "resource what-if proof manifest"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/e2e/test_resource_what_if_proof_manifest.sh",
+          "kind": "e2e_static_manifest"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "fixtures/scale-lab/resource-what-if-proof/manifest.v1.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": true,
+        "state": "skipped",
+        "artifact": "fixtures/scale-lab/resource-what-if-proof/manifest.v1.json",
+        "reason": "Resource what-if high-scale fixtures remain dry-run/skipped unless backed by target-class hardware."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "Static manifest verifier is support evidence for scale-lab proof packs."
+      }
+    },
+    {
+      "claim_id": "capacity.signal_inventory_path_hardening",
+      "bead_id": "ft-b94bx.12",
+      "title": "Constrain signal inventory artifact paths",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_signal_inventory.sh",
+          "role": "safe repo-relative path verifier"
+        }
+      ],
+      "tests": [
+        {
+          "path": "tests/e2e/test_swarm_capacity_signal_inventory.sh",
+          "kind": "e2e_static_jsonl"
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "path": "crates/frankenterm-core/tests/fixtures/swarm_capacity_signal_inventory/complete.json",
+          "evidence_state": "measured"
+        }
+      ],
+      "target_class_proof": {
+        "required": false,
+        "state": "unavailable",
+        "artifact": "docs/attestations/proofs/resource-cockpit-target-class.json",
+        "reason": "Path hardening prevents artifact drift and does not assert capacity."
+      },
+      "release_attestation": {
+        "state": "unavailable",
+        "category": null,
+        "manifest_path": null,
+        "reason": "Path hardening is covered by the completion dashboard audit."
+      }
+    }
+  ],
+  "summary": {
+    "claim_count": 12,
+    "measured_claims": 9,
+    "simulated_claims": 1,
+    "skipped_claims": 2,
+    "stale_claims": 0,
+    "unavailable_claims": 0,
+    "production_proven_claims": 0,
+    "target_class_high_scale_claim_allowed": false,
+    "release_wording_allowed": false,
+    "blocking_reason_codes": [
+      "target_class_skipped_or_stale",
+      "capacity.target_class_unproven",
+      "target_class_artifact_status_not_proven"
+    ]
+  }
+}

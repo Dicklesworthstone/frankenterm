@@ -1,0 +1,20 @@
+[package]
+name = "ft-perf-gate"
+description = "Performance proof-gate substrate for FrankenTerm evidence streams, SPRT, conformal bands, regime-shift detection, and causal attribution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "performance", "proof"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

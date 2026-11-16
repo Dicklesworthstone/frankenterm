@@ -1,0 +1,40 @@
+# Pinned by DATE, deliberately — do not revert this to a bare `channel = "nightly"`.
+#
+# A floating nightly means an upstream rustc regression lands here with no warning
+# and no reproducible green build. This repository hit it directly: on
+# nightly around 2026-08-22/08-23, `cargo clippy --fix` aborted twice with
+#
+#   delayed bug: unexpected rigid alias in layout_of after normalization
+#   error: could not compile `frankenterm-core` (lib)
+#
+# while `cargo check -p frankenterm-core --lib` succeeded — i.e. the clippy
+# driver ICEd, not the code. The identical signature appeared the same day in
+# toon_rust (an unrelated async opaque type) and charmed_rust (23 instances
+# across russh and tokio), which is what identified it as a toolchain bug rather
+# than a project one. It surfaces on async-heavy code, so a repository can look
+# fine one day and ICE the next purely because the channel moved.
+#
+# nightly-2026-08-20 was known-good across four repositories in that sweep.
+#
+# 2026-09-04: the pin moved to nightly-2026-08-31 for fleet unification, and the
+# verification this comment asks for was run afterwards rather than before. On
+# the new date the workspace is clean for `clippy --workspace --all-targets --
+# -D warnings` and for `fmt --all -- --check` on macOS, and the workspace check
+# passes on the Linux proof workers. Moving cost six new lint sites and
+# twenty-three targets that needed `#![recursion_limit = "256"]` to finish the
+# Send proof on the storage-open chain -- exactly the kind of breakage this
+# comment exists to have you find first.
+#
+# If you need to move this pin: bump the date, re-run
+# `cargo clippy --workspace --all-targets -- -D warnings` and the full test
+# suite, and update this comment with what you verified. Do not replace it with
+# a bare "nightly".
+[toolchain]
+channel = "nightly-2026-08-31"
+components = ["rustfmt", "clippy"]
+# Windows cross-check stdlib (ft-iubh9): rustup auto-installs this target on
+# every host that builds the repo — local Macs, CI, and RCH workers alike — so
+# remote `cargo check --target x86_64-pc-windows-gnu` proof lanes stop dying
+# with E0463 (missing target stdlib) and survive toolchain bumps without
+# per-worker provisioning.
+targets = ["x86_64-pc-windows-gnu"]

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-run.json",
+  "title": "WA Robot Workflow Run Response",
+  "description": "Schema for the data field when calling 'wa robot workflow run <name> <pane_id>'. Triggers a workflow execution.",
+  "type": "object",
+  "required": ["workflow_name", "pane_id", "status"],
+  "properties": {
+    "workflow_name": {
+      "type": "string",
+      "description": "Name of the workflow being run"
+    },
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Target pane for the workflow"
+    },
+    "execution_id": {
+      "type": "string",
+      "description": "Unique identifier for this execution"
+    },
+    "status": {
+      "type": "string",
+      "description": "Current status of the workflow execution"
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable status message"
+    },
+    "started_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when execution started"
+    },
+    "step_index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Current step index (0-based)"
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time elapsed since workflow started (ms)"
+    }
+  },
+  "additionalProperties": false
+}

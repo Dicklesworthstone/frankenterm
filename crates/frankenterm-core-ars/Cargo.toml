@@ -1,0 +1,61 @@
+[package]
+name = "frankenterm-core-ars"
+description = "Automated Reasoning System (ARS) sub-crate extracted from frankenterm-core (ft-y0loj.2 / ft-mr35k)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+# Sub-crate carved out of frankenterm-core under ft-y0loj.2 (Tier-1 leaf
+# extraction). Modules: ars_blast_radius, ars_compile, ars_drift,
+# ars_evidence, ars_evolve, ars_explain, ars_federation, ars_fst,
+# ars_generalize, ars_intercept, ars_replay, ars_secret_scan,
+# ars_serialize, ars_symbolic_exec, ars_timeout (15 modules total).
+#
+# No feature gate — ARS was always-on in the parent crate. Carving it
+# into its own crate lets the GUI / fuzz / mux-server graphs skip the
+# ~510 KB of ARS sources entirely.
+#
+# Direction of the dep edge: this crate depends on `frankenterm-core`
+# for `mdl_extraction`, `token_bucket`, and `workflows::*` types that
+# the ARS modules import. The reverse direction (core → ars) is
+# severed; the parent crate's `lib.rs` no longer declares
+# `pub mod ars_*`. No cargo cycle (regular dep).
+#
+# A dev-dep cycle exists (frankenterm-core's tests/proptest_ars_*.rs
+# need this crate) — Cargo allows dev-dep cycles, see ft-y0loj.1
+# tantivy precedent.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+regex = { workspace = true }
+aho-corasick = { workspace = true }
+serde_yaml = "0.9"
+
+# [ft-nsoxc / ft-8nqx0 Phase 5] ARS now consumes `CommandBlock` and
+# `TokenBucket` from the leaf audit-types crate instead of looping back
+# through `frankenterm-core`. The remaining `frankenterm-core` dep is
+# only needed for `workflows::{DescriptorStep, DescriptorMatcher,
+# DescriptorTrigger, DescriptorFailureHandler, WorkflowDescriptor}`,
+# which are not yet leaf-clean (their `descriptors.rs` carries 50+
+# `crate::*` refs through `super::*`). Follow-up work is expected to
+# either lift the descriptor DTOs or expose them via an ARS-owned
+# trait so this back-edge can drop entirely.
+frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
+frankenterm-core = { path = "../frankenterm-core", default-features = false }
+
+[dev-dependencies]
+proptest = "1.8.0"

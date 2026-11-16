@@ -1,0 +1,225 @@
+--- a/include/libssh2.h
++++ b/include/libssh2.h
+@@ -1075,6 +1075,12 @@
+ LIBSSH2_API
+ const char *libssh2_version(int req_version_num);
+ 
++/* FrankenTerm host-certificate KEX adapters, version 1. The caller must still
++ * verify the complete certificate, CA trust, principal, time and restrictions
++ * before user authentication. This is not an upstream libssh2 API. */
++#define LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION 1
++LIBSSH2_API unsigned int libssh2_frankenterm_host_certificate_version(void);
++
+ typedef enum {
+     libssh2_no_crypto = 0,
+     libssh2_openssl,
+--- a/src/hostkey.c
++++ b/src/hostkey.c
+@@ -45,6 +45,12 @@
+ #include <sys/uio.h>
+ #endif
+ 
++static int frankenterm_cert_init(LIBSSH2_SESSION *, const unsigned char *,
++                                size_t, void **);
++static int frankenterm_cert_verify(LIBSSH2_SESSION *, const unsigned char *,
++                                  size_t, const unsigned char *, size_t,
++                                  void **);
++
+ #if LIBSSH2_RSA
+ /* ***********
+  * ssh-rsa *
+@@ -503,10 +509,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ssh_rsa_sha2_256_cert = {
+      "rsa-sha2-256-cert-v01@openssh.com",
+      SHA256_DIGEST_LENGTH,
+-     NULL,
++     frankenterm_cert_init,
+      hostkey_method_ssh_rsa_initPEM,
+      hostkey_method_ssh_rsa_initPEMFromMemory,
+-     NULL,
++     frankenterm_cert_verify,
+      hostkey_method_ssh_rsa_sha2_256_signv,
+      NULL,                       /* encrypt */
+      hostkey_method_ssh_rsa_dtor,
+@@ -515,10 +521,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ssh_rsa_sha2_512_cert = {
+      "rsa-sha2-512-cert-v01@openssh.com",
+      SHA512_DIGEST_LENGTH,
+-     NULL,
++     frankenterm_cert_init,
+      hostkey_method_ssh_rsa_initPEM,
+      hostkey_method_ssh_rsa_initPEMFromMemory,
+-     NULL,
++     frankenterm_cert_verify,
+      hostkey_method_ssh_rsa_sha2_512_signv,
+      NULL,                       /* encrypt */
+      hostkey_method_ssh_rsa_dtor,
+@@ -1085,10 +1091,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ecdsa_ssh_nistp256_cert = {
+     "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+     SHA256_DIGEST_LENGTH,
+-    NULL,
++    frankenterm_cert_init,
+     hostkey_method_ssh_ecdsa_initPEM,
+     hostkey_method_ssh_ecdsa_initPEMFromMemory,
+-    NULL,
++    frankenterm_cert_verify,
+     hostkey_method_ssh_ecdsa_signv,
+     NULL,                       /* encrypt */
+     hostkey_method_ssh_ecdsa_dtor,
+@@ -1097,10 +1103,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ecdsa_ssh_nistp384_cert = {
+     "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+     SHA384_DIGEST_LENGTH,
+-    NULL,
++    frankenterm_cert_init,
+     hostkey_method_ssh_ecdsa_initPEM,
+     hostkey_method_ssh_ecdsa_initPEMFromMemory,
+-    NULL,
++    frankenterm_cert_verify,
+     hostkey_method_ssh_ecdsa_signv,
+     NULL,                       /* encrypt */
+     hostkey_method_ssh_ecdsa_dtor,
+@@ -1109,10 +1115,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ecdsa_ssh_nistp521_cert = {
+     "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+     SHA512_DIGEST_LENGTH,
+-    NULL,
++    frankenterm_cert_init,
+     hostkey_method_ssh_ecdsa_initPEM,
+     hostkey_method_ssh_ecdsa_initPEMFromMemory,
+-    NULL,
++    frankenterm_cert_verify,
+     hostkey_method_ssh_ecdsa_signv,
+     NULL,                       /* encrypt */
+     hostkey_method_ssh_ecdsa_dtor,
+@@ -1331,10 +1337,10 @@
+ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ssh_ed25519_cert = {
+     "ssh-ed25519-cert-v01@openssh.com",
+     SHA256_DIGEST_LENGTH,
+-    hostkey_method_ssh_ed25519_init,
++    frankenterm_cert_init,
+     hostkey_method_ssh_ed25519_initPEM,
+     hostkey_method_ssh_ed25519_initPEMFromMemory,
+-    hostkey_method_ssh_ed25519_sig_verify,
++    frankenterm_cert_verify,
+     hostkey_method_ssh_ed25519_signv,
+     NULL,                       /* encrypt */
+     hostkey_method_ssh_ed25519_dtor,
+@@ -1342,6 +1348,116 @@
+ 
+ #endif /* LIBSSH2_ED25519 */
+ 
++/* These adapters prove possession of the certified SUBJECT key for KEX. They
++ * never modify session->server_hostkey: the exchange hash and the application's
++ * host-key copy retain the exact complete certificate. Independent certificate
++ * signature/type/CA/principal/time/option verification remains the caller's
++ * mandatory gate before user authentication. */
++static const LIBSSH2_HOSTKEY_METHOD *
++frankenterm_cert_raw_method(const char *name)
++{
++#if LIBSSH2_ED25519
++    if(strcmp(name, "ssh-ed25519-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ssh_ed25519;
++#endif
++#if LIBSSH2_ECDSA
++    if(strcmp(name, "ecdsa-sha2-nistp256-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ecdsa_ssh_nistp256;
++    if(strcmp(name, "ecdsa-sha2-nistp384-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ecdsa_ssh_nistp384;
++    if(strcmp(name, "ecdsa-sha2-nistp521-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ecdsa_ssh_nistp521;
++#endif
++#if LIBSSH2_RSA_SHA2
++    if(strcmp(name, "rsa-sha2-256-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ssh_rsa_sha2_256;
++    if(strcmp(name, "rsa-sha2-512-cert-v01@openssh.com") == 0)
++        return &hostkey_method_ssh_rsa_sha2_512;
++#endif
++    return NULL;
++}
++
++static int
++frankenterm_cert_init(LIBSSH2_SESSION *session,
++                      const unsigned char *data, size_t length,
++                      void **abstract)
++{
++    const LIBSSH2_HOSTKEY_METHOD *raw;
++    const char *certificate_name;
++    struct string_buf buf;
++    unsigned char subject[1088], *next = subject, *field;
++    size_t field_length, caps[2], count, i, name_length;
++    if(!session || !session->hostkey || !data || length > 32768)
++        return -1;
++    raw = frankenterm_cert_raw_method(session->hostkey->name);
++    if(!raw || !raw->init || !raw->sig_verify)
++        return -1;
++    certificate_name = session->hostkey->name;
++    if(strncmp(raw->name, "rsa-sha2-", 9) == 0) {
++        certificate_name = "ssh-rsa-cert-v01@openssh.com";
++        count = 2; caps[0] = 9; caps[1] = 1025;
++    }
++    else if(strncmp(raw->name, "ecdsa-sha2-", 11) == 0) {
++        count = 2; caps[0] = 8; caps[1] = 133;
++    }
++    else {
++        count = 1; caps[0] = 32;
++    }
++    buf.data = (unsigned char *)data;
++    buf.dataptr = buf.data;
++    buf.len = length;
++    if(_libssh2_match_string(&buf, certificate_name) ||
++       _libssh2_get_string(&buf, &field, &field_length)) /* nonce */
++        return -1;
++    name_length = strlen(raw->name);
++    _libssh2_store_str(&next, raw->name, name_length);
++    for(i = 0; i < count; i++) {
++        if(_libssh2_get_string(&buf, &field, &field_length) ||
++           !field_length || field_length > caps[i] ||
++           field_length + 4 > sizeof(subject) - (size_t)(next - subject))
++            return -1;
++        _libssh2_store_str(&next, (const char *)field, field_length);
++    }
++    return raw->init(session, subject, (size_t)(next - subject), abstract);
++}
++
++static int
++frankenterm_cert_verify(LIBSSH2_SESSION *session,
++                        const unsigned char *signature, size_t length,
++                        const unsigned char *message, size_t message_length,
++                        void **abstract)
++{
++    const LIBSSH2_HOSTKEY_METHOD *raw;
++    struct string_buf buf;
++    unsigned char *payload;
++    size_t payload_length;
++    if(!session || !session->hostkey || !signature || length > 1044)
++        return -1;
++    raw = frankenterm_cert_raw_method(session->hostkey->name);
++    if(!raw || !raw->sig_verify)
++        return -1;
++    buf.data = (unsigned char *)signature;
++    buf.dataptr = buf.data;
++    buf.len = length;
++    /* Bind the actual signature name and complete encoding before entering
++     * legacy verifiers which skip the algorithm prefix by a fixed length. */
++    if(_libssh2_match_string(&buf, raw->name) ||
++       _libssh2_get_string(&buf, &payload, &payload_length) ||
++       !payload_length || !_libssh2_eob(&buf))
++        return -1;
++    return raw->sig_verify(session, signature, length, message,
++                           message_length, abstract);
++}
++
++LIBSSH2_API unsigned int libssh2_frankenterm_host_certificate_version(void)
++{
++#if LIBSSH2_ED25519 && LIBSSH2_ECDSA && LIBSSH2_RSA_SHA2
++    return LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION;
++#else
++    return 0;
++#endif
++}
++
+ 
+ static const LIBSSH2_HOSTKEY_METHOD *hostkey_methods[] = {
+ #if LIBSSH2_ECDSA

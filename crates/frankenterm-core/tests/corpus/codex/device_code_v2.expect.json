@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "codex.auth.device_code_prompt",
+    "agent_type": "codex",
+    "event_type": "auth.device_code",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "code": "WXYZ-98765"
+    },
+    "matched_text": "WXYZ-98765"
+  }
+]

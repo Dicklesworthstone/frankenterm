@@ -1,0 +1,38 @@
+# Rule: Ban ad-hoc Regex::new usage outside pattern/policy/config modules
+#
+# Detection regex should live in patterns.rs (via PatternPack/RuleDef).
+# Safety regex for command gating and secret detection lives in policy.rs.
+# Configuration pattern matching lives in config.rs.
+#
+# Adding regex elsewhere risks:
+# - Pattern drift and duplication
+# - Missing tests/corpus entries
+# - Inconsistent detection behavior
+
+id: no-adhoc-fancy-regex
+language: rust
+severity: error
+message: "Ad-hoc Regex::new() usage outside allowed modules. Detection patterns should use the pattern pack system in patterns.rs. Safety/secret patterns belong in policy.rs. Config matching belongs in config.rs."
+
+rule:
+  kind: call_expression
+  pattern: Regex::new($PATTERN)
+  # This matches `Regex::new(...)` calls
+
+# We use ast-grep's file filtering at scan time via script
+# Since ast-grep's built-in file filtering is limited,
+# the lint script will apply the allowlist
+
+note: |
+  Allowed files for Regex::new:
+  - crates/wa-core/src/patterns.rs (pattern detection engine)
+  - crates/wa-core/src/policy.rs (command safety, secret detection)
+  - crates/wa-core/src/config.rs (configuration parsing)
+
+  If you need detection for agent state transitions, add a RuleDef to the appropriate PatternPack in patterns.rs.
+
+fix: |
+  // Add detection via pattern pack system:
+  // 1. Add to patterns.rs as a RuleDef with anchors + optional regex
+  // 2. Include in appropriate PatternPack (core.codex, core.claude_code, etc.)
+  // 3. Add corpus test fixture

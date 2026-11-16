@@ -1,0 +1,414 @@
+//! Host function audit trail for WASM extensions.
+//!
+//! Every host function call from a WASM extension is recorded in
+//! a bounded in-memory ring buffer. Entries include the extension id,
+//! function name, arguments summary, and result (ok/denied/error).
+
+use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
+
+/// Outcome of a host function call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// Call succeeded.
+    Ok,
+    /// Call was denied by sandbox policy.
+    Denied(String),
+    /// Call failed with an error.
+    Error(String),
+}
+
+/// Single audit log entry.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    /// Monotonic timestamp relative to audit trail creation.
+    pub elapsed: std::time::Duration,
+    /// Extension identifier.
+    pub extension_id: String,
+    /// Host function name.
+    pub function: String,
+    /// Summary of arguments (truncated for large payloads).
+    pub args_summary: String,
+    /// Call outcome.
+    pub outcome: AuditOutcome,
+}
+
+/// Thread-safe audit trail with a bounded capacity.
+pub struct AuditTrail {
+    entries: Mutex<VecDeque<AuditEntry>>,
+    capacity: usize,
+    epoch: Instant,
+}
+
+impl AuditTrail {
+    /// Create a new audit trail with the given maximum entry count.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(capacity.min(16384))),
+            capacity,
+            epoch: Instant::now(),
+        }
+    }
+
+    fn entries_guard(&self) -> MutexGuard<'_, VecDeque<AuditEntry>> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.entries.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Record a host function call.
+    pub fn record(
+        &self,
+        extension_id: &str,
+        function: &str,
+        args_summary: &str,
+        outcome: AuditOutcome,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let entry = AuditEntry {
+            elapsed: self.epoch.elapsed(),
+            extension_id: extension_id.to_string(),
+            function: function.to_string(),
+            args_summary: truncate_string(args_summary, 256),
+            outcome,
+        };
+
+        let mut entries = self.entries_guard();
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    /// Retrieve recent audit entries (newest last).
+    pub fn recent(&self, limit: usize) -> Vec<AuditEntry> {
+        let entries = self.entries_guard();
+        let skip = entries.len().saturating_sub(limit);
+        entries.iter().skip(skip).cloned().collect()
+    }
+
+    /// Count entries matching the given extension id.
+    pub fn count_for_extension(&self, extension_id: &str) -> usize {
+        self.entries_guard()
+            .iter()
+            .filter(|e| e.extension_id == extension_id)
+            .count()
+    }
+
+    /// Count denied calls.
+    pub fn denied_count(&self) -> usize {
+        self.entries_guard()
+            .iter()
+            .filter(|e| matches!(e.outcome, AuditOutcome::Denied(_)))
+            .count()
+    }
+
+    /// Total number of entries currently stored.
+    pub fn len(&self) -> usize {
+        self.entries_guard().len()
+    }
+
+    /// Whether the audit trail is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut boundary = max_len;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+
+        let mut truncated = s[..boundary].to_string();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_record_and_retrieve() {
+        let trail = AuditTrail::new(100);
+        trail.record(
+            "ext-1",
+            "ft_get_config",
+            "\"color_scheme\"",
+            AuditOutcome::Ok,
+        );
+        trail.record(
+            "ext-2",
+            "ft_get_pane_text",
+            "0, 1000",
+            AuditOutcome::Denied("no_pane_access".to_string()),
+        );
+
+        assert_eq!(trail.len(), 2);
+        let recent = trail.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].extension_id, "ext-1");
+        assert_eq!(recent[0].outcome, AuditOutcome::Ok);
+        assert_eq!(recent[1].extension_id, "ext-2");
+        assert!(
+            matches!(&recent[1].outcome, AuditOutcome::Denied(reason) if reason == "no_pane_access")
+        );
+    }
+
+    #[test]
+    fn capacity_eviction() {
+        let trail = AuditTrail::new(3);
+        for i in 0..5 {
+            trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+        }
+        assert_eq!(trail.len(), 3);
+        let recent = trail.recent(10);
+        // Should have ext-2, ext-3, ext-4 (oldest evicted)
+        assert_eq!(recent[0].extension_id, "ext-2");
+        assert_eq!(recent[2].extension_id, "ext-4");
+    }
+
+    #[test]
+    fn zero_capacity_never_records_entries() {
+        let trail = AuditTrail::new(0);
+        trail.record("ext", "fn", "", AuditOutcome::Ok);
+        assert_eq!(trail.len(), 0);
+        assert!(trail.recent(10).is_empty());
+        assert_eq!(trail.count_for_extension("ext"), 0);
+        assert_eq!(trail.denied_count(), 0);
+    }
+
+    #[test]
+    fn count_for_extension() {
+        let trail = AuditTrail::new(100);
+        trail.record("ext-a", "fn1", "", AuditOutcome::Ok);
+        trail.record("ext-b", "fn2", "", AuditOutcome::Ok);
+        trail.record("ext-a", "fn3", "", AuditOutcome::Ok);
+
+        assert_eq!(trail.count_for_extension("ext-a"), 2);
+        assert_eq!(trail.count_for_extension("ext-b"), 1);
+        assert_eq!(trail.count_for_extension("ext-c"), 0);
+    }
+
+    #[test]
+    fn denied_count() {
+        let trail = AuditTrail::new(100);
+        trail.record("ext", "fn1", "", AuditOutcome::Ok);
+        trail.record(
+            "ext",
+            "fn2",
+            "",
+            AuditOutcome::Denied("no_access".to_string()),
+        );
+        trail.record("ext", "fn3", "", AuditOutcome::Error("oops".to_string()));
+        trail.record(
+            "ext",
+            "fn4",
+            "",
+            AuditOutcome::Denied("blocked".to_string()),
+        );
+
+        assert_eq!(trail.denied_count(), 2);
+    }
+
+    #[test]
+    fn args_truncation() {
+        let trail = AuditTrail::new(10);
+        let long_args = "x".repeat(500);
+        trail.record("ext", "fn", &long_args, AuditOutcome::Ok);
+
+        let recent = trail.recent(1);
+        assert!(recent[0].args_summary.len() < 300);
+        assert!(recent[0].args_summary.ends_with("..."));
+    }
+
+    #[test]
+    fn args_truncation_respects_utf8_boundaries() {
+        let trail = AuditTrail::new(10);
+        let long_args = "€".repeat(100);
+        trail.record("ext", "fn", &long_args, AuditOutcome::Ok);
+
+        let recent = trail.recent(1);
+        assert!(recent[0].args_summary.ends_with("..."));
+        assert!(recent[0].args_summary.len() <= 259);
+        let truncated = recent[0].args_summary.strip_suffix("...").unwrap();
+        assert_eq!(truncated.len(), 255);
+        assert!(truncated.chars().all(|ch| ch == '€'));
+    }
+
+    #[test]
+    fn empty_trail() {
+        let trail = AuditTrail::new(10);
+        assert!(trail.is_empty());
+        assert_eq!(trail.len(), 0);
+        assert!(trail.recent(10).is_empty());
+    }
+
+    #[test]
+    fn entries_buffer_recovers_after_poisoned_lock() {
+        let trail = AuditTrail::new(10);
+        trail.record("ext-before", "fn", "", AuditOutcome::Ok);
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = trail.entries.lock().unwrap();
+            panic!("poison audit trail entries");
+        }));
+        assert!(poison_result.is_err());
+        assert!(trail.entries.is_poisoned());
+
+        trail.record(
+            "ext-after",
+            "ft_get_pane_text",
+            "0, 100",
+            AuditOutcome::Denied("no_pane_access".to_string()),
+        );
+        assert!(!trail.entries.is_poisoned());
+        assert_eq!(trail.len(), 2);
+        assert_eq!(trail.count_for_extension("ext-after"), 1);
+        assert_eq!(trail.denied_count(), 1);
+
+        let recent = trail.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].extension_id, "ext-before");
+        assert_eq!(recent[1].extension_id, "ext-after");
+    }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// len is always bounded by capacity.
+        #[test]
+        fn prop_len_bounded_by_capacity(
+            capacity in 1_usize..64,
+            n_records in 0_usize..200,
+        ) {
+            let trail = AuditTrail::new(capacity);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert!(trail.len() <= capacity);
+        }
+
+        /// is_empty is consistent with len.
+        #[test]
+        fn prop_is_empty_consistent(n_records in 0_usize..20) {
+            let trail = AuditTrail::new(100);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert_eq!(trail.is_empty(), n_records == 0);
+        }
+
+        /// recent respects limit.
+        #[test]
+        fn prop_recent_respects_limit(
+            n_records in 1_usize..50,
+            limit in 1_usize..100,
+        ) {
+            let trail = AuditTrail::new(200);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(limit);
+            prop_assert!(recent.len() <= limit);
+            prop_assert!(recent.len() <= n_records);
+        }
+
+        /// After eviction, newest entries are preserved.
+        #[test]
+        fn prop_eviction_preserves_newest(
+            capacity in 1_usize..20,
+            n_records in 1_usize..100,
+        ) {
+            let trail = AuditTrail::new(capacity);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(capacity);
+            if n_records > 0 && !recent.is_empty() {
+                let last = &recent[recent.len() - 1];
+                let expected_id = format!("ext-{}", n_records - 1);
+                prop_assert_eq!(&last.extension_id, &expected_id);
+            }
+        }
+
+        /// count_for_extension is bounded by len.
+        #[test]
+        fn prop_count_for_extension(
+            n_a in 0_usize..20,
+            n_b in 0_usize..20,
+        ) {
+            let trail = AuditTrail::new(200);
+            for _ in 0..n_a {
+                trail.record("ext-a", "fn", "", AuditOutcome::Ok);
+            }
+            for _ in 0..n_b {
+                trail.record("ext-b", "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert!(trail.count_for_extension("ext-a") <= trail.len());
+            prop_assert!(trail.count_for_extension("ext-b") <= trail.len());
+            prop_assert_eq!(
+                trail.count_for_extension("ext-a") + trail.count_for_extension("ext-b"),
+                trail.len()
+            );
+        }
+
+        /// denied_count is bounded by len.
+        #[test]
+        fn prop_denied_count_bounded(
+            n_ok in 0_usize..20,
+            n_denied in 0_usize..20,
+        ) {
+            let trail = AuditTrail::new(200);
+            for _ in 0..n_ok {
+                trail.record("ext", "fn", "", AuditOutcome::Ok);
+            }
+            for _ in 0..n_denied {
+                trail.record("ext", "fn", "", AuditOutcome::Denied("no".to_string()));
+            }
+            prop_assert!(trail.denied_count() <= trail.len());
+        }
+
+        /// Truncation keeps args_summary bounded.
+        #[test]
+        fn prop_args_truncation_bounded(len in 0_usize..1000) {
+            let trail = AuditTrail::new(10);
+            let args = "x".repeat(len);
+            trail.record("ext", "fn", &args, AuditOutcome::Ok);
+            let recent = trail.recent(1);
+            prop_assert!(recent[0].args_summary.len() <= 259); // 256 + "..."
+        }
+
+        /// Elapsed timestamps are monotonically non-decreasing.
+        #[test]
+        fn prop_elapsed_monotonic(n in 2_usize..30) {
+            let trail = AuditTrail::new(100);
+            for i in 0..n {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(n);
+            for pair in recent.windows(2) {
+                prop_assert!(pair[0].elapsed <= pair[1].elapsed);
+            }
+        }
+    }
+}

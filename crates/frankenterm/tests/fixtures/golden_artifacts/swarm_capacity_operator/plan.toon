@@ -1,0 +1,11 @@
+contract_id: ft.robot.swarm_capacity.operator.v1
+dry_run: true
+live_mutation_allowed: false
+planned_action: defer
+raw_pane_content_stored: false
+requested_add_panes: 12
+side_effects_executed: false
+surface: plan
+workload_admission_plan:
+  dry_run: true
+  side_effects_executed: false

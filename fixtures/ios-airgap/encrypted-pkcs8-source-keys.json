@@ -1,0 +1,297 @@
+{
+  "description": "PUBLIC TEST MATERIAL. Independently encrypted and decrypted by OpenSSL; source identities are the existing recorded fixtures.",
+  "generator": "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)",
+  "passphrase": "PUBLIC PKCS8 fixture passphrase; never a credential",
+  "keys": [
+    {
+      "id": "hmacSHA1-aes128",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp256-1",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "prf": "hmacSHA1",
+      "iterations": 1,
+      "aesKeyBits": 128,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHdMEgGCSqGSIb3DQEFDTA7MBoGCSqGSIb3DQEFDDANBAjj6p3EU2oU1gIBATAd\nBglghkgBZQMEAQIEEN29xROOAQRsUCmYCKHbincEgZDJ7phoGcvwmkJPg7YXL5QT\nT94gXec1orsTwPG8DtgStwd94krPCLUxwyLe7e886b/PMmqzNC171ZisLs5vakt8\n0I/4iUcglmyGbUSsHIytLaS60UofvmzPx68rKAgtO0YPPO1tHQwfqjtHmeKe1BVe\n84Kk741Sky3tRHfelQh+o9tM34cAjX+aqhXFeyS4Iho=\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA1-aes192",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp384-1",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:g/a7eO/bEj8Kkn+sbYfXobnJIlCeQWSC0YqZ55ly/Dc",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKu9bgSclZC0GapsBhk4/FfM1GqEEB/Z2IWbccIJFkf+ZHRNiQILeMq9jmmnqRPg0OuY+71PFqDYhvGaiYPKEGdL5J5IrGr7VIZY7jf9asKfpHwTD8HURDV+UZJ5cO37ug==",
+      "prf": "hmacSHA1",
+      "iterations": 2048,
+      "aesKeyBits": 192,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBDjBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQIJBeXccZqA9ACAggA\nMB0GCWCGSAFlAwQBFgQQB0uZXR9Jznt3orn3X3fKawSBwDygTxEYlENP/PXP/sFz\nJNB0TfMC7/1fKDecps3EZERXRPyor/cl+V1AIK7RVbJ7pmUepRy6r3kEHR2LUvZV\nlP5Piww/Qlo/rPZZvCPvrOGejAoTNbgsBYMtaxVF4455SJj45Y/lqGiQNUEPRSQa\nA0lMc/vFQknw5bSdiZgUb0gZ3J+c+c8ndX4jPNLaoizsilotEpTJlkkGAJbrfgyu\nG7Ry9rG9m2OH9kWhwGUIISahzkDt7b6wwTt5LHIxUYhIUg==\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA1-aes256",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp521-1",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:ZoKZvk4d3ncKODoa55lx639anvSUIhnTdbus0738XBs",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==",
+      "prf": "hmacSHA1",
+      "iterations": 4096,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBTzBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQI70MF1nwuMNkCAhAA\nMB0GCWCGSAFlAwQBKgQQ/Dr1J47PBEP0lT3pChUE7wSCAQB7Dm8i0pDbjOiaMTOs\nbg3bB2683oE77486bCe5eNeuE8fU/1iH+/w6CRv6mA3J6MKtNsjMwB3lX6h/a+nm\n6tJgvov4Rf/IhPwR5tcmNMAxsmIBGqdh1PowkhFe+1QxQDdI6PxB/L1N8OqgwidE\n33VU4IfAoAFVDVkt/fJLya7oVz0tkVtHI6RfD9qlMBbdrfIjjfLfYMBfnr1K+DHK\ncEwbnd3o07PBCoCL6kS93dUP6JJfi6Gon0vh1NFGUFfzRDG4cdnQ92fUGH9wICpo\nE62YUt1n+/3JZsdqxCi21oVoGO03ubTyHmn9mlicdnGmVnVbD9pBkBT45y+lExI+\nl0eg\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA256-aes128",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp256-1",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "prf": "hmacSHA256",
+      "iterations": 1,
+      "aesKeyBits": 128,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHrMFYGCSqGSIb3DQEFDTBJMCgGCSqGSIb3DQEFDDAbBAhlOmx0nDUpXgIBATAM\nBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBAgQQ0ujShuJRp3LNfmxc/tG08wSBkCUD\nT669QD40n/nFR8v8cu8rVDk+wCTBjnP5c31VJc3nIul67pUaq5ookv6vwBebN7c8\nJgBG3zBXtM5JIONXSpVWPxKZGdH9kt0aEK1kDiS6M/eJK8rKYBjm2JXM2uVwhe1W\nCWsRCjXG+zx7cEwtJ4qj8XivhlHQzUftQkm2PIWHt0IbKGXA+Ei3YSzUDFAWgg==\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA256-aes192",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp384-1",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:g/a7eO/bEj8Kkn+sbYfXobnJIlCeQWSC0YqZ55ly/Dc",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKu9bgSclZC0GapsBhk4/FfM1GqEEB/Z2IWbccIJFkf+ZHRNiQILeMq9jmmnqRPg0OuY+71PFqDYhvGaiYPKEGdL5J5IrGr7VIZY7jf9asKfpHwTD8HURDV+UZJ5cO37ug==",
+      "prf": "hmacSHA256",
+      "iterations": 2048,
+      "aesKeyBits": 192,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBHDBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIahjHLyHQ9DwCAggA\nMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEWBBCj2qMMdYNqxcdT+97X8LoxBIHA\nCS/WleYApcCYzcRGngj7hwBi/RdPYq35uCVRjlUCWPcB03dBD/V29/a1cPw6uczg\nZAVcmin+BjGtsq47zA+vpmNJgRu4NQKGQwu80zIhcx2aWoXm9EkRJv8OZ7K21tbQ\nzufJccSsZVz7CKyhNbUaXsGo7tjfoccb9l6LOdmjOURX+ckuwkJ3Tod2ayWbon/W\nQ8tQGW1pAtwPymlHvFVb5OD5xfUBeEcIZGGqnENKXKwWilSnY20s94YzsBDuz4t/\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA256-aes256",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp521-1",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:ZoKZvk4d3ncKODoa55lx639anvSUIhnTdbus0738XBs",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==",
+      "prf": "hmacSHA256",
+      "iterations": 4096,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBXTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIpuP9LqG6FFwCAhAA\nMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEqBBD5EbFXRd2A113RG+5BP47PBIIB\nANcLclo2V4kXJgi7zr2FJBMvyrOXC1DYd6AaYj7oZdOTXNS76I9sDXE6LuEJB1YF\nOmAepvNvKBaSOUopNYgyXXpYvJ2YOuqKJ8ZPi/JSv+GsyPWD52Unl5tmwMb4qVUd\nxi4AM93zNaI/pzsOsGb6qqWSDdism8hd/2fBLa0nOp3RmyktnLkacqDE/hFCaXvp\naT6l2kXR4BiXa9xJoVFBjyIISmMEm0jmkCe3MYc13fhTtOpKpG7GxTqNx7qhwYWJ\n/6c6ab5xc14a5JREZoMXngL1DgTNcsQPx7wYfWYtqKbVeLIBw4qw+sv4GmneTUSS\nymKooGnQgyZIgCzOxb+wn/w=\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA384-aes128",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp256-1",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "prf": "hmacSHA384",
+      "iterations": 1,
+      "aesKeyBits": 128,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHrMFYGCSqGSIb3DQEFDTBJMCgGCSqGSIb3DQEFDDAbBAi03SsCWvv7BAIBATAM\nBggqhkiG9w0CCgUAMB0GCWCGSAFlAwQBAgQQ2iI2pN0TIvyoO2Y1v2eDGQSBkO+O\nBTEYNaraRPkFj5HcvS1b3895hbTf0edAN6NF9OnYiAVmzgWu5MLW5bhTDFaElfnV\nCAdE6PQDF53wW6nxnWn5DAr4lmPsgKjXy99+h/M+/KzvzxYpvZ8k/CA96CG8yqJj\nfCwDf5Is36QmfbnAqfzdWpiinmYTWW5IGpKfHqOS4AVZqFvLctuNqURTz/42Pg==\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA384-aes192",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp384-1",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:g/a7eO/bEj8Kkn+sbYfXobnJIlCeQWSC0YqZ55ly/Dc",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKu9bgSclZC0GapsBhk4/FfM1GqEEB/Z2IWbccIJFkf+ZHRNiQILeMq9jmmnqRPg0OuY+71PFqDYhvGaiYPKEGdL5J5IrGr7VIZY7jf9asKfpHwTD8HURDV+UZJ5cO37ug==",
+      "prf": "hmacSHA384",
+      "iterations": 2048,
+      "aesKeyBits": 192,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBHDBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQI2Af2V9kKEVwCAggA\nMAwGCCqGSIb3DQIKBQAwHQYJYIZIAWUDBAEWBBDHTzdCFZ+uS3wgvz8y/+qrBIHA\nay3WRN/wV4Bg/Ir8nVNho/eWYCaYHorzzQH/uo4qM8g1H6uEjWN/rdn/XV2oA1dF\nfv6pF9CR1fYE4dB14l+6OSlKcPOSx0SDmT5xPNRgGYpOYFpZslrWsvT8oIGcKyE+\nL2q/VUJstC4NwBStJtAyPcupbtlisTDRzT8XJP9OJDKLnbu0lllJt3Rx42sHvm5S\nlTWM4i5vWHJw7jDeUkEBOK4GbdRw1YNomaF62I0ZBcGjSRCqaHxmhepA5pEDrUHs\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA384-aes256",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp521-1",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:ZoKZvk4d3ncKODoa55lx639anvSUIhnTdbus0738XBs",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==",
+      "prf": "hmacSHA384",
+      "iterations": 4096,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBXTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIdSc8HFSWshwCAhAA\nMAwGCCqGSIb3DQIKBQAwHQYJYIZIAWUDBAEqBBC5lDdumajjTKDKXiUNKOUWBIIB\nACgv2ORoHJcbDmzUTZMLcWmkrxwcIa8aDxY4nn9gbqWUZ5BPge2TCQ5yj9ndtE+w\nPpAvdZN5q4BK+z6n17lfzHbtti9ga4a6mTwBkFyGc8mnLue+vnXayCPtaYB2BSvh\nDZ0cGYU3iOXVVVKBFxaDKQFZKRXzslw8cceZn0ctTyQWO9dS/jBI93r+Tyf4ZSKG\nLRD9oNYZcJxIWH2mi9393HrXGc0BGkhVCvhGvagaiqgSE2PJuUSVjI+i5FihilKX\nt2v3qMGaFk2ThFGDmM9VrOJeGc6CND++ANhxbJpSDR5j9ywe1bZyMU6khZ/Uekg2\ncfupQn+4EcIouiCmGbPtz3A=\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA512-aes128",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp256-1",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "prf": "hmacSHA512",
+      "iterations": 1,
+      "aesKeyBits": 128,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHrMFYGCSqGSIb3DQEFDTBJMCgGCSqGSIb3DQEFDDAbBAg2cgc3sOH0jwIBATAM\nBggqhkiG9w0CCwUAMB0GCWCGSAFlAwQBAgQQ8wvf0glDJ6QCfyYpvo1gLgSBkA2Z\nWiIZdtS1f1CcG7uNm1OokV/5ANqz+EG8LqPhRqC2o+/sVcv7Z/Ngw15RdwoeSk/Y\ntty3zyHz9WJsy57dG5KfKCyQBQK9I6bkI0mLx/OA+D0uKlqPDZXAw9GJ4J9fWFph\nwH/0C0xZ3NxfKXV2E6VtSzVujSuUp0XvOH7d8uqTsNeBywjczWK/Qqy6EsIbHg==\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA512-aes192",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp384-1",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:g/a7eO/bEj8Kkn+sbYfXobnJIlCeQWSC0YqZ55ly/Dc",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKu9bgSclZC0GapsBhk4/FfM1GqEEB/Z2IWbccIJFkf+ZHRNiQILeMq9jmmnqRPg0OuY+71PFqDYhvGaiYPKEGdL5J5IrGr7VIZY7jf9asKfpHwTD8HURDV+UZJ5cO37ug==",
+      "prf": "hmacSHA512",
+      "iterations": 2048,
+      "aesKeyBits": 192,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBHDBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIN4uh0/XaDS0CAggA\nMAwGCCqGSIb3DQILBQAwHQYJYIZIAWUDBAEWBBDoKKTOOBTbcFF9GRiwY6+lBIHA\n8//OvJstORkVfEuIVP04OWjB+mg86X5XgtXOQlBd1zBcMtWvn3g4n/L9sWgxzFA3\nuCQDTEnOXFPFRXGgO6WawI13srh7WzXkXuxo2xWyj9VIq0VveS+E46nVJsrZ1D64\nMfbNQrpPNvdS/BHFcBtmyt+CfrMGzfSo+lgD52MgGZuN4ywu3Nyl4U9GA+uStE8+\nVPLYFGKO0E4wEoIXjVKmGZ0AxOiE1qdBw5ARYfytZgN15uhqCQpxwG/V3apn7q1A\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "hmacSHA512-aes256",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp521-1",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:ZoKZvk4d3ncKODoa55lx639anvSUIhnTdbus0738XBs",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==",
+      "prf": "hmacSHA512",
+      "iterations": 4096,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBXTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIN8wlI/UMEPQCAhAA\nMAwGCCqGSIb3DQILBQAwHQYJYIZIAWUDBAEqBBD34h9dT54yF5SQEHGt4dZDBIIB\nAMr1e1JAarIP2+SRupSrgnOS387c+wBCN/tkJW07oxo3P+Gzf1Sq3GPxe6L7MklL\nKMPavIiPK92+gGRwJw3B5pHZlTKnNincm04gEFhKltIpvKgfevfZFs+845YJD2n/\nd3vHD2PdteWUksjNiJU+a4QzecSVD96O8KGRylHOeYbByrIlX0B3gJb0YhG7BJBL\nuNkQNbZXX9uek0MhXkioW/VLQ07ntNuztt3pI+LwmKaTMW9htAVcTRL5TrmqIuQV\nSePxTD+N8MIn46IpejCEI0X9tdauNCEp1ZWDzMkg7vgvpFUEw0+xZg2PxRNUil9f\n1f+WqU5RgT0H9kBNiQvp3N8=\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "openssl-default-rsa2048",
+      "sourceFile": "rsa-source-keys.json",
+      "sourceID": "rsa-2048",
+      "algorithm": "ssh-rsa",
+      "fingerprint": "SHA256:lMe/P4tXn753xdnVXclrdEuYbBWLlNgKtFkLKVay6ok",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDeQE0yArbkEaOGT8UqszpD/vx2INmrwfC41CRcoUk569ytCjJYm+VsSk/6DiCIpwAPgR+UHj57CFrTNUGYDobDkMCXLSET6iOOQ9WDPDO8kQmJ6u+EYDCfcaKVo8UsWyfmBa++GmFzb0b+3zt2tVKm66zardrAv9Gv1MkDyBRaLynTA98ib8hS0VXKm/s9+eCLyeHiMaqJiKaE68rHsS5RVx1Z4Qdmwefi+tAo/ABy/Bxh2j6Zo7rYRy7zIcNX+UidIBvyVq1eU6dJNOyHhzdbxi168duu3DPBTZNFceH0XWLYX8uI4w6KG1I4rT3EklR7t5EcrVpFja0G/7deTSqX PUBLIC-TEST-ONLY-rsa-2048",
+      "prf": "hmacSHA256",
+      "iterations": 2048,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFLTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIei664dCCrB0CAggA\nMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEqBBDkD/gncTs/MOnnEpWpJ3MbBIIE\n0G/m7AUhzAEeYLvjdX8ocyJHxQzrBWrb+EEQwXxz3Ch2kChftTk/6lHl/nUvK4Kh\ni9Is7jStEygf9EcM5DnRR9RxU91B3WiO4Zyo60iid4gGGQx4Nf7pAWu7iRHLmn10\ntQ+MsEjNEHvE8Y2vDR6+4XuNcQU9JyBqrP0P145bzmITEzEaZGqw0w0J3YobzzAY\nxPsVkrumfFLIwou8rnKUJPWr25Vpji89T76ts0KmGt5+nQ7Kf2zTr5nkkxkcUC2E\neP8oTlaQAkl/dJBtk5xcCtaWW7Lbouldc1AVvWcr0NKEJtYo3homyxofc5Lk7kPa\nY15XKfbkNU2Rw+ilweicV44OZ9VylBxoQBUsACxNV5qM3Tw3a36MbNUCmml2WLfR\nEuYC+tzGcioIbk30lIzGc9zZtII7jthKM7TEIpWDGL42MYxDMKqUX7JW/lbTexvH\no8gp6SiCO9Ny8HeIAU9mC6h/H3QTMpmHeLqJG2ac+9DyC8AZZ7nng/uDOYWyG5+i\n6u7lRcUselX1idEE+j4MP/wDYLmxJOpxR6OdTE5S9jPrfjbHNjdB7cm5V841aNIl\n7Sx+lrtaz36sNGhF/5dk7TaPO7+j8sNpa8c9mWwpU5l/w70QA7GbawJcNJ0Bzx5V\nUmCNCKxL+CQeNboDymHI4cDnzmFca8josM5lIVwy1eCRfavV+QtRI5Tix8INzTYo\n0E9Q9Xp+AW0pa4g2ik7BpQ1GjRMHnLqUL4BgN064SRrzF2n+pFHKToDQx1kRJPFi\n7T3rwpOvNFPbLEH2FM3aUgp/GSZ+gTxbwHUPt8I5YS0TRBhL03dd+0vCpAooOSb4\nQ8czBYC/wD9qluIfldIvCoeJFMUpJwvTdXJAud/2/Zjn08WNu2F6FZ3cksuwRxYp\nZip6rhJ3jEIdA9B8SzW/6yMckt/c+iHgwRi9hKoaWjeObZfSkakdV05gpe66LpNN\naN36OU6nvNxIsg8ZY+1sJz9A96+2rrtYDgzVtdbipS1QEtKEWmg7xCQhGHPssdhV\nnCz4aJ2pu8E8Q6ujPhd4LvQmjQRDklSkOmNhaCnrKhrptokQtS0fsUBlbZM7cNuY\n5XsqDhFj9LzSznKV3sY2A8Oz9EcYbMvOB+yQYjTEoCbEHpIWtkMbDiuVpnVha7+g\nkEg0OmSCd+xrMTCjBQCIHoCZpw99Zvxr7kAJXiaHsAnsjEY3gheyJQdk/7u5RsOV\nW3zmbvh691MkBZ7T1ubTfgnkqZfKc1WmbMU/usaslS0PS7iTR1rzu0C9sgF0QESI\nihEU21u+fhdWNrg8vU2xDur0PUSjU2s+ufrxq/XgLPSAo10dOWb6sWpuCVjYmMML\nPP9NLxoubM9WYg/aNqJFmNwvSQxmy4EVAzRt5NY5WjBG3x89dFg6ANI3h1XLM+sG\nupGtV+vMlLyP6/cdKdKevOoafmBP2xKfERxw6pFUOBFeru9APupCx5qn3leup9FT\nAmXnsbZ4G1kAgRClwJI+z+GCStnIIjxckj36vZGX08p6Ngn/D0ZQUd5ivslvlAEw\nZZYYaVGQXnAoJBuQ2TsV7JwbVhtMuYvi0RfIJlSuiwca4SHaZj5tHkGBeeq2Hf0m\nJ7oR2A05YApQqNPjtWgi5yztqMJGDF+uaHVAJcj/9rAk\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "rsa4096-aes192",
+      "sourceFile": "rsa-source-keys.json",
+      "sourceID": "rsa-4096",
+      "algorithm": "ssh-rsa",
+      "fingerprint": "SHA256:lUs/pmh2oIRwokt5BOZKRIlCRiJzbWsJtbv2KQmig1E",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDA+Xysg5KvcOl+bKKoCg/laoMIo77R+zJPZtwGAoMlftmkSCHIojZ7ulshv2IRxN8qCaJXMSq7Jlad7o87yloYNpjRIv2YzEKtOgBD4QUr7rpH1LaHeh07N4WkRnS5WesvJaNPitFPQqcaQylwFg5/nQfKVNFv7nTETGgnnF2IVVezEf8Sa/eMQw00ERguhnTwr8jAVtzUJ6zxkJAXwDfvK9Nj3KjilSE58dcq4YwRkxcsz11YQazEBAQsb306ZW3tuyUS/EPRQtAUKLqa9B1FCsSi8GCg8bnqPTUL2XmXZLx2MI/YTlK/eLPU9fUDU84XEq69ugUx3hPoBnNMlLF/EpyrSWfaTNly+defuEiMNdSV6VPPb6PoBCFHHCHcMZDXhCaqZwBJ4kzbP8tJVX/STeeNee3zikuS1USD14OrC1oXf6l1k6hpIr/lCSz06/s2FCBNU8G9/1QWUQywZv0z0eqxVf+hXvCRFYHKr8WDx6t8f56ScqATWSAxtBHblk+EHTnSZdzFOhG0YWG2EGc/sbcj+AtkjtKoE63mOS4F30TpVNVO+b2Ko7ZBZ90GRfvB+ZayHndfJpnS0OJPLEgOzmHKskVNpGexnacWfwawSU1Cvy/Vg1MV8xSVzfm4bGYgN1ukQzWn+yQwsrhE0HXh/AqyeQA9l85lEN2E5cvuMQ== PUBLIC-TEST-ONLY-rsa-4096",
+      "prf": "hmacSHA384",
+      "iterations": 2048,
+      "aesKeyBits": 192,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIJrTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIsozq+SD78LECAggA\nMAwGCCqGSIb3DQIKBQAwHQYJYIZIAWUDBAEWBBAGm6FkyzafFxK94Ndfa2bpBIIJ\nUKhG8wVa/6MTD4mNmbUEceKxv87muKHM+2UwD8USlLhVNzPcpl+0a/TxL4TO8mNw\nU2abazifxeH8EoHZCHMO7832WDEpyKwC3QOAuNTVBFKrjsrbHKsQJaUkvyBamjkQ\nQ8usFiSFyGmwqsoOCgKPQ4WvvcpDbKK1Y091MID+uqzUf7skeLPfT2EuRyR8tyi1\n1xDCsWuCtOpHsE3s0pOnxSpKq4+SVDlIBmBxpjPFNCie1yY7COfVChmc1ysDhoXF\n4ug+dO3NiUxXw12ov0ofRhOiU4gaZD1B2TOpDXAPg/Qlp/lYnKBNu189w3zhwkEU\n66/uZP6Hzs8LVIde2gkB5LVQ35bOXaQ9l4jLkT41DmPACNMKUYOOm1V9u5CeZhjH\nY9oLsCfGVf2/qxdymokwBx+czvW5reHOVXT/62qZ18mdReUea8fMcHmMheZ2cnPg\nVtxTVEK1PZggwHV5Q1NsCyizLHbgK4Ke/s8k5mzR0QxiBc7vv0v2l3qSfA3qcJPP\nunfisZUSJwhm7mPeUygAozsWLye3xZW23ixF2hXGj/ePg1hOf0eUIs+qF4zvkJI+\nm/EX8xAfEfQsi+OOdrRTlckKIOda6vox1wuduBS+tCtqQyK5vCcyP5zUEldMN7oW\n4Vt52oLSrALzohbGS8TPCXvjj5qSvr5k7nB4X0OgVmh9pXKIzpCEhnb0LjhXr557\nNHjAKz4+d79KfV4iwVIBhHdfwFuqeJYbVv0Te80h5BPxsVuriWBYV6KcL52T/y+3\nJqUU5JImmPVpbChx1RYDOBYp6vKzgNjbupIRL2w/YWHEnSj05CIzsMT9Zp0K2V/U\n8pw82ARm22yPQuuLw7pdEn5cmTzPESjw7XSqO97L5v2fPmR7h+DlK1IhQhSRex5N\nWVs9uCCG1/1HTmg9v655Z6hBRR31MPKBbXO7O3/8tf0v9gqEFVvr04HdS6U0qzvU\nNCDwKCmcfPYlhHc/BXzbjGHOIan+sh9HiHPP7RYMViec4FJbAuGJba4eDz9mTrCC\nhg0cvw0eh1JYKT15rGqL7BvVr3uYmzsGh9HXH0ERG5reqdHYAXCtOFOYmsoXZ7vK\nWEpXilX2Qlq2qeYoA7V2ze65vFyrwyAb4b3t6ZasDnGXapfLo/qymNqZEDB2Gsfe\naLbAa8vAotU/yzXkemZGyP7UaATNduEOprbarlDlymoj2lqFfsWc1AYcka2Mik9/\npQP1seQbFvHB8GUqfV2QKXvZ9VxfG+fvviXjQTKJ6PEhKs3xjpS+fsDNBmCZEudF\n3bUL3np3ZqxlZQ1OPeZLkYS2vXYeXFfb/M5iYVdQM+KenhE9857mWAzg9Rtp4XEi\ne6D66SSvJVYUVLSMRP8qfGBjkPZkz8TrmA/VVnD1OVSVzPkR4QcJ8T75ZKDVAYrk\nN55QIeYfgyoih2soCjtZ9OPSYGsHOAQs50f8LuEzzbK45XJAtpyKH0B6RUZK4P6z\nVdjijEGntH52zDazmIkBhKbvHclQFHudc5z3HyCBG1dMm3aQ1NIY0ikeuWqBzGgg\nAdGR9yC9ueEwN/5qAUTUGh01o2gvC6oiHprHznK7sWJhWSgiR+VcFBzkm8B/T8R9\nwWPyYG2IlfS87Fm7BZJYwrZR7mHhyRFxoh81PW1Zhl0V2nepyPLoZLo0DGQ07oJ0\nns1KhVeLvE0VG1JWx3OIojTekZWn4Ia0I+Pl6LfWFk4fgCLXGc8+ZofA3h2sXjsu\nStWPcB73z/rwZTd/LSC8uJX0Dr45Vc6mEiP2+q3q3YJuBQYlrCo02FegVTP+cw3s\nTNwcPIEziWghP6sg3/2hLj7hs6x28p9RMzCPQYtRvoP4dCUNvqR9njFdSxo8lsHh\nxGIAreBTIMn+fj85244kJwXflcF+Uep5uInCLPH0H6nVXrhr508JvZZLQHOeavvY\no+Ar4nievB+MR7kU5D92osNigWpa8e2YRkzhU1JPaIXvMIn+6dY9GrtsDhZZPdcS\n39klKR27jQrftKKSiwtZcDSPCzfyy7FFgZth/66zET9YZCOdhAJJK2u4cOrX/PBb\nlgiWs33vxXrYoM5MtdI3kBCZ8J1RAB9sUThIWssdh0ALVBmI9ftqvslpDQNyPGe5\n3KMRZe3G/rC1Y+rbUIaquDsapN0X+YMRcshIzvbcnaMpcahkNywTIvyB8brQ7SRU\nX4yFkCFk5BMR2Jay0vkco1T4KLg/+iqMuv+muK8gvk7uL+NnpHIxZvUDX+cLzjaC\n3d2bk+eVBOnrWSi41KkJ19aROE7ibWtzgJuHHr06fYEPI5Job1478IxVpESR5EiO\nhFphuwtryJjhZXlZfh4lt3SWHERvVs59CgdQLDP/j7+DUij7K2R8zPmKydTebFkk\nsG7OIMZa/IsrpBxLI+0GobSIvteDdLISWbQQPuzzoGUjp95ABMkhp0mfXNdJgQfr\nQghWEfTWJdbWSZVhbpt37y1IT77IvbLaAcBV1hmZaQL8hy9rxi/k9Z/E14G/fRJm\nVwflyrVCh7ll8cnNXzl717Zwe+iCfXgE5pssDMAQLaBCSG+UIPR+betZJwPFn0Me\nLO3y4C+/vH/M34h74/Ht/5jnnBbM6gCu29YpX1kjzvlNQ5uDfqs+ZB13Z3iFDEWp\nOnCXIl/eBHgjxyrfO0ySplJlsGFLLx+3AngHTG5fRx8tjV2DH0D6pmuUxosRv1zh\nciH/tb3s/tNkTvC4jFOPEMBdxbiC7Wm/vAjV2TnwD6BmvC6yLxsDElXaN+yfwGoK\nIrzWQG525flPwrSiTKZkXrsDnUkmXvFoMTL2spfp0Lxy8h3YWgcMDx8flct9Tfu7\nDGqrCMpzqYDmsI0NnVheFeUy9Zl3yDn7rsPrThk+7cO2yR4wmDLYjVuunJavRAn7\nIgKmOmxlNWtonm/hCxSaNtZNjuL12NvOrmC2Ttobbw1FYwWqMVIvBvy7jCCdaYgD\n5F1yw6qbQxRv2ctaMnt+EjoIQHLmIh+BCklVyDoQdUhUDcqWpEJtUs1c3U5YsUrw\nPXY2ltYs4TwSUlYCudsc3M4Rd4YL1o8/Ty3UvuE1sqwgAgSvmQl6DE0KlVoFB+ZC\nLh26ZbSa52UqQkrGbyXWMVpxeKXKAQUwYegcDXkt39fRX2ShdLTH6RDAXuds3tqo\nge9ujZeg/uQLkFc/XwJI4jUl3SnLhTs2dyHepBioJWDy\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "rsa8192-aes256",
+      "sourceFile": "rsa-source-keys.json",
+      "sourceID": "rsa-8192",
+      "algorithm": "ssh-rsa",
+      "fingerprint": "SHA256:WHdTUEZd9z9B/H9OHljecctP5mksOU+58JN2lBtSP6Y",
+      "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAEAQCh0mZZ/0UmRKNsg1EJLTLg21Ke6hnesx6NIEq+rlAjHMR06wqaKd964XHcYA13u3sdjKV5n4qDIYJUm1wd0+ZWCgsQZ7g4qSymWYBOWQjv3kFbRpK4OhUvLtpLjpJQ3Nu+J8IEH0bBKeptROQYz/w5u5fUj0StcGpq5X3kQ7tI7rGW55W5h5RcwLB+n32V1p2orXhFCBu39/2A7ckurpowJmdm97ds0xYQd79VFvKM0KlOuimB8kr6wr+ANdaGDpNqpQolxUI3K5Iu3WKGOr98hlG8aetWgo2zK8XYmYWAjmtrwXOwGjR3iUzr+cYHEZkHlPWnz9y+15J/O7bfgiTE9btB4amggVO6ZIl9/0iA9sFN2UPJqt4ClZbmGzHrUnPn3ohK2xTnDyTH35b8TgfRE8ZNcQB/5RcWWTpZhjoY/4T8o+oO2ng1beCyY0tPtfzEXNkBotF8gvZyOwx1EbfHIRcEaG0LXjq8pz6JLSU9BN96GHDtY5VXdiZTdgfYqremcUdox9wVt6vhaFItkKCLHKAdh90dP0w2Qgj1j5GXEAQ0Q86Zj90qEGlo0N5Lfa0ibPqeywkpGWQtARDQWKZDFjiCWfo3tESjhocF3kFeitH0PzFiqdU3C/rahtKzyV1I9uhWwa1h90NYbMyE8OjTQcK8U3ydqLuKV9uj7YnSBE+udnBU+FBheHLHlxx/1Koxt23ewQcaqQJ4czuWNJWa+vH4eRxYGUPHf9I47j6UhOu4glxd+nSiohQESjiYiq7ZDIN6QHN5G7UQW0vI19EByCOHpLY3AkckSwmfHiZrDNd3sj/XeUZYBNX9dWKw7MnvcjrIa4RhilnaVMKess+Wal/zsOgV9E5svECGIvHOA45b6Kkx39cpeTw5GQIpwmvalQQNntbbfpf97JR7wk+Hvv9IfIrUZ4OEFN0f8KfxveecLXKM4amYTNULBKo6sr/my4FljIrwOw9cSOaIm9r76i2cuQNBl2xrwXah7XfX5PYuUvpWL/lvjmbHAtzuhbmLUQnxMlZ+9HZeE2S8MFH+65SOGz89tjL6Ck8/8zPpB3oXPytrh9bWpeigMdiEvAXWaNL6TA0qwFYwgESeYqEfT58uBLTK23VcDOdKAs21+RVlEjaeANQtJKhYuW/5BZP1zXvluSyClBlNHTFn6E9r0MZehvIG4l992J2SFq0olbELoux3mWfQiqori8OnZEqo3U19bBSt1PBa6KxZe1TqKT9/mr3WLOSdGmgJTIh5X9AgsrDTE7bUG6RdpFbW4++b/BfrfoDkNOe9l6ZvcGBYYPOteW+IVq0ylN+6p7hSlmqlSmm+XXJTtBHxeLm2VWeif6A0klnkt8I62JD/NIUf PUBLIC-TEST-ONLY-rsa-8192",
+      "prf": "hmacSHA512",
+      "iterations": 2048,
+      "aesKeyBits": 256,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\n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\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    },
+    {
+      "id": "maximum-iterations",
+      "sourceFile": "legacy-ecdsa-source-keys.json",
+      "sourceID": "nistp256-1",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "prf": "hmacSHA256",
+      "iterations": 1000000,
+      "aesKeyBits": 128,
+      "encryptedPEM": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIHtMFgGCSqGSIb3DQEFDTBLMCoGCSqGSIb3DQEFDDAdBAj4WMM/CN3UHQIDD0JA\nMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAECBBCEX0/QRXCPRrn6QQjoo/QwBIGQ\nk26jv7XwwAJu5UsXg3fID/7NWJJS2zACKQxfnmpqHUWTPZk859yb0x15qa8rpjn4\nOvQCFe5t08kj4dWsP7X7jFweSo1GdRUdddImkjL7H7be5XdvClUHs6ZFStCryZZ8\nxe6cZcn/FUPyYpplc6o/ECWWZ7+IA+1wrsDoyBlDxwIRGCDIZZTDYQsEoTAlfN42\n-----END ENCRYPTED PRIVATE KEY-----\n"
+    }
+  ],
+  "vectors": [
+    {
+      "prf": "hmacSHA1",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 16,
+      "expectedHex": "6f2cd45513ecc4d333af3243e6887481"
+    },
+    {
+      "prf": "hmacSHA1",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 24,
+      "expectedHex": "6f2cd45513ecc4d333af3243e6887481806fd84d52659c11"
+    },
+    {
+      "prf": "hmacSHA1",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 32,
+      "expectedHex": "6f2cd45513ecc4d333af3243e6887481806fd84d52659c11241f99e8caa94564"
+    },
+    {
+      "prf": "hmacSHA256",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 16,
+      "expectedHex": "1da091f5bbe14cfa948eaebba5c2ea40"
+    },
+    {
+      "prf": "hmacSHA256",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 24,
+      "expectedHex": "1da091f5bbe14cfa948eaebba5c2ea406737e49117eb0a4a"
+    },
+    {
+      "prf": "hmacSHA256",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 32,
+      "expectedHex": "1da091f5bbe14cfa948eaebba5c2ea406737e49117eb0a4a3a1bf4c9240d5cbd"
+    },
+    {
+      "prf": "hmacSHA384",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 16,
+      "expectedHex": "978c3d3f965a46921e7764e1910f30dc"
+    },
+    {
+      "prf": "hmacSHA384",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 24,
+      "expectedHex": "978c3d3f965a46921e7764e1910f30dc74d7cb24483abde8"
+    },
+    {
+      "prf": "hmacSHA384",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 32,
+      "expectedHex": "978c3d3f965a46921e7764e1910f30dc74d7cb24483abde8fc2198abb19a4345"
+    },
+    {
+      "prf": "hmacSHA512",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 16,
+      "expectedHex": "89d63704dded0bf640479050ac0117db"
+    },
+    {
+      "prf": "hmacSHA512",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 24,
+      "expectedHex": "89d63704dded0bf640479050ac0117db0477e0532a7d72b6"
+    },
+    {
+      "prf": "hmacSHA512",
+      "passphraseHex": "746573740070617373706872617365f09f9491",
+      "saltHex": "000102030405060708090a0b0c0d0e0f",
+      "iterations": 17,
+      "outputByteCount": 32,
+      "expectedHex": "89d63704dded0bf640479050ac0117db0477e0532a7d72b60d4fcbb2845b6f17"
+    }
+  ]
+}

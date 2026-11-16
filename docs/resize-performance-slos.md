@@ -1,0 +1,225 @@
+# Resize/Reflow Performance SLO Contract
+
+**Parent track:** `wa-1u90p.1`  
+**Related tasks:** `wa-1u90p.1.2`, `wa-1u90p.1.3`, `wa-1u90p.1.4`, `wa-1u90p.1.5`  
+**Latency-immunity architecture:** `docs/latency-immunity-architecture-ft-1u90p.9.md` (`ft-1u90p.9`)  
+**Compatibility gate contract:** `docs/resize-no-regression-compatibility-contract-wa-1u90p.8.1.md` (`wa-1u90p.8.1`; consumed by `wa-1u90p.8.2` and `wa-1u90p.8.6`)  
+**Status:** Candidate v1.1 (numeric contract frozen; refresh calibration now pending live percentile capture from `wa-1u90p.1.3` telemetry surfaces)
+
+This document defines hard SLO targets and release gates for resize/reflow behavior.
+It records the historical zero-hitch program's numeric targets and model
+gates. Its simulation timings do not establish native presentation latency.
+
+**Evidence boundary (2026-09-04):** `Scenario`/MockWezterm stage timings
+measure the simulation harness. Runtime storage-lock and cursor-snapshot
+metrics describe the watcher/storage path, not the native terminal lock or
+GPU/display completion. Native timing and keep decisions use
+[the performance campaign](perf/mux-long-session-performance-campaign.md)
+and [renderer scenario contract](design/renderer-scenario-contract.md).
+The targets below remain goals until those real-path measurements qualify them.
+
+## Scope
+
+In scope:
+- interactive resize latency from user intent to presentation
+- stage-level latency for scheduler/reflow/render phases
+- artifact incidence budgets under deterministic storm scenarios
+- crash-free operation and rollback/degradation triggers
+
+Out of scope:
+- semantic correctness of non-resize terminal behavior (tracked separately in `wa-1u90p.8.1` contract)
+- renderer quality improvements unrelated to resize/reflow latency
+
+## Workload Classes
+
+Workload classes map directly to deterministic scenarios in `docs/resize-baseline-scenarios.md`.
+
+| Class | Scenario anchor | Description |
+|---|---|---|
+| `R1` | `resize_single_pane_scrollback` | Single pane + heavy scrollback resize sweep |
+| `R2` | `resize_multi_tab_storm` | Multi-tab/multi-pane repeated resize storm |
+| `R3` | `font_churn_multi_pane` | Font-size churn mixed with resize |
+| `R4` | `mixed_scale_soak` | Long-running mixed resize/font/scrollback soak |
+
+## Hardware Tiers
+
+| Tier | Definition (operator-side) |
+|---|---|
+| `low` | 4 cores or fewer, integrated graphics, constrained memory |
+| `mid` | 6-10 modern cores, standard laptop/desktop profile |
+| `high` | 12+ modern cores, high sustained single-thread + memory bandwidth |
+
+## Measurement Sources (Implemented)
+
+| SLO lane | Implemented source | Access path today | Notes |
+|---|---|---|---|
+| Scenario identity and reproducibility | `Scenario::metadata`, `Scenario::reproducibility_key()` in `crates/frankenterm-core/src/simulation.rs` | `ft simulate validate <scenario>.yaml --json`, `ft simulate run <scenario>.yaml --json` | Stable and machine-readable now |
+| Per-event simulation latency | `ResizeTimelineEvent.total_duration_ns` from `execute_all_with_resize_timeline` | Programmatic/test harness using `Scenario::execute_all_with_resize_timeline` | Model timing only; not native M1 input-to-presentation p50/p95/p99 |
+| Stage latency and queue attribution | `ResizeTimelineStageSample` + `ResizeQueueMetrics` + `ResizeTimeline::stage_summary()` | Programmatic/test harness | Stage names: `input_intent`, `scheduler_queueing`, `logical_reflow`, `render_prep`, `presentation` |
+| Flamegraph rows for attribution | `ResizeTimeline::flame_samples()` | Programmatic/test harness | Used for hotspot inspection and regression triage |
+| Lock contention and hold-time telemetry | `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_wait_ms`, `storage_lock_contention_events`, `RuntimeMetrics::{avg,p50,p95,max}_storage_lock_hold_ms` in `crates/frankenterm-core/src/runtime.rs` | Runtime health snapshot path (`RuntimeHandle::update_health_snapshot`) | Current warning thresholds: wait `15.0ms`, hold `75.0ms` |
+| Cursor snapshot memory telemetry | `RuntimeMetrics::{cursor_snapshot_bytes_last,p50_cursor_snapshot_bytes,p95_cursor_snapshot_bytes,cursor_snapshot_bytes_max,avg_cursor_snapshot_bytes}` | Runtime health snapshot path | Current warning threshold: `64 MiB` |
+
+## Collection Commands (Current Tree)
+
+```bash
+# Scenario metadata + reproducibility key
+ft simulate validate fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml --json
+ft simulate run fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml --json
+
+# Full resize timeline artifact envelope (timeline + stage_summary + flame_samples)
+ft simulate run fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml --json --resize-timeline-json
+
+# Resize timeline schema/probe coverage
+cargo test -p frankenterm-core simulation_resize_suite -- --nocapture
+cargo test -p frankenterm-core resize_timeline_summary_and_flame_samples_cover_all_stages -- --nocapture
+
+# Lock/memory warning-threshold coverage
+cargo test -p frankenterm-core warning_threshold_fires -- --nocapture
+```
+
+## Calibration Intake (2026-02-14)
+
+Latest lock/memory profiling intake from `wa-1u90p.1.3`:
+- `docs/resize-lock-memory-profile-wa-1u90p.1.3.md`
+- `evidence/wa-1u90p.1.3/summaries/simulate_cli_parse.log`
+- `evidence/wa-1u90p.1.3/summaries/simulation_harness_build.log`
+- `evidence/wa-1u90p.1.3/summaries/simulation_harness_build_error_summary.txt`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_telemetry_refs.txt`
+- `evidence/wa-1u90p.1.3/summaries/localpane_resize_telemetry_refs.txt`
+
+Replay/build blocker status:
+- prior `generate_scrollback` parse failures were due to stale `target/debug/ft`; replay is green from current source via `cargo run -p frankenterm -- simulate ...`.
+- historical compile blockers (`E0308`, `E0277`, `E0609`) from earlier intake are resolved in current tree.
+
+Remaining blocker to full calibration refresh:
+- live runtime collection still needs to be executed long enough to populate and publish refreshed percentile tables from lock/memory telemetry snapshots.
+
+## Primary SLO Metrics
+
+### M1. End-to-End Interaction Latency
+
+Measured as `input_intent -> presentation` from resize timeline artifacts.
+
+| Tier | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| `low` | <= 20 ms | <= 33 ms | <= 50 ms |
+| `mid` | <= 12 ms | <= 20 ms | <= 33 ms |
+| `high` | <= 8 ms | <= 12 ms | <= 20 ms |
+
+### M2. Stage Latency Budgets (`R2`, `R3` focus)
+
+Measured per stage using timeline probes.
+
+| Stage | low p95 | mid p95 | high p95 |
+|---|---:|---:|---:|
+| `input_intent` | <= 2 ms | <= 1 ms | <= 1 ms |
+| `scheduler_queueing` | <= 6 ms | <= 3 ms | <= 2 ms |
+| `logical_reflow` | <= 14 ms | <= 8 ms | <= 5 ms |
+| `render_prep` | <= 10 ms | <= 6 ms | <= 4 ms |
+| `presentation` | <= 8 ms | <= 4 ms | <= 3 ms |
+
+### M3. Visual Artifact Budgets
+
+Artifacts are counted per resize-class event.
+
+| Class | Allowed incidence |
+|---|---|
+| Critical artifacts (blank frame, stale full-frame, severe tear) | 0 per run |
+| Minor artifacts (single-frame transient mismatch) | <= 0.1% of resize-class events |
+
+### M4. Crash/Recovery Budget
+
+| Context | Requirement |
+|---|---|
+| CI scenario runs | 0 crashes, 0 hangs |
+| Nightly soak (`R4`) | >= 99.95% crash-free session-hours |
+| Release candidate | 0 unresolved resize/reflow P0 incidents |
+
+## Gate Definitions
+
+## CI Gate (required on merge path)
+
+- Run deterministic scenario suite in `crates/frankenterm-core/tests/simulation_resize_suite.rs`.
+- Run probe integrity tests for timeline summaries/flame rows.
+- Run runtime warning-threshold tests for lock wait/hold and cursor snapshot memory.
+- Enforce numeric M1/M2/M3 thresholds from generated baseline artifacts (mid tier minimum).
+- Fail build on any critical artifact or threshold breach.
+- Canonical command: `scripts/check_resize_performance_gates.sh`
+
+## Baseline Refresh Workflow (Audit Required)
+
+`scripts/check_resize_performance_gates.sh` supports threshold checks plus controlled baseline refresh.
+
+Rules:
+- Baseline updates require an explicit reason in `FT_RESIZE_GATE_BASELINE_REASON`.
+- Refresh writes baseline metrics to `evidence/wa-1u90p.7.4/resize_perf_mid_baseline.json`.
+- Refresh appends an audit trail row to `evidence/wa-1u90p.7.4/resize_perf_mid_baseline.audit.jsonl` with timestamp, user, commit, reason, and source report path.
+
+Example:
+
+```bash
+FT_RESIZE_GATE_BASELINE_REASON="Recalibrate after approved scheduler optimization" \
+scripts/check_resize_performance_gates.sh --write-baseline
+```
+
+## Nightly/Soak Gate
+
+- Run `R4` mixed-scale soak at minimum 60 minutes on low+mid tiers.
+- Enforce M1 p99, M3, and M4 crash-free requirements.
+- Store trend artifacts for 7-day regression review.
+
+## Go/No-Go Gate
+
+- Require green CI + 7 consecutive green nightly runs.
+- Require no unresolved resize/reflow P0/P1 bugs.
+- Require lock/memory profile review sign-off (`wa-1u90p.1.3` evidence).
+
+## Artifact Contract
+
+Required outputs for each gate:
+- scenario metadata + reproducibility key (`Scenario::metadata`, `Scenario::reproducibility_key`)
+- raw timeline events (`ResizeTimeline.events[*].total_duration_ns` for M1 percentile derivation)
+- stage samples (`ResizeTimeline.events[*].stages[*].duration_ns`)
+- queue attribution (`ResizeTimeline.events[*].stages[*].queue_metrics.depth_before/depth_after`)
+- stage aggregates (`ResizeTimeline::stage_summary()` -> `avg_duration_ns`, `p95_duration_ns`, `max_duration_ns`)
+- flame rows (`ResizeTimeline::flame_samples()`)
+- lock/memory telemetry (`avg_storage_lock_wait_ms`, `p50_storage_lock_wait_ms`, `p95_storage_lock_wait_ms`, `max_storage_lock_wait_ms`, `storage_lock_contention_events`, `avg_storage_lock_hold_ms`, `p50_storage_lock_hold_ms`, `p95_storage_lock_hold_ms`, `max_storage_lock_hold_ms`, `cursor_snapshot_bytes_last`, `p50_cursor_snapshot_bytes`, `p95_cursor_snapshot_bytes`, `cursor_snapshot_bytes_max`)
+- health warning snapshot (`HealthSnapshot.warnings`) + crash/timeout report
+
+## Current Gaps and Near-Term Closure
+
+- Full timeline artifacts are available via `ft simulate run --json --resize-timeline-json`; plain `--json` mode remains metadata/event playback oriented.
+- Numeric p50/p99 refresh and artifact incidence rollups remain pending live runtime percentile captures and refreshed rollups from `wa-1u90p.1.3`.
+- `wa-1u90p.1.5` consumes this contract as the normative threshold baseline and will tighten ranking confidence after replay unblock.
+
+## Degradation and Rollback Policy
+
+## Trigger conditions
+
+Any of the following triggers mitigation:
+- M1 p99 exceeds tier target by >20% in 2 consecutive runs
+- any critical artifact appears
+- any crash/hang in CI scenario run
+
+## Mitigation sequence
+
+1. Enable/raise degradation mode for resize quality policy.
+2. Re-run deterministic `R1-R3` scenarios to validate containment.
+3. If still failing, rollback latest resize/reflow optimization slice.
+
+## Recovery criteria
+
+Rollback/degradation can be lifted only after:
+- 3 consecutive green CI runs
+- 2 consecutive green nightly runs on affected tier(s)
+
+## Dependency-Bound Sections
+
+Thresholds in this document are explicit and enforceable now.
+Refresh-calibration is dependency-bound to:
+- `wa-1u90p.1.3`: publish fresh `R1..R4` percentile rollups from live runtime telemetry + simulation timeline artifacts
+- `wa-1u90p.1.5`: incorporate refreshed rollups into final intervention ranking package
+
+When replay/build blockers clear, update this document with refreshed percentile
+tables and record the revision in bead notes.

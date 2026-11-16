@@ -1,0 +1,19 @@
+{"arm": "on", "secs": 5.2626, "load_1m": 9.43, "dir": "/tmp/ftda.on.n5tks5y_", "dir_mb": 58, "presented_total": 160, "label": "t1-full", "round": 0}
+{"arm": "off", "secs": 5.2608, "load_1m": 10.49, "dir": "/tmp/ftda.off.b5_lzlh8", "dir_mb": 0, "presented_total": 162, "label": "t1-full", "round": 0}
+{"arm": "off", "secs": 5.1011, "load_1m": 9.94, "dir": "/tmp/ftda.off.bsh7t0to", "dir_mb": 0, "presented_total": 156, "label": "t1-full", "round": 1}
+{"arm": "on", "secs": 4.8738, "load_1m": 9.81, "dir": "/tmp/ftda.on.ufhbcq3e", "dir_mb": 38, "presented_total": 153, "label": "t1-full", "round": 1}
+{"arm": "on", "secs": 4.9871, "load_1m": 10.95, "dir": "/tmp/ftda.on.yipo4rp6", "dir_mb": 44, "presented_total": 154, "label": "t1-full", "round": 2}
+{"arm": "off", "secs": 11.7215, "load_1m": 10.34, "dir": "/tmp/ftda.off.12k2jshb", "dir_mb": 0, "presented_total": 355, "label": "t1-full", "round": 2}
+{"arm": "off", "secs": 5.2602, "load_1m": 17.51, "dir": "/tmp/ftda.off.hhhwmn2l", "dir_mb": 0, "presented_total": 163, "label": "t1-full", "round": 3}
+{"arm": "on", "secs": 5.387, "load_1m": 16.06, "dir": "/tmp/ftda.on.ez8szl3o", "dir_mb": 66, "presented_total": 166, "label": "t1-full", "round": 3}
+t1-full: on median 5.125 s [4.8738, 4.9871, 5.2626, 5.387]; off median 5.261 s [5.1011, 5.2602, 5.2608, 11.7215]; on/off per-round [1.0, 0.955, 0.425, 1.024] median 0.978
+{"arm": "on", "secs": 23.9655, "load_1m": 14.23, "dir": "/tmp/ftda.on.9gjn82vi", "dir_mb": 0, "presented_total": 723, "label": "t2-seq20m", "round": 0}
+{"arm": "off", "secs": 14.5022, "load_1m": 12.8, "dir": "/tmp/ftda.off.uuj6sbxc", "dir_mb": 0, "presented_total": 437, "label": "t2-seq20m", "round": 0}
+{"arm": "off", "secs": 17.58, "load_1m": 12.7, "dir": "/tmp/ftda.off.5ihmyq83", "dir_mb": 0, "presented_total": 532, "label": "t2-seq20m", "round": 1}
+{"arm": "on", "secs": 27.5749, "load_1m": 14.24, "dir": "/tmp/ftda.on.z4forrzc", "dir_mb": 5, "presented_total": 832, "label": "t2-seq20m", "round": 1}
+{"arm": "on", "secs": 26.296, "load_1m": 13.96, "dir": "/tmp/ftda.on.rpw_3wyv", "dir_mb": 33, "presented_total": 790, "label": "t2-seq20m", "round": 2}
+{"arm": "off", "secs": 15.634, "load_1m": 12.69, "dir": "/tmp/ftda.off.biudm65x", "dir_mb": 0, "presented_total": 469, "label": "t2-seq20m", "round": 2}
+{"arm": "off", "secs": 14.3869, "load_1m": 11.05, "dir": "/tmp/ftda.off.8ol2132s", "dir_mb": 0, "presented_total": 432, "label": "t2-seq20m", "round": 3}
+{"arm": "on", "secs": 21.3781, "load_1m": 11.36, "dir": "/tmp/ftda.on.t66wxu6_", "dir_mb": 11, "presented_total": 645, "label": "t2-seq20m", "round": 3}
+t2-seq20m: on median 25.131 s [21.3781, 23.9655, 26.296, 27.5749]; off median 15.068 s [14.3869, 14.5022, 15.634, 17.58]; on/off per-round [1.653, 1.569, 1.682, 1.486] median 1.611
+seq2m: on median 2.080 s [2.0633, 2.0745, 2.0858, 2.1186]; off median 1.435 s [1.4214, 1.4351, 1.4353, 1.6121]; on/off per-round [1.28, 1.467, 1.445, 1.476] median 1.456

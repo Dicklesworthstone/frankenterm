@@ -1,0 +1,3 @@
+'checkpoint_catalog_reread_published_candidate' in 'ft-guardian-checkpoint': 1955 samples
+   1305  frankenterm_pty_guardian::output::guardian_replay_build_page <- frankenterm_pty_guardian::runtime::execute_checkpoint_job <- frankenterm_pty_guardian::runtime::checkpoint_worker
+    650  frankenterm_pty_guardian::output::guardian_replay_open_catalog_descriptor <- frankenterm_pty_guardian::output::guardian_replay_open_snapshot::{closure#0} <- <frankenterm_pty_guardian::output::GuardianCheckpointStageStore>::with_exclusive_directory::

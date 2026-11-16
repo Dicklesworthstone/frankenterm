@@ -1,0 +1,30 @@
+   on-for-cli-tools/SKILL.md" is overriding the same skill from
+   "~/.gemini/skills/agent-ergonomics-and-intuitiveness-maximizati
+   on-for-cli-tools/SKILL.md".
+
+⚠  Skill conflict detected: "admin-page-for-nextjs-sites" from
+   "~/.agents/skills/admin-page-for-nextjs-sites/SKILL.md" is
+   overriding the same skill from
+   "~/.gemini/skills/admin-page-for-nextjs-sites/SKILL.md".
+
+⚠  Skill conflict detected: "ab-testing" from
+   "~/.agents/skills/ab-testing/SKILL.md" is overriding the same
+   skill from "~/.gemini/skills/ab-testing/SKILL.md".
+
+ℹ Update successful! The new version will be used on your next run.
+
+ ╭────────────────────────────────────────────────────────────────────────────╮
+ │                                                                            │
+ │ Do you trust the files in this folder?                                     │
+ │                                                                            │
+ │ Trusting a folder allows Gemini CLI to load its local configurations,      │
+ │ including custom commands, hooks, MCP servers, agent skills, and settings. │
+ │ These configurations could execute code on your behalf or change the       │
+ │ behavior of the CLI.                                                       │
+ │                                                                            │
+ │                                                                            │
+ │ ● 1. Trust folder (work)                                                   │
+ │   2. Trust parent folder (workspace)                                     │
+ │   3. Don't trust                                                           │
+ │                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────╯

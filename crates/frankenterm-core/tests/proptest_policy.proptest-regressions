@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e3e3bbbaafbbe705550b4e33f591f6f9fb856a2d6e1ccf7d1a8fed597a1ee402 # shrinks to action = ConnectorCredentialAction

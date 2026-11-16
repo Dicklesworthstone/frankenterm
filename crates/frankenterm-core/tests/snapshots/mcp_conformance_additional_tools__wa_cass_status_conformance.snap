@@ -1,0 +1,16 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "healthy": true,
+    "index_path": "/tmp/.cass/index",
+    "last_indexed": null,
+    "stale": false,
+    "total_lines": null,
+    "total_sessions": 150
+  },
+  "ok": true,
+  "tool": "wa.cass_status"
+}

@@ -1,0 +1,10 @@
+Prior historical CASS searches timed out in earlier block; no new historical-clean claim here.
+The RCH lane timed out after 600 seconds, so I reran it on ts1.
+ssh: connect to host 10.0.0.5 port 22: Connection timed out
+The websocket connection closed before the handshake finished.
+Error: connection failed - ECONNREFUSED
+network error: unable to reach the API server
+Request timed out after 30 seconds
+API call timed out after 120s
+API overloaded, retry in 30 seconds
+I grepped for API Error handling in the client.

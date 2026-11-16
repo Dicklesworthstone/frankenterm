@@ -1,0 +1,9594 @@
+//! Event-driven workflow runner.
+//!
+//! Provides WorkflowRunner, WorkflowRunnerConfig, WorkflowStartResult,
+//! and the event-driven execution loop that dispatches detections to
+//! registered workflows.
+//!
+//! Extracted from `workflows.rs` as part of strangler fig refactoring (ft-c45am).
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
+use crate::storage::{WorkflowAttemptPhase, WorkflowExecutionBudget};
+use tracing::{debug, warn};
+
+const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const WORKFLOW_DETECTION_REPLAY_PAGE_SIZE: usize = 64;
+const WORKFLOW_DETECTION_REPLAY_INTERVAL: Duration = Duration::from_millis(250);
+const WORKFLOW_RECOVERY_PAGE_SIZE: usize = 64;
+const WORKFLOW_RECOVERY_MAX_CHILDREN: usize = 32;
+
+#[derive(Default)]
+struct WorkflowRecoveryTasks {
+    active: std::sync::atomic::AtomicUsize,
+    // Keep only the earliest deferred cursor, rather than an unbounded queue
+    // of blocked executions. None inside Some means retry from the beginning.
+    #[allow(clippy::option_option)]
+    retry_after: Mutex<Option<Option<String>>>,
+}
+
+struct WorkflowRecoveryTaskGuard {
+    tasks: Arc<WorkflowRecoveryTasks>,
+    after_id: Option<String>,
+    retry: bool,
+}
+
+impl WorkflowRecoveryTaskGuard {
+    fn new(tasks: Arc<WorkflowRecoveryTasks>, after_id: Option<String>) -> Self {
+        tasks.active.fetch_add(1, Ordering::SeqCst);
+        Self {
+            tasks,
+            after_id,
+            // A panic or cancellation before an explicit disposition must not
+            // silently lose the durable record from this recovery sweep.
+            retry: true,
+        }
+    }
+
+    /// Record the child's disposition and release its recovery slot.
+    ///
+    /// Taking `self` makes the child task own the whole guard. Assigning
+    /// `guard.retry` inside a `move` closure captured only that `Copy`
+    /// field, so the guard itself dropped in the runner loop before the
+    /// child ran: the slot was released at once and every record retried.
+    fn settle(mut self, retry: bool) {
+        self.retry = retry;
+    }
+}
+
+impl Drop for WorkflowRecoveryTaskGuard {
+    fn drop(&mut self) {
+        if self.retry {
+            let mut retry = self
+                .tasks
+                .retry_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retry.as_ref().is_none_or(|old| self.after_id < *old) {
+                *retry = Some(self.after_id.clone());
+            }
+        }
+        self.tasks.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Bounded reconciliation of unfinished executions. This uses stable primary
+/// keys, not SQLite rowids (which can change during VACUUM or be reused).
+/// Membership is revalidated by the child before admission; a page is never
+/// itself authority to execute a workflow.
+struct WorkflowStartupRecovery {
+    after_id: Option<String>,
+    through_id: Option<String>,
+    // None inside Some means retry from the beginning.
+    #[allow(clippy::option_option)]
+    retry_after: Option<Option<String>>,
+    rows: std::collections::VecDeque<crate::storage::WorkflowRecord>,
+    page_loaded: bool,
+    page_exhausted: bool,
+    finished: bool,
+    next_poll: Instant,
+    tasks: Arc<WorkflowRecoveryTasks>,
+    max_children: usize,
+}
+
+impl WorkflowStartupRecovery {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            after_id: None,
+            through_id: None,
+            retry_after: None,
+            rows: std::collections::VecDeque::new(),
+            page_loaded: false,
+            page_exhausted: false,
+            finished: false,
+            next_poll: Instant::now(),
+            tasks: Arc::new(WorkflowRecoveryTasks::default()),
+            // Leave one global slot available to live detections whenever the
+            // configured limit permits it. A backlog of restored waiters must
+            // not occupy every slot indefinitely.
+            max_children: max_concurrent
+                .saturating_sub(1)
+                .max(usize::from(max_concurrent > 0))
+                .min(WORKFLOW_RECOVERY_MAX_CHILDREN),
+        }
+    }
+
+    fn collect_retries(&mut self) {
+        let retry = self
+            .tasks
+            .retry_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(after_id) = retry {
+            if self.finished {
+                self.after_id = after_id;
+                self.finished = false;
+                self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+            } else if self.retry_after.as_ref().is_none_or(|old| after_id < *old) {
+                self.retry_after = Some(after_id);
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        (!self.finished && self.tasks.active.load(Ordering::SeqCst) < self.max_children)
+            .then_some(self.next_poll)
+    }
+
+    async fn next_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+    ) -> crate::Result<Option<(Option<String>, crate::storage::WorkflowRecord)>> {
+        if self
+            .next_deadline()
+            .is_none_or(|next| Instant::now() < next)
+        {
+            return Ok(None);
+        }
+        if self.rows.is_empty() && self.page_loaded {
+            self.page_loaded = false;
+            if self.page_exhausted {
+                if let Some(after_id) = self.retry_after.take() {
+                    self.after_id = after_id;
+                    self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                } else {
+                    self.finished = true;
+                }
+            }
+            // Never process an unlimited backlog in one event-loop turn.
+            crate::runtime_async::task::yield_now().await;
+            return Ok(None);
+        }
+        if self.rows.is_empty() {
+            let page = storage
+                .scan_incomplete_workflows_with_cx(
+                    cx,
+                    self.after_id.clone(),
+                    self.through_id.clone(),
+                    WORKFLOW_RECOVERY_PAGE_SIZE,
+                )
+                .await?;
+            self.through_id = page.through_id;
+            self.page_exhausted = page.records.len() < WORKFLOW_RECOVERY_PAGE_SIZE
+                || page
+                    .records
+                    .last()
+                    .is_some_and(|record| Some(record.id.as_str()) == self.through_id.as_deref());
+            self.page_loaded = true;
+            self.rows = page.records.into();
+        }
+        Ok(self.rows.pop_front().map(|record| {
+            let before = self.after_id.replace(record.id.clone());
+            (before, record)
+        }))
+    }
+}
+
+struct WorkflowResumeAttempt {
+    result: Option<WorkflowExecutionResult>,
+    retry: bool,
+}
+
+/// A detection subscription prepared before the observation runtime starts.
+///
+/// The optional replay boundary belongs to this watcher session. It does not
+/// authorize historical events from a previous watcher or configuration.
+pub struct WorkflowEventSubscription {
+    subscriber: crate::events::EventSubscriber,
+    replay: Option<WorkflowDetectionReplay>,
+}
+
+struct RecoveredWorkflowSource {
+    pane_uuid: String,
+    event_epoch: String,
+    detected_at: i64,
+}
+
+struct WorkflowDetectionReplay {
+    cursor: crate::event_stream::DurableStreamCursor,
+    sweep_until: Option<i64>,
+    retry_after: Option<i64>,
+    rows: std::collections::VecDeque<crate::storage::StoredEvent>,
+    page_through: Option<i64>,
+    next_poll: Instant,
+}
+
+impl WorkflowDetectionReplay {
+    fn new(baseline: crate::storage::EventRetentionSnapshot) -> Self {
+        Self {
+            cursor: crate::event_stream::DurableStreamCursor {
+                after_id: baseline.max_event_id,
+                epoch: baseline.cursor_epoch,
+            },
+            sweep_until: None,
+            retry_after: None,
+            rows: std::collections::VecDeque::new(),
+            page_through: None,
+            next_poll: Instant::now(),
+        }
+    }
+
+    fn retry(&mut self, event_id: i64) {
+        let after_id = event_id.saturating_sub(1);
+        self.retry_after = Some(self.retry_after.map_or(after_id, |old| old.min(after_id)));
+    }
+
+    fn wake(&mut self, event_id: Option<i64>) {
+        if event_id.is_none_or(|id| id > self.cursor.after_id) {
+            self.next_poll = Instant::now();
+        }
+    }
+
+    /// Read one bounded page per turn. Freeze a sweep's upper watermark so
+    /// continuous insertion cannot starve a temporarily blocked earlier pane.
+    async fn next_stored_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+    ) -> Result<Option<crate::storage::StoredEvent>, crate::event_stream::DurableStreamError> {
+        use crate::event_stream::DurableStreamError;
+
+        cx.checkpoint().map_err(|_| DurableStreamError::Cancelled)?;
+        if let Some(row) = self.rows.pop_front() {
+            return Ok(Some(row));
+        }
+        if let Some(through_id) = self.page_through.take() {
+            self.cursor.after_id = through_id;
+            if self.sweep_until == Some(through_id) {
+                self.cursor.after_id = self.retry_after.take().unwrap_or(through_id);
+                self.sweep_until = None;
+                self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+            } else {
+                // Give shutdown, completed children, and live-only signals a
+                // turn between pages even when the durable backlog is large.
+                crate::runtime_async::task::yield_now().await;
+            }
+            return Ok(None);
+        }
+        if Instant::now() < self.next_poll {
+            return Ok(None);
+        }
+
+        let page = storage
+            .get_events_stream_page_with_cx(
+                cx,
+                crate::storage::EventStreamQuery {
+                    after_id: Some(self.cursor.after_id),
+                    limit: Some(WORKFLOW_DETECTION_REPLAY_PAGE_SIZE),
+                    unhandled_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        let upper = self.sweep_until.unwrap_or(page.retention.max_event_id);
+        let mut previous = self.cursor.after_id;
+        if page.events.len() > WORKFLOW_DETECTION_REPLAY_PAGE_SIZE
+            || upper < self.cursor.after_id
+            || page.retention.max_event_id < upper
+            || !page.events.iter().all(|event| {
+                let ordered = event.id > previous && event.id <= page.retention.max_event_id;
+                previous = event.id;
+                ordered
+            })
+        {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        let reaches_upper = page.events.len() < WORKFLOW_DETECTION_REPLAY_PAGE_SIZE
+            || page.events.last().is_some_and(|event| event.id >= upper);
+        let through_id = if reaches_upper {
+            upper
+        } else {
+            page.events.last().map_or(upper, |event| event.id)
+        };
+        let retention = storage
+            .check_event_retention_in_epoch_with_cx(
+                cx,
+                self.cursor.after_id,
+                through_id,
+                &self.cursor.epoch,
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        if page.retention.cursor_epoch != self.cursor.epoch
+            || retention.snapshot.cursor_epoch != self.cursor.epoch
+            || !matches!(
+                retention.status,
+                crate::storage::EventRetentionStatus::CompleteNoPruning
+            )
+        {
+            return Err(DurableStreamError::CursorExpired(Box::new(retention)));
+        }
+        if retention.checked_through_id != through_id
+            || retention.snapshot.max_event_id < page.retention.max_event_id
+            || retention.snapshot.generation < page.retention.generation
+        {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        tracing::debug!(
+            after_id = self.cursor.after_id,
+            through_id,
+            sweep_until = upper,
+            rows = page.events.len(),
+            "Reconciled workflow detection page"
+        );
+        self.sweep_until = Some(upper);
+        self.page_through = Some(through_id);
+        self.rows = page
+            .events
+            .into_iter()
+            .take_while(|event| event.id <= upper)
+            .collect();
+        self.next_poll = Instant::now();
+        Ok(self.rows.pop_front())
+    }
+}
+
+/// Action admission has stricter decoding than display-only event streams.
+fn workflow_detection_from_stored(
+    stored: &crate::storage::StoredEvent,
+) -> Option<crate::patterns::Detection> {
+    if stored.id <= 0 || !stored.confidence.is_finite() || !(0.0..=1.0).contains(&stored.confidence)
+    {
+        return None;
+    }
+    Some(crate::patterns::Detection {
+        rule_id: stored.rule_id.clone(),
+        agent_type: serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
+            .ok()?,
+        event_type: stored.event_type.clone(),
+        severity: serde_json::from_value(serde_json::Value::String(stored.severity.clone()))
+            .ok()?,
+        confidence: stored.confidence,
+        extracted: stored.extracted.clone().unwrap_or(serde_json::Value::Null),
+        matched_text: stored.matched_text.clone().unwrap_or_default(),
+        span: (0, 0),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowRunnerChildDrainOutcome {
+    Settled,
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+}
+
+fn classify_workflow_runner_child_drain(
+    timed_out: bool,
+    settlement: crate::runtime_async::task::JoinSetSettlement,
+) -> WorkflowRunnerChildDrainOutcome {
+    match settlement {
+        crate::runtime_async::task::JoinSetSettlement::Settled => {
+            WorkflowRunnerChildDrainOutcome::Settled
+        }
+        crate::runtime_async::task::JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } if timed_out => WorkflowRunnerChildDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+        crate::runtime_async::task::JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => WorkflowRunnerChildDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+    }
+}
+
+async fn settle_workflow_runner_children(
+    child_tasks: &mut crate::runtime_async::task::JoinSet<()>,
+) -> WorkflowRunnerChildDrainOutcome {
+    child_tasks.abort_all();
+    let drain_cx = crate::cx::for_request();
+    let drain_result = crate::runtime_async::timeout_with_cx(
+        &drain_cx,
+        WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT,
+        async {
+            loop {
+                match child_tasks.drain_next_with_cx(&drain_cx).await {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(error))) => {
+                        if matches!(
+                            error.kind(),
+                            crate::runtime_async::task::JoinErrorKind::Aborted
+                                | crate::runtime_async::task::JoinErrorKind::ContextCancelled
+                                | crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed
+                        ) {
+                            tracing::debug!(
+                                failure_class = ?error.kind(),
+                                "Workflow child task stopped during runner shutdown"
+                            );
+                        } else {
+                            tracing::warn!(
+                                failure_class = ?error.kind(),
+                                "Workflow child task failed during runner shutdown"
+                            );
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(drain_error) => return Err(drain_error),
+                }
+            }
+        },
+    )
+    .await;
+    if let Ok(Err(drain_error)) = &drain_result {
+        tracing::warn!(
+            failure_class = ?drain_error.kind(),
+            "Workflow child task drain context failed before terminal settlement"
+        );
+    }
+    classify_workflow_runner_child_drain(drain_result.is_err(), child_tasks.settlement())
+}
+
+type WorkflowChildJoinResult = Result<(), crate::runtime_async::task::JoinError>;
+type WorkflowChildDrainResult =
+    Result<Option<WorkflowChildJoinResult>, crate::runtime_async::task::JoinError>;
+
+enum WorkflowRunnerWake {
+    Shutdown,
+    Event(Box<Result<crate::events::Event, crate::events::RecvError>>),
+    Child(WorkflowChildDrainResult),
+}
+
+async fn wait_for_workflow_runner_activity(
+    cx: &crate::cx::Cx,
+    subscriber: &mut crate::events::EventSubscriber,
+    child_tasks: &mut crate::runtime_async::task::JoinSet<()>,
+    shutdown: Option<(
+        &std::sync::atomic::AtomicBool,
+        &crate::runtime_async::notify::Notify,
+    )>,
+) -> WorkflowRunnerWake {
+    use futures::future::{Either, select};
+
+    if child_tasks.is_empty() {
+        if let Some((shutdown_flag, shutdown_notify)) = shutdown {
+            let shutdown_wait = std::pin::pin!(
+                shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+            );
+            let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+            return match select(shutdown_wait, event_wait).await {
+                Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+                Either::Right((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
+            };
+        }
+        return WorkflowRunnerWake::Event(Box::new(subscriber.recv_cx(cx).await));
+    }
+
+    if let Some((shutdown_flag, shutdown_notify)) = shutdown {
+        let shutdown_wait =
+            std::pin::pin!(shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) }));
+        let activity_wait = std::pin::pin!(async {
+            let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+            let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
+            match select(event_wait, child_wait).await {
+                Either::Left((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
+                Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
+            }
+        });
+        return match select(shutdown_wait, activity_wait).await {
+            Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+            Either::Right((wake, _)) => wake,
+        };
+    }
+
+    let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+    let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
+    match select(event_wait, child_wait).await {
+        Either::Left((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
+        Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
+    }
+}
+
+fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+        "{label} cancelled: {err}"
+    )))
+}
+
+fn workflow_runner_cancelled(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: crate::error::RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
+
+fn workflow_execution_error(
+    execution_id: &str,
+    error: impl std::fmt::Display,
+) -> WorkflowExecutionResult {
+    WorkflowExecutionResult::Error {
+        execution_id: Some(execution_id.to_string()),
+        error: error.to_string(),
+    }
+}
+
+fn log_workflow_execution_result(result: &WorkflowExecutionResult) {
+    match result {
+        WorkflowExecutionResult::Completed {
+            execution_id,
+            steps_executed,
+            elapsed_ms,
+            ..
+        } => tracing::info!(
+            execution_id,
+            steps = steps_executed,
+            elapsed_ms,
+            explicit_cx = true,
+            "Workflow completed (cx)"
+        ),
+        WorkflowExecutionResult::Aborted {
+            execution_id,
+            reason,
+            step_index,
+            ..
+        } => tracing::warn!(
+            execution_id,
+            step = step_index,
+            reason,
+            explicit_cx = true,
+            "Workflow aborted (cx)"
+        ),
+        WorkflowExecutionResult::PolicyDenied {
+            execution_id,
+            step_index,
+            reason,
+        } => tracing::warn!(
+            execution_id,
+            step = step_index,
+            reason,
+            explicit_cx = true,
+            "Workflow denied by policy (cx)"
+        ),
+        WorkflowExecutionResult::Error {
+            execution_id,
+            error,
+        } => tracing::error!(
+            execution_id = execution_id.as_deref(),
+            error,
+            explicit_cx = true,
+            "Workflow error (cx)"
+        ),
+    }
+}
+
+async fn wait_duration_with_cx(
+    cx: &crate::cx::Cx,
+    duration: Duration,
+    label: &str,
+) -> Result<(), crate::Error> {
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| {
+            crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+                "{label} duration is too large: {duration:?}"
+            )))
+        })?;
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        cx.checkpoint()
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        let chunk = remaining.min(Duration::from_millis(50));
+        crate::runtime_async::sleep_with_cx(cx, chunk)
+            .await
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        remaining = remaining.saturating_sub(chunk);
+    }
+    Ok(())
+}
+
+async fn wait_required_duration_with_cx(
+    cx: &crate::cx::Cx,
+    required: Duration,
+    timeout: Duration,
+    label: &str,
+    condition: &str,
+) -> Result<(), crate::Error> {
+    wait_duration_with_cx(cx, required.min(timeout), label).await?;
+    if required > timeout {
+        return Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: {condition} timed out after {}ms before required {}ms elapsed",
+                timeout.as_millis(),
+                required.as_millis()
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn cap_wait_by_workflow_deadline(
+    requested: Duration,
+    budget: &WorkflowExecutionBudget,
+    last_observed: Instant,
+) -> Duration {
+    let mut observed = budget.clone();
+    if observed
+        .observe_time(now_ms(), elapsed_ms(last_observed))
+        .is_err()
+    {
+        return Duration::ZERO;
+    }
+    observed.remaining_ms.map_or(requested, |remaining| {
+        requested.min(Duration::from_millis(remaining))
+    })
+}
+
+fn workflow_budget_error(reason: &'static str) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason.to_string()))
+}
+
+fn is_workflow_budget_revision_conflict(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(crate::error::StorageError::Database(reason))
+            if reason == "workflow_budget_revision_conflict"
+    )
+}
+
+fn is_invalid_workflow_budget(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Storage(crate::error::StorageError::Database(reason))
+            if matches!(
+                reason.as_str(),
+                "workflow_budget_invalid_state"
+                    | "workflow_budget_invalid_payload"
+                    | "workflow_budget_identity_mismatch"
+                    | "workflow_budget_invalid_deadline"
+                    | "workflow_budget_invalid_retry"
+            )
+    )
+}
+
+fn normalized_retry_backoff_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_finite() && multiplier >= 1.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
+fn admit_retry_ordinal(current: usize, maximum: usize) -> Option<usize> {
+    current
+        .checked_add(1)
+        .filter(|next_ordinal| *next_ordinal <= maximum)
+}
+
+fn next_up_nonnegative(value: f64) -> f64 {
+    debug_assert!(!value.is_sign_negative());
+    if value.is_infinite() {
+        value
+    } else {
+        f64::from_bits(value.to_bits().saturating_add(1))
+    }
+}
+
+fn conservative_nonnegative_product(lhs: f64, rhs: f64) -> f64 {
+    let product = lhs * rhs;
+    if !product.is_finite() {
+        return f64::INFINITY;
+    }
+    let rounding_residual = lhs.mul_add(rhs, -product);
+    if rounding_residual > 0.0 {
+        next_up_nonnegative(product)
+    } else {
+        product
+    }
+}
+
+fn retry_backoff_scale(multiplier: f64, mut exponent: usize) -> f64 {
+    let mut scale = 1.0;
+    let mut factor = normalized_retry_backoff_multiplier(multiplier);
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            scale = conservative_nonnegative_product(scale, factor);
+            if !scale.is_finite() {
+                return f64::INFINITY;
+            }
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            factor = conservative_nonnegative_product(factor, factor);
+            if !factor.is_finite() {
+                return f64::INFINITY;
+            }
+        }
+    }
+    scale
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn retry_backoff_delay(base_delay_ms: u64, retry_attempt: usize, multiplier: f64) -> Duration {
+    let base_delay = Duration::from_millis(base_delay_ms);
+    if base_delay.is_zero() || retry_attempt <= 1 {
+        return base_delay;
+    }
+
+    let scale = retry_backoff_scale(multiplier, retry_attempt.saturating_sub(1));
+    let approximate_base_ms = base_delay_ms as f64;
+    let base_ms_upper_bound = if (approximate_base_ms as u64) < base_delay_ms {
+        next_up_nonnegative(approximate_base_ms)
+    } else {
+        approximate_base_ms
+    };
+    let scaled_ms = conservative_nonnegative_product(base_ms_upper_bound, scale);
+    if !scaled_ms.is_finite() || scaled_ms >= u64::MAX as f64 {
+        return Duration::from_millis(u64::MAX);
+    }
+    Duration::from_millis((scaled_ms.ceil() as u64).max(base_delay_ms))
+}
+
+fn budget_after_step_result(
+    budget: &WorkflowExecutionBudget,
+    result: &StepResult,
+    now: i64,
+) -> crate::Result<WorkflowExecutionBudget> {
+    let mut next = budget.clone();
+    if let StepResult::Retry { delay_ms } = result
+        && let Some(ordinal) = admit_retry_ordinal(budget.retries, budget.max_retries_per_step)
+    {
+        let delay = retry_backoff_delay(*delay_ms, ordinal, budget.retry_backoff_multiplier);
+        let effective_delay_ms = u64::try_from(delay.as_millis())
+            .map_err(|_| workflow_budget_error("workflow_budget_retry_delay_overflow"))?;
+        let not_before = now
+            .checked_add(
+                i64::try_from(effective_delay_ms)
+                    .map_err(|_| workflow_budget_error("workflow_budget_retry_delay_overflow"))?,
+            )
+            .ok_or_else(|| workflow_budget_error("workflow_budget_retry_delay_overflow"))?;
+        next.phase = WorkflowAttemptPhase::RetryWaiting;
+        next.retries = ordinal;
+        next.retry_not_before_ms = Some(not_before);
+        next.retry_base_delay_ms = *delay_ms;
+        next.retry_effective_delay_ms = effective_delay_ms;
+    }
+    Ok(next)
+}
+
+fn invalid_jump_target_reason(step: usize, step_count: usize) -> Option<String> {
+    if step < step_count {
+        None
+    } else {
+        Some(format!(
+            "jump target {step} is outside workflow step range 0..{step_count}"
+        ))
+    }
+}
+
+fn invalid_resume_step_reason(step: usize, step_count: usize) -> Option<String> {
+    if step <= step_count {
+        None
+    } else {
+        Some(format!(
+            "resume step {step} is outside workflow resume range 0..={step_count}"
+        ))
+    }
+}
+
+async fn wait_external_signal_with_cx(
+    cx: &crate::cx::Cx,
+    registry: &ExternalSignalRegistry,
+    key: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<(), crate::Error> {
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+                "{label} duration is too large: {timeout:?}"
+            )))
+        })?;
+    let mut remaining = timeout;
+    let mut interval = Duration::from_millis(5);
+    let max_interval = Duration::from_millis(50);
+    loop {
+        cx.checkpoint()
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        if registry.is_signaled(key) {
+            return Ok(());
+        }
+        if remaining.is_zero() {
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "{label}: external signal '{key}' timed out after {}ms",
+                    timeout.as_millis()
+                )),
+            ));
+        }
+        let chunk = interval.min(remaining);
+        crate::runtime_async::sleep_with_cx(cx, chunk)
+            .await
+            .map_err(|err| workflow_wait_aborted(label, err))?;
+        remaining = remaining.saturating_sub(chunk);
+        interval = interval.saturating_mul(2).min(max_interval);
+    }
+}
+
+async fn wait_condition_pause_with_cx(
+    cx: &crate::cx::Cx,
+    condition: &WaitCondition,
+    timeout: Duration,
+    external_signals: Option<&ExternalSignalRegistry>,
+    label: &str,
+) -> Result<(), crate::Error> {
+    match condition {
+        WaitCondition::PaneIdle {
+            idle_threshold_ms, ..
+        } => {
+            wait_required_duration_with_cx(
+                cx,
+                Duration::from_millis(*idle_threshold_ms),
+                timeout,
+                label,
+                "pane idle wait",
+            )
+            .await
+        }
+        WaitCondition::Pattern { rule_id, .. } => Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: pattern wait '{rule_id}' requires a pane text source; use \
+                 WaitConditionExecutor instead of the WorkflowRunner timeout-sleep fallback"
+            )),
+        )),
+        WaitCondition::TextMatch { matcher, .. } => Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: text-match wait {} requires a pane text source; use \
+                 WaitConditionExecutor instead of the WorkflowRunner timeout-sleep fallback",
+                matcher.description()
+            )),
+        )),
+        WaitCondition::External { key } => {
+            if key.trim().is_empty() {
+                return Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "{label}: external signal key cannot be empty"
+                    )),
+                ));
+            }
+            let Some(registry) = external_signals else {
+                return Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "{label}: external signal '{key}' requires registry; wire one via \
+                         WorkflowRunner::with_external_signals(registry)"
+                    )),
+                ));
+            };
+            wait_external_signal_with_cx(cx, registry, key, timeout, label).await
+        }
+        WaitCondition::StableTail { stable_for_ms, .. } => {
+            wait_required_duration_with_cx(
+                cx,
+                Duration::from_millis(*stable_for_ms),
+                timeout,
+                label,
+                "stable tail wait",
+            )
+            .await
+        }
+        WaitCondition::Sleep { duration_ms } => {
+            wait_required_duration_with_cx(
+                cx,
+                Duration::from_millis(*duration_ms),
+                timeout,
+                label,
+                "sleep wait",
+            )
+            .await
+        }
+    }
+}
+
+// ============================================================================
+// WorkflowRunner - Event-driven workflow execution
+// ============================================================================
+
+/// Result of attempting to start a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowStartResult {
+    /// Workflow started successfully
+    Started {
+        /// Unique execution ID
+        execution_id: String,
+        /// Name of the workflow that was started
+        workflow_name: String,
+    },
+    /// No workflow handles this detection
+    NoMatchingWorkflow {
+        /// The rule_id from the detection
+        rule_id: String,
+    },
+    /// The durable event cannot authorize a fresh automatic execution.
+    TriggerRejected {
+        event_id: i64,
+        reason: crate::error::WorkflowTriggerRejection,
+    },
+    /// The pane is already locked by another workflow
+    PaneLocked {
+        /// The pane that is locked
+        pane_id: u64,
+        /// Workflow name holding the lock
+        held_by_workflow: String,
+        /// Execution ID holding the lock
+        held_by_execution: String,
+    },
+    /// Global concurrent workflow limit reached.
+    ConcurrencyLimitReached {
+        /// Current number of active workflows.
+        active: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
+    /// The detection's source pane is not in the workflow's trust scope (ft-j0ufc).
+    SourcePaneNotTrusted {
+        /// The source pane that produced the trigger text.
+        source_pane_id: u64,
+        /// The matched workflow's name.
+        workflow_name: String,
+        /// The detection rule_id that would have fired.
+        rule_id: String,
+    },
+    /// The target pane is rate/usage-limited and the workflow declared
+    /// `requires_unlimited_pane()` (ft-7h5da.8.3, W7.3). Declined before any
+    /// lock, engine state, or audit row is created.
+    PaneRateLimited {
+        /// The pane that is currently limited.
+        pane_id: u64,
+        /// The matched workflow's name.
+        workflow_name: String,
+        /// The detection rule_id that would have fired.
+        rule_id: String,
+        /// Effective reset deadline (epoch ms) when the pane is expected to
+        /// become usable again — the latest active limit window's deadline.
+        reset_at_ms: i64,
+        /// False when `reset_at_ms` is a conservative fallback (the underlying
+        /// window had no parseable reset, `reset_source == "unknown_ttl"`).
+        reset_known: bool,
+    },
+    /// An error occurred
+    Error {
+        /// Error message
+        error: String,
+    },
+}
+
+/// Outcome of a manually invoked workflow run (ft-cli44).
+///
+/// The manual entry points — MCP `wa.workflow_run`, `ft robot workflows run`,
+/// and `ft workflow run` — must use the same lock + execution-record protocol
+/// as the detection path. See [`WorkflowRunner::run_workflow_manual_with_cx`].
+#[derive(Debug)]
+pub enum ManualWorkflowRunOutcome {
+    /// Lock acquired, execution record persisted, workflow ran to a terminal
+    /// result.
+    Ran(WorkflowExecutionResult),
+    /// The target pane is already locked by another workflow execution; the
+    /// workflow was not started.
+    PaneLocked {
+        /// The pane that is locked.
+        pane_id: u64,
+        /// Workflow name holding the lock.
+        held_by_workflow: String,
+        /// Execution ID holding the lock.
+        held_by_execution: String,
+    },
+    /// Runner-wide concurrency limit reached; the workflow was not started.
+    ConcurrencyLimitReached {
+        /// Current number of active workflows.
+        active: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
+    /// The execution record could not be created; the workflow was not run.
+    StartError {
+        /// Error message from the engine/storage start handshake.
+        error: String,
+    },
+}
+
+impl WorkflowStartResult {
+    /// Returns true if a workflow was started.
+    #[must_use]
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::Started { .. })
+    }
+
+    /// Returns true if the pane was locked by another workflow.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::PaneLocked { .. })
+    }
+
+    /// Returns true if the trigger was refused by the workflow's
+    /// source-pane trust scope (ft-j0ufc).
+    #[must_use]
+    pub fn is_source_pane_not_trusted(&self) -> bool {
+        matches!(self, Self::SourcePaneNotTrusted { .. })
+    }
+
+    /// Returns true if the trigger was declined because the target pane is
+    /// rate/usage-limited and the workflow requires an unlimited pane
+    /// (ft-7h5da.8.3).
+    #[must_use]
+    pub fn is_pane_rate_limited(&self) -> bool {
+        matches!(self, Self::PaneRateLimited { .. })
+    }
+
+    /// Returns the execution ID if the workflow was started.
+    #[must_use]
+    pub fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Started { execution_id, .. } => Some(execution_id),
+            _ => None,
+        }
+    }
+}
+
+/// Result of workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowExecutionResult {
+    /// Workflow completed successfully
+    Completed {
+        /// Execution ID
+        execution_id: String,
+        /// Final result value
+        result: serde_json::Value,
+        /// Total elapsed time in milliseconds
+        elapsed_ms: u64,
+        /// Number of steps executed
+        steps_executed: usize,
+    },
+    /// Workflow was aborted
+    Aborted {
+        /// Execution ID
+        execution_id: String,
+        /// Reason for abort
+        reason: String,
+        /// Step index where abort occurred
+        step_index: usize,
+        /// Elapsed time in milliseconds
+        elapsed_ms: u64,
+    },
+    /// Workflow step was denied by policy
+    PolicyDenied {
+        /// Execution ID
+        execution_id: String,
+        /// Step index where denial occurred
+        step_index: usize,
+        /// Reason for denial
+        reason: String,
+    },
+    /// An error occurred during execution
+    Error {
+        /// Execution ID (if available)
+        execution_id: Option<String>,
+        /// Error message
+        error: String,
+    },
+}
+
+impl WorkflowExecutionResult {
+    /// Returns true if the workflow completed successfully.
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed { .. })
+    }
+
+    /// Returns true if the workflow was aborted.
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted { .. })
+    }
+
+    /// Returns the execution ID.
+    #[must_use]
+    pub fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Completed { execution_id, .. }
+            | Self::Aborted { execution_id, .. }
+            | Self::PolicyDenied { execution_id, .. } => Some(execution_id),
+            Self::Error { execution_id, .. } => execution_id.as_deref(),
+        }
+    }
+}
+
+/// Configuration for the workflow runner.
+#[derive(Debug, Clone)]
+pub struct WorkflowRunnerConfig {
+    /// Maximum concurrent workflow executions
+    pub max_concurrent: usize,
+    /// Default timeout for step execution (milliseconds)
+    pub step_timeout_ms: u64,
+    /// Retry delay multiplier for exponential backoff. A step's returned
+    /// `Retry::delay_ms` is the first-attempt base; retry N waits
+    /// `base * multiplier^(N - 1)`.
+    pub retry_backoff_multiplier: f64,
+    /// Maximum retries per step
+    pub max_retries_per_step: usize,
+    /// Maximum total time from original execution creation to completion,
+    /// including retry waits and time spent stopped between restarts. Exceeding
+    /// this deadline triggers the same cleanup path as a cx-cancellation:
+    /// the failed record and its trigger settled as `"error"` (one writer
+    /// transaction), lock release, and a terminal-action audit row, then returns
+    /// `WorkflowExecutionResult::Error`. Default 600_000 ms (10 min) — a
+    /// pathologically retrying workflow can no longer pin a pane forever.
+    /// The original deadline and retry policy are persisted at creation and
+    /// cannot be increased by a restarted runner's configuration. Set to `0`
+    /// to disable the overall deadline for newly created executions.
+    pub workflow_total_deadline_ms: u64,
+}
+
+impl Default for WorkflowRunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 3,
+            step_timeout_ms: 30_000,
+            retry_backoff_multiplier: 2.0,
+            max_retries_per_step: 3,
+            workflow_total_deadline_ms: 600_000,
+        }
+    }
+}
+
+/// Event-driven workflow runner that subscribes to detection events
+/// and executes matching workflows.
+///
+/// # Architecture
+///
+/// ```text
+/// EventBus (detections) -> WorkflowRunner -> find_matching_workflow
+///                                         -> acquire_pane_lock
+///                                         -> WorkflowEngine (persist)
+///                                         -> execute_steps
+///                                         -> release_pane_lock
+/// ```
+///
+/// # Usage
+///
+/// ```ignore
+/// let runner = WorkflowRunner::new(
+///     engine,
+///     lock_manager,
+///     storage,
+///     injector,
+///     config,
+/// );
+///
+/// // Register workflows
+/// runner.register_workflow(Arc::new(MyWorkflow::new()));
+///
+/// // Run the event loop
+/// runner.run(event_bus).await;
+/// ```
+pub struct WorkflowRunner {
+    /// Registered workflows
+    workflows: std::sync::RwLock<Vec<Arc<dyn Workflow>>>,
+    /// Workflow engine for persistence
+    pub engine: WorkflowEngine,
+    /// Per-pane lock manager
+    lock_manager: Arc<PaneWorkflowLockManager>,
+    /// Storage handle for persistence
+    storage: Arc<crate::storage::StorageHandle>,
+    /// Live incarnation authority for automatic durable detection recovery.
+    source_registry: Option<Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>>,
+    /// Policy-gated injector for terminal input
+    injector: CxPolicyInjector,
+    /// Optional replay capture adapter for decision provenance.
+    replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
+    /// Optional external signal registry for `WaitCondition::External` (ft-ao9k9).
+    /// When unset, External waits return an explicit `WorkflowError::Aborted`
+    /// instead of the legacy timeout-sleep mock.
+    external_signals: Option<Arc<ExternalSignalRegistry>>,
+    /// Live pattern engine whose rule `workflow` labels gate detection
+    /// dispatch (ft-frujlz). When set, a detection starts only the workflow
+    /// its rule declares, and only if that workflow also accepts it. Packs
+    /// downgraded to observe-only declare no workflow, so they start none.
+    /// When unset, the first workflow whose `handles` accepts the detection
+    /// runs.
+    rule_workflows: Option<Arc<crate::runtime_async::RwLock<crate::patterns::PatternEngine>>>,
+    /// Configuration
+    config: WorkflowRunnerConfig,
+}
+
+impl WorkflowRunner {
+    /// Create a new workflow runner.
+    ///
+    /// This stays public because the ft CLI and other integration surfaces
+    /// construct runners directly around a shared engine/storage/injector set.
+    pub fn new(
+        engine: WorkflowEngine,
+        lock_manager: Arc<PaneWorkflowLockManager>,
+        storage: Arc<crate::storage::StorageHandle>,
+        injector: CxPolicyInjector,
+        mut config: WorkflowRunnerConfig,
+    ) -> Self {
+        let normalized_multiplier =
+            normalized_retry_backoff_multiplier(config.retry_backoff_multiplier);
+        if config.retry_backoff_multiplier.to_bits() != normalized_multiplier.to_bits() {
+            warn!(
+                failure_class = "invalid_retry_backoff_multiplier",
+                fallback_multiplier = normalized_multiplier,
+                "Workflow runner retry multiplier must be finite and at least 1.0; using safe constant-delay fallback"
+            );
+            config.retry_backoff_multiplier = normalized_multiplier;
+        }
+        Self {
+            workflows: std::sync::RwLock::new(Vec::new()),
+            engine,
+            lock_manager,
+            injector: injector.with_capability_source(Arc::clone(&storage), None),
+            storage,
+            source_registry: None,
+            replay_capture: None,
+            external_signals: None,
+            rule_workflows: None,
+            config,
+        }
+    }
+
+    /// Start a detection's workflow only if its rule declares it (ft-frujlz).
+    /// Pass the engine the observation runtime detects with, so pack reloads
+    /// apply here too.
+    #[must_use]
+    pub fn with_rule_workflow_gate(
+        mut self,
+        patterns: Arc<crate::runtime_async::RwLock<crate::patterns::PatternEngine>>,
+    ) -> Self {
+        self.rule_workflows = Some(patterns);
+        self
+    }
+
+    /// Use the workspace watcher for live shell and capture-continuity evidence.
+    #[must_use]
+    pub fn with_watcher_socket(mut self, socket: std::path::PathBuf) -> Self {
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(crate::pane_capability_resolution::WatcherCapabilitySource::Ipc(socket)),
+        );
+        self
+    }
+
+    /// Share the actual observation runtime's registry on every platform.
+    #[must_use]
+    pub fn with_watcher_registry(
+        mut self,
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+    ) -> Self {
+        self.source_registry = Some(Arc::clone(&registry));
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(crate::pane_capability_resolution::WatcherCapabilitySource::Registry(registry)),
+        );
+        self
+    }
+
+    /// Share the observation runtime's registry and the mux it observes, so
+    /// workflow sends also see live prompt evidence from semantic zones.
+    #[must_use]
+    pub fn with_watcher_registry_and_mux(
+        mut self,
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+        mux: crate::wezterm::WeztermHandle,
+    ) -> Self {
+        self.source_registry = Some(Arc::clone(&registry));
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(
+                crate::pane_capability_resolution::WatcherCapabilitySource::RegistryWithMux(
+                    registry, mux,
+                ),
+            ),
+        );
+        self
+    }
+
+    /// Attach a replay capture adapter for workflow step decision provenance.
+    #[must_use]
+    pub fn with_replay_capture_adapter(
+        mut self,
+        replay_capture: crate::replay_capture::SharedCaptureAdapter,
+    ) -> Self {
+        self.replay_capture = Some(replay_capture);
+        self
+    }
+
+    /// Attach an external signal registry consulted by `WaitCondition::External`
+    /// (ft-ao9k9). Without a registry, External waits abort with an explicit
+    /// error naming the signal key and the wiring API instead of silently
+    /// sleeping until the configured timeout.
+    #[must_use]
+    pub fn with_external_signals(mut self, registry: Arc<ExternalSignalRegistry>) -> Self {
+        self.external_signals = Some(registry);
+        self
+    }
+
+    /// Borrow the external signal registry, if any.
+    #[must_use]
+    pub fn external_signals(&self) -> Option<&Arc<ExternalSignalRegistry>> {
+        self.external_signals.as_ref()
+    }
+
+    /// Get the lock manager.
+    pub fn lock_manager(&self) -> &Arc<PaneWorkflowLockManager> {
+        &self.lock_manager
+    }
+
+    /// Register a workflow.
+    ///
+    /// Recovers from a poisoned `workflows` RwLock instead of
+    /// panicking. The `Vec<Arc<dyn Workflow>>` is append-only;
+    /// the worst-case mid-push panic state is "the panicking
+    /// registration didn't add the workflow" — the correct
+    /// recovery state. See ft-o2t7l for the analysis: the
+    /// runner is shared across every detection event, so a
+    /// poisoned lock would brick the entire event-driven
+    /// workflow surface until process restart.
+    pub fn register_workflow(&self, workflow: Arc<dyn Workflow>) {
+        let mut workflows = self
+            .workflows
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workflows.push(workflow);
+    }
+
+    /// Find a workflow that handles the given detection.
+    ///
+    /// Recovers from a poisoned `workflows` RwLock — see
+    /// `register_workflow` for the rationale.
+    pub fn find_matching_workflow(
+        &self,
+        detection: &crate::patterns::Detection,
+    ) -> Option<Arc<dyn Workflow>> {
+        let workflows = self
+            .workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workflows
+            .iter()
+            .find(|w| w.is_enabled() && w.handles(detection))
+            .cloned()
+    }
+
+    /// Find the workflow a detection starts when its rule declares
+    /// `declared`: that workflow, if it is registered, enabled and accepts
+    /// the detection. A rule that declares nothing starts nothing.
+    pub fn find_declared_workflow(
+        &self,
+        detection: &crate::patterns::Detection,
+        declared: Option<&str>,
+    ) -> Option<Arc<dyn Workflow>> {
+        let declared = declared?;
+        let workflows = self
+            .workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workflows
+            .iter()
+            .find(|w| w.name() == declared && w.is_enabled() && w.handles(detection))
+            .cloned()
+    }
+
+    /// Find a workflow by name.
+    ///
+    /// Recovers from a poisoned `workflows` RwLock.
+    pub fn find_workflow_by_name(&self, name: &str) -> Option<Arc<dyn Workflow>> {
+        let workflows = self
+            .workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workflows.iter().find(|w| w.name() == name).cloned()
+    }
+
+    /// Handle a detection event, potentially starting a workflow.
+    ///
+    /// Returns immediately with `WorkflowStartResult`. The actual workflow
+    /// execution happens asynchronously if started.
+    pub async fn handle_detection(
+        &self,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+    ) -> WorkflowStartResult {
+        // ft-dit9w: ergonomic wrapper around `handle_detection_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.handle_detection_with_cx(&cx, pane_id, detection, event_id)
+            .await
+    }
+
+    /// Cx-first variant of [`WorkflowRunner::handle_detection`]
+    /// (ft-xbnl0.2.2).
+    ///
+    /// Honours the caller's asupersync capability context by
+    /// short-circuiting with `WorkflowStartResult::Error` when the Cx is
+    /// already cancelled on entry, before doing any pane-lock
+    /// acquisition or engine work. This prevents a detection dispatched
+    /// to a cancelled context from acquiring a lock that no workflow
+    /// will ever release on the inner path.
+    ///
+    /// Tick 190 (ft-xbnl0.2.3): inlines the detection body and routes
+    /// the engine start through `engine.start_with_id_cx(cx, ...)` so
+    /// the persist threads cx into `upsert_workflow_with_cx` (tick 189).
+    /// Legacy `handle_detection` preserved verbatim; this variant no
+    /// longer delegates so the storage insert is cancel-observant.
+    pub async fn handle_detection_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+    ) -> WorkflowStartResult {
+        self.handle_detection_for_source_with_cx(cx, pane_id, detection, event_id, None)
+            .await
+    }
+
+    async fn handle_detection_for_source_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+        source: Option<&RecoveredWorkflowSource>,
+    ) -> WorkflowStartResult {
+        if cx.is_cancel_requested() {
+            return WorkflowStartResult::Error {
+                error: "capability context already cancelled".to_owned(),
+            };
+        }
+
+        let matched = match &self.rule_workflows {
+            Some(patterns) => {
+                let declared = patterns
+                    .read()
+                    .await
+                    .rule_workflow(&detection.rule_id)
+                    .map(str::to_owned);
+                let declared_workflow = self.find_declared_workflow(detection, declared.as_deref());
+                if declared_workflow.is_none() {
+                    if let Some(undeclared) = self.find_matching_workflow(detection) {
+                        tracing::debug!(
+                            rule_id = %detection.rule_id,
+                            workflow = %undeclared.name(),
+                            declared = ?declared,
+                            "workflow not started: the rule does not declare it (ft-frujlz)"
+                        );
+                    }
+                }
+                declared_workflow
+            }
+            None => self.find_matching_workflow(detection),
+        };
+        let Some(workflow) = matched else {
+            return WorkflowStartResult::NoMatchingWorkflow {
+                rule_id: detection.rule_id.clone(),
+            };
+        };
+
+        let workflow_name = workflow.name().to_string();
+
+        // ft-j0ufc: enforce source-pane trust scope (mirrors the legacy
+        // `handle_detection` check). Run before lock acquisition so a
+        // refused trigger leaves no lock, no engine state, and no audit
+        // row.
+        let trigger_policy = workflow.trigger_policy();
+        let source_pane_id = pane_id;
+        if !trigger_policy.allows_source_pane(source_pane_id) {
+            tracing::warn!(
+                source_pane_id,
+                workflow = %workflow_name,
+                rule_id = %detection.rule_id,
+                explicit_cx = true,
+                "workflow trigger refused: source pane not in trust scope (ft-j0ufc)"
+            );
+            return WorkflowStartResult::SourcePaneNotTrusted {
+                source_pane_id,
+                workflow_name,
+                rule_id: detection.rule_id.clone(),
+            };
+        }
+
+        // ft-7h5da.8.3 (W7.3): decline workflows that require an unlimited pane
+        // when the target pane has an active rate/usage-limit window. Runs
+        // before lock acquisition so a declined trigger leaves no lock, engine
+        // state, or audit row (mirrors the ft-j0ufc check above). Fails closed:
+        // if the ledger cannot be consulted, the workflow is not run.
+        if workflow.requires_unlimited_pane() {
+            match self
+                .storage
+                .list_active_limit_windows_with_cx(cx, now_ms())
+                .await
+            {
+                Ok(windows) => {
+                    if let Some(window) = windows
+                        .iter()
+                        .filter(|w| w.pane_id == pane_id)
+                        .max_by_key(|w| w.effective_reset_at_ms())
+                    {
+                        let reset_at_ms = window.effective_reset_at_ms();
+                        let reset_known = window.reset_known();
+                        tracing::info!(
+                            pane_id,
+                            workflow = %workflow_name,
+                            rule_id = %detection.rule_id,
+                            reset_at_ms,
+                            reset_known,
+                            "workflow trigger declined: target pane rate-limited (ft-7h5da.8.3)"
+                        );
+                        return WorkflowStartResult::PaneRateLimited {
+                            pane_id,
+                            workflow_name,
+                            rule_id: detection.rule_id.clone(),
+                            reset_at_ms,
+                            reset_known,
+                        };
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        pane_id,
+                        workflow = %workflow_name,
+                        error = %err,
+                        "limit-window lookup failed; declining requires_unlimited_pane workflow"
+                    );
+                    return WorkflowStartResult::Error {
+                        error: format!("limit-window lookup failed: {err}"),
+                    };
+                }
+            }
+        }
+
+        let execution_id = generate_workflow_id(&workflow_name);
+        // ft-rlbvg: use the owned-guard variant of try_acquire_with_limit
+        // so the post-acquire engine-error path drops the guard
+        // automatically — including under panic unwind.
+        let lock_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+            pane_id,
+            &workflow_name,
+            &execution_id,
+            self.config.max_concurrent,
+        ) {
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(g)) => g,
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            }) => {
+                return WorkflowStartResult::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
+            Err(limit_info) => {
+                return WorkflowStartResult::ConcurrencyLimitReached {
+                    active: limit_info.active,
+                    limit: limit_info.limit,
+                };
+            }
+        };
+
+        let agent_type_str = match detection.agent_type {
+            crate::patterns::AgentType::Codex => "codex",
+            crate::patterns::AgentType::ClaudeCode => "claude_code",
+            crate::patterns::AgentType::Gemini => "gemini",
+            crate::patterns::AgentType::Wezterm => "wezterm",
+            crate::patterns::AgentType::Unknown => "unknown",
+        };
+        let severity_str = format!("{:?}", detection.severity).to_lowercase();
+
+        // ft-j0ufc: persist `source_pane_id` for audit/forensics; see
+        // the legacy `handle_detection` body for the rationale.
+        let context = serde_json::json!({
+            "rule_id": detection.rule_id,
+            "agent_type": agent_type_str,
+            "event_type": detection.event_type,
+            "severity": severity_str,
+            "confidence": detection.confidence,
+            "extracted": detection.extracted,
+            "matched_text": detection.matched_text,
+            "span": { "start": detection.span.0, "end": detection.span.1 },
+            "source_pane_id": source_pane_id,
+            "source_pane_uuid": source.map(|source| source.pane_uuid.as_str()),
+            "source_event_epoch": source.map(|source| source.event_epoch.as_str()),
+            "detection": {
+                "rule_id": detection.rule_id,
+                "matched_text": detection.matched_text,
+                "severity": format!("{:?}", detection.severity),
+            }
+        });
+
+        // Discovery publishes the live registry before its durable pane
+        // upsert. Keep this short read guard through the admission transaction
+        // so that neither authority can silently validate a predecessor while
+        // the other already describes its replacement. No workflow code or
+        // nested capability lookup runs while this guard is held.
+        let source_guard = if let Some(source) = source {
+            let Some(event_id) = event_id else {
+                return WorkflowStartResult::Error {
+                    error: "recovered workflow source has no durable event".to_string(),
+                };
+            };
+            let Some(registry) = &self.source_registry else {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                };
+            };
+            let registry = match registry.read_with_cx(cx).await {
+                Ok(registry) => registry,
+                Err(error) => {
+                    return WorkflowStartResult::Error {
+                        error: format!("workflow source identity unavailable: {error}"),
+                    };
+                }
+            };
+            if !registry
+                .get_entry(pane_id)
+                .is_some_and(|pane| pane.should_observe() && pane.pane_uuid == source.pane_uuid)
+            {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                };
+            }
+            if !crate::storage::workflow_trigger_recovery_is_fresh(source.detected_at, now_ms()) {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::StaleDetection,
+                };
+            }
+            Some(registry)
+        } else {
+            None
+        };
+        let started = self
+            .engine
+            .start_with_id_cx(
+                cx,
+                &self.storage,
+                super::engine::WorkflowStartInput {
+                    execution_id: execution_id.clone(),
+                    workflow_name: workflow_name.clone(),
+                    pane_id,
+                    trigger_event_id: event_id,
+                    context: Some(context),
+                },
+            )
+            .await;
+        drop(source_guard);
+        match started {
+            Ok(execution) => {
+                if let Err(error) = self
+                    .initialize_execution_budget_with_cx(cx, &execution_id, execution.started_at)
+                    .await
+                {
+                    let error = self
+                        .persist_budget_failure_with_fresh_cx(
+                            &workflow_name,
+                            &execution_id,
+                            pane_id,
+                            0,
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                    return WorkflowStartResult::Error { error };
+                }
+                // ft-rlbvg: handoff to downstream `run_workflow_inner`,
+                // which takes its own `held_lock_release_guard` at
+                // entry. We must keep the lock entry alive for that
+                // handoff — `defuse()` consumes the guard without
+                // releasing (and without leaking the Arc).
+                lock_guard.defuse();
+                WorkflowStartResult::Started {
+                    execution_id,
+                    workflow_name,
+                }
+            }
+            Err(e) => {
+                // lock_guard drops here → release(pane_id, &execution_id).
+                drop(lock_guard);
+                match e {
+                    crate::Error::Workflow(crate::error::WorkflowError::TriggerRejected {
+                        event_id,
+                        reason,
+                    }) => WorkflowStartResult::TriggerRejected { event_id, reason },
+                    error => WorkflowStartResult::Error {
+                        error: error.to_string(),
+                    },
+                }
+            }
+        }
+    }
+
+    async fn replay_source_uuid_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        stored: &crate::storage::StoredEvent,
+        detection: &crate::patterns::Detection,
+    ) -> crate::Result<Option<String>> {
+        let Some(registry) = &self.source_registry else {
+            return Ok(None);
+        };
+        let registry = registry.read_with_cx(cx).await.map_err(|error| {
+            workflow_runner_cancelled("workflow.replay_source", error.to_string())
+        })?;
+        let Some(pane) = registry.get_entry(stored.pane_id) else {
+            return Ok(None);
+        };
+        if !pane.should_observe() || pane.pane_uuid.trim().is_empty() {
+            return Ok(None);
+        }
+        let expected =
+            crate::events::event_identity_key(detection, stored.pane_id, Some(&pane.pane_uuid));
+        let bound = stored.dedupe_key.as_deref().is_some_and(|key| {
+            key.strip_prefix(&expected)
+                .is_some_and(|suffix| suffix.starts_with(':') && suffix.len() > 1)
+        });
+        Ok(bound.then(|| pane.pane_uuid.clone()))
+    }
+
+    /// Manually start and run a workflow to completion (ft-cli44).
+    ///
+    /// The detection path ([`Self::handle_detection_with_cx`]) acquires the
+    /// pane workflow lock and persists the execution record via
+    /// `engine.start_with_id_cx` BEFORE `run_workflow`. The manual entry
+    /// points (MCP `wa.workflow_run`, `ft robot workflows run`,
+    /// `ft workflow run`) used to skip both and call [`Self::run_workflow`]
+    /// directly with a fabricated execution id: every storage helper that
+    /// requires the execution record (`update_execution_step`,
+    /// abort/complete persistence) then failed with
+    /// `WorkflowError::NotFound(execution_id)`, so manual runs could not
+    /// persist progress, were invisible to status/abort surfaces, and
+    /// bypassed the pane lock + concurrency limit.
+    ///
+    /// This method is the supported manual entry point: same lock +
+    /// execution-record protocol as the detection path, minus the
+    /// detection-only trigger checks (source-pane trust scope and the
+    /// rate-limit decline are properties of pane-output-triggered
+    /// automation; manual runs are operator-initiated and remain
+    /// policy-gated per step).
+    pub async fn run_workflow_manual_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        trigger_context: Option<serde_json::Value>,
+    ) -> ManualWorkflowRunOutcome {
+        let workflow_name = workflow.name().to_string();
+        let lock_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+            pane_id,
+            &workflow_name,
+            execution_id,
+            self.config.max_concurrent,
+        ) {
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(g)) => g,
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            }) => {
+                return ManualWorkflowRunOutcome::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
+            Err(limit_info) => {
+                return ManualWorkflowRunOutcome::ConcurrencyLimitReached {
+                    active: limit_info.active,
+                    limit: limit_info.limit,
+                };
+            }
+        };
+
+        match self
+            .engine
+            .start_with_id_cx(
+                cx,
+                &self.storage,
+                super::engine::WorkflowStartInput {
+                    execution_id: execution_id.to_string(),
+                    workflow_name: workflow_name.clone(),
+                    pane_id,
+                    trigger_event_id: None,
+                    context: trigger_context,
+                },
+            )
+            .await
+        {
+            Ok(execution) => {
+                if let Err(error) = self
+                    .initialize_execution_budget_with_cx(cx, execution_id, execution.started_at)
+                    .await
+                {
+                    let error = self
+                        .persist_budget_failure_with_fresh_cx(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            0,
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                    return ManualWorkflowRunOutcome::StartError { error };
+                }
+                // Handoff to `run_workflow_inner`, which takes its own RAII
+                // release guard at entry — defuse (consume without
+                // releasing) exactly like the detection path.
+                lock_guard.defuse();
+                ManualWorkflowRunOutcome::Ran(
+                    self.run_workflow_with_cx(cx, pane_id, workflow, execution_id, 0)
+                        .await,
+                )
+            }
+            Err(e) => {
+                // lock_guard drops here → release(pane_id, &execution_id).
+                drop(lock_guard);
+                ManualWorkflowRunOutcome::StartError {
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Run a workflow execution to completion.
+    ///
+    /// This method executes all steps of a workflow, handling retries,
+    /// wait conditions, and policy gates.
+    ///
+    /// # Plan-first execution (wa-upg.2.3)
+    ///
+    /// If the workflow implements `to_action_plan`, the plan is generated and
+    /// attached to the context before execution begins. This enables:
+    /// - Deterministic step descriptions for audit trails
+    /// - Idempotency keys for safe replay
+    /// - Structured verification and failure handling
+    pub async fn run_workflow(
+        &self,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
+        // ft-dit9w: ergonomic wrapper around `run_workflow_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_workflow_with_cx(&cx, pane_id, workflow, execution_id, start_step)
+            .await
+    }
+
+    /// Shared Cx-first implementation for [`run_workflow`] and
+    /// [`run_workflow_with_cx`]. The ambient entry constructs a concrete Cx
+    /// before reaching this function, so optional proof would only hide gaps
+    /// in cancellation propagation.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_workflow_inner(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
+        // ft-haa2b: pane workflow lock is acquired upstream (in
+        // `handle_detection_with_cx` or the resume loop). Take an RAII
+        // release guard at function entry so every early-return path
+        // — and any panic unwind — drops the lock by construction. This
+        // replaces a chain of 17 manual `lock_manager.release(...)`
+        // call sites that previously had to be threaded through every
+        // branch of the step loop.
+        let _release_guard = self
+            .lock_manager
+            .held_lock_release_guard(pane_id, execution_id);
+        let start_time = Instant::now();
+        let workflow_name = workflow.name().to_string();
+        let step_count = workflow.step_count();
+        let mut current_step = start_step;
+        let mut budget_observed_at = start_time;
+        let mut jump_count: usize = 0;
+        // Prevent infinite loops from backward JumpTo cycles.
+        // A workflow with N steps should never need more than N*10 jumps.
+        let max_total_jumps = step_count.saturating_mul(10).max(100);
+        // A trigger context is optional; the durable execution that owns it is
+        // not. Require that record before creating audit/undo state or running
+        // any workflow code with side effects.
+        let execution_record = match self.storage.get_workflow_with_cx(cx, execution_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return workflow_execution_error(
+                    execution_id,
+                    crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                        execution_id.to_string(),
+                    )),
+                );
+            }
+            Err(error) => {
+                let reason = format!("Workflow execution-record lookup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return workflow_execution_error(execution_id, error);
+            }
+        };
+        if matches!(
+            execution_record.status.as_str(),
+            "completed" | "failed" | "aborted"
+        ) {
+            return workflow_execution_error(
+                execution_id,
+                "terminal workflow execution cannot start or resume",
+            );
+        }
+
+        // A missing legacy budget cannot establish how many attempts or how
+        // much time were already consumed. Never reconstruct that authority
+        // from advisory logs, the current config, or a new invocation clock.
+        let loaded_budget = self
+            .storage
+            .get_workflow_budget_with_cx(cx, execution_id)
+            .await;
+        let mut budget = match loaded_budget {
+            Ok(Some(budget)) => budget,
+            Ok(None) => {
+                return self
+                    .settle_budget_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        None,
+                        "workflow_budget_missing",
+                    )
+                    .await;
+            }
+            Err(error) => {
+                if !is_invalid_workflow_budget(&error) {
+                    return workflow_execution_error(
+                        execution_id,
+                        "workflow_budget_load_unavailable",
+                    );
+                }
+                return self
+                    .settle_budget_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        None,
+                        "workflow_budget_invalid_resume_state",
+                    )
+                    .await;
+            }
+        };
+        let budget_rejection = match budget.validate() {
+            Err(reason) => Some(reason),
+            Ok(()) if budget.started_at_ms != execution_record.started_at => {
+                Some("workflow_budget_start_mismatch")
+            }
+            Ok(()) => None,
+        };
+        if let Some(reason) = budget_rejection {
+            return self
+                .settle_budget_failure(
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    current_step,
+                    None,
+                    reason,
+                )
+                .await;
+        }
+        if budget.current_step != start_step {
+            // A different runner may have progressed since resume inspected
+            // the cursor. Refuse stale admission without settling its owner.
+            return workflow_execution_error(execution_id, "workflow_budget_step_mismatch");
+        }
+        if budget.phase == WorkflowAttemptPhase::InFlight {
+            // Admission precedes effects. Without a durable ownership lease,
+            // a crash and another live process are indistinguishable: refuse
+            // replay and leave its execution/trigger untouched for recovery.
+            return workflow_execution_error(execution_id, "workflow_budget_indeterminate_attempt");
+        }
+        let is_first_admission = budget.revision == 0 && start_step == 0;
+        let observed_budget = budget.clone();
+        if let Err(error) = self
+            .persist_execution_budget_with_cx(
+                cx,
+                execution_id,
+                &mut budget,
+                observed_budget,
+                &mut budget_observed_at,
+            )
+            .await
+        {
+            return self
+                .settle_budget_write_failure(
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    current_step,
+                    None,
+                    &error,
+                )
+                .await;
+        }
+        let start_action_id_result = if is_first_admission {
+            record_workflow_start_action_with_cx(
+                cx,
+                &self.storage,
+                &workflow_name,
+                execution_id,
+                pane_id,
+                step_count,
+                start_step,
+            )
+            .await
+            .map(Some)
+        } else {
+            fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
+        };
+        let start_action_id = match start_action_id_result {
+            Ok(action_id) => action_id,
+            Err(error) => {
+                let reason = format!("Workflow start-audit setup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
+            }
+        };
+
+        if let Some(reason) = invalid_resume_step_reason(start_step, step_count) {
+            tracing::error!(
+                execution_id,
+                start_step,
+                step_count,
+                "Workflow resume step is outside the executable step range"
+            );
+            if let Err(e) = self
+                .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
+                .await
+            {
+                tracing::error!(
+                    execution_id,
+                    error = %e,
+                    "Failed to persist abort after invalid resume step; not reporting aborted"
+                );
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: e.to_string(),
+                };
+            }
+            if let Err(error) = record_workflow_terminal_action_with_cx(
+                cx,
+                &self.storage,
+                &workflow_name,
+                execution_id,
+                pane_id,
+                "workflow_aborted",
+                "aborted",
+                Some(&reason),
+                Some(start_step),
+                None,
+                start_action_id,
+            )
+            .await
+            {
+                return workflow_execution_error(execution_id, error);
+            }
+
+            return WorkflowExecutionResult::Aborted {
+                execution_id: execution_id.to_string(),
+                reason,
+                step_index: start_step,
+                elapsed_ms: elapsed_ms(start_time),
+            };
+        }
+
+        // Create workflow context with injector for policy-gated actions.
+        // Detection is not proof of prompt, normal screen, or continuity.
+        // Preconditions get a live snapshot; each send independently refreshes.
+        let capabilities = self
+            .injector
+            .resolve_capabilities(cx, pane_id, &PaneCapabilities::unknown())
+            .await;
+        let mut ctx =
+            WorkflowContext::new(self.storage.clone(), pane_id, capabilities, execution_id)
+                .with_config(WorkflowConfig {
+                    default_wait_timeout_ms: self.config.step_timeout_ms,
+                })
+                .with_injector(self.injector.clone());
+
+        // Attach the already-validated execution's optional trigger context.
+        if let Some(trigger) = execution_record.context {
+            ctx = ctx.with_trigger(trigger);
+        }
+
+        let maybe_pane = match self.storage.get_pane_with_cx(cx, pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = format!("Workflow pane-metadata lookup failed: {error}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
+            }
+        };
+        if let Some(record) = maybe_pane {
+            ctx.set_pane_meta(PaneMetadata::from_record(&record));
+        }
+
+        if let Some(adapter) = self.replay_capture.as_ref() {
+            if let Err(error) = self
+                .injector
+                .set_decision_capture(cx, adapter.clone())
+                .await
+            {
+                let reason = format!("Workflow decision-capture setup failed: {error}");
+                let mut reported_error = reason.clone();
+                if let Err(cleanup_error) = self
+                    .persist_terminal_failure_with_fresh_cx(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        &reason,
+                        current_step,
+                        start_action_id,
+                        "error",
+                        "workflow_error",
+                        "error",
+                    )
+                    .await
+                {
+                    reported_error.push_str(&format!(
+                        "; independent cleanup also failed: {cleanup_error}"
+                    ));
+                }
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: reported_error,
+                };
+            }
+        }
+
+        // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
+        if let Some(plan) = workflow.to_action_plan(&ctx, execution_id) {
+            tracing::info!(
+                execution_id,
+                workflow_name = %workflow_name,
+                plan_id = %plan.plan_id,
+                step_count = plan.step_count(),
+                "Generated action plan for workflow"
+            );
+
+            // Validate the plan before execution
+            if let Err(validation_error) = plan.validate() {
+                tracing::error!(
+                    execution_id,
+                    error = %validation_error,
+                    "Action plan validation failed"
+                );
+                let reason = format!("Plan validation failed: {validation_error}");
+                if let Err(cleanup_error) = self
+                    .persist_aborted_execution_with_cx(cx, execution_id, &reason, "error")
+                    .await
+                {
+                    return workflow_execution_error(
+                        execution_id,
+                        format!("{reason}; failure-state persistence also failed: {cleanup_error}"),
+                    );
+                }
+                if let Err(error) = record_workflow_terminal_action_with_cx(
+                    cx,
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    "workflow_error",
+                    "error",
+                    Some(&reason),
+                    Some(current_step),
+                    None,
+                    start_action_id,
+                )
+                .await
+                {
+                    return workflow_execution_error(execution_id, error);
+                }
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: reason,
+                };
+            }
+
+            let persist_result = self
+                .storage
+                .upsert_action_plan_with_cx(cx, execution_id, &plan)
+                .await;
+            if let Err(e) = persist_result {
+                let reason = format!("Workflow action-plan persistence failed: {e}");
+                let error = self
+                    .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                    .await;
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error,
+                };
+            }
+
+            ctx.set_action_plan(plan);
+        }
+
+        while current_step < step_count {
+            // Tick 181: per-step cancellation seam. On cx-cancel
+            // we do the same cleanup sequence as a plan-validation
+            // error (failed record + trigger settlement in one write +
+            // lock release + terminal-action audit) so the pane
+            // lock and trigger state don't leak under a cancelled
+            // parent. Cleanup deliberately uses a new request-rooted Cx because
+            // the caller's Cx has already crossed its cancellation boundary.
+            if let Err(err) = cx.checkpoint() {
+                let reason = format!("run_workflow cancelled at step {current_step}: {err}");
+                let mut reported_error = reason.clone();
+                if let Err(error) = self
+                    .persist_terminal_failure_with_fresh_cx(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        &reason,
+                        current_step,
+                        start_action_id,
+                        "error",
+                        "workflow_error",
+                        "error",
+                    )
+                    .await
+                {
+                    reported_error.push_str(&format!("; independent cleanup also failed: {error}"));
+                }
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: reported_error,
+                };
+            }
+
+            if budget.phase == WorkflowAttemptPhase::RetryWaiting {
+                let retry_wait_ms = budget
+                    .retry_not_before_ms
+                    .map(|at| u64::try_from(at.saturating_sub(now_ms()).max(0)).unwrap_or(0))
+                    .unwrap_or(0);
+                let wait = cap_wait_by_workflow_deadline(
+                    Duration::from_millis(retry_wait_ms),
+                    &budget,
+                    budget_observed_at,
+                );
+                if let Err(error) = wait_duration_with_cx(cx, wait, "workflow retry backoff").await
+                {
+                    let reason = error.to_string();
+                    if let Err(cleanup_error) = self
+                        .persist_cancelled_execution_with_fresh_cx(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            &reason,
+                            current_step,
+                            start_action_id,
+                        )
+                        .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!(
+                                "{reason}; independent cancellation cleanup failed: {cleanup_error}"
+                            ),
+                        );
+                    }
+                    return WorkflowExecutionResult::Aborted {
+                        execution_id: execution_id.to_string(),
+                        reason,
+                        step_index: current_step,
+                        elapsed_ms: elapsed_ms(start_time),
+                    };
+                }
+            }
+
+            // Charge and commit admission before calling workflow code. A
+            // crash anywhere after this write and before a durable result is
+            // an indeterminate attempt, never a fresh allowance on restart.
+            let mut admitted_budget = budget.clone();
+            admitted_budget.phase = WorkflowAttemptPhase::InFlight;
+            if let Err(error) = self
+                .persist_execution_budget_with_cx(
+                    cx,
+                    execution_id,
+                    &mut budget,
+                    admitted_budget,
+                    &mut budget_observed_at,
+                )
+                .await
+            {
+                return self
+                    .settle_budget_write_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        start_action_id,
+                        &error,
+                    )
+                    .await;
+            }
+
+            let step_plan = ctx.get_step_plan(current_step).cloned();
+            let mut idempotency_skip: Option<(i64, Option<String>)> = None;
+            let mut idempotency_abort: Option<String> = None;
+            let step_started_at = now_ms();
+
+            if let Some(step_plan) = step_plan.as_ref() {
+                if step_plan.idempotent {
+                    match check_step_idempotency_with_cx(
+                        cx,
+                        &self.storage,
+                        execution_id,
+                        &step_plan.step_id,
+                        current_step,
+                    )
+                    .await
+                    {
+                        IdempotencyCheckResult::AlreadyCompleted {
+                            completed_at,
+                            previous_result,
+                        } => {
+                            tracing::info!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Skipping idempotent step already completed"
+                            );
+                            idempotency_skip = Some((completed_at, previous_result));
+                        }
+                        IdempotencyCheckResult::PartiallyExecuted { started_at } => {
+                            let reason = format!(
+                                "Idempotent step {} was started at {} but not completed",
+                                step_plan.step_id, started_at
+                            );
+                            tracing::warn!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Idempotent step partially executed; aborting"
+                            );
+                            idempotency_abort = Some(reason);
+                        }
+                        IdempotencyCheckResult::LedgerUnavailable => {
+                            let reason = format!(
+                                "Idempotency ledger unavailable for step {}; \
+                                 failing closed without replay",
+                                step_plan.step_id
+                            );
+                            tracing::warn!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Idempotency ledger unavailable; aborting"
+                            );
+                            idempotency_abort = Some(reason);
+                        }
+                        IdempotencyCheckResult::NotExecuted => {}
+                    }
+                }
+            }
+
+            // Execute the step (or skip/abort based on idempotency)
+            let step_result = if let Some(reason) = idempotency_abort {
+                StepResult::Abort { reason }
+            } else if idempotency_skip.is_some() {
+                StepResult::Continue
+            } else {
+                ctx.update_capabilities(
+                    self.injector
+                        .resolve_capabilities(cx, pane_id, &PaneCapabilities::unknown())
+                        .await,
+                );
+                workflow.execute_step_cx(cx, &mut ctx, current_step).await
+            };
+
+            // Publish retry admission before its advisory log and before any
+            // sleep. A restart can recover this exact ordinal and due time
+            // even if the process died before logging the returned result.
+            let result_budget = match budget_after_step_result(&budget, &step_result, now_ms()) {
+                Ok(next) => next,
+                Err(error) => {
+                    return self
+                        .settle_budget_failure(
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            current_step,
+                            start_action_id,
+                            &error.to_string(),
+                        )
+                        .await;
+                }
+            };
+            if let Err(error) = self
+                .persist_execution_budget_with_cx(
+                    cx,
+                    execution_id,
+                    &mut budget,
+                    result_budget,
+                    &mut budget_observed_at,
+                )
+                .await
+            {
+                return self
+                    .settle_budget_write_failure(
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        current_step,
+                        start_action_id,
+                        &error,
+                    )
+                    .await;
+            }
+
+            // Log step result
+            let result_type = match &step_result {
+                StepResult::Continue => "continue",
+                StepResult::Done { .. } => "done",
+                StepResult::Retry { .. } => "retry",
+                StepResult::Abort { .. } => "abort",
+                StepResult::WaitFor { .. } => "wait_for",
+                StepResult::SendText { .. } => "send_text",
+                StepResult::JumpTo { .. } => "jump_to",
+            };
+
+            let steps = workflow.steps();
+            let step_name = steps
+                .get(current_step)
+                .map_or("unknown", |s| s.name.as_str());
+
+            let step_plan_ref = step_plan.as_ref();
+            let step_id = step_plan_ref.map(|step| step.step_id.0.clone());
+            let step_kind = step_plan_ref.map(|step| step.action.action_type_name().to_string());
+            let verification_refs = match build_verification_refs(&step_result, step_plan_ref) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    let reason = format!(
+                        "Workflow verification metadata serialization failed at step \
+                         {current_step}: {error}"
+                    );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
+                }
+            };
+            let step_error_code = step_error_code_from_result(&step_result);
+            let log_step_result = redacted_step_result_for_logging(&step_result);
+
+            if let Some(adapter) = self.replay_capture.as_ref() {
+                let Some(step_definition) = steps.get(current_step) else {
+                    let reason = format!(
+                        "Workflow step definition missing at index {current_step} while step_count \
+                         reported {step_count}"
+                    );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
+                };
+                let step_definition_text = match serde_json::to_string(step_definition) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay step-definition serialization failed at step \
+                             {current_step}: {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
+                let step_input = serde_json::json!({
+                    "workflow_name": workflow_name.as_str(),
+                    "execution_id": execution_id,
+                    "pane_id": pane_id,
+                    "step_index": current_step,
+                    "step_name": step_name,
+                    "trigger": ctx.trigger().cloned().unwrap_or(serde_json::Value::Null),
+                });
+                let step_input_text = match serde_json::to_string(&step_input) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay input serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
+                let step_output = match serde_json::to_value(&log_step_result) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow replay output serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
+                let decision_event = crate::replay_capture::DecisionEvent::new(
+                    crate::replay_capture::DecisionType::WorkflowStep,
+                    pane_id,
+                    format!("workflow.{workflow_name}.step.{current_step}"),
+                    &step_definition_text,
+                    &step_input_text,
+                    step_output,
+                    Some(format!("workflow_execution:{execution_id}")),
+                    None,
+                    crate::recording::epoch_ms_now(),
+                );
+                if let Err(error) = adapter.capture_decision(
+                    crate::recording::RecorderEventSource::WorkflowEngine,
+                    Some(execution_id.to_string()),
+                    decision_event,
+                ) {
+                    return WorkflowExecutionResult::Error {
+                        execution_id: Some(execution_id.to_string()),
+                        error: format!("replay capture rejected workflow step decision: {error}"),
+                    };
+                }
+            }
+
+            // Build result data, enriching with plan information if available (wa-upg.2.3)
+            let result_data = {
+                let mut data = serde_json::json!({
+                    "step_result": &log_step_result,
+                });
+                if matches!(&step_result, StepResult::Retry { .. }) {
+                    data["retry_budget"] = serde_json::json!({
+                        "admitted": budget.phase == WorkflowAttemptPhase::RetryWaiting,
+                        "retry_ordinal": budget.retries,
+                        "max_retries": budget.max_retries_per_step,
+                        "base_delay_ms": budget.retry_base_delay_ms,
+                        "effective_delay_ms": budget.retry_effective_delay_ms,
+                        "not_before_ms": budget.retry_not_before_ms,
+                    });
+                }
+
+                // Include idempotency key from plan if executing in plan-first mode
+                if let Some(idempotency_key) = ctx.get_step_idempotency_key(current_step) {
+                    data["idempotency_key"] = serde_json::json!(idempotency_key.0);
+                }
+
+                // Include step action type from plan if available
+                if let Some(step_plan) = step_plan_ref {
+                    data["action_type"] = serde_json::json!(step_plan.action.action_type_name());
+                    data["step_description"] = serde_json::json!(step_plan.description);
+                }
+
+                if let Some((completed_at, previous_result)) = &idempotency_skip {
+                    data["idempotency_skip"] = serde_json::json!(true);
+                    data["previous_completed_at"] = serde_json::json!(completed_at);
+                    if let Some(previous_result) = previous_result {
+                        data["previous_result"] = serde_json::json!(previous_result);
+                    }
+                }
+
+                match serde_json::to_string(&data) {
+                    Ok(serialized) => Some(serialized),
+                    Err(error) => {
+                        let reason = format!(
+                            "Workflow step-data serialization failed at step {current_step}: \
+                             {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                }
+            };
+            let step_completed_at = now_ms();
+
+            // Persist step log for non-SendText steps
+            // SendText steps are logged after injection to capture the audit_action_id (wa-nu4.1.1.11)
+            if !matches!(&step_result, StepResult::SendText { .. }) {
+                let step_audit_action_id = match record_workflow_step_action_with_cx(
+                    cx,
+                    &self.storage,
+                    WorkflowStepActionInput {
+                        workflow_name: &workflow_name,
+                        execution_id,
+                        pane_id,
+                        step_index: current_step,
+                        step_name,
+                        step_id: step_id.clone(),
+                        step_kind: step_kind.clone(),
+                        result_type,
+                        parent_action_id: start_action_id,
+                    },
+                )
+                .await
+                {
+                    Ok(action_id) => action_id,
+                    Err(error) => {
+                        let reason =
+                            format!("Workflow step audit failed at step {current_step}: {error}");
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+                };
+
+                if let Err(error) = self
+                    .storage
+                    .insert_step_log_with_cx(
+                        cx,
+                        execution_id,
+                        Some(step_audit_action_id),
+                        current_step,
+                        step_name,
+                        step_id.clone(),
+                        step_kind.clone(),
+                        result_type,
+                        result_data.clone(),
+                        None,
+                        verification_refs.clone(),
+                        step_error_code,
+                        step_started_at,
+                        step_completed_at,
+                    )
+                    .await
+                {
+                    let reason = format!(
+                        "Workflow step-log persistence failed at step {current_step}: {error}"
+                    );
+                    let error = self
+                        .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                        .await;
+                    return workflow_execution_error(execution_id, error);
+                }
+            }
+
+            // Handle step result
+            match step_result {
+                StepResult::Continue => {
+                    current_step += 1;
+
+                    // Update execution state
+                    if let Err(e) = self
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step"
+                        );
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                                reason,
+                            )) => {
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
+                StepResult::JumpTo { step } => {
+                    jump_count += 1;
+                    if jump_count > max_total_jumps {
+                        let reason = format!("exceeded maximum jump count ({max_total_jumps})");
+                        tracing::error!(
+                            execution_id,
+                            jump_count,
+                            "Workflow exceeded maximum jump count ({max_total_jumps}); aborting to prevent infinite loop"
+                        );
+                        workflow.cleanup(&mut ctx).await;
+                        if let Err(error) = self
+                            .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
+                            .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; abort settlement failed: {error}"),
+                            );
+                        }
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step.saturating_add(1)),
+                            start_action_id,
+                        )
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
+                        return WorkflowExecutionResult::Aborted {
+                            execution_id: execution_id.to_string(),
+                            reason,
+                            step_index: current_step,
+                            elapsed_ms: elapsed_ms(start_time),
+                        };
+                    }
+                    if let Some(reason) = invalid_jump_target_reason(step, step_count) {
+                        tracing::error!(
+                            execution_id,
+                            current_step,
+                            target_step = step,
+                            step_count,
+                            "Workflow jump target is outside the executable step range"
+                        );
+
+                        if let Err(e) = self
+                            .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
+                            .await
+                        {
+                            tracing::error!(
+                                execution_id,
+                                error = %e,
+                                "Failed to persist abort after invalid jump; not reporting aborted"
+                            );
+                            return WorkflowExecutionResult::Error {
+                                execution_id: Some(execution_id.to_string()),
+                                error: e.to_string(),
+                            };
+                        }
+                        workflow.cleanup(&mut ctx).await;
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step + 1),
+                            start_action_id,
+                        )
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
+
+                        return WorkflowExecutionResult::Aborted {
+                            execution_id: execution_id.to_string(),
+                            reason,
+                            step_index: current_step,
+                            elapsed_ms: elapsed_ms(start_time),
+                        };
+                    }
+                    current_step = step;
+
+                    // Update execution state
+                    if let Err(e) = self
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step after jump"
+                        );
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                                reason,
+                            )) => {
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
+                StepResult::Done { result } => {
+                    // Workflow completed
+                    let elapsed_ms = elapsed_ms(start_time);
+
+                    if let Err(e) = self
+                        .persist_completed_execution_with_cx(cx, execution_id, Some(result.clone()))
+                        .await
+                    {
+                        tracing::error!(
+                            execution_id,
+                            error = %e,
+                            "Workflow completion persistence failed; not reporting completed"
+                        );
+                        return WorkflowExecutionResult::Error {
+                            execution_id: Some(execution_id.to_string()),
+                            error: e.to_string(),
+                        };
+                    }
+
+                    // Release lock
+
+                    if let Err(error) = record_workflow_terminal_action_with_cx(
+                        cx,
+                        &self.storage,
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        "workflow_completed",
+                        "completed",
+                        None,
+                        Some(current_step),
+                        Some(current_step + 1),
+                        start_action_id,
+                    )
+                    .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("Workflow completed but terminal audit failed: {error}"),
+                        );
+                    }
+
+                    return WorkflowExecutionResult::Completed {
+                        execution_id: execution_id.to_string(),
+                        result,
+                        elapsed_ms,
+                        steps_executed: current_step + 1,
+                    };
+                }
+                StepResult::Retry { .. } => {
+                    if budget.phase != WorkflowAttemptPhase::RetryWaiting {
+                        let elapsed_ms = elapsed_ms(start_time);
+                        let reason = format!(
+                            "Max retries ({}) exceeded at step {}",
+                            budget.max_retries_per_step, current_step
+                        );
+
+                        // Cleanup and release lock
+                        workflow.cleanup(&mut ctx).await;
+
+                        if let Err(error) = self
+                            .persist_aborted_execution_with_cx(cx, execution_id, &reason, "failed")
+                            .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; failure settlement failed: {error}"),
+                            );
+                        }
+
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step + 1),
+                            start_action_id,
+                        )
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
+
+                        return WorkflowExecutionResult::Aborted {
+                            execution_id: execution_id.to_string(),
+                            reason,
+                            step_index: current_step,
+                            elapsed_ms,
+                        };
+                    }
+                    debug!(
+                        execution_id,
+                        step_index = current_step,
+                        retry_attempt = budget.retries,
+                        base_delay_ms = budget.retry_base_delay_ms,
+                        effective_delay_ms = budget.retry_effective_delay_ms,
+                        retry_backoff_multiplier = budget.retry_backoff_multiplier,
+                        "Workflow step scheduled for exponential-backoff retry"
+                    );
+                    // The next loop iteration (including a restart) consumes
+                    // the persisted due time before admitting this retry.
+                }
+                StepResult::Abort { reason } => {
+                    let elapsed_ms = elapsed_ms(start_time);
+
+                    // Cleanup and release lock
+                    workflow.cleanup(&mut ctx).await;
+
+                    if let Err(error) = self
+                        .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
+                        .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("{reason}; abort settlement failed: {error}"),
+                        );
+                    }
+
+                    if let Err(error) = record_workflow_terminal_action_with_cx(
+                        cx,
+                        &self.storage,
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        "workflow_aborted",
+                        "aborted",
+                        Some(&reason),
+                        Some(current_step),
+                        Some(current_step + 1),
+                        start_action_id,
+                    )
+                    .await
+                    {
+                        return workflow_execution_error(
+                            execution_id,
+                            format!("{reason}; terminal audit failed: {error}"),
+                        );
+                    }
+
+                    return WorkflowExecutionResult::Aborted {
+                        execution_id: execution_id.to_string(),
+                        reason,
+                        step_index: current_step,
+                        elapsed_ms,
+                    };
+                }
+                StepResult::WaitFor {
+                    condition,
+                    timeout_ms,
+                } => {
+                    // Update execution to waiting
+                    if let Err(e) = self
+                        .set_execution_waiting_with_cx(cx, execution_id, current_step, &condition)
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to set waiting state"
+                        );
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                                reason,
+                            )) => {
+                                if let Err(cleanup_error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!(
+                                            "{reason}; independent cancellation cleanup failed: \
+                                             {cleanup_error}"
+                                        ),
+                                    );
+                                }
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
+                        }
+                    }
+
+                    // Execute wait condition
+                    let timeout = timeout_ms.map_or_else(
+                        || Duration::from_millis(self.config.step_timeout_ms),
+                        Duration::from_millis,
+                    );
+                    let timeout =
+                        cap_wait_by_workflow_deadline(timeout, &budget, budget_observed_at);
+
+                    if let Err(e) = wait_condition_pause_with_cx(
+                        cx,
+                        &condition,
+                        timeout,
+                        self.external_signals.as_deref(),
+                        "workflow wait condition",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Workflow wait condition aborted"
+                        );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
+                            if let Err(cleanup_error) = self
+                                .persist_cancelled_execution_with_fresh_cx(
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    &reason,
+                                    current_step,
+                                    start_action_id,
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{reason}; independent cancellation cleanup failed: \
+                                         {cleanup_error}"
+                                    ),
+                                );
+                            }
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
+                        }
+
+                        return WorkflowExecutionResult::Error {
+                            execution_id: Some(execution_id.to_string()),
+                            error: e.to_string(),
+                        };
+                    }
+
+                    // Continue to next step after wait
+                    current_step += 1;
+
+                    // Update execution back to running
+                    if let Err(e) = self
+                        .update_execution_step_with_cx(
+                            cx,
+                            execution_id,
+                            current_step,
+                            &mut budget,
+                            &mut budget_observed_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step after wait"
+                        );
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                                reason,
+                            )) => {
+                                if let Err(error) = self
+                                    .persist_cancelled_execution_with_fresh_cx(
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        &reason,
+                                        current_step,
+                                        start_action_id,
+                                    )
+                                    .await
+                                {
+                                    return workflow_execution_error(
+                                        execution_id,
+                                        format!("{reason}; terminal audit failed: {error}"),
+                                    );
+                                }
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
+                StepResult::SendText {
+                    text,
+                    wait_for,
+                    wait_timeout_ms,
+                } => {
+                    // Attempt to send text via policy-gated injector
+                    tracing::info!(
+                        pane_id,
+                        execution_id,
+                        text_len = text.len(),
+                        "Workflow requesting text injection"
+                    );
+
+                    let send_result = match self
+                        .injector
+                        .send_text(
+                            cx,
+                            pane_id,
+                            &text,
+                            crate::policy::ActorKind::Workflow,
+                            ctx.capabilities(),
+                            Some(execution_id),
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let reason = format!("Workflow text injection failed: {error}");
+                            let mut reported_error = reason.clone();
+                            if let Err(cleanup_error) = self
+                                .persist_terminal_failure_with_fresh_cx(
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    &reason,
+                                    current_step,
+                                    start_action_id,
+                                    "error",
+                                    "workflow_error",
+                                    "error",
+                                )
+                                .await
+                            {
+                                reported_error.push_str(&format!(
+                                    "; independent failure cleanup also failed: {cleanup_error}"
+                                ));
+                            }
+                            return workflow_execution_error(execution_id, reported_error);
+                        }
+                    };
+
+                    // Log the SendText step with audit_action_id (wa-nu4.1.1.11)
+                    let audit_action_id = send_result.audit_action_id();
+                    let policy_summary = match policy_summary_from_injection(&send_result) {
+                        Ok(summary) => Some(summary),
+                        Err(error) => {
+                            let reason = format!(
+                                "Workflow policy-summary serialization failed at step \
+                                 {current_step}: {error}"
+                            );
+                            let error = self
+                                .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                                .await;
+                            return workflow_execution_error(execution_id, error);
+                        }
+                    };
+                    let policy_error_code = policy_error_code_from_injection(&send_result);
+                    if let Err(error) = self
+                        .storage
+                        .insert_step_log_with_cx(
+                            cx,
+                            execution_id,
+                            audit_action_id,
+                            current_step,
+                            step_name,
+                            step_id.clone(),
+                            step_kind.clone(),
+                            "send_text",
+                            result_data.clone(),
+                            policy_summary,
+                            verification_refs.clone(),
+                            policy_error_code,
+                            step_started_at,
+                            now_ms(), // Use current time as completion
+                        )
+                        .await
+                    {
+                        let reason = format!(
+                            "Workflow SendText step-log persistence failed at step \
+                             {current_step}: {error}"
+                        );
+                        let error = self
+                            .persist_failure_with_fresh_cx(execution_id, &reason, "error")
+                            .await;
+                        return workflow_execution_error(execution_id, error);
+                    }
+
+                    match send_result {
+                        crate::policy::InjectionResult::Allowed { .. } => {
+                            tracing::info!(pane_id, execution_id, "Text injection succeeded");
+
+                            // If there's a wait condition, handle it
+                            if let Some(condition) = wait_for {
+                                let timeout = wait_timeout_ms.map_or_else(
+                                    || Duration::from_millis(self.config.step_timeout_ms),
+                                    Duration::from_millis,
+                                );
+                                let timeout = cap_wait_by_workflow_deadline(
+                                    timeout,
+                                    &budget,
+                                    budget_observed_at,
+                                );
+
+                                if let Err(e) = wait_condition_pause_with_cx(
+                                    cx,
+                                    &condition,
+                                    timeout,
+                                    self.external_signals.as_deref(),
+                                    "workflow send-text verification wait",
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        execution_id,
+                                        error = %e,
+                                        "Workflow send-text wait aborted"
+                                    );
+                                    if let crate::Error::Workflow(
+                                        crate::error::WorkflowError::Aborted(reason),
+                                    ) = e
+                                    {
+                                        if let Err(cleanup_error) = self
+                                            .persist_cancelled_execution_with_fresh_cx(
+                                                &workflow_name,
+                                                execution_id,
+                                                pane_id,
+                                                &reason,
+                                                current_step,
+                                                start_action_id,
+                                            )
+                                            .await
+                                        {
+                                            return workflow_execution_error(
+                                                execution_id,
+                                                format!(
+                                                    "{reason}; independent cancellation cleanup \
+                                                     failed: {cleanup_error}"
+                                                ),
+                                            );
+                                        }
+                                        return WorkflowExecutionResult::Aborted {
+                                            execution_id: execution_id.to_string(),
+                                            reason,
+                                            step_index: current_step,
+                                            elapsed_ms: elapsed_ms(start_time),
+                                        };
+                                    }
+
+                                    return WorkflowExecutionResult::Error {
+                                        execution_id: Some(execution_id.to_string()),
+                                        error: e.to_string(),
+                                    };
+                                }
+                            }
+
+                            // Continue to next step
+                            current_step += 1;
+
+                            if let Err(e) = self
+                                .update_execution_step_with_cx(
+                                    cx,
+                                    execution_id,
+                                    current_step,
+                                    &mut budget,
+                                    &mut budget_observed_at,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to update execution step after send"
+                                );
+                                match e {
+                                    crate::Error::Workflow(
+                                        crate::error::WorkflowError::Aborted(reason),
+                                    ) => {
+                                        if let Err(error) = self
+                                            .persist_cancelled_execution_with_fresh_cx(
+                                                &workflow_name,
+                                                execution_id,
+                                                pane_id,
+                                                &reason,
+                                                current_step,
+                                                start_action_id,
+                                            )
+                                            .await
+                                        {
+                                            return workflow_execution_error(
+                                                execution_id,
+                                                format!("{reason}; terminal audit failed: {error}"),
+                                            );
+                                        }
+                                        return WorkflowExecutionResult::Aborted {
+                                            execution_id: execution_id.to_string(),
+                                            reason,
+                                            step_index: current_step,
+                                            elapsed_ms: elapsed_ms(start_time),
+                                        };
+                                    }
+                                    other => {
+                                        return WorkflowExecutionResult::Error {
+                                            execution_id: Some(execution_id.to_string()),
+                                            error: other.to_string(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        crate::policy::InjectionResult::Denied { decision, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let reason = match &decision {
+                                crate::policy::PolicyDecision::Deny { reason, .. } => {
+                                    reason.clone()
+                                }
+                                _ => "Unknown denial reason".to_string(),
+                            };
+                            let abort_reason = format!("Policy denied text injection: {reason}");
+
+                            tracing::warn!(
+                                pane_id,
+                                execution_id,
+                                reason = %reason,
+                                "Text injection denied by policy"
+                            );
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+
+                            if let Err(error) = self
+                                .persist_aborted_execution_with_cx(
+                                    cx,
+                                    execution_id,
+                                    &abort_reason,
+                                    "denied",
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{abort_reason}; policy-denial settlement failed: {error}"
+                                    ),
+                                );
+                            }
+
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
+                                cx,
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_policy_denied",
+                                "policy_denied",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
+                        crate::policy::InjectionResult::RequiresApproval { decision, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let code = match &decision {
+                                crate::policy::PolicyDecision::RequireApproval {
+                                    approval, ..
+                                } => approval.as_ref().map_or_else(
+                                    || "unknown".to_string(),
+                                    |a| a.allow_once_code.clone(),
+                                ),
+                                _ => "unknown".to_string(),
+                            };
+                            // Workflows do not currently suspend to wait for manual approval of steps.
+                            // The approval code may be 'unknown' if not persisted by the injector.
+                            let abort_reason = if code == "unknown" {
+                                "Text injection requires human approval (workflow aborted)"
+                                    .to_string()
+                            } else {
+                                format!("Text injection requires approval (code: {code})")
+                            };
+
+                            tracing::warn!(
+                                pane_id,
+                                execution_id,
+                                code = %code,
+                                "Text injection requires approval"
+                            );
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+
+                            if let Err(error) = self
+                                .persist_aborted_execution_with_cx(
+                                    cx,
+                                    execution_id,
+                                    &abort_reason,
+                                    "requires_approval",
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; approval settlement failed: {error}"),
+                                );
+                            }
+
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
+                                cx,
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_requires_approval",
+                                "requires_approval",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
+                        crate::policy::InjectionResult::Error { error, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let abort_reason =
+                                format!("Text injection failed after policy allowed: {error}");
+
+                            tracing::error!(
+                                pane_id,
+                                execution_id,
+                                error = %error,
+                                "Text injection failed after policy allowed"
+                            );
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+
+                            if let Err(settlement_error) = self
+                                .persist_aborted_execution_with_cx(
+                                    cx,
+                                    execution_id,
+                                    &abort_reason,
+                                    "error",
+                                )
+                                .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!(
+                                        "{abort_reason}; injection-error settlement failed: \
+                                         {settlement_error}"
+                                    ),
+                                );
+                            }
+
+                            if let Err(error) = record_workflow_terminal_action_with_cx(
+                                cx,
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_error",
+                                "error",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await
+                            {
+                                return workflow_execution_error(
+                                    execution_id,
+                                    format!("{abort_reason}; terminal audit failed: {error}"),
+                                );
+                            }
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // All steps completed without explicit Done
+        let elapsed_ms = elapsed_ms(start_time);
+        let result = serde_json::json!({ "status": "completed" });
+
+        if let Err(e) = self
+            .persist_completed_execution_with_cx(cx, execution_id, Some(result.clone()))
+            .await
+        {
+            tracing::error!(
+                execution_id,
+                error = %e,
+                "Workflow completion persistence failed; not reporting completed"
+            );
+            return WorkflowExecutionResult::Error {
+                execution_id: Some(execution_id.to_string()),
+                error: e.to_string(),
+            };
+        }
+
+        if let Err(error) = record_workflow_terminal_action_with_cx(
+            cx,
+            &self.storage,
+            &workflow_name,
+            execution_id,
+            pane_id,
+            "workflow_completed",
+            "completed",
+            None,
+            Some(step_count.saturating_sub(1)),
+            Some(step_count),
+            start_action_id,
+        )
+        .await
+        {
+            return workflow_execution_error(
+                execution_id,
+                format!("Workflow completed but terminal audit failed: {error}"),
+            );
+        }
+
+        WorkflowExecutionResult::Completed {
+            execution_id: execution_id.to_string(),
+            result,
+            elapsed_ms,
+            steps_executed: step_count,
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_workflow`].
+    ///
+    /// Tick 178: entry-point shim. Pre-flight `cx.checkpoint()`
+    /// gates the workflow start — if the caller's cx is already
+    /// cancelled after an earlier `handle_detection_with_cx` acquired
+    /// the pane lock and persisted the execution record, this entry
+    /// point now performs best-effort cleanup (release lock, mark the
+    /// execution failed, mark the trigger handled) before surfacing
+    /// `WorkflowExecutionResult::Error`.
+    ///
+    /// Routes through the shared `run_workflow_inner(cx, ...)` path so the
+    /// complete internal workflow call graph carries one concrete Cx.
+    ///
+    /// Using the `Error` variant (not a new variant) keeps the
+    /// match surface stable — every `run_workflow` caller already
+    /// handles Error.
+    pub async fn run_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
+        let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+            crate::runtime_telemetry::SwarmCapacityStage::WorkflowRunner,
+            0,
+        );
+        if let Err(err) = cx.checkpoint() {
+            // ft-rlbvg: pre-start cancel path. Take a release
+            // guard so the lock drops on every exit branch
+            // (including panics inside the failure-state persistence).
+            let _release_guard = self
+                .lock_manager
+                .held_lock_release_guard(pane_id, execution_id);
+            let reason = format!("run_workflow cancelled pre-start: {err}");
+            let cleanup_result = self
+                .persist_cancelled_execution_with_fresh_cx(
+                    workflow.name(),
+                    execution_id,
+                    pane_id,
+                    &reason,
+                    start_step,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    format!("{reason}; independent cancellation cleanup failed: {error}")
+                });
+            capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Safety);
+            return WorkflowExecutionResult::Error {
+                execution_id: Some(execution_id.to_string()),
+                error: cleanup_result.err().unwrap_or(reason),
+            };
+        }
+        let result = self
+            .run_workflow_inner(cx, pane_id, workflow, execution_id, start_step)
+            .await;
+        match &result {
+            WorkflowExecutionResult::Completed { .. } => capacity_timer.finish_completion(),
+            WorkflowExecutionResult::Aborted { .. } => capacity_timer.finish_cancellation(),
+            WorkflowExecutionResult::PolicyDenied { .. } => {
+                capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Safety);
+            }
+            WorkflowExecutionResult::Error { .. } => {
+                capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Transient);
+            }
+        }
+        result
+    }
+
+    /// Run the event loop, subscribing to detection events.
+    ///
+    /// This spawns workflow executions for matching detections. The loop
+    /// runs until the event bus channel is closed.
+    ///
+    /// On startup, resumes any incomplete workflows that were interrupted
+    /// (e.g., by a previous watcher crash or restart).
+    /// Run the workflow runner.
+    ///
+    /// ft-dit9w: ergonomic wrapper around [`Self::run_with_cx`].
+    /// Constructs a request-rooted cx (or borrows the ambient one)
+    /// so the entire runner loop — including the spawned per-workflow
+    /// execution tasks — runs under the RuntimeProof seal.
+    pub async fn run(&self, event_bus: &crate::events::EventBus) {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, event_bus).await;
+    }
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run`] (tick 223).
+    ///
+    /// Threads the caller's cx through the entire event-loop
+    /// driver:
+    /// - Bounded recovery scans and restored execution children on startup
+    /// - `subscriber.recv_cx(cx)` for detection reads (cancel-aware
+    ///   instead of ambient `recv`)
+    /// - Top-of-loop `cx.checkpoint()` lets a cx-cancelled caller
+    ///   break the loop cleanly between events.
+    /// - `handle_detection_with_cx(cx, ...)` instead of ambient
+    ///   `handle_detection` — tick-190 migration means this threads
+    ///   cx into `engine.start_with_id_cx`.
+    /// - Per-spawn `child_cx = cx.clone()` into each spawned
+    ///   workflow-execution task, and `run_workflow_with_cx`
+    ///   inside the spawn so the execution chain is cx-threaded
+    ///   end-to-end (ticks 178-187).
+    ///
+    /// Callers (watcher startup) can now thread an operator-scoped
+    /// cx into the runner loop. A cx-cancel at any point bubbles
+    /// through cleanly: the loop exits on cancel, and the
+    /// child tasks already in flight terminate at their next
+    /// cx-observing await.
+    ///
+    /// Legacy [`run`](Self::run) preserved unchanged.
+    pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
+        match self.subscribe_with_cx(cx, event_bus).await {
+            Ok(subscription) => self.run_subscribed_with_cx(cx, subscription, None).await,
+            Err(error) => tracing::error!(
+                error = %error,
+                "Workflow detection subscription could not establish its storage boundary"
+            ),
+        }
+    }
+
+    /// Run the event loop with an explicit cooperative shutdown channel.
+    ///
+    /// The atomic flag is the durable predicate and `shutdown_notify` is its
+    /// wake accelerator. They must be the same pair owned by the surrounding
+    /// [`crate::watchdog::WatchdogHandle`]. On shutdown, the runner stops
+    /// admitting detections, aborts every owned per-workflow task, and performs
+    /// a bounded trusted terminal drain before returning.
+    pub async fn run_with_shutdown_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+        shutdown_flag: &std::sync::atomic::AtomicBool,
+        shutdown_notify: &crate::runtime_async::notify::Notify,
+    ) {
+        match self.subscribe_with_cx(cx, event_bus).await {
+            Ok(subscription) => {
+                self.run_subscribed_with_cx(
+                    cx,
+                    subscription,
+                    Some((shutdown_flag, shutdown_notify)),
+                )
+                .await;
+            }
+            Err(error) => tracing::error!(
+                error = %error,
+                "Workflow detection subscription could not establish its storage boundary"
+            ),
+        }
+    }
+
+    /// Subscribe and capture this session's durable event boundary.
+    ///
+    /// The watcher calls this before spawning its workflow task or starting
+    /// observation. A live registry enables ordered recovery of newly stored
+    /// detections; without incarnation authority the subscription remains
+    /// live-only. Earlier events are never newly authorized by startup.
+    pub async fn subscribe_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+    ) -> crate::Result<WorkflowEventSubscription> {
+        cx.checkpoint()
+            .map_err(|error| workflow_runner_cancelled("workflow.subscribe", error.to_string()))?;
+        let subscriber = event_bus.subscribe_detections();
+        let replay = if self.source_registry.is_some() {
+            Some(WorkflowDetectionReplay::new(
+                self.storage
+                    .get_event_retention_snapshot_with_cx(cx)
+                    .await?,
+            ))
+        } else {
+            None
+        };
+        Ok(WorkflowEventSubscription { subscriber, replay })
+    }
+
+    /// Recover unfinished workflows and run with an already-owned detection
+    /// subscription. Watcher startup must create this subscription before
+    /// spawning the runner or starting observation: subscribing inside an
+    /// asynchronous task leaves a window where initial detections are lost.
+    ///
+    /// Recovery is a bounded reconciliation campaign, not a historical
+    /// snapshot: Ready or RetryWaiting executions inserted within its fixed ID
+    /// range may be discovered while it runs. Every candidate is reloaded and
+    /// admitted through the shared local pane/global locks and durable attempt
+    /// CAS; an already-owned execution is skipped, and InFlight remains
+    /// indeterminate. This does not provide a lease across watcher processes.
+    /// Each turn inspects at most one candidate, and recovery leaves a slot for
+    /// live detections when the global limit exceeds one. Only temporary read
+    /// or admission failures cause another bounded sweep; once the range and
+    /// deferred candidates are exhausted, scanning ends.
+    ///
+    /// With live incarnation authority, persisted notifications only wake an
+    /// ordered storage scan. Periodic scans recover missed publications and
+    /// bounded sweeps revisit temporary admission failures without blocking
+    /// other panes. Newly recovered admissions expire five minutes after
+    /// detection; they do not replay pre-boundary history after a crash.
+    /// When supplied, the shutdown flag and notification must be the pair
+    /// owned by the surrounding [`crate::watchdog::WatchdogHandle`].
+    pub async fn run_subscribed_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        subscription: WorkflowEventSubscription,
+        shutdown: Option<(
+            &std::sync::atomic::AtomicBool,
+            &crate::runtime_async::notify::Notify,
+        )>,
+    ) {
+        let WorkflowEventSubscription {
+            mut subscriber,
+            mut replay,
+        } = subscription;
+        if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+            tracing::info!(
+                explicit_cx = true,
+                "Workflow runner shutdown was already requested before resume"
+            );
+            return;
+        }
+        let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+        let mut recovery = WorkflowStartupRecovery::new(self.config.max_concurrent);
+
+        loop {
+            while let Some(join_result) = child_tasks.try_join_next() {
+                if let Err(error) = join_result {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task failed"
+                    );
+                }
+            }
+            recovery.collect_retries();
+
+            if cx.checkpoint().is_err() {
+                tracing::info!(
+                    explicit_cx = true,
+                    "Workflow runner loop cancelled via Cx, stopping"
+                );
+                break;
+            }
+            if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+                tracing::info!(
+                    explicit_cx = true,
+                    "Workflow runner received shutdown signal"
+                );
+                break;
+            }
+
+            // Restored workflows are children of the same owner as fresh
+            // admissions. Their waits cannot prevent receiving detections or
+            // observing watchdog shutdown, and shutdown settles both kinds.
+            match recovery.next_with_cx(cx, &self.storage).await {
+                Ok(Some((after_id, record))) => {
+                    if let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) {
+                        let runner = self.runner_for_workflow(workflow);
+                        let recovery_guard =
+                            WorkflowRecoveryTaskGuard::new(Arc::clone(&recovery.tasks), after_id);
+                        child_tasks.spawn_with_cx(cx, move |child_cx| async move {
+                            let attempt = runner.resume_record_with_cx(&child_cx, &record).await;
+                            recovery_guard.settle(attempt.retry);
+                            if let Some(result) = attempt.result {
+                                log_workflow_execution_result(&result);
+                            }
+                        });
+                    } else {
+                        tracing::warn!(
+                            workflow_name = %record.workflow_name,
+                            execution_id = %record.id,
+                            "Cannot resume: workflow not registered"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Workflow recovery storage unavailable; retaining cursor"
+                    );
+                    recovery.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                }
+            }
+
+            let recovered = if let Some(replay) = &mut replay {
+                match replay.next_stored_with_cx(cx, &self.storage).await {
+                    Ok(row) => row,
+                    Err(crate::event_stream::DurableStreamError::Storage(error)) => {
+                        tracing::warn!(
+                            error = %error,
+                            after_id = replay.cursor.after_id,
+                            "Workflow detection replay storage unavailable; retaining cursor"
+                        );
+                        replay.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            after_id = replay.cursor.after_id,
+                            "Workflow detection continuity unavailable; stopping without rebasing"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let next_poll = replay
+                .as_ref()
+                .map(|replay| replay.next_poll)
+                .into_iter()
+                .chain(recovery.next_deadline())
+                .min();
+            let mut recovered_source = None;
+            let wake = if let Some(stored) = recovered {
+                if !crate::storage::workflow_trigger_recovery_is_fresh(stored.detected_at, now_ms())
+                {
+                    tracing::warn!(
+                        event_id = stored.id,
+                        pane_id = stored.pane_id,
+                        reason = "stale_detection",
+                        "Refused recovered workflow detection"
+                    );
+                    continue;
+                }
+                let Some(detection) = workflow_detection_from_stored(&stored) else {
+                    tracing::warn!(
+                        event_id = stored.id,
+                        pane_id = stored.pane_id,
+                        reason = "invalid_detection",
+                        "Refused recovered workflow detection"
+                    );
+                    continue;
+                };
+                let pane_uuid = match self
+                    .replay_source_uuid_with_cx(cx, &stored, &detection)
+                    .await
+                {
+                    Ok(Some(uuid)) => uuid,
+                    Ok(None) => {
+                        tracing::warn!(
+                            event_id = stored.id,
+                            pane_id = stored.pane_id,
+                            reason = "source_identity_mismatch",
+                            "Refused recovered workflow detection"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            event_id = stored.id,
+                            error = %error,
+                            "Workflow source identity unavailable; retaining detection for retry"
+                        );
+                        if let Some(replay) = &mut replay {
+                            replay.retry(stored.id);
+                        }
+                        continue;
+                    }
+                };
+                let Some(replay) = &replay else {
+                    // A stored row without its subscription epoch cannot
+                    // authorize an action, even if the row looks valid.
+                    break;
+                };
+                recovered_source = Some(RecoveredWorkflowSource {
+                    pane_uuid: pane_uuid.clone(),
+                    event_epoch: replay.cursor.epoch.clone(),
+                    detected_at: stored.detected_at,
+                });
+                WorkflowRunnerWake::Event(Box::new(Ok(crate::events::Event::PatternDetected {
+                    pane_id: stored.pane_id,
+                    pane_uuid: Some(pane_uuid),
+                    detection,
+                    event_id: Some(stored.id),
+                })))
+            } else if let Some(next_poll) = next_poll {
+                // A fixed deadline wins even under an uninterrupted stream of
+                // live notifications. Probe the bus between storage pages so
+                // lag and closure remain visible during a long catch-up.
+                if Instant::now() >= next_poll {
+                    match subscriber.try_recv() {
+                        Some(event) => WorkflowRunnerWake::Event(Box::new(event)),
+                        None => continue,
+                    }
+                } else {
+                    match crate::runtime_async::timeout_with_cx(
+                        cx,
+                        next_poll.saturating_duration_since(Instant::now()),
+                        wait_for_workflow_runner_activity(
+                            cx,
+                            &mut subscriber,
+                            &mut child_tasks,
+                            shutdown,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(wake) => wake,
+                        Err(_) => continue,
+                    }
+                }
+            } else {
+                wait_for_workflow_runner_activity(cx, &mut subscriber, &mut child_tasks, shutdown)
+                    .await
+            };
+            let next_event = match wake {
+                WorkflowRunnerWake::Shutdown => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Workflow runner received shutdown notification"
+                    );
+                    break;
+                }
+                WorkflowRunnerWake::Event(event) => *event,
+                WorkflowRunnerWake::Child(Ok(Some(Ok(())))) => continue,
+                WorkflowRunnerWake::Child(Ok(Some(Err(error)))) => {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task failed"
+                    );
+                    continue;
+                }
+                WorkflowRunnerWake::Child(Ok(None)) => continue,
+                WorkflowRunnerWake::Child(Err(error)) => {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task drain wait failed"
+                    );
+                    continue;
+                }
+            };
+
+            match next_event {
+                Ok(event) => {
+                    if let crate::events::Event::PatternDetected {
+                        pane_id,
+                        pane_uuid: _,
+                        detection,
+                        event_id,
+                    } = event
+                    {
+                        if recovered_source.is_none()
+                            && let Some(replay) = &mut replay
+                            && let Some(event_id) = event_id
+                        {
+                            // No notification can replace the stored payload,
+                            // jump the ordered cursor, or replay old history.
+                            replay.wake(Some(event_id));
+                            continue;
+                        }
+                        let result = self
+                            .handle_detection_for_source_with_cx(
+                                cx,
+                                pane_id,
+                                &detection,
+                                event_id,
+                                recovered_source.as_ref(),
+                            )
+                            .await;
+
+                        if recovered_source.is_some()
+                            && matches!(
+                                &result,
+                                WorkflowStartResult::PaneLocked { .. }
+                                    | WorkflowStartResult::ConcurrencyLimitReached { .. }
+                                    | WorkflowStartResult::PaneRateLimited { .. }
+                                    | WorkflowStartResult::Error { .. }
+                            )
+                            && let (Some(replay), Some(event_id)) = (&mut replay, event_id)
+                        {
+                            replay.retry(event_id);
+                        }
+
+                        match result {
+                            WorkflowStartResult::Started {
+                                execution_id,
+                                workflow_name,
+                            } => {
+                                if let Some(workflow) = self.find_workflow_by_name(&workflow_name) {
+                                    child_tasks.spawn_with_cx(
+                                        cx,
+                                        self.workflow_execution_child(
+                                            pane_id,
+                                            workflow,
+                                            execution_id,
+                                        ),
+                                    );
+                                } else {
+                                    // The workflow that
+                                    // `handle_detection_with_cx` matched and
+                                    // started vanished from the registry before
+                                    // we could spawn its runner. The success
+                                    // path already `defuse()`d the pane lock
+                                    // (handing release ownership to the spawned
+                                    // `run_workflow_inner`), so skipping the
+                                    // spawn would leak the lock and brick the
+                                    // pane for every future workflow
+                                    // (`PaneLocked` forever). Release the
+                                    // orphaned lock so the pane recovers.
+                                    tracing::error!(
+                                        workflow_name = %workflow_name,
+                                        execution_id = %execution_id,
+                                        pane_id,
+                                        explicit_cx = true,
+                                        "Started workflow missing from registry before spawn; releasing orphaned pane lock (cx)"
+                                    );
+                                    self.lock_manager.release(pane_id, &execution_id);
+                                }
+                            }
+                            WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
+                                tracing::debug!(
+                                    rule_id,
+                                    explicit_cx = true,
+                                    "No workflow handles detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::TriggerRejected { event_id, reason } => {
+                                tracing::debug!(
+                                    event_id,
+                                    reason = %reason,
+                                    explicit_cx = true,
+                                    "Stored detection did not authorize a new workflow (cx)"
+                                );
+                            }
+                            WorkflowStartResult::PaneLocked {
+                                pane_id,
+                                held_by_workflow,
+                                ..
+                            } => {
+                                tracing::debug!(
+                                    pane_id,
+                                    held_by = %held_by_workflow,
+                                    explicit_cx = true,
+                                    "Pane locked, skipping detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::ConcurrencyLimitReached { active, limit } => {
+                                tracing::debug!(
+                                    active,
+                                    limit,
+                                    explicit_cx = true,
+                                    "Workflow concurrency limit reached, skipping detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::SourcePaneNotTrusted {
+                                source_pane_id,
+                                workflow_name,
+                                rule_id,
+                            } => {
+                                tracing::warn!(
+                                    source_pane_id,
+                                    workflow = %workflow_name,
+                                    rule_id,
+                                    explicit_cx = true,
+                                    "ft-j0ufc: trigger refused (source pane not in trust scope) (cx)"
+                                );
+                            }
+                            WorkflowStartResult::PaneRateLimited {
+                                pane_id,
+                                workflow_name,
+                                rule_id,
+                                reset_at_ms,
+                                reset_known,
+                            } => {
+                                tracing::info!(
+                                    pane_id,
+                                    workflow = %workflow_name,
+                                    rule_id,
+                                    reset_at_ms,
+                                    reset_known,
+                                    explicit_cx = true,
+                                    "ft-7h5da.8.3: trigger declined (target pane rate-limited) (cx)"
+                                );
+                            }
+                            WorkflowStartResult::Error { error } => {
+                                tracing::error!(
+                                    error,
+                                    explicit_cx = true,
+                                    "Failed to start workflow (cx)"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(crate::events::RecvError::Lagged { missed_count }) => {
+                    if let Some(replay) = &mut replay {
+                        replay.wake(None);
+                    }
+                    tracing::warn!(
+                        skipped = missed_count,
+                        explicit_cx = true,
+                        storage_replay = replay.is_some(),
+                        "Workflow notification gap; reconciling eligible stored detections"
+                    );
+                }
+                Err(crate::events::RecvError::Cancelled) => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Workflow runner subscriber cancelled via Cx, stopping"
+                    );
+                    break;
+                }
+                Err(crate::events::RecvError::Closed) => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Event bus closed, workflow runner stopping (cx)"
+                    );
+                    break;
+                }
+            }
+        }
+
+        match settle_workflow_runner_children(&mut child_tasks).await {
+            WorkflowRunnerChildDrainOutcome::Settled => {}
+            WorkflowRunnerChildDrainOutcome::TimedOut {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::warn!(
+                    event = "workflow_runner_child_task_drain_timeout",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = child_tasks.len(),
+                    orphan_risk = true,
+                    "Workflow child tasks missed bounded terminal settlement"
+                );
+            }
+            WorkflowRunnerChildDrainOutcome::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::warn!(
+                    event = "workflow_runner_child_task_settlement_incomplete",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = child_tasks.len(),
+                    orphan_risk = true,
+                    "Workflow child task drain ended without terminal settlement"
+                );
+            }
+        }
+    }
+
+    /// Resume incomplete workflows after restart.
+    ///
+    /// Queries storage for workflows with status 'running' or 'waiting'
+    /// and attempts to resume them.
+    /// Resume incomplete workflows after restart.
+    ///
+    /// ft-dit9w: ergonomic wrapper around [`Self::resume_incomplete_with_cx`].
+    pub async fn resume_incomplete(&self) -> Vec<WorkflowExecutionResult> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.resume_incomplete_with_cx(&cx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`resume_incomplete`]
+    /// (tick 222). Final orphan from tick-187's pending list.
+    ///
+    /// Threads caller cx through the entire restart-resume chain:
+    /// - `find_incomplete_workflows_with_cx(cx)` for the initial read
+    /// - Per-record `cx.checkpoint()` gates entry to each resume
+    /// - `engine.resume_cx(cx, &storage, &record.id)` for the state
+    ///   load (tick 188 migration)
+    /// - `run_workflow_with_cx(cx, ...)` for the actual execution
+    ///   (tick 178 entry — runs through run_workflow_inner which is
+    ///   fully cx-threaded as of ticks 178-187)
+    ///
+    /// A cancel fired mid-restart-resume cleanly aborts between
+    /// workflow records instead of resuming all N incomplete ones.
+    pub async fn resume_incomplete_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Vec<WorkflowExecutionResult> {
+        let incomplete = match self.storage.find_incomplete_workflows_with_cx(cx).await {
+            Ok(workflows) => workflows,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    explicit_cx = true,
+                    "Failed to query incomplete workflows (cx)"
+                );
+                return vec![];
+            }
+        };
+
+        let mut results = Vec::new();
+
+        for record in incomplete {
+            if cx.checkpoint().is_err() {
+                tracing::info!(
+                    explicit_cx = true,
+                    "resume_incomplete_with_cx: cancelled between workflow records"
+                );
+                break;
+            }
+
+            if let Some(result) = self.resume_record_with_cx(cx, &record).await.result {
+                results.push(result);
+            }
+        }
+
+        results
+    }
+
+    // --- Private helper methods ---
+
+    fn workflow_execution_child(
+        &self,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: String,
+    ) -> impl FnOnce(crate::cx::Cx) -> BoxFuture<'static, ()> + Send + 'static + use<> {
+        let runner = self.runner_for_workflow(Arc::clone(&workflow));
+        // spawn_with_cx invokes its constructor on the child's first poll.
+        // Capture release ownership in that constructor, before submitting it,
+        // so an abort before that poll cannot leak the admission.
+        let release_guard = self
+            .lock_manager
+            .held_lock_release_guard(pane_id, &execution_id);
+        move |child_cx| -> BoxFuture<'static, ()> {
+            Box::pin(async move {
+                release_guard.defuse();
+                let result = runner
+                    .run_workflow_with_cx(&child_cx, pane_id, workflow, &execution_id, 0)
+                    .await;
+                log_workflow_execution_result(&result);
+            })
+        }
+    }
+
+    fn runner_for_workflow(&self, workflow: Arc<dyn Workflow>) -> Self {
+        Self {
+            workflows: std::sync::RwLock::new(vec![workflow]),
+            engine: WorkflowEngine::new(self.config.max_concurrent),
+            lock_manager: Arc::clone(&self.lock_manager),
+            storage: Arc::clone(&self.storage),
+            source_registry: self.source_registry.clone(),
+            injector: self.injector.clone(),
+            config: self.config.clone(),
+            replay_capture: self.replay_capture.clone(),
+            external_signals: self.external_signals.clone(),
+            rule_workflows: self.rule_workflows.clone(),
+        }
+    }
+
+    async fn resume_record_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        candidate: &crate::storage::WorkflowRecord,
+    ) -> WorkflowResumeAttempt {
+        use crate::workflows::lock::OwnedLockAcquisitionResult;
+
+        let skipped = || WorkflowResumeAttempt {
+            result: None,
+            retry: false,
+        };
+        let unavailable = || WorkflowResumeAttempt {
+            result: Some(workflow_execution_error(
+                &candidate.id,
+                "workflow_resume_unavailable",
+            )),
+            retry: true,
+        };
+        let Some(workflow) = self.find_workflow_by_name(&candidate.workflow_name) else {
+            tracing::warn!(
+                workflow_name = %candidate.workflow_name,
+                execution_id = %candidate.id,
+                "Cannot resume: workflow not registered"
+            );
+            return skipped();
+        };
+        let record = match self.storage.get_workflow_with_cx(cx, &candidate.id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return skipped(),
+            Err(_) => return unavailable(),
+        };
+        // The bounded page is only a hint. A deleted/replaced row must never
+        // substitute a different pane, workflow, trigger, or execution epoch.
+        if record.workflow_name != candidate.workflow_name
+            || record.pane_id != candidate.pane_id
+            || record.started_at != candidate.started_at
+            || record.trigger_event_id != candidate.trigger_event_id
+            || !matches!(record.status.as_str(), "running" | "waiting")
+        {
+            return skipped();
+        }
+        // Trust can tighten while the watcher is down. Check before either
+        // executing a step or settling malformed durable state.
+        if !workflow.trigger_policy().allows_source_pane(record.pane_id) {
+            tracing::warn!(
+                execution_id = %record.id,
+                pane_id = record.pane_id,
+                "Refusing workflow resume outside source-pane trust scope"
+            );
+            return skipped();
+        }
+        let resume = self.engine.resume_cx(cx, &self.storage, &record.id).await;
+        let invalid_budget = matches!(&resume, Err(error) if is_invalid_workflow_budget(error));
+        let (execution, next_step) = match resume {
+            Ok(Some(resume)) => (Some(resume.0), resume.1),
+            Ok(None) => return skipped(),
+            Err(_) if !invalid_budget || cx.checkpoint().is_err() => return unavailable(),
+            Err(_) => (None, record.current_step),
+        };
+        if execution.as_ref().is_some_and(|execution| {
+            execution.pane_id != record.pane_id
+                || execution.workflow_name != record.workflow_name
+                || execution.started_at != record.started_at
+        }) {
+            return skipped();
+        }
+
+        let release_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+            record.pane_id,
+            &record.workflow_name,
+            &record.id,
+            self.config.max_concurrent,
+        ) {
+            Ok(OwnedLockAcquisitionResult::Acquired(guard)) => guard,
+            Ok(OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_execution, ..
+            }) if held_by_execution == record.id => {
+                // A live admission or earlier recovery child already owns
+                // this exact execution. Do not enqueue a second attempt when
+                // that owner finishes or leaves an indeterminate effect.
+                return skipped();
+            }
+            _ => {
+                return WorkflowResumeAttempt {
+                    result: invalid_budget.then(|| {
+                        workflow_execution_error(&record.id, "workflow_budget_resume_busy")
+                    }),
+                    retry: true,
+                };
+            }
+        };
+        if invalid_budget {
+            // Invalid authority becomes a visible failure under the same
+            // admission limits as a normal resumed workflow.
+            let result = self
+                .settle_budget_failure(
+                    &record.workflow_name,
+                    &record.id,
+                    record.pane_id,
+                    record.current_step,
+                    None,
+                    "workflow_budget_invalid_resume_state",
+                )
+                .await;
+            drop(release_guard);
+            return WorkflowResumeAttempt {
+                result: Some(result),
+                retry: false,
+            };
+        }
+        tracing::info!(
+            execution_id = %record.id,
+            workflow = %record.workflow_name,
+            pane_id = record.pane_id,
+            resume_step = next_step,
+            "Resuming workflow"
+        );
+        // run_workflow_inner takes release ownership on its first poll. There
+        // is no await between this handoff and polling that future.
+        release_guard.defuse();
+        let result = self
+            .run_workflow_with_cx(cx, record.pane_id, workflow, &record.id, next_step)
+            .await;
+        // This finite error is returned before durable attempt admission or
+        // workflow code. Other errors may follow an effect and must not cause
+        // another automatic attempt, especially an InFlight recovery fence.
+        let retry = matches!(
+            &result,
+            WorkflowExecutionResult::Error { error, .. }
+                if error == "workflow_budget_load_unavailable"
+        );
+        WorkflowResumeAttempt {
+            result: Some(result),
+            retry,
+        }
+    }
+
+    async fn initialize_execution_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        started_at_ms: i64,
+    ) -> crate::Result<()> {
+        let budget = WorkflowExecutionBudget::new(
+            started_at_ms,
+            now_ms(),
+            self.config.workflow_total_deadline_ms,
+            self.config.max_retries_per_step,
+            self.config.retry_backoff_multiplier,
+        )
+        .map_err(workflow_budget_error)?;
+        self.storage
+            .create_workflow_budget_with_cx(cx, execution_id, budget)
+            .await
+    }
+
+    /// Commit one authority transition and debit elapsed time from the last
+    /// successful write. Sampling the new monotonic anchor before awaiting
+    /// storage ensures queue/commit latency is charged by the next checkpoint.
+    async fn persist_execution_budget_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        budget: &mut WorkflowExecutionBudget,
+        mut next: WorkflowExecutionBudget,
+        observed_at: &mut Instant,
+    ) -> crate::Result<()> {
+        let next_observed_at = Instant::now();
+        let observed_wall_ms = now_ms();
+        next.observe_time(observed_wall_ms, elapsed_ms(*observed_at))
+            .map_err(workflow_budget_error)?;
+        if budget.phase == WorkflowAttemptPhase::InFlight
+            && next.phase == WorkflowAttemptPhase::RetryWaiting
+        {
+            next.retry_not_before_ms = Some(
+                observed_wall_ms
+                    .checked_add(i64::try_from(next.retry_effective_delay_ms).map_err(|_| {
+                        workflow_budget_error("workflow_budget_retry_delay_overflow")
+                    })?)
+                    .ok_or_else(|| workflow_budget_error("workflow_budget_retry_delay_overflow"))?,
+            );
+        }
+        next.revision = budget
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| workflow_budget_error("workflow_budget_revision_exhausted"))?;
+        if !self
+            .storage
+            .compare_exchange_workflow_budget_with_cx(
+                cx,
+                execution_id,
+                budget.revision,
+                next.clone(),
+            )
+            .await?
+        {
+            // Keep lost authority distinct from an aborted workflow. The
+            // winning writer may be running in another process, and neither
+            // its execution nor its terminal audit belongs to this loser.
+            return Err(crate::error::StorageError::Database(
+                "workflow_budget_revision_conflict".to_string(),
+            )
+            .into());
+        }
+        *budget = next;
+        *observed_at = next_observed_at;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_budget_write_failure(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        error: &crate::Error,
+    ) -> WorkflowExecutionResult {
+        if is_workflow_budget_revision_conflict(error) {
+            return workflow_execution_error(execution_id, "workflow_budget_revision_conflict");
+        }
+        self.settle_budget_failure(
+            workflow_name,
+            execution_id,
+            pane_id,
+            current_step,
+            start_action_id,
+            &error.to_string(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_budget_failure(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        reason: &str,
+    ) -> WorkflowExecutionResult {
+        let reported = self
+            .persist_budget_failure_with_fresh_cx(
+                workflow_name,
+                execution_id,
+                pane_id,
+                current_step,
+                start_action_id,
+                reason,
+            )
+            .await;
+        workflow_execution_error(execution_id, reported)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_budget_failure_with_fresh_cx(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        reason: &str,
+    ) -> String {
+        let mut reported = reason.to_string();
+        if let Err(error) = self
+            .persist_terminal_failure_with_fresh_cx(
+                workflow_name,
+                execution_id,
+                pane_id,
+                reason,
+                current_step,
+                start_action_id,
+                "error",
+                "workflow_error",
+                "error",
+            )
+            .await
+        {
+            reported.push_str(&format!("; independent cleanup also failed: {error}"));
+        }
+        reported
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_terminal_failure_with_fresh_cx(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        reason: &str,
+        current_step: usize,
+        start_action_id: Option<i64>,
+        handled_status: &str,
+        action_kind: &str,
+        action_result: &str,
+    ) -> crate::Result<()> {
+        let cleanup_cx = crate::cx::for_request();
+        let cleanup = async {
+            let mut failures = Vec::new();
+            if let Err(error) = self
+                .persist_aborted_execution_with_cx(
+                    &cleanup_cx,
+                    execution_id,
+                    reason,
+                    handled_status,
+                )
+                .await
+            {
+                failures.push(format!("state/trigger settlement failed: {error}"));
+            }
+            if let Err(error) = record_workflow_terminal_action_with_cx(
+                &cleanup_cx,
+                &self.storage,
+                workflow_name,
+                execution_id,
+                pane_id,
+                action_kind,
+                action_result,
+                Some(reason),
+                Some(current_step),
+                None,
+                start_action_id,
+            )
+            .await
+            {
+                failures.push(format!("terminal audit failed: {error}"));
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "independent terminal cleanup incomplete: {}",
+                        failures.join("; ")
+                    )),
+                ))
+            }
+        };
+
+        match crate::runtime_async::timeout_with_cx(
+            &cleanup_cx,
+            WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT,
+            cleanup,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(workflow_runner_cancelled(
+                "workflow.terminal_cleanup",
+                format!(
+                    "independent cleanup exceeded {:?}: {error}",
+                    WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT
+                ),
+            )),
+        }
+    }
+
+    async fn persist_failure_with_fresh_cx(
+        &self,
+        execution_id: &str,
+        reason: &str,
+        handled_status: &str,
+    ) -> String {
+        let cleanup_cx = crate::cx::for_request();
+        let cleanup = self.persist_aborted_execution_with_cx(
+            &cleanup_cx,
+            execution_id,
+            reason,
+            handled_status,
+        );
+        match crate::runtime_async::timeout_with_cx(
+            &cleanup_cx,
+            WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT,
+            cleanup,
+        )
+        .await
+        {
+            Ok(Ok(())) => reason.to_string(),
+            Ok(Err(cleanup_error)) => {
+                format!("{reason}; independent cleanup also failed: {cleanup_error}")
+            }
+            Err(timeout_error) => format!(
+                "{reason}; independent cleanup exceeded {:?}: {timeout_error}",
+                WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT
+            ),
+        }
+    }
+
+    /// Advance the authoritative cursor and clear waiting state in the same
+    /// storage transaction. A separate read/upsert could overwrite another
+    /// runner's progress or an external terminal decision after the CAS.
+    async fn update_execution_step_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        step: usize,
+        budget: &mut WorkflowExecutionBudget,
+        budget_observed_at: &mut Instant,
+    ) -> crate::Result<()> {
+        let mut next_budget = budget.clone();
+        next_budget.current_step = step;
+        next_budget.phase = WorkflowAttemptPhase::Ready;
+        next_budget.retries = 0;
+        next_budget.retry_not_before_ms = None;
+        next_budget.retry_base_delay_ms = 0;
+        next_budget.retry_effective_delay_ms = 0;
+        if let Err(error) = self
+            .persist_execution_budget_with_cx(
+                cx,
+                execution_id,
+                budget,
+                next_budget,
+                budget_observed_at,
+            )
+            .await
+        {
+            if is_workflow_budget_revision_conflict(&error) {
+                return Err(error);
+            }
+            // Every progress caller settles this abort with a fresh context,
+            // including the terminal audit when the caller was cancelled.
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(error.to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persists a waiting state under the workflow's explicit Cx.
+    async fn set_execution_waiting_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        step: usize,
+        condition: &WaitCondition,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "Workflow externally modified to status: {}",
+                    record.status
+                )),
+            ));
+        }
+
+        record.current_step = step;
+        record.status = "waiting".to_string();
+        record.wait_condition = Some(serde_json::to_value(condition)?);
+        record.updated_at = now_ms();
+
+        self.storage.upsert_workflow_with_cx(cx, record).await
+    }
+
+    /// Persists completion, settles the trigger event as `completed`, then
+    /// records the usage metric, all with the workflow Cx.
+    ///
+    /// The completed record and the trigger settlement are one writer
+    /// transaction (`settle_workflow_terminal_with_cx`). As two writes, a
+    /// runner shutdown that aborted this task between them left a completed
+    /// workflow whose trigger event read unhandled, and nothing settled it
+    /// again: a replay meets the completed owner, and startup recovery only
+    /// resumes running workflows. The metric comes after the settlement, so
+    /// its failure is still reported but can no longer leave the trigger
+    /// replayable.
+    async fn persist_completed_execution_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        result: Option<serde_json::Value>,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.status = "completed".to_string();
+        record.result = result;
+        let now = now_ms();
+        record.updated_at = now;
+        record.completed_at = Some(now);
+
+        let duration_ms = now.saturating_sub(record.started_at);
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let metric = crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now,
+            metric_type: crate::storage::MetricType::WorkflowCost,
+            pane_id: Some(pane_id),
+            agent_type: None,
+            account_id: None,
+            workflow_id: Some(record.id.clone()),
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: Some(
+                serde_json::json!({
+                    "source": "workflow.runner",
+                    "workflow_name": workflow_name,
+                    "status": "completed",
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            ),
+            created_at: now,
+        };
+
+        self.storage
+            .settle_workflow_terminal_with_cx(cx, record, "completed")
+            .await?;
+        self.storage
+            .record_usage_metric_with_cx(cx, metric)
+            .await
+            .map(|_| ())
+    }
+
+    /// Persists failure, settles the trigger event with `handled_status`, then
+    /// records the usage metric, all with an explicit Cx.
+    ///
+    /// The failed record and the trigger settlement are one writer
+    /// transaction, for the reason given on
+    /// `persist_completed_execution_with_cx`. If this execution was already
+    /// aborted, the storage refuses to revive it and the trigger keeps the
+    /// status the abort settled it with.
+    async fn persist_aborted_execution_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: &str,
+        handled_status: &str,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.status = "failed".to_string();
+        record.error = Some(reason.to_string());
+        let now = now_ms();
+        record.updated_at = now;
+        record.completed_at = Some(now);
+
+        let duration_ms = now.saturating_sub(record.started_at);
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let metric = crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now,
+            metric_type: crate::storage::MetricType::WorkflowCost,
+            pane_id: Some(pane_id),
+            agent_type: None,
+            account_id: None,
+            workflow_id: Some(record.id.clone()),
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: Some(
+                serde_json::json!({
+                    "source": "workflow.runner",
+                    "workflow_name": workflow_name,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            ),
+            created_at: now,
+        };
+
+        self.storage
+            .settle_workflow_terminal_with_cx(cx, record, handled_status)
+            .await?;
+        self.storage
+            .record_usage_metric_with_cx(cx, metric)
+            .await
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_cancelled_execution_with_fresh_cx(
+        &self,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        reason: &str,
+        current_step: usize,
+        start_action_id: Option<i64>,
+    ) -> crate::Result<()> {
+        self.persist_terminal_failure_with_fresh_cx(
+            workflow_name,
+            execution_id,
+            pane_id,
+            reason,
+            current_step,
+            start_action_id,
+            "aborted",
+            "workflow_aborted",
+            "aborted",
+        )
+        .await
+    }
+
+    /// Abort a running workflow execution.
+    ///
+    /// This is the external API for aborting workflows (e.g., from robot mode).
+    /// It differs from internal abort handling in that:
+    /// 1. It validates the execution state before aborting
+    /// 2. It releases the pane lock if held
+    /// 3. It returns detailed abort information
+    ///
+    /// # Arguments
+    /// * `execution_id` - The workflow execution ID to abort
+    /// * `reason` - Optional reason for the abort (recorded in audit)
+    /// * `force` - If true, skip cleanup steps
+    ///
+    /// # Returns
+    /// * `Ok(AbortResult)` - Details about the aborted workflow
+    /// * `Err` - If the workflow doesn't exist or is in invalid state
+    pub async fn abort_execution(
+        &self,
+        execution_id: &str,
+        reason: Option<&str>,
+        force: bool,
+    ) -> crate::Result<AbortResult> {
+        // ft-dit9w: ergonomic wrapper around `abort_execution_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.abort_execution_with_cx(&cx, execution_id, reason, force)
+            .await
+    }
+
+    /// Cx-first variant of [`WorkflowRunner::abort_execution`]
+    /// (ft-xbnl0.2.2).
+    ///
+    /// Short-circuits with a cancelled-error when the caller's
+    /// asupersync capability context is already cancelled on entry,
+    /// before issuing any storage reads or lock releases. This matches
+    /// the `handle_detection_with_cx` contract so a cancelled operator
+    /// request cannot accidentally mutate workflow state during
+    /// teardown.
+    pub async fn abort_execution_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        _force: bool,
+    ) -> crate::Result<AbortResult> {
+        self.abort_execution_inner_with_cx(cx, execution_id, reason, None)
+            .await
+    }
+
+    pub(crate) async fn abort_execution_for_undo_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        action_id: i64,
+        actor: &str,
+    ) -> crate::Result<AbortResult> {
+        self.abort_execution_inner_with_cx(
+            cx,
+            execution_id,
+            reason,
+            Some((action_id, actor.to_string())),
+        )
+        .await
+    }
+
+    async fn abort_execution_inner_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        undo_attempt: Option<(i64, String)>,
+    ) -> crate::Result<AbortResult> {
+        if cx.is_cancel_requested() {
+            return Err(workflow_runner_cancelled(
+                "workflow.abort_execution",
+                "capability context already cancelled; abort_execution refused",
+            ));
+        }
+
+        // ft-xbnl0.2.3 tick 131: deepened from pre-flight delegate
+        // to fully cx-threaded body. Routes both internal storage
+        // calls through cx-first siblings so caller cancellation
+        // propagates into storage's pre-flight checkpoints.
+
+        let record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        // Check if already in terminal state
+        match record.status.as_str() {
+            "completed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_completed".to_string()),
+                });
+            }
+            "aborted" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_aborted".to_string()),
+                });
+            }
+            "failed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_failed".to_string()),
+                });
+            }
+            _ => {}
+        }
+
+        cx.checkpoint().map_err(|err| {
+            let detail = format!(
+                "abort_execution cancelled before atomic abort admission (exec_id={execution_id}): {err}"
+            );
+            workflow_runner_cancelled("workflow.abort_execution", detail)
+        })?;
+
+        let previous_status = record.status.clone();
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let aborted_at_step = record.current_step;
+        let action = super::engine::build_explicit_abort_action(&record, reason)?;
+        let now = action.ts;
+        let lock_manager = Arc::clone(&self.lock_manager);
+        let owned_execution_id = execution_id.to_string();
+        if !self
+            .storage
+            .abort_workflow_with_cx(cx, record, action, undo_attempt, move || {
+                lock_manager.release(pane_id, &owned_execution_id);
+            })
+            .await?
+        {
+            let current = self
+                .storage
+                .get_workflow_with_cx(&crate::cx::for_request(), execution_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                        execution_id.to_string(),
+                    ))
+                })?;
+            if !matches!(current.status.as_str(), "aborted" | "completed" | "failed") {
+                return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                    "workflow changed during abort; no abort committed; retry against current state".into()
+                )));
+            }
+            return Ok(AbortResult {
+                aborted: false,
+                execution_id: execution_id.to_string(),
+                workflow_name: current.workflow_name,
+                pane_id: current.pane_id,
+                previous_status: current.status.clone(),
+                aborted_at_step: current.current_step,
+                reason: None,
+                aborted_at: None,
+                error_reason: Some(format!("already_{}", current.status)),
+            });
+        }
+
+        // The writer owns commit-only lock cleanup, including when this future
+        // is dropped after admission and never observes its response.
+
+        // Trigger settlement is part of the same durable writer transaction;
+        // no caller continuation owns post-commit database work.
+
+        tracing::info!(
+            execution_id,
+            workflow_name,
+            pane_id,
+            reason_present = reason.is_some(),
+            "Workflow aborted (cx-first)"
+        );
+
+        Ok(AbortResult {
+            aborted: true,
+            execution_id: execution_id.to_string(),
+            workflow_name,
+            pane_id,
+            previous_status,
+            aborted_at_step,
+            reason: reason.map(std::string::ToString::to_string),
+            aborted_at: Some(now as u64),
+            error_reason: None,
+        })
+    }
+}
+
+/// Result of an abort operation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AbortResult {
+    /// Whether the abort was successful
+    pub aborted: bool,
+    /// Execution ID
+    pub execution_id: String,
+    /// Workflow name
+    pub workflow_name: String,
+    /// Pane ID
+    pub pane_id: u64,
+    /// Status before abort
+    pub previous_status: String,
+    /// Step index where abort occurred
+    pub aborted_at_step: usize,
+    /// Reason for abort (if provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Timestamp of abort (epoch ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aborted_at: Option<u64>,
+    /// Error reason if abort failed (e.g., "already_completed")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_async::CompatRuntime;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for async test");
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        crate::runtime_async::clear_runtime_handle();
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn workflow_runner_child_drain_truth_gives_settlement_precedence() {
+        assert_eq!(
+            classify_workflow_runner_child_drain(
+                true,
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            ),
+            WorkflowRunnerChildDrainOutcome::Settled,
+        );
+        assert_eq!(
+            classify_workflow_runner_child_drain(
+                true,
+                crate::runtime_async::task::JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            WorkflowRunnerChildDrainOutcome::TimedOut {
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn workflow_runner_child_drain_trusted_polls_registration_failure_to_settlement() {
+        run_async_test(async {
+            let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+            child_tasks.spawn(std::future::pending::<()>());
+            child_tasks.force_join_registration_failure_for_test();
+
+            assert_eq!(
+                settle_workflow_runner_children(&mut child_tasks).await,
+                WorkflowRunnerChildDrainOutcome::Settled,
+                "forced caller-waker registration failure must retain and trusted-drain the aborted workflow task",
+            );
+            assert_eq!(
+                child_tasks.settlement(),
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            );
+        });
+    }
+
+    #[test]
+    fn workflow_runner_reaps_completed_child_while_event_stream_is_idle() {
+        run_async_test(async {
+            let event_bus = crate::events::EventBus::new(8);
+            let mut subscriber = event_bus.subscribe_detections();
+            let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+            child_tasks.spawn(async {});
+            let cx = crate::cx::for_testing();
+
+            let wake = crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(1),
+                wait_for_workflow_runner_activity(&cx, &mut subscriber, &mut child_tasks, None),
+            )
+            .await
+            .expect("child completion must wake an otherwise-idle runner");
+            assert!(matches!(wake, WorkflowRunnerWake::Child(Ok(Some(Ok(()))))));
+            assert_eq!(
+                child_tasks.settlement(),
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            );
+        });
+    }
+
+    // ========================================================================
+    // WorkflowStartResult predicates
+    // ========================================================================
+
+    #[test]
+    fn start_result_started_is_started() {
+        let r = WorkflowStartResult::Started {
+            execution_id: "exec-1".to_string(),
+            workflow_name: "wf".to_string(),
+        };
+        assert!(r.is_started());
+        assert!(!r.is_locked());
+        assert_eq!(r.execution_id(), Some("exec-1"));
+    }
+
+    #[test]
+    fn start_result_no_matching_workflow() {
+        let r = WorkflowStartResult::NoMatchingWorkflow {
+            rule_id: "rule-1".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(!r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    #[test]
+    fn start_result_pane_locked() {
+        let r = WorkflowStartResult::PaneLocked {
+            pane_id: 42,
+            held_by_workflow: "wf-other".to_string(),
+            held_by_execution: "exec-other".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    #[test]
+    fn start_result_error() {
+        let r = WorkflowStartResult::Error {
+            error: "boom".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(!r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    #[test]
+    fn start_result_concurrency_limit_reached() {
+        let r = WorkflowStartResult::ConcurrencyLimitReached {
+            active: 3,
+            limit: 3,
+        };
+        assert!(!r.is_started());
+        assert!(!r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // WorkflowStartResult serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn start_result_serde_started() {
+        let r = WorkflowStartResult::Started {
+            execution_id: "e1".to_string(),
+            workflow_name: "w1".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_started());
+        assert_eq!(back.execution_id(), Some("e1"));
+    }
+
+    #[test]
+    fn start_result_serde_no_matching() {
+        let r = WorkflowStartResult::NoMatchingWorkflow {
+            rule_id: "r1".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_started());
+    }
+
+    #[test]
+    fn start_result_serde_pane_locked() {
+        let r = WorkflowStartResult::PaneLocked {
+            pane_id: 10,
+            held_by_workflow: "hw".to_string(),
+            held_by_execution: "he".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_locked());
+    }
+
+    #[test]
+    fn start_result_serde_error() {
+        let r = WorkflowStartResult::Error {
+            error: "err".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_started());
+    }
+
+    #[test]
+    fn start_result_serde_concurrency_limit_reached() {
+        let r = WorkflowStartResult::ConcurrencyLimitReached {
+            active: 2,
+            limit: 3,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_started());
+        assert!(!back.is_locked());
+        assert!(back.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // WorkflowExecutionResult predicates
+    // ========================================================================
+
+    #[test]
+    fn exec_result_completed() {
+        let r = WorkflowExecutionResult::Completed {
+            execution_id: "e1".to_string(),
+            result: serde_json::json!({"ok": true}),
+            elapsed_ms: 500,
+            steps_executed: 3,
+        };
+        assert!(r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e1"));
+    }
+
+    #[test]
+    fn exec_result_aborted() {
+        let r = WorkflowExecutionResult::Aborted {
+            execution_id: "e2".to_string(),
+            reason: "timeout".to_string(),
+            step_index: 1,
+            elapsed_ms: 30_000,
+        };
+        assert!(!r.is_completed());
+        assert!(r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e2"));
+    }
+
+    #[test]
+    fn exec_result_policy_denied() {
+        let r = WorkflowExecutionResult::PolicyDenied {
+            execution_id: "e3".to_string(),
+            step_index: 0,
+            reason: "alt_screen".to_string(),
+        };
+        assert!(!r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e3"));
+    }
+
+    #[test]
+    fn exec_result_error_with_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: Some("e4".to_string()),
+            error: "oops".to_string(),
+        };
+        assert!(!r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e4"));
+    }
+
+    #[test]
+    fn exec_result_error_without_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: None,
+            error: "oops".to_string(),
+        };
+        assert!(r.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // WorkflowExecutionResult serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn exec_result_serde_completed() {
+        let r = WorkflowExecutionResult::Completed {
+            execution_id: "e1".to_string(),
+            result: serde_json::json!(42),
+            elapsed_ms: 100,
+            steps_executed: 2,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_completed());
+    }
+
+    #[test]
+    fn exec_result_serde_aborted() {
+        let r = WorkflowExecutionResult::Aborted {
+            execution_id: "e2".to_string(),
+            reason: "err".to_string(),
+            step_index: 1,
+            elapsed_ms: 500,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_aborted());
+    }
+
+    // ========================================================================
+    // WorkflowRunnerConfig defaults
+    // ========================================================================
+
+    #[test]
+    fn runner_config_defaults() {
+        let config = WorkflowRunnerConfig::default();
+        assert_eq!(config.max_concurrent, 3);
+        assert_eq!(config.step_timeout_ms, 30_000);
+        assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.max_retries_per_step, 3);
+        // ft-3p7re: overall workflow deadline default is 600s (10 min).
+        // A pathologically retrying workflow can no longer pin a pane
+        // forever. `0` disables.
+        assert_eq!(config.workflow_total_deadline_ms, 600_000);
+    }
+
+    #[test]
+    fn retry_backoff_uses_step_delay_as_first_attempt_base() {
+        assert_eq!(retry_backoff_delay(100, 1, 2.0), Duration::from_millis(100));
+        assert_eq!(retry_backoff_delay(100, 2, 2.0), Duration::from_millis(200));
+        assert_eq!(retry_backoff_delay(100, 3, 2.0), Duration::from_millis(400));
+        assert_eq!(
+            retry_backoff_delay(100, 4, 1.5),
+            Duration::from_millis(338),
+            "fractional backoff rounds up so configured delay is never shortened"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_invalid_multiplier_uses_safe_constant_delay() {
+        for multiplier in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.5] {
+            assert_eq!(
+                normalized_retry_backoff_multiplier(multiplier).to_bits(),
+                1.0f64.to_bits()
+            );
+            assert_eq!(
+                retry_backoff_delay(250, 10, multiplier),
+                Duration::from_millis(250)
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_saturates_instead_of_wrapping() {
+        assert_eq!(
+            retry_backoff_delay(u64::MAX, 2, 2.0),
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(retry_backoff_delay(0, usize::MAX, f64::MAX), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_admission_never_overflows_at_usize_max() {
+        assert_eq!(admit_retry_ordinal(0, 0), None);
+        assert_eq!(admit_retry_ordinal(0, 1), Some(1));
+        assert_eq!(admit_retry_ordinal(1, 1), None);
+        assert_eq!(
+            admit_retry_ordinal(usize::MAX - 1, usize::MAX),
+            Some(usize::MAX)
+        );
+        assert_eq!(admit_retry_ordinal(usize::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn retry_backoff_never_rounds_large_integer_base_down() {
+        for base_delay_ms in [
+            (1_u64 << 53) + 1,
+            (1_u64 << 53) + 3,
+            (1_u64 << 54) + 1,
+            u64::MAX - 2_048,
+        ] {
+            let effective = retry_backoff_delay(base_delay_ms, 2, 1.0);
+            assert!(
+                effective >= Duration::from_millis(base_delay_ms),
+                "large integer base {base_delay_ms}ms rounded down to {effective:?}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // AbortResult serialization
+    // ========================================================================
+
+    #[test]
+    fn abort_result_serializes() {
+        let r = AbortResult {
+            aborted: true,
+            execution_id: "e1".to_string(),
+            workflow_name: "wf1".to_string(),
+            pane_id: 42,
+            previous_status: "running".to_string(),
+            aborted_at_step: 2,
+            reason: Some("user requested".to_string()),
+            aborted_at: Some(1234567890),
+            error_reason: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["aborted"], true);
+        assert_eq!(json["execution_id"], "e1");
+        assert_eq!(json["pane_id"], 42);
+        assert_eq!(json["reason"], "user requested");
+        // error_reason should be skipped (None)
+        assert!(json.get("error_reason").is_none());
+    }
+
+    #[test]
+    fn abort_result_skips_none_fields() {
+        let r = AbortResult {
+            aborted: false,
+            execution_id: "e2".to_string(),
+            workflow_name: "wf2".to_string(),
+            pane_id: 1,
+            previous_status: "waiting".to_string(),
+            aborted_at_step: 0,
+            reason: None,
+            aborted_at: None,
+            error_reason: Some("already_completed".to_string()),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("reason").is_none());
+        assert!(json.get("aborted_at").is_none());
+        assert_eq!(json["error_reason"], "already_completed");
+    }
+
+    // ========================================================================
+    // Serde roundtrip for PolicyDenied and Error variants
+    // ========================================================================
+
+    #[test]
+    fn exec_result_serde_policy_denied() {
+        let r = WorkflowExecutionResult::PolicyDenied {
+            execution_id: "e-denied".to_string(),
+            step_index: 0,
+            reason: "pane in alt-screen".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_completed());
+        assert!(!back.is_aborted());
+        assert_eq!(back.execution_id(), Some("e-denied"));
+    }
+
+    #[test]
+    fn exec_result_serde_error_with_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: Some("e-err".to_string()),
+            error: "storage unavailable".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_completed());
+        assert_eq!(back.execution_id(), Some("e-err"));
+    }
+
+    #[test]
+    fn exec_result_serde_error_without_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: None,
+            error: "early failure".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // AbortResult roundtrip
+    // ========================================================================
+
+    #[test]
+    fn abort_result_serializes_all_fields() {
+        let r = AbortResult {
+            aborted: true,
+            execution_id: "e-abort".to_string(),
+            workflow_name: "handle_usage_limits".to_string(),
+            pane_id: 99,
+            previous_status: "running".to_string(),
+            aborted_at_step: 3,
+            reason: Some("operator initiated".to_string()),
+            aborted_at: Some(1710403200000),
+            error_reason: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["aborted"], true);
+        assert_eq!(json["execution_id"], "e-abort");
+        assert_eq!(json["workflow_name"], "handle_usage_limits");
+        assert_eq!(json["pane_id"], 99);
+        assert_eq!(json["previous_status"], "running");
+        assert_eq!(json["aborted_at_step"], 3);
+        assert_eq!(json["reason"], "operator initiated");
+        assert_eq!(json["aborted_at"], 1710403200000_i64);
+        assert!(json.get("error_reason").is_none());
+    }
+
+    // ========================================================================
+    // WorkflowRunnerConfig custom values
+    // ========================================================================
+
+    #[test]
+    fn runner_config_custom_values() {
+        let config = WorkflowRunnerConfig {
+            max_concurrent: 10,
+            step_timeout_ms: 60_000,
+            retry_backoff_multiplier: 1.5,
+            max_retries_per_step: 5,
+            workflow_total_deadline_ms: 1_800_000, // 30 min
+        };
+        assert_eq!(config.max_concurrent, 10);
+        assert_eq!(config.step_timeout_ms, 60_000);
+        assert!((config.retry_backoff_multiplier - 1.5).abs() < f64::EPSILON);
+        assert_eq!(config.max_retries_per_step, 5);
+        assert_eq!(config.workflow_total_deadline_ms, 1_800_000);
+    }
+
+    #[test]
+    fn runner_new_normalizes_invalid_retry_multiplier() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("runner_invalid_retry_multiplier.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig {
+                    retry_backoff_multiplier: f64::NAN,
+                    ..WorkflowRunnerConfig::default()
+                },
+            );
+
+            assert_eq!(
+                runner.config.retry_backoff_multiplier.to_bits(),
+                1.0f64.to_bits()
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn runner_config_disabled_overall_deadline_is_zero() {
+        // ft-3p7re: explicit zero disables the overall-workflow deadline
+        // (legacy behavior). The runner's deadline check is gated on
+        // `> 0`. This test pins the contract so a future change of the
+        // sentinel value cannot silently break opt-out callers.
+        let config = WorkflowRunnerConfig {
+            workflow_total_deadline_ms: 0,
+            ..WorkflowRunnerConfig::default()
+        };
+        assert_eq!(config.workflow_total_deadline_ms, 0);
+    }
+
+    fn reject_terminal_workflow_updates(db_path: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open fault-injection database");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_terminal_workflow_updates
+             BEFORE UPDATE ON workflow_executions
+             WHEN NEW.status IN ('completed', 'failed', 'aborted')
+             BEGIN
+               SELECT RAISE(ABORT, 'injected terminal persistence failure');
+             END;",
+        )
+        .expect("install terminal-write fault");
+    }
+
+    struct CompletionPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for CompletionPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "completion_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Completes immediately to exercise terminal persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match step_idx {
+                    0 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_completion_persistence_failure_is_not_reported_completed() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("completion_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "completion-write-rejected";
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
+            reject_terminal_workflow_updates(&db_path);
+            let result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(CompletionPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    execution_id,
+                    None,
+                )
+                .await;
+
+            match result {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                }) => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains("injected terminal persistence failure"),
+                        "the terminal-write fault must cause the failure: {error}"
+                    );
+                }
+                other => panic!("failed terminal persistence must not report success: {other:?}"),
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    // ── ft-7h5da.8.3 (W7.3): requires_unlimited_pane scheduling gate ──
+
+    struct UnlimitedGateProbeWorkflow {
+        requires_unlimited: bool,
+    }
+
+    impl Workflow for UnlimitedGateProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "unlimited_gate_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Probes the requires_unlimited_pane scheduling gate (ft-7h5da.8.3)"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn requires_unlimited_pane(&self) -> bool {
+            self.requires_unlimited
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    fn unlimited_gate_detection() -> crate::patterns::Detection {
+        crate::patterns::Detection {
+            rule_id: "unlimited_gate.trigger".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "test".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "trigger".to_string(),
+            span: (0, 0),
+        }
+    }
+
+    async fn unlimited_gate_runner(
+        db_path: &str,
+    ) -> (
+        Arc<crate::storage::StorageHandle>,
+        WorkflowRunner,
+        Arc<PaneWorkflowLockManager>,
+    ) {
+        let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let handle: crate::wezterm::WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+            crate::policy::PolicyEngine::permissive(),
+            handle,
+        ));
+        let runner = WorkflowRunner::new(
+            WorkflowEngine::default(),
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+        (storage, runner, lock_manager)
+    }
+
+    struct DurableRetryProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for DurableRetryProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "durable_retry_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Observes durable admission before attempting a retryable effect"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new(
+                "retry",
+                "Retry until the original allowance is spent",
+            )]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            let storage = Arc::clone(ctx.storage());
+            let execution_id = ctx.execution_id().to_string();
+            Box::pin(async move {
+                let cx = crate::cx::for_testing();
+                let admitted = storage
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(admitted.phase, WorkflowAttemptPhase::InFlight);
+                assert_eq!(
+                    admitted.retries,
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                    "the durable ordinal must precede every independently counted effect"
+                );
+                StepResult::retry(250)
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_retry_budget_survives_interrupted_wait_and_database_reopen() {
+        run_async_test(async {
+            use futures::future::{Either, select};
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retry_restart.db");
+            let path = path.to_str().unwrap();
+            let (storage, mut runner, locks) = unlimited_gate_runner(path).await;
+            runner.config.max_retries_per_step = 2;
+            runner.config.retry_backoff_multiplier = 3.0;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let workflow: Arc<dyn Workflow> = Arc::new(DurableRetryProbeWorkflow {
+                calls: Arc::clone(&calls),
+            });
+            runner.register_workflow(Arc::clone(&workflow));
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let start = runner
+                .handle_detection(77, &unlimited_gate_detection(), None)
+                .await;
+            let execution_id = start.execution_id().unwrap().to_string();
+            let cx = crate::cx::for_testing();
+            let running = Box::pin(runner.run_workflow_with_cx(
+                &cx,
+                77,
+                Arc::clone(&workflow),
+                &execution_id,
+                0,
+            ));
+            let observe_committed_retry = Box::pin(async {
+                loop {
+                    let budget = storage
+                        .get_workflow_budget_with_cx(&cx, &execution_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let logs = storage.get_step_logs(&execution_id).await.unwrap();
+                    if budget.phase == WorkflowAttemptPhase::RetryWaiting
+                        && budget.retries == 2
+                        && logs.iter().filter(|log| log.result_type == "retry").count() == 2
+                        && let Some(log) = logs.iter().rev().find(|log| log.result_type == "retry")
+                    {
+                        let data: serde_json::Value =
+                            serde_json::from_str(log.result_data.as_deref().unwrap()).unwrap();
+                        assert_eq!(data["retry_budget"]["retry_ordinal"], 2);
+                        assert_eq!(data["retry_budget"]["base_delay_ms"], 250);
+                        assert_eq!(data["retry_budget"]["effective_delay_ms"], 750);
+                        return budget;
+                    }
+                    crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            });
+            let persisted = match crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(5),
+                select(running, observe_committed_retry),
+            )
+            .await
+            .expect("the production runner must reach its committed retry wait")
+            {
+                Either::Right((budget, interrupted_run)) => {
+                    // This is the crash boundary: no cancellation cleanup or
+                    // terminal write runs when the admitted future disappears.
+                    drop(interrupted_run);
+                    budget
+                }
+                Either::Left((result, _)) => panic!("runner passed the cutpoint: {result:?}"),
+            };
+            assert_eq!(persisted.retries, 2);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(locks.is_locked(77).is_none());
+            drop(runner);
+            storage.shutdown().await.unwrap();
+            drop(storage);
+
+            let (reopened, mut resumed_runner, resumed_locks) = unlimited_gate_runner(path).await;
+            // A restarted runner must not replace any part of the policy
+            // captured by the original execution.
+            resumed_runner.config.max_retries_per_step = 20;
+            resumed_runner.config.retry_backoff_multiplier = 1.0;
+            resumed_runner.config.workflow_total_deadline_ms = 0;
+            resumed_runner.register_workflow(workflow);
+            let resumed = resumed_runner.resume_incomplete_with_cx(&cx).await;
+            assert_eq!(resumed.len(), 1);
+            assert!(matches!(
+                &resumed[0],
+                WorkflowExecutionResult::Aborted { reason, .. }
+                    if reason.contains("Max retries (2)")
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert!(resumed_locks.is_locked(77).is_none());
+            let retained = reopened
+                .get_workflow_budget_with_cx(&cx, &execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.deadline_at_ms, persisted.deadline_at_ms);
+            assert_eq!(retained.max_retries_per_step, 2);
+            assert_eq!(
+                retained.retry_backoff_multiplier.to_bits(),
+                3.0_f64.to_bits()
+            );
+            assert!(retained.remaining_ms <= persisted.remaining_ms);
+            assert!(
+                resumed_runner
+                    .resume_incomplete_with_cx(&cx)
+                    .await
+                    .is_empty()
+            );
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    struct CompetingBudgetWriterWorkflow {
+        winning_budget: Arc<std::sync::Mutex<Option<WorkflowExecutionBudget>>>,
+    }
+
+    impl Workflow for CompetingBudgetWriterWorkflow {
+        fn name(&self) -> &'static str {
+            "competing_budget_writer"
+        }
+
+        fn description(&self) -> &'static str {
+            "Advances durable authority before the current runner can settle its result"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let storage = Arc::clone(ctx.storage());
+            let execution_id = ctx.execution_id().to_string();
+            let winning_budget = Arc::clone(&self.winning_budget);
+            Box::pin(async move {
+                let cx = crate::cx::for_testing();
+                let budget = storage
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(budget.phase, WorkflowAttemptPhase::InFlight);
+                let mut next = budget.clone();
+                next.observe_time(now_ms(), 0).unwrap();
+                next.revision += 1;
+                assert!(
+                    storage
+                        .compare_exchange_workflow_budget_with_cx(
+                            &cx,
+                            &execution_id,
+                            budget.revision,
+                            next.clone(),
+                        )
+                        .await
+                        .unwrap()
+                );
+                *winning_budget.lock().unwrap() = Some(next);
+                StepResult::done(serde_json::json!({ "ok": true }))
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_budget_revision_loser_does_not_settle_the_winner() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("budget_revision_conflict.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let winning_budget = Arc::new(std::sync::Mutex::new(None));
+            let workflow: Arc<dyn Workflow> = Arc::new(CompetingBudgetWriterWorkflow {
+                winning_budget: Arc::clone(&winning_budget),
+            });
+            let cx = crate::cx::for_testing();
+            let execution_id = "budget_revision_conflict";
+            let result = runner
+                .run_workflow_manual_with_cx(&cx, 77, workflow, execution_id, None)
+                .await;
+            assert!(matches!(
+                result,
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error { error, .. })
+                    if error == "workflow_budget_revision_conflict"
+            ));
+            assert!(locks.is_locked(77).is_none());
+            let record = storage.get_workflow(execution_id).await.unwrap().unwrap();
+            assert_eq!(record.status, "running");
+            assert!(record.completed_at.is_none());
+            assert!(record.error.is_none());
+            assert_eq!(
+                storage
+                    .get_workflow_budget_with_cx(&cx, execution_id)
+                    .await
+                    .unwrap(),
+                winning_budget.lock().unwrap().clone(),
+            );
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery::default())
+                .await
+                .unwrap();
+            assert!(!audit.iter().any(|action| matches!(
+                action.action_kind.as_str(),
+                "workflow_completed" | "workflow_aborted" | "workflow_error"
+            )));
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_invalid_initial_budget_settles_state_and_terminal_audit() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("invalid_initial_budget.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.workflow_total_deadline_ms = u64::MAX;
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let workflow: Arc<dyn Workflow> = Arc::new(CompletionPersistenceProbeWorkflow {
+                calls: Arc::clone(&calls),
+            });
+            let cx = crate::cx::for_testing();
+            let execution_id = "invalid_initial_budget";
+            assert!(matches!(
+                runner
+                    .run_workflow_manual_with_cx(&cx, 77, workflow, execution_id, None)
+                    .await,
+                ManualWorkflowRunOutcome::StartError { error }
+                    if error.contains("workflow_budget_invalid_deadline")
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(locks.is_locked(77).is_none());
+            let record = storage.get_workflow(execution_id).await.unwrap().unwrap();
+            assert_eq!(record.status, "failed");
+            assert!(record.completed_at.is_some());
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    action_kind: Some("workflow_error".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audit.len(), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_resume_rejects_missing_expired_rollback_and_indeterminate_budgets() {
+        run_async_test(async {
+            for (case, expected_reason) in [
+                ("missing", "workflow_budget_missing"),
+                ("in_flight", "workflow_budget_indeterminate_attempt"),
+                ("expired", "workflow_budget_expired"),
+                ("rollback", "workflow_budget_clock_rollback"),
+                ("malformed", "workflow_budget_invalid_resume_state"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{case}.db"));
+                let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let workflow: Arc<dyn Workflow> = Arc::new(CompletionPersistenceProbeWorkflow {
+                    calls: Arc::clone(&calls),
+                });
+                runner.register_workflow(Arc::clone(&workflow));
+                seed_test_pane(&storage, 77, now_ms()).await;
+                let cx = crate::cx::for_testing();
+                let execution_id = if case == "missing" {
+                    runner
+                        .engine
+                        .start(&storage, workflow.name(), 77, None, None)
+                        .await
+                        .unwrap()
+                        .id
+                } else {
+                    let start = runner
+                        .handle_detection(77, &unlimited_gate_detection(), None)
+                        .await;
+                    let id = start.execution_id().unwrap().to_string();
+                    locks.release(77, &id);
+                    let budget = storage
+                        .get_workflow_budget_with_cx(&cx, &id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut next = budget.clone();
+                    next.revision += 1;
+                    match case {
+                        "in_flight" => next.phase = WorkflowAttemptPhase::InFlight,
+                        "expired" => next.remaining_ms = Some(0),
+                        "rollback" => {
+                            next.observe_time(next.last_observed_at_ms + 10_000, 10_000)
+                                .unwrap();
+                        }
+                        "malformed" => {}
+                        _ => unreachable!(),
+                    }
+                    if case == "malformed" {
+                        let connection = rusqlite::Connection::open(&path).unwrap();
+                        connection.execute(
+                            "UPDATE workflow_execution_budgets SET budget_json = ?1 WHERE workflow_id = ?2",
+                            ["private-synthetic-payload-must-not-escape", id.as_str()],
+                        ).unwrap();
+                    } else {
+                        assert!(
+                            storage
+                                .compare_exchange_workflow_budget_with_cx(
+                                    &cx,
+                                    &id,
+                                    budget.revision,
+                                    next
+                                )
+                                .await
+                                .unwrap()
+                        );
+                    }
+                    id
+                };
+                let original_record = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+                let original_budget = if case == "in_flight" {
+                    storage
+                        .get_workflow_budget_with_cx(&cx, &execution_id)
+                        .await
+                        .unwrap()
+                } else {
+                    None
+                };
+                let results = runner.resume_incomplete_with_cx(&cx).await;
+                assert_eq!(results.len(), 1, "{case} must report its failed admission");
+                assert!(
+                    matches!(
+                        &results[0],
+                        WorkflowExecutionResult::Error { error, .. }
+                            if error.contains(expected_reason)
+                                && !error.contains("private-synthetic-payload")
+                    ),
+                    "{case}: {:?}",
+                    results[0]
+                );
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "{case}");
+                assert!(locks.is_locked(77).is_none(), "{case}");
+                let record = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+                if case == "in_flight" {
+                    // Another process may still own the admitted attempt.
+                    // Without its ownership lease, recovery must neither
+                    // replay effects nor write a terminal failure for it.
+                    assert_eq!(record.status, original_record.status);
+                    assert_eq!(record.updated_at, original_record.updated_at);
+                    assert_eq!(record.completed_at, original_record.completed_at);
+                    assert_eq!(record.error, original_record.error);
+                    assert_eq!(
+                        storage
+                            .get_workflow_budget_with_cx(&cx, &execution_id)
+                            .await
+                            .unwrap(),
+                        original_budget,
+                    );
+                    assert!(
+                        storage
+                            .get_audit_actions(crate::storage::AuditQuery::default())
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(record.status, "failed", "{case}");
+                    assert!(record.completed_at.is_some(), "{case}");
+                    assert!(
+                        runner.resume_incomplete_with_cx(&cx).await.is_empty(),
+                        "{case}"
+                    );
+                }
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    struct StartupIngressProbeWorkflow {
+        recovery_entered: std::sync::atomic::AtomicBool,
+        recovery_released: std::sync::atomic::AtomicBool,
+        recovery_notify: crate::runtime_async::notify::Notify,
+        detections: std::sync::atomic::AtomicUsize,
+        executions: Mutex<Vec<(u64, String)>>,
+    }
+
+    impl StartupIngressProbeWorkflow {
+        fn new() -> Self {
+            Self {
+                recovery_entered: std::sync::atomic::AtomicBool::new(false),
+                recovery_released: std::sync::atomic::AtomicBool::new(false),
+                recovery_notify: crate::runtime_async::notify::Notify::new(),
+                detections: std::sync::atomic::AtomicUsize::new(0),
+                executions: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Workflow for StartupIngressProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "startup_ingress_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Pauses durable recovery while new detections arrive"
+        }
+
+        fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+            self.detections.fetch_add(1, Ordering::SeqCst);
+            detection.rule_id == "startup_ingress.trigger"
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let pane_id = ctx.pane_id();
+            let execution_id = ctx.execution_id().to_string();
+            Box::pin(async move {
+                if step_idx != 0 {
+                    return StepResult::abort("unexpected step");
+                }
+                self.executions
+                    .lock()
+                    .unwrap()
+                    .push((pane_id, execution_id));
+                if pane_id == 77 {
+                    self.recovery_entered.store(true, Ordering::SeqCst);
+                    self.recovery_notify.notify_waiters();
+                    self.recovery_notify
+                        .wait_until(|| self.recovery_released.load(Ordering::SeqCst))
+                        .await;
+                }
+                StepResult::done(serde_json::json!({ "ok": true }))
+            })
+        }
+    }
+
+    fn startup_ingress_event(pane_id: u64) -> crate::events::Event {
+        crate::events::Event::PatternDetected {
+            pane_id,
+            pane_uuid: None,
+            detection: crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            },
+            event_id: None,
+        }
+    }
+
+    async fn persist_test_detection(
+        storage: &StorageHandle,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+    ) -> i64 {
+        storage
+            .record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id.clone(),
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type.clone(),
+                severity: format!("{:?}", detection.severity).to_lowercase(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted.clone()),
+                matched_text: Some(detection.matched_text.clone()),
+                segment_id: None,
+                detected_at: now_ms(),
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn persisted_trigger_replay_after_restart_does_not_repeat_completed_workflow() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("trigger-replay.db");
+            let path = db_path.to_str().unwrap();
+            let (storage, runner, locks) = unlimited_gate_runner(path).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_test_pane(&storage, 78, now_ms()).await;
+            let detection = crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            };
+            let event_id = persist_test_detection(&storage, 78, &detection).await;
+            let cx = crate::cx::for_testing();
+            let first = runner
+                .handle_detection_with_cx(&cx, 78, &detection, Some(event_id))
+                .await;
+            let execution_id = first
+                .execution_id()
+                .expect("first trigger starts")
+                .to_string();
+            assert!(matches!(
+                runner
+                    .run_workflow_with_cx(&cx, 78, probe.clone(), &execution_id, 0)
+                    .await,
+                WorkflowExecutionResult::Completed { .. }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let original = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+            let budget = storage
+                .get_workflow_budget_with_cx(&cx, &execution_id)
+                .await
+                .unwrap();
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(events[0].handled_at.is_some());
+            storage.shutdown().await.unwrap();
+            drop(runner);
+            drop(storage);
+
+            let (reopened, runner, locks) = unlimited_gate_runner(path).await;
+            runner.register_workflow(probe.clone());
+            let replay = runner
+                .handle_detection_with_cx(&cx, 78, &detection, Some(event_id))
+                .await;
+            assert!(matches!(
+                replay,
+                WorkflowStartResult::TriggerRejected {
+                    event_id: rejected_id,
+                    reason: crate::error::WorkflowTriggerRejection::AlreadyClaimed {
+                        execution_id: original_id,
+                    },
+                } if rejected_id == event_id && original_id == execution_id
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(
+                locks.active_count(),
+                0,
+                "rejected admission releases its pane lock"
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.get_workflow(&execution_id).await.unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(original).unwrap(),
+            );
+            assert_eq!(
+                reopened
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap(),
+                budget,
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    reopened
+                        .get_events(crate::storage::EventQuery::default())
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(events).unwrap(),
+                "replay cannot overwrite the original handling receipt",
+            );
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn persisted_trigger_competing_writers_admit_one_execution_without_handling_early() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("trigger-race.db");
+            let path = db_path.to_str().unwrap();
+            let (left_storage, left, left_locks) = unlimited_gate_runner(path).await;
+            let (right_storage, right, right_locks) = unlimited_gate_runner(path).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            left.register_workflow(probe.clone());
+            right.register_workflow(probe.clone());
+            seed_test_pane(&left_storage, 78, now_ms()).await;
+            let detection = crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            };
+            let event_id = persist_test_detection(&left_storage, 78, &detection).await;
+            let left_cx = crate::cx::for_testing();
+            let right_cx = crate::cx::for_testing();
+            let (left_result, right_result) = futures::join!(
+                left.handle_detection_with_cx(&left_cx, 78, &detection, Some(event_id)),
+                right.handle_detection_with_cx(&right_cx, 78, &detection, Some(event_id)),
+            );
+            let (winner, rejection, winner_runner) = if left_result.is_started() {
+                (&left_result, &right_result, &left)
+            } else {
+                (&right_result, &left_result, &right)
+            };
+            let execution_id = winner.execution_id().expect("one writer must win");
+            assert!(
+                matches!(
+                    rejection,
+                    WorkflowStartResult::TriggerRejected {
+                        event_id: rejected_id,
+                        reason: crate::error::WorkflowTriggerRejection::AlreadyClaimed {
+                            execution_id: original_id,
+                        },
+                    } if *rejected_id == event_id && original_id == execution_id
+                ),
+                "expected one typed duplicate, got {rejection:?}"
+            );
+            assert_eq!(left_locks.active_count() + right_locks.active_count(), 1);
+            let pending = left_storage.find_incomplete_workflows().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, execution_id);
+            let unhandled = left_storage
+                .get_events(crate::storage::EventQuery {
+                    unhandled_only: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(unhandled.len(), 1, "admission is not an effect receipt");
+            assert_eq!(unhandled[0].id, event_id);
+
+            assert!(matches!(
+                winner_runner
+                    .run_workflow_with_cx(&left_cx, 78, probe.clone(), execution_id, 0)
+                    .await,
+                WorkflowExecutionResult::Completed { .. }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(left_locks.active_count() + right_locks.active_count(), 0);
+            left_storage.shutdown().await.unwrap();
+            right_storage.shutdown().await.unwrap();
+        });
+    }
+
+    async fn durable_ingress_registry(
+        storage: &StorageHandle,
+        pane_ids: &[u64],
+    ) -> Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>> {
+        let mut registry = crate::ingest::PaneRegistry::new();
+        let panes = pane_ids
+            .iter()
+            .map(|pane_id| {
+                serde_json::from_value::<crate::wezterm::PaneInfo>(serde_json::json!({
+                    "pane_id": pane_id,
+                    "tab_id": 1,
+                    "window_id": 1,
+                    "domain_name": "local",
+                    "title": "codex"
+                }))
+                .unwrap()
+            })
+            .collect();
+        registry.update(panes);
+        for pane_id in pane_ids {
+            seed_test_pane(storage, *pane_id, now_ms()).await;
+            assert!(registry.adopt_uuid(*pane_id, format!("pane-{pane_id}")));
+            assert!(registry.get_entry(*pane_id).unwrap().should_observe());
+        }
+        Arc::new(crate::runtime_async::RwLock::new(registry))
+    }
+
+    fn durable_ingress_detection() -> crate::patterns::Detection {
+        crate::patterns::Detection {
+            rule_id: "startup_ingress.trigger".to_string(),
+            ..unlimited_gate_detection()
+        }
+    }
+
+    async fn persist_durable_ingress_detection(storage: &StorageHandle, pane_id: u64) -> i64 {
+        persist_durable_ingress_detection_at(storage, pane_id, now_ms()).await
+    }
+
+    async fn persist_durable_ingress_detection_at(
+        storage: &StorageHandle,
+        pane_id: u64,
+        detected_at: i64,
+    ) -> i64 {
+        let detection = durable_ingress_detection();
+        let identity = crate::events::event_identity_key(
+            &detection,
+            pane_id,
+            Some(&format!("pane-{pane_id}")),
+        );
+        storage
+            .record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id,
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type,
+                severity: format!("{:?}", detection.severity).to_lowercase(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted),
+                matched_text: Some(detection.matched_text),
+                segment_id: None,
+                detected_at,
+                dedupe_key: Some(format!("{identity}:{}", detected_at / 300_000)),
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn workflow_runner_recovers_lost_publications_and_ignores_forged_wake_payloads() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_lost_wake.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 999]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let first_id = persist_durable_ingress_detection(&storage, 78).await;
+            let second_id = persist_durable_ingress_detection(&storage, 79).await;
+
+            // Overflow the live channel with duplicate, out-of-order hints whose
+            // pane and detection payload disagree with the durable event IDs.
+            for event_id in [second_id, first_id, second_id] {
+                assert_eq!(
+                    event_bus.publish(crate::events::Event::PatternDetected {
+                        pane_id: 999,
+                        pane_uuid: Some("pane-999".to_string()),
+                        detection: crate::patterns::Detection {
+                            rule_id: "forged.unregistered.rule".to_string(),
+                            ..durable_ingress_detection()
+                        },
+                        event_id: Some(event_id),
+                    }),
+                    1
+                );
+            }
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[78, 79]).await;
+
+            // The runner is already active. This committed detection has no bus
+            // publication at all, so only periodic storage recovery can find it.
+            let third_id = persist_durable_ingress_detection(&storage, 80).await;
+            wait_for_startup_executions(&storage, &probe, &[78, 79, 80]).await;
+            assert_eq!(event_bus.metrics().snapshot().events_published, 3);
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 3);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 3);
+            for event_id in [first_id, second_id, third_id] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(row.handled_at.is_some());
+                let owner = storage
+                    .get_workflow(row.handled_by_workflow_id.as_deref().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(owner.trigger_event_id, Some(event_id));
+                assert_eq!(owner.pane_id, row.pane_id);
+                assert_eq!(owner.status, "completed");
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_retries_busy_pane_without_starving_other_panes() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_busy_pane.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let held = pre_hold_pane_lock(&locks, 78);
+            let blocked_id = persist_durable_ingress_detection(&storage, 78).await;
+            persist_durable_ingress_detection(&storage, 79).await;
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+
+            // An earlier busy event must not hold the durable scan at its ID.
+            wait_for_startup_executions(&storage, &probe, &[79]).await;
+            assert!(locks.is_locked(78).is_some());
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let blocked = rows.iter().find(|row| row.id == blocked_id).unwrap();
+            assert!(blocked.handled_at.is_none());
+            assert!(blocked.handled_by_workflow_id.is_none());
+
+            // No further bus event is sent. Releasing admission capacity is enough
+            // for a later bounded sweep to retry the original durable detection.
+            drop(held);
+            wait_for_startup_executions(&storage, &probe, &[78, 79]).await;
+            assert_eq!(event_bus.metrics().snapshot().events_published, 0);
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 2);
+            assert_eq!(locks.active_count(), 0);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_does_not_authorize_pre_subscription_detections() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_historical.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let historical_id = persist_durable_ingress_detection(&storage, 78).await;
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(8);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let fresh_id = persist_durable_ingress_detection(&storage, 79).await;
+            assert_eq!(
+                event_bus.publish(crate::events::Event::PatternDetected {
+                    pane_id: 78,
+                    pane_uuid: Some("pane-78".to_string()),
+                    detection: durable_ingress_detection(),
+                    event_id: Some(historical_id),
+                }),
+                1
+            );
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[79]).await;
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let historical = rows.iter().find(|row| row.id == historical_id).unwrap();
+            assert!(historical.handled_at.is_none());
+            assert!(historical.handled_by_workflow_id.is_none());
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == fresh_id)
+                    .unwrap()
+                    .handled_at
+                    .is_some()
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_skips_expired_and_future_detections_without_blocking_fresh_work() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_freshness.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 81]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let now = now_ms();
+            let expired_id = persist_durable_ingress_detection_at(
+                &storage,
+                78,
+                now - crate::storage::WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS - 1,
+            )
+            .await;
+            let future_id = persist_durable_ingress_detection_at(&storage, 79, now + 60_000).await;
+            let invalid_id = persist_durable_ingress_detection_at(&storage, 80, 0).await;
+            persist_durable_ingress_detection(&storage, 81).await;
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+
+            // The final healthy row fences traversal of all earlier rejected
+            // rows, without relying on an arbitrary sleep to prove refusal.
+            wait_for_startup_executions(&storage, &probe, &[81]).await;
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_testing(),
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            for event_id in [expired_id, future_id, invalid_id] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(row.handled_at.is_none());
+                assert!(row.handled_by_workflow_id.is_none());
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_rejects_unbound_and_retired_pane_incarnations() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_incarnations.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 81, 82]).await;
+            let runner = runner.with_watcher_registry(Arc::clone(&registry));
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let changed_storage_id = persist_durable_ingress_detection(&storage, 78).await;
+            let unbound_id =
+                persist_test_detection(&storage, 79, &durable_ingress_detection()).await;
+            let unobserved_id = persist_durable_ingress_detection(&storage, 80).await;
+            let changed_registry_id = persist_durable_ingress_detection(&storage, 81).await;
+            let healthy_id = persist_durable_ingress_detection(&storage, 82).await;
+
+            // Keep the live registry unchanged for pane 78: the storage-side
+            // incarnation check must independently reject stale authority.
+            let mut changed = storage.get_pane(78).await.unwrap().unwrap();
+            changed.pane_uuid = Some("replacement-pane-78".to_string());
+            storage.upsert_pane(changed).await.unwrap();
+            let mut unobserved = storage.get_pane(80).await.unwrap().unwrap();
+            unobserved.observed = false;
+            unobserved.ignore_reason = Some("operator excluded pane".to_string());
+            storage.upsert_pane(unobserved).await.unwrap();
+            assert!(
+                registry
+                    .write()
+                    .await
+                    .adopt_uuid(81, "replacement-pane-81".to_string())
+            );
+
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            // A valid later row proves the scan traversed all four rejected rows.
+            wait_for_startup_executions(&storage, &probe, &[82]).await;
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            for event_id in [
+                changed_storage_id,
+                unbound_id,
+                unobserved_id,
+                changed_registry_id,
+            ] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(
+                    row.handled_at.is_none(),
+                    "event {event_id} must stay unhandled"
+                );
+                assert!(
+                    row.handled_by_workflow_id.is_none(),
+                    "event {event_id} must not acquire a workflow owner"
+                );
+            }
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == healthy_id)
+                    .unwrap()
+                    .handled_at
+                    .is_some()
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_rechecks_live_incarnation_after_resolving_recovery_source() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory
+                .path()
+                .join("durable_ingress_replaced_before_admission.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78]).await;
+            let runner = runner.with_watcher_registry(Arc::clone(&registry));
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_id = persist_durable_ingress_detection(&storage, 78).await;
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let stored = events.iter().find(|event| event.id == event_id).unwrap();
+            let detection = workflow_detection_from_stored(stored).unwrap();
+            let resolved_uuid = runner
+                .replay_source_uuid_with_cx(&cx, stored, &detection)
+                .await
+                .unwrap()
+                .expect("the original live incarnation authorizes source resolution");
+            assert_eq!(resolved_uuid, "pane-78");
+            let epoch = storage
+                .get_event_retention_snapshot_with_cx(&cx)
+                .await
+                .unwrap()
+                .cursor_epoch;
+            let recovered_source = RecoveredWorkflowSource {
+                pane_uuid: resolved_uuid,
+                event_epoch: epoch,
+                detected_at: stored.detected_at,
+            };
+
+            // Discovery publishes the replacement before its asynchronous pane
+            // upsert. The unchanged database row alone would still admit the old
+            // event; admission must recheck the actual live registry as well.
+            assert!(
+                registry
+                    .write_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .adopt_uuid(78, "replacement-pane-78".to_string())
+            );
+            assert_eq!(
+                storage.get_pane(78).await.unwrap().unwrap().pane_uuid,
+                Some("pane-78".to_string())
+            );
+            assert!(matches!(
+                runner
+                    .handle_detection_for_source_with_cx(
+                        &cx,
+                        78,
+                        &detection,
+                        Some(event_id),
+                        Some(&recovered_source),
+                    )
+                    .await,
+                WorkflowStartResult::TriggerRejected {
+                    event_id: rejected_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                } if rejected_id == event_id
+            ));
+
+            assert_eq!(locks.active_count(), 0);
+            assert!(probe.executions.lock().unwrap().is_empty());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            for table in ["workflow_executions", "workflow_execution_budgets"] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "rejected source must not write {table}");
+            }
+            drop(connection);
+            assert!(
+                storage
+                    .get_audit_actions(crate::storage::AuditQuery::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let stored = events.iter().find(|event| event.id == event_id).unwrap();
+            assert!(stored.handled_at.is_none());
+            assert!(stored.handled_by_workflow_id.is_none());
+
+            // An early rejection must drop the admission read guard too.
+            let mut registry_guard = crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(1),
+                registry.write_with_cx(&cx),
+            )
+            .await
+            .expect("source rejection must release the live registry read guard")
+            .unwrap();
+            assert!(registry_guard.adopt_uuid(78, "pane-78".to_string()));
+            drop(registry_guard);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    async fn seed_startup_recovery(runner: &WorkflowRunner) {
+        seed_startup_recovery_record(runner, 77, "startup-recovery").await;
+    }
+
+    async fn seed_startup_recovery_record(
+        runner: &WorkflowRunner,
+        pane_id: u64,
+        execution_id: &str,
+    ) {
+        let cx = crate::cx::for_testing();
+        seed_test_pane(&runner.storage, pane_id, now_ms()).await;
+        let execution = runner
+            .engine
+            .start_with_id_cx(
+                &cx,
+                &runner.storage,
+                super::super::engine::WorkflowStartInput {
+                    execution_id: execution_id.to_string(),
+                    workflow_name: "startup_ingress_probe".to_string(),
+                    pane_id,
+                    trigger_event_id: None,
+                    context: None,
+                },
+            )
+            .await
+            .expect("persist unfinished workflow");
+        runner
+            .initialize_execution_budget_with_cx(&cx, &execution.id, execution.started_at)
+            .await
+            .expect("persist unfinished workflow budget");
+    }
+
+    async fn wait_for_startup_executions(
+        storage: &StorageHandle,
+        probe: &StartupIngressProbeWorkflow,
+        expected_panes: &[u64],
+    ) {
+        let cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&cx, Duration::from_secs(5), async {
+            loop {
+                let executions = probe.executions.lock().unwrap().clone();
+                assert!(
+                    executions.len() <= expected_panes.len(),
+                    "duplicate execution"
+                );
+                if executions.len() == expected_panes.len() {
+                    let mut completed = true;
+                    for (_, execution_id) in &executions {
+                        let record = storage
+                            .get_workflow_with_cx(&cx, execution_id)
+                            .await
+                            .unwrap()
+                            .expect("executed workflow must be durable");
+                        assert!(
+                            !matches!(record.status.as_str(), "failed" | "aborted"),
+                            "workflow must complete: {record:?}"
+                        );
+                        completed &= record.status == "completed";
+                    }
+                    if completed {
+                        let mut panes = executions
+                            .into_iter()
+                            .map(|(pane_id, _)| pane_id)
+                            .collect::<Vec<_>>();
+                        panes.sort_unstable();
+                        assert_eq!(panes.as_slice(), expected_panes);
+                        return;
+                    }
+                }
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("buffered detections must reach completed workflow records");
+    }
+
+    async fn wait_for_startup_pane_completion(
+        storage: &StorageHandle,
+        probe: &StartupIngressProbeWorkflow,
+        locks: &PaneWorkflowLockManager,
+        pane_id: u64,
+    ) {
+        let cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&cx, Duration::from_secs(5), async {
+            loop {
+                let executions = probe.executions.lock().unwrap().clone();
+                let matches = executions
+                    .iter()
+                    .filter(|(executed_pane, _)| *executed_pane == pane_id)
+                    .collect::<Vec<_>>();
+                assert!(matches.len() <= 1, "a pane executed more than once");
+                if let Some((_, execution_id)) = matches.first()
+                    && storage
+                        .get_workflow_with_cx(&cx, execution_id)
+                        .await
+                        .unwrap()
+                        .is_some_and(|record| record.status == "completed")
+                    && locks.is_locked(pane_id).is_none()
+                {
+                    return;
+                }
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("unrelated pane must complete while recovered work is blocked");
+    }
+
+    #[test]
+    fn workflow_runner_recovers_without_blocking_live_detections_or_shutdown() {
+        run_async_test(async {
+            for cancel in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("concurrent-recovery.db");
+                let (storage, mut runner, locks) =
+                    unlimited_gate_runner(path.to_str().unwrap()).await;
+                runner.config.max_concurrent = 2;
+                runner.config.step_timeout_ms = 60_000;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_startup_recovery(&runner).await;
+                seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+                seed_test_pane(&storage, 79, now_ms()).await;
+                let event_bus = crate::events::EventBus::new(8);
+                let runner_cx = crate::cx::for_testing();
+                let child_cx = runner_cx.clone();
+                let subscription = runner
+                    .subscribe_with_cx(&runner_cx, &event_bus)
+                    .await
+                    .unwrap();
+                let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let child_stopped = Arc::clone(&stopped);
+                let notify = Arc::new(crate::runtime_async::notify::Notify::new());
+                let child_notify = Arc::clone(&notify);
+                let task = crate::runtime_async::task::spawn(async move {
+                    runner
+                        .run_subscribed_with_cx(
+                            &child_cx,
+                            subscription,
+                            Some((&child_stopped, &child_notify)),
+                        )
+                        .await;
+                });
+                let observer_cx = crate::cx::for_testing();
+                crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(5),
+                    probe
+                        .recovery_notify
+                        .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+                )
+                .await
+                .expect("restored execution must enter its real pending step");
+
+                assert_eq!(event_bus.publish(startup_ingress_event(79)), 1);
+                wait_for_startup_pane_completion(&storage, &probe, &locks, 79).await;
+                assert!(!probe.recovery_released.load(Ordering::SeqCst));
+                assert_eq!(probe.executions.lock().unwrap().len(), 2);
+                assert!(locks.is_locked(77).is_some());
+                assert!(locks.is_locked(78).is_none());
+                assert_eq!(
+                    storage
+                        .get_workflow("startup-recovery-queued")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "running",
+                    "recovery must reserve capacity for live detections"
+                );
+                assert_eq!(
+                    storage
+                        .get_workflow_budget_with_cx(&observer_cx, "startup-recovery")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    WorkflowAttemptPhase::InFlight,
+                    "the pending effect retains its durable attempt fence"
+                );
+
+                if cancel {
+                    runner_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel while restored step is pending"),
+                    );
+                } else {
+                    stopped.store(true, Ordering::SeqCst);
+                    notify.notify_waiters();
+                }
+                crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                    .await
+                    .expect("shutdown must not wait for the restored step to finish")
+                    .expect("runner and its owned children must settle");
+                assert_eq!(locks.active_count(), 0);
+                assert_eq!(event_bus.stats().detection_subscribers, 0);
+                assert_eq!(probe.executions.lock().unwrap().len(), 2);
+
+                storage.shutdown().await.unwrap();
+                drop(storage);
+                let (reopened, restarted, restarted_locks) =
+                    unlimited_gate_runner(path.to_str().unwrap()).await;
+                restarted.register_workflow(probe.clone());
+                crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(5),
+                    Box::pin(restarted.resume_incomplete_with_cx(&observer_cx)),
+                )
+                .await
+                .expect("restart must refuse the indeterminate attempt and finish queued work");
+                wait_for_startup_pane_completion(&reopened, &probe, &restarted_locks, 78).await;
+                assert_eq!(probe.executions.lock().unwrap().len(), 3);
+                assert_eq!(restarted_locks.active_count(), 0);
+                reopened.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    /// A restored child holds its recovery slot until it settles. With a
+    /// global limit of two, recovery runs one child at a time: while pane
+    /// 77's restored step waits, recovery must not start pane 78. 0cb662337
+    /// let the slot guard drop in the runner loop (the move closure captured
+    /// only its Copy `retry` field), so each child freed its slot at spawn.
+    #[test]
+    fn workflow_recovery_holds_its_child_slot_until_the_child_settles() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery-slot.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.max_concurrent = 2;
+            runner.config.step_timeout_ms = 60_000;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_startup_recovery(&runner).await;
+            seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+            let event_bus = crate::events::EventBus::new(8);
+            let cx = crate::cx::for_testing();
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(5),
+                probe
+                    .recovery_notify
+                    .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+            )
+            .await
+            .expect("restored execution must enter its pending step");
+
+            // Four recovery poll intervals: ample time for a freed slot to
+            // admit pane 78.
+            for _ in 0..100 {
+                let health = locks.health();
+                assert_eq!(
+                    (
+                        health.acquisitions_total,
+                        health.concurrency_limit_blocks_total
+                    ),
+                    (1, 0),
+                    "recovery admitted another child while the first held its slot"
+                );
+                assert_eq!(probe.executions.lock().unwrap().len(), 1);
+                crate::runtime_async::sleep_with_cx(&observer_cx, Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            }
+            assert!(locks.is_locked(78).is_none());
+
+            probe.recovery_released.store(true, Ordering::SeqCst);
+            probe.recovery_notify.notify_waiters();
+            wait_for_startup_executions(&storage, &probe, &[77, 78]).await;
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                .await
+                .expect("runner must observe bus closure after recovery")
+                .expect("runner task must settle");
+            assert_eq!(locks.active_count(), 0);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_revisits_deferred_recovery_without_blocking_other_panes() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("deferred-recovery.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.max_concurrent = 3;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_startup_recovery(&runner).await;
+            seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+            let held = locks
+                .try_acquire_owned_guarded(77, "other", "other-execution")
+                .unwrap();
+            let capacity_a = locks
+                .try_acquire_owned_guarded(80, "other", "capacity-a")
+                .unwrap();
+            let capacity_b = locks
+                .try_acquire_owned_guarded(81, "other", "capacity-b")
+                .unwrap();
+            let event_bus = crate::events::EventBus::new(8);
+            let cx = crate::cx::for_testing();
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(5), async {
+                loop {
+                    let health = locks.health();
+                    if health.concurrency_limit_blocks_total > 0
+                        && health.pane_already_locked_total > 0
+                    {
+                        break;
+                    }
+                    crate::runtime_async::sleep_with_cx(&observer_cx, Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("recovery must honor both global capacity and the existing pane owner");
+            assert!(probe.executions.lock().unwrap().is_empty());
+            assert_eq!(locks.active_count(), 3);
+            drop(capacity_a);
+            wait_for_startup_pane_completion(&storage, &probe, &locks, 78).await;
+            assert!(!probe.recovery_entered.load(Ordering::SeqCst));
+            assert_eq!(locks.active_count(), 2);
+            assert_eq!(locks.is_locked(77).unwrap().execution_id, "other-execution");
+            drop(held);
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(5),
+                probe
+                    .recovery_notify
+                    .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+            )
+            .await
+            .expect("deferred recovery must retry without another event publication");
+            probe.recovery_released.store(true, Ordering::SeqCst);
+            probe.recovery_notify.notify_waiters();
+            wait_for_startup_executions(&storage, &probe, &[77, 78]).await;
+            drop(capacity_b);
+            assert_eq!(event_bus.metrics().snapshot().events_published, 0);
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                .await
+                .expect("runner must observe bus closure after recovery")
+                .expect("runner task must settle");
+            assert_eq!(locks.active_count(), 0);
+            assert_eq!(probe.executions.lock().unwrap().len(), 2);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_recovery_pages_cross_deleted_and_terminal_ids_with_a_fixed_upper_bound() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery-pages.db");
+            let (storage, runner, _) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            for (pane_id, id) in [
+                (80, "scan-a"),
+                (81, "scan-b"),
+                (82, "scan-c"),
+                (83, "scan-d"),
+                (84, "scan-e"),
+            ] {
+                seed_startup_recovery_record(&runner, pane_id, id).await;
+            }
+            let cx = crate::cx::for_testing();
+            let first = storage
+                .scan_incomplete_workflows_with_cx(&cx, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(first.through_id.as_deref(), Some("scan-e"));
+            assert_eq!(
+                first
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-a", "scan-b"]
+            );
+            let through = first.through_id;
+            let mut terminal = storage.get_workflow("scan-c").await.unwrap().unwrap();
+            terminal.status = "completed".to_string();
+            terminal.completed_at = Some(now_ms());
+            storage.upsert_workflow(terminal).await.unwrap();
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = ON")
+                .unwrap();
+            connection
+                .execute("DELETE FROM workflow_executions WHERE id = 'scan-b'", [])
+                .unwrap();
+            connection.execute_batch("VACUUM").unwrap();
+            drop(connection);
+            seed_startup_recovery_record(&runner, 85, "scan-bb").await;
+            seed_startup_recovery_record(&runner, 86, "scan-z").await;
+
+            let second = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-b".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            // This is reconciliation, not immutable snapshot membership: an
+            // in-range new identity is inspected, but never substitutes the
+            // removed cursor's identity or expands the fixed upper bound.
+            assert_eq!(
+                second
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-bb", "scan-d"]
+            );
+            assert_eq!(second.through_id, through);
+            let third = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-d".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                third
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-e"]
+            );
+            let last = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-e".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert!(last.records.is_empty());
+            assert_eq!(last.through_id, through);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_unpolled_child_releases_its_durable_admission() {
+        run_async_test(async {
+            for construct_future in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("unpolled-workflow.db");
+                let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_test_pane(&storage, 78, now_ms()).await;
+                let crate::events::Event::PatternDetected { detection, .. } =
+                    startup_ingress_event(78)
+                else {
+                    unreachable!();
+                };
+                let cx = crate::cx::for_testing();
+                let start = runner
+                    .handle_detection_with_cx(&cx, 78, &detection, None)
+                    .await;
+                let id = start.execution_id().expect("durable admission").to_string();
+                assert!(locks.is_locked(78).is_some());
+                // Exercise the exact constructor submitted by the event loop.
+                // Neither dropping it nor its unpolled future may leak a lock.
+                let child = runner.workflow_execution_child(78, probe.clone(), id.clone());
+                if construct_future {
+                    drop(child(cx.clone()));
+                } else {
+                    drop(child);
+                }
+                assert_eq!(locks.active_count(), 0);
+                assert!(probe.executions.lock().unwrap().is_empty());
+                assert_eq!(
+                    storage.get_workflow(&id).await.unwrap().unwrap().status,
+                    "running"
+                );
+                let results = runner.resume_incomplete_with_cx(&cx).await;
+                assert!(matches!(
+                    results.as_slice(),
+                    [WorkflowExecutionResult::Completed { .. }]
+                ));
+                assert_eq!(probe.executions.lock().unwrap().len(), 1);
+                assert_eq!(locks.active_count(), 0);
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum StartupRunnerEntry {
+        Cx,
+        Shutdown,
+        Subscribed,
+    }
+
+    async fn assert_startup_detections_retained(entry: StartupRunnerEntry) {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("startup_ingress.db");
+        let (storage, runner, locks) = unlimited_gate_runner(db_path.to_str().unwrap()).await;
+        let probe = Arc::new(StartupIngressProbeWorkflow::new());
+        runner.register_workflow(probe.clone());
+        seed_startup_recovery(&runner).await;
+        seed_test_pane(&storage, 78, now_ms()).await;
+        seed_test_pane(&storage, 79, now_ms()).await;
+
+        let event_bus = Arc::new(crate::events::EventBus::new(8));
+        let subscriber = if matches!(entry, StartupRunnerEntry::Subscribed) {
+            let subscriber = runner
+                .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                .await
+                .unwrap();
+            assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
+            Some(subscriber)
+        } else {
+            None
+        };
+        let task_event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
+        let task_shutdown_notify = Arc::clone(&shutdown_notify);
+        let runner_cx = crate::cx::for_testing();
+        let task_cx = runner_cx.clone();
+        let runner_task = crate::runtime_async::task::spawn(async move {
+            match entry {
+                StartupRunnerEntry::Cx => runner.run_with_cx(&task_cx, &task_event_bus).await,
+                StartupRunnerEntry::Shutdown => {
+                    runner
+                        .run_with_shutdown_with_cx(
+                            &task_cx,
+                            &task_event_bus,
+                            &task_shutdown_flag,
+                            &task_shutdown_notify,
+                        )
+                        .await;
+                }
+                StartupRunnerEntry::Subscribed => {
+                    runner
+                        .run_subscribed_with_cx(
+                            &task_cx,
+                            subscriber.expect("watcher must subscribe before spawning"),
+                            Some((&task_shutdown_flag, &task_shutdown_notify)),
+                        )
+                        .await;
+                }
+            }
+        });
+
+        let observer_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(
+            &observer_cx,
+            Duration::from_secs(5),
+            probe
+                .recovery_notify
+                .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+        )
+        .await
+        .expect("runner must enter the actual unfinished workflow");
+        // A pre-spawn detection may already have run concurrently with
+        // recovery; no additional publication has happened yet.
+        assert!(
+            probe.detections.load(Ordering::SeqCst)
+                <= usize::from(matches!(entry, StartupRunnerEntry::Subscribed))
+        );
+        // This publication occurs while the durable recovery step is pending,
+        // not merely before or after an artificial startup delay.
+        assert_eq!(event_bus.publish(startup_ingress_event(79)), 1);
+        probe.recovery_released.store(true, Ordering::SeqCst);
+        probe.recovery_notify.notify_waiters();
+
+        let expected_panes: &[u64] = if matches!(entry, StartupRunnerEntry::Subscribed) {
+            &[77, 78, 79]
+        } else {
+            &[77, 79]
+        };
+        wait_for_startup_executions(&storage, &probe, expected_panes).await;
+        assert_eq!(
+            probe.detections.load(Ordering::SeqCst),
+            expected_panes.len() - 1
+        );
+        assert_eq!(
+            event_bus.metrics().snapshot().events_dropped_no_subscribers,
+            0
+        );
+
+        if matches!(entry, StartupRunnerEntry::Cx) {
+            runner_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("startup ingress regression complete"),
+            );
+        } else {
+            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_notify.notify_waiters();
+        }
+        crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(1), runner_task)
+            .await
+            .expect("runner stop must remain bounded")
+            .expect("runner task must settle");
+        assert_eq!(event_bus.stats().detection_subscribers, 0);
+        assert_eq!(probe.executions.lock().unwrap().len(), expected_panes.len());
+        for pane_id in expected_panes {
+            assert!(locks.is_locked(*pane_id).is_none());
+        }
+        storage.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn workflow_runner_subscribes_before_resuming_incomplete_workflows() {
+        run_async_test(async {
+            assert_startup_detections_retained(StartupRunnerEntry::Cx).await;
+            assert_startup_detections_retained(StartupRunnerEntry::Shutdown).await;
+        });
+    }
+
+    #[test]
+    fn workflow_runner_retains_detections_before_spawn_and_during_recovery() {
+        run_async_test(assert_startup_detections_retained(
+            StartupRunnerEntry::Subscribed,
+        ));
+    }
+
+    #[test]
+    fn workflow_runner_pre_stopped_subscription_dispatches_nothing() {
+        run_async_test(async {
+            for cancelled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let db_path = directory.path().join("startup_stopped.db");
+                let (storage, runner, locks) =
+                    unlimited_gate_runner(db_path.to_str().unwrap()).await;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_startup_recovery(&runner).await;
+                let event_bus = crate::events::EventBus::new(8);
+                let subscriber = runner
+                    .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                    .await
+                    .unwrap();
+                assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
+                let shutdown_flag = std::sync::atomic::AtomicBool::new(!cancelled);
+                let shutdown_notify = crate::runtime_async::notify::Notify::new();
+                let runner_cx = crate::cx::for_testing();
+                if cancelled {
+                    runner_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel before runner startup"),
+                    );
+                }
+                let observer_cx = crate::cx::for_testing();
+                Box::pin(crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(1),
+                    runner.run_subscribed_with_cx(
+                        &runner_cx,
+                        subscriber,
+                        Some((&shutdown_flag, &shutdown_notify)),
+                    ),
+                ))
+                .await
+                .expect("pre-stopped runner must return without resuming or dispatching");
+                assert_eq!(probe.detections.load(Ordering::SeqCst), 0);
+                assert!(probe.executions.lock().unwrap().is_empty());
+                assert_eq!(event_bus.stats().detection_subscribers, 0);
+                assert!(locks.is_locked(77).is_none());
+                assert_eq!(
+                    storage
+                        .get_workflow("startup-recovery")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "running",
+                    "an execution skipped before startup remains available for recovery"
+                );
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn workflow_runner_startup_buffer_keeps_lag_and_channel_close_semantics() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("startup_lag.db");
+            let (storage, runner, _locks) = unlimited_gate_runner(db_path.to_str().unwrap()).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let event_bus = crate::events::EventBus::new(1);
+            let subscriber = runner
+                .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                .await
+                .unwrap();
+            for pane_id in 78..=80 {
+                seed_test_pane(&storage, pane_id, now_ms()).await;
+                assert_eq!(event_bus.publish(startup_ingress_event(pane_id)), 1);
+            }
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                let cx = crate::cx::for_testing();
+                runner.run_subscribed_with_cx(&cx, subscriber, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[80]).await;
+            assert_eq!(probe.detections.load(Ordering::SeqCst), 1);
+            assert!(event_bus.metrics().snapshot().subscriber_lag_events > 0);
+            // The owned subscription must observe closure; retaining a bus in
+            // the runner merely to subscribe again would keep it alive here.
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop the runner")
+            .expect("runner task must settle after bus closure");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_shutdown_notify_wakes_idle_loop_and_settles() {
+        run_async_test(assert_idle_runner_stops(false));
+    }
+
+    #[test]
+    fn workflow_runner_cancellation_wakes_idle_loop_and_settles() {
+        run_async_test(assert_idle_runner_stops(true));
+    }
+
+    async fn assert_idle_runner_stops(cancelled: bool) {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp_dir
+            .path()
+            .join("runner_cooperative_shutdown.db")
+            .to_string_lossy()
+            .to_string();
+        let (storage, runner, _lock_manager) = unlimited_gate_runner(&db_path).await;
+        let probe = Arc::new(StartupIngressProbeWorkflow::new());
+        runner.register_workflow(probe.clone());
+        let task_probe = Arc::clone(&probe);
+        let event_bus = Arc::new(crate::events::EventBus::new(8));
+        let task_event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
+        let task_shutdown_notify = Arc::clone(&shutdown_notify);
+        let runner_cx = crate::cx::for_testing();
+        let cancel_cx = runner_cx.clone();
+        let (ready_tx, ready_rx) = crate::runtime_async::oneshot::channel();
+
+        let runner_task = crate::runtime_async::task::spawn(async move {
+            let mut running = std::pin::pin!(runner.run_with_shutdown_with_cx(
+                &runner_cx,
+                &task_event_bus,
+                &task_shutdown_flag,
+                &task_shutdown_notify,
+            ));
+            let mut ready_tx = Some(ready_tx);
+            let mut readiness_published = false;
+            futures::future::poll_fn(|poll_cx| {
+                let result = std::future::Future::poll(running.as_mut(), poll_cx);
+                if result.is_pending()
+                    && !readiness_published
+                    && task_event_bus.stats().detection_subscribers > 0
+                {
+                    assert_eq!(
+                        task_event_bus.publish(crate::events::Event::PatternDetected {
+                            pane_id: 78,
+                            pane_uuid: None,
+                            detection: unlimited_gate_detection(),
+                            event_id: None,
+                        }),
+                        1
+                    );
+                    readiness_published = true;
+                }
+                // Subscription now precedes recovery. Only a pending
+                // poll after consuming this non-matching detection proves
+                // recovery finished and the actual idle wait registered.
+                if result.is_pending()
+                    && task_probe.detections.load(Ordering::SeqCst) > 0
+                    && let Some(ready_tx) = ready_tx.take()
+                {
+                    let _ = ready_tx.send(());
+                }
+                result
+            })
+            .await;
+        });
+
+        let readiness_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(
+            &readiness_cx,
+            Duration::from_secs(5),
+            crate::runtime_async::oneshot_recv(ready_rx),
+        )
+        .await
+        .expect("runner startup must reach its idle wait within the readiness bound")
+        .expect("runner must not exit before registering its idle wait");
+
+        if cancelled {
+            cancel_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel idle workflow runner"),
+            );
+        } else {
+            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_notify.notify_waiters();
+        }
+        let join_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&join_cx, Duration::from_secs(1), runner_task)
+            .await
+            .expect("cooperative shutdown must remain bounded")
+            .expect("workflow runner task must settle cleanly");
+
+        assert_eq!(event_bus.stats().detection_subscribers, 0);
+        assert!(probe.executions.lock().unwrap().is_empty());
+        storage.shutdown().await.expect("shutdown workflow storage");
+    }
+
+    async fn seed_test_pane(
+        storage: &crate::storage::StorageHandle,
+        pane_id: u64,
+        last_seen_at: i64,
+    ) {
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id,
+                pane_uuid: Some(format!("pane-{pane_id}")),
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("codex".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: last_seen_at,
+                last_seen_at,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_limited_pane(
+        storage: &crate::storage::StorageHandle,
+        pane_id: u64,
+        reset_at: Option<i64>,
+        reset_source: &str,
+        last_seen_at: i64,
+        conservative_ttl_ms: i64,
+    ) {
+        seed_test_pane(storage, pane_id, last_seen_at).await;
+        storage
+            .upsert_limit_window(crate::storage::LimitWindowRecord {
+                id: 0,
+                pane_id,
+                service: "openai".to_string(),
+                account_id: "acct-a".to_string(),
+                account_db_id: None,
+                account_known: false,
+                agent_type: Some("codex".to_string()),
+                rule_id: "codex.usage.reached".to_string(),
+                event_type: "usage.reached".to_string(),
+                limited_at: last_seen_at,
+                reset_at,
+                reset_source: reset_source.to_string(),
+                reset_text: None,
+                conservative_ttl_ms,
+                last_seen_at,
+                seen_count: 1,
+                metadata: None,
+                created_at: last_seen_at,
+                updated_at: last_seen_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn pre_hold_pane_lock(
+        lock_manager: &Arc<PaneWorkflowLockManager>,
+        pane_id: u64,
+    ) -> crate::workflows::lock::OwnedPaneWorkflowLockGuard {
+        let Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(guard)) =
+            lock_manager.try_acquire_with_limit_owned_full(pane_id, "holder", "holder-exec", 8)
+        else {
+            panic!("failed to pre-acquire pane {pane_id} lock");
+        };
+        guard
+    }
+
+    #[test]
+    fn requires_unlimited_pane_declines_with_absolute_reset() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_absolute.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, _locks) = unlimited_gate_runner(&db_path).await;
+            let reset_at = crate::storage::now_ms() + 3_600_000;
+            seed_limited_pane(
+                &storage,
+                77,
+                Some(reset_at),
+                "absolute",
+                crate::storage::now_ms(),
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+
+            let result = runner
+                .handle_detection(77, &unlimited_gate_detection(), None)
+                .await;
+
+            match result {
+                WorkflowStartResult::PaneRateLimited {
+                    pane_id,
+                    reset_at_ms,
+                    reset_known,
+                    ..
+                } => {
+                    assert_eq!(pane_id, 77);
+                    assert_eq!(reset_at_ms, reset_at);
+                    assert!(reset_known, "absolute reset must be reported as known");
+                }
+                other => panic!("expected PaneRateLimited, got {other:?}"),
+            }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn requires_unlimited_pane_declines_with_unknown_ttl_reset() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_unknown.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, _locks) = unlimited_gate_runner(&db_path).await;
+            let last_seen = crate::storage::now_ms();
+            seed_limited_pane(&storage, 88, None, "unknown_ttl", last_seen, 300_000).await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+
+            let result = runner
+                .handle_detection(88, &unlimited_gate_detection(), None)
+                .await;
+
+            match result {
+                WorkflowStartResult::PaneRateLimited {
+                    reset_at_ms,
+                    reset_known,
+                    ..
+                } => {
+                    assert_eq!(reset_at_ms, last_seen + 300_000);
+                    assert!(
+                        !reset_known,
+                        "unknown_ttl reset must be reported as estimated"
+                    );
+                }
+                other => panic!("expected PaneRateLimited, got {other:?}"),
+            }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn requires_unlimited_pane_allows_when_not_limited() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_clear.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, lock_manager) = unlimited_gate_runner(&db_path).await;
+            // Pane exists with only an EXPIRED window — no active limit.
+            seed_limited_pane(
+                &storage,
+                99,
+                Some(crate::storage::now_ms() - 1_000),
+                "absolute",
+                crate::storage::now_ms() - 1_000,
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+            // Pre-hold the pane lock so the post-gate path returns PaneLocked
+            // before any engine/spawn work — a deterministic "gate passed" signal.
+            let _guard = pre_hold_pane_lock(&lock_manager, 99);
+
+            let result = runner
+                .handle_detection(99, &unlimited_gate_detection(), None)
+                .await;
+
+            assert!(
+                !result.is_pane_rate_limited(),
+                "pane with no active limit window must not be declined: {result:?}"
+            );
+            assert!(
+                result.is_locked(),
+                "gate should pass through to lock acquisition: {result:?}"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn default_workflow_runs_on_limited_pane() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_default.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, lock_manager) = unlimited_gate_runner(&db_path).await;
+            // Pane IS limited, but the workflow does not require an unlimited pane.
+            seed_limited_pane(
+                &storage,
+                55,
+                Some(crate::storage::now_ms() + 3_600_000),
+                "absolute",
+                crate::storage::now_ms(),
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: false,
+            }));
+            let _guard = pre_hold_pane_lock(&lock_manager, 55);
+
+            let result = runner
+                .handle_detection(55, &unlimited_gate_detection(), None)
+                .await;
+
+            assert!(
+                !result.is_pane_rate_limited(),
+                "default workflow must be unaffected by limit state: {result:?}"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    struct ProgressPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for ProgressPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "progress_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Continues once before completing to exercise progress persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("advance", "Advance"),
+                WorkflowStep::new("finish", "Finish"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match step_idx {
+                    0 => StepResult::Continue,
+                    1 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_missing_record_stops_before_any_steps() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("progress_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Keep the pane valid so an unrelated audit foreign key cannot
+            // accidentally enforce the missing-execution precondition.
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let execution_id = "missing-progress-record";
+            let result = runner
+                .run_workflow(
+                    77,
+                    Arc::new(ProgressPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    execution_id,
+                    0,
+                )
+                .await;
+
+            match result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains(execution_id),
+                        "progress persistence error should identify the execution: {error}"
+                    );
+                }
+                other => panic!("missing progress persistence must not keep running: {other:?}"),
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "runner must not execute side effects without its durable execution record"
+            );
+            let cx = crate::cx::for_testing();
+            assert!(
+                fetch_workflow_start_action_id_with_cx(&cx, &storage, execution_id)
+                    .await
+                    .expect("query start audit")
+                    .is_none(),
+                "missing executions must not acquire start-audit or undo authority"
+            );
+            let valid_result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(ProgressPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    "present-progress-record",
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    valid_result,
+                    ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed { .. })
+                ),
+                "a persisted execution must still run: {valid_result:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    struct InvalidJumpPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for InvalidJumpPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "invalid_jump_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Attempts an invalid jump to exercise abort persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("bad_jump", "Bad jump")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StepResult::JumpTo { step: 99 }
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_invalid_jump_abort_persistence_failure_is_not_reported_aborted() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("invalid_jump_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "invalid-jump-write-rejected";
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
+            reject_terminal_workflow_updates(&db_path);
+            let result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(InvalidJumpPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    execution_id,
+                    None,
+                )
+                .await;
+
+            match result {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                }) => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains("injected terminal persistence failure"),
+                        "the terminal-write fault must cause the failure: {error}"
+                    );
+                }
+                other => panic!("failed abort persistence must not report aborted: {other:?}"),
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    struct JumpCyclePersistenceProbeWorkflow;
+
+    impl Workflow for JumpCyclePersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "jump_cycle_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Loops until the runner's jump-cycle guard aborts"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("loop", "Loop")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::JumpTo { step: 0 } })
+        }
+    }
+
+    #[test]
+    fn workflow_jump_cycle_guard_persists_terminal_state() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("jump_cycle_guard_terminal_state.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "jump-cycle-terminal-state";
+            let cx = crate::cx::for_testing();
+            seed_test_pane(&storage, 77, now_ms()).await;
+            let outcome = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(JumpCyclePersistenceProbeWorkflow),
+                    execution_id,
+                    None,
+                )
+                .await;
+
+            match outcome {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Aborted {
+                    reason, ..
+                }) => assert!(reason.contains("exceeded maximum jump count")),
+                other => panic!("jump cycle should terminate as a durable abort: {other:?}"),
+            }
+
+            let record = storage
+                .get_workflow_with_cx(&cx, execution_id)
+                .await
+                .expect("terminal workflow lookup should succeed")
+                .expect("manual workflow record should exist");
+            assert!(
+                matches!(record.status.as_str(), "failed" | "aborted"),
+                "jump-cycle guard must not leave a resumable record: {record:?}"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn jump_target_inside_step_range_is_valid() {
+        assert!(invalid_jump_target_reason(0, 1).is_none());
+        assert!(invalid_jump_target_reason(2, 3).is_none());
+    }
+
+    #[test]
+    fn jump_target_at_or_beyond_step_count_is_invalid() {
+        let at_end = invalid_jump_target_reason(3, 3).expect("step_count is not executable");
+        assert!(at_end.contains("jump target 3"));
+        assert!(at_end.contains("0..3"));
+
+        let beyond_end = invalid_jump_target_reason(99, 3).expect("beyond step_count is invalid");
+        assert!(beyond_end.contains("jump target 99"));
+        assert!(beyond_end.contains("0..3"));
+    }
+
+    #[test]
+    fn resume_step_allows_exact_completion_boundary() {
+        assert!(invalid_resume_step_reason(0, 0).is_none());
+        assert!(invalid_resume_step_reason(3, 3).is_none());
+    }
+
+    #[test]
+    fn resume_step_beyond_completion_boundary_is_invalid() {
+        let reason = invalid_resume_step_reason(4, 3).expect("resume beyond step_count is invalid");
+        assert!(reason.contains("resume step 4"));
+        assert!(reason.contains("0..=3"));
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for workflows/runner.rs primitives
+    // (ft-xbnl0.2.2 slice).
+    //
+    // Full `WorkflowRunner` construction requires storage, engine,
+    // lock_manager, and injector — an integration-scale setup unsuited
+    // to LabRuntime's deterministic scheduler. These LabRuntime tests
+    // therefore pin the pure-data surface that backs
+    // `handle_detection_with_cx` and `abort_execution_with_cx` pre-cancel
+    // contracts: result predicates, serde shapes, config defaults.
+    // -------------------------------------------------------------------------
+
+    mod labruntime_runner {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, mut handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::Quiescent
+                ),
+                "LabRuntime did not finish; termination: {:?}",
+                report.termination,
+            );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
+            );
+        }
+
+        /// 1. WorkflowRunnerConfig defaults are stable under LabRuntime.
+        #[test]
+        fn workflow_runner_config_defaults_under_labruntime() {
+            run_lab(5001, || async move {
+                let config = WorkflowRunnerConfig::default();
+                assert_eq!(config.max_concurrent, 3);
+                assert_eq!(config.step_timeout_ms, 30_000);
+                assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
+                assert_eq!(config.max_retries_per_step, 3);
+                // ft-3p7re: overall-deadline default is stable under
+                // LabRuntime (deterministic, non-time-sensitive).
+                assert_eq!(config.workflow_total_deadline_ms, 600_000);
+            });
+        }
+
+        #[test]
+        fn cx_wait_helpers_use_labruntime_virtual_time() {
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_task = Arc::clone(&completed);
+            let wall_start = Instant::now();
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(5007)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
+                    wait_duration_with_cx(&cx, Duration::from_secs(5), "virtual duration")
+                        .await
+                        .expect("virtual duration wait should complete");
+
+                    let signals = ExternalSignalRegistry::new();
+                    let error = wait_external_signal_with_cx(
+                        &cx,
+                        &signals,
+                        "never-fired",
+                        Duration::from_secs(5),
+                        "virtual external wait",
+                    )
+                    .await
+                    .expect_err("missing signal should time out");
+                    assert!(
+                        error.to_string().contains("timed out after 5000ms"),
+                        "unexpected timeout error: {error}"
+                    );
+                    completed_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("spawn virtual-time workflow wait task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime workflow waits should not get stuck: {:?}",
+                report.termination
+            );
+            assert!(
+                runtime.now() >= asupersync::Time::from_secs(10),
+                "virtual time should advance through both five-second waits"
+            );
+            assert!(
+                wall_start.elapsed() < Duration::from_secs(1),
+                "virtual waits must not consume ten wall-clock seconds"
+            );
+            assert!(
+                completed.load(std::sync::atomic::Ordering::SeqCst),
+                "workflow wait task should complete"
+            );
+        }
+
+        /// 2. The "capability context already cancelled" Error variant
+        ///    produced by `handle_detection_with_cx` serializes stably:
+        ///    downstream telemetry that matches on the `type` tag + the
+        ///    error-message prefix must remain reliable.
+        #[test]
+        fn cancelled_error_variant_serde_roundtrip_under_labruntime() {
+            run_lab(5002, || async move {
+                let err = WorkflowStartResult::Error {
+                    error: "capability context already cancelled".to_owned(),
+                };
+                let json = serde_json::to_string(&err).expect("serialize");
+                assert!(
+                    json.contains("\"type\":\"error\""),
+                    "serde tag missing in {json}"
+                );
+                assert!(
+                    json.contains("capability context already cancelled"),
+                    "cancellation message must round-trip verbatim: {json}"
+                );
+                let restored: WorkflowStartResult =
+                    serde_json::from_str(&json).expect("deserialize");
+                match restored {
+                    WorkflowStartResult::Error { error } => {
+                        assert_eq!(error, "capability context already cancelled");
+                    }
+                    other => panic!("unexpected variant: {other:?}"),
+                }
+            });
+        }
+
+        /// 3. `WorkflowStartResult::Error` is classified correctly by
+        ///    the `is_started` / `is_locked` / `execution_id` helpers
+        ///    under LabRuntime virtual time.
+        #[test]
+        fn error_variant_predicates_under_labruntime() {
+            run_lab(5003, || async move {
+                let r = WorkflowStartResult::Error {
+                    error: "capability context already cancelled".to_owned(),
+                };
+                assert!(!r.is_started());
+                assert!(!r.is_locked());
+                assert!(r.execution_id().is_none());
+            });
+        }
+
+        /// 4. `WorkflowStartResult::Started` remains detectable by
+        ///    `is_started` and surfaces its execution_id, so the
+        ///    Cx-first pre-cancel path is observably distinct from a
+        ///    successful start.
+        #[test]
+        fn started_variant_predicates_under_labruntime() {
+            run_lab(5004, || async move {
+                let r = WorkflowStartResult::Started {
+                    execution_id: "exec-wa-runner".to_owned(),
+                    workflow_name: "wf-lab".to_owned(),
+                };
+                assert!(r.is_started());
+                assert!(!r.is_locked());
+                assert_eq!(r.execution_id(), Some("exec-wa-runner"));
+            });
+        }
+
+        /// 5. AbortResult serde shape: the Cx-first
+        ///    `abort_execution_with_cx` relies on the existing
+        ///    AbortResult surface staying stable.
+        #[test]
+        fn abort_result_serde_shape_under_labruntime() {
+            run_lab(5005, || async move {
+                let result = AbortResult {
+                    aborted: true,
+                    execution_id: "exec-abort-1".to_owned(),
+                    workflow_name: "wf-abort".to_owned(),
+                    pane_id: 42,
+                    previous_status: "running".to_owned(),
+                    aborted_at_step: 3,
+                    reason: Some("operator".to_owned()),
+                    aborted_at: Some(1_700_000_000_000),
+                    error_reason: None,
+                };
+                let json = serde_json::to_string(&result).expect("serialize");
+                assert!(json.contains("\"aborted\":true"));
+                assert!(json.contains("\"pane_id\":42"));
+                assert!(json.contains("\"aborted_at_step\":3"));
+                assert!(
+                    !json.contains("error_reason"),
+                    "skip_serializing_if must drop None error_reason"
+                );
+            });
+        }
+
+        /// 6. AbortResult with None reason and None aborted_at omits
+        ///    those fields (via skip_serializing_if). Pins the
+        ///    wire-format contract for already-terminal abort paths.
+        #[test]
+        fn abort_result_omits_none_fields_under_labruntime() {
+            run_lab(5006, || async move {
+                let result = AbortResult {
+                    aborted: false,
+                    execution_id: "exec-done".to_owned(),
+                    workflow_name: "wf-done".to_owned(),
+                    pane_id: 7,
+                    previous_status: "completed".to_owned(),
+                    aborted_at_step: 10,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_completed".to_owned()),
+                };
+                let json = serde_json::to_string(&result).expect("serialize");
+                assert!(
+                    !json.contains("\"reason\""),
+                    "None reason must be skipped: {json}"
+                );
+                assert!(
+                    !json.contains("\"aborted_at\""),
+                    "None aborted_at must be skipped: {json}"
+                );
+                assert!(json.contains("\"error_reason\":\"already_completed\""));
+            });
+        }
+
+        // ================================================================
+        // Wait helper coverage (commit 3503a151)
+        // ================================================================
+
+        /// workflow_wait_aborted formats "{label} cancelled: {err}"
+        #[test]
+        fn wait_aborted_error_format() {
+            let err = workflow_wait_aborted("my-label", "some reason");
+            match err {
+                crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                    assert_eq!(reason, "my-label cancelled: some reason");
+                }
+                other => panic!("expected Workflow(Aborted), got: {other:?}"),
+            }
+        }
+
+        /// A Cx-aware duration wait completes normally while the Cx is live.
+        #[test]
+        fn wait_duration_with_cx_completes() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let result = wait_duration_with_cx(&cx, Duration::from_millis(1), "test-cx").await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// A Cx-aware zero duration wait returns immediately.
+        #[test]
+        fn wait_duration_zero_returns_immediately() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let result = wait_duration_with_cx(&cx, Duration::ZERO, "test-zero").await;
+                assert!(result.is_ok());
+            });
+        }
+
+        #[test]
+        fn workflow_deadline_cap_leaves_waits_uncapped_when_disabled() {
+            let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 0, 3, 2.0).unwrap();
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("test instant subtracts");
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
+                requested
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_limits_wait_to_remaining_budget() {
+            let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_millis(900))
+                .expect("test instant subtracts");
+
+            let capped = cap_wait_by_workflow_deadline(requested, &budget, started_at);
+
+            assert!(
+                capped <= Duration::from_millis(100),
+                "wait cap should not exceed remaining workflow deadline budget: {capped:?}"
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_returns_zero_after_deadline() {
+            let requested = Duration::from_secs(60);
+            let wall_now = now_ms();
+            let budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("test instant subtracts");
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
+                Duration::ZERO
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_fails_closed_when_deadline_overflows() {
+            let requested = Duration::from_secs(60);
+            let started_at = Instant::now();
+            let wall_now = now_ms();
+            let mut budget =
+                WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
+            budget.workflow_total_deadline_ms = u64::MAX;
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, &budget, started_at),
+                Duration::ZERO,
+                "overflowing workflow_total_deadline_ms must not disable the wait cap"
+            );
+        }
+
+        /// wait_condition_pause_with_cx dispatches Sleep correctly.
+        #[test]
+        fn wait_condition_sleep_with_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cond = WaitCondition::sleep(1);
+                let result = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(1),
+                    None,
+                    "test-sleep",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
+        #[test]
+        fn wait_condition_sleep_aborts_when_timeout_expires() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cond = WaitCondition::sleep(60);
+                let start = std::time::Instant::now();
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_millis(5),
+                    None,
+                    "test-sleep",
+                )
+                .await
+                .expect_err("sleep longer than timeout must abort");
+                let elapsed = start.elapsed();
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("sleep wait timed out"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "timeout abort should not wait for full sleep duration: {elapsed:?}"
+                );
+            });
+        }
+
+        /// wait_condition_pause_with_cx dispatches PaneIdle correctly.
+        #[test]
+        fn wait_condition_pane_idle_with_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cond = WaitCondition::pane_idle(1);
+                let result = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(1),
+                    None,
+                    "test-idle",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// wait_condition_pause_with_cx dispatches StableTail correctly.
+        #[test]
+        fn wait_condition_stable_tail_with_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cond = WaitCondition::stable_tail(1);
+                let result = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(1),
+                    None,
+                    "test-tail",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
+        #[test]
+        fn wait_condition_duration_variants_abort_when_timeout_expires() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                for (condition, expected_reason) in [
+                    (WaitCondition::pane_idle(60), "pane idle wait timed out"),
+                    (WaitCondition::stable_tail(60), "stable tail wait timed out"),
+                ] {
+                    let start = std::time::Instant::now();
+                    let err = wait_condition_pause_with_cx(
+                        &cx,
+                        &condition,
+                        Duration::from_millis(5),
+                        None,
+                        "test-duration",
+                    )
+                    .await
+                    .expect_err("duration wait longer than timeout must abort");
+                    let elapsed = start.elapsed();
+
+                    match err {
+                        crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                            assert!(
+                                reason.contains(expected_reason),
+                                "unexpected abort reason: {reason}"
+                            );
+                        }
+                        other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                    }
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "timeout abort should not wait for full duration: {elapsed:?}"
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn pattern_and_text_match_waits_require_observable_pane_text() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                for (condition, expected_reason) in [
+                    (
+                        WaitCondition::pattern("prompt.ready"),
+                        "pattern wait 'prompt.ready' requires a pane text source",
+                    ),
+                    (
+                        WaitCondition::text_match(TextMatch::substring("done")),
+                        "text-match wait substring(len=4",
+                    ),
+                ] {
+                    let err = wait_condition_pause_with_cx(
+                        &cx,
+                        &condition,
+                        Duration::from_secs(60),
+                        None,
+                        "workflow wait condition",
+                    )
+                    .await
+                    .expect_err("unobservable wait must abort instead of advancing");
+
+                    match err {
+                        crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                            assert!(
+                                reason.contains(expected_reason),
+                                "unexpected abort reason: {reason}"
+                            );
+                            assert!(
+                                reason.contains("WaitConditionExecutor"),
+                                "abort reason should point to the observable wait executor: {reason}"
+                            );
+                        }
+                        other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                    }
+                }
+            });
+        }
+
+        /// 7. Wait helpers used by `WaitFor` and `SendText(wait_for=...)`
+        ///    must surface a cancelled caller context as an aborted
+        ///    workflow result instead of falling back to an ambient
+        ///    sleep that ignores cancellation entirely.
+        #[test]
+        fn wait_condition_pause_observes_pre_cancelled_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("runner wait test pre-cancel"),
+                );
+
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &WaitCondition::sleep(250),
+                    Duration::from_secs(1),
+                    None,
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("pre-cancelled cx should abort wait helper");
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow wait condition cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected wait error: {other:?}"),
+                }
+            });
+        }
+
+        /// Retry backoff uses the same helper as wait conditions. A cancel
+        /// fired during the backoff must abort promptly instead of sleeping
+        /// until the requested retry delay elapses.
+        #[test]
+        fn retry_backoff_wait_observes_mid_flight_cancelled_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cancel_cx = cx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    cancel_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("retry backoff cancel regression"),
+                    );
+                });
+
+                let start = std::time::Instant::now();
+                let err =
+                    wait_duration_with_cx(&cx, Duration::from_secs(60), "workflow retry backoff")
+                        .await
+                        .expect_err("mid-flight cx cancel should abort retry backoff");
+                let elapsed = start.elapsed();
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow retry backoff cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected retry backoff error: {other:?}"),
+                }
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "retry backoff should not sleep until the long delay after cancellation; took {elapsed:?}"
+                );
+            });
+        }
+
+        // ================================================================
+        // ft-ao9k9: External wait registry wiring (was: timeout-sleep mock)
+        // ================================================================
+
+        /// Without a registry the runner used to silently sleep until the
+        /// configured timeout. Now it must abort with a message naming the
+        /// signal key and the wiring API.
+        #[test]
+        fn external_wait_without_registry_returns_explicit_error() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cond = WaitCondition::external("deploy-finished");
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(60),
+                    None,
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("missing registry must surface as abort");
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("deploy-finished"),
+                            "abort reason must name signal key: {reason}"
+                        );
+                        assert!(
+                            reason.contains("with_external_signals"),
+                            "abort reason must point at the wiring API: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+            });
+        }
+
+        #[test]
+        fn external_wait_rejects_empty_signal_key() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let registry = ExternalSignalRegistry::new();
+                let cond = WaitCondition::external(" \t ");
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("blank external signal key must abort");
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("external signal key cannot be empty"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+            });
+        }
+
+        /// Pre-fired signal must be observed immediately (well under timeout).
+        #[test]
+        fn external_wait_observes_pre_fired_signal() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let registry = ExternalSignalRegistry::new();
+                registry.signal("ready");
+                let cond = WaitCondition::external("ready");
+                let start = std::time::Instant::now();
+                wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect("pre-fired signal must be observed");
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "pre-fired signal returned too slowly: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Signal fired by another task during the wait must be observed
+        /// well before the configured timeout.
+        #[test]
+        fn external_wait_unblocks_when_signal_fires_during_wait() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let registry = Arc::new(ExternalSignalRegistry::new());
+                let cond = WaitCondition::external("late");
+                let signaler = Arc::clone(&registry);
+                let handle = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(80));
+                    signaler.signal("late");
+                });
+
+                let start = std::time::Instant::now();
+                wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_secs(30),
+                    Some(registry.as_ref()),
+                    "workflow wait condition",
+                )
+                .await
+                .expect("late signal must be observed");
+                let elapsed = start.elapsed();
+                let _ = handle.join();
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "signal observed too late: {elapsed:?}"
+                );
+                assert!(
+                    elapsed >= Duration::from_millis(40),
+                    "signal observed before it could fire: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Timeout still bounds the wait when no signal fires, and must fail
+        /// closed so the workflow cannot advance without the external event.
+        #[test]
+        fn external_wait_aborts_at_timeout_when_signal_never_fires() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let registry = ExternalSignalRegistry::new();
+                let cond = WaitCondition::external("never");
+                let start = std::time::Instant::now();
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &cond,
+                    Duration::from_millis(120),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("timeout path must abort instead of advancing");
+                let elapsed = start.elapsed();
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("external signal 'never' timed out"),
+                            "abort reason must name the missing signal: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+                assert!(
+                    elapsed >= Duration::from_millis(100),
+                    "wait returned before timeout: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "wait massively exceeded timeout: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Pre-cancelled cx propagates through the External wait path.
+        #[test]
+        fn external_wait_observes_pre_cancelled_cx() {
+            run_async_test(async {
+                let registry = ExternalSignalRegistry::new();
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("external wait pre-cancel"),
+                );
+                let err = wait_condition_pause_with_cx(
+                    &cx,
+                    &WaitCondition::external("anything"),
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("pre-cancelled cx must abort external wait");
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow wait condition cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected wait error: {other:?}"),
+                }
+            });
+        }
+    }
+
+    // ========================================================================
+    // ft-o2t7l — RwLock poison-recovery regression
+    //
+    // The fix replaces three `.unwrap()` call sites at register_workflow /
+    // find_matching_workflow / find_workflow_by_name with
+    // `unwrap_or_else(|poisoned| poisoned.into_inner())`. The data is
+    // append-only `Vec<Arc<dyn Workflow>>` — recovery from poison is safe
+    // (the worst-case mid-push panic state is "the panicking registration
+    // didn't add the workflow," which is the correct recovery state).
+    //
+    // These tests pin the pattern. The first test validates that the
+    // exact lock-recovery idiom used by the production code recovers
+    // cleanly from a poisoned `std::sync::RwLock<Vec<Arc<dyn Workflow>>>`.
+    // The second test validates that the same pattern handles the
+    // double-poison (poison-after-poisoned-read) case, which can occur
+    // if a panic fires during a lookup mid-iteration.
+    // ========================================================================
+
+    use crate::workflows::{BoxFuture, StepResult, Workflow, WorkflowContext, WorkflowStep};
+
+    struct PoisonProbeWorkflow;
+
+    impl Workflow for PoisonProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "poison_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "ft-o2t7l RwLock poison-recovery probe"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            false
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::done_empty() })
+        }
+    }
+
+    #[test]
+    fn rwlock_recovers_from_write_side_poison() {
+        // Same shape as `WorkflowRunner.workflows`: an append-only
+        // Vec<Arc<dyn Workflow>> behind a std::sync::RwLock.
+        let workflows: Arc<std::sync::RwLock<Vec<Arc<dyn Workflow>>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+
+        // Pre-register one workflow before the poison.
+        {
+            let mut g = workflows
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            g.push(Arc::new(PoisonProbeWorkflow));
+        }
+
+        // Poison the lock by panicking inside a write critical
+        // section.
+        let workflows_clone = Arc::clone(&workflows);
+        let join = std::thread::spawn(move || {
+            let _g = workflows_clone
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("intentional poison for ft-o2t7l regression");
+        })
+        .join();
+        assert!(join.is_err(), "thread MUST panic to poison the lock");
+
+        // Sanity — the lock is poisoned now.
+        assert!(
+            workflows.is_poisoned(),
+            "lock must be poisoned after the panic"
+        );
+
+        // The pattern used by the fix: read recovers cleanly.
+        let g = workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(g.len(), 1, "pre-poison workflow must still be present");
+        assert_eq!(g[0].name(), "poison_probe");
+
+        // And subsequent writes also recover.
+        drop(g);
+        {
+            let mut g = workflows
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            g.push(Arc::new(PoisonProbeWorkflow));
+        }
+        let g = workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(g.len(), 2, "post-poison write must succeed");
+    }
+
+    // Note on read-side poison: `std::sync::RwLock` is only
+    // poisoned when a writer panics. A read-guard panic does
+    // NOT poison the lock (readers don't have exclusive
+    // access; std doesn't treat their panics as state-
+    // corrupting). The write-side test above is the only
+    // reachable poisoning path; it's also the path the bead
+    // identified in `register_workflow`.
+}

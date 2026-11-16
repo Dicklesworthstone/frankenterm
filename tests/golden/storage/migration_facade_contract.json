@@ -1,0 +1,82 @@
+{
+  "schema": "frankenterm.storage.migration_facade.v1",
+  "directions": [
+    {
+      "variant": "Up",
+      "as_str": "up"
+    },
+    {
+      "variant": "Down",
+      "as_str": "down"
+    }
+  ],
+  "stages": [
+    {
+      "as_str": "preflight",
+      "serde": "preflight"
+    },
+    {
+      "as_str": "export",
+      "serde": "export"
+    },
+    {
+      "as_str": "import",
+      "serde": "import"
+    },
+    {
+      "as_str": "checkpoint_sync",
+      "serde": "checkpoint_sync"
+    },
+    {
+      "as_str": "projection_rebuild",
+      "serde": "projection_rebuild"
+    },
+    {
+      "as_str": "activate",
+      "serde": "activate"
+    },
+    {
+      "as_str": "soak",
+      "serde": "soak"
+    }
+  ],
+  "plan": {
+    "from_version": 41,
+    "to_version": 43,
+    "direction": "up",
+    "steps": [
+      {
+        "migration_version": 42,
+        "resulting_version": 42,
+        "description": "create audit table",
+        "direction": "up"
+      },
+      {
+        "migration_version": 43,
+        "resulting_version": 43,
+        "description": "add checksum column",
+        "direction": "up"
+      }
+    ]
+  },
+  "status": {
+    "db_exists": true,
+    "needs_initialization": false,
+    "current_version": 42,
+    "target_version": 43,
+    "entries": [
+      {
+        "version": 42,
+        "description": "create audit table",
+        "applied": true,
+        "rollback_supported": true
+      },
+      {
+        "version": 43,
+        "description": "add checksum column",
+        "applied": false,
+        "rollback_supported": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "The quick brown fox jumps over the lazy dog.\n0123456789 !@#$%^&*()_+-=[]{};':\",./<>?\nfn main() { println!(\"hello\"); }\u001b[?25l",
+    "config": {
+      "font_size": 13.0,
+      "font_rasterizer": "CoreText"
+    }
+  },
+  "reference_golden": "real/ascii-size-13",
+  "reference_min_ssim": 0.998
+}

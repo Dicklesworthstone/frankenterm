@@ -1,0 +1,30 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "count": 1,
+    "cursor": null,
+    "hits": [
+      {
+        "agent": "codex",
+        "content": "needle hit",
+        "line_number": 42,
+        "score": null,
+        "source_path": "/tmp/session.md",
+        "timestamp": null,
+        "workspace": null
+      }
+    ],
+    "hits_clamped": null,
+    "limit": null,
+    "max_tokens": null,
+    "offset": null,
+    "query": "agent context",
+    "request_id": null,
+    "total_matches": null
+  },
+  "ok": true,
+  "tool": "wa.cass_search"
+}

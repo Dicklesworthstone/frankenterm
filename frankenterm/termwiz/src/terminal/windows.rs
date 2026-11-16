@@ -1,0 +1,1304 @@
+use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
+use crate::istty::IsTty;
+use crate::terminal::ProbeCapabilities;
+use crate::{bail, ensure, format_err, Result};
+use filedescriptor::{FileDescriptor, OwnedHandle};
+use std::cmp::{max, min};
+use std::collections::VecDeque;
+use std::convert::TryFrom;
+use std::fs::OpenOptions;
+use std::io::{stdin, stdout, Error as IoError, Read, Result as IoResult, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::sync::Arc;
+use std::time::Duration;
+use std::{mem, ptr};
+use winapi::shared::winerror::WAIT_TIMEOUT;
+use winapi::um::consoleapi;
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use winapi::um::winbase::{INFINITE, WAIT_FAILED, WAIT_OBJECT_0};
+use winapi::um::wincon::{
+    CreateConsoleScreenBuffer, FillConsoleOutputAttribute, FillConsoleOutputCharacterW,
+    GetConsoleScreenBufferInfo, ReadConsoleOutputW, ScrollConsoleScreenBufferW,
+    SetConsoleActiveScreenBuffer, SetConsoleCP, SetConsoleCursorPosition, SetConsoleOutputCP,
+    SetConsoleScreenBufferSize, SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
+    CHAR_INFO, CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_TEXTMODE_BUFFER, COORD,
+    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_WINDOW_INPUT, INPUT_RECORD, SMALL_RECT,
+};
+use winapi::um::winnls::CP_UTF8;
+use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+
+use crate::caps::Capabilities;
+use crate::input::{InputEvent, InputParser};
+use crate::render::terminfo::TerminfoRenderer;
+use crate::render::windows::WindowsConsoleRenderer;
+use crate::render::RenderTty;
+use crate::surface::Change;
+use crate::terminal::{cast, ScreenSize, Terminal};
+
+const BUF_SIZE: usize = 128;
+const MAX_FINITE_WAIT_MS: u32 = INFINITE - 1;
+
+fn wait_timeout_millis(wait: Option<Duration>) -> u32 {
+    wait.map(|wait| wait.as_millis().min(MAX_FINITE_WAIT_MS as u128) as u32)
+        .unwrap_or(INFINITE)
+}
+
+fn scroll_region_rect(
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+    dx: i16,
+    dy: i16,
+) -> SMALL_RECT {
+    SMALL_RECT {
+        Left: max(left, left.saturating_sub(dx)),
+        Top: max(top, top.saturating_sub(dy)),
+        Right: min(right, right.saturating_sub(dx)),
+        Bottom: min(bottom, bottom.saturating_sub(dy)),
+    }
+}
+
+fn scroll_destination(left: i16, top: i16, dx: i16, dy: i16) -> COORD {
+    COORD {
+        X: max(left, left.saturating_add(dx)),
+        Y: max(top, top.saturating_add(dy)),
+    }
+}
+
+fn visible_window_size(info: &CONSOLE_SCREEN_BUFFER_INFO) -> Result<(usize, usize)> {
+    let cols = cast(info.dwSize.X)?;
+    let top = i32::from(info.srWindow.Top);
+    let bottom = i32::from(info.srWindow.Bottom);
+    ensure!(
+        bottom >= top,
+        "console window bottom {} is above top {}",
+        bottom,
+        top
+    );
+    let rows = cast(bottom - top + 1)?;
+    Ok((cols, rows))
+}
+
+fn checked_cell_count(cols: usize, rows: usize) -> Result<usize> {
+    cols.checked_mul(rows)
+        .ok_or_else(|| format_err!("console cell count overflow: cols={cols} rows={rows}"))
+}
+
+fn input_event_count_to_u32(num_events: usize) -> Result<u32> {
+    u32::try_from(num_events)
+        .map_err(|_| format_err!("console input event count overflow: {num_events}"))
+}
+
+fn received_input_event_count(num_events: u32, capacity: usize) -> Result<usize> {
+    let count = num_events as usize;
+    ensure!(
+        count <= capacity,
+        "ReadConsoleInput returned {count} events for buffer capacity {capacity}"
+    );
+    Ok(count)
+}
+
+fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
+    current_len
+        .checked_add(incoming_len)
+        .map_or(true, |total| total > capacity)
+}
+
+fn visible_span(start: i16, end: i16) -> i16 {
+    end.saturating_sub(start).saturating_add(1).max(1)
+}
+
+fn rect_end(start: i16, extent: i16) -> i16 {
+    start.saturating_add(extent.saturating_sub(1))
+}
+
+enum Renderer {
+    Terminfo(TerminfoRenderer),
+    Windows(WindowsConsoleRenderer),
+}
+
+pub trait ConsoleInputHandle {
+    fn set_input_mode(&mut self, mode: u32) -> Result<()>;
+    fn get_input_mode(&mut self) -> Result<u32>;
+    fn set_input_cp(&mut self, cp: u32) -> Result<()>;
+    fn get_input_cp(&mut self) -> u32;
+    fn get_number_of_input_events(&mut self) -> Result<usize>;
+    fn read_console_input(&mut self, num_events: usize) -> Result<Vec<INPUT_RECORD>>;
+}
+
+pub trait ConsoleOutputHandle {
+    fn set_output_mode(&mut self, mode: u32) -> Result<()>;
+    fn get_output_mode(&mut self) -> Result<u32>;
+    fn set_output_cp(&mut self, cp: u32) -> Result<()>;
+    fn get_output_cp(&mut self) -> u32;
+    fn fill_char(&mut self, text: char, x: i16, y: i16, len: u32) -> Result<u32>;
+    fn fill_attr(&mut self, attr: u16, x: i16, y: i16, len: u32) -> Result<u32>;
+    fn set_attr(&mut self, attr: u16) -> Result<()>;
+    fn set_cursor_position(&mut self, x: i16, y: i16) -> Result<()>;
+    fn get_buffer_info(&mut self) -> Result<CONSOLE_SCREEN_BUFFER_INFO>;
+    fn get_buffer_contents(&mut self) -> Result<Vec<CHAR_INFO>>;
+    fn set_buffer_contents(&mut self, buffer: &[CHAR_INFO]) -> Result<()>;
+    fn set_viewport(&mut self, left: i16, top: i16, right: i16, bottom: i16) -> Result<()>;
+    fn scroll_region(
+        &mut self,
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+        dx: i16,
+        dy: i16,
+        attr: u16,
+    ) -> Result<()>;
+}
+
+struct InputHandle {
+    handle: FileDescriptor,
+}
+
+impl Read for InputHandle {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        self.handle.read(buf)
+    }
+}
+
+impl ConsoleInputHandle for InputHandle {
+    fn set_input_mode(&mut self, mode: u32) -> Result<()> {
+        if unsafe { consoleapi::SetConsoleMode(self.handle.as_raw_handle() as *mut _, mode) } == 0 {
+            bail!("SetConsoleMode failed: {}", IoError::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_input_mode(&mut self) -> Result<u32> {
+        let mut mode = 0;
+        if unsafe { consoleapi::GetConsoleMode(self.handle.as_raw_handle() as *mut _, &mut mode) }
+            == 0
+        {
+            bail!("GetConsoleMode failed: {}", IoError::last_os_error());
+        }
+        Ok(mode)
+    }
+
+    fn set_input_cp(&mut self, cp: u32) -> Result<()> {
+        if unsafe { SetConsoleCP(cp) } == 0 {
+            bail!("SetConsoleCP failed: {}", IoError::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_input_cp(&mut self) -> u32 {
+        unsafe { consoleapi::GetConsoleCP() }
+    }
+
+    fn get_number_of_input_events(&mut self) -> Result<usize> {
+        let mut num = 0;
+        if unsafe {
+            consoleapi::GetNumberOfConsoleInputEvents(
+                self.handle.as_raw_handle() as *mut _,
+                &mut num,
+            )
+        } == 0
+        {
+            bail!(
+                "GetNumberOfConsoleInputEvents failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(num as usize)
+    }
+
+    fn read_console_input(&mut self, num_events: usize) -> Result<Vec<INPUT_RECORD>> {
+        let requested_events = input_event_count_to_u32(num_events)?;
+        let mut res = Vec::with_capacity(num_events);
+        let empty_record: INPUT_RECORD = unsafe { mem::zeroed() };
+        res.resize(num_events, empty_record);
+
+        let mut num = 0;
+
+        if unsafe {
+            consoleapi::ReadConsoleInputW(
+                self.handle.as_raw_handle() as *mut _,
+                res.as_mut_ptr(),
+                requested_events,
+                &mut num,
+            )
+        } == 0
+        {
+            bail!("ReadConsoleInput failed: {}", IoError::last_os_error());
+        }
+
+        let received_events = received_input_event_count(num, res.len())?;
+        unsafe { res.set_len(received_events) };
+        Ok(res)
+    }
+}
+
+struct OutputHandle {
+    handle: FileDescriptor,
+    write_buffer: Vec<u8>,
+}
+
+impl OutputHandle {
+    fn new(handle: FileDescriptor) -> Self {
+        Self {
+            handle,
+            write_buffer: Vec::with_capacity(BUF_SIZE),
+        }
+    }
+
+    fn new_screen_buffer() -> Result<Self> {
+        let handle = unsafe {
+            CreateConsoleScreenBuffer(
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                CONSOLE_TEXTMODE_BUFFER,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            bail!(
+                "CreateConsoleScreenBuffer failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(Self::new(unsafe {
+            FileDescriptor::from_raw_handle(handle as _)
+        }))
+    }
+
+    fn set_active_screen_buffer(&mut self) -> Result<()> {
+        self.flush()?;
+        if unsafe { SetConsoleActiveScreenBuffer(self.handle.as_raw_handle() as *mut _) } == 0 {
+            bail!(
+                "SetConsoleActiveScreenBuffer failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn set_screen_buffer_size(&mut self, size: COORD) -> Result<()> {
+        if unsafe { SetConsoleScreenBufferSize(self.handle.as_raw_handle() as *mut _, size) } != 1 {
+            bail!(
+                "SetConsoleScreenBufferSize failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn dimensions_from_buffer_info(info: CONSOLE_SCREEN_BUFFER_INFO) -> (usize, usize) {
+    let cols = visible_span(info.srWindow.Left, info.srWindow.Right);
+    let rows = visible_span(info.srWindow.Top, info.srWindow.Bottom);
+    (cols as usize, rows as usize)
+}
+
+fn alternate_screen_buffer_geometry(info: CONSOLE_SCREEN_BUFFER_INFO) -> (COORD, SMALL_RECT) {
+    let visible_cols = visible_span(info.srWindow.Left, info.srWindow.Right);
+    let visible_rows = visible_span(info.srWindow.Top, info.srWindow.Bottom);
+    let cols = max(info.dwSize.X, visible_cols).max(1);
+    let rows = max(info.dwSize.Y, visible_rows).max(1);
+    (
+        COORD { X: cols, Y: rows },
+        SMALL_RECT {
+            Left: 0,
+            Top: 0,
+            Right: visible_cols.saturating_sub(1),
+            Bottom: visible_rows.saturating_sub(1),
+        },
+    )
+}
+
+struct ScreenResizePlan {
+    pre_buffer_viewport: Option<SMALL_RECT>,
+    buffer_size: COORD,
+    final_viewport: SMALL_RECT,
+}
+
+fn visible_window_dimensions(info: CONSOLE_SCREEN_BUFFER_INFO) -> COORD {
+    COORD {
+        X: visible_span(info.srWindow.Left, info.srWindow.Right),
+        Y: visible_span(info.srWindow.Top, info.srWindow.Bottom),
+    }
+}
+
+fn viewport_for_buffer_size(size: COORD) -> SMALL_RECT {
+    debug_assert!(size.X > 0);
+    debug_assert!(size.Y > 0);
+    SMALL_RECT {
+        Left: 0,
+        Top: 0,
+        Right: size.X.saturating_sub(1),
+        Bottom: size.Y.saturating_sub(1),
+    }
+}
+
+fn pre_buffer_resize_viewport(
+    info: CONSOLE_SCREEN_BUFFER_INFO,
+    target: COORD,
+) -> Option<SMALL_RECT> {
+    let visible = visible_window_dimensions(info);
+    if visible.X <= target.X && visible.Y <= target.Y {
+        return None;
+    }
+
+    let cols = min(visible.X, target.X).max(1);
+    let rows = min(visible.Y, target.Y).max(1);
+    let max_left = target.X.saturating_sub(cols);
+    let max_top = target.Y.saturating_sub(rows);
+    let left = min(max(info.srWindow.Left, 0), max_left);
+    let top = min(max(info.srWindow.Top, 0), max_top);
+
+    Some(SMALL_RECT {
+        Left: left,
+        Top: top,
+        Right: rect_end(left, cols),
+        Bottom: rect_end(top, rows),
+    })
+}
+
+fn screen_resize_plan(info: CONSOLE_SCREEN_BUFFER_INFO, target: COORD) -> ScreenResizePlan {
+    ScreenResizePlan {
+        pre_buffer_viewport: pre_buffer_resize_viewport(info, target),
+        buffer_size: target,
+        final_viewport: viewport_for_buffer_size(target),
+    }
+}
+
+impl RenderTty for OutputHandle {
+    fn get_size_in_cells(&mut self) -> Result<(usize, usize)> {
+        let info = self.get_buffer_info()?;
+        let (cols, rows) = dimensions_from_buffer_info(info);
+
+        Ok((cols, rows))
+    }
+}
+
+struct EventHandle {
+    handle: OwnedHandle,
+}
+
+impl EventHandle {
+    fn new() -> IoResult<Self> {
+        let handle = unsafe { CreateEventW(ptr::null_mut(), 0, 0, ptr::null_mut()) };
+        if handle.is_null() {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(Self {
+                handle: unsafe { OwnedHandle::from_raw_handle(handle as *mut _) },
+            })
+        }
+    }
+
+    fn set(&self) -> IoResult<()> {
+        let ok = unsafe { SetEvent(self.handle.as_raw_handle() as *mut _) };
+        if ok == 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// Handle created by `CreateEventW` is safe to be shared.
+unsafe impl Sync for EventHandle {}
+
+impl Write for OutputHandle {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        if buffered_write_needs_flush(
+            self.write_buffer.len(),
+            buf.len(),
+            self.write_buffer.capacity(),
+        ) {
+            self.flush()?;
+        }
+        if buf.len() >= self.write_buffer.capacity() {
+            self.handle.write(buf)
+        } else {
+            self.write_buffer.write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        if !self.write_buffer.is_empty() {
+            self.handle.write_all(&self.write_buffer)?;
+            self.write_buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+impl ConsoleOutputHandle for OutputHandle {
+    fn set_output_mode(&mut self, mode: u32) -> Result<()> {
+        if unsafe { consoleapi::SetConsoleMode(self.handle.as_raw_handle() as *mut _, mode) } == 0 {
+            bail!("SetConsoleMode failed: {}", IoError::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_output_mode(&mut self) -> Result<u32> {
+        let mut mode = 0;
+        if unsafe { consoleapi::GetConsoleMode(self.handle.as_raw_handle() as *mut _, &mut mode) }
+            == 0
+        {
+            bail!("GetConsoleMode failed: {}", IoError::last_os_error());
+        }
+        Ok(mode)
+    }
+
+    fn set_output_cp(&mut self, cp: u32) -> Result<()> {
+        if unsafe { SetConsoleOutputCP(cp) } == 0 {
+            bail!("SetConsoleOutputCP failed: {}", IoError::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_output_cp(&mut self) -> u32 {
+        unsafe { consoleapi::GetConsoleOutputCP() }
+    }
+
+    fn fill_char(&mut self, text: char, x: i16, y: i16, len: u32) -> Result<u32> {
+        let mut wrote = 0;
+        if unsafe {
+            FillConsoleOutputCharacterW(
+                self.handle.as_raw_handle() as *mut _,
+                text as u16,
+                len,
+                COORD { X: x, Y: y },
+                &mut wrote,
+            )
+        } == 0
+        {
+            bail!(
+                "FillConsoleOutputCharacterW failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(wrote)
+    }
+
+    fn fill_attr(&mut self, attr: u16, x: i16, y: i16, len: u32) -> Result<u32> {
+        let mut wrote = 0;
+        if unsafe {
+            FillConsoleOutputAttribute(
+                self.handle.as_raw_handle() as *mut _,
+                attr,
+                len,
+                COORD { X: x, Y: y },
+                &mut wrote,
+            )
+        } == 0
+        {
+            bail!(
+                "FillConsoleOutputAttribute failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(wrote)
+    }
+
+    fn set_attr(&mut self, attr: u16) -> Result<()> {
+        if unsafe { SetConsoleTextAttribute(self.handle.as_raw_handle() as *mut _, attr) } == 0 {
+            bail!(
+                "SetConsoleTextAttribute failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn set_cursor_position(&mut self, x: i16, y: i16) -> Result<()> {
+        if unsafe {
+            SetConsoleCursorPosition(self.handle.as_raw_handle() as *mut _, COORD { X: x, Y: y })
+        } == 0
+        {
+            bail!(
+                "SetConsoleCursorPosition(x={}, y={}) failed: {}",
+                x,
+                y,
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn get_buffer_contents(&mut self) -> Result<Vec<CHAR_INFO>> {
+        let info = self.get_buffer_info()?;
+
+        let (cols, rows) = visible_window_size(&info)?;
+        let cell_count = checked_cell_count(cols, rows)?;
+
+        let mut res = vec![
+            CHAR_INFO {
+                Attributes: 0,
+                Char: unsafe { mem::zeroed() }
+            };
+            cell_count
+        ];
+        let mut read_region = SMALL_RECT {
+            Left: 0,
+            Right: info.dwSize.X - 1,
+            Top: info.srWindow.Top,
+            Bottom: info.srWindow.Bottom,
+        };
+        unsafe {
+            if ReadConsoleOutputW(
+                self.handle.as_raw_handle() as *mut _,
+                res.as_mut_ptr(),
+                COORD {
+                    X: cols.min(i16::MAX as usize) as i16,
+                    Y: rows.min(i16::MAX as usize) as i16,
+                },
+                COORD { X: 0, Y: 0 },
+                &mut read_region,
+            ) == 0
+            {
+                bail!("ReadConsoleOutputW failed: {}", IoError::last_os_error());
+            }
+        }
+        Ok(res)
+    }
+
+    fn set_buffer_contents(&mut self, buffer: &[CHAR_INFO]) -> Result<()> {
+        let info = self.get_buffer_info()?;
+
+        let (cols, rows) = visible_window_size(&info)?;
+        let cell_count = checked_cell_count(cols, rows)?;
+        ensure!(
+            cell_count == buffer.len(),
+            "buffer size doesn't match screen size"
+        );
+
+        let mut write_region = SMALL_RECT {
+            Left: 0,
+            Right: info.dwSize.X - 1,
+            Top: info.srWindow.Top,
+            Bottom: info.srWindow.Bottom,
+        };
+
+        unsafe {
+            if WriteConsoleOutputW(
+                self.handle.as_raw_handle() as *mut _,
+                buffer.as_ptr(),
+                COORD {
+                    X: cols.min(i16::MAX as usize) as i16,
+                    Y: rows.min(i16::MAX as usize) as i16,
+                },
+                COORD { X: 0, Y: 0 },
+                &mut write_region,
+            ) == 0
+            {
+                bail!("WriteConsoleOutputW failed: {}", IoError::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn get_buffer_info(&mut self) -> Result<CONSOLE_SCREEN_BUFFER_INFO> {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { mem::zeroed() };
+        let ok = unsafe {
+            GetConsoleScreenBufferInfo(self.handle.as_raw_handle() as *mut _, &mut info as *mut _)
+        };
+        if ok == 0 {
+            bail!(
+                "GetConsoleScreenBufferInfo failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(info)
+    }
+
+    fn set_viewport(&mut self, left: i16, top: i16, right: i16, bottom: i16) -> Result<()> {
+        let rect = SMALL_RECT {
+            Left: left,
+            Top: top,
+            Right: right,
+            Bottom: bottom,
+        };
+        if unsafe { SetConsoleWindowInfo(self.handle.as_raw_handle() as *mut _, 1, &rect) } == 0 {
+            bail!("SetConsoleWindowInfo failed: {}", IoError::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn scroll_region(
+        &mut self,
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+        dx: i16,
+        dy: i16,
+        attr: u16,
+    ) -> Result<()> {
+        let scroll_rect = scroll_region_rect(left, top, right, bottom, dx, dy);
+        let clip_rect = SMALL_RECT {
+            Left: left,
+            Top: top,
+            Right: right,
+            Bottom: bottom,
+        };
+        let fill = unsafe {
+            let mut fill = CHAR_INFO {
+                Char: mem::zeroed(),
+                Attributes: attr,
+            };
+            *fill.Char.UnicodeChar_mut() = ' ' as u16;
+            fill
+        };
+        if unsafe {
+            ScrollConsoleScreenBufferW(
+                self.handle.as_raw_handle() as *mut _,
+                &scroll_rect,
+                &clip_rect,
+                scroll_destination(left, top, dx, dy),
+                &fill,
+            )
+        } == 0
+        {
+            bail!(
+                "ScrollConsoleScreenBufferW failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct WindowsTerminal {
+    input_handle: InputHandle,
+    output_handle: OutputHandle,
+    waker_handle: Arc<EventHandle>,
+    saved_input_mode: u32,
+    saved_output_mode: u32,
+    renderer: Renderer,
+    input_parser: InputParser,
+    input_queue: VecDeque<InputEvent>,
+    saved_input_cp: u32,
+    saved_output_cp: u32,
+    in_alternate_screen: bool,
+    alternate_main_output: Option<OutputHandle>,
+    caps: Capabilities,
+}
+
+impl Drop for WindowsTerminal {
+    fn drop(&mut self) {
+        if matches!(&self.renderer, Renderer::Terminfo(_)) {
+            macro_rules! decreset {
+                ($variant:ident) => {
+                    if let Err(err) = write!(
+                        self.output_handle,
+                        "{}",
+                        CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                            DecPrivateModeCode::$variant
+                        )))
+                    ) {
+                        log::warn!(
+                            "failed to reset terminal mode {} during WindowsTerminal drop: {err}",
+                            stringify!($variant)
+                        );
+                    }
+                };
+            }
+            self.render(&[Change::CursorVisibility(
+                crate::surface::CursorVisibility::Visible,
+            )])
+            .ok();
+            decreset!(BracketedPaste);
+            decreset!(SGRMouse);
+            decreset!(AnyEventMouse);
+        }
+
+        if let Err(err) = self.exit_alternate_screen() {
+            log::warn!("failed to exit alternate screen during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.output_handle.flush() {
+            log::warn!("failed to flush terminal during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.input_handle.set_input_mode(self.saved_input_mode) {
+            log::warn!("failed to restore console input mode during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.input_handle.set_input_cp(self.saved_input_cp) {
+            log::warn!(
+                "failed to restore console input codepage during WindowsTerminal drop: {err}"
+            );
+        }
+        if let Err(err) = self.output_handle.set_output_mode(self.saved_output_mode) {
+            log::warn!("failed to restore console output mode during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.output_handle.set_output_cp(self.saved_output_cp) {
+            log::warn!(
+                "failed to restore console output codepage during WindowsTerminal drop: {err}"
+            );
+        }
+    }
+}
+
+impl WindowsTerminal {
+    /// Attempt to create an instance from the stdin and stdout of the
+    /// process.  This will fail unless both are associated with a tty.
+    /// Note that this will duplicate the underlying file descriptors
+    /// and will no longer participate in the stdin/stdout locking
+    /// provided by the rust standard library.
+    pub fn new_from_stdio(caps: Capabilities) -> Result<Self> {
+        Self::new_with(caps, stdin(), stdout())
+    }
+
+    /// Create an instance using the provided capabilities, read and write
+    /// handles. The read and write handles must be tty handles of this
+    /// will return an error.
+    pub fn new_with<A: Read + IsTty + AsRawHandle, B: Write + IsTty + AsRawHandle>(
+        caps: Capabilities,
+        read: A,
+        write: B,
+    ) -> Result<Self> {
+        if !read.is_tty() || !write.is_tty() {
+            bail!("stdin and stdout must both be tty handles");
+        }
+
+        let mut input_handle = InputHandle {
+            handle: FileDescriptor::dup(&read)?,
+        };
+        let mut output_handle = OutputHandle::new(FileDescriptor::dup(&write)?);
+        let waker_handle = Arc::new(EventHandle::new()?);
+
+        let saved_input_mode = input_handle.get_input_mode()?;
+        let saved_output_mode = output_handle.get_output_mode()?;
+        let saved_input_cp = input_handle.get_input_cp();
+        let saved_output_cp = output_handle.get_output_cp();
+
+        // Test whether we have a virtual terminal capable
+        // console device by attempting to set the appropriate flags.
+        let virtual_terminal_available = output_handle
+            .set_output_mode(
+                saved_output_mode
+                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    | DISABLE_NEWLINE_AUTO_RETURN,
+            )
+            .is_ok();
+
+        // Allow opting out of that processing
+        fn bypass_virtual_terminal() -> bool {
+            if let Ok(t) = std::env::var("TERMWIZ_BYPASS_VIRTUAL_TERMINAL") {
+                t == "1"
+            } else {
+                false
+            }
+        }
+
+        let renderer = if caps.terminfo_db().is_some() {
+            Renderer::Terminfo(TerminfoRenderer::new(caps.clone()))
+        } else if virtual_terminal_available && !bypass_virtual_terminal() {
+            Renderer::Terminfo(TerminfoRenderer::new(caps.clone().apply_builtin_terminfo()))
+        } else {
+            Renderer::Windows(WindowsConsoleRenderer::new(caps.clone()))
+        };
+        let input_parser = InputParser::new();
+
+        let mut terminal = Self {
+            input_handle,
+            output_handle,
+            waker_handle,
+            saved_input_mode,
+            saved_output_mode,
+            saved_input_cp,
+            saved_output_cp,
+            renderer,
+            input_parser,
+            input_queue: VecDeque::new(),
+            in_alternate_screen: false,
+            alternate_main_output: None,
+            caps,
+        };
+
+        terminal.input_handle.set_input_cp(CP_UTF8)?;
+        terminal.output_handle.set_output_cp(CP_UTF8)?;
+
+        // We already enabled this for output, but let's also turn it
+        // on for input here now.
+        terminal.enable_virtual_terminal_processing_if_needed()?;
+
+        Ok(terminal)
+    }
+
+    fn enable_virtual_terminal_processing_if_needed(&mut self) -> Result<()> {
+        match &self.renderer {
+            Renderer::Terminfo(_) => self.enable_virtual_terminal_processing(),
+            Renderer::Windows(_) => Ok(()),
+        }
+    }
+
+    /// Attempt to explicitly open handles to a console device (CONIN$,
+    /// CONOUT$). This should yield the terminal already associated with
+    /// the process, even if stdio streams have been redirected.
+    pub fn new(caps: Capabilities) -> Result<Self> {
+        let read = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+        let write = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
+        Self::new_with(caps, read, write)
+    }
+
+    pub fn enable_virtual_terminal_processing(&mut self) -> Result<()> {
+        let mode = self.output_handle.get_output_mode()?;
+        self.output_handle.set_output_mode(
+            mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN,
+        )?;
+
+        let mode = self.input_handle.get_input_mode()?;
+        self.input_handle
+            .set_input_mode(mode | ENABLE_VIRTUAL_TERMINAL_INPUT)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct WindowsTerminalWaker {
+    handle: Option<Arc<EventHandle>>,
+}
+
+impl WindowsTerminalWaker {
+    pub fn noop() -> Self {
+        Self { handle: None }
+    }
+
+    pub fn wake(&self) -> IoResult<()> {
+        let Some(handle) = self.handle.as_ref() else {
+            return Ok(());
+        };
+        handle.set()?;
+        Ok(())
+    }
+}
+
+impl Terminal for WindowsTerminal {
+    fn set_raw_mode(&mut self) -> Result<()> {
+        let mode = self.output_handle.get_output_mode()?;
+        self.output_handle
+            .set_output_mode(mode | DISABLE_NEWLINE_AUTO_RETURN)
+            .ok();
+
+        let mode = self.input_handle.get_input_mode()?;
+
+        self.input_handle.set_input_mode(
+            (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_MOUSE_INPUT
+                | ENABLE_WINDOW_INPUT,
+        )?;
+
+        if matches!(&self.renderer, Renderer::Terminfo(_)) {
+            macro_rules! decset {
+                ($variant:ident) => {
+                    write!(
+                        self.output_handle,
+                        "{}",
+                        CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                            DecPrivateModeCode::$variant
+                        )))
+                    )?;
+                };
+            }
+
+            if self.caps.bracketed_paste() {
+                decset!(BracketedPaste);
+            }
+            if self.caps.mouse_reporting() {
+                decset!(AnyEventMouse);
+                decset!(SGRMouse);
+            }
+            self.output_handle.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn set_cooked_mode(&mut self) -> Result<()> {
+        let mode = self.output_handle.get_output_mode()?;
+        self.output_handle
+            .set_output_mode(mode & !DISABLE_NEWLINE_AUTO_RETURN)
+            .ok();
+
+        let mode = self.input_handle.get_input_mode()?;
+
+        self.input_handle.set_input_mode(
+            (mode & !(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT))
+                | ENABLE_ECHO_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_PROCESSED_INPUT,
+        )
+    }
+
+    fn enter_alternate_screen(&mut self) -> Result<()> {
+        if matches!(&self.renderer, Renderer::Terminfo(_)) {
+            if !self.in_alternate_screen {
+                write!(
+                    self.output_handle,
+                    "{}",
+                    CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                        DecPrivateModeCode::ClearAndEnableAlternateScreen
+                    )))
+                )?;
+                self.in_alternate_screen = true;
+            }
+            Ok(())
+        } else {
+            if self.in_alternate_screen {
+                return Ok(());
+            }
+
+            let current_info = self.output_handle.get_buffer_info()?;
+            let current_mode = self.output_handle.get_output_mode()?;
+            let (buffer_size, window_rect) = alternate_screen_buffer_geometry(current_info);
+
+            let mut alternate = OutputHandle::new_screen_buffer()?;
+            alternate.set_output_mode(current_mode)?;
+            alternate.set_screen_buffer_size(buffer_size)?;
+            alternate.set_viewport(
+                window_rect.Left,
+                window_rect.Top,
+                window_rect.Right,
+                window_rect.Bottom,
+            )?;
+            alternate.set_cursor_position(0, 0)?;
+            alternate.set_active_screen_buffer()?;
+
+            let main = mem::replace(&mut self.output_handle, alternate);
+            self.alternate_main_output = Some(main);
+            self.in_alternate_screen = true;
+            Ok(())
+        }
+    }
+
+    fn exit_alternate_screen(&mut self) -> Result<()> {
+        if matches!(&self.renderer, Renderer::Terminfo(_)) {
+            if self.in_alternate_screen {
+                write!(
+                    self.output_handle,
+                    "{}",
+                    CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                        DecPrivateModeCode::ClearAndEnableAlternateScreen
+                    )))
+                )?;
+                self.in_alternate_screen = false;
+            }
+            Ok(())
+        } else if !self.in_alternate_screen {
+            Ok(())
+        } else {
+            let Some(main_output) = self.alternate_main_output.as_mut() else {
+                bail!(
+                    "native Windows alternate screen is marked active but main buffer handle is missing"
+                );
+            };
+            main_output.set_active_screen_buffer()?;
+
+            let main = self
+                .alternate_main_output
+                .take()
+                .expect("checked alternate main output above");
+            let alternate = mem::replace(&mut self.output_handle, main);
+            drop(alternate);
+            self.in_alternate_screen = false;
+            Ok(())
+        }
+    }
+
+    fn get_screen_size(&mut self) -> Result<ScreenSize> {
+        let info = self.output_handle.get_buffer_info()?;
+        let (cols, rows) = dimensions_from_buffer_info(info);
+
+        Ok(ScreenSize {
+            rows: cast(rows)?,
+            cols: cast(cols)?,
+            xpixel: 0,
+            ypixel: 0,
+        })
+    }
+
+    fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+        Some(ProbeCapabilities::new(
+            &mut self.input_handle,
+            &mut self.output_handle,
+        ))
+    }
+
+    fn set_screen_size(&mut self, size: ScreenSize) -> Result<()> {
+        ensure!(
+            size.cols > 0 && size.rows > 0,
+            "screen size must be positive: cols={}, rows={}",
+            size.cols,
+            size.rows
+        );
+        let target = COORD {
+            X: cast(size.cols)?,
+            Y: cast(size.rows)?,
+        };
+
+        let plan = screen_resize_plan(self.output_handle.get_buffer_info()?, target);
+        if let Some(rect) = plan.pre_buffer_viewport {
+            self.output_handle
+                .set_viewport(rect.Left, rect.Top, rect.Right, rect.Bottom)?;
+        }
+        self.output_handle
+            .set_screen_buffer_size(plan.buffer_size)?;
+        let rect = plan.final_viewport;
+        self.output_handle
+            .set_viewport(rect.Left, rect.Top, rect.Right, rect.Bottom)?;
+        Ok(())
+    }
+
+    fn render(&mut self, changes: &[Change]) -> Result<()> {
+        match &mut self.renderer {
+            Renderer::Terminfo(r) => r.render_to(changes, &mut self.output_handle),
+            Renderer::Windows(r) => r.render_to(changes, &mut self.output_handle),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.output_handle
+            .flush()
+            .map_err(|e| format_err!("flush failed: {}", e))
+    }
+
+    fn poll_input(&mut self, wait: Option<Duration>) -> Result<Option<InputEvent>> {
+        loop {
+            if let Some(event) = self.input_queue.pop_front() {
+                return Ok(Some(event));
+            }
+
+            let mut pending = self.input_handle.get_number_of_input_events()?;
+
+            if pending == 0 {
+                let mut handles = [
+                    self.input_handle.handle.as_raw_handle() as *mut _,
+                    self.waker_handle.handle.as_raw_handle() as *mut _,
+                ];
+                let result = unsafe {
+                    WaitForMultipleObjects(2, handles.as_mut_ptr(), 0, wait_timeout_millis(wait))
+                };
+                if result == WAIT_OBJECT_0 + 0 {
+                    pending = self.input_handle.get_number_of_input_events()?;
+                } else if result == WAIT_OBJECT_0 + 1 {
+                    return Ok(Some(InputEvent::Wake));
+                } else if result == WAIT_FAILED {
+                    bail!(
+                        "failed to WaitForMultipleObjects: {}",
+                        IoError::last_os_error()
+                    );
+                } else if result == WAIT_TIMEOUT {
+                    return Ok(None);
+                } else {
+                    return Ok(None);
+                }
+            }
+
+            let records = self.input_handle.read_console_input(pending)?;
+
+            let input_queue = &mut self.input_queue;
+            self.input_parser
+                .decode_input_records(&records, &mut |evt| input_queue.push_back(evt));
+        }
+    }
+
+    fn waker(&self) -> WindowsTerminalWaker {
+        WindowsTerminalWaker {
+            handle: Some(self.waker_handle.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coord(cols: i16, rows: i16) -> COORD {
+        COORD { X: cols, Y: rows }
+    }
+
+    fn rect_tuple(rect: SMALL_RECT) -> (i16, i16, i16, i16) {
+        (rect.Left, rect.Top, rect.Right, rect.Bottom)
+    }
+
+    fn buffer_info(
+        buffer_cols: i16,
+        buffer_rows: i16,
+        window_left: i16,
+        window_top: i16,
+        window_right: i16,
+        window_bottom: i16,
+    ) -> CONSOLE_SCREEN_BUFFER_INFO {
+        CONSOLE_SCREEN_BUFFER_INFO {
+            dwSize: COORD {
+                X: buffer_cols,
+                Y: buffer_rows,
+            },
+            dwCursorPosition: COORD { X: 0, Y: 0 },
+            wAttributes: 0,
+            srWindow: SMALL_RECT {
+                Left: window_left,
+                Top: window_top,
+                Right: window_right,
+                Bottom: window_bottom,
+            },
+            dwMaximumWindowSize: COORD {
+                X: buffer_cols,
+                Y: buffer_rows,
+            },
+        }
+    }
+
+    #[test]
+    fn wait_timeout_none_preserves_infinite_sentinel() {
+        assert_eq!(wait_timeout_millis(None), INFINITE);
+    }
+
+    #[test]
+    fn wait_timeout_preserves_in_range_finite_wait() {
+        assert_eq!(
+            wait_timeout_millis(Some(Duration::from_millis(12_345))),
+            12_345
+        );
+    }
+
+    #[test]
+    fn wait_timeout_saturates_without_using_infinite_sentinel() {
+        let overflowing = Duration::from_millis(MAX_FINITE_WAIT_MS as u64 + 1);
+        assert_eq!(wait_timeout_millis(Some(overflowing)), MAX_FINITE_WAIT_MS);
+    }
+
+    #[test]
+    fn input_event_count_to_u32_rejects_overflowing_values() {
+        assert_eq!(input_event_count_to_u32(42).unwrap(), 42);
+        if usize::BITS > u32::BITS {
+            assert!(input_event_count_to_u32(usize::MAX).is_err());
+        }
+    }
+
+    #[test]
+    fn received_input_event_count_rejects_counts_beyond_capacity() {
+        assert_eq!(received_input_event_count(3, 3).unwrap(), 3);
+        assert!(received_input_event_count(4, 3).is_err());
+    }
+
+    #[test]
+    fn scroll_destination_clamps_y_against_top_not_left() {
+        let destination = scroll_destination(20, 3, 0, -1);
+
+        assert_eq!((destination.X, destination.Y), (20, 3));
+    }
+
+    #[test]
+    fn scroll_region_math_saturates_extreme_deltas() {
+        let rect = scroll_region_rect(-30_000, -20_000, 30_000, 20_000, i16::MIN, i16::MAX);
+        let destination = scroll_destination(-30_000, -20_000, i16::MIN, i16::MAX);
+
+        assert_eq!(rect_tuple(rect), (2_768, -20_000, 30_000, -12_767));
+        assert_eq!((destination.X, destination.Y), (-30_000, 12_767));
+    }
+
+    #[test]
+    fn visible_window_size_rejects_invalid_geometry() {
+        let negative_cols = buffer_info(-1, 24, 0, 0, 79, 23);
+        assert!(visible_window_size(&negative_cols).is_err());
+
+        let inverted_window = buffer_info(80, 24, 0, 10, 79, 5);
+        assert!(visible_window_size(&inverted_window).is_err());
+    }
+
+    #[test]
+    fn checked_cell_count_rejects_overflow() {
+        assert_eq!(checked_cell_count(80, 24).unwrap(), 1_920);
+        assert!(checked_cell_count(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn buffered_write_flush_check_handles_overflow() {
+        assert!(!buffered_write_needs_flush(4, 4, 8));
+        assert!(buffered_write_needs_flush(5, 4, 8));
+        assert!(buffered_write_needs_flush(usize::MAX, 1, usize::MAX));
+    }
+
+    #[test]
+    fn visible_span_clamps_invalid_ranges() {
+        assert_eq!(visible_span(10, 19), 10);
+        assert_eq!(visible_span(20, 10), 1);
+        assert_eq!(visible_span(i16::MIN, i16::MAX), i16::MAX);
+    }
+
+    #[test]
+    fn viewport_rect_construction_saturates_edges() {
+        let viewport = viewport_for_buffer_size(COORD { X: 1, Y: i16::MAX });
+
+        assert_eq!(rect_tuple(viewport), (0, 0, 0, i16::MAX - 1));
+        assert_eq!(rect_end(i16::MAX - 1, 10), i16::MAX);
+    }
+
+    #[test]
+    fn alternate_screen_geometry_preserves_main_buffer_scrollback_rows() {
+        let info = buffer_info(120, 9_000, 0, 8_950, 119, 8_999);
+
+        let (size, rect) = alternate_screen_buffer_geometry(info);
+
+        assert_eq!((size.X, size.Y), (120, 9_000));
+        assert_eq!(
+            (rect.Left, rect.Top, rect.Right, rect.Bottom),
+            (0, 0, 119, 49)
+        );
+    }
+
+    #[test]
+    fn alternate_screen_geometry_expands_buffer_to_visible_window() {
+        let info = buffer_info(40, 10, 10, 5, 89, 29);
+
+        let (size, rect) = alternate_screen_buffer_geometry(info);
+
+        assert_eq!((size.X, size.Y), (80, 25));
+        assert_eq!(
+            (rect.Left, rect.Top, rect.Right, rect.Bottom),
+            (0, 0, 79, 24)
+        );
+    }
+
+    #[test]
+    fn screen_resize_plan_shrinks_viewport_before_shrinking_buffer() {
+        let info = buffer_info(120, 9_000, 0, 8_950, 119, 8_999);
+
+        let plan = screen_resize_plan(info, coord(80, 24));
+
+        let pre_buffer_viewport = plan
+            .pre_buffer_viewport
+            .expect("shrinking below the current viewport needs a pre-buffer viewport");
+        assert_eq!(rect_tuple(pre_buffer_viewport), (0, 0, 79, 23));
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (80, 24));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 79, 23));
+    }
+
+    #[test]
+    fn screen_resize_plan_grows_buffer_before_growing_viewport() {
+        let info = buffer_info(80, 24, 0, 0, 79, 23);
+
+        let plan = screen_resize_plan(info, coord(120, 40));
+
+        assert!(plan.pre_buffer_viewport.is_none());
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (120, 40));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 119, 39));
+    }
+
+    #[test]
+    fn screen_resize_plan_clamps_offset_viewport_inside_target_buffer() {
+        let info = buffer_info(200, 100, 20, 10, 119, 39);
+
+        let plan = screen_resize_plan(info, coord(80, 50));
+
+        let pre_buffer_viewport = plan
+            .pre_buffer_viewport
+            .expect("width shrink needs the viewport to fit inside the target buffer first");
+        assert_eq!(rect_tuple(pre_buffer_viewport), (0, 10, 79, 39));
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (80, 50));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 79, 49));
+    }
+}

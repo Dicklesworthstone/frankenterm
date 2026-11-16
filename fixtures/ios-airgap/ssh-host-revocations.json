@@ -1,0 +1,664 @@
+{
+  "schemaVersion": 1,
+  "generator": "OpenSSH ssh-keygen, independently of FrankenTerm",
+  "sshVersion": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.18, OpenSSL 3.0.13 30 Jan 2024",
+  "primarySourceCommit": "1fbdcb402516aacce59b4cc7b7d98f06820a1e44",
+  "validAfter": 1577836800,
+  "validBefore": 2524608000,
+  "targets": [
+    {
+      "id": "subject-a",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWkn subject-a",
+      "isCertificate": false,
+      "subjectID": "subject-a"
+    },
+    {
+      "id": "subject-b",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPVpX7g+co661cdciaqipB9ALITodop2bpjdKKAXHnPV subject-b",
+      "isCertificate": false,
+      "subjectID": "subject-b"
+    },
+    {
+      "id": "ca-a",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4 ca-a",
+      "isCertificate": false,
+      "subjectID": "ca-a"
+    },
+    {
+      "id": "ca-b",
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMAoaxnWdJwKKsjQ24ft9me3smlZvEoYdapzo9dllkQg ca-b",
+      "isCertificate": false,
+      "subjectID": "ca-b"
+    },
+    {
+      "id": "serial-0",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIBS6iv4hX/vh/kgP9zl9gsB8/Cc78fINGOk6t5bG0Hi0AAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAECgQIarbslRVN2wPk03zAMlPGdzTf+FDcCVx91fkQk5uPrjLDqa42chDPXVMGre4y5Rk8NlETzc7SZkFVfRn7UG subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-1",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAICOsodJqaN3CZLekbsxKYbb/ZI5UTC+RQVh3UeN5XDWGAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAEAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAECFxcmzRtP9dMekYsiwGS3Zc+JAN6B2jjZFa0S56B1FISCRFsgmFo7cx1kluq3gbWmDgW6+8vX5GOjUmMVr3J8L subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 1,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-99",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIPNtFTjKzx0ttD+bkvpPG3/QYIDcDFcTf7HwimYyCOdAAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGMAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAECekLmtihAhYy3sdO/pJB6/2U4dIdYmY2lCNRUfDLWDN4Nv4BmoVp/Va4a2y3DTTVpw3oEZGikYZRctG1/8lNIM subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 99,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-100",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIBuayfHTDZON5UHXJwtqvtRTGRRUtfIb4875BwYZ7a0cAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGQAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAECGHCdTGQeVBb3g+b0W+6jjXiPme7FeiwcCO5ChOAP5aQxEIOHqEz312hxJDLFWpGDjYZVcB0zoMioUqYT8zTIP subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 100,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-101",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAINPg7if+sMC183+MSIL2yQoiqptINREIb8SMuCzOeBOuAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGUAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAJjENhDWH4UDxePlbvh1rRMw9ouEPRtyd6V7uadcxb7EKyHLXhCz1NIC6NxGLQ809H+h1eY1kwDzQRtHHc16UO subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 101,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-102",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIIuJw6kxm4M77wqy0fLfnvB+5LWrORjsXCD9z2lqkJ6FAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGYAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEDEXDJ6/F6XQz77AzLLPWKxS67oPKfrKWlhsKF5hlJZ1c9VoQX9jAEwxhWQhuWgBtAQodj2J3HXWZo7hCJ5YdoG subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 102,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-105",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIAU1bPCFZYJLeOypVZT983fe4FuEdG+oWrQiZmH8B96CAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGkAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEA1t1Mx1UHFx0MCzPMuPpqz6SCT5fAzvMb76aMGecufrfgC7SLuN4MPo5Yd0SufTy9gvF+5BhzPaWm9xPdjHa8B subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 105,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-107",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIFgSZjg4+Bp3t0ikj9kCFUdDt5d44gi0YA9IEKqOSAxwAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGsAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAbDxNukjomIWRA0TcseBN3Me5QUUXaiJg4JE0ydlF/FPwEkmY/WhIdSbmqWz3TFiCqLtpJrOFbrYwQVa2tN0QO subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 107,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-108",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIG7iZTiRfi87Lu7lw0RHJ5ojG8VA5zLYlnbT97SfNC8bAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGwAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEDCLhV3Klf3IwI6UqXO54+NbcD2Ph9V5O804V/5marfYFDPOptJlUiT9pZfzJW+I5rXi7/bXGHXDvuW4kQM0uAL subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 108,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-111",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIKHDs9iI9wMLHkblFBp/te0odTvkrzRvxEoYIfLXwPG2AAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAG8AAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAiivHJDniahMexcxu9ueL2rYKpbErgBYgWWGTR1Oe9hWejKu+yaCG4iz01DZ/1r0S7RWrUlA6mziCODQEBlAAP subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 111,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-112",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIBmUFaA7+tDANydhzOYaLTD24VKsBt7sPAMEdLkeSvrSAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAHAAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBfMjV7/cNCKs/9z2vWz8s7eUaqpu24qzV7lDrLfxAzcrs7IxQ0qb0YKlCnyQQG1QmiMcFTB2amKgPXUh6yFCUF subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 112,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-999",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIEFYb9yMsn03eQcHJZHLqZBbun5ijIkPEnG4JSkQ0bSrAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAA+cAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEB3wSuhuroRSNCP5kT33zJUOCV1jnjNMhip/+omd/0BC5GxZq8NBwsk5g3hvSXTWyE7+nEse6NQI13nmoXIq5cP subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 999,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-1000",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIByl61nAfAyG8sIse5p0ZjU11AO4WaqsxSTv3nm9OZTiAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAA+gAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEA20qhUntWFO+SnLr101Olp1EXOqV1cATE7J3ymy3UHwYMpMI2LQ0gLqJntM7H0aQobIB8drcsshe3kb3c525ME subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 1000,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-500000",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIHvAdUU7oWCKUVum/2IJO4Kk3l75vkh6k+CUobbk+2ZYAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAHoSAAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBZHADEUuN6GaFldcHU+AUZAPwJhqisJ+eG2TGPrQoQ4x+XkSh7LAQUFlvoYg6MAVCfslrr2LDlyiMxYzX/sCAP subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 500000,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "serial-18446744073709551615",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIIIet6kbowE5q/HiHojoAJpsZuWTL3d8Z+RkT9rCERAmAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWkn//////////8AAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEA6Natw0VrhDcW+qBbhFIwsbO13LFonjto59gupC+WwolUzpoQydFDYGVlJ6Th3YOtdJChfPKi7OzCFNAZCL0IP subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 18446744073709551615,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "other-ca",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIBiXyGbK2/MIAfEyf71+27l9scEN+Lfl5m+wWu+CD7bhAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAGQAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIMAoaxnWdJwKKsjQ24ft9me3smlZvEoYdapzo9dllkQgAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAJNcMDV/AQKyss+qJzb3Sf99Cihthmz6/rulYmtXavruqpADdy7+FGm2i+jt0fbFI3/kM7yL2Guc9spDo66A8A subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-b",
+      "serial": 100,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "other-subject",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIP+2VXwbgeRIqaWTKHg+HYwVOv5vMjCMiYY668OBSqRYAAAAIPVpX7g+co661cdciaqipB9ALITodop2bpjdKKAXHnPVAAAAAAAAAGQAAAACAAAACG9yZGluYXJ5AAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBgR+pF4bnRCF22rIXm+X0O4XJFYyiPndky1AWf1BtvmKfjgGUhgBnyT3yUfz+zmnprxbvkHh9bIFDdP04iv9gL subject-b",
+      "isCertificate": true,
+      "subjectID": "subject-b",
+      "authorityID": "ca-a",
+      "serial": 100,
+      "keyID": "b3JkaW5hcnk="
+    },
+    {
+      "id": "opaque-id-a",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIPye/PuBALGU5JutZvRoeaL5iak4uqqqAQAXf/XdfbyIAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAACmRldmljZS3/gP4AAAAYAAAAFGhvc3QuZXhhbXBsZS5pbnZhbGlkAAAAAF4MCzAAAAAAlnqgMAAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAABTAAAAC3NzaC1lZDI1NTE5AAAAQBSArWmzOYFsLkqUI9CQoy504yBrSLAlIFtbOYsRAGdcpZduYNup8EtaSPLJjaQcZ+LY3e8J+o9g3lzFgiDunQ0= subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": "ZGV2aWNlLf+A/g=="
+    },
+    {
+      "id": "opaque-id-b",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIMjeGutkFJLMTv1kOgXhMdL8a+nYkIqhLtkSPYZdEG8jAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAACmRldmljZS3/gP4AAAAYAAAAFGhvc3QuZXhhbXBsZS5pbnZhbGlkAAAAAF4MCzAAAAAAlnqgMAAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgwChrGdZ0nAoqyNDbh+32Z7eyaVm8Shh1qnOj12WWRCAAAABTAAAAC3NzaC1lZDI1NTE5AAAAQFec5wFQqCTuSIXHBXKV7yto7MwD645e6F1cOk1DJWvGz3dNxsKult0pqtpvGBL7EHl3nQ8i/lztKPaUgv79NAo= subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-b",
+      "serial": 0,
+      "keyID": "ZGV2aWNlLf+A/g=="
+    },
+    {
+      "id": "different-id",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIPLUeAiiO16RBpobUk6Cx3Q3UIuoPzgcaz/LKrvHI0m8AAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAACmRldmljZS3/gP0AAAAYAAAAFGhvc3QuZXhhbXBsZS5pbnZhbGlkAAAAAF4MCzAAAAAAlnqgMAAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAABTAAAAC3NzaC1lZDI1NTE5AAAAQOz2Y/dJkWi1jwM+8epJ/deqn9P4jK7LBegDDI1RsYxdf20lqBxGwHVkikKB7fLQXWYKzNiOZ67oPmcf1JxNegg= subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": "ZGV2aWNlLf+A/Q=="
+    },
+    {
+      "id": "composed-id",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIPBXG9Pwf7R2FKXRdjrexifkqaPvuTbRRCf5vuN5JrPKAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAABWNhZsOpAAAAGAAAABRob3N0LmV4YW1wbGUuaW52YWxpZAAAAABeDAswAAAAAJZ6oDAAAAAAAAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAID7LLOmlSeXvy7rB89TBmqj/mgVXVifQhwyK3e1EtOX4AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAe/8vtBZntSBXpt1Q+LkpxLKKpQSISKVXm9jO5LUZ2W0rpkIVj8cX9djCZ+hoBlOu30/ro27QutXV8xi/rnKgO subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": "Y2Fmw6k="
+    },
+    {
+      "id": "decomposed-id",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIAACZBLdjBfypvToY5f9X98A5RUooPWui6bLcIBiMz7kAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAABmNhZmXMgQAAABgAAAAUaG9zdC5leGFtcGxlLmludmFsaWQAAAAAXgwLMAAAAACWeqAwAAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACA+yyzppUnl78u6wfPUwZqo/5oFV1Yn0IcMit3tRLTl+AAAAFMAAAALc3NoLWVkMjU1MTkAAABAMP+q3I6Wsbn3UUzOGRINGKQzsZmi400iR6VXelmo3eDyhbz4I6lrBteCQxJOlUcxByGMAbK//WO47+THueb6AQ== subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": "Y2FmZcyB"
+    },
+    {
+      "id": "empty-id",
+      "publicKey": "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIMQzAuxoBNAOiNs5WciV/KR78Sz+JZ/6IaTdrdCrAjnxAAAAIAWpKZrxbhUB9zUsE3k4eXHnzeYShiwcWOql6ceUwWknAAAAAAAAAAAAAAACAAAAAAAAABgAAAAUaG9zdC5leGFtcGxlLmludmFsaWQAAAAAXgwLMAAAAACWeqAwAAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACA+yyzppUnl78u6wfPUwZqo/5oFV1Yn0IcMit3tRLTl+AAAAFMAAAALc3NoLWVkMjU1MTkAAABAZgttGFF/Qp8gfWIAAFVWRMoNm6l4nPCAelgYFXkpZwlm1wEDCpgCNjoaGRzaIHsK1rl2n9nqfvgSbtcrMP8sDw== subject-a",
+      "isCertificate": true,
+      "subjectID": "subject-a",
+      "authorityID": "ca-a",
+      "serial": 0,
+      "keyID": ""
+    }
+  ],
+  "sources": [
+    {
+      "id": "key-subject-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAACAAAANwAAADMAAAALc3NoLWVkMjU1MTkAAAAgBakpmvFuFQH3NSwTeTh5cefN5hKGLBxY6qXpx5TBaSc=",
+      "sections": [
+        2
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "subject-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-ca",
+        "opaque-id-a",
+        "opaque-id-b",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "key-ca-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAACAAAANwAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fg=",
+      "sections": [
+        2
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "ca-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-subject",
+        "opaque-id-a",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "sha1-subject-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAADAAAAGAAAABRuBZ0OHHlFRM1AWbH4mzPkkoI1AA==",
+      "sections": [
+        3
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "subject-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-ca",
+        "opaque-id-a",
+        "opaque-id-b",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "sha1-ca-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAADAAAAGAAAABTeLwqV2zMhDunrmVO0Py36nZskVA==",
+      "sections": [
+        3
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "ca-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-subject",
+        "opaque-id-a",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "sha256-subject-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAAFAAAAJAAAACBzLvVbW16czOT1so63RbgN+3lqRrCrZ1hyjxoYjoogEQ==",
+      "sections": [
+        5
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "subject-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-ca",
+        "opaque-id-a",
+        "opaque-id-b",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "sha256-ca-a",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAAFAAAAJAAAACAPSDKfOHMfX4tEsbXva6YgG8F/U3RVTu8CdHcn7MaFyw==",
+      "sections": [
+        5
+      ],
+      "certificateSections": [],
+      "expectedDenied": [
+        "ca-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-subject",
+        "opaque-id-a",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "serial-list",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr7wAAAAAAAAAAAAAAAAAAAAABAAAAWAAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIAAAABgAAAAAAAAAAQAAAAAAB6Eg//////////8=",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        32
+      ],
+      "expectedDenied": [
+        "serial-1",
+        "serial-500000",
+        "serial-18446744073709551615"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "serial-range",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAAUAAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIQAAABAAAAAAAAAD6P//////////",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        33
+      ],
+      "expectedDenied": [
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "serial-bitmap",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAATgAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIgAAAA4AAAAAAAAAZAAAAAIJpQ==",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        34
+      ],
+      "expectedDenied": [
+        "serial-100",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "other-subject"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "opaque-ca-id",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAATgAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIwAAAA4AAAAKZGV2aWNlLf+A/g==",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        35
+      ],
+      "expectedDenied": [
+        "opaque-id-a"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "opaque-any-ca-id",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAAGwAAAAAAAAAAIwAAAA4AAAAKZGV2aWNlLf+A/g==",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        35
+      ],
+      "expectedDenied": [
+        "opaque-id-a",
+        "opaque-id-b"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "composed-id",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAASQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIwAAAAkAAAAFY2Fmw6k=",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        35
+      ],
+      "expectedDenied": [
+        "composed-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "empty-id",
+      "format": "krl",
+      "data": "U1NIS1JMCgAAAAABAAAAAAAAACUAAAAAauYr8AAAAAAAAAAAAAAAAAAAAAABAAAARAAAADMAAAALc3NoLWVkMjU1MTkAAAAgPsss6aVJ5e/LusHz1MGaqP+aBVdWJ9CHDIrd7US05fgAAAAAIwAAAAQAAAAA",
+      "sections": [
+        1
+      ],
+      "certificateSections": [
+        35
+      ],
+      "expectedDenied": [
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Q"
+    },
+    {
+      "id": "plain-subject",
+      "format": "public-key-list",
+      "data": "IyBJbmRlcGVuZGVudCBPcGVuU1NIIHB1YmxpYyByZXZvY2F0aW9ucwoKIAlzc2gtZWQyNTUxOSBBQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQVdwS1pyeGJoVUI5elVzRTNrNGVYSG56ZVlTaGl3Y1dPcWw2Y2VVd1drbiBzdWJqZWN0LWEK",
+      "sections": [],
+      "certificateSections": [],
+      "expectedDenied": [
+        "subject-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-ca",
+        "opaque-id-a",
+        "opaque-id-b",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Y verify -r (baseline verified first)"
+    },
+    {
+      "id": "plain-authority",
+      "format": "public-key-list",
+      "data": "IyBJbmRlcGVuZGVudCBPcGVuU1NIIHB1YmxpYyByZXZvY2F0aW9ucwoKIAlzc2gtZWQyNTUxOSBBQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJRDdMTE9tbFNlWHZ5N3JCODlUQm1xai9tZ1ZYVmlmUWh3eUszZTFFdE9YNCBjYS1hCg==",
+      "sections": [],
+      "certificateSections": [],
+      "expectedDenied": [
+        "ca-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-subject",
+        "opaque-id-a",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Y verify -r (baseline verified first)"
+    },
+    {
+      "id": "plain-certificate-subject",
+      "format": "public-key-list",
+      "data": "IyBJbmRlcGVuZGVudCBPcGVuU1NIIHB1YmxpYyByZXZvY2F0aW9ucwoKIAlzc2gtZWQyNTUxOS1jZXJ0LXYwMUBvcGVuc3NoLmNvbSBBQUFBSUhOemFDMWxaREkxTlRFNUxXTmxjblF0ZGpBeFFHOXdaVzV6YzJndVkyOXRBQUFBSUJ1YXlmSFREWk9ONVVIWEp3dHF2dFJUR1JSVXRmSWI0ODc1QndZWjdhMGNBQUFBSUFXcEtacnhiaFVCOXpVc0UzazRlWEhuemVZU2hpd2NXT3FsNmNlVXdXa25BQUFBQUFBQUFHUUFBQUFDQUFBQUNHOXlaR2x1WVhKNUFBQUFHQUFBQUJSb2IzTjBMbVY0WVcxd2JHVXVhVzUyWVd4cFpBQUFBQUJlREFzd0FBQUFBSlo2b0RBQUFBQUFBQUFBQUFBQUFBQUFBQUF6QUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUQ3TExPbWxTZVh2eTdyQjg5VEJtcWovbWdWWFZpZlFod3lLM2UxRXRPWDRBQUFBVXdBQUFBdHpjMmd0WldReU5UVXhPUUFBQUVDR0hDZFRHUWVWQmIzZytiMFcrNmpqWGlQbWU3RmVpd2NDTzVDaE9BUDVhUXhFSU9IcUV6MzEyaHhKRExGV3BHRGpZWlZjQjB6b01pb1VxWVQ4elRJUCBzdWJqZWN0LWEK",
+      "sections": [],
+      "certificateSections": [],
+      "expectedDenied": [
+        "subject-a",
+        "serial-0",
+        "serial-1",
+        "serial-99",
+        "serial-100",
+        "serial-101",
+        "serial-102",
+        "serial-105",
+        "serial-107",
+        "serial-108",
+        "serial-111",
+        "serial-112",
+        "serial-999",
+        "serial-1000",
+        "serial-500000",
+        "serial-18446744073709551615",
+        "other-ca",
+        "opaque-id-a",
+        "opaque-id-b",
+        "different-id",
+        "composed-id",
+        "decomposed-id",
+        "empty-id"
+      ],
+      "oracle": "ssh-keygen -Y verify -r (baseline verified first)"
+    }
+  ]
+}

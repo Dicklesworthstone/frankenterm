@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "captured_at": 1713723600000,
+  "workspace_id": "swarm-a",
+  "windows": [
+    {
+      "window_id": 10,
+      "title": "swarm-control",
+      "tabs": [
+        {
+          "tab_id": 20,
+          "title": "triage",
+          "pane_tree": {
+            "type": "VSplit",
+            "children": [
+              [
+                0.45,
+                {
+                  "type": "HSplit",
+                  "children": [
+                    [
+                      0.4,
+                      {
+                        "type": "Leaf",
+                        "pane_id": 101,
+                        "rows": 18,
+                        "cols": 88,
+                        "cwd": "/tmp/ft-a",
+                        "title": "logs",
+                        "is_active": false
+                      }
+                    ],
+                    [
+                      0.6,
+                      {
+                        "type": "Leaf",
+                        "pane_id": 102,
+                        "rows": 30,
+                        "cols": 88,
+                        "cwd": "/tmp/ft-a",
+                        "title": "watch",
+                        "is_active": false
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                0.55,
+                {
+                  "type": "Leaf",
+                  "pane_id": 103,
+                  "rows": 48,
+                  "cols": 92,
+                  "cwd": "/tmp/ft-b",
+                  "title": "operator",
+                  "is_active": true
+                }
+              ]
+            ]
+          },
+          "active_pane_id": 103
+        }
+      ],
+      "active_tab_index": 0
+    }
+  ]
+}

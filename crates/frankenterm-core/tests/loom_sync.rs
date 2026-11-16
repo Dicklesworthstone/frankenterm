@@ -1,0 +1,659 @@
+//! Loom model-checking for the wa-3d14m sync primitive contracts.
+//!
+//! These tests model the invariants the `runtime_async::{Mutex, RwLock,
+//! Semaphore}` surface must preserve after the tokio -> asupersync migration.
+//! Loom cannot instrument tokio/asupersync internals directly, so we verify the
+//! concurrency contracts with loom-native primitives and a small ticketed
+//! semaphore model.
+//!
+//! Skeleton seeded under ft-syqcz.6 (commit 7ff0f9e37). Exhaustive
+//! per-primitive proofs live under ft-syqcz.7's per-primitive sub-beads:
+//! - **Mutex**:     ft-e2usk
+//! - **RwLock**:    ft-5omg9
+//! - **Semaphore**: ft-5fbkx
+//!
+//! Mazurkiewicz trace catalog at
+//! [docs/runtime/mazurkiewicz-traces.md](../../../../docs/runtime/mazurkiewicz-traces.md).
+
+use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::{Arc, Condvar, Mutex, RwLock};
+use loom::thread;
+
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
+fn update_max(max_seen: &AtomicUsize, candidate: usize) {
+    let mut current = max_seen.load(Ordering::SeqCst);
+    while candidate > current {
+        match max_seen.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[test]
+fn loom_sync_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "mutex-waiter-cancel-before-lock",
+                &["cancel", "lock"],
+                &[("cancel", "lock")],
+                "a cancelled waiter never enters the critical section",
+            ),
+            (
+                "mutex-sequenced-acquisition",
+                &["lock", "drop", "lock_next"],
+                &[("lock", "drop"), ("drop", "lock_next")],
+                "at most one holder exists and no updates are lost",
+            ),
+            (
+                "mutex-drop-wakes-next",
+                &["drop", "lock_next", "cancel"],
+                &[("drop", "lock_next"), ("cancel", "lock_next")],
+                "the next acquirer observes the prior write after release",
+            ),
+            (
+                "rwlock-reader-cancel-before-read",
+                &["cancel", "read_lock"],
+                &[("cancel", "read_lock")],
+                "a cancelled reader does not increment the reader count",
+            ),
+            (
+                "rwlock-concurrent-readers",
+                &["read_a", "read_b", "write"],
+                &[("read_a", "write"), ("read_b", "write")],
+                "readers commute with each other but not with writers",
+            ),
+            (
+                "rwlock-writer-exclusive",
+                &["write_a", "write_b", "read", "cancel"],
+                &[
+                    ("write_a", "write_b"),
+                    ("write_a", "read"),
+                    ("write_b", "read"),
+                    ("cancel", "read"),
+                ],
+                "writers serialize and never overlap readers",
+            ),
+            (
+                "semaphore-waiter-cancel-before-acquire",
+                &["cancel", "acquire"],
+                &[("cancel", "acquire")],
+                "a cancelled waiter leaves the permit count unchanged",
+            ),
+            (
+                "semaphore-drop-as-release",
+                &["acquire", "drop", "available"],
+                &[("acquire", "drop"), ("drop", "available")],
+                "dropping a permit restores availability",
+            ),
+            (
+                "semaphore-release-wakes-blocked",
+                &["drop", "blocked_acquire", "cancel"],
+                &[("drop", "blocked_acquire"), ("cancel", "blocked_acquire")],
+                "blocked acquirers wake in ticket order after release",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 9);
+    });
+}
+
+#[test]
+fn loom_mutex_preserves_mutual_exclusion() {
+    loom::model(|| {
+        let value = Arc::new(Mutex::new(0usize));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_inside = Arc::new(AtomicUsize::new(0));
+
+        let v1 = Arc::clone(&value);
+        let i1 = Arc::clone(&inside);
+        let m1 = Arc::clone(&max_inside);
+        let t1 = thread::spawn(move || {
+            let mut guard = v1.lock().unwrap();
+            let previously_inside = i1.fetch_add(1, Ordering::SeqCst);
+            update_max(&m1, previously_inside + 1);
+            assert_eq!(previously_inside, 0, "mutex allowed overlapping writers");
+            *guard += 1;
+            i1.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let v2 = Arc::clone(&value);
+        let i2 = Arc::clone(&inside);
+        let m2 = Arc::clone(&max_inside);
+        let t2 = thread::spawn(move || {
+            let mut guard = v2.lock().unwrap();
+            let previously_inside = i2.fetch_add(1, Ordering::SeqCst);
+            update_max(&m2, previously_inside + 1);
+            assert_eq!(previously_inside, 0, "mutex allowed overlapping writers");
+            *guard += 2;
+            i2.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(*value.lock().unwrap(), 3);
+        assert_eq!(max_inside.load(Ordering::SeqCst), 1);
+    });
+}
+
+// ============================================================================
+// ft-e2usk: Mutex exhaustive proofs
+// ============================================================================
+
+/// ft-e2usk: three concurrent threads each increment the shared
+/// counter twice. Every increment is mutex-serialized, so the final
+/// value must equal `threads * iterations` with no lost updates.
+/// Forbids "lost write" on the contended counter path.
+#[test]
+fn loom_mutex_no_lost_updates_under_contention() {
+    loom::model(|| {
+        let value = Arc::new(Mutex::new(0usize));
+        let mut handles = Vec::new();
+
+        for _ in 0..3 {
+            let v = Arc::clone(&value);
+            handles.push(thread::spawn(move || {
+                for _ in 0..2 {
+                    let mut guard = v.lock().unwrap();
+                    *guard += 1;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(*value.lock().unwrap(), 6, "lost mutex update");
+    });
+}
+
+/// ft-e2usk: dropping a MutexGuard releases the lock so a second
+/// thread can acquire it. The two acquisitions are sequenced; the
+/// second never observes the lock held. This is a per-primitive
+/// no-deadlock invariant for the simplest single-thread sequencing
+/// pattern.
+#[test]
+fn loom_mutex_drop_releases_for_next_acquirer() {
+    loom::model(|| {
+        let value = Arc::new(Mutex::new(0usize));
+
+        let v1 = Arc::clone(&value);
+        let first = thread::spawn(move || {
+            let mut g = v1.lock().unwrap();
+            *g = 100;
+            // guard drops at end of block — lock released.
+        });
+        first.join().unwrap();
+
+        let v2 = Arc::clone(&value);
+        let second = thread::spawn(move || {
+            let g = v2.lock().unwrap();
+            *g
+        });
+        let observed = second.join().unwrap();
+
+        assert_eq!(
+            observed, 100,
+            "second acquirer must observe first thread's write"
+        );
+    });
+}
+
+/// ft-e2usk: try_lock returns Ok when the mutex is free and is
+/// observable as a clean acquisition. The mutex starts unlocked;
+/// try_lock returns a Result, as std does, and this test checks
+/// its successful branch. Contended try_lock behavior is not
+/// exercised by this test or the blocking-lock tests above.
+#[test]
+fn loom_mutex_try_lock_succeeds_when_free() {
+    loom::model(|| {
+        let value = Arc::new(Mutex::new(42usize));
+
+        let v = Arc::clone(&value);
+        let observed = thread::spawn(move || {
+            // No other thread holds the lock — try_lock must
+            // produce Ok(guard) with the inner value visible.
+            // (TryLockError doesn't implement PartialEq, so the
+            // test inspects the Ok branch directly rather than
+            // asserting on a Result equality.)
+            v.try_lock().ok().map(|g| *g)
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            Some(42),
+            "try_lock on a free mutex must succeed and yield the inner value",
+        );
+    });
+}
+
+#[test]
+fn loom_rwlock_preserves_reader_writer_invariant() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let value = Arc::new(RwLock::new(0usize));
+        let active_readers = Arc::new(AtomicUsize::new(0));
+        let active_writers = Arc::new(AtomicUsize::new(0));
+        let max_readers = Arc::new(AtomicUsize::new(0));
+
+        let lock_reader_a = Arc::clone(&value);
+        let active_readers_a = Arc::clone(&active_readers);
+        let writers_a = Arc::clone(&active_writers);
+        let max_a = Arc::clone(&max_readers);
+        let reader_a = thread::spawn(move || {
+            let guard = lock_reader_a.read().unwrap();
+            let prior = active_readers_a.fetch_add(1, Ordering::SeqCst);
+            update_max(&max_a, prior + 1);
+            assert_eq!(
+                writers_a.load(Ordering::SeqCst),
+                0,
+                "writer overlapped with reader"
+            );
+            let observed = *guard;
+            assert!(
+                observed <= 1,
+                "reader observed impossible value after a single writer: {observed}"
+            );
+            thread::yield_now();
+            active_readers_a.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let lock_reader_b = Arc::clone(&value);
+        let active_readers_b = Arc::clone(&active_readers);
+        let writers_b = Arc::clone(&active_writers);
+        let max_b = Arc::clone(&max_readers);
+        let reader_b = thread::spawn(move || {
+            let guard = lock_reader_b.read().unwrap();
+            let prior = active_readers_b.fetch_add(1, Ordering::SeqCst);
+            update_max(&max_b, prior + 1);
+            assert_eq!(
+                writers_b.load(Ordering::SeqCst),
+                0,
+                "writer overlapped with reader"
+            );
+            let observed = *guard;
+            assert!(
+                observed <= 1,
+                "reader observed impossible value after a single writer: {observed}"
+            );
+            thread::yield_now();
+            active_readers_b.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let lock_writer = Arc::clone(&value);
+        let readers_c = Arc::clone(&active_readers);
+        let writers_c = Arc::clone(&active_writers);
+        let writer = thread::spawn(move || {
+            let mut guard = lock_writer.write().unwrap();
+            let prior_writers = writers_c.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(prior_writers, 0, "multiple writers entered simultaneously");
+            assert_eq!(
+                readers_c.load(Ordering::SeqCst),
+                0,
+                "reader overlapped with writer"
+            );
+            *guard += 1;
+            writers_c.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        reader_a.join().unwrap();
+        reader_b.join().unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(*value.read().unwrap(), 1);
+        assert!(max_readers.load(Ordering::SeqCst) <= 2);
+    });
+}
+
+// ============================================================================
+// ft-5omg9: RwLock exhaustive proofs
+// ============================================================================
+
+/// ft-5omg9: independently scheduled readers observe the same
+/// underlying value. This checks read consistency; it does not
+/// establish simultaneous ownership or absence of serialization.
+#[test]
+fn loom_rwlock_concurrent_readers_observe_consistent_value() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(42usize));
+
+        let v1 = Arc::clone(&value);
+        let r1 = thread::spawn(move || *v1.read().unwrap());
+        let v2 = Arc::clone(&value);
+        let r2 = thread::spawn(move || *v2.read().unwrap());
+
+        let observed_a = r1.join().unwrap();
+        let observed_b = r2.join().unwrap();
+
+        assert_eq!(observed_a, 42, "reader A observed wrong value");
+        assert_eq!(observed_b, 42, "reader B observed wrong value");
+    });
+}
+
+/// ft-5omg9: dropping a write guard releases the lock so a
+/// subsequent reader can acquire and observe the write. Tests the
+/// no-deadlock invariant for write-then-read sequencing — the
+/// reader must NOT park forever after the writer drops.
+#[test]
+fn loom_rwlock_drop_writer_releases_for_reader() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(0usize));
+
+        let v_w = Arc::clone(&value);
+        let writer = thread::spawn(move || {
+            let mut g = v_w.write().unwrap();
+            *g = 99;
+            // write guard drops at end-of-scope.
+        });
+        writer.join().unwrap();
+
+        let v_r = Arc::clone(&value);
+        let reader = thread::spawn(move || *v_r.read().unwrap());
+        let observed = reader.join().unwrap();
+
+        assert_eq!(
+            observed, 99,
+            "reader after writer-drop must observe the writer's value",
+        );
+    });
+}
+
+/// ft-5omg9: concurrent writers serialize through the write-lock,
+/// so N concurrent writes produce a final value of N. Forbids
+/// "lost write" on the contended writer path. Mirrors the Mutex
+/// no-lost-updates proof but exercises the writer-side branch of
+/// the RwLock state machine.
+#[test]
+fn loom_rwlock_no_lost_writes_under_writer_contention() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(0usize));
+
+        let v_a = Arc::clone(&value);
+        let writer_a = thread::spawn(move || {
+            let mut g = v_a.write().unwrap();
+            *g += 1;
+        });
+
+        let v_b = Arc::clone(&value);
+        let writer_b = thread::spawn(move || {
+            let mut g = v_b.write().unwrap();
+            *g += 1;
+        });
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        assert_eq!(
+            *value.read().unwrap(),
+            2,
+            "lost RwLock write under writer-writer contention",
+        );
+    });
+}
+
+#[derive(Debug)]
+struct LoomTicketSemaphore {
+    state: Mutex<LoomTicketSemaphoreState>,
+    cv: Condvar,
+}
+
+#[derive(Debug)]
+struct LoomTicketSemaphoreState {
+    available: usize,
+    serving_ticket: usize,
+    held: usize,
+    max_held: usize,
+}
+
+impl LoomTicketSemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(LoomTicketSemaphoreState {
+                available: permits,
+                serving_ticket: 0,
+                held: 0,
+                max_held: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire_owned(semaphore: Arc<Self>, ticket: usize) -> LoomSemaphorePermit {
+        {
+            let mut state = semaphore.state.lock().unwrap();
+            while state.available == 0 || state.serving_ticket != ticket {
+                state = semaphore.cv.wait(state).unwrap();
+            }
+            state.available -= 1;
+            state.serving_ticket += 1;
+            // Count actual held permits at acquisition, without introducing
+            // unrelated atomic-counter schedules after the lock is released.
+            state.held += 1;
+            state.max_held = state.max_held.max(state.held);
+        }
+        LoomSemaphorePermit { semaphore }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.held -= 1;
+        state.available += 1;
+        self.cv.notify_all();
+    }
+
+    fn available_permits(&self) -> usize {
+        self.state.lock().unwrap().available
+    }
+}
+
+#[derive(Debug)]
+struct LoomSemaphorePermit {
+    semaphore: Arc<LoomTicketSemaphore>,
+}
+
+impl Drop for LoomSemaphorePermit {
+    fn drop(&mut self) {
+        self.semaphore.release();
+    }
+}
+
+#[test]
+fn loom_semaphore_never_exceeds_capacity() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(2));
+
+        let sem_a = Arc::clone(&semaphore);
+        let t1 = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_a, 0);
+        });
+
+        let sem_b = Arc::clone(&semaphore);
+        let t2 = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_b, 1);
+        });
+
+        // Keep three concurrent acquirers, with the model thread serving as
+        // the third. Acquisition and Drop still take separate locks, so Loom
+        // explores schedules with overlapping permit lifetimes.
+        let third = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 2);
+        drop(third);
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let state = semaphore.state.lock().unwrap();
+        assert_eq!(state.available, 2);
+        assert_eq!(state.held, 0);
+        assert!(state.max_held > 0);
+        assert!(
+            state.max_held <= 2,
+            "semaphore exceeded configured capacity"
+        );
+    });
+}
+
+#[test]
+fn loom_semaphore_honors_fifo_waiter_order() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let initial_permit = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 0);
+
+        let sem_first = Arc::clone(&semaphore);
+        let order_first = Arc::clone(&order);
+        let first = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_first, 1);
+            order_first.lock().unwrap().push(1usize);
+        });
+
+        let sem_second = Arc::clone(&semaphore);
+        let order_second = Arc::clone(&order);
+        let second = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_second, 2);
+            order_second.lock().unwrap().push(2usize);
+        });
+
+        thread::yield_now();
+        drop(initial_permit);
+
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        assert_eq!(semaphore.available_permits(), 1);
+    });
+}
+
+// ============================================================================
+// ft-5fbkx: Semaphore exhaustive proofs
+// ============================================================================
+
+/// ft-5fbkx: dropping a SemaphorePermit calls release(), restoring
+/// the available_permits count. Proves the RAII guard's Drop
+/// implementation is the inverse of acquire — single-threaded, so
+/// the schedule space stays small but the contract is pinned.
+#[test]
+fn loom_semaphore_drop_permit_restores_count() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        let permit = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 0);
+        assert_eq!(semaphore.available_permits(), 0);
+
+        drop(permit);
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit drop must restore available_permits",
+        );
+    });
+}
+
+/// ft-5fbkx: an acquirer that parks because available_permits is 0
+/// must wake when a held permit is dropped. This proves the
+/// not-deadlock invariant for the contended semaphore path: the
+/// `cv.notify_all()` in release() reaches the parked thread.
+///
+/// Distinct from the existing FIFO proof by isolating the single
+/// "release wakes parked" linearization point — no second waiter,
+/// no third permit, just the one transition from "permit held" to
+/// "permit available" → "parked thread acquires".
+#[test]
+fn loom_semaphore_release_wakes_blocked_acquirer() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+        let initial_permit = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 0);
+
+        let sem_blocked = Arc::clone(&semaphore);
+        let blocked = thread::spawn(move || {
+            // Parks on the cv until initial_permit drops.
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_blocked, 1);
+        });
+
+        // Yielding gives Loom an opportunity to schedule the spawned
+        // thread into its park branch before this thread releases.
+        thread::yield_now();
+        drop(initial_permit);
+
+        blocked.join().unwrap();
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit accounting must balance after wake-and-acquire-and-drop",
+        );
+    });
+}
+
+/// ft-5fbkx: N concurrent acquire+drop pairs preserve the global
+/// permit count: final available_permits == initial. Forbids leaks
+/// (permit lost on drop) and over-release (count exceeds capacity).
+/// Uses 2 threads × 1 acquire/drop each on a capacity-1 semaphore
+/// — Loom enumerates every interleaving of the two acquire/drop
+/// sequences.
+#[test]
+fn loom_semaphore_concurrent_balanced_no_leak() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+
+        let sem_a = Arc::clone(&semaphore);
+        let t_a = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_a, 0);
+            // permit drops at end-of-scope.
+        });
+
+        let sem_b = Arc::clone(&semaphore);
+        let t_b = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_b, 1);
+        });
+
+        t_a.join().unwrap();
+        t_b.join().unwrap();
+
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "concurrent acquire/drop pairs must preserve capacity",
+        );
+    });
+}

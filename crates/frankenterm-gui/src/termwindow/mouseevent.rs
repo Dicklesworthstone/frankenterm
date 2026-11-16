@@ -1,0 +1,1588 @@
+use crate::tabbar::TabBarItem;
+use crate::termwindow::{
+    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TMB, TermWindowNotif, UIItem, UIItemType,
+};
+use ::window::{
+    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
+    WindowDecorations, WindowOps, WindowState,
+};
+use config::MouseEventAltScreen;
+use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use mux::Mux;
+use mux::pane::Pane;
+use mux::tab::SplitDirection;
+use mux_lua::MuxPane;
+use std::convert::TryInto;
+use std::ops::Sub;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use wezterm_dynamic::ToDynamic;
+use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
+use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
+
+/// The render facts a local pane publishes, which the mouse path reads
+/// instead of locking its terminal (ft-yccm0.2.2.2). None for other panes,
+/// whose getters it keeps, and with FT_DISABLE_LOCK_FREE_MOUSE=1.
+fn published_facts(pane: &dyn Pane) -> Option<Arc<mux::pane::PaneRenderFacts>> {
+    (mux::localpane::lock_free_mouse_enabled()
+        && pane.downcast_ref::<mux::localpane::LocalPane>().is_some())
+    .then(|| pane.render_facts())
+}
+
+/// Whether `pane` reports the mouse; see [`published_facts`].
+fn mouse_grabbed(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(|| pane.is_mouse_grabbed(), |facts| facts.mouse_grabbed)
+}
+
+/// Whether `pane` shows its alternate screen; see [`published_facts`].
+fn alt_screen_active(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(
+        || pane.is_alt_screen_active(),
+        |facts| facts.alt_screen_active,
+    )
+}
+
+/// `pane`'s dimensions; see [`published_facts`].
+pub(super) fn pane_dimensions(pane: &dyn Pane) -> mux::renderable::RenderableDimensions {
+    published_facts(pane).map_or_else(|| pane.get_dimensions(), |facts| facts.dimensions)
+}
+
+fn checked_mouse_stable_row(viewport: StableRowIndex, row: i64) -> Option<StableRowIndex> {
+    let offset = StableRowIndex::try_from(row).ok()?;
+    if offset < 0 {
+        return None;
+    }
+    viewport.checked_add(offset)
+}
+
+fn release_ends_selection_drag(press: MousePress, active_button: Option<MousePress>) -> bool {
+    Some(press) == active_button
+}
+
+pub(super) fn selection_gesture_button(
+    event: &WMEK,
+    held_buttons: &[MousePress],
+) -> Option<MousePress> {
+    match event {
+        WMEK::Press(button) => held_buttons.contains(button).then_some(*button),
+        // MouseEventTrigger::Drag is dispatched for this same last-held button.
+        WMEK::Move => held_buttons.last().copied(),
+        _ => None,
+    }
+}
+
+impl super::TermWindow {
+    fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
+        let x = event.coords.x;
+        let y = event.coords.y;
+        self.ui_items
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(x, y))
+            .cloned()
+    }
+
+    fn leave_ui_item(&mut self, item: &UIItem) {
+        match item.item_type {
+            UIItemType::TabBar(_) => {
+                self.update_title_post_status();
+            }
+            UIItemType::CloseTab(_)
+            | UIItemType::AboveScrollThumb
+            | UIItemType::BelowScrollThumb
+            | UIItemType::ScrollThumb
+            | UIItemType::Split(_) => {}
+        }
+    }
+
+    fn enter_ui_item(&mut self, item: &UIItem) {
+        match item.item_type {
+            UIItemType::TabBar(_) => {}
+            UIItemType::CloseTab(_)
+            | UIItemType::AboveScrollThumb
+            | UIItemType::BelowScrollThumb
+            | UIItemType::ScrollThumb
+            | UIItemType::Split(_) => {}
+        }
+    }
+
+    pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        log::trace!("{:?}", event);
+        let idle_event = match event.kind {
+            WMEK::Move => super::idle_detector::IdleEvent::MouseMove,
+            WMEK::Press(_) | WMEK::Release(_) | WMEK::VertWheel(_) | WMEK::HorzWheel(_) => {
+                super::idle_detector::IdleEvent::MouseClick
+            }
+        };
+        self.record_idle_event(idle_event);
+
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        self.current_mouse_event.replace(event.clone());
+
+        let border = self.get_os_border();
+
+        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.) as isize
+        } else {
+            0
+        } + border.top.get() as isize;
+
+        let (padding_left, padding_top) = self.padding_left_top();
+
+        let cell_h = self.render_metrics.cell_size.height.max(1);
+        let cell_w = (self.render_metrics.cell_size.width as f32).max(1.0);
+        let y = (event
+            .coords
+            .y
+            .sub(padding_top as isize)
+            .sub(first_line_offset)
+            .max(0)
+            / cell_h) as i64;
+
+        let x = (event
+            .coords
+            .x
+            .sub((padding_left + border.left.get() as f32) as isize)
+            .max(0) as f32)
+            / cell_w;
+        let x = if !mouse_grabbed(&*pane) {
+            // Round the x coordinate so that we're a bit more forgiving of
+            // the horizontal position when selecting cells
+            x.round()
+        } else {
+            x
+        }
+        .trunc() as usize;
+
+        let mut y_pixel_offset = event
+            .coords
+            .y
+            .sub(padding_top as isize)
+            .sub(first_line_offset);
+        if y > 0 && self.render_metrics.cell_size.height > 0 {
+            y_pixel_offset = y_pixel_offset.max(0) % self.render_metrics.cell_size.height;
+        }
+
+        let mut x_pixel_offset = event
+            .coords
+            .x
+            .sub((padding_left + border.left.get() as f32) as isize);
+        if x > 0 && self.render_metrics.cell_size.width > 0 {
+            x_pixel_offset = x_pixel_offset.max(0) % self.render_metrics.cell_size.width;
+        }
+
+        self.last_mouse_coords = (x, y);
+
+        let mut capture_mouse = false;
+
+        match event.kind {
+            WMEK::Release(ref press) => {
+                let ends_selection_drag =
+                    release_ends_selection_drag(*press, self.active_selection_drag_button);
+                if ends_selection_drag {
+                    // Mark release before ending drag protection, but resolve
+                    // only after this event's final coordinates are captured.
+                    if let Some(pane_id) = self.active_selection_drag_pane {
+                        if let Some(pending) = self
+                            .pane_state(pane_id)
+                            .as_deref_mut()
+                            .and_then(|state| state.pending_selection_start.as_mut())
+                        {
+                            pending.released = true;
+                            pending.paint_retries_remaining = 3;
+                            if let Some(window) = self.window.as_ref() {
+                                window.invalidate();
+                            }
+                        }
+                    }
+                }
+                // An unrelated release must not drop the captured selection
+                // pane while its initiating button remains held.
+                if ends_selection_drag || self.active_selection_drag_button.is_none() {
+                    self.current_mouse_capture = None;
+                }
+                self.current_mouse_buttons.retain(|p| p != press);
+                if ends_selection_drag {
+                    self.clear_selection_drag();
+                }
+                if press == &MousePress::Left && self.window_drag_position.take().is_some() {
+                    // Completed a window drag
+                    return;
+                }
+                if press == &MousePress::Left && self.dragging.take().is_some() {
+                    // Completed a drag
+                    return;
+                }
+            }
+
+            WMEK::Press(ref press) => {
+                capture_mouse = true;
+                if press == &MousePress::Left {
+                    let other_active_button = self
+                        .active_selection_drag_button
+                        .is_some_and(|button| button != *press);
+                    if !other_active_button {
+                        self.clear_selection_drag();
+                    }
+                }
+
+                // Perform click counting
+                let button = mouse_press_to_tmb(press);
+
+                let click_position = ClickPosition {
+                    column: x,
+                    row: y,
+                    x_pixel_offset,
+                    y_pixel_offset,
+                };
+                let click_interval_ms = self.config.click_interval_ms;
+
+                let click = match self.last_mouse_click.take() {
+                    None => LastMouseClick::new(button, click_position),
+                    Some(click) => click.add(button, click_position, click_interval_ms),
+                };
+                self.last_mouse_click = Some(click);
+                self.current_mouse_buttons.retain(|p| p != press);
+                self.current_mouse_buttons.push(*press);
+            }
+
+            WMEK::Move => {
+                if let Some(start) = self.window_drag_position.as_ref() {
+                    // Dragging the window
+                    // Compute the distance since the initial event
+                    let delta_x = start.screen_coords.x - event.screen_coords.x;
+                    let delta_y = start.screen_coords.y - event.screen_coords.y;
+
+                    // Now compute a new window position.
+                    // We don't have a direct way to get the position,
+                    // but we can infer it by comparing the mouse coords
+                    // with the screen coords in the initial event.
+                    // This computes the original top_left position,
+                    // and applies the total drag delta to it.
+                    let top_left = ::window::ScreenPoint::new(
+                        (start.screen_coords.x - start.coords.x) - delta_x,
+                        (start.screen_coords.y - start.coords.y) - delta_y,
+                    );
+                    // and now tell the window to go there
+                    context.set_window_position(top_left);
+                    return;
+                }
+
+                if let Some((item, start_event)) = self.dragging.take() {
+                    self.drag_ui_item(item, start_event, x, y, event, context);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        let prior_ui_item = self.last_ui_item.clone();
+
+        let ui_item = if matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)) {
+            let ui_item = self.resolve_ui_item(&event);
+
+            match (self.last_ui_item.take(), &ui_item) {
+                (Some(prior), Some(item)) => {
+                    if prior != *item || !self.config.use_fancy_tab_bar {
+                        self.leave_ui_item(&prior);
+                        self.enter_ui_item(item);
+                        context.invalidate();
+                    }
+                }
+                (Some(prior), None) => {
+                    self.leave_ui_item(&prior);
+                    context.invalidate();
+                }
+                (None, Some(item)) => {
+                    self.enter_ui_item(item);
+                    context.invalidate();
+                }
+                (None, None) => {}
+            }
+
+            ui_item
+        } else {
+            None
+        };
+
+        if let Some(item) = ui_item.clone() {
+            if capture_mouse {
+                self.current_mouse_capture = Some(MouseCapture::UI);
+            }
+            self.mouse_event_ui_item(item, pane, y, event, context);
+        } else if matches!(
+            self.current_mouse_capture,
+            None | Some(MouseCapture::TerminalPane(_))
+        ) {
+            self.mouse_event_terminal(
+                pane,
+                ClickPosition {
+                    column: x,
+                    row: y,
+                    x_pixel_offset,
+                    y_pixel_offset,
+                },
+                event,
+                context,
+                capture_mouse,
+            );
+        }
+
+        if prior_ui_item != ui_item {
+            self.update_title_post_status();
+        }
+    }
+
+    pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
+        self.current_mouse_event = None;
+        self.update_title();
+        context.set_cursor(Some(MouseCursor::Arrow));
+        context.invalidate();
+    }
+
+    fn drag_split(
+        &mut self,
+        mut item: UIItem,
+        split: PositionedSplit,
+        start_event: MouseEvent,
+        x: usize,
+        y: i64,
+        context: &dyn WindowOps,
+    ) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let delta = match split.direction {
+            SplitDirection::Horizontal => (x as isize).saturating_sub(split.left as isize),
+            SplitDirection::Vertical => (y as isize).saturating_sub(split.top as isize),
+        };
+
+        if delta != 0 {
+            tab.resize_split_by(split.index, delta);
+            if let Some(split) = tab.iter_splits().into_iter().nth(split.index) {
+                item.item_type = UIItemType::Split(split);
+                context.invalidate();
+            }
+        }
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        let dims = pane_dimensions(&*pane);
+        let current_viewport = self.get_viewport(pane.pane_id());
+
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+            (0.0, tab_bar_height)
+        } else {
+            (tab_bar_height, 0.0)
+        };
+
+        let border = self.get_os_border();
+        let y_offset = top_bar_height + border.top.get() as f32;
+
+        let from_top = start_event.coords.y.saturating_sub(item.y as isize);
+        let effective_thumb_top = event
+            .coords
+            .y
+            .saturating_sub(y_offset as isize + from_top)
+            .max(0) as usize;
+
+        // Convert thumb top into a row index by reversing the math
+        // in ScrollHit::thumb
+        let row = ScrollHit::thumb_top_to_scroll_top(
+            effective_thumb_top,
+            &dims,
+            current_viewport,
+            self.dimensions.pixel_height.saturating_sub(
+                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
+            ),
+            self.min_scroll_bar_height() as usize,
+        );
+        self.set_viewport(pane.pane_id(), Some(row), dims);
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_ui_item(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        x: usize,
+        y: i64,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match item.item_type {
+            UIItemType::Split(split) => {
+                self.drag_split(item, split, start_event, x, y, context);
+            }
+            UIItemType::ScrollThumb => {
+                self.drag_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::TabBar(
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus,
+            ) => {
+                context.set_window_drag_position(event.screen_coords);
+            }
+            UIItemType::TabBar(
+                TabBarItem::Tab { .. }
+                | TabBarItem::NewTabButton { .. }
+                | TabBarItem::WindowButton(_),
+            )
+            | UIItemType::CloseTab(_)
+            | UIItemType::AboveScrollThumb
+            | UIItemType::BelowScrollThumb => {
+                log::trace!("ignoring drag for non-draggable UI item: {:?}", item);
+            }
+        }
+    }
+
+    fn mouse_event_ui_item(
+        &mut self,
+        item: UIItem,
+        pane: Arc<dyn Pane>,
+        _y: i64,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.last_ui_item.replace(item.clone());
+        match item.item_type {
+            UIItemType::TabBar(item) => {
+                self.mouse_event_tab_bar(item, event, context);
+            }
+            UIItemType::AboveScrollThumb => {
+                self.mouse_event_above_scroll_thumb(item, pane, event, context);
+            }
+            UIItemType::ScrollThumb => {
+                self.mouse_event_scroll_thumb(item, pane, event, context);
+            }
+            UIItemType::BelowScrollThumb => {
+                self.mouse_event_below_scroll_thumb(item, pane, event, context);
+            }
+            UIItemType::Split(split) => {
+                self.mouse_event_split(item, split, event, context);
+            }
+            UIItemType::CloseTab(idx) => {
+                self.mouse_event_close_tab(idx, event, context);
+            }
+        }
+    }
+
+    pub fn mouse_event_close_tab(
+        &mut self,
+        idx: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                log::debug!("Should close tab {}", idx);
+                self.close_specific_tab(idx, true);
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn do_new_tab_button_click(&mut self, button: MousePress) {
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+        let action = match button {
+            MousePress::Left => Some(KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain)),
+            MousePress::Right => Some(KeyAssignment::ShowLauncher),
+            MousePress::Middle => None,
+        };
+
+        async fn dispatch_new_tab_button(
+            lua: Option<Rc<mlua::Lua>>,
+            window: GuiWin,
+            pane: MuxPane,
+            button: MousePress,
+            action: Option<KeyAssignment>,
+        ) -> anyhow::Result<()> {
+            let default_action = match lua {
+                Some(lua) => {
+                    let args = lua.pack_multi((
+                        window.clone(),
+                        pane,
+                        format!("{button:?}"),
+                        action.clone(),
+                    ))?;
+                    config::lua::emit_event(
+                        lua.as_ref().clone(),
+                        ("new-tab-button-click".to_string(), args),
+                    )
+                    .await
+                    .map_err(|e| {
+                        log::error!("while processing new-tab-button-click event: {:#}", e);
+                        e
+                    })?
+                }
+                None => true,
+            };
+            if let (true, Some(assignment)) = (default_action, action) {
+                window.window.notify(TermWindowNotif::PerformAssignment {
+                    pane_id: pane.0,
+                    assignment,
+                    tx: None,
+                });
+            }
+            Ok(())
+        }
+        let Some(window) = GuiWin::try_new(self) else {
+            return;
+        };
+        let pane = MuxPane(pane.pane_id());
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(config::with_lua_config_on_main_thread(move |lua| {
+                        dispatch_new_tab_button(lua, window, pane, button, action)
+                    }))
+                    .detach();
+            }
+            rejected => log::error!(
+                "main-thread scheduler rejected new-tab mouse action before Lua dispatch: {rejected:?}"
+            ),
+        }
+    }
+
+    pub fn mouse_event_tab_bar(
+        &mut self,
+        item: TabBarItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => match item {
+                TabBarItem::Tab { tab_idx, .. } => {
+                    self.activate_tab(tab_idx as isize).ok();
+                }
+                TabBarItem::NewTabButton { .. } => {
+                    self.do_new_tab_button_click(MousePress::Left);
+                }
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                    let maximized = self
+                        .window_state
+                        .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
+                    if let Some(ref window) = self.window {
+                        if self.config.window_decorations
+                            == WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
+                        {
+                            if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+                                if maximized {
+                                    window.restore();
+                                } else {
+                                    window.maximize();
+                                }
+                            }
+                        }
+                    }
+                    // Potentially starting a drag by the tab bar
+                    if !maximized {
+                        self.window_drag_position.replace(event.clone());
+                    }
+                    context.request_drag_move();
+                }
+                TabBarItem::WindowButton(button) => {
+                    use window::IntegratedTitleButton as Button;
+                    if let Some(ref window) = self.window {
+                        match button {
+                            Button::Hide => window.hide(),
+                            Button::Maximize => {
+                                let maximized = self
+                                    .window_state
+                                    .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
+                                if maximized {
+                                    window.restore();
+                                } else {
+                                    window.maximize();
+                                }
+                            }
+                            Button::Close => self.close_requested(&window.clone()),
+                        }
+                    }
+                }
+            },
+            WMEK::Press(MousePress::Middle) => match item {
+                TabBarItem::Tab { tab_idx, .. } => {
+                    self.close_specific_tab(tab_idx, true);
+                }
+                TabBarItem::NewTabButton { .. } => {
+                    self.do_new_tab_button_click(MousePress::Middle);
+                }
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::WindowButton(_) => {}
+            },
+            WMEK::Press(MousePress::Right) => match item {
+                TabBarItem::Tab { .. } => {
+                    self.show_tab_navigator();
+                }
+                TabBarItem::NewTabButton { .. } => {
+                    self.do_new_tab_button_click(MousePress::Right);
+                }
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::WindowButton(_) => {}
+            },
+            WMEK::Move => match item {
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                    context.set_window_drag_position(event.screen_coords);
+                }
+                TabBarItem::WindowButton(window::IntegratedTitleButton::Maximize) => {
+                    let Some(item) = self.last_ui_item.clone() else {
+                        return;
+                    };
+                    let bounds: ::window::ScreenRect = euclid::rect(
+                        item.x as isize - (event.coords.x as isize - event.screen_coords.x),
+                        item.y as isize - (event.coords.y as isize - event.screen_coords.y),
+                        item.width as isize,
+                        item.height as isize,
+                    );
+                    context.set_maximize_button_position(bounds);
+                }
+                TabBarItem::WindowButton(_)
+                | TabBarItem::Tab { .. }
+                | TabBarItem::NewTabButton { .. } => {}
+            },
+            WMEK::VertWheel(n) => {
+                if self.config.mouse_wheel_scrolls_tabs {
+                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
+                        .ok();
+                }
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_above_scroll_thumb(
+        &mut self,
+        _item: UIItem,
+        pane: Arc<dyn Pane>,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            let dims = pane_dimensions(&*pane);
+            let current_viewport = self.get_viewport(pane.pane_id());
+            // Page up
+            self.set_viewport(
+                pane.pane_id(),
+                Some(
+                    current_viewport
+                        .unwrap_or(dims.physical_top)
+                        .saturating_sub(self.terminal_size.rows.try_into().unwrap_or(isize::MAX)),
+                ),
+                dims,
+            );
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_below_scroll_thumb(
+        &mut self,
+        _item: UIItem,
+        pane: Arc<dyn Pane>,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            let dims = pane_dimensions(&*pane);
+            let current_viewport = self.get_viewport(pane.pane_id());
+            // Page down
+            self.set_viewport(
+                pane.pane_id(),
+                Some(
+                    current_viewport
+                        .unwrap_or(dims.physical_top)
+                        .saturating_add(self.terminal_size.rows.try_into().unwrap_or(isize::MAX)),
+                ),
+                dims,
+            );
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        _pane: Arc<dyn Pane>,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            // Start a scroll drag
+            // self.scroll_drag_start = Some(from_top);
+            self.dragging = Some((item, event));
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_split(
+        &mut self,
+        item: UIItem,
+        split: PositionedSplit,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(match &split.direction {
+            SplitDirection::Horizontal => MouseCursor::SizeLeftRight,
+            SplitDirection::Vertical => MouseCursor::SizeUpDown,
+        }));
+
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    /// `cursor_click_to_move`: a plain click in the cursor's command line,
+    /// one that made no selection and opened no link, moves the cursor there
+    /// by the arrow keys it takes, as if typed (see `click_to_move`). A click
+    /// that only focused the pane, one with a modifier, and one in a program
+    /// that reads the mouse or shows its alternate screen move nothing.
+    pub(super) fn move_cursor_to_click(&mut self, pane: &Arc<dyn Pane>) {
+        use frankenterm_gui::click_to_move::{ClickToMove, cursor_move_for_click};
+        let rules = ClickToMove {
+            shell_integration: self.config.cursor_click_to_move,
+            cursor_row: self.config.cursor_click_to_move_on_cursor_row,
+        };
+        if !(rules.shell_integration || rules.cursor_row)
+            || !self
+                .current_mouse_event
+                .as_ref()
+                .is_some_and(|event| event.modifiers == ::window::Modifiers::NONE)
+            // An overlay (copy mode, search) reads arrow keys as its own.
+            || !self
+                .get_active_pane_no_overlay()
+                .is_some_and(|active| active.pane_id() == pane.pane_id())
+            || !self.pane_input_ready(pane)
+            || mouse_grabbed(&**pane)
+            || alt_screen_active(&**pane)
+        {
+            return;
+        }
+        let Some((click, click_row)) = self.pane_state(pane.pane_id()).and_then(|state| {
+            if state.click_focused_pane {
+                None
+            } else {
+                state.mouse_terminal_coords
+            }
+        }) else {
+            return;
+        };
+        let cursor = published_facts(&**pane)
+            .map_or_else(|| pane.get_cursor_position(), |facts| facts.cursor);
+        if cursor.visibility != termwiz::surface::CursorVisibility::Visible {
+            return;
+        }
+        let zones = if rules.shell_integration {
+            pane.get_semantic_zones().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let Some(motion) = cursor_move_for_click(
+            rules,
+            &zones,
+            |rows| pane.get_lines(rows),
+            (cursor.y, cursor.x),
+            (click_row, click.column),
+        ) else {
+            return;
+        };
+        log::trace!("click moves the cursor: {motion:?}");
+        for _ in 0..motion.presses {
+            if let Err(error) = pane.key_down(motion.key, wezterm_term::KeyModifiers::NONE) {
+                log::warn!("click-to-move stopped after a refused key: {error:#}");
+                return;
+            }
+            pane.key_up(motion.key, wezterm_term::KeyModifiers::NONE)
+                .ok();
+        }
+    }
+
+    fn mouse_event_terminal(
+        &mut self,
+        mut pane: Arc<dyn Pane>,
+        position: ClickPosition,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+        capture_mouse: bool,
+    ) {
+        let mut is_click_to_focus_pane = false;
+
+        let ClickPosition {
+            mut column,
+            mut row,
+            mut x_pixel_offset,
+            mut y_pixel_offset,
+        } = position;
+
+        let is_already_captured = matches!(
+            self.current_mouse_capture,
+            Some(MouseCapture::TerminalPane(_))
+        );
+        let mut selection_position = None;
+
+        for pos in self.get_panes_to_render() {
+            if !is_already_captured
+                && row >= pos.top as i64
+                && row <= (pos.top + pos.height) as i64
+                && column >= pos.left
+                && column <= pos.left + pos.width
+            {
+                if pane.pane_id() != pos.pane.pane_id() {
+                    // We're over a pane that isn't active
+                    match &event.kind {
+                        WMEK::Press(_) => {
+                            if let Some(mux) = Mux::try_get() {
+                                mux.get_active_tab_for_window(self.mux_window_id)
+                                    .map(|tab| tab.set_active_idx(pos.index));
+                            }
+
+                            pane = Arc::clone(&pos.pane);
+                            is_click_to_focus_pane = true;
+                        }
+                        WMEK::Move => {
+                            if self.config.pane_focus_follows_mouse {
+                                if let Some(mux) = Mux::try_get() {
+                                    mux.get_active_tab_for_window(self.mux_window_id)
+                                        .map(|tab| tab.set_active_idx(pos.index));
+                                }
+
+                                pane = Arc::clone(&pos.pane);
+                                context.invalidate();
+                            }
+                        }
+                        WMEK::Release(_) | WMEK::HorzWheel(_) => {}
+                        WMEK::VertWheel(_) => {
+                            // Let wheel events route to the hovered pane,
+                            // even if it doesn't have focus
+                            pane = Arc::clone(&pos.pane);
+                            context.invalidate();
+                        }
+                    }
+                }
+                column = column.saturating_sub(pos.left);
+                row = row.saturating_sub(pos.top as i64);
+                selection_position = Some(pos);
+                break;
+            } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
+                column = column.saturating_sub(pos.left);
+                row = row.saturating_sub(pos.top as i64).max(0);
+
+                if position.column < pos.left {
+                    x_pixel_offset -= self.render_metrics.cell_size.width
+                        * (pos.left as isize - position.column as isize);
+                }
+                if position.row < pos.top as i64 {
+                    y_pixel_offset -= self.render_metrics.cell_size.height
+                        * (pos.top as isize - position.row as isize);
+                }
+
+                selection_position = Some(pos);
+                break;
+            }
+        }
+
+        if self.admit_gui_pane(pane.pane_id()).is_none() {
+            return;
+        }
+        if capture_mouse {
+            self.current_mouse_capture = Some(MouseCapture::TerminalPane(pane.pane_id()));
+        }
+
+        let is_focused = if let Some(focused) = self.focused.as_ref() {
+            !self.config.swallow_mouse_click_on_window_focus
+                || (focused.elapsed() > Duration::from_millis(200))
+        } else {
+            false
+        };
+
+        if self.focused.is_some() && !is_focused {
+            if matches!(&event.kind, WMEK::Press(_))
+                && self.config.swallow_mouse_click_on_window_focus
+            {
+                // Entering click to focus state
+                self.is_click_to_focus_window = true;
+                context.invalidate();
+                log::trace!("enter click to focus");
+                return;
+            }
+        }
+        if self.is_click_to_focus_window && matches!(&event.kind, WMEK::Release(_)) {
+            // Exiting click to focus state
+            self.is_click_to_focus_window = false;
+            context.invalidate();
+            log::trace!("exit click to focus");
+            return;
+        }
+
+        let allow_action = if self.is_click_to_focus_window || !is_focused {
+            matches!(&event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+        } else {
+            true
+        };
+
+        log::trace!(
+            "is_focused={} allow_action={} event={:?}",
+            is_focused,
+            allow_action,
+            event
+        );
+
+        let current_selection_frame = selection_position
+            .as_ref()
+            .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
+        let mouse_selection_frame = {
+            let Some(state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
+            state
+                .selection_frame
+                .for_mouse(current_selection_frame)
+                .or_else(|| {
+                    // Retain only the coordinates actually displayed at the press.
+                    // A busy source can be retried; a known layout mismatch cannot.
+                    if current_selection_frame.is_some() {
+                        return None;
+                    }
+                    let geometry = self.selection_frame_geometry(selection_position.as_ref()?)?;
+                    state.selection_frame.displayed_for_geometry(geometry)
+                })
+        };
+        // Mouse coordinates belong to the accepted displayed frame. Reading
+        // current dimensions here both waits on native parser/reflow locks
+        // and can map a displayed row onto a different, undisplayed viewport.
+        let stable_row =
+            mouse_selection_frame.and_then(|frame| checked_mouse_stable_row(frame.viewport, row));
+
+        {
+            let Some(mut pane_state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
+            pane_state.mouse_selection_frame = mouse_selection_frame;
+            if matches!(&event.kind, WMEK::Press(_)) {
+                pane_state.click_focused_pane = is_click_to_focus_pane;
+            }
+            if let Some(pending) = pane_state.pending_selection_start.as_mut() {
+                if let Some((frame, stable_row)) = mouse_selection_frame.zip(stable_row) {
+                    pending.retain_endpoint(
+                        frame,
+                        ClickPosition {
+                            column,
+                            row,
+                            x_pixel_offset,
+                            y_pixel_offset,
+                        },
+                        stable_row,
+                        match &event.kind {
+                            WMEK::Release(button) => Some(*button),
+                            _ => None,
+                        },
+                    );
+                }
+            }
+            if let Some(stable_row) = stable_row {
+                pane_state.mouse_terminal_coords.replace((
+                    ClickPosition {
+                        column,
+                        row,
+                        x_pixel_offset,
+                        y_pixel_offset,
+                    },
+                    stable_row,
+                ));
+            } else {
+                // A coordinate outside the stable-row domain cannot safely be
+                // retained for a later click. Continue routing the mouse event
+                // itself, but fail closed for hyperlink hit testing.
+                pane_state.mouse_terminal_coords.take();
+            }
+        }
+
+        // Hit test the rule-expanded cells that reached presentation. Reading
+        // the terminal here can drain parser work, lose the link on contention,
+        // or pick a URL that has never been displayed beneath the pointer.
+        let new_highlight = if !self.pane_input_ready(&pane) {
+            None
+        } else if self.metal_render.is_some() || self.metal.is_some() {
+            selection_position.as_ref().and_then(|position| {
+                self.metal_hyperlink_at(
+                    &pane,
+                    position,
+                    [event.coords.x as f32, event.coords.y as f32],
+                )
+            })
+        } else {
+            mouse_selection_frame
+                .zip(stable_row)
+                .and_then(|(frame, row)| {
+                    self.pane_state(pane.pane_id())?
+                        .selection_frame
+                        .hyperlink_at(&pane, frame, row, event.coords.x as f32)
+                })
+        };
+
+        match (self.current_highlight.as_ref(), new_highlight) {
+            (Some(old_link), Some(new_link)) if Arc::ptr_eq(&old_link, &new_link) => {
+                // Unchanged
+            }
+            (None, None) => {
+                // Unchanged
+            }
+            (_, rhs) => {
+                // We're hovering over a different URL, so invalidate and repaint
+                // so that we render the underline correctly
+                self.current_highlight = rhs;
+                context.invalidate();
+            }
+        };
+
+        let outside_window = event.coords.x < 0
+            || event.coords.x as usize > self.dimensions.pixel_width
+            || event.coords.y < 0
+            || event.coords.y as usize > self.dimensions.pixel_height;
+
+        context.set_cursor(Some(if self.current_highlight.is_some() {
+            // When hovering over a hyperlink, show an appropriate
+            // mouse cursor to give the cue that it is clickable
+            MouseCursor::Hand
+        } else if mouse_grabbed(&*pane) || outside_window {
+            MouseCursor::Arrow
+        } else {
+            MouseCursor::Text
+        }));
+
+        let event_trigger_type = match &event.kind {
+            WMEK::Press(press) => {
+                let press = mouse_press_to_tmb(press);
+                match self.last_mouse_click.as_ref() {
+                    Some(LastMouseClick { streak, button, .. }) if *button == press => {
+                        Some(MouseEventTrigger::Down {
+                            streak: *streak,
+                            button: press,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            WMEK::Release(press) => {
+                let press = mouse_press_to_tmb(press);
+                match self.last_mouse_click.as_ref() {
+                    Some(LastMouseClick { streak, button, .. }) if *button == press => {
+                        Some(MouseEventTrigger::Up {
+                            streak: *streak,
+                            button: press,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            WMEK::Move => {
+                if !self.current_mouse_buttons.is_empty() {
+                    if let Some(LastMouseClick { streak, button, .. }) =
+                        self.last_mouse_click.as_ref()
+                    {
+                        if Some(*button)
+                            == self.current_mouse_buttons.last().map(mouse_press_to_tmb)
+                        {
+                            Some(MouseEventTrigger::Drag {
+                                streak: *streak,
+                                button: *button,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            WMEK::VertWheel(amount) => Some(match *amount {
+                0 => return,
+                1.. => MouseEventTrigger::Down {
+                    streak: 1,
+                    button: MouseButton::WheelUp(*amount as usize),
+                },
+                _ => MouseEventTrigger::Down {
+                    streak: 1,
+                    button: MouseButton::WheelDown(amount.unsigned_abs() as usize),
+                },
+            }),
+            WMEK::HorzWheel(amount) => Some(match *amount {
+                0 => return,
+                1.. => MouseEventTrigger::Down {
+                    streak: 1,
+                    button: MouseButton::WheelLeft(*amount as usize),
+                },
+                _ => MouseEventTrigger::Down {
+                    streak: 1,
+                    button: MouseButton::WheelRight(amount.unsigned_abs() as usize),
+                },
+            }),
+        };
+
+        if allow_action {
+            if let Some(mut event_trigger_type) = event_trigger_type {
+                self.current_event = Some(event_trigger_type.to_dynamic());
+                let mut modifiers = event.modifiers;
+
+                // Since we use shift to force assessing the mouse bindings, pretend
+                // that shift is not one of the mods when the mouse is grabbed.
+                let mut mouse_reporting = mouse_grabbed(&*pane);
+                if mouse_reporting {
+                    if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
+                        modifiers.remove(self.config.bypass_mouse_reporting_modifiers);
+                        mouse_reporting = false;
+                    }
+                }
+
+                if mouse_reporting {
+                    // If they were scrolled back prior to launching an
+                    // application that captures the mouse, then mouse based
+                    // scrolling assignments won't have any effect.
+                    // Ensure that we scroll to the bottom if they try to
+                    // use the mouse so that things are less surprising
+                    self.scroll_to_bottom(&pane);
+                }
+
+                // normalize delta and streak to make mouse assignment
+                // easier to wrangle
+                match event_trigger_type {
+                    MouseEventTrigger::Down {
+                        ref mut streak,
+                        button:
+                            MouseButton::WheelUp(ref mut delta)
+                            | MouseButton::WheelDown(ref mut delta)
+                            | MouseButton::WheelLeft(ref mut delta)
+                            | MouseButton::WheelRight(ref mut delta),
+                    }
+                    | MouseEventTrigger::Up {
+                        ref mut streak,
+                        button:
+                            MouseButton::WheelUp(ref mut delta)
+                            | MouseButton::WheelDown(ref mut delta)
+                            | MouseButton::WheelLeft(ref mut delta)
+                            | MouseButton::WheelRight(ref mut delta),
+                    }
+                    | MouseEventTrigger::Drag {
+                        ref mut streak,
+                        button:
+                            MouseButton::WheelUp(ref mut delta)
+                            | MouseButton::WheelDown(ref mut delta)
+                            | MouseButton::WheelLeft(ref mut delta)
+                            | MouseButton::WheelRight(ref mut delta),
+                    } => {
+                        *streak = 1;
+                        *delta = 1;
+                    }
+                    _ => {}
+                };
+
+                let mouse_mods = config::MouseEventTriggerMods {
+                    mods: modifiers,
+                    mouse_reporting,
+                    alt_screen: if alt_screen_active(&*pane) {
+                        MouseEventAltScreen::True
+                    } else {
+                        MouseEventAltScreen::False
+                    },
+                };
+
+                if let Some(action) = self.input_map.lookup_mouse(event_trigger_type, mouse_mods) {
+                    self.perform_key_assignment(&pane, &action).ok();
+                    return;
+                }
+            }
+        }
+
+        let mouse_event = wezterm_term::MouseEvent {
+            kind: match event.kind {
+                WMEK::Move => TMEK::Move,
+                WMEK::VertWheel(_) | WMEK::HorzWheel(_) | WMEK::Press(_) => TMEK::Press,
+                WMEK::Release(_) => TMEK::Release,
+            },
+            button: match event.kind {
+                WMEK::Release(ref press) | WMEK::Press(ref press) => mouse_press_to_tmb(press),
+                WMEK::Move => {
+                    if event.mouse_buttons == WMB::LEFT {
+                        TMB::Left
+                    } else if event.mouse_buttons == WMB::RIGHT {
+                        TMB::Right
+                    } else if event.mouse_buttons == WMB::MIDDLE {
+                        TMB::Middle
+                    } else {
+                        TMB::None
+                    }
+                }
+                WMEK::VertWheel(amount) => {
+                    if amount > 0 {
+                        TMB::WheelUp(amount as usize)
+                    } else {
+                        TMB::WheelDown(amount.unsigned_abs() as usize)
+                    }
+                }
+                WMEK::HorzWheel(amount) => {
+                    if amount > 0 {
+                        TMB::WheelLeft(amount as usize)
+                    } else {
+                        TMB::WheelRight(amount.unsigned_abs() as usize)
+                    }
+                }
+            },
+            x: column,
+            y: row,
+            x_pixel_offset,
+            y_pixel_offset,
+            modifiers: event.modifiers,
+        };
+
+        if allow_action
+            && !(self.config.swallow_mouse_click_on_pane_focus && is_click_to_focus_pane)
+            && self.pane_input_ready(&pane)
+        {
+            if let Err(error) = pane.mouse_event(mouse_event) {
+                log::error!("mouse input was not accepted: {error:#}");
+            }
+        }
+
+        match event.kind {
+            WMEK::Move => {}
+            _ => {
+                context.invalidate();
+            }
+        }
+    }
+}
+
+fn mouse_press_to_tmb(press: &MousePress) -> TMB {
+    match press {
+        MousePress::Left => TMB::Left,
+        MousePress::Right => TMB::Right,
+        MousePress::Middle => TMB::Middle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checked_mouse_stable_row, release_ends_selection_drag, selection_gesture_button};
+    use crate::termwindow::should_preserve_selection_during_dirty_line_update as preserve_drag;
+    use wezterm_term::StableRowIndex;
+    use window::{MouseEventKind, MousePress};
+
+    #[test]
+    fn mouse_stable_row_conversion_fails_closed_at_domain_boundaries() {
+        assert_eq!(checked_mouse_stable_row(10, 3), Some(13));
+        assert_eq!(checked_mouse_stable_row(10, -1), None);
+        assert_eq!(checked_mouse_stable_row(StableRowIndex::MAX, 1), None);
+    }
+
+    #[test]
+    fn deferred_custom_button_release_retires_only_its_own_gesture() {
+        assert!(!release_ends_selection_drag(
+            MousePress::Left,
+            Some(MousePress::Right)
+        ));
+        assert!(release_ends_selection_drag(
+            MousePress::Right,
+            Some(MousePress::Right)
+        ));
+        assert!(!release_ends_selection_drag(
+            MousePress::Right,
+            Some(MousePress::Middle)
+        ));
+        assert!(release_ends_selection_drag(
+            MousePress::Middle,
+            Some(MousePress::Middle)
+        ));
+        assert!(!release_ends_selection_drag(MousePress::Left, None));
+    }
+
+    #[test]
+    fn initiating_button_survives_pending_resolution_and_matches_chord_dispatch() {
+        let held = [MousePress::Left, MousePress::Right];
+        let active = selection_gesture_button(&MouseEventKind::Press(MousePress::Left), &held);
+        assert_eq!(active, Some(MousePress::Left));
+        // Resolution consumes pending coordinates, not the active button.
+        assert!(!release_ends_selection_drag(MousePress::Right, active));
+        assert!(release_ends_selection_drag(MousePress::Left, active));
+        let active = selection_gesture_button(&MouseEventKind::Move, &held);
+        assert_eq!(active, Some(MousePress::Right));
+        assert!(release_ends_selection_drag(MousePress::Right, active));
+        assert!(
+            selection_gesture_button(&MouseEventKind::Release(MousePress::Right), &held).is_none()
+        );
+        assert!(
+            selection_gesture_button(&MouseEventKind::Press(MousePress::Middle), &held).is_none()
+        );
+        let capture = Some(crate::termwindow::MouseCapture::TerminalPane(42));
+        assert!(preserve_drag(
+            &capture,
+            &[MousePress::Right],
+            Some(42),
+            active,
+            42,
+        ));
+        assert!(!preserve_drag(
+            &capture,
+            &[MousePress::Left],
+            Some(42),
+            active,
+            42,
+        ));
+    }
+
+    /// ft-yccm0.2.2.2: the mouse path's grabbed, alternate-screen and
+    /// dimension reads of a local pane are its published render facts, not
+    /// a terminal lock, for a grabbed pane on the alternate screen and for
+    /// one that is neither.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_reads_a_local_panes_published_facts() {
+        use mux::pane::Pane;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        for (id, output, grabbed) in [
+            (998_321, &b"\x1b[?1000h\x1b[?1049h"[..], true),
+            (998_322, &b"plain"[..], false),
+        ] {
+            let terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 4,
+                    cols: 20,
+                    dpi: 96,
+                    pixel_width: 160,
+                    pixel_height: 64,
+                },
+                Arc::new(FactsConfig),
+                "mouse-facts-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+                id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                id,
+                [0x35; 16],
+                "mouse facts test".to_owned(),
+            ));
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+            pane.perform_actions(actions).unwrap();
+
+            let facts = pane.render_facts();
+            assert_eq!(facts.mouse_grabbed, grabbed);
+            assert_eq!(facts.alt_screen_active, grabbed);
+            assert!(super::published_facts(&*pane).is_some_and(|read| Arc::ptr_eq(&read, &facts)));
+            assert_eq!(super::mouse_grabbed(&*pane), grabbed);
+            assert_eq!(super::alt_screen_active(&*pane), grabbed);
+            assert_eq!(super::pane_dimensions(&*pane), facts.dimensions);
+            pane.kill();
+        }
+    }
+
+    /// ft-yccm0.2.2.2 acceptance: while another thread holds a local pane's
+    /// terminal mutex for 500 ms, the mouse path on the main thread returns
+    /// at once. Its reads (grabbed, alternate screen, dimensions) are
+    /// published facts, and the report for a grabbed pane is queued for the
+    /// pane to apply after the holder. The M.4 ledger records no wait.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_never_waits_for_a_terminal_another_thread_holds() {
+        use frankenterm_alloc::resource_ledger::TerminalLockLedger;
+        use mux::pane::{Pane, WithPaneLines};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Holds a pane's terminal mutex from inside `with_lines_mut`.
+        struct HoldTerminal {
+            held: std::sync::mpsc::SyncSender<()>,
+            hold: Duration,
+        }
+        impl WithPaneLines for HoldTerminal {
+            fn with_lines_mut(
+                &mut self,
+                _first: StableRowIndex,
+                _lines: &mut [&mut termwiz::surface::Line],
+            ) {
+                let _ = self.held.send(());
+                std::thread::sleep(self.hold);
+            }
+        }
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+
+        const HOLD: Duration = Duration::from_millis(500);
+        let terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 20,
+                dpi: 96,
+                pixel_width: 160,
+                pixel_height: 64,
+            },
+            Arc::new(FactsConfig),
+            "mouse-hold-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_323,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_323,
+            [0x36; 16],
+            "mouse hold test".to_owned(),
+        ));
+        // SGR mouse reporting on the alternate screen: a grabbed pane.
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"\x1b[?1000h\x1b[?1006h\x1b[?1049h", |action| {
+                actions.push(action)
+            });
+        pane.perform_actions(actions).unwrap();
+        let dims = pane.render_facts().dimensions;
+
+        let released = AtomicBool::new(false);
+        let (elapsed, grabbed, alt_screen, read_dims, before, after) =
+            std::thread::scope(|scope| {
+                let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+                let (pane, released) = (&pane, &released);
+                scope.spawn(move || {
+                    pane.with_lines_mut(
+                        0..1,
+                        &mut HoldTerminal {
+                            held: held_tx,
+                            hold: HOLD,
+                        },
+                    );
+                    released.store(true, Ordering::Release);
+                });
+                held_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the holder took the terminal");
+                let before = TerminalLockLedger::global().snapshot();
+                // The ledger counts waits by threads named "main", the name
+                // std gives the process's main thread, the AppKit thread.
+                let reads = std::thread::Builder::new()
+                    .name("main".to_string())
+                    .spawn_scoped(scope, move || {
+                        let started = Instant::now();
+                        let grabbed = super::mouse_grabbed(&**pane);
+                        let alt_screen = super::alt_screen_active(&**pane);
+                        let read_dims = super::pane_dimensions(&**pane);
+                        pane.mouse_event(wezterm_term::MouseEvent {
+                            kind: wezterm_term::input::MouseEventKind::Press,
+                            x: 3,
+                            y: 1,
+                            x_pixel_offset: 0,
+                            y_pixel_offset: 0,
+                            button: wezterm_term::input::MouseButton::Left,
+                            modifiers: wezterm_term::KeyModifiers::NONE,
+                        })
+                        .unwrap();
+                        (started.elapsed(), grabbed, alt_screen, read_dims)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                let after = TerminalLockLedger::global().snapshot();
+                assert!(
+                    !released.load(Ordering::Acquire),
+                    "the terminal was held throughout the mouse path"
+                );
+                (reads.0, reads.1, reads.2, reads.3, before, after)
+            });
+        assert!(released.load(Ordering::Acquire));
+        assert!(grabbed && alt_screen, "the pane reads as grabbed");
+        assert_eq!(read_dims, dims);
+        // A bound, not an equality: the ledger is process-wide, and a test
+        // on another thread named "main" (paint's bounded capture) may wait
+        // in the same window. Waiting out the holder would be ~500 ms.
+        let blocked =
+            Duration::from_nanos(after.main_thread_blocked_ns - before.main_thread_blocked_ns);
+        assert!(
+            blocked < Duration::from_millis(50),
+            "the main thread was blocked {blocked:?} while the terminal was held for {HOLD:?}"
+        );
+        eprintln!("mouse path while the terminal was held: {elapsed:?}");
+        // Honest slack for a loaded debug build; any wait would be ~500 ms.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the mouse path took {elapsed:?} while the terminal was held for {HOLD:?}"
+        );
+        pane.kill();
+    }
+}

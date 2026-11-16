@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.approval_needed",
+    "agent_type": "claude_code",
+    "event_type": "session.approval_needed",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "action": "proceed"
+    },
+    "matched_text": "proceed with the deployment?"
+  }
+]

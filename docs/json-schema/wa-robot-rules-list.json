@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-list.json",
+  "title": "WA Robot Rules List Response",
+  "description": "Schema for the data field when calling 'wa robot rules list'. Lists pattern detection rules.",
+  "type": "object",
+  "required": ["rules"],
+  "properties": {
+    "rules": {
+      "type": "array",
+      "description": "Pattern detection rules",
+      "items": {
+        "$ref": "#/$defs/rule_item"
+      }
+    },
+    "pack_filter": {
+      "type": "string",
+      "description": "Pack ID filter applied (if any)"
+    },
+    "agent_type_filter": {
+      "type": "string",
+      "description": "Agent type filter applied (if any)"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "rule_item": {
+      "type": "object",
+      "description": "A pattern detection rule",
+      "required": ["id", "agent_type", "event_type", "severity", "anchor_count", "has_regex"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Full rule ID (e.g., 'core.codex:usage_warning_25')"
+        },
+        "agent_type": {
+          "type": "string",
+          "description": "Agent type this rule applies to"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Event type produced (e.g., 'usage.warning')"
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity level (e.g., 'info', 'warning', 'critical')"
+        },
+        "description": {
+          "type": "string",
+          "description": "What this rule detects"
+        },
+        "workflow": {
+          "type": "string",
+          "description": "Associated workflow (if any)"
+        },
+        "anchor_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of anchor patterns in this rule"
+        },
+        "has_regex": {
+          "type": "boolean",
+          "description": "Whether this rule uses regex matching"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

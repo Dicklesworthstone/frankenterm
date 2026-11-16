@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-search-index-stats.json",
+  "title": "WA Robot Search Index Stats Response",
+  "description": "Schema for the data field when calling 'wa robot search-index stats'. Returns a health and freshness snapshot for the on-disk search index.",
+  "type": "object",
+  "required": [
+    "index_dir",
+    "state_path",
+    "format_version",
+    "document_count",
+    "segment_count",
+    "index_size_bytes",
+    "pending_docs",
+    "max_index_size_bytes",
+    "ttl_days",
+    "flush_interval_secs",
+    "flush_docs_threshold",
+    "source_counts",
+    "embedder_tiers_available",
+    "background_job_status",
+    "indexing_error_count"
+  ],
+  "properties": {
+    "index_dir": {
+      "type": "string",
+      "description": "Filesystem path to the Tantivy index directory"
+    },
+    "state_path": {
+      "type": "string",
+      "description": "Filesystem path to the index state file"
+    },
+    "format_version": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Current on-disk index format version"
+    },
+    "document_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of searchable documents currently stored"
+    },
+    "segment_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of index segments currently present"
+    },
+    "index_size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Approximate on-disk index size in bytes"
+    },
+    "pending_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents queued for the next flush"
+    },
+    "max_index_size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Configured index size cap before eviction/cleanup"
+    },
+    "ttl_days": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Retention window applied to indexed content"
+    },
+    "flush_interval_secs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Configured background flush interval"
+    },
+    "flush_docs_threshold": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Queued-document threshold that triggers a flush"
+    },
+    "newest_captured_at_ms": {
+      "type": ["integer", "null"],
+      "description": "Newest indexed capture timestamp (epoch ms)"
+    },
+    "oldest_captured_at_ms": {
+      "type": ["integer", "null"],
+      "description": "Oldest indexed capture timestamp (epoch ms)"
+    },
+    "freshness_age_ms": {
+      "type": ["integer", "null"],
+      "description": "Age of the newest indexed capture relative to now (ms)"
+    },
+    "last_update_ts": {
+      "type": ["integer", "null"],
+      "description": "Timestamp of the last successful index update (epoch ms)"
+    },
+    "source_counts": {
+      "type": "object",
+      "description": "Indexed document counts grouped by source type",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "embedder_tiers_available": {
+      "type": "array",
+      "description": "Embedding tiers currently available for semantic indexing",
+      "items": {
+        "type": "string"
+      }
+    },
+    "background_job_status": {
+      "type": "string",
+      "description": "Background indexing job state"
+    },
+    "indexing_error_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of recent indexing errors tracked in state"
+    },
+    "last_error": {
+      "type": ["string", "null"],
+      "description": "Most recent indexing error message, if recorded"
+    }
+  },
+  "additionalProperties": false
+}

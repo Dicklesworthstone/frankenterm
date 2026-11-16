@@ -1,0 +1,16 @@
+.{
+    .name = .ghostty_h2h_probe,
+    .version = "0.1.0",
+    .fingerprint = 0xb4ad92d1afa9d278,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Rendered by scripts/ghostty-headless-h2h.sh: the path from the
+        // scratch build tree to the pinned Ghostty checkout.
+        .ghostty = .{ .path = "@GHOSTTY_PATH@" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

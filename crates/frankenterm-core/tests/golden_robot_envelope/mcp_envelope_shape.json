@@ -1,0 +1,26 @@
+{
+  "error": {
+    "ok": false,
+    "error": "bad input",
+    "error_code": "FT-MCP-0001",
+    "hint": "fix it",
+    "elapsed_ms": 7,
+    "version": "[VERSION]",
+    "now": "[NOW_MS]",
+    "mcp_version": "v1"
+  },
+  "success": {
+    "ok": true,
+    "data": {
+      "items": [
+        "pane-1",
+        "pane-2"
+      ],
+      "status": "ready"
+    },
+    "elapsed_ms": 12,
+    "version": "[VERSION]",
+    "now": "[NOW_MS]",
+    "mcp_version": "v1"
+  }
+}

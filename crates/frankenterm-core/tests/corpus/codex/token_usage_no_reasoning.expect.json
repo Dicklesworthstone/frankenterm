@@ -1,0 +1,16 @@
+[
+  {
+    "rule_id": "codex.session.token_usage",
+    "agent_type": "codex",
+    "event_type": "session.summary",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "total": "2,500",
+      "input": "1,200",
+      "cached": "300",
+      "output": "1,000"
+    },
+    "matched_text": "total=2,500 input=1,200 (+ 300 cached) output=1,000"
+  }
+]

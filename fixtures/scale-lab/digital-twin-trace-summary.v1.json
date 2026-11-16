@@ -1,0 +1,115 @@
+{
+  "schema_version": "ft.digital_twin_trace.v1",
+  "generated_at_ms": 4000,
+  "trace_hash": "232d5d2fb6db8ad94f5cc71c613e9a1f5e01605d3db647e350413e0d96a85ee3",
+  "source_artifact_hashes": [
+    "0e2e0a2a8a2efdcd398b1dd596e1fd2758b54040c2ab93ccf6924454b43550cf",
+    "3bb2da12ca020ef7ba37ea950784221cdc26ba42378f58340e2263a172f4a902",
+    "9436fd0a9f0da7102b7e441395503bb8d49b5855d141ebc90f11a2b89213eeeb",
+    "aef69202934af450470b20b9c10bb760a21e01145e821d56987c3a7aa49d5002",
+    "golden-degraded",
+    "golden-healthy",
+    "golden-pressured"
+  ],
+  "steps": [
+    {
+      "step_id": "healthy",
+      "source": "resource_admission",
+      "monotonic_ms": 10,
+      "source_hash": "9436fd0a9f0da7102b7e441395503bb8d49b5855d141ebc90f11a2b89213eeeb",
+      "source_artifact_hashes": [
+        "golden-healthy"
+      ],
+      "queue_utilization": 0.2,
+      "pending_items": 2,
+      "admission_action": "admit",
+      "reason_codes": [
+        "healthy"
+      ],
+      "raw_pressure_severity": 0,
+      "effective_pressure_severity": 0,
+      "fleet_pressure": "normal",
+      "memory_tier_pressure": "normal",
+      "max_latency_over_budget_ratio": 0.5,
+      "pressure_score": 0
+    },
+    {
+      "step_id": "pressured",
+      "source": "resource_admission",
+      "monotonic_ms": 20,
+      "source_hash": "0e2e0a2a8a2efdcd398b1dd596e1fd2758b54040c2ab93ccf6924454b43550cf",
+      "source_artifact_hashes": [
+        "golden-pressured"
+      ],
+      "queue_utilization": 0.84,
+      "pending_items": 48,
+      "admission_action": "defer",
+      "reason_codes": [
+        "fleet_pressure",
+        "queue_elevated"
+      ],
+      "raw_pressure_severity": 1,
+      "effective_pressure_severity": 1,
+      "fleet_pressure": "elevated",
+      "memory_tier_pressure": "elevated",
+      "max_latency_over_budget_ratio": 1.1,
+      "pressure_score": 1
+    },
+    {
+      "step_id": "degraded",
+      "source": "resource_admission",
+      "monotonic_ms": 30,
+      "source_hash": "aef69202934af450470b20b9c10bb760a21e01145e821d56987c3a7aa49d5002",
+      "source_artifact_hashes": [
+        "golden-degraded"
+      ],
+      "queue_utilization": 0.94,
+      "pending_items": 96,
+      "admission_action": "degrade",
+      "reason_codes": [
+        "latency_stage_over_budget",
+        "memory_tier_pressure",
+        "queue_saturated"
+      ],
+      "raw_pressure_severity": 2,
+      "effective_pressure_severity": 2,
+      "fleet_pressure": "critical",
+      "memory_tier_pressure": "critical",
+      "max_latency_over_budget_ratio": 1.75,
+      "pressure_score": 2
+    },
+    {
+      "step_id": "missing_telemetry",
+      "source": "resource_admission",
+      "monotonic_ms": 40,
+      "source_hash": "3bb2da12ca020ef7ba37ea950784221cdc26ba42378f58340e2263a172f4a902",
+      "source_artifact_hashes": [
+        "3bb2da12ca020ef7ba37ea950784221cdc26ba42378f58340e2263a172f4a902"
+      ],
+      "admission_action": "defer",
+      "reason_codes": [
+        "missing_fleet_telemetry",
+        "missing_latency_telemetry",
+        "missing_memory_tier_telemetry",
+        "missing_queue_telemetry"
+      ],
+      "raw_pressure_severity": 1,
+      "effective_pressure_severity": 1,
+      "pressure_score": 1,
+      "quality_flags": [
+        "missing_queue_telemetry",
+        "missing_fleet_telemetry",
+        "missing_memory_tier_telemetry",
+        "missing_latency_telemetry",
+        "derived_source_hash"
+      ]
+    }
+  ],
+  "quality_flags": [
+    "missing_queue_telemetry",
+    "missing_fleet_telemetry",
+    "missing_memory_tier_telemetry",
+    "missing_latency_telemetry",
+    "derived_source_hash"
+  ]
+}

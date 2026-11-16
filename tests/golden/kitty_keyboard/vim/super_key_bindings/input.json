@@ -1,0 +1,10 @@
+{
+  "mode": "\u001b[>11;1u",
+  "flags": 11,
+  "events": [
+    {
+      "key": "p",
+      "modifiers": ["SUPER"]
+    }
+  ]
+}

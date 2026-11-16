@@ -1,0 +1,6 @@
+Configuration reference:
+
+Using model: gpt-4o-mini
+Set `model:` in your local tool config if you want a different provider.
+
+This is documentation text, not a live Claude Code status line.

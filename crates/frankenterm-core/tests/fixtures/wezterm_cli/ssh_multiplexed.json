@@ -1,0 +1,50 @@
+[
+  {
+    "pane_id": 0,
+    "tab_id": 0,
+    "window_id": 0,
+    "domain_name": "local",
+    "workspace": "default",
+    "size": {
+      "rows": 24,
+      "cols": 80
+    },
+    "title": "local shell",
+    "cwd": "file:///home/user",
+    "is_active": false,
+    "is_zoomed": false
+  },
+  {
+    "pane_id": 1,
+    "tab_id": 1,
+    "window_id": 0,
+    "domain_id": 1,
+    "domain_name": "ssh:prod-server",
+    "workspace": "default",
+    "size": {
+      "rows": 48,
+      "cols": 120
+    },
+    "title": "prod-server: /var/log",
+    "cwd": "file://prod-server/var/log",
+    "is_active": true,
+    "is_zoomed": false,
+    "tty_name": "/dev/pts/1"
+  },
+  {
+    "pane_id": 2,
+    "tab_id": 2,
+    "window_id": 0,
+    "domain_id": 2,
+    "domain_name": "ssh:staging-server",
+    "workspace": "default",
+    "size": {
+      "rows": 48,
+      "cols": 120
+    },
+    "title": "staging-server: ~",
+    "cwd": "file://staging-server/home/deploy",
+    "is_active": false,
+    "is_zoomed": false
+  }
+]

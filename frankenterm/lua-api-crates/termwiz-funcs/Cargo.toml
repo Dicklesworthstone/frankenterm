@@ -1,0 +1,25 @@
+[package]
+name = "termwiz-funcs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["lua", "async-asupersync"]
+lua = ["dep:luahelper", "dep:mlua", "config/lua"]
+async-smol = ["config/async-smol"]
+async-asupersync = ["config/async-asupersync"]
+
+[dependencies]
+anyhow.workspace = true
+config = { path = "../../config", default-features = false }
+finl_unicode.workspace = true
+lazy_static.workspace = true
+luahelper = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true }
+terminfo.workspace = true
+termwiz = { workspace=true, features=["use_serde"] }
+frankenterm-dynamic.workspace = true
+frankenterm-input-types.workspace = true

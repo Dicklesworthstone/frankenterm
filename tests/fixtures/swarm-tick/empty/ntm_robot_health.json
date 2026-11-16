@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "session": "frankenterm",
+  "summary": {
+    "total": 0,
+    "healthy": 0,
+    "degraded": 0,
+    "unhealthy": 0,
+    "rate_limited": 0
+  }
+}

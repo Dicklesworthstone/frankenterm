@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "wezterm.pane.exited",
+    "agent_type": "wezterm",
+    "event_type": "pane.exited",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "exit_code": "0"
+    },
+    "matched_text": "status 0"
+  }
+]

@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "ft-tf6g3.14",
+  "scenario_id": "resource_cockpit_target_class",
+  "run_id": "20260512T150000Z",
+  "status": "skipped_not_proven",
+  "exit_code": 0,
+  "artifact_dir": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z",
+  "sku": {
+    "id": "linux-x86_64-high-core",
+    "major_sku": "linux",
+    "description": "Linux x86_64 high-core swarm host",
+    "high_scale_sku": true,
+    "required": {
+      "os_family": "Linux",
+      "arch": "x86_64",
+      "logical_cpus": 64,
+      "memory_gib": 256,
+      "disk_free_gib": 200,
+      "kernel_major": 6,
+      "os_version_major": 0
+    }
+  },
+  "observed_host": {
+    "os_family": "Darwin",
+    "arch": "arm64",
+    "kernel_release": "25.2.0",
+    "os_name": "macOS",
+    "os_version": "26.2",
+    "os_build": "25C56",
+    "logical_cpus": 14,
+    "memory_gib": 64,
+    "disk_free_gib": 285
+  },
+  "target_sku_predicate": {
+    "met": false,
+    "checks": {
+      "os_family": false,
+      "arch": false,
+      "logical_cpus": false,
+      "memory_gib": false,
+      "disk_free_gib": true,
+      "kernel_major": true,
+      "os_version_major": true
+    }
+  },
+  "hardware_predicate": {
+    "required_logical_cpus": 64,
+    "required_memory_gib": 256,
+    "observed_logical_cpus": 14,
+    "observed_memory_gib": 64,
+    "target_class": false,
+    "proof_status": "skipped_not_proven",
+    "failure_reasons": [
+      "target_class.high_scale_predicate_absent",
+      "target_class.cpu_below_sku_floor",
+      "target_class.memory_below_sku_floor",
+      "target_class.os_family_mismatch",
+      "target_class.arch_mismatch"
+    ]
+  },
+  "evidence": {
+    "target_hardware": "skipped_not_proven",
+    "skipped_not_proven": true,
+    "high_scale_claim_allowed": false,
+    "conformance": "not_run_predicate_absent",
+    "conformance_summary": null,
+    "rch_capabilities": {
+      "status": "passed",
+      "max_worker_logical_cpus": 10
+    }
+  },
+  "release_bundle_gate": {
+    "requires_artifact_per_major_sku": true,
+    "major_sku": "linux",
+    "artifact_path_pattern": "tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json"
+  },
+  "artifacts": {
+    "host": "host.json",
+    "commands": "commands.txt",
+    "rch_worker_capabilities": "rch-worker-capabilities.json",
+    "rch_worker_capabilities_stderr": "rch-worker-capabilities.stderr.log",
+    "conformance_log": "resource-cockpit-conformance.log"
+  }
+}

@@ -1,0 +1,179 @@
+name: resize_multi_tab_storm
+description: "Eight panes across four tabs; synchronized resize storm and cross-pane font transitions"
+duration: "8s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "1002"
+  scale_profile: multi_tab_resize_storm
+  pane_count: "8"
+  tab_count: "4"
+  scrollback_lines: "12000"
+  font_steps: "8"
+panes:
+  - id: 0
+    title: "tab0-left"
+    window_id: 0
+    tab_id: 0
+    cols: 100
+    rows: 30
+  - id: 1
+    title: "tab0-right"
+    window_id: 0
+    tab_id: 0
+    cols: 100
+    rows: 30
+  - id: 2
+    title: "tab1-left"
+    window_id: 0
+    tab_id: 1
+    cols: 100
+    rows: 30
+  - id: 3
+    title: "tab1-right"
+    window_id: 0
+    tab_id: 1
+    cols: 100
+    rows: 30
+  - id: 4
+    title: "tab2-left"
+    window_id: 0
+    tab_id: 2
+    cols: 100
+    rows: 30
+  - id: 5
+    title: "tab2-right"
+    window_id: 0
+    tab_id: 2
+    cols: 100
+    rows: 30
+  - id: 6
+    title: "tab3-left"
+    window_id: 0
+    tab_id: 3
+    cols: 100
+    rows: 30
+  - id: 7
+    title: "tab3-right"
+    window_id: 0
+    tab_id: 3
+    cols: 100
+    rows: 30
+events:
+  - at: "0.1s"
+    pane: 0
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.2s"
+    pane: 1
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.3s"
+    pane: 2
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.4s"
+    pane: 3
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.5s"
+    pane: 4
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.6s"
+    pane: 5
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.7s"
+    pane: 6
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "0.8s"
+    pane: 7
+    action: generate_scrollback
+    content: "1500x96"
+  - at: "1.2s"
+    pane: 0
+    action: resize
+    content: "140x45"
+  - at: "1.3s"
+    pane: 1
+    action: resize
+    content: "140x45"
+  - at: "1.4s"
+    pane: 2
+    action: resize
+    content: "140x45"
+  - at: "1.5s"
+    pane: 3
+    action: resize
+    content: "140x45"
+  - at: "1.6s"
+    pane: 4
+    action: resize
+    content: "140x45"
+  - at: "1.7s"
+    pane: 5
+    action: resize
+    content: "140x45"
+  - at: "1.8s"
+    pane: 6
+    action: resize
+    content: "140x45"
+  - at: "1.9s"
+    pane: 7
+    action: resize
+    content: "140x45"
+  - at: "2.4s"
+    pane: 0
+    action: set_font_size
+    content: "1.05"
+  - at: "2.5s"
+    pane: 2
+    action: set_font_size
+    content: "1.05"
+  - at: "2.6s"
+    pane: 4
+    action: set_font_size
+    content: "1.05"
+  - at: "2.7s"
+    pane: 6
+    action: set_font_size
+    content: "1.05"
+  - at: "3.2s"
+    pane: 1
+    action: set_font_size
+    content: "0.90"
+  - at: "3.3s"
+    pane: 3
+    action: set_font_size
+    content: "0.90"
+  - at: "3.4s"
+    pane: 5
+    action: set_font_size
+    content: "0.90"
+  - at: "3.5s"
+    pane: 7
+    action: set_font_size
+    content: "0.90"
+  - at: "4.2s"
+    pane: 0
+    action: marker
+    name: wave_a_complete
+  - at: "4.3s"
+    pane: 7
+    action: marker
+    name: wave_b_complete
+expectations:
+  - contains:
+      pane: 0
+      text: "[FONT_SIZE:1.05]"
+  - contains:
+      pane: 7
+      text: "[FONT_SIZE:0.90]"
+  - contains:
+      pane: 0
+      text: "[MARKER:wave_a_complete]"
+  - contains:
+      pane: 7
+      text: "[MARKER:wave_b_complete]"

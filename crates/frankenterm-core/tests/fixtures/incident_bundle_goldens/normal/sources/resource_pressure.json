@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-05-10T11:12:40Z",
+  "pressure": {
+    "cpu_load": "normal",
+    "disk": "normal",
+    "memory": "moderate"
+  },
+  "provenance": {
+    "mutates_state": false,
+    "source_surface": "fixture::resource_pressure_snapshot"
+  },
+  "samples": [
+    {
+      "available_memory_bytes": 68719476736,
+      "label": "fleet-host",
+      "resident_memory_bytes": 2147483648
+    }
+  ]
+}

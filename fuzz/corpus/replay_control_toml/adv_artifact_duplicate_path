@@ -1,0 +1,24 @@
+schema_version = "replay.manifest.v1"
+last_updated_ms = 42
+
+[[artifacts]]
+path = "same.ftreplay"
+label = "one"
+sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+event_count = 1
+decision_count = 1
+created_at_ms = 1
+sensitivity_tier = "t1"
+status = "active"
+size_bytes = 1
+
+[[artifacts]]
+path = "same.ftreplay"
+label = "two"
+sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+event_count = 2
+decision_count = 2
+created_at_ms = 2
+sensitivity_tier = "t1"
+status = "retired"
+size_bytes = 2

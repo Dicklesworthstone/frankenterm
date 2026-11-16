@@ -1,0 +1,462 @@
+# vttest/vt220-screen-display screen dumps (ft-yccm0.1.9): cursor, DECSCNM, then rows.
+# Golden expectations: change only with a recorded reason (README).
+# Screens corrected by hand where legacy is wrong (see xfail.txt): 09, 10, 11, 12, 13, 14, 15, 16.
+=== 00 key ''
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||
+=== 01 key '11\r'
+cursor 17,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11: Non-VT100 Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of VT220 features|
+09 |          2. Test of VT320 features|
+10 |          3. Test of VT420 features|
+11 |          4. Test of VT520 features|
+12 |          5. Test ISO-6429 cursor-movement|
+13 |          6. Test ISO-6429 colors|
+14 |          7. Test other ISO-6429 features|
+15 |          8. Test XTERM special features|
+16 ||
+17 |          Enter choice number (0 - 8):|
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 02 key '1\r'
+cursor 16,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1: VT220 Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test reporting functions|
+09 |          2. Test screen-display functions|
+10 |          3. Test 8-bit controls (S7C1T/S8C1T)|
+11 |          4. Test Printer (MC)|
+12 |          5. Test Soft Character Sets (DECDLD)|
+13 |          6. Test Soft Terminal Reset (DECSTR)|
+14 |          7. Test User-Defined Keys (DECUDK)|
+15 ||
+16 |          Enter choice number (0 - 7):|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 03 key '2\r'
+cursor 13,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1.2: VT220 Screen-Display Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test Send/Receive mode (SRM)|
+09 |          2. Test Visible/Invisible Cursor (DECTCEM)|
+10 |          3. Test Erase Char (ECH)|
+11 |          4. Test Protected-Areas (DECSCA)|
+12 ||
+13 |          Enter choice number (0 - 4):|
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 04 key '2\r'
+cursor 2,14 hidden
+screen normal
+01 |The cursor should be invisible|
+02 |Push <RETURN>|
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 05 key '\r'
+cursor 4,14 visible
+screen normal
+01 |The cursor should be invisible|
+02 |Push <RETURN>|
+03 |The cursor should be visible again|
+04 |Push <RETURN>|
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 06 key '\r'
+cursor 13,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1.2: VT220 Screen-Display Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test Send/Receive mode (SRM)|
+09 |          2. Test Visible/Invisible Cursor (DECTCEM)|
+10 |          3. Test Erase Char (ECH)|
+11 |          4. Test Protected-Areas (DECSCA)|
+12 ||
+13 |          Enter choice number (0 - 4):|
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 07 key '3\r'
+cursor 23,14 visible
+screen normal
+01 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+02 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+03 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+04 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+05 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+06 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+07 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+08 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+09 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+10 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+11 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+12 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+13 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+14 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+15 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+16 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+17 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+18 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+19 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE **|
+20 |                                                 diagonal: ^^ (clear)|
+21 |ECH test: there should be E's with a gap before diagonal of **'s|
+22 |The lower-right diagonal region should be cleared.  Nothing else.|
+23 |Push <RETURN>|
+24 ||
+=== 08 key '\r'
+cursor 13,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1.2: VT220 Screen-Display Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test Send/Receive mode (SRM)|
+09 |          2. Test Visible/Invisible Cursor (DECTCEM)|
+10 |          3. Test Erase Char (ECH)|
+11 |          4. Test Protected-Areas (DECSCA)|
+12 ||
+13 |          Enter choice number (0 - 4):|
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 09 key '4\r'
+cursor 23,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 |                    *****************************************|
+06 |                    *****************************************|
+07 |                    *****************************************|
+08 |                    *****************************************|
+09 |                    *****************************************|
+10 |                    *****************************************|
+11 |                    *****************************************|
+12 |                    *****************************************|
+13 |                    *****************************************|
+14 |                    *****************************************|
+15 |                    *****************************************|
+16 |                    *****************************************|
+17 |                    *****************************************|
+18 ||
+19 ||
+20 ||
+21 |If your terminal supports DEC protected areas (DECSCA, DECSED, DECSEL),|
+22 |there will be an solid box made of *'s in the middle of the screen.|
+23 |Push <RETURN>|
+24 ||
+=== 10 key '\r'
+cursor 23,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 |                    *****************************************|
+06 |                    *****************************************|
+07 |                    *****************************************|
+08 |                    *****************************************|
+09 |                    *****************************************|
+10 |                    *****************************************|
+11 |                    *****************************************|
+12 |                    *****************************************|
+13 |                    *****************************************|
+14 |                    *****************************************|
+15 |                    *****************************************|
+16 |                    *****************************************|
+17 |                    *****************************************|
+18 ||
+19 ||
+20 ||
+21 |If your terminal supports DEC protected areas (DECSCA, ignoring EL/ED),|
+22 |there will be an solid box made of *'s in the middle of the screen.|
+23 |Push <RETURN>|
+24 ||
+=== 11 key '\r'
+cursor 23,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 |                    *****************************************|
+06 |                    *****************************************|
+07 |                    *****************************************|
+08 |                    *****************************************|
+09 |                    *****************************************|
+10 |                    *****************************************|
+11 |                    *****************************************|
+12 |                    *****************************************|
+13 |                    *****************************************|
+14 |                    *****************************************|
+15 |                    *****************************************|
+16 |                    *****************************************|
+17 |                    *****************************************|
+18 ||
+19 ||
+20 ||
+21 |If your terminal supports DEC protected areas (DECSCA, ignoring ECH/ICH/DCH),|
+22 |there will be an solid box made of *'s in the middle of the screen.|
+23 |Push <RETURN>|
+24 ||
+=== 12 key '\r'
+cursor 13,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1.2: VT220 Screen-Display Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test Send/Receive mode (SRM)|
+09 |          2. Test Visible/Invisible Cursor (DECTCEM)|
+10 |          3. Test Erase Char (ECH)|
+11 |          4. Test Protected-Areas (DECSCA)|
+12 ||
+13 |          Enter choice number (0 - 4):|
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 13 key '0\r'
+cursor 16,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1: VT220 Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test reporting functions|
+09 |          2. Test screen-display functions|
+10 |          3. Test 8-bit controls (S7C1T/S8C1T)|
+11 |          4. Test Printer (MC)|
+12 |          5. Test Soft Character Sets (DECDLD)|
+13 |          6. Test Soft Terminal Reset (DECSTR)|
+14 |          7. Test User-Defined Keys (DECUDK)|
+15 ||
+16 |          Enter choice number (0 - 7):|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 14 key '6\r'
+cursor 5,14 visible
+screen normal
+01 |Test Soft Terminal Reset (DECSTR)|
+02 |(VT220 & up)|
+03 ||
+04 |The terminal will now soft-reset|
+05 |Push <RETURN>|
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 15 key '\r'
+cursor 6,14 visible
+screen normal
+01 |Test Soft Terminal Reset (DECSTR)|
+02 |(VT220 & up)|
+03 ||
+04 |The terminal will now soft-reset|
+05 |Push <RETURN>|
+06 |Push <RETURN>|
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 16 key '\r'
+cursor 16,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.1: VT220 Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test reporting functions|
+09 |          2. Test screen-display functions|
+10 |          3. Test 8-bit controls (S7C1T/S8C1T)|
+11 |          4. Test Printer (MC)|
+12 |          5. Test Soft Character Sets (DECDLD)|
+13 |          6. Test Soft Terminal Reset (DECSTR)|
+14 |          7. Test User-Defined Keys (DECUDK)|
+15 ||
+16 |          Enter choice number (0 - 7):|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||

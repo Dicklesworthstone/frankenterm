@@ -1,0 +1,259 @@
+{
+  "agents": [
+    {
+      "agent_id": "codex-idle",
+      "agent_name": "CodexIdle",
+      "bead": {
+        "assignee": "codex",
+        "id": "ft-idle",
+        "status": "in_progress",
+        "status_age_ms": 30000,
+        "title": "Idle fixture bead"
+      },
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "pane_state",
+          "label": "pane 11 classified idle",
+          "observed_at_ms": 1800000000000,
+          "uri": "pane:11"
+        }
+      ],
+      "pane_id": 11,
+      "provider": "codex",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "continue_work",
+        "reason": "recent pane output is quiet but the bead claim is fresh"
+      },
+      "state": "idle",
+      "status_age_ms": 30000
+    },
+    {
+      "agent_id": "claude-active",
+      "agent_name": "ClaudeActive",
+      "bead": {
+        "assignee": "codex",
+        "id": "ft-active",
+        "status": "in_progress",
+        "status_age_ms": 30000,
+        "title": "Active fixture bead"
+      },
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "robot_event",
+          "label": "recent output event",
+          "observed_at_ms": 1800000000000,
+          "uri": "event:active"
+        }
+      ],
+      "pane_id": 12,
+      "provider": "claude",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "continue_work",
+        "reason": "agent is producing output and proof is not due yet"
+      },
+      "state": "active",
+      "status_age_ms": 30000
+    },
+    {
+      "agent_id": "codex-stuck",
+      "agent_name": "CodexStuck",
+      "bead": {
+        "assignee": "codex",
+        "id": "ft-stuck",
+        "status": "in_progress",
+        "status_age_ms": 30000,
+        "title": "Stuck fixture bead"
+      },
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "placeholder_idle_text",
+          "label": "placeholder idle banner",
+          "observed_at_ms": 1800000000000,
+          "uri": "pane:13#placeholder"
+        },
+        {
+          "kind": "robot_event",
+          "label": "same error repeated for 15 minutes",
+          "observed_at_ms": 1800000000000,
+          "uri": "event:stuck"
+        }
+      ],
+      "pane_id": 13,
+      "provider": "codex",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "inspect_pane",
+        "reason": "stale status age plus repeated error event needs inspection"
+      },
+      "risk_flags": [
+        {
+          "code": "stale_pane_state",
+          "evidence_index": 1,
+          "message": "pane state is stale beyond the operator threshold",
+          "severity": "high"
+        }
+      ],
+      "state": "stuck",
+      "status_age_ms": 30000
+    },
+    {
+      "agent_id": "gemini-rate",
+      "agent_name": "GeminiRate",
+      "bead": {
+        "assignee": "codex",
+        "id": "ft-rate",
+        "status": "in_progress",
+        "status_age_ms": 30000,
+        "title": "Rate limit fixture bead"
+      },
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "robot_event",
+          "label": "provider rate limit detected",
+          "observed_at_ms": 1800000000000,
+          "uri": "event:rate-limit"
+        }
+      ],
+      "pane_id": 14,
+      "provider": "gemini",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "wait",
+        "reason": "rate-limit evidence is current and should not be reassigned yet"
+      },
+      "risk_flags": [
+        {
+          "code": "rate_limited",
+          "evidence_index": 0,
+          "message": "provider quota window is active",
+          "severity": "medium"
+        }
+      ],
+      "state": "rate_limited",
+      "status_age_ms": 30000
+    },
+    {
+      "agent_id": "codex-converged",
+      "agent_name": "CodexConverged",
+      "bead": {
+        "assignee": "codex",
+        "id": "ft-done",
+        "status": "closed",
+        "status_age_ms": 30000,
+        "title": "Converged fixture bead"
+      },
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "git_commit",
+          "label": "latest commit pushed",
+          "observed_at_ms": 1800000000000,
+          "uri": "git:abc1234"
+        },
+        {
+          "kind": "proof_lane",
+          "label": "proof lane passed",
+          "observed_at_ms": 1800000000000,
+          "uri": "proof:active-agent-health"
+        }
+      ],
+      "latest_commit": {
+        "authored_at_ms": 1800000000050,
+        "pushed": true,
+        "sha": "abc1234",
+        "summary": "test: active agent health fixture"
+      },
+      "pane_id": 15,
+      "proof_lane": {
+        "artifact_uri": "proof:active-agent-health",
+        "backend": "rch",
+        "command": "cargo test -p frankenterm-core active_agent_health --lib",
+        "last_run_at_ms": 1800000000123,
+        "status": "passed"
+      },
+      "provider": "codex",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "mark_converged",
+        "reason": "bead is closed and the proof lane passed"
+      },
+      "state": "converged",
+      "status_age_ms": 30000
+    },
+    {
+      "agent_id": "unknown-orphan",
+      "agent_name": "UnknownOrphan",
+      "confidence": "high",
+      "cwd": "/Users/demo/projects/frankenterm",
+      "evidence": [
+        {
+          "kind": "manual_note",
+          "label": "operator imported orphan agent row",
+          "observed_at_ms": 1800000000000,
+          "uri": "note:unknown"
+        }
+      ],
+      "provider": "unknown",
+      "recommended_action": {
+        "confidence": "high",
+        "evidence_indices": [
+          0
+        ],
+        "kind": "escalate_human",
+        "reason": "agent has no pane, no bead assignment, and no proof trail"
+      },
+      "risk_flags": [
+        {
+          "code": "unknown_agent",
+          "evidence_index": 0,
+          "message": "agent cannot be correlated to a live pane or bead",
+          "severity": "critical"
+        }
+      ],
+      "state": "unknown",
+      "status_age_ms": 30000
+    }
+  ],
+  "generated_at_ms": 1800000000000,
+  "schema_version": 1,
+  "summary": {
+    "active_agents": 1,
+    "converged_agents": 1,
+    "high_risk_agents": 2,
+    "idle_agents": 1,
+    "missing_bead_assignment": 1,
+    "missing_proof_lane": 5,
+    "needs_human_action": 1,
+    "rate_limited_agents": 1,
+    "stuck_agents": 1,
+    "total_agents": 6,
+    "unknown_agents": 1
+  },
+  "truncated_agents": 0
+}

@@ -1,0 +1,101 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "runtime-async-cancel-tlc-attestation",
+  "category": "proofs/runtime-async-cancel",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T14:19:13Z",
+  "produced_by_bead": "ft-tf6g3.18.2",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the runtime_async Cx cancellation TLA+ model.",
+  "model": {
+    "spec": "docs/specs/runtime-async-cancel.tla",
+    "cfg": "docs/specs/runtime-async-cancel.cfg",
+    "mapping": "docs/specs/runtime-async-cancel-mapping.md",
+    "release_bundle_slot": "proofs/runtime-async-cancel.json",
+    "bounded_model": {
+      "max_history": 2,
+      "primitive_families": [
+        "Mutex",
+        "RwLock",
+        "Semaphore",
+        "mpsc",
+        "watch",
+        "broadcast",
+        "oneshot",
+        "Notify",
+        "sleep",
+        "timeout",
+        "JoinSet",
+        "spawn_blocking"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/runtime-async-cancel.tla",
+    "local_bounded_run": true,
+    "rch_note": "No Cargo, Rust build, or Rust test proof was run locally. This proof uses the repository TLC wrapper for a bounded non-Cargo spec smoke model.",
+    "state_count": 5407,
+    "distinct_state_count": 2962,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/runtime-async-cancel/summary.json",
+      "stdout": "target/tlc/runtime-async-cancel/tlc.stdout.log",
+      "stderr": "target/tlc/runtime-async-cancel/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/runtime-async-cancel.tla",
+      "media_type": "text/plain",
+      "sha256": "241352ffd8fb893ac689fbdb46d954e6768b56084544da668cd677cb99497473",
+      "size_bytes": 11613
+    },
+    {
+      "path": "docs/specs/runtime-async-cancel.cfg",
+      "media_type": "text/plain",
+      "sha256": "0776f75a005eefc78ee3af3af3b884ffb34cbfdece99da64adf6cd4e674a30de",
+      "size_bytes": 291
+    },
+    {
+      "path": "docs/specs/runtime-async-cancel-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "41e57c2c3f0e34041989533719f542258c10a6e1e536b46cca0d4546ee88e45f",
+      "size_bytes": 5954
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "9 spec(s) passed"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/runtime-async-cancel.json",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/runtime-async-cancel.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/runtime-async-cancel/module/RuntimeAsyncCancel.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/runtime-async-cancel.tla",
+      "status": "pass",
+      "result": "5407 states generated; 2962 distinct states; no timeout"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.2 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}

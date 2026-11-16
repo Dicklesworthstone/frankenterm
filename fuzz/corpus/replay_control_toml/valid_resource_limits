@@ -1,0 +1,5 @@
+max_events = 1000
+max_wall_clock_ms = 60000
+memory_warning_events = 500
+max_concurrent = 2
+watchdog_timeout_ms = 10000

@@ -1,0 +1,113 @@
+//! Scripting abstraction layer for FrankenTerm runtime engines.
+//!
+//! This crate defines a common `ScriptingEngine` trait and a
+//! `ScriptingDispatcher` that can coordinate multiple engines
+//! (for example Lua + WASM) behind one interface.
+//!
+//! STATUS: experimental / not yet integrated. No production crate depends on
+//! `frankenterm-scripting` (only `fuzz/` does, behind an optional feature); its
+//! engines, dispatcher, and lifecycle are exercised only by tests, benches, and
+//! fuzz targets, so nothing here can affect the running terminal today. Treat
+//! the dispatch-order and security-boundary language throughout as the intended
+//! design, NOT an active runtime guarantee, until the crate is wired into the
+//! mux/gui config-reload + event paths (see ft-rxk40 / ft-0dki4).
+
+use anyhow::Result;
+use std::path::Path;
+
+/// Reserve one process-local scripting identity without ever wrapping into an
+/// already-issued value. `u64::MAX` is retained as the exhausted sentinel.
+#[must_use]
+pub(crate) fn try_next_unique_id(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Reserve one identity from a mutex-protected, non-atomic scripting counter.
+#[cfg(feature = "lua")]
+#[must_use]
+pub(crate) fn try_next_unique_id_value(counter: &mut u64) -> Option<u64> {
+    let current = *counter;
+    *counter = current.checked_add(1)?;
+    Some(current)
+}
+
+pub mod audit;
+mod dispatcher;
+pub mod events;
+pub mod extension;
+pub mod keybindings;
+pub mod lifecycle;
+#[cfg(feature = "lua")]
+mod lua_engine;
+pub mod manifest;
+pub mod package;
+pub mod sandbox;
+pub mod storage;
+mod types;
+#[cfg(feature = "wasm")]
+mod wasm_cache;
+#[cfg(feature = "wasm")]
+mod wasm_engine;
+#[cfg(feature = "wasm")]
+mod wasm_host;
+
+pub use audit::{AuditOutcome, AuditTrail};
+pub use dispatcher::ScriptingDispatcher;
+pub use events::{DispatchTier, EventBus, EventHookId};
+pub use extension::{ExtensionManager, InstalledExtension};
+pub use keybindings::{KeyCombo, KeybindingId, KeybindingRegistry, Modifiers};
+pub use lifecycle::{ExtensionLifecycle, ExtensionState, ManagedExtension};
+#[cfg(feature = "lua")]
+pub use lua_engine::LuaEngine;
+pub use manifest::{EngineConfig, EngineType, ExtensionPermissions, ParsedManifest};
+pub use package::{FtxBuilder, FtxPackage};
+pub use sandbox::{ResourceLimits, SandboxConfig, SandboxEnforcer};
+pub use storage::ExtensionStorage;
+pub use types::{
+    Action, ConfigValue, EngineCapabilities, ExtensionId, ExtensionManifest, HookHandler, HookId,
+    LogLevel,
+};
+#[cfg(feature = "wasm")]
+pub use wasm_cache::ModuleCache;
+#[cfg(feature = "wasm")]
+pub use wasm_engine::{WasmEngine, WasmEngineConfig};
+#[cfg(feature = "wasm")]
+pub use wasm_host::{HostState, register_host_functions};
+
+/// Unified interface for all scripting engines.
+///
+/// Implementors can be language runtimes such as Lua or WASM.
+pub trait ScriptingEngine: Send + Sync + 'static {
+    /// Evaluate a configuration file and return structured config data.
+    fn eval_config(&self, path: &Path) -> Result<ConfigValue>;
+
+    /// Register an event hook and return a stable handle.
+    fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId>;
+
+    /// Remove a previously registered hook.
+    fn unregister_hook(&self, id: HookId) -> Result<()>;
+
+    /// Fire an event and collect resulting actions.
+    fn fire_event(&self, event: &str, payload: &frankenterm_dynamic::Value) -> Result<Vec<Action>>;
+
+    /// Load an extension manifest and return an extension handle.
+    fn load_extension(&self, manifest: &ExtensionManifest) -> Result<ExtensionId>;
+
+    /// Unload an extension by handle.
+    fn unload_extension(&self, id: ExtensionId) -> Result<()>;
+
+    /// Report runtime capabilities to callers.
+    fn capabilities(&self) -> EngineCapabilities;
+
+    /// Human-readable runtime name (`lua-5.4`, `wasmtime-28`, ...).
+    fn engine_name(&self) -> &str;
+}

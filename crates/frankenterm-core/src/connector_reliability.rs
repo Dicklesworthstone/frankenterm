@@ -1,0 +1,1865 @@
+//! Connector-specific reliability controls: circuit breakers, dead-letter queues,
+//! and replay tooling for handling external system outages.
+//!
+//! Layers on top of the generic `circuit_breaker`, `retry`, and `backpressure`
+//! modules with connector-aware error classification, bounded dead-letter storage,
+//! and replay orchestration for failed connector actions.
+//!
+//! Part of ft-3681t.5.15.
+
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::connector_outbound_bridge::ConnectorAction;
+use crate::retry::RetryPolicy;
+pub use frankenterm_core_connector_types::{
+    ConnectorReliabilitySnapshot, DeadLetterTelemetrySnapshot,
+};
+
+/// Persisted provider-effect state. Only `Admitted` can acquire dispatch
+/// ownership; no lease expiry can make `Dispatched` eligible again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorDeliveryState {
+    Admitted,
+    Dispatched,
+    Completed,
+    Rejected,
+    Failed,
+    Cancelled,
+    Indeterminate,
+}
+
+impl ConnectorDeliveryState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Dispatched => "dispatched",
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+
+    pub const fn permits(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Admitted,
+                Self::Dispatched | Self::Rejected | Self::Cancelled
+            ) | (
+                Self::Dispatched,
+                Self::Completed | Self::Failed | Self::Indeterminate
+            )
+        )
+    }
+}
+
+/// Durable outbox item. The configured input has already passed classification
+/// and policy before insertion; credentials and raw provider responses are absent.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConnectorOutboxEntry {
+    pub key: String,
+    pub generation: String,
+    pub source_event_id: i64,
+    pub rule_id: String,
+    pub invoke: crate::connector_host_runtime::FcpOperation,
+    pub action_kind: crate::connector_outbound_bridge::ConnectorActionKind,
+    pub correlation_id: String,
+    pub state: ConnectorDeliveryState,
+    pub revision: i64,
+    pub due_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub receipt_id: Option<String>,
+    pub receipt_hash: Option<String>,
+    pub reason_code: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectorOutboxEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorOutboxEntry")
+            .field("key", &self.key)
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Atomic storage requests use the existing serialized writer and transaction
+/// failure receipts. Payloads have no Debug implementation by design.
+pub(crate) enum ConnectorStorageMutation {
+    Initialize {
+        generation: String,
+        now_ms: i64,
+    },
+    Admit {
+        generation: String,
+        expected_cursor: i64,
+        through_event_id: i64,
+        entries: Vec<ConnectorOutboxEntry>,
+        max_pending: usize,
+        max_retained: usize,
+    },
+    Transition {
+        key: String,
+        expected_revision: i64,
+        expected_state: ConnectorDeliveryState,
+        next_state: ConnectorDeliveryState,
+        now_ms: i64,
+        receipt_id: Option<String>,
+        receipt_hash: Option<String>,
+        reason_code: Option<String>,
+    },
+    /// A failed preflight has not sent an invocation. Rescheduling still uses
+    /// revision CAS and is forbidden once dispatch ownership was acquired.
+    Reschedule {
+        key: String,
+        expected_revision: i64,
+        now_ms: i64,
+        due_at_ms: i64,
+    },
+    Ingest {
+        subscription_key: String,
+        expected_cursor: i64,
+        records: Vec<(i64, crate::storage::StoredEvent)>,
+    },
+    AcknowledgeIngress {
+        event_ids: Vec<i64>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum ConnectorStorageOutcome {
+    Cursor {
+        after_event_id: i64,
+        cursor_epoch: String,
+    },
+    Admitted,
+    Transitioned(Box<ConnectorOutboxEntry>),
+    Ingested(Vec<crate::storage::EventRecordOutcome>),
+    IngressAcknowledged,
+    Conflict,
+    Saturated,
+}
+
+// =============================================================================
+// Connector error classification
+// =============================================================================
+
+/// Connector-specific error classification for retry/circuit-breaker decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorErrorKind {
+    /// Transient network issue — safe to retry immediately.
+    Transient,
+    /// Rate-limited by upstream — retry after backoff.
+    RateLimited,
+    /// Authentication/authorization failure — not retryable without credential refresh.
+    AuthFailure,
+    /// Request was malformed or rejected by the connector — not retryable.
+    Permanent,
+    /// Upstream service unavailable — retry with circuit breaker.
+    ServiceUnavailable,
+    /// Timeout waiting for response — safe to retry.
+    Timeout,
+    /// Caller-initiated cancellation — not a connector failure.
+    Cancelled,
+    /// Dispatch may have produced an effect, but no authoritative receipt was
+    /// confirmed. This must never feed automatic retry or dead-letter replay.
+    Indeterminate,
+    /// Unknown error — classify as transient for safety.
+    Unknown,
+}
+
+impl ConnectorErrorKind {
+    /// Whether this error kind is retryable.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Transient
+                | Self::RateLimited
+                | Self::ServiceUnavailable
+                | Self::Timeout
+                | Self::Unknown
+        )
+    }
+
+    /// Whether this error should trip the circuit breaker.
+    ///
+    /// `Unknown` is included for the same reason it is treated as retryable:
+    /// the variant is documented as "classify as transient for safety", and it
+    /// is the catch-all for every error string `classify_connector_error` does
+    /// not recognise. Excluding it left a real protection gap — a connector
+    /// whose upstream is persistently failing with an unrecognised error format
+    /// would be retried (and DLQ'd) forever while the breaker never opened. A
+    /// single sporadic unknown error still cannot trip the breaker on its own;
+    /// it takes `failure_threshold` consecutive failures while Closed.
+    #[must_use]
+    pub const fn trips_breaker(self) -> bool {
+        matches!(
+            self,
+            Self::ServiceUnavailable | Self::Timeout | Self::Transient | Self::Unknown
+        )
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::RateLimited => "rate_limited",
+            Self::AuthFailure => "auth_failure",
+            Self::Permanent => "permanent",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify an error message string into a connector error kind.
+#[must_use]
+pub fn classify_connector_error(msg: &str) -> ConnectorErrorKind {
+    let lower = msg.to_lowercase();
+    if lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("context cancelled")
+        || lower.contains("context canceled")
+        || lower.contains("aborted by caller")
+    {
+        ConnectorErrorKind::Cancelled
+    } else if lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+    {
+        ConnectorErrorKind::RateLimited
+    } else if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        ConnectorErrorKind::AuthFailure
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline exceeded")
+    {
+        ConnectorErrorKind::Timeout
+    } else if lower.contains("service unavailable")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
+    {
+        ConnectorErrorKind::ServiceUnavailable
+    } else if lower.contains("not found")
+        || lower.contains("404")
+        || lower.contains("invalid")
+        || lower.contains("malformed")
+    {
+        ConnectorErrorKind::Permanent
+    } else if lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("reset")
+    {
+        ConnectorErrorKind::Transient
+    } else {
+        ConnectorErrorKind::Unknown
+    }
+}
+
+// =============================================================================
+// Dead-letter queue entry
+// =============================================================================
+
+/// A failed connector action stored in the dead-letter queue for later replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEntry {
+    /// Sequential ID within the DLQ.
+    pub id: u64,
+    /// The failed action.
+    pub action: ConnectorAction,
+    /// Error message from the last attempt.
+    pub last_error: String,
+    /// Classification of the last error.
+    pub error_kind: ConnectorErrorKind,
+    /// Number of delivery attempts so far.
+    pub attempt_count: u32,
+    /// Timestamp of first failure (millis since epoch).
+    pub first_failed_at_ms: u64,
+    /// Timestamp of last failure (millis since epoch).
+    pub last_failed_at_ms: u64,
+    /// Whether this entry has been manually marked for skip/discard.
+    pub discarded: bool,
+}
+
+impl DeadLetterEntry {
+    /// Create a new dead-letter entry.
+    #[must_use]
+    pub fn new(
+        id: u64,
+        action: ConnectorAction,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id,
+            action,
+            last_error: error.into(),
+            error_kind,
+            attempt_count: 1,
+            first_failed_at_ms: timestamp_ms,
+            last_failed_at_ms: timestamp_ms,
+            discarded: false,
+        }
+    }
+
+    /// Record a retry attempt that failed.
+    pub fn record_retry_failure(
+        &mut self,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        timestamp_ms: u64,
+    ) {
+        self.attempt_count = self.attempt_count.saturating_add(1);
+        self.last_error = error.into();
+        self.error_kind = error_kind;
+        self.last_failed_at_ms = timestamp_ms;
+    }
+
+    /// Age of this entry since first failure (millis).
+    #[must_use]
+    pub fn age_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.first_failed_at_ms)
+    }
+
+    /// Whether this entry has exceeded the maximum retry count.
+    #[must_use]
+    pub fn exceeded_max_retries(&self, max: u32) -> bool {
+        self.attempt_count >= max
+    }
+}
+
+// =============================================================================
+// Dead-letter queue
+// =============================================================================
+
+/// Configuration for the dead-letter queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterQueueConfig {
+    /// Maximum entries in the DLQ before oldest are evicted.
+    pub max_entries: usize,
+    /// Maximum age before entries are auto-discarded (millis).
+    pub max_age_ms: u64,
+    /// Maximum retry attempts before an entry is permanently discarded.
+    pub max_retries: u32,
+}
+
+impl Default for DeadLetterQueueConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            max_age_ms: 24 * 60 * 60 * 1000, // 24 hours
+            max_retries: 5,
+        }
+    }
+}
+
+/// Bounded dead-letter queue for failed connector actions.
+///
+/// Stores failed actions for later replay or manual intervention.
+/// Entries are evicted when the queue is full (oldest first) or
+/// when they exceed the configured age/retry limits.
+#[derive(Debug)]
+pub struct DeadLetterQueue {
+    config: DeadLetterQueueConfig,
+    entries: VecDeque<DeadLetterEntry>,
+    next_id: u64,
+    telemetry: DeadLetterTelemetry,
+}
+
+impl DeadLetterQueue {
+    /// Create a new dead-letter queue with the given configuration.
+    #[must_use]
+    pub fn new(config: DeadLetterQueueConfig) -> Self {
+        let config = Self::normalize_config(config);
+        Self {
+            config,
+            entries: VecDeque::new(),
+            next_id: 1,
+            telemetry: DeadLetterTelemetry::default(),
+        }
+    }
+
+    fn normalize_config(mut config: DeadLetterQueueConfig) -> DeadLetterQueueConfig {
+        config.max_entries = config.max_entries.max(1);
+        config
+    }
+
+    /// Enqueue a failed action.
+    ///
+    /// Returns the assigned DLQ entry ID.
+    pub fn enqueue(
+        &mut self,
+        action: ConnectorAction,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        timestamp_ms: u64,
+    ) -> u64 {
+        // Evict oldest if at capacity
+        while self.entries.len() >= self.config.max_entries {
+            self.entries.pop_front();
+            self.telemetry.evictions = self.telemetry.evictions.saturating_add(1);
+        }
+
+        let id = self.allocate_id();
+        self.entries.push_back(DeadLetterEntry::new(
+            id,
+            action,
+            error,
+            error_kind,
+            timestamp_ms,
+        ));
+        self.telemetry.total_enqueued = self.telemetry.total_enqueued.saturating_add(1);
+        id
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        let mut candidate = self.next_id.max(1);
+        loop {
+            if !self.entries.iter().any(|entry| entry.id == candidate) {
+                self.next_id = candidate.checked_add(1).unwrap_or(1);
+                return candidate;
+            }
+            candidate = candidate.checked_add(1).unwrap_or(1);
+        }
+    }
+
+    /// Get the current queue depth (non-discarded entries).
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.entries.iter().filter(|e| !e.discarded).count()
+    }
+
+    /// Get all non-discarded entries.
+    #[must_use]
+    pub fn pending_entries(&self) -> Vec<&DeadLetterEntry> {
+        self.entries.iter().filter(|e| !e.discarded).collect()
+    }
+
+    /// Get entries eligible for replay (non-discarded, retryable, within limits).
+    #[must_use]
+    pub fn replayable_entries(&self, now_ms: u64) -> Vec<&DeadLetterEntry> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                !e.discarded
+                    && e.error_kind.is_retryable()
+                    && !e.exceeded_max_retries(self.config.max_retries)
+                    && e.age_ms(now_ms) <= self.config.max_age_ms
+            })
+            .collect()
+    }
+
+    /// Mark an entry as discarded (will not be replayed).
+    pub fn discard(&mut self, id: u64) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.discarded = true;
+            self.telemetry.discarded = self.telemetry.discarded.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a retry attempt on a DLQ entry.
+    pub fn record_retry(
+        &mut self,
+        id: u64,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        timestamp_ms: u64,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.record_retry_failure(error, error_kind, timestamp_ms);
+            self.telemetry.retry_attempts = self.telemetry.retry_attempts.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove an entry after successful replay.
+    pub fn remove(&mut self, id: u64) -> Option<DeadLetterEntry> {
+        if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
+            let entry = self.entries.remove(pos);
+            self.telemetry.replayed_ok = self.telemetry.replayed_ok.saturating_add(1);
+            entry
+        } else {
+            None
+        }
+    }
+
+    /// Purge entries that exceed age or retry limits.
+    pub fn purge_expired(&mut self, now_ms: u64) -> usize {
+        let max_age = self.config.max_age_ms;
+        let max_retries = self.config.max_retries;
+        let before = self.entries.len();
+
+        self.entries
+            .retain(|e| !(e.age_ms(now_ms) > max_age || e.exceeded_max_retries(max_retries)));
+
+        let purged = before - self.entries.len();
+        self.telemetry.purged = self.telemetry.purged.saturating_add(purged as u64);
+        purged
+    }
+
+    /// Get telemetry snapshot.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> DeadLetterTelemetrySnapshot {
+        self.telemetry.snapshot(self.entries.len())
+    }
+}
+
+// =============================================================================
+// DLQ telemetry
+// =============================================================================
+
+#[derive(Debug, Default)]
+struct DeadLetterTelemetry {
+    total_enqueued: u64,
+    replayed_ok: u64,
+    retry_attempts: u64,
+    evictions: u64,
+    discarded: u64,
+    purged: u64,
+}
+
+impl DeadLetterTelemetry {
+    fn snapshot(&self, current_depth: usize) -> DeadLetterTelemetrySnapshot {
+        DeadLetterTelemetrySnapshot {
+            total_enqueued: self.total_enqueued,
+            current_depth: current_depth as u64,
+            replayed_ok: self.replayed_ok,
+            retry_attempts: self.retry_attempts,
+            evictions: self.evictions,
+            discarded: self.discarded,
+            purged: self.purged,
+        }
+    }
+}
+
+// =============================================================================
+// Connector circuit breaker presets
+// =============================================================================
+
+/// Preset circuit breaker configuration for connector operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorCircuitConfig {
+    /// Failure threshold before opening the circuit.
+    pub failure_threshold: u32,
+    /// Successes needed in half-open to close the circuit.
+    pub success_threshold: u32,
+    /// Cooldown duration before probing half-open.
+    pub cooldown: Duration,
+}
+
+impl Default for ConnectorCircuitConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 2,
+            cooldown: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ConnectorCircuitConfig {
+    /// Aggressive preset for critical connectors (fail fast, recover fast).
+    #[must_use]
+    pub fn critical() -> Self {
+        Self {
+            failure_threshold: 3,
+            success_threshold: 1,
+            cooldown: Duration::from_secs(10),
+        }
+    }
+
+    /// Lenient preset for non-critical connectors.
+    #[must_use]
+    pub fn lenient() -> Self {
+        Self {
+            failure_threshold: 10,
+            success_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        }
+    }
+
+    /// Convert to a generic `CircuitBreakerConfig`.
+    #[must_use]
+    pub fn to_breaker_config(&self) -> CircuitBreakerConfig {
+        CircuitBreakerConfig::new(
+            self.failure_threshold,
+            self.success_threshold,
+            self.cooldown,
+        )
+    }
+}
+
+// =============================================================================
+// Connector retry presets
+// =============================================================================
+
+/// Preset retry policy for connector operations.
+///
+/// br-ft-xya21 (partial deployment of br-ft-jitter-modes): the
+/// `jitter_percent` values below are bumped from connector-specific
+/// defaults (0.10 / 0.15 / 0.20) to **0.50** as a low-risk
+/// approximation of Marc Brooker's Full Jitter (AWS Architecture
+/// Blog 2015,
+/// https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/).
+///
+/// ## Why this approximation, not `JitterMode::Full` directly
+///
+/// The proper fix is to thread `JitterMode::Full` through every
+/// retry-loop dispatch via a new `jitter_mode: JitterMode` field on
+/// `RetryPolicy`. That change requires updating ~30 struct-literal
+/// callers across `tests/perf_integration_tests.rs`,
+/// `tests/proptest_retry.rs`, `tests/integration_*.rs`, and
+/// `tests/retry_labruntime.rs` (Rust struct literals require all
+/// fields). Under heavy sibling-agent edit contention, doing that
+/// safely in one cycle is infeasible.
+///
+/// `jitter_percent: 0.50` keeps the existing equal-jitter algorithm
+/// but expands the spread from ±10-20% (which Marc Brooker's
+/// analysis showed still concentrates retries during fleet-wide
+/// failures) to ±50%. The retry distribution becomes wider — closer
+/// in shape to the uniform[0, 2×base] envelope that Full Jitter
+/// approximates, though still centered on `base`. Effective spread
+/// improvement: ~3-5× wider window than the prior 0.10-0.20 values,
+/// significantly reducing thundering-herd peaks for the documented
+/// 200-agent fleet hot path.
+///
+/// ## Proper upgrade path
+///
+/// Once a coordinated cycle is available to add the
+/// `jitter_mode: JitterMode` field + update all struct-literal
+/// callers, the constructors below should set
+/// `jitter_mode: JitterMode::Full` and revert `jitter_percent` to
+/// the connector-specific defaults (it becomes ignored when
+/// `jitter_mode != LegacyEqual`). Tracked in br-ft-xya21 close
+/// note.
+impl RetryPolicy {
+    /// Retry policy for connector webhook deliveries.
+    #[must_use]
+    pub fn connector_webhook() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            backoff_factor: 2.0,
+            // br-ft-xya21: bumped from 0.15 → 0.50 (Marc Brooker
+            // Full-Jitter approximation; see impl docstring above).
+            jitter_percent: 0.50,
+            max_attempts: Some(5),
+        }
+    }
+
+    /// Retry policy for connector API calls.
+    #[must_use]
+    pub fn connector_api() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            // br-ft-xya21: bumped from 0.10 → 0.50.
+            jitter_percent: 0.50,
+            max_attempts: Some(3),
+        }
+    }
+
+    /// Retry policy for connector stream reconnection.
+    #[must_use]
+    pub fn connector_stream() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            backoff_factor: 1.5,
+            // br-ft-xya21: bumped from 0.20 → 0.50.
+            jitter_percent: 0.50,
+            max_attempts: Some(10),
+        }
+    }
+}
+
+// =============================================================================
+// Replay plan
+// =============================================================================
+
+/// A plan for replaying dead-letter entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayPlan {
+    /// IDs of entries to replay in order.
+    pub entry_ids: Vec<u64>,
+    /// Retry policy to use for replay attempts.
+    pub policy: ReplayPolicy,
+    /// Maximum entries to attempt in a single replay run.
+    pub batch_size: usize,
+    /// Whether to stop on first failure.
+    pub stop_on_failure: bool,
+}
+
+/// Policy for replay behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayPolicy {
+    /// Delay between replay attempts within a batch.
+    pub inter_attempt_delay_ms: u64,
+    /// Maximum concurrent replay operations.
+    pub concurrency: usize,
+    /// Whether to re-enqueue failed replays back into the DLQ.
+    pub re_enqueue_on_failure: bool,
+}
+
+impl Default for ReplayPolicy {
+    fn default() -> Self {
+        Self {
+            inter_attempt_delay_ms: 100,
+            concurrency: 1,
+            re_enqueue_on_failure: true,
+        }
+    }
+}
+
+/// Result of a replay run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayResult {
+    /// Number of entries successfully replayed.
+    pub succeeded: usize,
+    /// Number of entries that failed replay.
+    pub failed: usize,
+    /// Number of entries skipped (discarded or expired).
+    pub skipped: usize,
+    /// IDs of entries that failed (for manual inspection).
+    pub failed_ids: Vec<u64>,
+}
+
+impl ReplayResult {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            succeeded: 0,
+            failed: 0,
+            skipped: 0,
+            failed_ids: Vec::new(),
+        }
+    }
+}
+
+// =============================================================================
+// Connector reliability controller
+// =============================================================================
+
+/// Configuration for the connector reliability controller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorReliabilityConfig {
+    /// Circuit breaker settings.
+    pub circuit: ConnectorCircuitConfig,
+    /// Dead-letter queue settings.
+    pub dlq: DeadLetterQueueConfig,
+    /// Whether to auto-enqueue failed actions to the DLQ.
+    pub auto_dlq: bool,
+    /// Maximum queue depth before shedding load.
+    pub shed_threshold: usize,
+}
+
+impl Default for ConnectorReliabilityConfig {
+    fn default() -> Self {
+        Self {
+            circuit: ConnectorCircuitConfig::default(),
+            dlq: DeadLetterQueueConfig::default(),
+            auto_dlq: true,
+            shed_threshold: 800,
+        }
+    }
+}
+
+/// Per-connector reliability controller combining circuit breaker + DLQ.
+///
+/// Each connector gets its own controller instance, managing its own
+/// circuit state and dead-letter queue independently.
+#[derive(Debug)]
+pub struct ConnectorReliabilityController {
+    /// Connector identifier.
+    connector_id: String,
+    /// Circuit breaker for this connector.
+    circuit: CircuitBreaker,
+    /// Dead-letter queue for failed actions.
+    dlq: DeadLetterQueue,
+    /// Configuration.
+    config: ConnectorReliabilityConfig,
+    /// Telemetry counters.
+    telemetry: ControllerTelemetry,
+}
+
+impl ConnectorReliabilityController {
+    /// Create a new reliability controller for a connector.
+    #[must_use]
+    pub fn new(connector_id: impl Into<String>, config: ConnectorReliabilityConfig) -> Self {
+        let cid = connector_id.into();
+        let circuit = CircuitBreaker::with_name(
+            format!("connector.{cid}"),
+            config.circuit.to_breaker_config(),
+        );
+        let dlq = DeadLetterQueue::new(config.dlq.clone());
+        Self {
+            connector_id: cid,
+            circuit,
+            dlq,
+            config,
+            telemetry: ControllerTelemetry::default(),
+        }
+    }
+
+    /// Check whether a new operation may proceed.
+    ///
+    /// Gates on two independent backpressure signals: the circuit breaker AND
+    /// load shedding. Shedding fires when the dead-letter queue has backed up to
+    /// or past `shed_threshold` — a signal that failed work is accumulating
+    /// faster than it drains, so new operations are refused until the DLQ
+    /// recovers, regardless of circuit state. (Previously `is_shedding` was
+    /// computed but never consulted by any production path, so the configured
+    /// `shed_threshold` had no effect — load shedding never actually fired.)
+    pub fn allow_operation(&mut self) -> bool {
+        self.telemetry.operations_attempted = self.telemetry.operations_attempted.saturating_add(1);
+
+        // Load shedding takes precedence: if the DLQ is saturated, refuse new
+        // work even when the circuit is closed.
+        if self.is_shedding() {
+            return false;
+        }
+
+        let allowed = self.circuit.allow();
+        if !allowed {
+            self.telemetry.circuit_rejections = self.telemetry.circuit_rejections.saturating_add(1);
+        }
+        allowed
+    }
+
+    /// Record a successful operation.
+    pub fn record_success(&mut self) {
+        self.circuit.record_success();
+        self.telemetry.operations_succeeded = self.telemetry.operations_succeeded.saturating_add(1);
+    }
+
+    /// Record a failed operation, optionally enqueuing to DLQ.
+    ///
+    /// Returns the DLQ entry ID if the action was enqueued.
+    pub fn record_failure(
+        &mut self,
+        action: &ConnectorAction,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        timestamp_ms: u64,
+    ) -> Option<u64> {
+        if error_kind == ConnectorErrorKind::Cancelled {
+            return None;
+        }
+
+        let err_str = error.into();
+
+        // Trip circuit breaker if applicable
+        if error_kind.trips_breaker() {
+            self.circuit.record_failure();
+        }
+        self.telemetry.operations_failed = self.telemetry.operations_failed.saturating_add(1);
+
+        // Auto-enqueue to DLQ if configured
+        if self.config.auto_dlq && error_kind.is_retryable() {
+            let id = self
+                .dlq
+                .enqueue(action.clone(), &err_str, error_kind, timestamp_ms);
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Get the connector ID.
+    #[must_use]
+    pub fn connector_id(&self) -> &str {
+        &self.connector_id
+    }
+
+    /// Check if the DLQ is above the shedding threshold.
+    #[must_use]
+    pub fn is_shedding(&self) -> bool {
+        self.dlq.depth() >= self.config.shed_threshold
+    }
+
+    /// Get the dead-letter queue (immutable access).
+    #[must_use]
+    pub fn dlq(&self) -> &DeadLetterQueue {
+        &self.dlq
+    }
+
+    /// Get the dead-letter queue (mutable access).
+    pub fn dlq_mut(&mut self) -> &mut DeadLetterQueue {
+        &mut self.dlq
+    }
+
+    /// Get circuit breaker status.
+    #[must_use]
+    pub fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+        self.circuit.status()
+    }
+
+    /// Build a replay plan for eligible DLQ entries.
+    #[must_use]
+    pub fn build_replay_plan(
+        &self,
+        now_ms: u64,
+        batch_size: usize,
+        stop_on_failure: bool,
+    ) -> ReplayPlan {
+        let replayable = self.dlq.replayable_entries(now_ms);
+        let entry_ids: Vec<u64> = replayable.iter().take(batch_size).map(|e| e.id).collect();
+
+        ReplayPlan {
+            entry_ids,
+            policy: ReplayPolicy::default(),
+            batch_size,
+            stop_on_failure,
+        }
+    }
+
+    /// Get telemetry snapshot.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> ConnectorReliabilitySnapshot {
+        ConnectorReliabilitySnapshot {
+            connector_id: self.connector_id.clone(),
+            operations_attempted: self.telemetry.operations_attempted,
+            operations_succeeded: self.telemetry.operations_succeeded,
+            operations_failed: self.telemetry.operations_failed,
+            circuit_rejections: self.telemetry.circuit_rejections,
+            dlq: self.dlq.telemetry_snapshot(),
+        }
+    }
+}
+
+// =============================================================================
+// Controller telemetry
+// =============================================================================
+
+#[derive(Debug, Default)]
+struct ControllerTelemetry {
+    operations_attempted: u64,
+    operations_succeeded: u64,
+    operations_failed: u64,
+    circuit_rejections: u64,
+}
+
+// =============================================================================
+// Multi-connector reliability registry
+// =============================================================================
+
+/// Registry managing reliability controllers for multiple connectors.
+#[derive(Debug)]
+pub struct ReliabilityRegistry {
+    controllers: Vec<ConnectorReliabilityController>,
+    default_config: ConnectorReliabilityConfig,
+}
+
+impl ReliabilityRegistry {
+    /// Create a new registry with default configuration.
+    #[must_use]
+    pub fn new(default_config: ConnectorReliabilityConfig) -> Self {
+        Self {
+            controllers: Vec::new(),
+            default_config,
+        }
+    }
+
+    /// Get or create a controller for a connector.
+    pub fn get_or_create(&mut self, connector_id: &str) -> &mut ConnectorReliabilityController {
+        let pos = self
+            .controllers
+            .iter()
+            .position(|c| c.connector_id == connector_id);
+        match pos {
+            Some(idx) => &mut self.controllers[idx],
+            None => {
+                self.controllers.push(ConnectorReliabilityController::new(
+                    connector_id,
+                    self.default_config.clone(),
+                ));
+                self.controllers.last_mut().unwrap()
+            }
+        }
+    }
+
+    /// Get a controller by connector ID (immutable).
+    #[must_use]
+    pub fn get(&self, connector_id: &str) -> Option<&ConnectorReliabilityController> {
+        self.controllers
+            .iter()
+            .find(|c| c.connector_id == connector_id)
+    }
+
+    /// Get all registered connector IDs.
+    #[must_use]
+    pub fn connector_ids(&self) -> Vec<&str> {
+        self.controllers
+            .iter()
+            .map(|c| c.connector_id.as_str())
+            .collect()
+    }
+
+    /// Get telemetry snapshots for all connectors.
+    #[must_use]
+    pub fn all_snapshots(&self) -> Vec<ConnectorReliabilitySnapshot> {
+        self.controllers
+            .iter()
+            .map(|c| c.telemetry_snapshot())
+            .collect()
+    }
+
+    /// Purge expired DLQ entries across all connectors.
+    pub fn purge_all_expired(&mut self, now_ms: u64) -> usize {
+        self.controllers
+            .iter_mut()
+            .map(|c| c.dlq_mut().purge_expired(now_ms))
+            .sum()
+    }
+
+    /// Total DLQ depth across all connectors.
+    #[must_use]
+    pub fn total_dlq_depth(&self) -> usize {
+        self.controllers.iter().map(|c| c.dlq().depth()).sum()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector_outbound_bridge::ConnectorActionKind;
+
+    fn sample_action(connector: &str, kind: ConnectorActionKind) -> ConnectorAction {
+        ConnectorAction {
+            target_connector: connector.to_string(),
+            action_kind: kind,
+            correlation_id: format!("corr-{connector}"),
+            params: serde_json::json!({"test": true}),
+            created_at_ms: 1000,
+        }
+    }
+
+    // ---- Error classification ----
+
+    #[test]
+    fn connector_reliability_classify_rate_limit() {
+        assert_eq!(
+            classify_connector_error("429 Too Many Requests"),
+            ConnectorErrorKind::RateLimited
+        );
+        assert_eq!(
+            classify_connector_error("rate limit exceeded"),
+            ConnectorErrorKind::RateLimited
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_auth() {
+        assert_eq!(
+            classify_connector_error("401 Unauthorized"),
+            ConnectorErrorKind::AuthFailure
+        );
+        assert_eq!(
+            classify_connector_error("403 Forbidden"),
+            ConnectorErrorKind::AuthFailure
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_timeout() {
+        assert_eq!(
+            classify_connector_error("request timed out after 30s"),
+            ConnectorErrorKind::Timeout
+        );
+        assert_eq!(
+            classify_connector_error("deadline exceeded"),
+            ConnectorErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_cancelled() {
+        assert_eq!(
+            classify_connector_error("operation cancelled by caller"),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            classify_connector_error("context canceled"),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            classify_connector_error("request aborted by caller"),
+            ConnectorErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_service_unavailable() {
+        assert_eq!(
+            classify_connector_error("503 Service Unavailable"),
+            ConnectorErrorKind::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_permanent() {
+        assert_eq!(
+            classify_connector_error("404 Not Found"),
+            ConnectorErrorKind::Permanent
+        );
+        assert_eq!(
+            classify_connector_error("invalid request body"),
+            ConnectorErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_transient() {
+        assert_eq!(
+            classify_connector_error("connection reset by peer"),
+            ConnectorErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn connector_reliability_classify_unknown() {
+        assert_eq!(
+            classify_connector_error("something weird happened"),
+            ConnectorErrorKind::Unknown
+        );
+    }
+
+    #[test]
+    fn connector_reliability_error_retryability() {
+        assert!(ConnectorErrorKind::Transient.is_retryable());
+        assert!(ConnectorErrorKind::RateLimited.is_retryable());
+        assert!(ConnectorErrorKind::ServiceUnavailable.is_retryable());
+        assert!(ConnectorErrorKind::Timeout.is_retryable());
+        assert!(ConnectorErrorKind::Unknown.is_retryable());
+        assert!(!ConnectorErrorKind::AuthFailure.is_retryable());
+        assert!(!ConnectorErrorKind::Permanent.is_retryable());
+        assert!(!ConnectorErrorKind::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn connector_reliability_error_trips_breaker() {
+        assert!(ConnectorErrorKind::ServiceUnavailable.trips_breaker());
+        assert!(ConnectorErrorKind::Timeout.trips_breaker());
+        assert!(ConnectorErrorKind::Transient.trips_breaker());
+        // Unknown trips the breaker: it is the catch-all for unrecognised
+        // errors and is documented as "classify as transient for safety", so
+        // it must give the same circuit protection as Transient. Without this,
+        // a persistently-failing connector emitting unrecognised errors would
+        // never open the circuit.
+        assert!(ConnectorErrorKind::Unknown.trips_breaker());
+        // Consistency with is_retryable: every kind that trips the breaker is
+        // also retryable (the breaker only guards transient/retryable failures).
+        assert!(ConnectorErrorKind::Unknown.is_retryable());
+        assert!(!ConnectorErrorKind::RateLimited.trips_breaker());
+        assert!(!ConnectorErrorKind::AuthFailure.trips_breaker());
+        assert!(!ConnectorErrorKind::Permanent.trips_breaker());
+        assert!(!ConnectorErrorKind::Cancelled.trips_breaker());
+    }
+
+    /// Regression: persistent Unknown failures must eventually open the circuit
+    /// breaker (end-to-end through the reliability controller), not retry the
+    /// dead upstream forever. Pre-fix, Unknown did not trip the breaker, so the
+    /// circuit stayed Closed no matter how many unknown errors arrived.
+    #[test]
+    fn connector_reliability_unknown_failures_open_circuit() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut controller = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+
+        assert_eq!(
+            controller.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed
+        );
+        for i in 0..3 {
+            assert!(
+                controller.allow_operation(),
+                "ops allowed while closed (i={i})"
+            );
+            controller.record_failure(
+                &action,
+                "weird upstream glitch",
+                ConnectorErrorKind::Unknown,
+                1000 + i,
+            );
+        }
+        assert_eq!(
+            controller.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Open,
+            "the circuit must open after failure_threshold consecutive Unknown failures"
+        );
+        assert!(
+            !controller.allow_operation(),
+            "an open circuit must reject further operations"
+        );
+    }
+
+    /// Regression: load shedding must actually fire. When the dead-letter queue
+    /// backs up to shed_threshold, allow_operation must refuse new work even
+    /// while the circuit breaker is Closed. Previously is_shedding() was never
+    /// consulted, so the shed_threshold config had no effect.
+    #[test]
+    fn connector_reliability_sheds_when_dlq_saturated_even_with_closed_circuit() {
+        let config = ConnectorReliabilityConfig {
+            shed_threshold: 3,
+            ..Default::default() // auto_dlq: true, default circuit (does not trip on RateLimited)
+        };
+        let mut ctrl = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+
+        // Healthy to start: circuit closed, DLQ empty, ops allowed.
+        assert!(ctrl.allow_operation());
+        assert!(!ctrl.is_shedding());
+
+        // RateLimited is retryable (auto-enqueued to DLQ) but does NOT trip the
+        // breaker, so we drive the DLQ to shed_threshold while the circuit stays
+        // Closed — isolating the shedding path from circuit rejection.
+        for i in 0..3 {
+            ctrl.record_failure(
+                &action,
+                "rate limited",
+                ConnectorErrorKind::RateLimited,
+                1000 + i,
+            );
+        }
+        assert_eq!(ctrl.dlq().depth(), 3, "three retryable failures enqueued");
+        assert!(ctrl.is_shedding(), "DLQ at shed_threshold");
+        assert_eq!(
+            ctrl.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed,
+            "RateLimited must not trip the breaker — isolate the shedding path"
+        );
+        assert!(
+            !ctrl.allow_operation(),
+            "load shedding must refuse new work when the DLQ is saturated, even with a closed circuit"
+        );
+
+        // Drain the DLQ below the threshold; shedding must stop.
+        let ids: Vec<u64> = ctrl.dlq().pending_entries().iter().map(|e| e.id).collect();
+        ctrl.dlq_mut().remove(ids[0]);
+        assert!(!ctrl.is_shedding(), "DLQ drained below threshold");
+        assert!(
+            ctrl.allow_operation(),
+            "operations resume once the DLQ recovers"
+        );
+    }
+
+    // ---- Dead-letter queue ----
+
+    #[test]
+    fn connector_reliability_dlq_enqueue_and_depth() {
+        let mut dlq = DeadLetterQueue::new(DeadLetterQueueConfig::default());
+        assert_eq!(dlq.depth(), 0);
+
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+        let id = dlq.enqueue(action, "timeout", ConnectorErrorKind::Timeout, 1000);
+        assert_eq!(id, 1);
+        assert_eq!(dlq.depth(), 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_bounded_capacity() {
+        let config = DeadLetterQueueConfig {
+            max_entries: 3,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+
+        for i in 0..5 {
+            let action = sample_action("test", ConnectorActionKind::Notify);
+            dlq.enqueue(
+                action,
+                format!("error-{i}"),
+                ConnectorErrorKind::Transient,
+                1000 + i,
+            );
+        }
+
+        // Should only have 3 entries (oldest evicted)
+        assert_eq!(dlq.entries.len(), 3);
+        let snap = dlq.telemetry_snapshot();
+        assert_eq!(snap.total_enqueued, 5);
+        assert_eq!(snap.evictions, 2);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_telemetry_counters_saturate() {
+        let config = DeadLetterQueueConfig {
+            max_entries: 1,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+        dlq.telemetry.total_enqueued = u64::MAX;
+        dlq.telemetry.evictions = u64::MAX;
+        dlq.telemetry.discarded = u64::MAX;
+        dlq.telemetry.retry_attempts = u64::MAX;
+        dlq.telemetry.replayed_ok = u64::MAX;
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            1001,
+        );
+
+        assert_ne!(first, second);
+        assert!(dlq.discard(second));
+        assert!(dlq.record_retry(second, "retry", ConnectorErrorKind::Timeout, 2000));
+        assert!(dlq.remove(second).is_some());
+
+        let snap = dlq.telemetry_snapshot();
+        assert_eq!(snap.total_enqueued, u64::MAX);
+        assert_eq!(snap.evictions, u64::MAX);
+        assert_eq!(snap.discarded, u64::MAX);
+        assert_eq!(snap.retry_attempts, u64::MAX);
+        assert_eq!(snap.replayed_ok, u64::MAX);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_zero_capacity_does_not_spin() {
+        let config = DeadLetterQueueConfig {
+            max_entries: 0,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            2000,
+        );
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(dlq.depth(), 1);
+        assert_eq!(dlq.pending_entries()[0].id, second);
+        assert_eq!(dlq.telemetry_snapshot().evictions, 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_id_allocation_wraps_without_collision() {
+        let mut dlq = DeadLetterQueue::new(DeadLetterQueueConfig::default());
+        dlq.next_id = u64::MAX;
+
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            2000,
+        );
+
+        assert_eq!(first, u64::MAX);
+        assert_eq!(second, 1);
+        assert_eq!(dlq.pending_entries()[0].id, u64::MAX);
+        assert_eq!(dlq.pending_entries()[1].id, 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_discard() {
+        let mut dlq = DeadLetterQueue::new(DeadLetterQueueConfig::default());
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let id = dlq.enqueue(action, "err", ConnectorErrorKind::Transient, 1000);
+
+        assert_eq!(dlq.depth(), 1);
+        assert!(dlq.discard(id));
+        assert_eq!(dlq.depth(), 0); // discarded entries don't count
+    }
+
+    #[test]
+    fn connector_reliability_dlq_replayable_filters() {
+        let config = DeadLetterQueueConfig {
+            max_retries: 2,
+            max_age_ms: 10_000,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+
+        // Retryable entry
+        let a1 = sample_action("test", ConnectorActionKind::Notify);
+        let id1 = dlq.enqueue(a1, "timeout", ConnectorErrorKind::Timeout, 1000);
+
+        // Non-retryable entry (auth failure)
+        let a2 = sample_action("test", ConnectorActionKind::Ticket);
+        dlq.enqueue(a2, "auth", ConnectorErrorKind::AuthFailure, 1000);
+
+        // Exceeded retries entry
+        let a3 = sample_action("test", ConnectorActionKind::AuditLog);
+        let id3 = dlq.enqueue(a3, "err", ConnectorErrorKind::Transient, 1000);
+        dlq.record_retry(id3, "err2", ConnectorErrorKind::Transient, 2000);
+
+        let replayable = dlq.replayable_entries(2000);
+        assert_eq!(replayable.len(), 1);
+        assert_eq!(replayable[0].id, id1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_remove_on_success() {
+        let mut dlq = DeadLetterQueue::new(DeadLetterQueueConfig::default());
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let id = dlq.enqueue(action, "err", ConnectorErrorKind::Transient, 1000);
+
+        let removed = dlq.remove(id);
+        assert!(removed.is_some());
+        assert_eq!(dlq.depth(), 0);
+        assert_eq!(dlq.telemetry_snapshot().replayed_ok, 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_purge_expired() {
+        let config = DeadLetterQueueConfig {
+            max_age_ms: 5000,
+            max_retries: 100,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+
+        let a1 = sample_action("test", ConnectorActionKind::Notify);
+        dlq.enqueue(a1, "err", ConnectorErrorKind::Transient, 1000);
+
+        let a2 = sample_action("test", ConnectorActionKind::Ticket);
+        dlq.enqueue(a2, "err", ConnectorErrorKind::Transient, 5000);
+
+        // At time 7000, first entry is 6000ms old (> 5000 max)
+        let purged = dlq.purge_expired(7000);
+        assert_eq!(purged, 1);
+        assert_eq!(dlq.entries.len(), 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_purged_counter_saturates() {
+        let config = DeadLetterQueueConfig {
+            max_age_ms: 5000,
+            max_retries: 100,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+        dlq.telemetry.purged = u64::MAX;
+        dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "old",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+
+        assert_eq!(dlq.purge_expired(7000), 1);
+        assert_eq!(dlq.telemetry_snapshot().purged, u64::MAX);
+    }
+
+    // ---- Controller ----
+
+    #[test]
+    fn connector_reliability_controller_allow_and_record() {
+        let mut ctrl =
+            ConnectorReliabilityController::new("slack", ConnectorReliabilityConfig::default());
+
+        assert!(ctrl.allow_operation());
+        ctrl.record_success();
+
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.operations_attempted, 1);
+        assert_eq!(snap.operations_succeeded, 1);
+        assert_eq!(snap.connector_id, "slack");
+    }
+
+    #[test]
+    fn connector_reliability_controller_telemetry_saturates() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+        ctrl.record_failure(&action, "timeout", ConnectorErrorKind::Timeout, 1000);
+        ctrl.telemetry.operations_attempted = u64::MAX;
+        ctrl.telemetry.operations_succeeded = u64::MAX;
+        ctrl.telemetry.operations_failed = u64::MAX;
+        ctrl.telemetry.circuit_rejections = u64::MAX;
+
+        assert!(!ctrl.allow_operation());
+        ctrl.record_success();
+        ctrl.record_failure(&action, "rate limit", ConnectorErrorKind::RateLimited, 2000);
+
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.operations_attempted, u64::MAX);
+        assert_eq!(snap.operations_succeeded, u64::MAX);
+        assert_eq!(snap.operations_failed, u64::MAX);
+        assert_eq!(snap.circuit_rejections, u64::MAX);
+    }
+
+    #[test]
+    fn connector_reliability_controller_failure_enqueues_dlq() {
+        let mut ctrl =
+            ConnectorReliabilityController::new("github", ConnectorReliabilityConfig::default());
+
+        let action = sample_action("github", ConnectorActionKind::Notify);
+        let dlq_id = ctrl.record_failure(
+            &action,
+            "503 Service Unavailable",
+            ConnectorErrorKind::ServiceUnavailable,
+            1000,
+        );
+
+        assert!(dlq_id.is_some());
+        assert_eq!(ctrl.dlq().depth(), 1);
+    }
+
+    #[test]
+    fn connector_reliability_controller_permanent_not_enqueued() {
+        let mut ctrl =
+            ConnectorReliabilityController::new("test", ConnectorReliabilityConfig::default());
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let dlq_id = ctrl.record_failure(
+            &action,
+            "404 Not Found",
+            ConnectorErrorKind::Permanent,
+            1000,
+        );
+
+        assert!(dlq_id.is_none());
+        assert_eq!(ctrl.dlq().depth(), 0);
+    }
+
+    #[test]
+    fn connector_reliability_controller_cancelled_is_neutral() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("test", config);
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let dlq_id = ctrl.record_failure(
+            &action,
+            "operation cancelled by caller",
+            ConnectorErrorKind::Cancelled,
+            1000,
+        );
+
+        assert!(dlq_id.is_none());
+        assert_eq!(ctrl.dlq().depth(), 0);
+        assert_eq!(
+            ctrl.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed
+        );
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.operations_failed, 0);
+        assert_eq!(snap.dlq.total_enqueued, 0);
+    }
+
+    #[test]
+    fn connector_reliability_controller_circuit_trips() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 2,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("test", config);
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+
+        // Trip the circuit with 2 failures
+        ctrl.record_failure(&action, "timeout", ConnectorErrorKind::Timeout, 1000);
+        ctrl.record_failure(&action, "timeout", ConnectorErrorKind::Timeout, 2000);
+
+        // Circuit should be open now
+        assert!(!ctrl.allow_operation());
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.circuit_rejections, 1);
+    }
+
+    #[test]
+    fn connector_reliability_controller_replay_plan() {
+        let mut ctrl =
+            ConnectorReliabilityController::new("slack", ConnectorReliabilityConfig::default());
+
+        // Add some failures
+        for i in 0..5 {
+            let action = sample_action("slack", ConnectorActionKind::Notify);
+            ctrl.record_failure(
+                &action,
+                "service unavailable",
+                ConnectorErrorKind::ServiceUnavailable,
+                1000 + i * 100,
+            );
+        }
+
+        let plan = ctrl.build_replay_plan(2000, 3, true);
+        assert_eq!(plan.entry_ids.len(), 3);
+        assert!(plan.stop_on_failure);
+    }
+
+    // ---- Registry ----
+
+    #[test]
+    fn connector_reliability_registry_get_or_create() {
+        let mut registry = ReliabilityRegistry::new(ConnectorReliabilityConfig::default());
+
+        registry.get_or_create("slack");
+        registry.get_or_create("github");
+        registry.get_or_create("slack"); // should reuse
+
+        assert_eq!(registry.connector_ids().len(), 2);
+    }
+
+    #[test]
+    fn connector_reliability_registry_total_depth() {
+        let mut registry = ReliabilityRegistry::new(ConnectorReliabilityConfig::default());
+
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+        registry.get_or_create("slack").record_failure(
+            &action,
+            "err",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+
+        let action2 = sample_action("github", ConnectorActionKind::Ticket);
+        registry.get_or_create("github").record_failure(
+            &action2,
+            "err",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+
+        assert_eq!(registry.total_dlq_depth(), 2);
+    }
+
+    #[test]
+    fn connector_reliability_registry_purge_all() {
+        let config = ConnectorReliabilityConfig {
+            dlq: DeadLetterQueueConfig {
+                max_age_ms: 5000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut registry = ReliabilityRegistry::new(config);
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        registry.get_or_create("test").record_failure(
+            &action,
+            "err",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+
+        let purged = registry.purge_all_expired(100_000);
+        assert_eq!(purged, 1);
+        assert_eq!(registry.total_dlq_depth(), 0);
+    }
+
+    // ---- Serde roundtrips ----
+
+    #[test]
+    fn connector_reliability_error_kind_serde() {
+        for kind in [
+            ConnectorErrorKind::Transient,
+            ConnectorErrorKind::RateLimited,
+            ConnectorErrorKind::AuthFailure,
+            ConnectorErrorKind::Permanent,
+            ConnectorErrorKind::ServiceUnavailable,
+            ConnectorErrorKind::Timeout,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::Unknown,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: ConnectorErrorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back);
+        }
+    }
+
+    #[test]
+    fn connector_reliability_dlq_entry_serde() {
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let entry = DeadLetterEntry::new(1, action, "timeout", ConnectorErrorKind::Timeout, 1000);
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: DeadLetterEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry.id, back.id);
+        assert_eq!(entry.error_kind, back.error_kind);
+        assert_eq!(entry.attempt_count, back.attempt_count);
+    }
+
+    #[test]
+    fn connector_reliability_snapshot_serde() {
+        let snap = ConnectorReliabilitySnapshot {
+            connector_id: "test".to_string(),
+            operations_attempted: 10,
+            operations_succeeded: 8,
+            operations_failed: 2,
+            circuit_rejections: 0,
+            dlq: DeadLetterTelemetrySnapshot {
+                total_enqueued: 2,
+                current_depth: 1,
+                replayed_ok: 1,
+                retry_attempts: 3,
+                evictions: 0,
+                discarded: 0,
+                purged: 0,
+            },
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ConnectorReliabilitySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn connector_reliability_replay_plan_serde() {
+        let plan = ReplayPlan {
+            entry_ids: vec![1, 2, 3],
+            policy: ReplayPolicy::default(),
+            batch_size: 10,
+            stop_on_failure: false,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: ReplayPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entry_ids.len(), 3);
+        assert!(!back.stop_on_failure);
+    }
+
+    // ---- Presets ----
+
+    #[test]
+    fn connector_reliability_circuit_presets() {
+        let critical = ConnectorCircuitConfig::critical();
+        assert_eq!(critical.failure_threshold, 3);
+
+        let lenient = ConnectorCircuitConfig::lenient();
+        assert_eq!(lenient.failure_threshold, 10);
+
+        let default = ConnectorCircuitConfig::default();
+        assert_eq!(default.failure_threshold, 5);
+    }
+
+    #[test]
+    fn connector_reliability_retry_presets() {
+        let webhook = RetryPolicy::connector_webhook();
+        assert_eq!(webhook.max_attempts, Some(5));
+
+        let api = RetryPolicy::connector_api();
+        assert_eq!(api.max_attempts, Some(3));
+
+        let stream = RetryPolicy::connector_stream();
+        assert_eq!(stream.max_attempts, Some(10));
+    }
+
+    // ---- Dead-letter entry helpers ----
+
+    #[test]
+    fn connector_reliability_entry_age_and_retries() {
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let mut entry = DeadLetterEntry::new(1, action, "err", ConnectorErrorKind::Transient, 1000);
+
+        assert_eq!(entry.age_ms(5000), 4000);
+        assert!(!entry.exceeded_max_retries(3));
+
+        entry.record_retry_failure("err2", ConnectorErrorKind::Transient, 2000);
+        entry.record_retry_failure("err3", ConnectorErrorKind::Transient, 3000);
+        assert!(entry.exceeded_max_retries(3));
+        assert_eq!(entry.attempt_count, 3);
+        assert_eq!(entry.last_failed_at_ms, 3000);
+    }
+
+    #[test]
+    fn connector_reliability_entry_retry_count_saturates() {
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let mut entry = DeadLetterEntry::new(1, action, "err", ConnectorErrorKind::Transient, 1000);
+        entry.attempt_count = u32::MAX;
+
+        entry.record_retry_failure("err2", ConnectorErrorKind::Timeout, 2000);
+
+        assert_eq!(entry.attempt_count, u32::MAX);
+        assert_eq!(entry.error_kind, ConnectorErrorKind::Timeout);
+        assert_eq!(entry.last_failed_at_ms, 2000);
+    }
+
+    // ---- Shedding ----
+
+    #[test]
+    fn connector_reliability_shedding_threshold() {
+        let config = ConnectorReliabilityConfig {
+            shed_threshold: 2,
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("test", config);
+
+        assert!(!ctrl.is_shedding());
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        ctrl.record_failure(&action, "err", ConnectorErrorKind::Transient, 1000);
+        ctrl.record_failure(&action, "err", ConnectorErrorKind::Transient, 2000);
+
+        assert!(ctrl.is_shedding());
+    }
+}

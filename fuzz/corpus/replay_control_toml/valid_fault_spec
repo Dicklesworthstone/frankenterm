@@ -1,0 +1,8 @@
+name = "drop-data"
+seed = 123
+
+[[faults]]
+type = "drop"
+probability = 0.25
+[faults.filter]
+event_kind = "data"

@@ -1,0 +1,17 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "English ASCII baseline 0123456789",
+    "Simplified Chinese: \u4f60\u597d \u4e16\u754c \u7ec8\u7aef\u6e32\u67d3",
+    "Traditional Chinese: \u7e41\u9ad4\u4e2d\u6587 \u96fb\u8166 \u7d42\u7aef \u6e2c\u8a66",
+    "Japanese: \u3072\u3089\u304c\u306a \u30ab\u30bf\u30ab\u30ca \u6f22\u5b57",
+    "Korean: \ud55c\uad6d\uc5b4 \ud55c\uae00 \ud14c\ubbf8\ub110 \ub80c\ub354\ub9c1"
+  ],
+  "cursor": {
+    "row": 0,
+    "col": 31,
+    "shape": "beam"
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

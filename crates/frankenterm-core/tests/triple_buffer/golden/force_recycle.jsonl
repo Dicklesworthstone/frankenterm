@@ -1,0 +1,2 @@
+{"ts_ms":0,"kind":"publish","state":{"writer_slot":1,"presented_slot":0,"reader_slot":2,"dirty":true},"generation":1}
+{"ts_ms":5,"kind":"force_recycle","state":{"writer_slot":1,"presented_slot":2,"reader_slot":0,"dirty":false},"generation":2}

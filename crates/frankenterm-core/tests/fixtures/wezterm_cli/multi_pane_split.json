@@ -1,0 +1,32 @@
+[
+  {
+    "pane_id": 0,
+    "tab_id": 0,
+    "window_id": 0,
+    "domain_name": "local",
+    "workspace": "default",
+    "size": {
+      "rows": 24,
+      "cols": 40
+    },
+    "title": "nvim",
+    "cwd": "file:///home/user/project",
+    "is_active": true,
+    "is_zoomed": false
+  },
+  {
+    "pane_id": 1,
+    "tab_id": 0,
+    "window_id": 0,
+    "domain_name": "local",
+    "workspace": "default",
+    "size": {
+      "rows": 24,
+      "cols": 40
+    },
+    "title": "cargo watch",
+    "cwd": "file:///home/user/project",
+    "is_active": false,
+    "is_zoomed": false
+  }
+]

@@ -1,0 +1,160 @@
+name: font_churn_multi_pane
+description: "Six-pane font-size churn with intermittent resize pulses to emulate editor/UI density toggles"
+duration: "7s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "1003"
+  scale_profile: font_churn_focus
+  pane_count: "6"
+  tab_count: "2"
+  scrollback_lines: "6000"
+  font_steps: "18"
+panes:
+  - id: 10
+    title: "fonts-a"
+    window_id: 1
+    tab_id: 0
+    cols: 120
+    rows: 34
+  - id: 11
+    title: "fonts-b"
+    window_id: 1
+    tab_id: 0
+    cols: 120
+    rows: 34
+  - id: 12
+    title: "fonts-c"
+    window_id: 1
+    tab_id: 1
+    cols: 120
+    rows: 34
+  - id: 13
+    title: "fonts-d"
+    window_id: 1
+    tab_id: 1
+    cols: 120
+    rows: 34
+  - id: 14
+    title: "fonts-e"
+    window_id: 1
+    tab_id: 1
+    cols: 120
+    rows: 34
+  - id: 15
+    title: "fonts-f"
+    window_id: 1
+    tab_id: 1
+    cols: 120
+    rows: 34
+events:
+  - at: "0.1s"
+    pane: 10
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "0.2s"
+    pane: 11
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "0.3s"
+    pane: 12
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "0.4s"
+    pane: 13
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "0.5s"
+    pane: 14
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "0.6s"
+    pane: 15
+    action: generate_scrollback
+    content: "1000x110"
+  - at: "1.0s"
+    pane: 10
+    action: set_font_size
+    content: "0.85"
+  - at: "1.1s"
+    pane: 11
+    action: set_font_size
+    content: "0.90"
+  - at: "1.2s"
+    pane: 12
+    action: set_font_size
+    content: "0.95"
+  - at: "1.3s"
+    pane: 13
+    action: set_font_size
+    content: "1.05"
+  - at: "1.4s"
+    pane: 14
+    action: set_font_size
+    content: "1.10"
+  - at: "1.5s"
+    pane: 15
+    action: set_font_size
+    content: "1.15"
+  - at: "2.0s"
+    pane: 10
+    action: resize
+    content: "90x24"
+  - at: "2.1s"
+    pane: 11
+    action: resize
+    content: "90x24"
+  - at: "2.2s"
+    pane: 12
+    action: resize
+    content: "90x24"
+  - at: "2.3s"
+    pane: 13
+    action: resize
+    content: "90x24"
+  - at: "2.4s"
+    pane: 14
+    action: resize
+    content: "90x24"
+  - at: "2.5s"
+    pane: 15
+    action: resize
+    content: "90x24"
+  - at: "3.0s"
+    pane: 10
+    action: set_font_size
+    content: "1.20"
+  - at: "3.1s"
+    pane: 11
+    action: set_font_size
+    content: "1.20"
+  - at: "3.2s"
+    pane: 12
+    action: set_font_size
+    content: "1.20"
+  - at: "3.3s"
+    pane: 13
+    action: set_font_size
+    content: "1.20"
+  - at: "3.4s"
+    pane: 14
+    action: set_font_size
+    content: "1.20"
+  - at: "3.5s"
+    pane: 15
+    action: set_font_size
+    content: "1.20"
+  - at: "4.0s"
+    pane: 12
+    action: marker
+    name: font_churn_plateau
+expectations:
+  - contains:
+      pane: 10
+      text: "[FONT_SIZE:1.20]"
+  - contains:
+      pane: 15
+      text: "[FONT_SIZE:1.20]"
+  - contains:
+      pane: 12
+      text: "[MARKER:font_churn_plateau]"

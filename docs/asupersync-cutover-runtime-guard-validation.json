@@ -1,0 +1,131 @@
+{
+  "checked_at": "2026-09-12T00:50:20Z",
+  "checks": [
+    {
+      "name": "contract_identity",
+      "status": "passed"
+    },
+    {
+      "name": "dependency_manifest_allowlist",
+      "observed": {
+        "async-io": [
+          "Cargo.toml",
+          "frankenterm/async_ossl/Cargo.toml",
+          "frankenterm/promise/Cargo.toml",
+          "frankenterm/uds/Cargo.toml"
+        ],
+        "smol": [
+          "Cargo.toml",
+          "frankenterm/codec/Cargo.toml",
+          "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
+          "frankenterm/ssh/Cargo.toml"
+        ],
+        "tokio": ["Cargo.toml", "crates/frankenterm-core/Cargo.toml"]
+      },
+      "status": "passed"
+    },
+    {
+      "counts": {
+        "async_io::": 9,
+        "smol::": 32,
+        "tokio::": 138
+      },
+      "files": {
+        "async_io::": [
+          "crates/frankenterm-core/src/dependency_eradication.rs",
+          "frankenterm/async_ossl/src/lib.rs",
+          "frankenterm/promise/src/spawn.rs",
+          "frankenterm/uds/src/lib.rs"
+        ],
+        "smol::": [
+          "crates/frankenterm-core/src/dependency_eradication.rs",
+          "crates/frankenterm-core/src/vendored_migration_map.rs",
+          "frankenterm/codec/src/lib.rs",
+          "frankenterm/ssh/src/lib.rs"
+        ],
+        "tokio::": [
+          "crates/frankenterm-core/src/dependency_eradication.rs",
+          "crates/frankenterm-core/src/forbidden_dep_guards.rs",
+          "crates/frankenterm-core/src/manifest_dep_eradication.rs",
+          "crates/frankenterm-core/src/mcp_proxy.rs",
+          "crates/frankenterm-core/src/runtime_async.rs",
+          "crates/frankenterm-core/src/runtime_proof.rs",
+          "crates/frankenterm-core/src/vendored_async_contracts.rs",
+          "crates/frankenterm-core/src/web/sse.rs",
+          "crates/frankenterm-core/tests/cleanup_labruntime.rs",
+          "crates/frankenterm-core/tests/diagnostic_labruntime.rs",
+          "crates/frankenterm-core/tests/distributed_labruntime.rs",
+          "crates/frankenterm-core/tests/events_labruntime.rs",
+          "crates/frankenterm-core/tests/export_labruntime.rs",
+          "crates/frankenterm-core/tests/metrics_labruntime.rs",
+          "crates/frankenterm-core/tests/notifications_labruntime.rs",
+          "crates/frankenterm-core/tests/orphan_reaper_labruntime.rs",
+          "crates/frankenterm-core/tests/policy_labruntime.rs",
+          "crates/frankenterm-core/tests/pool_labruntime.rs",
+          "crates/frankenterm-core/tests/proptest_dependency_eradication.rs",
+          "crates/frankenterm-core/tests/proptest_forbidden_dep_guards.rs",
+          "crates/frankenterm-core/tests/protocol_recovery_labruntime.rs",
+          "crates/frankenterm-core/tests/recorder_lexical_ingest_labruntime.rs",
+          "crates/frankenterm-core/tests/recorder_migration_labruntime.rs",
+          "crates/frankenterm-core/tests/recorder_storage_labruntime.rs",
+          "crates/frankenterm-core/tests/replay_labruntime.rs",
+          "crates/frankenterm-core/tests/reports_labruntime.rs",
+          "crates/frankenterm-core/tests/restore_layout_labruntime.rs",
+          "crates/frankenterm-core/tests/retry_labruntime.rs",
+          "crates/frankenterm-core/tests/runtime_async_surface_guard.rs",
+          "crates/frankenterm-core/tests/runtime_labruntime.rs",
+          "crates/frankenterm-core/tests/secrets_labruntime.rs",
+          "crates/frankenterm-core/tests/session_correlation_labruntime.rs",
+          "crates/frankenterm-core/tests/sharding_labruntime.rs",
+          "crates/frankenterm-core/tests/simulation_labruntime.rs",
+          "crates/frankenterm-core/tests/snapshot_engine_labruntime.rs",
+          "crates/frankenterm-core/tests/spsc_labruntime.rs",
+          "crates/frankenterm-core/tests/storage_labruntime.rs",
+          "crates/frankenterm-core/tests/tantivy_ingest_labruntime.rs",
+          "crates/frankenterm-core/tests/tantivy_reindex_labruntime.rs",
+          "crates/frankenterm-core/tests/telemetry_labruntime.rs",
+          "crates/frankenterm-core/tests/undo_labruntime.rs",
+          "crates/frankenterm-core/tests/vendored_async_contract_verification.rs",
+          "crates/frankenterm-core/tests/wa_22x4r_no_tokio_test_in_supported_paths.rs",
+          "crates/frankenterm-core/tests/watchdog_labruntime.rs",
+          "crates/frankenterm-core/tests/webhook_labruntime.rs",
+          "crates/frankenterm-core/tests/wezterm_labruntime.rs",
+          "crates/frankenterm-core/tests/workflows_labruntime.rs",
+          "frankenterm/ssh/src/lib.rs"
+        ]
+      },
+      "name": "forbidden_token_ceiling",
+      "status": "passed"
+    },
+    {
+      "module_count": 3,
+      "name": "strict_zero_modules",
+      "status": "passed"
+    }
+  ],
+  "policy_path": "docs/asupersync-cutover-runtime-guardrails.json",
+  "repo_root": "/Users/jemanuel/projects/frankenterm",
+  "status": "passed",
+  "summary": {
+    "dependency_manifest_hits": {
+      "async-io": [
+        "Cargo.toml",
+        "frankenterm/async_ossl/Cargo.toml",
+        "frankenterm/promise/Cargo.toml",
+        "frankenterm/uds/Cargo.toml"
+      ],
+      "smol": [
+        "Cargo.toml",
+        "frankenterm/codec/Cargo.toml",
+        "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
+        "frankenterm/ssh/Cargo.toml"
+      ],
+      "tokio": ["Cargo.toml", "crates/frankenterm-core/Cargo.toml"]
+    },
+    "forbidden_token_counts": {
+      "async_io::": 9,
+      "smol::": 32,
+      "tokio::": 138
+    }
+  }
+}

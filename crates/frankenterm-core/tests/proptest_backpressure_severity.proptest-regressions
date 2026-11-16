@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f17989759e5c0bee99d6240748b4eeb92ef41f49b54630cd4c2ccb1a787c449f # shrinks to config = SeverityConfig { center_threshold: 0.01, steepness: 0.1, smoothing_window: 1 }
+cc 8ee25373e9993e91cf5a9900685bcabded9a0bf858ab50b87ced2a47e42a34b5 # shrinks to config = SeverityConfig { center_threshold: 0.01, steepness: 15.209327002665935, smoothing_window: 1 }

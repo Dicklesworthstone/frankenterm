@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.usage.warning",
+    "agent_type": "claude_code",
+    "event_type": "usage.warning",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "remaining": "5"
+    },
+    "matched_text": "5% remaining"
+  }
+]

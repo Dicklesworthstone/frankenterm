@@ -1,0 +1,17 @@
+[package]
+name = "frankenterm-terminal-wire"
+description = "Bounded terminal protocol shared by native and browser clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true

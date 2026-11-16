@@ -1,0 +1,2003 @@
+//! Search orchestration layer for frankensearch migration.
+//!
+//! Provides a `SearchOrchestrator` that encapsulates the full search pipeline:
+//! query → lexical + semantic retrieval → fusion → ranked results.
+//!
+//! Two backends are available:
+//!
+//! - **Legacy** (`OrchestrationBackend::Legacy`): Uses `HybridSearchService::fuse()`
+//!   directly with caller-provided lexical/semantic ranked lists. This is the current
+//!   production path that storage.rs uses.
+//!
+//! - **Bridge** (`OrchestrationBackend::Bridge`): Delegates full orchestration to
+//!   `SearchBridge` / `TwoTierSearcher`, which internally manages lexical retrieval,
+//!   semantic retrieval, and RRF fusion. Requires the `frankensearch` feature.
+//!
+//! The backend is selected at construction time and can be overridden via the
+//! `FT_SEARCH_ORCHESTRATION` environment variable (`legacy` or `bridge`).
+//!
+//! # Embedder dispatch (B3)
+//!
+//! The orchestrator supports two embedder dispatch strategies:
+//!
+//! - **Legacy**: Caller embeds externally and provides pre-ranked lists.
+//! - **Managed**: Orchestrator owns a `ManagedEmbedderStack` with tiered fallback
+//!   (Quality → Fast → Hash). The stack auto-detects available models and
+//!   degrades gracefully to hash embeddings when ONNX/distilled models are
+//!   unavailable.
+//!
+//! # Migration path
+//!
+//! 1. A1 (done): Freeze API contract + baseline regression corpus
+//! 2. B1 (done): Create orchestration abstraction with legacy + bridge backends
+//! 3. B2 (done): Weight-aware frankensearch RRF fusion + bridge fallback
+//! 4. B3 (done): Migrate embedder stack dispatch + fallback tiers
+//! 5. B4 (done): Migrate vector/chunk index internals to FSVI path
+//! 6. **B5 (done)**: Preserve terminal-specific chunking via adapter layer
+//! 7. **B6 (done)**: Migrate reranker path to frankensearch-rerank bridge
+//! 8. **B7 (done)**: Adapt daemon/background indexing to frankensearch APIs
+//! 9. **B8 (done)**: Unify tantivy ingest/query into single lexical backend
+
+use super::reranker::RerankConfig;
+use super::{
+    EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
+    HybridSearchService, SearchMode, TwoTierMetrics,
+};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::sync::Arc;
+
+/// Serializable search mode selector (mirrors SearchMode but with serde).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchModeConfig {
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl From<SearchModeConfig> for SearchMode {
+    fn from(val: SearchModeConfig) -> Self {
+        match val {
+            SearchModeConfig::Lexical => SearchMode::Lexical,
+            SearchModeConfig::Semantic => SearchMode::Semantic,
+            SearchModeConfig::Hybrid => SearchMode::Hybrid,
+        }
+    }
+}
+
+impl From<SearchMode> for SearchModeConfig {
+    fn from(val: SearchMode) -> Self {
+        match val {
+            SearchMode::Lexical => SearchModeConfig::Lexical,
+            SearchMode::Semantic => SearchModeConfig::Semantic,
+            SearchMode::Hybrid => SearchModeConfig::Hybrid,
+        }
+    }
+}
+
+// ── B3: Embedder dispatch types ───────────────────────────────────────
+
+/// Reranker dispatch strategy (B6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerDispatch {
+    /// Reranking disabled (no post-fusion reranking step).
+    #[default]
+    Disabled,
+    /// Use local reranker implementation (PassthroughReranker or CrossEncoderReranker).
+    Legacy,
+    /// Use frankensearch reranker via bridge adapter.
+    Managed,
+}
+
+impl RerankerDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Legacy => "legacy",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "legacy" | "local" | "passthrough" => Self::Legacy,
+            "managed" | "bridge" | "frankensearch" | "flashrank" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether reranking is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl fmt::Display for RerankerDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Daemon dispatch strategy (B7).
+///
+/// Controls whether the embedding daemon uses the local worker path or
+/// delegates to frankensearch's `BatchCoalescer` + `CachedEmbedder`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonDispatch {
+    /// Daemon is disabled (no background embedding).
+    #[default]
+    Disabled,
+    /// Legacy daemon worker — processes requests one at a time.
+    Legacy,
+    /// Managed daemon via frankensearch BatchCoalescer + CachedEmbedder.
+    Managed,
+}
+
+impl DaemonDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Legacy => "legacy",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "legacy" | "local" | "single" | "worker" => Self::Legacy,
+            "managed" | "bridge" | "frankensearch" | "batch" | "coalescer" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether the daemon is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether managed batch coalescing is active.
+    #[must_use]
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
+impl fmt::Display for DaemonDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lexical backend dispatch strategy (B8).
+///
+/// Controls whether lexical indexing/querying uses the recorder-lexical
+/// (direct tantivy) path or the frankensearch-managed lexical backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalDispatch {
+    /// Lexical search disabled.
+    #[default]
+    Disabled,
+    /// Direct tantivy via recorder-lexical pipeline.
+    RecorderDirect,
+    /// FrankenSearch-managed lexical backend.
+    Managed,
+}
+
+impl LexicalDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::RecorderDirect => "recorder_direct",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "recorder_direct" | "recorder" | "direct" | "tantivy" => Self::RecorderDirect,
+            "managed" | "bridge" | "frankensearch" | "unified" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether lexical search is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether the managed (frankensearch) path is active.
+    #[must_use]
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
+impl fmt::Display for LexicalDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Embedder dispatch strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbedderDispatch {
+    /// Caller embeds externally and provides pre-ranked lists.
+    #[default]
+    Legacy,
+    /// Orchestrator manages an embedder stack with tiered fallback.
+    Managed,
+}
+
+/// Availability tier of the managed embedder stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbedderAvailability {
+    /// Quality + fast + hash all available.
+    Full,
+    /// Fast + hash available, quality model missing.
+    FastOnly,
+    /// Hash-only fallback (no semantic models).
+    HashOnly,
+    /// No embedder configured (legacy dispatch).
+    None,
+}
+
+impl EmbedderAvailability {
+    /// Whether this represents a degraded state (missing tiers).
+    #[must_use]
+    pub const fn is_degraded(self) -> bool {
+        matches!(self, Self::FastOnly | Self::HashOnly)
+    }
+}
+
+impl fmt::Display for EmbedderAvailability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => write!(f, "full (quality + fast + hash)"),
+            Self::FastOnly => write!(f, "degraded (fast + hash, no quality)"),
+            Self::HashOnly => write!(f, "minimal (hash only)"),
+            Self::None => write!(f, "none (legacy dispatch)"),
+        }
+    }
+}
+
+/// Managed embedder stack with tiered fallback.
+///
+/// Wraps one or more `Embedder` implementations with automatic fallback:
+/// Quality → Fast → Hash. Tracks which tier was actually used for metrics.
+pub struct ManagedEmbedderStack {
+    /// Quality-tier embedder (e.g. FastEmbed ONNX). Optional.
+    quality: Option<Arc<dyn Embedder>>,
+    /// Fast-tier embedder (e.g. Model2Vec distilled). Optional.
+    fast: Option<Arc<dyn Embedder>>,
+    /// Hash-tier embedder (always available).
+    hash: Arc<dyn Embedder>,
+    /// Current availability classification.
+    availability: EmbedderAvailability,
+}
+
+impl ManagedEmbedderStack {
+    /// Create a hash-only stack (always succeeds).
+    #[must_use]
+    pub fn hash_only() -> Self {
+        Self {
+            quality: None,
+            fast: None,
+            hash: Arc::new(HashEmbedder::default()),
+            availability: EmbedderAvailability::HashOnly,
+        }
+    }
+
+    /// Create from explicit tier parts.
+    #[must_use]
+    pub fn from_tiers(
+        quality: Option<Arc<dyn Embedder>>,
+        fast: Option<Arc<dyn Embedder>>,
+        hash: Arc<dyn Embedder>,
+    ) -> Self {
+        let availability = match (&quality, &fast) {
+            (Some(_), _) => EmbedderAvailability::Full,
+            (None, Some(_)) => EmbedderAvailability::FastOnly,
+            (None, None) => EmbedderAvailability::HashOnly,
+        };
+        Self {
+            quality,
+            fast,
+            hash,
+            availability,
+        }
+    }
+
+    /// Current availability classification.
+    #[must_use]
+    pub fn availability(&self) -> EmbedderAvailability {
+        self.availability
+    }
+
+    /// Get the best available embedder, falling back through tiers.
+    ///
+    /// Returns the embedder and which tier was selected.
+    #[must_use]
+    pub fn best_embedder(&self) -> (&dyn Embedder, EmbedderTier) {
+        if let Some(ref q) = self.quality {
+            return (q.as_ref(), EmbedderTier::Quality);
+        }
+        if let Some(ref f) = self.fast {
+            return (f.as_ref(), EmbedderTier::Fast);
+        }
+        (self.hash.as_ref(), EmbedderTier::Hash)
+    }
+
+    /// Get a specific tier's embedder, if available.
+    #[must_use]
+    pub fn embedder_for_tier(&self, tier: EmbedderTier) -> Option<&dyn Embedder> {
+        match tier {
+            EmbedderTier::Quality => self.quality.as_deref(),
+            EmbedderTier::Fast => self.fast.as_deref(),
+            EmbedderTier::Hash => Some(self.hash.as_ref()),
+        }
+    }
+
+    /// Embed text using the best available embedder, with fallback on error.
+    ///
+    /// Tries Quality → Fast → Hash. Returns the embedding vector and which
+    /// tier actually produced it.
+    pub fn embed_with_fallback(&self, text: &str) -> Result<(Vec<f32>, EmbedderTier), EmbedError> {
+        // Try quality tier first
+        if let Some(ref q) = self.quality {
+            match q.embed(text) {
+                Ok(v) => return Ok((v, EmbedderTier::Quality)),
+                Err(_) => { /* fall through to fast */ }
+            }
+        }
+        // Try fast tier
+        if let Some(ref f) = self.fast {
+            match f.embed(text) {
+                Ok(v) => return Ok((v, EmbedderTier::Fast)),
+                Err(_) => { /* fall through to hash */ }
+            }
+        }
+        // Hash always succeeds
+        let v = self.hash.embed(text)?;
+        Ok((v, EmbedderTier::Hash))
+    }
+
+    /// Info for the best available embedder.
+    #[must_use]
+    pub fn best_info(&self) -> EmbedderInfo {
+        let (emb, _) = self.best_embedder();
+        emb.info()
+    }
+}
+
+impl fmt::Debug for ManagedEmbedderStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedEmbedderStack")
+            .field("availability", &self.availability)
+            .field("quality", &self.quality.as_ref().map(|e| e.info().name))
+            .field("fast", &self.fast.as_ref().map(|e| e.info().name))
+            .field("hash", &self.hash.info().name)
+            .finish()
+    }
+}
+
+// ── Backend + metrics types ───────────────────────────────────────────
+
+/// Backend selector for search orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationBackend {
+    /// Legacy: caller provides ranked lists, fuse via HybridSearchService.
+    Legacy,
+    /// Bridge: delegate full pipeline to TwoTierSearcher via SearchBridge.
+    Bridge,
+}
+
+impl OrchestrationBackend {
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "bridge" | "frankensearch" | "two_tier" | "twotier" => Self::Bridge,
+            _ => Self::Legacy,
+        }
+    }
+
+    /// Resolve from `FT_SEARCH_ORCHESTRATION` environment variable.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("FT_SEARCH_ORCHESTRATION") {
+            Ok(val) => Self::parse(&val),
+            Err(_) => Self::Legacy,
+        }
+    }
+
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+impl fmt::Display for OrchestrationBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Orchestration-level metrics, superset of fusion metrics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrchestrationMetrics {
+    /// Backend that was used.
+    pub backend: String,
+    /// Search mode that was effective.
+    pub effective_mode: String,
+    /// Whether the backend fell back from bridge to legacy.
+    pub fallback_occurred: bool,
+    /// Reason for fallback (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// Number of lexical candidates provided/generated.
+    pub lexical_candidates: usize,
+    /// Number of semantic candidates provided/generated.
+    pub semantic_candidates: usize,
+    /// Two-tier fusion metrics (from HybridSearchService).
+    pub fusion: TwoTierMetrics,
+    /// Embedder dispatch strategy used.
+    pub embedder_dispatch: String,
+    /// Embedder availability at query time.
+    pub embedder_availability: String,
+    /// Which embedder tier actually produced the query embedding (if managed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedder_tier_used: Option<String>,
+    /// Whether an embedder fallback occurred (e.g. quality→hash).
+    pub embedder_fallback: bool,
+    /// Vector index backend used (ftvi or fsvi).
+    pub vector_index_backend: String,
+    /// Whether the chunking adapter was active for this query (B5).
+    #[serde(default)]
+    pub chunking_adapter_enabled: bool,
+    /// Reranker dispatch strategy used (B6).
+    #[serde(default)]
+    pub reranker_dispatch: String,
+    /// Whether reranking was enabled for this query (B6).
+    #[serde(default)]
+    pub reranker_enabled: bool,
+    /// Daemon dispatch strategy used (B7).
+    #[serde(default)]
+    pub daemon_dispatch: String,
+    /// Whether the daemon is enabled (B7).
+    #[serde(default)]
+    pub daemon_enabled: bool,
+    /// Lexical dispatch strategy used (B8).
+    #[serde(default)]
+    pub lexical_dispatch: String,
+    /// Whether lexical search is enabled (B8).
+    #[serde(default)]
+    pub lexical_enabled: bool,
+}
+
+/// Input for legacy orchestration: pre-ranked lists from caller.
+#[derive(Debug, Clone)]
+pub struct LegacySearchInput {
+    /// Lexical ranked list: (doc_id, score) in descending score order.
+    pub lexical_ranked: Vec<(u64, f32)>,
+    /// Semantic ranked list: (doc_id, score) in descending score order.
+    pub semantic_ranked: Vec<(u64, f32)>,
+    /// Maximum results to return.
+    pub top_k: usize,
+}
+
+/// Result from orchestrated search.
+#[derive(Debug, Clone)]
+pub struct OrchestrationResult {
+    /// Fused ranked results.
+    pub results: Vec<FusedResult>,
+    /// Orchestration-level metrics.
+    pub metrics: OrchestrationMetrics,
+}
+
+/// Configuration for the search orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    /// Which backend to use.
+    pub backend: OrchestrationBackend,
+    /// Search mode.
+    pub mode: SearchModeConfig,
+    /// RRF parameter k.
+    pub rrf_k: u32,
+    /// Two-tier blending alpha (0.0 = all tier2, 1.0 = all tier1).
+    pub alpha: f32,
+    /// Lexical lane weight for weighted RRF.
+    pub lexical_weight: f32,
+    /// Semantic lane weight for weighted RRF.
+    pub semantic_weight: f32,
+    /// Whether to fall back to legacy if bridge fails.
+    pub fallback_to_legacy: bool,
+    /// Embedder dispatch strategy.
+    pub embedder_dispatch: EmbedderDispatch,
+    /// Vector index backend (ftvi = legacy, fsvi = frankensearch).
+    pub vector_index_backend: String,
+    /// Whether the chunking adapter layer is enabled (B5).
+    /// When true, SemanticChunks are converted through the adapter before indexing.
+    #[serde(default)]
+    pub chunking_adapter_enabled: bool,
+    /// Reranker dispatch strategy (B6).
+    #[serde(default)]
+    pub reranker_dispatch: RerankerDispatch,
+    /// Daemon dispatch strategy (B7).
+    #[serde(default)]
+    pub daemon_dispatch: DaemonDispatch,
+    /// Lexical backend dispatch strategy (B8).
+    #[serde(default)]
+    pub lexical_dispatch: LexicalDispatch,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            backend: OrchestrationBackend::from_env(),
+            mode: SearchModeConfig::Hybrid,
+            rrf_k: 60,
+            alpha: 0.7,
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            fallback_to_legacy: true,
+            embedder_dispatch: EmbedderDispatch::Legacy,
+            vector_index_backend: "ftvi".to_string(),
+            chunking_adapter_enabled: false,
+            reranker_dispatch: RerankerDispatch::Disabled,
+            daemon_dispatch: DaemonDispatch::Disabled,
+            lexical_dispatch: LexicalDispatch::Disabled,
+        }
+    }
+}
+
+/// Internal helper for migration metrics.
+struct MigrationMetrics {
+    embedder_dispatch: String,
+    embedder_availability: String,
+    embedder_tier_used: Option<String>,
+    embedder_fallback: bool,
+    vector_index_backend: String,
+    chunking_adapter_enabled: bool,
+    reranker_dispatch: String,
+    reranker_enabled: bool,
+    daemon_dispatch: String,
+    daemon_enabled: bool,
+    lexical_dispatch: String,
+    lexical_enabled: bool,
+}
+
+/// Search orchestrator that encapsulates backend selection and fallback logic.
+///
+/// In the legacy path, the caller provides pre-ranked lexical and semantic lists.
+/// In the bridge path, the orchestrator delegates fusion to frankensearch with
+/// weight-aware RRF scoring.
+///
+/// With managed embedder dispatch (B3), the orchestrator owns a `ManagedEmbedderStack`
+/// and handles embedding with automatic fallback across tiers.
+///
+/// Both paths produce the same `OrchestrationResult` with compatible `FusedResult`
+/// vectors, preserving the frozen API contract.
+pub struct SearchOrchestrator {
+    config: OrchestratorConfig,
+    embedder_stack: Option<ManagedEmbedderStack>,
+}
+
+impl SearchOrchestrator {
+    /// Create a new orchestrator with the given configuration.
+    #[must_use]
+    pub fn new(config: OrchestratorConfig) -> Self {
+        Self {
+            config,
+            embedder_stack: None,
+        }
+    }
+
+    /// Attach a managed embedder stack, switching dispatch to Managed.
+    #[must_use]
+    pub fn with_embedder_stack(mut self, stack: ManagedEmbedderStack) -> Self {
+        self.config.embedder_dispatch = EmbedderDispatch::Managed;
+        self.embedder_stack = Some(stack);
+        self
+    }
+
+    /// Create with default config (resolves backend from env).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::new(OrchestratorConfig::default())
+    }
+
+    /// Get the current configuration.
+    #[must_use]
+    pub fn config(&self) -> &OrchestratorConfig {
+        &self.config
+    }
+
+    /// Get the active backend.
+    #[must_use]
+    pub fn backend(&self) -> OrchestrationBackend {
+        self.config.backend
+    }
+
+    /// Get the embedder availability (None if legacy dispatch).
+    #[must_use]
+    pub fn embedder_availability(&self) -> EmbedderAvailability {
+        self.embedder_stack
+            .as_ref()
+            .map_or(EmbedderAvailability::None, |s| s.availability())
+    }
+
+    /// Embed a query using the managed embedder stack (with fallback).
+    ///
+    /// Returns `None` if no managed stack is configured (legacy dispatch).
+    pub fn embed_query(&self, text: &str) -> Option<Result<(Vec<f32>, EmbedderTier), EmbedError>> {
+        self.embedder_stack
+            .as_ref()
+            .map(|stack| stack.embed_with_fallback(text))
+    }
+
+    /// Build the effective `RerankConfig` from the orchestrator's `RerankerDispatch`.
+    ///
+    /// Maps the high-level dispatch enum to a detailed config struct that the
+    /// reranking pipeline step consumes.
+    #[must_use]
+    pub fn effective_rerank_config(&self) -> RerankConfig {
+        use super::reranker::RerankBackend;
+        match self.config.reranker_dispatch {
+            RerankerDispatch::Disabled => RerankConfig::default(), // enabled = false
+            RerankerDispatch::Legacy => RerankConfig {
+                enabled: true,
+                backend: RerankBackend::Passthrough,
+                ..Default::default()
+            },
+            RerankerDispatch::Managed => RerankConfig {
+                enabled: true,
+                backend: RerankBackend::FrankenSearch,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Build embedder + vector-index metrics based on current state.
+    fn migration_metrics(&self) -> MigrationMetrics {
+        MigrationMetrics {
+            embedder_dispatch: format!("{:?}", self.config.embedder_dispatch),
+            embedder_availability: format!("{}", self.embedder_availability()),
+            embedder_tier_used: None,
+            embedder_fallback: false,
+            vector_index_backend: self.config.vector_index_backend.clone(),
+            chunking_adapter_enabled: self.config.chunking_adapter_enabled,
+            reranker_dispatch: self.config.reranker_dispatch.as_str().to_string(),
+            reranker_enabled: self.config.reranker_dispatch.is_enabled(),
+            daemon_dispatch: self.config.daemon_dispatch.as_str().to_string(),
+            daemon_enabled: self.config.daemon_dispatch.is_enabled(),
+            lexical_dispatch: self.config.lexical_dispatch.as_str().to_string(),
+            lexical_enabled: self.config.lexical_dispatch.is_enabled(),
+        }
+    }
+
+    /// Execute search using pre-ranked lists (legacy-compatible entry point).
+    pub fn fuse_ranked(&self, input: &LegacySearchInput) -> OrchestrationResult {
+        match self.config.backend {
+            OrchestrationBackend::Legacy => self.fuse_legacy(input),
+            OrchestrationBackend::Bridge => self.fuse_bridge(input),
+        }
+    }
+
+    /// Legacy fusion: delegate directly to HybridSearchService.
+    fn fuse_legacy(&self, input: &LegacySearchInput) -> OrchestrationResult {
+        let svc = HybridSearchService::new()
+            .with_mode(SearchMode::from(self.config.mode))
+            .with_rrf_k(self.config.rrf_k)
+            .with_alpha(self.config.alpha)
+            .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
+
+        let results = svc.fuse(&input.lexical_ranked, &input.semantic_ranked, input.top_k);
+
+        let mm = self.migration_metrics();
+
+        OrchestrationResult {
+            results,
+            metrics: OrchestrationMetrics {
+                backend: "legacy".to_string(),
+                effective_mode: format!("{:?}", SearchMode::from(self.config.mode)),
+                fallback_occurred: false,
+                fallback_reason: None,
+                lexical_candidates: input.lexical_ranked.len(),
+                semantic_candidates: input.semantic_ranked.len(),
+                fusion: TwoTierMetrics::default(),
+                embedder_dispatch: mm.embedder_dispatch,
+                embedder_availability: mm.embedder_availability,
+                embedder_tier_used: mm.embedder_tier_used,
+                embedder_fallback: mm.embedder_fallback,
+                vector_index_backend: mm.vector_index_backend,
+                chunking_adapter_enabled: mm.chunking_adapter_enabled,
+                reranker_dispatch: mm.reranker_dispatch,
+                reranker_enabled: mm.reranker_enabled,
+                daemon_dispatch: mm.daemon_dispatch,
+                daemon_enabled: mm.daemon_enabled,
+                lexical_dispatch: mm.lexical_dispatch,
+                lexical_enabled: mm.lexical_enabled,
+            },
+        }
+    }
+
+    /// Bridge fusion: delegates to frankensearch with weight-aware RRF scoring.
+    fn fuse_bridge(&self, input: &LegacySearchInput) -> OrchestrationResult {
+        let run_bridge = || {
+            let svc = HybridSearchService::new()
+                .with_mode(SearchMode::from(self.config.mode))
+                .with_rrf_k(self.config.rrf_k)
+                .with_alpha(self.config.alpha)
+                .with_fusion_backend(super::FusionBackend::FrankenSearchRrf)
+                .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
+
+            svc.fuse(&input.lexical_ranked, &input.semantic_ranked, input.top_k)
+        };
+        // A bridge panic is recoverable only when this orchestrator is
+        // configured to take the legacy fallback. Without that fallback there
+        // is no recovery action: execute directly so the ordinary fatal hook
+        // reports the panic exactly once instead of suppressing and rethrowing
+        // a payload that the sanitized recovery API intentionally discards.
+        let bridge_result = if self.config.fallback_to_legacy {
+            catch_recoverable(
+                RecoverablePanicSite::CoreSearchBridge,
+                std::panic::AssertUnwindSafe(run_bridge),
+            )
+        } else {
+            Ok(run_bridge())
+        };
+
+        let mm = self.migration_metrics();
+
+        match bridge_result {
+            Ok(results) => OrchestrationResult {
+                results,
+                metrics: OrchestrationMetrics {
+                    backend: "bridge".to_string(),
+                    effective_mode: format!("{:?}", SearchMode::from(self.config.mode)),
+                    fallback_occurred: false,
+                    fallback_reason: None,
+                    lexical_candidates: input.lexical_ranked.len(),
+                    semantic_candidates: input.semantic_ranked.len(),
+                    fusion: TwoTierMetrics::default(),
+                    embedder_dispatch: mm.embedder_dispatch,
+                    embedder_availability: mm.embedder_availability,
+                    embedder_tier_used: mm.embedder_tier_used,
+                    embedder_fallback: mm.embedder_fallback,
+                    vector_index_backend: mm.vector_index_backend,
+                    chunking_adapter_enabled: mm.chunking_adapter_enabled,
+                    reranker_dispatch: mm.reranker_dispatch,
+                    reranker_enabled: mm.reranker_enabled,
+                    daemon_dispatch: mm.daemon_dispatch,
+                    daemon_enabled: mm.daemon_enabled,
+                    lexical_dispatch: mm.lexical_dispatch,
+                    lexical_enabled: mm.lexical_enabled,
+                },
+            },
+            Err(_) => {
+                debug_assert!(self.config.fallback_to_legacy);
+                let mut result = self.fuse_legacy(input);
+                result.metrics.fallback_occurred = true;
+                result.metrics.fallback_reason =
+                    Some("bridge_panic: fell back to legacy fusion".to_string());
+                result.metrics.backend = "bridge(fallback->legacy)".to_string();
+                result
+            }
+        }
+    }
+
+    /// Compare legacy and bridge results for the same input (migration validation).
+    pub fn compare_backends(&self, input: &LegacySearchInput) -> OrchestrationComparison {
+        let legacy = self.fuse_legacy(input);
+        let bridge = self.fuse_bridge(input);
+
+        let legacy_ids: Vec<u64> = legacy.results.iter().map(|r| r.id).collect();
+        let bridge_ids: Vec<u64> = bridge.results.iter().map(|r| r.id).collect();
+        let ranking_match = legacy_ids == bridge_ids;
+
+        let score_diff = if legacy.results.len() == bridge.results.len() {
+            legacy
+                .results
+                .iter()
+                .zip(bridge.results.iter())
+                .map(|(a, b)| (a.score - b.score).abs())
+                .fold(0.0_f32, f32::max)
+        } else {
+            f32::INFINITY
+        };
+
+        OrchestrationComparison {
+            legacy,
+            bridge,
+            ranking_match,
+            max_score_diff: score_diff,
+        }
+    }
+}
+
+impl fmt::Debug for SearchOrchestrator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchOrchestrator")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+/// Comparison report from running both backends on the same input.
+#[derive(Debug)]
+pub struct OrchestrationComparison {
+    /// Legacy backend result.
+    pub legacy: OrchestrationResult,
+    /// Bridge backend result.
+    pub bridge: OrchestrationResult,
+    /// Whether the ranking order matches exactly.
+    pub ranking_match: bool,
+    /// Maximum absolute score difference across corresponding positions.
+    pub max_score_diff: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_input() -> LegacySearchInput {
+        LegacySearchInput {
+            lexical_ranked: vec![(1, 10.0), (2, 9.0), (3, 8.0), (4, 7.0)],
+            semantic_ranked: vec![(3, 0.99), (5, 0.95), (1, 0.90)],
+            top_k: 5,
+        }
+    }
+
+    // ── OrchestrationBackend ──────────────────────────────────────────
+
+    #[test]
+    fn backend_parse_legacy() {
+        assert_eq!(
+            OrchestrationBackend::parse("legacy"),
+            OrchestrationBackend::Legacy
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("LEGACY"),
+            OrchestrationBackend::Legacy
+        );
+        assert_eq!(
+            OrchestrationBackend::parse(""),
+            OrchestrationBackend::Legacy
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("unknown"),
+            OrchestrationBackend::Legacy
+        );
+    }
+
+    #[test]
+    fn backend_parse_bridge() {
+        assert_eq!(
+            OrchestrationBackend::parse("bridge"),
+            OrchestrationBackend::Bridge
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("BRIDGE"),
+            OrchestrationBackend::Bridge
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("frankensearch"),
+            OrchestrationBackend::Bridge
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("two_tier"),
+            OrchestrationBackend::Bridge
+        );
+        assert_eq!(
+            OrchestrationBackend::parse("twotier"),
+            OrchestrationBackend::Bridge
+        );
+    }
+
+    #[test]
+    fn backend_as_str() {
+        assert_eq!(OrchestrationBackend::Legacy.as_str(), "legacy");
+        assert_eq!(OrchestrationBackend::Bridge.as_str(), "bridge");
+    }
+
+    #[test]
+    fn backend_display() {
+        assert_eq!(format!("{}", OrchestrationBackend::Legacy), "legacy");
+        assert_eq!(format!("{}", OrchestrationBackend::Bridge), "bridge");
+    }
+
+    #[test]
+    fn backend_serde_roundtrip() {
+        for backend in [OrchestrationBackend::Legacy, OrchestrationBackend::Bridge] {
+            let json = serde_json::to_string(&backend).unwrap();
+            let back: OrchestrationBackend = serde_json::from_str(&json).unwrap();
+            assert_eq!(backend, back);
+        }
+    }
+
+    // ── OrchestratorConfig ────────────────────────────────────────────
+
+    #[test]
+    fn config_default() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.mode, SearchModeConfig::Hybrid);
+        assert_eq!(cfg.rrf_k, 60);
+        assert!((cfg.alpha - 0.7).abs() < 1e-6);
+        assert!((cfg.lexical_weight - 1.0).abs() < 1e-6);
+        assert!((cfg.semantic_weight - 1.0).abs() < 1e-6);
+        assert!(cfg.fallback_to_legacy);
+        assert_eq!(cfg.embedder_dispatch, EmbedderDispatch::Legacy);
+        assert!(!cfg.chunking_adapter_enabled);
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            mode: SearchModeConfig::Hybrid,
+            rrf_k: 50,
+            alpha: 0.6,
+            lexical_weight: 0.8,
+            semantic_weight: 1.2,
+            fallback_to_legacy: false,
+            embedder_dispatch: EmbedderDispatch::Managed,
+            vector_index_backend: "fsvi".to_string(),
+            chunking_adapter_enabled: true,
+            reranker_dispatch: RerankerDispatch::Managed,
+            daemon_dispatch: DaemonDispatch::Managed,
+            lexical_dispatch: LexicalDispatch::Managed,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.backend, OrchestrationBackend::Bridge);
+        assert_eq!(back.rrf_k, 50);
+        assert_eq!(back.embedder_dispatch, EmbedderDispatch::Managed);
+        assert_eq!(back.vector_index_backend, "fsvi");
+        assert!(back.chunking_adapter_enabled);
+        assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
+        assert_eq!(back.daemon_dispatch, DaemonDispatch::Managed);
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::Managed);
+    }
+
+    // ── SearchOrchestrator ────────────────────────────────────────────
+
+    #[test]
+    fn orchestrator_legacy_produces_results() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.results.is_empty());
+        assert_eq!(result.metrics.backend, "legacy");
+        assert!(!result.metrics.fallback_occurred);
+        assert_eq!(result.metrics.lexical_candidates, 4);
+        assert_eq!(result.metrics.semantic_candidates, 3);
+    }
+
+    #[test]
+    fn orchestrator_bridge_produces_results() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.results.is_empty());
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+
+    #[test]
+    fn orchestrator_legacy_and_bridge_agree_with_unit_weights() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            ..Default::default()
+        });
+        let comparison = orch.compare_backends(&sample_input());
+        assert!(
+            comparison.ranking_match,
+            "unit-weight backends should produce identical rankings"
+        );
+        assert!(
+            comparison.max_score_diff < 1e-5,
+            "unit-weight backends should produce near-identical scores, got diff={}",
+            comparison.max_score_diff
+        );
+    }
+
+    #[test]
+    fn orchestrator_deterministic() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            ..Default::default()
+        });
+        let input = sample_input();
+        let r1 = orch.fuse_ranked(&input);
+        let r2 = orch.fuse_ranked(&input);
+        assert_eq!(r1.results.len(), r2.results.len());
+        for (a, b) in r1.results.iter().zip(r2.results.iter()) {
+            assert_eq!(a.id, b.id);
+            assert!((a.score - b.score).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn orchestrator_lexical_only_mode() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            mode: SearchModeConfig::Lexical,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        let ids: Vec<u64> = result.results.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn orchestrator_semantic_only_mode() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            mode: SearchModeConfig::Semantic,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        let ids: Vec<u64> = result.results.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 5, 1]);
+    }
+
+    #[test]
+    fn orchestrator_hybrid_mode_includes_both() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            mode: SearchModeConfig::Hybrid,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        let ids: Vec<u64> = result.results.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+        assert!(ids.contains(&5));
+    }
+
+    #[test]
+    fn orchestrator_empty_input() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let input = LegacySearchInput {
+            lexical_ranked: vec![],
+            semantic_ranked: vec![],
+            top_k: 10,
+        };
+        let result = orch.fuse_ranked(&input);
+        assert!(result.results.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_top_k_limiting() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            mode: SearchModeConfig::Lexical,
+            ..Default::default()
+        });
+        let input = LegacySearchInput {
+            lexical_ranked: vec![(1, 10.0), (2, 9.0), (3, 8.0), (4, 7.0)],
+            semantic_ranked: vec![],
+            top_k: 2,
+        };
+        let result = orch.fuse_ranked(&input);
+        assert_eq!(result.results.len(), 2);
+    }
+
+    #[test]
+    fn orchestrator_metrics_serde() {
+        let metrics = OrchestrationMetrics {
+            backend: "legacy".to_string(),
+            effective_mode: "Hybrid".to_string(),
+            fallback_occurred: false,
+            fallback_reason: None,
+            lexical_candidates: 100,
+            semantic_candidates: 50,
+            fusion: TwoTierMetrics::default(),
+            embedder_dispatch: "Legacy".to_string(),
+            embedder_availability: "none (legacy dispatch)".to_string(),
+            embedder_tier_used: None,
+            embedder_fallback: false,
+            vector_index_backend: "ftvi".to_string(),
+            chunking_adapter_enabled: false,
+            reranker_dispatch: "disabled".to_string(),
+            reranker_enabled: false,
+            daemon_dispatch: "disabled".to_string(),
+            daemon_enabled: false,
+            lexical_dispatch: "disabled".to_string(),
+            lexical_enabled: false,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.backend, "legacy");
+        assert_eq!(back.lexical_candidates, 100);
+        assert_eq!(back.embedder_dispatch, "Legacy");
+        assert_eq!(back.vector_index_backend, "ftvi");
+        assert_eq!(back.reranker_dispatch, "disabled");
+        assert!(!back.reranker_enabled);
+        assert_eq!(back.daemon_dispatch, "disabled");
+        assert!(!back.daemon_enabled);
+        assert_eq!(back.lexical_dispatch, "disabled");
+        assert!(!back.lexical_enabled);
+    }
+
+    #[test]
+    fn comparison_unit_weights_match() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            ..Default::default()
+        });
+        let comparison = orch.compare_backends(&sample_input());
+        assert!(
+            comparison.ranking_match,
+            "unit-weight comparison should match"
+        );
+        assert!(comparison.max_score_diff < 1e-5);
+        assert_eq!(comparison.legacy.metrics.backend, "legacy");
+        assert_eq!(comparison.bridge.metrics.backend, "bridge");
+    }
+
+    #[test]
+    fn bridge_fallback_on_panic_disabled() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            fallback_to_legacy: false,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.results.is_empty());
+        assert!(!result.metrics.fallback_occurred);
+    }
+
+    #[test]
+    fn orchestrator_custom_rrf_k() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            rrf_k: 10,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.results.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_custom_weights_affect_ranking() {
+        let input = LegacySearchInput {
+            lexical_ranked: vec![(100, 1.0), (200, 0.9)],
+            semantic_ranked: vec![(300, 0.95), (400, 0.90)],
+            top_k: 4,
+        };
+
+        let lex_biased = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            lexical_weight: 10.0,
+            semantic_weight: 0.1,
+            ..Default::default()
+        });
+        let result = lex_biased.fuse_ranked(&input);
+        assert!(!result.results.is_empty());
+        assert!(
+            result.results[0].id == 100 || result.results[0].id == 200,
+            "lexical bias should promote lexical items, got id={}",
+            result.results[0].id,
+        );
+
+        let sem_biased = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            lexical_weight: 0.1,
+            semantic_weight: 10.0,
+            ..Default::default()
+        });
+        let result = sem_biased.fuse_ranked(&input);
+        assert!(
+            result.results[0].id == 300 || result.results[0].id == 400,
+            "semantic bias should promote semantic items, got id={}",
+            result.results[0].id,
+        );
+    }
+
+    #[test]
+    fn orchestrator_from_env_defaults_to_legacy() {
+        let orch = SearchOrchestrator::from_env();
+        assert_eq!(orch.backend(), OrchestrationBackend::Legacy);
+    }
+
+    #[test]
+    fn orchestrator_debug_impl() {
+        let orch = SearchOrchestrator::from_env();
+        let debug = format!("{:?}", orch);
+        assert!(debug.contains("SearchOrchestrator"));
+        assert!(debug.contains("config"));
+    }
+
+    // ── B3: EmbedderDispatch ──────────────────────────────────────────
+
+    #[test]
+    fn embedder_dispatch_default_is_legacy() {
+        assert_eq!(EmbedderDispatch::default(), EmbedderDispatch::Legacy);
+    }
+
+    #[test]
+    fn embedder_dispatch_serde_roundtrip() {
+        for d in [EmbedderDispatch::Legacy, EmbedderDispatch::Managed] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: EmbedderDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    // ── B3: EmbedderAvailability ──────────────────────────────────────
+
+    #[test]
+    fn embedder_availability_is_degraded() {
+        assert!(!EmbedderAvailability::Full.is_degraded());
+        assert!(EmbedderAvailability::FastOnly.is_degraded());
+        assert!(EmbedderAvailability::HashOnly.is_degraded());
+        assert!(!EmbedderAvailability::None.is_degraded());
+    }
+
+    #[test]
+    fn embedder_availability_display() {
+        assert!(format!("{}", EmbedderAvailability::Full).contains("quality"));
+        assert!(format!("{}", EmbedderAvailability::FastOnly).contains("degraded"));
+        assert!(format!("{}", EmbedderAvailability::HashOnly).contains("minimal"));
+        assert!(format!("{}", EmbedderAvailability::None).contains("legacy"));
+    }
+
+    #[test]
+    fn embedder_availability_serde_roundtrip() {
+        for a in [
+            EmbedderAvailability::Full,
+            EmbedderAvailability::FastOnly,
+            EmbedderAvailability::HashOnly,
+            EmbedderAvailability::None,
+        ] {
+            let json = serde_json::to_string(&a).unwrap();
+            let back: EmbedderAvailability = serde_json::from_str(&json).unwrap();
+            assert_eq!(a, back);
+        }
+    }
+
+    // ── B3: ManagedEmbedderStack ──────────────────────────────────────
+
+    #[test]
+    fn managed_stack_hash_only() {
+        let stack = ManagedEmbedderStack::hash_only();
+        assert_eq!(stack.availability(), EmbedderAvailability::HashOnly);
+        let (emb, tier) = stack.best_embedder();
+        assert_eq!(tier, EmbedderTier::Hash);
+        assert_eq!(emb.dimension(), 128);
+    }
+
+    #[test]
+    fn managed_stack_from_tiers_full() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
+        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256));
+        let stack = ManagedEmbedderStack::from_tiers(Some(quality), Some(fast), hash);
+        assert_eq!(stack.availability(), EmbedderAvailability::Full);
+        let (_, tier) = stack.best_embedder();
+        assert_eq!(tier, EmbedderTier::Quality);
+    }
+
+    #[test]
+    fn managed_stack_from_tiers_fast_only() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
+        let stack = ManagedEmbedderStack::from_tiers(None, Some(fast), hash);
+        assert_eq!(stack.availability(), EmbedderAvailability::FastOnly);
+        let (_, tier) = stack.best_embedder();
+        assert_eq!(tier, EmbedderTier::Fast);
+    }
+
+    #[test]
+    fn managed_stack_from_tiers_hash_only() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let stack = ManagedEmbedderStack::from_tiers(None, None, hash);
+        assert_eq!(stack.availability(), EmbedderAvailability::HashOnly);
+    }
+
+    #[test]
+    fn managed_stack_embedder_for_tier() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
+        let stack = ManagedEmbedderStack::from_tiers(None, Some(fast), hash);
+
+        assert!(stack.embedder_for_tier(EmbedderTier::Hash).is_some());
+        assert!(stack.embedder_for_tier(EmbedderTier::Fast).is_some());
+        assert!(stack.embedder_for_tier(EmbedderTier::Quality).is_none());
+    }
+
+    #[test]
+    fn managed_stack_embed_with_fallback_hash_only() {
+        let stack = ManagedEmbedderStack::hash_only();
+        let (vec, tier) = stack.embed_with_fallback("hello world").unwrap();
+        assert_eq!(tier, EmbedderTier::Hash);
+        assert_eq!(vec.len(), 128);
+    }
+
+    #[test]
+    fn managed_stack_embed_with_fallback_uses_best() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
+        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256));
+        let stack = ManagedEmbedderStack::from_tiers(Some(quality), Some(fast), hash);
+        let (vec, tier) = stack.embed_with_fallback("test query").unwrap();
+        assert_eq!(tier, EmbedderTier::Quality);
+        assert_eq!(vec.len(), 256);
+    }
+
+    #[test]
+    fn managed_stack_best_info() {
+        let stack = ManagedEmbedderStack::hash_only();
+        let info = stack.best_info();
+        assert!(info.name.contains("hash"));
+        assert_eq!(info.tier, EmbedderTier::Hash);
+    }
+
+    #[test]
+    fn managed_stack_debug() {
+        let stack = ManagedEmbedderStack::hash_only();
+        let dbg = format!("{:?}", stack);
+        assert!(dbg.contains("ManagedEmbedderStack"));
+        assert!(dbg.contains("HashOnly"));
+    }
+
+    // ── B3: Orchestrator embedder integration ─────────────────────────
+
+    #[test]
+    fn orchestrator_no_embedder_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        assert_eq!(orch.embedder_availability(), EmbedderAvailability::None);
+        assert!(orch.embed_query("test").is_none());
+    }
+
+    #[test]
+    fn orchestrator_with_embedder_stack() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default())
+            .with_embedder_stack(ManagedEmbedderStack::hash_only());
+        assert_eq!(orch.embedder_availability(), EmbedderAvailability::HashOnly);
+        assert_eq!(orch.config().embedder_dispatch, EmbedderDispatch::Managed);
+    }
+
+    #[test]
+    fn orchestrator_embed_query_with_stack() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default())
+            .with_embedder_stack(ManagedEmbedderStack::hash_only());
+        let result = orch.embed_query("hello world");
+        assert!(result.is_some());
+        let (vec, tier) = result.unwrap().unwrap();
+        assert_eq!(tier, EmbedderTier::Hash);
+        assert_eq!(vec.len(), 128);
+    }
+
+    #[test]
+    fn orchestrator_metrics_include_embedder_info() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default())
+            .with_embedder_stack(ManagedEmbedderStack::hash_only());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.embedder_dispatch, "Managed");
+        assert!(result.metrics.embedder_availability.contains("minimal"));
+        assert!(!result.metrics.embedder_fallback);
+    }
+
+    #[test]
+    fn orchestrator_legacy_dispatch_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.embedder_dispatch, "Legacy");
+        assert!(result.metrics.embedder_availability.contains("legacy"));
+        assert!(result.metrics.embedder_tier_used.is_none());
+        assert_eq!(result.metrics.vector_index_backend, "ftvi");
+    }
+
+    #[test]
+    fn orchestrator_bridge_with_embedder_stack() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            ..Default::default()
+        })
+        .with_embedder_stack(ManagedEmbedderStack::hash_only());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.backend, "bridge");
+        assert_eq!(result.metrics.embedder_dispatch, "Managed");
+    }
+
+    #[test]
+    fn orchestrator_full_stack_availability() {
+        let hash: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(64));
+        let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
+        let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256));
+        let stack = ManagedEmbedderStack::from_tiers(Some(quality), Some(fast), hash);
+        let orch =
+            SearchOrchestrator::new(OrchestratorConfig::default()).with_embedder_stack(stack);
+        assert_eq!(orch.embedder_availability(), EmbedderAvailability::Full);
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(result.metrics.embedder_availability.contains("full"));
+    }
+
+    #[test]
+    fn managed_stack_deterministic_embedding() {
+        let stack = ManagedEmbedderStack::hash_only();
+        let (v1, _) = stack.embed_with_fallback("test").unwrap();
+        let (v2, _) = stack.embed_with_fallback("test").unwrap();
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn embedder_dispatch_debug() {
+        assert_eq!(format!("{:?}", EmbedderDispatch::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", EmbedderDispatch::Managed), "Managed");
+    }
+
+    #[test]
+    fn embedder_availability_debug() {
+        assert_eq!(format!("{:?}", EmbedderAvailability::Full), "Full");
+        assert_eq!(format!("{:?}", EmbedderAvailability::None), "None");
+    }
+
+    // ── B4: Vector index backend config ───────────────────────────────
+
+    #[test]
+    fn config_default_vector_index_backend() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.vector_index_backend, "ftvi");
+    }
+
+    #[test]
+    fn config_fsvi_backend_serde() {
+        let cfg = OrchestratorConfig {
+            vector_index_backend: "fsvi".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vector_index_backend, "fsvi");
+    }
+
+    #[test]
+    fn orchestrator_metrics_include_vector_backend() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            vector_index_backend: "fsvi".to_string(),
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.vector_index_backend, "fsvi");
+    }
+
+    // ── B5: Chunking adapter config ──────────────────────────────────
+
+    #[test]
+    fn config_default_chunking_adapter_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert!(!cfg.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn config_chunking_adapter_serde() {
+        let cfg = OrchestratorConfig {
+            chunking_adapter_enabled: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn config_chunking_adapter_serde_absent_defaults_false() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_chunking_adapter_disabled() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.metrics.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_chunking_adapter_enabled() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            chunking_adapter_enabled: true,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(result.metrics.chunking_adapter_enabled);
+    }
+
+    // ── B6: RerankerDispatch ─────────────────────────────────────────
+
+    #[test]
+    fn reranker_dispatch_default_is_disabled() {
+        assert_eq!(RerankerDispatch::default(), RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn reranker_dispatch_as_str() {
+        assert_eq!(RerankerDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(RerankerDispatch::Legacy.as_str(), "legacy");
+        assert_eq!(RerankerDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn reranker_dispatch_display() {
+        assert_eq!(format!("{}", RerankerDispatch::Disabled), "disabled");
+        assert_eq!(format!("{}", RerankerDispatch::Legacy), "legacy");
+        assert_eq!(format!("{}", RerankerDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn reranker_dispatch_parse() {
+        assert_eq!(RerankerDispatch::parse("legacy"), RerankerDispatch::Legacy);
+        assert_eq!(RerankerDispatch::parse("local"), RerankerDispatch::Legacy);
+        assert_eq!(
+            RerankerDispatch::parse("passthrough"),
+            RerankerDispatch::Legacy
+        );
+        assert_eq!(
+            RerankerDispatch::parse("managed"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(RerankerDispatch::parse("bridge"), RerankerDispatch::Managed);
+        assert_eq!(
+            RerankerDispatch::parse("frankensearch"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("flashrank"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("disabled"),
+            RerankerDispatch::Disabled
+        );
+        assert_eq!(
+            RerankerDispatch::parse("unknown"),
+            RerankerDispatch::Disabled
+        );
+        assert_eq!(RerankerDispatch::parse(""), RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn reranker_dispatch_is_enabled() {
+        assert!(!RerankerDispatch::Disabled.is_enabled());
+        assert!(RerankerDispatch::Legacy.is_enabled());
+        assert!(RerankerDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn reranker_dispatch_serde_roundtrip() {
+        for d in [
+            RerankerDispatch::Disabled,
+            RerankerDispatch::Legacy,
+            RerankerDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: RerankerDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn config_default_reranker_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_reranker_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
+    }
+
+    #[test]
+    fn config_reranker_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "disabled");
+        assert!(!result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_legacy() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Legacy,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "legacy");
+        assert!(result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "managed");
+        assert!(result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_reranker_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "managed");
+        assert!(result.metrics.reranker_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+
+    #[test]
+    fn reranker_dispatch_debug() {
+        assert_eq!(format!("{:?}", RerankerDispatch::Disabled), "Disabled");
+        assert_eq!(format!("{:?}", RerankerDispatch::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", RerankerDispatch::Managed), "Managed");
+    }
+
+    // ── B7: DaemonDispatch ─────────────────────────────────────────
+
+    #[test]
+    fn daemon_dispatch_default_is_disabled() {
+        assert_eq!(DaemonDispatch::default(), DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn daemon_dispatch_as_str() {
+        assert_eq!(DaemonDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(DaemonDispatch::Legacy.as_str(), "legacy");
+        assert_eq!(DaemonDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn daemon_dispatch_display() {
+        assert_eq!(format!("{}", DaemonDispatch::Disabled), "disabled");
+        assert_eq!(format!("{}", DaemonDispatch::Legacy), "legacy");
+        assert_eq!(format!("{}", DaemonDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn daemon_dispatch_parse() {
+        assert_eq!(DaemonDispatch::parse("legacy"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("local"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("single"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("worker"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("managed"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("bridge"), DaemonDispatch::Managed);
+        assert_eq!(
+            DaemonDispatch::parse("frankensearch"),
+            DaemonDispatch::Managed
+        );
+        assert_eq!(DaemonDispatch::parse("batch"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("coalescer"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("MANAGED"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("disabled"), DaemonDispatch::Disabled);
+        assert_eq!(DaemonDispatch::parse("unknown"), DaemonDispatch::Disabled);
+        assert_eq!(DaemonDispatch::parse(""), DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn daemon_dispatch_is_enabled() {
+        assert!(!DaemonDispatch::Disabled.is_enabled());
+        assert!(DaemonDispatch::Legacy.is_enabled());
+        assert!(DaemonDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn daemon_dispatch_is_managed() {
+        assert!(!DaemonDispatch::Disabled.is_managed());
+        assert!(!DaemonDispatch::Legacy.is_managed());
+        assert!(DaemonDispatch::Managed.is_managed());
+    }
+
+    #[test]
+    fn daemon_dispatch_serde_roundtrip() {
+        for d in [
+            DaemonDispatch::Disabled,
+            DaemonDispatch::Legacy,
+            DaemonDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: DaemonDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn daemon_dispatch_debug() {
+        assert_eq!(format!("{:?}", DaemonDispatch::Disabled), "Disabled");
+        assert_eq!(format!("{:?}", DaemonDispatch::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", DaemonDispatch::Managed), "Managed");
+    }
+
+    #[test]
+    fn config_default_daemon_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.daemon_dispatch, DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_daemon_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.daemon_dispatch, DaemonDispatch::Managed);
+    }
+
+    #[test]
+    fn config_daemon_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.daemon_dispatch, DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "disabled");
+        assert!(!result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_legacy() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Legacy,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "legacy");
+        assert!(result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "managed");
+        assert!(result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_daemon_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "managed");
+        assert!(result.metrics.daemon_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+
+    // ── B8: LexicalDispatch ──────────────────────────────────────────
+
+    #[test]
+    fn lexical_dispatch_default_is_disabled() {
+        assert_eq!(LexicalDispatch::default(), LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn lexical_dispatch_as_str() {
+        assert_eq!(LexicalDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(LexicalDispatch::RecorderDirect.as_str(), "recorder_direct");
+        assert_eq!(LexicalDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn lexical_dispatch_display() {
+        assert_eq!(format!("{}", LexicalDispatch::Disabled), "disabled");
+        assert_eq!(
+            format!("{}", LexicalDispatch::RecorderDirect),
+            "recorder_direct"
+        );
+        assert_eq!(format!("{}", LexicalDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn lexical_dispatch_parse() {
+        assert_eq!(
+            LexicalDispatch::parse("recorder_direct"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("recorder"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("direct"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("tantivy"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(LexicalDispatch::parse("managed"), LexicalDispatch::Managed);
+        assert_eq!(LexicalDispatch::parse("bridge"), LexicalDispatch::Managed);
+        assert_eq!(
+            LexicalDispatch::parse("frankensearch"),
+            LexicalDispatch::Managed
+        );
+        assert_eq!(LexicalDispatch::parse("unified"), LexicalDispatch::Managed);
+        assert_eq!(LexicalDispatch::parse("MANAGED"), LexicalDispatch::Managed);
+        assert_eq!(
+            LexicalDispatch::parse("disabled"),
+            LexicalDispatch::Disabled
+        );
+        assert_eq!(LexicalDispatch::parse("unknown"), LexicalDispatch::Disabled);
+        assert_eq!(LexicalDispatch::parse(""), LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn lexical_dispatch_is_enabled() {
+        assert!(!LexicalDispatch::Disabled.is_enabled());
+        assert!(LexicalDispatch::RecorderDirect.is_enabled());
+        assert!(LexicalDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn lexical_dispatch_is_managed() {
+        assert!(!LexicalDispatch::Disabled.is_managed());
+        assert!(!LexicalDispatch::RecorderDirect.is_managed());
+        assert!(LexicalDispatch::Managed.is_managed());
+    }
+
+    #[test]
+    fn lexical_dispatch_serde_roundtrip() {
+        for d in [
+            LexicalDispatch::Disabled,
+            LexicalDispatch::RecorderDirect,
+            LexicalDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: LexicalDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn lexical_dispatch_debug() {
+        assert_eq!(format!("{:?}", LexicalDispatch::Disabled), "Disabled");
+        assert_eq!(
+            format!("{:?}", LexicalDispatch::RecorderDirect),
+            "RecorderDirect"
+        );
+        assert_eq!(format!("{:?}", LexicalDispatch::Managed), "Managed");
+    }
+
+    #[test]
+    fn config_default_lexical_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.lexical_dispatch, LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_lexical_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::Managed);
+    }
+
+    #[test]
+    fn config_lexical_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.lexical_dispatch, LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_lexical_recorder_direct_serde() {
+        let cfg = OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::RecorderDirect,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::RecorderDirect);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "disabled");
+        assert!(!result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_recorder_direct() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::RecorderDirect,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "recorder_direct");
+        assert!(result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "managed");
+        assert!(result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_lexical_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "managed");
+        assert!(result.metrics.lexical_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+}

@@ -1,0 +1,14 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+assertion_line: 731
+expression: workflow_execute_snapshot(&capture)
+---
+{
+  "data": null,
+  "error": "handle_usage_limits aborted (stage=codex_exit, error_class=codex_exit_failed)",
+  "error_code": "FT-MCP-0008",
+  "hint": null,
+  "ok": false,
+  "scenario": "execute_real_workflow_no_preconditions",
+  "tool": "wa.workflow_run"
+}

@@ -1,0 +1,6909 @@
+//! Pane content tailing with adaptive polling.
+//!
+//! This module provides the TailerSupervisor for managing per-pane content
+//! capture with adaptive polling intervals, weighted scheduling, and budget
+//! enforcement.
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
+use std::time::{Duration, Instant};
+
+use crate::runtime_async::mpsc;
+use crate::runtime_async::timeout;
+use crate::runtime_async::{RwLock, Semaphore};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, Stream, StreamExt};
+use tracing::{debug, trace, warn};
+
+use crate::capture_authority::CaptureAuthority;
+use crate::capture_authority::{
+    ActivePaneIdentity, CaptureAuthorityError, CaptureLease, CaptureProducerGuard,
+    CaptureSourceKind, CaptureStamp,
+};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
+use crate::config::CaptureBudgetConfig;
+use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
+use crate::wezterm::{PaneInfo, PaneTextSource};
+
+/// Number of consecutive backpressure events per pane before emitting an
+/// overflow GAP segment.  Once exceeded, the tailer inserts a synthetic gap
+/// to signal that capture data was likely lost during the congestion period.
+pub const OVERFLOW_BACKPRESSURE_THRESHOLD: u64 = 5;
+
+/// Maximum per-pane scheduler rows included in the compact health snapshot.
+pub const MAX_SCHEDULER_SNAPSHOT_PANES: usize = 200;
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// M7 moonshot gate env var (`ingest.cadence_model=predictive`, default backoff).
+///
+/// The shipping path stays on deterministic x1.5 idle backoff unless the
+/// experiment is explicitly enabled. Malformed values fail closed to backoff.
+const FT_MOONSHOT_INGEST_CADENCE_MODEL: &str = "FT_MOONSHOT_INGEST_CADENCE_MODEL";
+const FT_MOONSHOT_PREDICTIVE_POLL_CADENCE: &str = "FT_MOONSHOT_PREDICTIVE_POLL_CADENCE";
+
+const PREDICTIVE_GAP_SLOTS: usize = 5;
+const PREDICTIVE_MIN_GAPS: usize = 2;
+const PREDICTIVE_EWMA_ALPHA: f64 = 0.35;
+const PREDICTIVE_JIT_FRACTION: f64 = 0.90;
+const PREDICTIVE_STALE_HORIZON: f64 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollCadenceModel {
+    Backoff,
+    Predictive,
+}
+
+static POLL_CADENCE_MODEL: OnceLock<PollCadenceModel> = OnceLock::new();
+
+fn configured_poll_cadence_model() -> PollCadenceModel {
+    *POLL_CADENCE_MODEL.get_or_init(|| {
+        // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build):
+        // forces the predictive renewal/hazard cadence model on.
+        if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
+            return PollCadenceModel::Predictive;
+        }
+        if let Ok(value) = std::env::var(FT_MOONSHOT_INGEST_CADENCE_MODEL) {
+            if value.eq_ignore_ascii_case("predictive") {
+                return PollCadenceModel::Predictive;
+            }
+            return PollCadenceModel::Backoff;
+        }
+
+        if std::env::var_os(FT_MOONSHOT_PREDICTIVE_POLL_CADENCE).is_some() {
+            PollCadenceModel::Predictive
+        } else {
+            PollCadenceModel::Backoff
+        }
+    })
+}
+
+fn duration_from_secs_f64_checked(seconds: f64) -> Option<Duration> {
+    if seconds.is_finite() && (0.0..=Duration::MAX.as_secs_f64()).contains(&seconds) {
+        Some(Duration::from_secs_f64(seconds))
+    } else {
+        None
+    }
+}
+
+fn legacy_backoff_interval(current_interval: Duration, config: &TailerConfig) -> Duration {
+    // Fail closed: `Duration::from_secs_f64` panics on NaN, negative, or
+    // overflowing input. `TailerConfig` does not normalize
+    // `backoff_multiplier`, so hostile or non-finite config saturates to the
+    // slowest legacy poll interval instead of crashing the scheduler.
+    let max_secs = config.max_interval.as_secs_f64();
+    let scaled = current_interval.as_secs_f64() * config.backoff_multiplier;
+    let new_interval = if scaled.is_finite() && scaled >= 0.0 {
+        Duration::from_secs_f64(scaled.min(max_secs))
+    } else {
+        config.max_interval
+    };
+    new_interval.min(config.max_interval)
+}
+
+fn clamp_predictive_interval(interval: Duration, config: &TailerConfig) -> Duration {
+    if config.max_interval < config.min_interval {
+        return config.max_interval;
+    }
+    interval.max(config.min_interval).min(config.max_interval)
+}
+
+/// Configuration for the tailer supervisor.
+#[derive(Debug, Clone)]
+pub struct TailerConfig {
+    /// Minimum polling interval (fast polling for active panes)
+    pub min_interval: Duration,
+    /// Maximum polling interval (slow polling for idle panes)
+    pub max_interval: Duration,
+    /// Multiplier for backoff when pane is idle
+    pub backoff_multiplier: f64,
+    /// Maximum number of concurrent captures
+    pub max_concurrent: usize,
+    /// Overlap size for delta extraction
+    pub overlap_size: usize,
+    /// Timeout for sending to channel
+    pub send_timeout: Duration,
+    /// Timeout for a single pane text capture operation
+    pub capture_timeout: Duration,
+}
+
+impl Default for TailerConfig {
+    fn default() -> Self {
+        Self {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.5,
+            max_concurrent: 10,
+            overlap_size: 256,
+            send_timeout: Duration::from_millis(100),
+            capture_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Metrics for tailer supervisor.
+#[derive(Debug, Default)]
+pub struct TailerMetrics {
+    /// Total capture events sent
+    pub events_sent: u64,
+    /// Number of send timeouts
+    pub send_timeouts: u64,
+    /// Number of timed-out pane text captures
+    pub capture_timeouts: u64,
+    /// Number of captures that found no changes
+    pub no_change_captures: u64,
+    /// Number of overflow GAP segments emitted due to sustained backpressure
+    pub overflow_gaps_emitted: u64,
+    /// Number of polls skipped because the pane had no capture cursor (ft-0kdi9).
+    ///
+    /// A pane is only polled while the registry reports it observed, so this
+    /// counter is *not* an expected steady-state outcome: it means the pane is
+    /// observed but the capture-side cursor map has no entry for it, and every
+    /// poll for that pane is discarding output. Before ft-0kdi9 this was the
+    /// only poll outcome with neither a counter nor a warn-level log, which is
+    /// what let an `Observed -> Ignored -> Observed` pane die silently.
+    ///
+    /// Forensic verification contract:
+    ///     no_cursor_polls > 0  =>  at least one observed pane lost capture
+    /// A non-zero value with a matching `last_reason_code = no_cursor` row in
+    /// the scheduler snapshot identifies the affected pane. Same observability
+    /// defect family as ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10.
+    pub no_cursor_polls: u64,
+}
+
+/// Metrics for supervisor operations.
+#[derive(Debug, Default)]
+pub struct SupervisorMetrics {
+    /// Number of tailers started
+    pub tailers_started: u64,
+    /// Number of tailers stopped
+    pub tailers_stopped: u64,
+    /// Total sync operations
+    pub sync_count: u64,
+}
+
+/// Stable reason code for the latest polling outcome, skip, or scheduler deferral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSkipReason {
+    /// Pane has not reached a capture scheduler decision yet.
+    NotObserved,
+    /// Pane is handled by streaming capture instead of polling.
+    StreamingMode,
+    /// Pane fell back from streaming capture to polling.
+    StreamingFallback,
+    /// Pane was checked before its current adaptive poll interval elapsed.
+    NotDue,
+    /// Pane already has an in-flight capture task.
+    AlreadyCapturing,
+    /// Global capture-per-second budget prevented this ready pane from polling.
+    GlobalCaptureBudgetExhausted,
+    /// Global byte-per-second budget prevented this ready pane from polling.
+    GlobalByteBudgetExhausted,
+    /// No concurrency permit was available for this ready pane.
+    NoPermit,
+    /// Capture result could not be sent because downstream was backpressured.
+    SendBackpressure,
+    /// Backpressure threshold was reached and an overflow gap is pending.
+    OverflowGapPending,
+    /// Overflow gap event was emitted after earlier capture backpressure.
+    OverflowGapEmitted,
+    /// Pane had no cursor available for incremental capture.
+    NoCursor,
+    /// Capture task channel closed before a normal result was delivered.
+    ChannelClosed,
+    /// Capture operation exceeded its timeout.
+    CaptureTimeout,
+    /// Capture circuit breaker was open for this pane.
+    CaptureCircuitOpen,
+    /// Capture operation returned an error.
+    CaptureError,
+    /// Capture incarnation/source authority rejected stale producer work.
+    AuthorityRejected,
+    /// Poll completed successfully and found no changed text.
+    NoChange,
+    /// Poll completed successfully and produced a changed capture segment.
+    Changed,
+    /// Supervisor shutdown prevented polling.
+    Shutdown,
+}
+
+impl CaptureSkipReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::StreamingMode => "streaming_mode",
+            Self::StreamingFallback => "streaming_fallback",
+            Self::NotDue => "not_due",
+            Self::AlreadyCapturing => "already_capturing",
+            Self::GlobalCaptureBudgetExhausted => "global_capture_budget_exhausted",
+            Self::GlobalByteBudgetExhausted => "global_byte_budget_exhausted",
+            Self::NoPermit => "no_permit",
+            Self::SendBackpressure => "send_backpressure",
+            Self::OverflowGapPending => "overflow_gap_pending",
+            Self::OverflowGapEmitted => "overflow_gap_emitted",
+            Self::NoCursor => "no_cursor",
+            Self::ChannelClosed => "channel_closed",
+            Self::CaptureTimeout => "capture_timeout",
+            Self::CaptureCircuitOpen => "capture_circuit_open",
+            Self::CaptureError => "capture_error",
+            Self::AuthorityRejected => "authority_rejected",
+            Self::NoChange => "no_change",
+            Self::Changed => "changed",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Priority tier used by the weighted capture scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePriorityTier {
+    /// High-priority pane tier (`priority <= 50`).
+    High,
+    /// Lower-priority pane tier (`priority > 50`).
+    Low,
+}
+
+impl CapturePriorityTier {
+    #[must_use]
+    pub const fn from_priority(priority: u32) -> Self {
+        if priority <= 50 {
+            Self::High
+        } else {
+            Self::Low
+        }
+    }
+}
+
+/// Starvation warning class for compact operator telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStarvationWarning {
+    /// No starvation warning is active for this pane.
+    None,
+    /// Strict capture invariant is violated, usually because overflow is pending.
+    StrictInvariantFailed,
+    /// Pane is stale for a scheduler or capture-backpressure reason.
+    BenchmarkTargetMissed,
+    /// Pane is stale but this snapshot cannot attribute it to scheduler starvation.
+    NotProven,
+}
+
+impl CaptureStarvationWarning {
+    const fn severity_rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::NotProven => 1,
+            Self::BenchmarkTargetMissed => 2,
+            Self::StrictInvariantFailed => 3,
+        }
+    }
+}
+
+/// Per-pane scheduler row included in the compact scheduler snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneSchedulerSnapshot {
+    pub pane_id: u64,
+    pub priority: u32,
+    pub tier: CapturePriorityTier,
+    pub mode: TailerMode,
+    pub stale: bool,
+    pub last_successful_capture_age_ms: Option<u64>,
+    pub last_poll_age_ms: u64,
+    pub current_interval_ms: u64,
+    pub last_reason_code: CaptureSkipReason,
+    pub selection_opportunities: u64,
+    pub selected_count: u64,
+    pub skipped_count: u64,
+    pub consecutive_backpressure: u64,
+    pub overflow_gap_pending: bool,
+    pub starvation_warning: CaptureStarvationWarning,
+}
+
+/// Aggregate scheduler service counters per priority tier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerTierSnapshot {
+    pub tier: CapturePriorityTier,
+    pub selection_opportunities: u64,
+    pub selected_count: u64,
+    pub skipped_count: u64,
+}
+
+impl SchedulerTierSnapshot {
+    fn new(tier: CapturePriorityTier) -> Self {
+        Self {
+            tier,
+            selection_opportunities: 0,
+            selected_count: 0,
+            skipped_count: 0,
+        }
+    }
+}
+
+/// Shared, single-assignment outcome for one generation-resync persistence
+/// barrier.
+///
+/// The capture coordinator retains this receipt while the provisional binding
+/// is unpublished.  Persistence decides it only after durable commit and any
+/// required cursor correction, or records a terminal failure on every earlier
+/// exit. Unlike a one-shot receiver, the outcome remains inspectable across
+/// arbitrary coordinator scheduling delay, allowing the coordinator to retain
+/// exactly one outstanding resync instead of timing out and duplicating work
+/// into a backlogged persistence queue.
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureResyncReceipt {
+    outcome: Arc<OnceLock<std::result::Result<u64, String>>>,
+}
+
+impl CaptureResyncReceipt {
+    /// Return the terminal outcome when persistence has decided it.
+    pub(crate) fn outcome(&self) -> Option<std::result::Result<u64, String>> {
+        self.outcome.get().cloned()
+    }
+}
+
+/// Drop-safe producer half of a [`CaptureResyncReceipt`].
+#[derive(Debug)]
+pub(crate) struct CaptureResyncDecision {
+    receipt: CaptureResyncReceipt,
+    decided: bool,
+}
+
+impl CaptureResyncDecision {
+    /// Create one decision/receipt pair for a provisional resync event.
+    pub(crate) fn channel() -> (Self, CaptureResyncReceipt) {
+        let receipt = CaptureResyncReceipt {
+            outcome: Arc::new(OnceLock::new()),
+        };
+        (
+            Self {
+                receipt: receipt.clone(),
+                decided: false,
+            },
+            receipt,
+        )
+    }
+
+    /// Publish the one terminal persistence decision.
+    pub(crate) fn finish(&mut self, outcome: std::result::Result<u64, String>) {
+        if self.decided {
+            return;
+        }
+        let _ = self.receipt.outcome.set(outcome);
+        self.decided = true;
+    }
+}
+
+impl Drop for CaptureResyncDecision {
+    fn drop(&mut self) {
+        self.finish(Err(
+            "capture resync left the pipeline without a persistence decision".to_string(),
+        ));
+    }
+}
+
+/// A captured segment event for persistence.
+#[derive(Debug)]
+pub struct CaptureEvent {
+    /// The captured segment (includes pane_id, seq, content, kind, captured_at)
+    pub segment: CapturedSegment,
+    /// Exact runtime-owned pane incarnation and producer source epoch.
+    stamp: CaptureStamp,
+    /// Drop-safe, inspectable receipt for a provisional generation resync.
+    resync_decision: Option<CaptureResyncDecision>,
+}
+
+impl CaptureEvent {
+    /// Construct an event from a currently-held producer admission guard.
+    ///
+    /// Requiring the guard at construction makes it impossible for a polling,
+    /// streaming, or native producer to enqueue a bare pane-ID-only event.  The
+    /// caller must continue holding the guard through the actual queue send.
+    pub fn from_producer(
+        segment: CapturedSegment,
+        producer_guard: &CaptureProducerGuard,
+    ) -> Result<Self, CaptureAuthorityError> {
+        let stamp = producer_guard.stamp();
+        if segment.pane_id != stamp.global_pane_id() {
+            return Err(CaptureAuthorityError::PaneIdMismatch);
+        }
+        Ok(Self {
+            segment,
+            stamp,
+            resync_decision: None,
+        })
+    }
+
+    /// Exact immutable authority attached at producer admission.
+    #[must_use]
+    pub fn stamp(&self) -> CaptureStamp {
+        self.stamp
+    }
+
+    /// Attach the durable decision cell for a provisional generation resync.
+    pub(crate) fn with_resync_decision(mut self, decision: CaptureResyncDecision) -> Self {
+        self.resync_decision = Some(decision);
+        self
+    }
+
+    /// Whether this event requires a singleton durable resync decision.
+    pub(crate) fn has_resync_decision(&self) -> bool {
+        self.resync_decision.is_some()
+    }
+
+    /// Transfer the optional resync decision to the persistence consumer.
+    pub(crate) fn take_resync_decision(&mut self) -> Option<CaptureResyncDecision> {
+        self.resync_decision.take()
+    }
+}
+
+#[derive(Clone)]
+struct PredictiveCadenceState {
+    gaps: [Duration; PREDICTIVE_GAP_SLOTS],
+    gap_count: usize,
+    next_slot: usize,
+    ewma_gap_secs: Option<f64>,
+    last_change_poll: Option<Instant>,
+}
+
+impl Default for PredictiveCadenceState {
+    fn default() -> Self {
+        Self {
+            gaps: [Duration::ZERO; PREDICTIVE_GAP_SLOTS],
+            gap_count: 0,
+            next_slot: 0,
+            ewma_gap_secs: None,
+            last_change_poll: None,
+        }
+    }
+}
+
+impl PredictiveCadenceState {
+    fn observe_change(&mut self, now: Instant) {
+        if let Some(previous) = self.last_change_poll {
+            self.observe_gap(now.saturating_duration_since(previous));
+        }
+        self.last_change_poll = Some(now);
+    }
+
+    fn observe_gap(&mut self, gap: Duration) {
+        let secs = gap.as_secs_f64();
+        if !secs.is_finite() || secs <= 0.0 {
+            return;
+        }
+
+        self.gaps[self.next_slot] = gap;
+        self.next_slot = (self.next_slot + 1) % PREDICTIVE_GAP_SLOTS;
+        self.gap_count = self.gap_count.saturating_add(1).min(PREDICTIVE_GAP_SLOTS);
+
+        self.ewma_gap_secs = Some(match self.ewma_gap_secs {
+            Some(previous) if previous.is_finite() && previous > 0.0 => {
+                previous.mul_add(1.0 - PREDICTIVE_EWMA_ALPHA, secs * PREDICTIVE_EWMA_ALPHA)
+            }
+            _ => secs,
+        });
+    }
+
+    fn next_interval_after_no_change(
+        &self,
+        now: Instant,
+        config: &TailerConfig,
+    ) -> Option<Duration> {
+        let last_change = self.last_change_poll?;
+        let estimate_secs = self.estimated_gap_secs()?;
+        let target = duration_from_secs_f64_checked(estimate_secs * PREDICTIVE_JIT_FRACTION)?;
+        let stale_horizon =
+            duration_from_secs_f64_checked(estimate_secs * PREDICTIVE_STALE_HORIZON)?;
+        let age = now.saturating_duration_since(last_change);
+        if age > stale_horizon {
+            return None;
+        }
+
+        let interval = target
+            .checked_sub(age)
+            .unwrap_or(config.min_interval)
+            .max(config.min_interval);
+        Some(clamp_predictive_interval(interval, config))
+    }
+
+    fn estimated_gap_secs(&self) -> Option<f64> {
+        if self.gap_count < PREDICTIVE_MIN_GAPS {
+            return None;
+        }
+
+        let mut sorted = [0.0; PREDICTIVE_GAP_SLOTS];
+        for (idx, gap) in self.gaps.iter().take(self.gap_count).enumerate() {
+            let secs = gap.as_secs_f64();
+            if !secs.is_finite() || secs <= 0.0 {
+                return None;
+            }
+            sorted[idx] = secs;
+        }
+
+        for idx in 1..self.gap_count {
+            let value = sorted[idx];
+            let mut pos = idx;
+            while pos > 0 && sorted[pos - 1] > value {
+                sorted[pos] = sorted[pos - 1];
+                pos -= 1;
+            }
+            sorted[pos] = value;
+        }
+
+        let quantile_idx = ((self.gap_count - 1) * 4) / 5;
+        let quantile = sorted[quantile_idx];
+        let ewma = self.ewma_gap_secs?;
+        let estimate = quantile.min(ewma);
+        if estimate.is_finite() && estimate > 0.0 {
+            Some(estimate)
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-pane tailer state.
+struct PaneTailer {
+    /// Pane ID (retained for debugging/logging)
+    #[allow(dead_code)]
+    pane_id: u64,
+    /// Current polling interval
+    current_interval: Duration,
+    /// Last poll time
+    last_poll: Instant,
+    /// Last poll that completed successfully, including no-change captures.
+    last_successful_capture: Option<Instant>,
+    /// Whether changes were detected in last poll
+    had_changes: bool,
+    /// Latest stable reason code for operator telemetry
+    last_reason_code: CaptureSkipReason,
+    /// Number of times this pane reached scheduler selection.
+    selection_opportunities: u64,
+    /// Number of times this pane was admitted for polling.
+    selected_count: u64,
+    /// Number of times this pane was skipped or deferred.
+    skipped_count: u64,
+    /// Consecutive backpressure events without a successful capture
+    consecutive_backpressure: u64,
+    /// Whether an overflow GAP needs to be emitted on the next successful poll
+    overflow_gap_pending: bool,
+    /// Per-pane renewal estimate used only by the default-off predictive gate.
+    cadence: PredictiveCadenceState,
+}
+
+impl PaneTailer {
+    fn new(pane_id: u64, initial_interval: Duration) -> Self {
+        Self {
+            pane_id,
+            current_interval: initial_interval,
+            last_poll: Instant::now(),
+            last_successful_capture: None,
+            had_changes: false,
+            last_reason_code: CaptureSkipReason::NotObserved,
+            selection_opportunities: 0,
+            selected_count: 0,
+            skipped_count: 0,
+            consecutive_backpressure: 0,
+            overflow_gap_pending: false,
+            cadence: PredictiveCadenceState::default(),
+        }
+    }
+
+    fn should_poll(&self) -> bool {
+        self.should_poll_at(Instant::now())
+    }
+
+    fn should_poll_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_poll) >= self.current_interval
+    }
+
+    #[cfg(test)]
+    fn record_poll(&mut self, had_changes: bool, config: &TailerConfig) {
+        let reason = if had_changes {
+            CaptureSkipReason::Changed
+        } else {
+            CaptureSkipReason::NoChange
+        };
+        self.record_poll_outcome(had_changes, true, reason, config);
+    }
+
+    fn record_poll_outcome(
+        &mut self,
+        had_changes: bool,
+        successful_capture: bool,
+        reason: CaptureSkipReason,
+        config: &TailerConfig,
+    ) {
+        self.record_poll_outcome_at(
+            had_changes,
+            successful_capture,
+            reason,
+            config,
+            Instant::now(),
+            configured_poll_cadence_model(),
+        );
+    }
+
+    fn record_poll_outcome_at(
+        &mut self,
+        had_changes: bool,
+        successful_capture: bool,
+        reason: CaptureSkipReason,
+        config: &TailerConfig,
+        now: Instant,
+        cadence_model: PollCadenceModel,
+    ) {
+        self.last_poll = now;
+        if successful_capture {
+            self.last_successful_capture = Some(now);
+        }
+        self.had_changes = had_changes;
+        self.last_reason_code = reason;
+
+        // Adaptive interval: speed up if changes, slow down if idle
+        if had_changes {
+            self.cadence.observe_change(now);
+            self.current_interval = config.min_interval;
+        } else {
+            self.current_interval = match cadence_model {
+                PollCadenceModel::Backoff => legacy_backoff_interval(self.current_interval, config),
+                PollCadenceModel::Predictive => self
+                    .cadence
+                    .next_interval_after_no_change(now, config)
+                    .unwrap_or_else(|| legacy_backoff_interval(self.current_interval, config)),
+            };
+        }
+    }
+
+    fn record_selection_opportunity(&mut self) {
+        self.selection_opportunities = self.selection_opportunities.saturating_add(1);
+    }
+
+    fn record_selected(&mut self) {
+        self.selected_count = self.selected_count.saturating_add(1);
+        if self.overflow_gap_pending {
+            self.last_reason_code = CaptureSkipReason::OverflowGapPending;
+        }
+    }
+
+    fn record_skip(&mut self, reason: CaptureSkipReason) {
+        self.skipped_count = self.skipped_count.saturating_add(1);
+        self.last_reason_code = reason;
+    }
+
+    fn snapshot(&self, pane_id: u64, priority: u32, now: Instant) -> PaneSchedulerSnapshot {
+        let last_poll_age_ms =
+            duration_millis_saturating(now.saturating_duration_since(self.last_poll));
+        let last_successful_capture_age_ms = self
+            .last_successful_capture
+            .map(|last| duration_millis_saturating(now.saturating_duration_since(last)));
+        let current_interval_ms = duration_millis_saturating(self.current_interval);
+        let stale_threshold_ms = current_interval_ms.saturating_mul(2);
+        let stale = last_successful_capture_age_ms
+            .map_or(last_poll_age_ms > stale_threshold_ms, |age| {
+                age > stale_threshold_ms
+            });
+        let starvation_warning = self.starvation_warning(stale);
+
+        PaneSchedulerSnapshot {
+            pane_id,
+            priority,
+            tier: CapturePriorityTier::from_priority(priority),
+            mode: TailerMode::Polling,
+            stale,
+            last_successful_capture_age_ms,
+            last_poll_age_ms,
+            current_interval_ms,
+            last_reason_code: self.last_reason_code,
+            selection_opportunities: self.selection_opportunities,
+            selected_count: self.selected_count,
+            skipped_count: self.skipped_count,
+            consecutive_backpressure: self.consecutive_backpressure,
+            overflow_gap_pending: self.overflow_gap_pending,
+            starvation_warning,
+        }
+    }
+
+    fn starvation_warning(&self, stale: bool) -> CaptureStarvationWarning {
+        if self.overflow_gap_pending
+            || self.consecutive_backpressure >= OVERFLOW_BACKPRESSURE_THRESHOLD
+        {
+            return CaptureStarvationWarning::StrictInvariantFailed;
+        }
+
+        if stale {
+            return match self.last_reason_code {
+                CaptureSkipReason::GlobalCaptureBudgetExhausted
+                | CaptureSkipReason::GlobalByteBudgetExhausted
+                | CaptureSkipReason::NoPermit
+                | CaptureSkipReason::SendBackpressure
+                | CaptureSkipReason::CaptureTimeout
+                | CaptureSkipReason::CaptureCircuitOpen => {
+                    CaptureStarvationWarning::BenchmarkTargetMissed
+                }
+                _ => CaptureStarvationWarning::NotProven,
+            };
+        }
+
+        CaptureStarvationWarning::None
+    }
+}
+
+// ─── Weighted Capture Scheduler ─────────────────────────────────────
+
+/// Metrics for budget enforcement and scheduling.
+#[derive(Debug, Default)]
+pub struct SchedulerMetrics {
+    /// Captures skipped due to global rate limit.
+    pub global_rate_limited: u64,
+    /// Captures skipped due to per-pane byte budget.
+    pub pane_byte_budget_exceeded: u64,
+    /// Total throttle events emitted.
+    pub throttle_events: u64,
+}
+
+/// Serializable snapshot of scheduler state for health reporting.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerSnapshot {
+    /// Whether budget enforcement is active (any non-zero limit).
+    pub budget_active: bool,
+    /// Configured captures per second (0 = unlimited).
+    pub max_captures_per_sec: u32,
+    /// Configured bytes per second (0 = unlimited).
+    pub max_bytes_per_sec: u64,
+    /// Captures remaining in the current window.
+    pub captures_remaining: u32,
+    /// Bytes remaining in the current window.
+    pub bytes_remaining: u64,
+    /// Total captures throttled by global rate limit.
+    pub total_rate_limited: u64,
+    /// Total captures throttled by byte budget.
+    pub total_byte_budget_exceeded: u64,
+    /// Total throttle events.
+    pub total_throttle_events: u64,
+    /// Number of panes being tracked.
+    pub tracked_panes: usize,
+    /// Total per-pane rows represented by the supervisor snapshot.
+    #[serde(default)]
+    pub pane_rows_total: usize,
+    /// Whether `panes` was truncated to the compact snapshot cap.
+    #[serde(default)]
+    pub pane_rows_truncated: bool,
+    /// Per-pane scheduler rows, capped for compact health reporting.
+    #[serde(default)]
+    pub panes: Vec<PaneSchedulerSnapshot>,
+    /// Aggregate scheduler service counters per priority tier.
+    #[serde(default)]
+    pub tiers: Vec<SchedulerTierSnapshot>,
+}
+
+/// Per-pane budget tracking within a sliding window.
+#[derive(Debug)]
+struct PaneBudgetTracker {
+    /// Bytes captured in the current window.
+    bytes_in_window: u64,
+    /// Captures in the current window.
+    captures_in_window: u32,
+    /// When the current window started.
+    window_start: Instant,
+}
+
+impl PaneBudgetTracker {
+    fn new() -> Self {
+        Self {
+            bytes_in_window: 0,
+            captures_in_window: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Reset the window if a full second has elapsed.
+    fn maybe_reset(&mut self) {
+        if self.window_start.elapsed() >= Duration::from_secs(1) {
+            self.bytes_in_window = 0;
+            self.captures_in_window = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    /// Record a completed capture.
+    fn record(&mut self, bytes: u64) {
+        self.captures_in_window += 1;
+        self.bytes_in_window += bytes;
+    }
+}
+
+/// Weighted capture scheduler with token-bucket rate limiting.
+///
+/// Enforces `CaptureBudgetConfig` limits (captures/sec and bytes/sec) and
+/// provides weighted pane selection so higher-priority panes get a larger
+/// share of the capture budget under contention.
+pub struct CaptureScheduler {
+    /// Budget configuration (0 = unlimited for each field).
+    budget: CaptureBudgetConfig,
+    /// Global captures remaining in the current 1-second window.
+    global_captures_remaining: u32,
+    /// Global bytes remaining in the current 1-second window.
+    global_bytes_remaining: u64,
+    /// When the current global window started.
+    global_window_start: Instant,
+    /// Per-pane budget tracking.
+    pane_trackers: HashMap<u64, PaneBudgetTracker>,
+    /// Rotates the reserved low-tier floor when multiple low-priority subtier
+    /// values are ready, so lower subtiers cannot wait forever behind priority
+    /// 100 panes. Equal-priority rotation remains owned by `TailerSupervisor`.
+    low_tier_floor_offset: usize,
+    /// Scheduler metrics.
+    metrics: SchedulerMetrics,
+}
+
+impl CaptureScheduler {
+    /// Create a scheduler with the given budget configuration.
+    pub fn new(budget: CaptureBudgetConfig) -> Self {
+        Self {
+            global_captures_remaining: budget.max_captures_per_sec,
+            global_bytes_remaining: budget.max_bytes_per_sec,
+            global_window_start: Instant::now(),
+            budget,
+            pane_trackers: HashMap::new(),
+            low_tier_floor_offset: 0,
+            metrics: SchedulerMetrics::default(),
+        }
+    }
+
+    /// Update the budget configuration (hot-reload safe).
+    pub fn update_budget(&mut self, budget: CaptureBudgetConfig) {
+        self.budget = budget;
+        // Don't reset the window; let it expire naturally.
+    }
+
+    /// Remove tracking for panes no longer observed.
+    pub fn remove_pane(&mut self, pane_id: u64) {
+        self.pane_trackers.remove(&pane_id);
+    }
+
+    /// Check if a capture is allowed for the given pane under global limits.
+    ///
+    /// Returns `true` if the capture should proceed, `false` if throttled.
+    pub fn check_global_budget(&mut self) -> bool {
+        self.maybe_refill_global();
+
+        // 0 means unlimited
+        if self.budget.max_captures_per_sec == 0 {
+            return true;
+        }
+
+        if self.global_captures_remaining == 0 {
+            self.metrics.global_rate_limited += 1;
+            self.metrics.throttle_events += 1;
+            return false;
+        }
+
+        self.global_captures_remaining -= 1;
+        true
+    }
+
+    /// Record that a capture completed, consuming bytes from the budget.
+    pub fn record_capture(&mut self, pane_id: u64, bytes: u64) {
+        // Debit global byte budget
+        if self.budget.max_bytes_per_sec > 0 {
+            self.global_bytes_remaining = self.global_bytes_remaining.saturating_sub(bytes);
+        }
+
+        // Track per-pane
+        let tracker = self
+            .pane_trackers
+            .entry(pane_id)
+            .or_insert_with(PaneBudgetTracker::new);
+        tracker.maybe_reset();
+        tracker.record(bytes);
+    }
+
+    /// Check if global byte budget is exhausted.
+    pub fn is_byte_budget_exhausted(&mut self) -> bool {
+        self.maybe_refill_global();
+
+        if self.budget.max_bytes_per_sec == 0 {
+            return false;
+        }
+
+        if self.global_bytes_remaining == 0 {
+            self.metrics.pane_byte_budget_exceeded += 1;
+            self.metrics.throttle_events += 1;
+            return true;
+        }
+
+        false
+    }
+
+    /// Apply weighted selection: given a priority-sorted list of ready panes,
+    /// return those that should be scheduled under the current budget.
+    ///
+    /// Uses a tiered anti-starvation algorithm:
+    /// 1. Panes split into High (<= 50) and Low (> 50) priority.
+    /// 2. Low priority gets a reserved 20% floor of available slots.
+    ///    The reserved floor rotates across the whole low tier only when
+    ///    multiple low-priority values are ready.
+    /// 3. High priority gets the remaining 80% (plus any unused Low slots).
+    /// 4. Excess High slots spill back to Low in priority order.
+    ///
+    /// This ensures low-priority panes (e.g. SSH) get at least *some* service
+    /// even when high-priority panes (e.g. Codex) are saturating the budget.
+    pub fn select_panes(
+        &mut self,
+        ready_panes: &[(u64, u32)],
+        available_permits: usize,
+    ) -> Vec<u64> {
+        self.maybe_refill_global();
+
+        let budget_limit = if self.budget.max_captures_per_sec > 0 {
+            self.global_captures_remaining as usize
+        } else {
+            usize::MAX
+        };
+
+        let effective_limit = available_permits.min(budget_limit);
+        if effective_limit == 0 {
+            if !ready_panes.is_empty() && budget_limit == 0 {
+                self.metrics.global_rate_limited += 1;
+                self.metrics.throttle_events += 1;
+            }
+            return Vec::new();
+        }
+
+        // Split into high/low priority tiers (zero-copy)
+        // ready_panes is already sorted by (priority, pane_id).
+        // High = 0-50 (Critical/High), Low = 51+ (Normal/Low)
+        let split_idx = ready_panes.partition_point(|&(_, prio)| prio <= 50);
+        let (high_prio, low_prio) = ready_panes.split_at(split_idx);
+
+        // Reserve 20% for low priority to prevent starvation (at least 1 if limit >= 2)
+        let target_low_count = if effective_limit >= 2 {
+            1.max(effective_limit / 5)
+        } else {
+            0
+        };
+
+        // Calculate allocations allowing spillover.
+        let guaranteed_low = low_prio.len().min(target_low_count);
+        let mut slots_remaining = effective_limit - guaranteed_low;
+
+        // High priority takes what it needs from the remaining pool
+        let taken_high = high_prio.len().min(slots_remaining);
+        slots_remaining -= taken_high;
+
+        let low_tier_contention =
+            guaranteed_low > 0 && guaranteed_low + slots_remaining < low_prio.len();
+
+        let mut low_floor = Vec::with_capacity(guaranteed_low);
+        if guaranteed_low > 0 {
+            let should_rotate_low_floor =
+                low_tier_contention && low_prio.windows(2).any(|window| window[0].1 != window[1].1);
+            if should_rotate_low_floor {
+                // Use stable pane order for the subtier cursor. The caller may
+                // have already rotated equal-priority groups, and combining the
+                // two rotations can phase-lock on the same lower-subtier panes.
+                let mut floor_order = low_prio.to_vec();
+                floor_order.sort_by_key(|(id, priority)| (*priority, *id));
+
+                let low_len = floor_order.len();
+                let start = self.low_tier_floor_offset % low_len;
+                low_floor.extend(
+                    (0..guaranteed_low).map(|offset| floor_order[(start + offset) % low_len].0),
+                );
+                self.low_tier_floor_offset = (start + guaranteed_low) % low_len;
+            } else {
+                low_floor.extend(low_prio.iter().take(guaranteed_low).map(|(id, _)| *id));
+            }
+        }
+
+        // Low priority gets the reserved floor plus any spillover from high.
+        // Spillover keeps priority order; the adaptive cursor applies only to
+        // the anti-starvation floor.
+        let low_spillover = low_prio
+            .len()
+            .saturating_sub(low_floor.len())
+            .min(slots_remaining);
+
+        // Collect results (stable order preserved from input sort)
+        let mut selected = Vec::with_capacity(taken_high + low_floor.len() + low_spillover);
+        selected.extend(high_prio.iter().take(taken_high).map(|(id, _)| *id));
+        selected.extend(low_floor.iter().copied());
+        if low_spillover > 0 {
+            let low_floor_set: std::collections::HashSet<u64> = low_floor.iter().copied().collect();
+            let mut spillover_taken = 0usize;
+            for (id, _) in low_prio {
+                if low_floor_set.contains(id) {
+                    continue;
+                }
+                selected.push(*id);
+                spillover_taken += 1;
+                if spillover_taken == low_spillover {
+                    break;
+                }
+            }
+        }
+
+        // Debit global capture budget for the count we'll schedule.
+        if self.budget.max_captures_per_sec > 0 {
+            let debit = match u32::try_from(selected.len()) {
+                Ok(debit) => debit,
+                Err(_) => self.global_captures_remaining,
+            };
+            self.global_captures_remaining = self.global_captures_remaining.saturating_sub(debit);
+        }
+
+        selected
+    }
+
+    /// Access scheduler metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &SchedulerMetrics {
+        &self.metrics
+    }
+
+    /// Export a serializable snapshot of the current scheduler state.
+    #[must_use]
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            budget_active: self.budget.max_captures_per_sec > 0
+                || self.budget.max_bytes_per_sec > 0,
+            max_captures_per_sec: self.budget.max_captures_per_sec,
+            max_bytes_per_sec: self.budget.max_bytes_per_sec,
+            captures_remaining: self.global_captures_remaining,
+            bytes_remaining: self.global_bytes_remaining,
+            total_rate_limited: self.metrics.global_rate_limited,
+            total_byte_budget_exceeded: self.metrics.pane_byte_budget_exceeded,
+            total_throttle_events: self.metrics.throttle_events,
+            tracked_panes: self.pane_trackers.len(),
+            pane_rows_total: 0,
+            pane_rows_truncated: false,
+            panes: Vec::new(),
+            tiers: Vec::new(),
+        }
+    }
+
+    /// Refill the global token bucket if a full second has elapsed.
+    fn maybe_refill_global(&mut self) {
+        if self.global_window_start.elapsed() >= Duration::from_secs(1) {
+            self.global_captures_remaining = self.budget.max_captures_per_sec;
+            self.global_bytes_remaining = self.budget.max_bytes_per_sec;
+            self.global_window_start = Instant::now();
+        }
+    }
+}
+
+// ─── Tailer Supervisor ──────────────────────────────────────────────
+
+struct StandaloneCaptureBinding {
+    identity: ActivePaneIdentity,
+}
+
+/// Supervisor for managing multiple pane tailers.
+pub struct TailerSupervisor<S>
+where
+    S: PaneTextSource + Send + Sync + 'static,
+{
+    /// Configuration
+    config: TailerConfig,
+    /// Channel for sending capture events (will be used when actual polling is implemented)
+    #[allow(dead_code)]
+    tx: mpsc::Sender<CaptureEvent>,
+    /// Per-pane cursors (shared with runtime)
+    cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    /// Pane registry (for authoritative state like alt-screen)
+    registry: Arc<RwLock<PaneRegistry>>,
+    /// Shutdown flag
+    shutdown_flag: Arc<AtomicBool>,
+    /// Pane text source (WezTerm client or test double)
+    source: Arc<S>,
+    /// Circuit breaker for capture pipeline reliability.
+    capture_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    /// Concurrency limiter for in-flight polls
+    semaphore: Arc<Semaphore>,
+    /// Per-pane tailer state
+    tailers: HashMap<u64, PaneTailer>,
+    /// Exact polling-source lease for each active tailer.
+    capture_leases: HashMap<u64, CaptureLease>,
+    /// Panes currently being captured (to prevent duplicate polling)
+    capturing_panes: HashSet<u64>,
+    /// Exact source stamp for every in-flight polling task.
+    ///
+    /// A marker survives tailer replacement/removal until the predecessor task
+    /// settles, preventing its late outcome from mutating a same-ID successor.
+    capturing_stamps: HashMap<u64, CaptureStamp>,
+    /// Effective pane priorities for scheduling (lower = higher priority).
+    ///
+    /// This is updated by the runtime at sync ticks (config rules + runtime overrides).
+    pane_priorities: HashMap<u64, u32>,
+    /// Round-robin offsets for equal-priority scheduling groups.
+    ///
+    /// Without this, a stable `(priority, pane_id)` sort can permanently starve
+    /// higher pane ids when ready panes recycle faster than the queue drains.
+    priority_round_robin_offsets: HashMap<u32, usize>,
+    /// Weighted capture scheduler with budget enforcement.
+    scheduler: CaptureScheduler,
+    /// Metrics
+    metrics: TailerMetrics,
+    /// Supervisor metrics
+    supervisor_metrics: SupervisorMetrics,
+    /// Authority for standalone tailer consumers. Runtime orchestration
+    /// supplies its own exact leases through `sync_authorized_tailers`.
+    standalone_capture_authority: CaptureAuthority,
+    standalone_capture_bindings: HashMap<u64, StandaloneCaptureBinding>,
+    /// Optional standalone egress tap. Runtime-wide replay capture is emitted
+    /// after the common persistence authority gate instead.
+    egress_tap: Option<crate::recording::SharedEgressTap>,
+}
+
+/// Minimal task-set abstraction for polling tasks.
+///
+/// This keeps tailer scheduling logic decoupled from a concrete task set
+/// implementation while the runtime migration is in progress.
+pub trait PollTaskSet {
+    fn spawn_poll_task<F>(&mut self, future: F)
+    where
+        F: Future<Output = (u64, PollOutcome)> + Send + 'static;
+}
+
+/// Tailer-owned task set wrapper for poll workers.
+///
+/// Runtime and tests use this wrapper instead of depending on a concrete task-set
+/// implementation directly.
+pub struct TailerPollTaskSet {
+    inner: FuturesUnordered<PollTaskFuture>,
+}
+
+type PollTaskFuture = Pin<Box<dyn Future<Output = (u64, PollOutcome)> + Send + 'static>>;
+
+impl TailerPollTaskSet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: FuturesUnordered::new(),
+        }
+    }
+
+    pub async fn join_next(&mut self) -> Option<(u64, PollOutcome)> {
+        // ft-tr5a0: ergonomic wrapper around `join_next_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.join_next_with_cx(&cx).await
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::join_next`].
+    ///
+    /// ft-l8uk7: actually observes `Cx` cancellation. The previous body named a
+    /// `Cx` but discarded it (`_cx`), awaiting `inner.next()` directly, which
+    /// gave callers false cancel-safety — a cancelled caller could hang until a
+    /// poll task happened to complete. This now mirrors
+    /// [`crate::runtime_async`]'s `JoinSet::join_next_with_cx`: a pre-flight
+    /// `checkpoint()` gates entry and a per-poll `checkpoint()` inside the poll
+    /// loop surfaces a mid-flight cancel within the same tick instead of waiting
+    /// for the next task completion.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Cancellation (pre-flight or mid-poll) returns `None`: a cancelled caller
+    /// drains no outcome. `None` is therefore overloaded — it means either "task
+    /// set exhausted" or "cancelled"; a caller that must distinguish should
+    /// inspect the `Cx` itself. Returning `None` on cancel cleanly terminates
+    /// the production capture drain loop (`runtime.rs`), which only acts on
+    /// `Some(outcome)` and otherwise re-checks its shutdown/cancel state.
+    pub async fn join_next_with_cx(&mut self, cx: &crate::cx::Cx) -> Option<(u64, PollOutcome)> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        // Pre-flight: a caller cancelled before we start drains no outcome.
+        if cx.checkpoint().is_err() {
+            return None;
+        }
+        std::future::poll_fn(|poll_cx| {
+            // Per-poll: observe a cancel that arrives while we await a pending
+            // poll task so it surfaces within the tick rather than hanging.
+            if cx.checkpoint().is_err() {
+                return std::task::Poll::Ready(None);
+            }
+            Pin::new(&mut self.inner).poll_next(poll_cx)
+        })
+        .await
+    }
+
+    /// Poll the task set once without waiting for an outcome.
+    ///
+    /// Reconciliation uses this bounded fairness hook before looping back to a
+    /// prompt lifecycle retry. Without polling the set, a 10 ms transition
+    /// cadence can starve the producer futures that hold the exact authority
+    /// guards the transition is waiting to drain.
+    pub(crate) fn try_join_next(&mut self) -> Option<(u64, PollOutcome)> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        self.inner.next().now_or_never().flatten()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl Default for TailerPollTaskSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PollTaskSet for TailerPollTaskSet {
+    fn spawn_poll_task<F>(&mut self, future: F)
+    where
+        F: Future<Output = (u64, PollOutcome)> + Send + 'static,
+    {
+        self.inner.push(Box::pin(future));
+    }
+}
+
+impl<S> TailerSupervisor<S>
+where
+    S: PaneTextSource + Send + Sync + 'static,
+{
+    /// Create a new tailer supervisor.
+    pub fn new(
+        config: TailerConfig,
+        tx: mpsc::Sender<CaptureEvent>,
+        cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        shutdown_flag: Arc<AtomicBool>,
+        source: Arc<S>,
+    ) -> Self {
+        let max_concurrent = config.max_concurrent.max(1);
+        Self {
+            config,
+            tx,
+            cursors,
+            registry,
+            shutdown_flag,
+            source,
+            capture_circuit_breaker: get_or_register_circuit(
+                "capture_pipeline",
+                CircuitBreakerConfig::default(),
+            ),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            tailers: HashMap::new(),
+            capture_leases: HashMap::new(),
+            capturing_panes: HashSet::new(),
+            capturing_stamps: HashMap::new(),
+            pane_priorities: HashMap::new(),
+            priority_round_robin_offsets: HashMap::new(),
+            scheduler: CaptureScheduler::new(CaptureBudgetConfig::default()),
+            metrics: TailerMetrics::default(),
+            supervisor_metrics: SupervisorMetrics::default(),
+            standalone_capture_authority: CaptureAuthority::new(),
+            standalone_capture_bindings: HashMap::new(),
+            egress_tap: None,
+        }
+    }
+
+    /// Create a new tailer supervisor with explicit budget configuration.
+    pub fn with_budget(
+        config: TailerConfig,
+        tx: mpsc::Sender<CaptureEvent>,
+        cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        shutdown_flag: Arc<AtomicBool>,
+        source: Arc<S>,
+        budget: CaptureBudgetConfig,
+    ) -> Self {
+        let max_concurrent = config.max_concurrent.max(1);
+        Self {
+            config,
+            tx,
+            cursors,
+            registry,
+            shutdown_flag,
+            source,
+            capture_circuit_breaker: get_or_register_circuit(
+                "capture_pipeline",
+                CircuitBreakerConfig::default(),
+            ),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            tailers: HashMap::new(),
+            capture_leases: HashMap::new(),
+            capturing_panes: HashSet::new(),
+            capturing_stamps: HashMap::new(),
+            pane_priorities: HashMap::new(),
+            priority_round_robin_offsets: HashMap::new(),
+            scheduler: CaptureScheduler::new(budget),
+            metrics: TailerMetrics::default(),
+            supervisor_metrics: SupervisorMetrics::default(),
+            standalone_capture_authority: CaptureAuthority::new(),
+            standalone_capture_bindings: HashMap::new(),
+            egress_tap: None,
+        }
+    }
+
+    /// Set the optional egress observer used by a standalone supervisor.
+    pub fn set_egress_tap(&mut self, tap: crate::recording::SharedEgressTap) {
+        self.egress_tap = Some(tap);
+    }
+
+    /// Number of active tailers.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.tailers.len()
+    }
+
+    /// Sync tailers with exact polling leases issued by the runtime authority.
+    pub fn sync_authorized_tailers(
+        &mut self,
+        observed_panes: &HashMap<u64, PaneInfo>,
+        leases: &HashMap<u64, CaptureLease>,
+    ) -> Result<(), CaptureAuthorityError> {
+        let mut desired = HashMap::with_capacity(observed_panes.len());
+        for pane_id in observed_panes.keys().copied() {
+            let lease = leases
+                .get(&pane_id)
+                .ok_or(CaptureAuthorityError::SourceNotActive {
+                    source_kind: CaptureSourceKind::Polling,
+                })?;
+            let stamp = lease.stamp();
+            if stamp.global_pane_id() != pane_id {
+                return Err(CaptureAuthorityError::PaneIdMismatch);
+            }
+            if stamp.source_kind() != CaptureSourceKind::Polling {
+                return Err(CaptureAuthorityError::StampMismatch);
+            }
+            desired.insert(pane_id, lease.clone());
+        }
+
+        let changed_leases = self
+            .capture_leases
+            .iter()
+            .filter_map(|(pane_id, current)| {
+                desired
+                    .get(pane_id)
+                    .is_some_and(|replacement| replacement.stamp() != current.stamp())
+                    .then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in changed_leases {
+            self.tailers.remove(&pane_id);
+            self.scheduler.remove_pane(pane_id);
+            self.pane_priorities.remove(&pane_id);
+            self.supervisor_metrics.tailers_stopped += 1;
+        }
+        self.capture_leases = desired;
+        self.sync_tailers_inner(observed_panes);
+        Ok(())
+    }
+
+    /// Sync a standalone supervisor, provisioning mandatory polling authority.
+    ///
+    /// The resulting events are stamped, but the authority is private to this
+    /// supervisor. Runtime persistence deliberately uses
+    /// [`Self::sync_authorized_tailers`] so a standalone lease cannot be
+    /// confused with runtime authority.
+    pub fn sync_tailers(&mut self, observed_panes: &HashMap<u64, PaneInfo>) {
+        let departed = self
+            .standalone_capture_bindings
+            .keys()
+            .filter(|pane_id| !observed_panes.contains_key(*pane_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for pane_id in departed {
+            self.capture_leases.remove(&pane_id);
+            let Some(identity) = self
+                .standalone_capture_bindings
+                .get(&pane_id)
+                .map(|binding| binding.identity)
+            else {
+                continue;
+            };
+            match self
+                .standalone_capture_authority
+                .retire_pane_if_drained(identity)
+            {
+                Ok(true) => {
+                    self.standalone_capture_bindings.remove(&pane_id);
+                }
+                Ok(false) => {
+                    debug!(pane_id, "Standalone polling predecessor is still draining");
+                }
+                Err(error) => {
+                    warn!(pane_id, error = %error, "Failed to retire standalone polling authority");
+                }
+            }
+        }
+
+        let mut admitted_panes = HashMap::with_capacity(observed_panes.len());
+        for (&pane_id, pane_info) in observed_panes {
+            if !self.capture_leases.contains_key(&pane_id) {
+                if let Some(identity) = self
+                    .standalone_capture_bindings
+                    .get(&pane_id)
+                    .map(|binding| binding.identity)
+                {
+                    match self
+                        .standalone_capture_authority
+                        .retire_pane_if_drained(identity)
+                    {
+                        Ok(true) => {
+                            self.standalone_capture_bindings.remove(&pane_id);
+                        }
+                        Ok(false) => {
+                            debug!(
+                                pane_id,
+                                "Refusing same-ID standalone polling replacement until predecessor drains"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(pane_id, error = %error, "Failed to resume standalone polling retirement");
+                            continue;
+                        }
+                    }
+                }
+
+                let identity = match self.standalone_capture_authority.activate_pane(pane_id) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(pane_id, error = %error, "Failed to activate standalone polling pane");
+                        continue;
+                    }
+                };
+                let lease = match self
+                    .standalone_capture_authority
+                    .issue_source(identity, CaptureSourceKind::Polling)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        match self
+                            .standalone_capture_authority
+                            .retire_pane_if_drained(identity)
+                        {
+                            Ok(true) => {}
+                            Ok(false) => warn!(
+                                pane_id,
+                                "Empty standalone polling activation unexpectedly remained draining"
+                            ),
+                            Err(rollback_error) => warn!(
+                                pane_id,
+                                error = %rollback_error,
+                                "Failed to roll back empty standalone polling activation"
+                            ),
+                        }
+                        warn!(pane_id, error = %error, "Failed to issue standalone polling source");
+                        continue;
+                    }
+                };
+                self.capture_leases.insert(pane_id, lease);
+                self.standalone_capture_bindings
+                    .insert(pane_id, StandaloneCaptureBinding { identity });
+            }
+            admitted_panes.insert(pane_id, pane_info.clone());
+        }
+        self.sync_tailers_inner(&admitted_panes);
+    }
+
+    fn sync_tailers_inner(&mut self, observed_panes: &HashMap<u64, PaneInfo>) {
+        self.supervisor_metrics.sync_count += 1;
+
+        // Remove tailers for panes no longer observed
+        let to_remove: Vec<u64> = self
+            .tailers
+            .keys()
+            .filter(|id| !observed_panes.contains_key(*id))
+            .copied()
+            .collect();
+
+        for pane_id in to_remove {
+            self.tailers.remove(&pane_id);
+            self.capture_leases.remove(&pane_id);
+            self.scheduler.remove_pane(pane_id);
+            self.pane_priorities.remove(&pane_id);
+            self.supervisor_metrics.tailers_stopped += 1;
+            debug!(pane_id, "Removed tailer for departed pane");
+        }
+
+        // Add tailers for new panes
+        for &pane_id in observed_panes.keys() {
+            if !self.tailers.contains_key(&pane_id) {
+                self.tailers
+                    .insert(pane_id, PaneTailer::new(pane_id, self.config.min_interval));
+                self.supervisor_metrics.tailers_started += 1;
+                debug!(pane_id, "Added tailer for new pane");
+            }
+        }
+
+        let active_priorities: HashSet<u32> = self
+            .tailers
+            .keys()
+            .map(|pane_id| {
+                self.pane_priorities
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        self.priority_round_robin_offsets
+            .retain(|priority, _| active_priorities.contains(priority));
+    }
+
+    /// Update configuration dynamically.
+    ///
+    /// Updates polling intervals and concurrency limits. Note that `semaphore` is updated
+    /// to reflect the new concurrency limit.
+    pub fn update_config(&mut self, config: TailerConfig) {
+        if config.max_concurrent != self.config.max_concurrent {
+            // Update semaphore capacity
+            // Note: Semaphore doesn't support resizing, so we replace it.
+            // This is safe because tasks hold a permit from the OLD semaphore.
+            // New tasks will acquire from the NEW semaphore.
+            // The concurrency limit will effectively be the sum during the transition,
+            // but will converge quickly.
+            self.semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+            debug!(
+                old = self.config.max_concurrent,
+                new = config.max_concurrent,
+                "Tailer concurrency updated"
+            );
+        }
+
+        if config.min_interval != self.config.min_interval
+            || config.max_interval != self.config.max_interval
+        {
+            debug!(
+                min = ?config.min_interval,
+                max = ?config.max_interval,
+                "Tailer intervals updated"
+            );
+        }
+
+        self.config = config;
+    }
+
+    /// Update the effective pane priorities used for scheduling.
+    pub fn update_pane_priorities(&mut self, pane_priorities: HashMap<u64, u32>) {
+        self.pane_priorities = pane_priorities;
+    }
+
+    /// Update the capture budget configuration (hot-reload safe).
+    pub fn update_budget(&mut self, budget: CaptureBudgetConfig) {
+        self.scheduler.update_budget(budget);
+    }
+
+    /// Record that a capture completed with the given byte count.
+    ///
+    /// Call this after a successful capture to debit per-pane and global
+    /// byte budgets.
+    pub fn record_capture_bytes(&mut self, pane_id: u64, bytes: u64) {
+        self.scheduler.record_capture(pane_id, bytes);
+    }
+
+    /// Access scheduler metrics for observability.
+    #[must_use]
+    pub fn scheduler_metrics(&self) -> &SchedulerMetrics {
+        self.scheduler.metrics()
+    }
+
+    /// Export a serializable snapshot of the scheduler state.
+    #[must_use]
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        let mut snapshot = self.scheduler.snapshot();
+        let mut pane_rows = self.scheduler_pane_rows();
+        snapshot.pane_rows_total = pane_rows.len();
+        snapshot.tiers = Self::tier_snapshots(&pane_rows);
+        snapshot.pane_rows_truncated = pane_rows.len() > MAX_SCHEDULER_SNAPSHOT_PANES;
+        if snapshot.pane_rows_truncated {
+            pane_rows.truncate(MAX_SCHEDULER_SNAPSHOT_PANES);
+        }
+        snapshot.panes = pane_rows;
+        snapshot
+    }
+
+    fn scheduler_pane_rows(&self) -> Vec<PaneSchedulerSnapshot> {
+        let now = Instant::now();
+        let mut rows: Vec<PaneSchedulerSnapshot> = self
+            .tailers
+            .iter()
+            .map(|(pane_id, tailer)| {
+                let priority = self
+                    .pane_priorities
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                tailer.snapshot(*pane_id, priority, now)
+            })
+            .collect();
+
+        rows.sort_by(|left, right| {
+            right
+                .stale
+                .cmp(&left.stale)
+                .then_with(|| {
+                    right
+                        .starvation_warning
+                        .severity_rank()
+                        .cmp(&left.starvation_warning.severity_rank())
+                })
+                .then_with(|| {
+                    let right_lag = right
+                        .last_successful_capture_age_ms
+                        .unwrap_or(right.last_poll_age_ms);
+                    let left_lag = left
+                        .last_successful_capture_age_ms
+                        .unwrap_or(left.last_poll_age_ms);
+                    right_lag.cmp(&left_lag)
+                })
+                .then_with(|| left.pane_id.cmp(&right.pane_id))
+        });
+
+        rows
+    }
+
+    fn tier_snapshots(rows: &[PaneSchedulerSnapshot]) -> Vec<SchedulerTierSnapshot> {
+        let mut high = SchedulerTierSnapshot::new(CapturePriorityTier::High);
+        let mut low = SchedulerTierSnapshot::new(CapturePriorityTier::Low);
+
+        for row in rows {
+            let target = match row.tier {
+                CapturePriorityTier::High => &mut high,
+                CapturePriorityTier::Low => &mut low,
+            };
+            target.selection_opportunities = target
+                .selection_opportunities
+                .saturating_add(row.selection_opportunities);
+            target.selected_count = target.selected_count.saturating_add(row.selected_count);
+            target.skipped_count = target.skipped_count.saturating_add(row.skipped_count);
+        }
+
+        vec![high, low]
+    }
+
+    fn rotate_equal_priority_ready_panes(
+        &self,
+        ready_panes: &mut [(u64, u32)],
+    ) -> Vec<(u32, usize)> {
+        let mut group_lengths = Vec::new();
+        let mut start = 0usize;
+        while start < ready_panes.len() {
+            let priority = ready_panes[start].1;
+            let mut end = start + 1;
+            while end < ready_panes.len() && ready_panes[end].1 == priority {
+                end += 1;
+            }
+
+            let group_len = end - start;
+            group_lengths.push((priority, group_len));
+            if group_len > 1 {
+                let rotate_by = self
+                    .priority_round_robin_offsets
+                    .get(&priority)
+                    .copied()
+                    .unwrap_or(0)
+                    % group_len;
+                ready_panes[start..end].rotate_left(rotate_by);
+            }
+
+            start = end;
+        }
+
+        group_lengths
+    }
+
+    fn increment_started_priority(started_per_priority: &mut Vec<(u32, usize)>, priority: u32) {
+        if let Some((_, started)) = started_per_priority
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == priority)
+        {
+            *started += 1;
+        } else {
+            started_per_priority.push((priority, 1));
+        }
+    }
+
+    /// Spawn tasks for all ready panes that are not currently being captured.
+    ///
+    /// Uses weighted scheduling: panes are sorted by priority (lower = higher),
+    /// then filtered through the capture budget. Under contention, higher-priority
+    /// panes get a larger share of the capture budget.
+    pub fn spawn_ready<T>(&mut self, task_set: &mut T)
+    where
+        T: PollTaskSet,
+    {
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            for tailer in self.tailers.values_mut() {
+                tailer.record_skip(CaptureSkipReason::Shutdown);
+            }
+            return;
+        }
+
+        // Check if byte budget is exhausted before doing any work.
+        if self.scheduler.is_byte_budget_exhausted() {
+            let capturing_panes = &self.capturing_panes;
+            for (pane_id, tailer) in &mut self.tailers {
+                if capturing_panes.contains(pane_id) {
+                    tailer.record_skip(CaptureSkipReason::AlreadyCapturing);
+                } else if tailer.should_poll() {
+                    tailer.record_selection_opportunity();
+                    tailer.record_skip(CaptureSkipReason::GlobalByteBudgetExhausted);
+                } else {
+                    tailer.record_skip(CaptureSkipReason::NotDue);
+                }
+            }
+            return;
+        }
+
+        // Find panes ready for polling AND not currently capturing.
+        let mut ready_panes = Vec::<(u64, u32)>::new();
+        let capturing_panes = &self.capturing_panes;
+        let pane_priorities = &self.pane_priorities;
+        for (pane_id, tailer) in &mut self.tailers {
+            if capturing_panes.contains(pane_id) {
+                tailer.record_skip(CaptureSkipReason::AlreadyCapturing);
+                continue;
+            }
+
+            if !tailer.should_poll() {
+                tailer.record_skip(CaptureSkipReason::NotDue);
+                continue;
+            }
+
+            tailer.record_selection_opportunity();
+            let prio = pane_priorities.get(pane_id).copied().unwrap_or(u32::MAX);
+            ready_panes.push((*pane_id, prio));
+        }
+
+        // Order by priority (lower = higher), tie-breaker pane_id for determinism.
+        ready_panes.sort_by_key(|&(pane_id, prio)| (prio, pane_id));
+        let ready_group_lengths = self.rotate_equal_priority_ready_panes(&mut ready_panes);
+
+        // Apply weighted scheduling with budget enforcement.
+        self.scheduler.maybe_refill_global();
+        let available = self.semaphore.available_permits();
+        let capture_limit_before = if self.scheduler.budget.max_captures_per_sec > 0 {
+            self.scheduler.global_captures_remaining as usize
+        } else {
+            usize::MAX
+        };
+        let selected = self.scheduler.select_panes(&ready_panes, available);
+        let selected_set: HashSet<u64> = selected.iter().copied().collect();
+        let defer_reason = if available == 0 {
+            CaptureSkipReason::NoPermit
+        } else if self.scheduler.budget.max_captures_per_sec > 0
+            && capture_limit_before <= available
+        {
+            CaptureSkipReason::GlobalCaptureBudgetExhausted
+        } else {
+            CaptureSkipReason::NoPermit
+        };
+        for (pane_id, _) in &ready_panes {
+            if !selected_set.contains(pane_id)
+                && let Some(tailer) = self.tailers.get_mut(pane_id)
+            {
+                tailer.record_skip(defer_reason);
+            }
+        }
+        let mut started_per_priority = Vec::<(u32, usize)>::new();
+
+        macro_rules! reserve_capture_event_permit {
+            ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
+                // Inherit the ambient task Cx so a shutdown signal sent to
+                // the supervisor propagates into the permit-reservation
+                // wait. The earlier revision unconditionally called
+                // `crate::cx::for_request()`, which built a detached
+                // request-scoped Cx with no parent chain — meaning an
+                // in-flight poll task blocked on `$tx.reserve` would keep
+                // waiting up to `send_timeout` even after its parent was
+                // cancelled. Matches the inherit-or-fallback idiom already
+                // used in native_events.rs, cpu_pressure.rs, storage.rs,
+                // etc.
+                let $reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return ($pane_id, PollOutcome::ChannelClosed),
+                    Err(_) => return ($pane_id, PollOutcome::Backpressure),
+                };
+            };
+        }
+
+        for pane_id in selected {
+            // Check if this pane needs an overflow gap emitted before normal capture
+            let overflow_gap_pending = self
+                .tailers
+                .get(&pane_id)
+                .is_some_and(|t| t.overflow_gap_pending);
+
+            // Attempt to synchronously acquire a permit. This prevents queueing up tasks
+            // in the task_set faster than the semaphore allows, keeping `available_permits()`
+            // perfectly accurate for the next `spawn_ready` call.
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // This is unexpected since we bound `selected` by `available`, but if it happens,
+                    // just record backpressure.
+                    if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                        tailer.record_skip(CaptureSkipReason::NoPermit);
+                        tailer.consecutive_backpressure += 1;
+                        self.metrics.send_timeouts += 1;
+                    }
+                    continue;
+                }
+            };
+
+            if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                tailer.record_selected();
+            }
+
+            let priority = self
+                .pane_priorities
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(u32::MAX);
+            Self::increment_started_priority(&mut started_per_priority, priority);
+
+            let tx = self.tx.clone();
+            let cursors = Arc::clone(&self.cursors);
+            let registry = Arc::clone(&self.registry);
+            let source = Arc::clone(&self.source);
+            let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
+            let Some(capture_lease) = self.capture_leases.get(&pane_id).cloned() else {
+                if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                    tailer.record_skip(CaptureSkipReason::AuthorityRejected);
+                }
+                self.capturing_panes.remove(&pane_id);
+                continue;
+            };
+            let capture_stamp = capture_lease.stamp();
+            // Keep the exact source identity alongside the pane marker. The
+            // marker is intentionally retained across a lease replacement
+            // until this predecessor task settles.
+            self.capturing_panes.insert(pane_id);
+            self.capturing_stamps.insert(pane_id, capture_stamp);
+            let overlap_size = self.config.overlap_size;
+            let send_timeout = self.config.send_timeout;
+            let capture_timeout = self.config.capture_timeout;
+            let egress_tap = self.egress_tap.clone();
+
+            task_set.spawn_poll_task(async move {
+                let _permit = permit; // Hold permit for the duration of the task
+
+                let has_cursor = {
+                    let cursors = cursors.read().await;
+                    cursors.contains_key(&pane_id)
+                };
+
+                if !has_cursor {
+                    return (pane_id, PollOutcome::NoCursor);
+                }
+
+                // If overflow gap is pending, emit a synthetic gap segment instead
+                // of doing a normal capture.  The gap signals to downstream consumers
+                // that data was lost during sustained backpressure.
+                if overflow_gap_pending {
+                    reserve_capture_event_permit!(
+                        pane_id,
+                        tx,
+                        send_timeout,
+                        overflow_reserve_cx,
+                        permit
+                    );
+
+                    let producer_guard =
+                        match capture_lease.try_acquire_producer(capture_lease.stamp(), pane_id) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                drop(permit);
+                                return (pane_id, PollOutcome::AuthorityRejected(error));
+                            }
+                        };
+
+                    let gap_segment = {
+                        let mut cursors = cursors.write().await;
+                        cursors
+                            .get_mut(&pane_id)
+                            .map(|cursor| cursor.emit_overflow_gap("backpressure_overflow"))
+                    };
+
+                    if let Some(segment) = gap_segment {
+                        if let Some(ref tap) = egress_tap {
+                            use crate::recording::{
+                                EgressEvent, RecorderRedactionLevel, RecorderSegmentKind,
+                                RecorderTextEncoding, epoch_ms_now,
+                            };
+                            tap.on_egress(EgressEvent {
+                                pane_id,
+                                text: segment.content.clone(),
+                                segment_kind: RecorderSegmentKind::Gap,
+                                is_gap: true,
+                                gap_reason: Some("backpressure_overflow".to_string()),
+                                encoding: RecorderTextEncoding::Utf8,
+                                redaction: RecorderRedactionLevel::None,
+                                occurred_at_ms: epoch_ms_now(),
+                                sequence: segment.seq,
+                            });
+                        }
+                        let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                drop(permit);
+                                return (pane_id, PollOutcome::AuthorityRejected(error));
+                            }
+                        };
+                        permit.send(event);
+                        return (pane_id, PollOutcome::OverflowGapEmitted);
+                    }
+
+                    drop(permit);
+                    return (pane_id, PollOutcome::NoCursor);
+                }
+
+                let producer_guard =
+                    match capture_lease.try_acquire_producer(capture_lease.stamp(), pane_id) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            return (pane_id, PollOutcome::AuthorityRejected(error));
+                        }
+                    };
+
+                let retry_after_ms = {
+                    let mut guard = match capture_circuit_breaker.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    if guard.allow() {
+                        None
+                    } else {
+                        let status = guard.status();
+                        Some(status.cooldown_remaining_ms.unwrap_or(0))
+                    }
+                };
+
+                if let Some(retry_after_ms) = retry_after_ms {
+                    return (pane_id, PollOutcome::CircuitOpen { retry_after_ms });
+                }
+
+                reserve_capture_event_permit!(
+                    pane_id,
+                    tx,
+                    send_timeout,
+                    capture_reserve_cx,
+                    permit
+                );
+
+                let text_result = timeout(capture_timeout, source.get_text(pane_id, false)).await;
+                let text = match text_result {
+                    Ok(Ok(text)) => {
+                        let mut guard = match capture_circuit_breaker.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.record_success();
+                        text
+                    }
+                    Ok(Err(err)) => {
+                        if let crate::Error::Wezterm(wez) = &err {
+                            if let crate::error::WeztermError::CircuitOpen { retry_after_ms } = wez
+                            {
+                                drop(permit);
+                                return (
+                                    pane_id,
+                                    PollOutcome::CircuitOpen {
+                                        retry_after_ms: *retry_after_ms,
+                                    },
+                                );
+                            }
+
+                            if wez.is_circuit_breaker_trigger() {
+                                let mut guard = match capture_circuit_breaker.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.record_failure();
+                            }
+                        }
+                        drop(permit);
+                        return (pane_id, PollOutcome::Error(err.to_string()));
+                    }
+                    Err(_) => {
+                        drop(permit);
+                        return (pane_id, PollOutcome::CaptureTimeout);
+                    }
+                };
+
+                // Fetch external alt-screen state from registry if available
+                let external_alt_screen = {
+                    let reg = registry.read().await;
+                    reg.is_alt_screen(pane_id)
+                };
+
+                let captured = {
+                    let mut cursors = cursors.write().await;
+                    cursors.get_mut(&pane_id).and_then(|cursor| {
+                        cursor.capture_snapshot(&text, overlap_size, external_alt_screen)
+                    })
+                };
+
+                if let Some(segment) = captured {
+                    let bytes = segment.content.len() as u64;
+                    if let Some(ref tap) = egress_tap {
+                        use crate::recording::{
+                            EgressEvent, RecorderRedactionLevel, RecorderTextEncoding,
+                            captured_kind_to_segment, epoch_ms_now,
+                        };
+                        let (segment_kind, is_gap) = captured_kind_to_segment(&segment.kind);
+                        let gap_reason = match &segment.kind {
+                            crate::ingest::CapturedSegmentKind::Gap { reason } => {
+                                Some(reason.clone())
+                            }
+                            crate::ingest::CapturedSegmentKind::Delta => None,
+                        };
+                        tap.on_egress(EgressEvent {
+                            pane_id,
+                            text: segment.content.clone(),
+                            segment_kind,
+                            is_gap,
+                            gap_reason,
+                            encoding: RecorderTextEncoding::Utf8,
+                            redaction: RecorderRedactionLevel::None,
+                            occurred_at_ms: epoch_ms_now(),
+                            sequence: segment.seq,
+                        });
+                    }
+                    let event = match CaptureEvent::from_producer(segment, &producer_guard) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            drop(permit);
+                            return (pane_id, PollOutcome::AuthorityRejected(error));
+                        }
+                    };
+                    permit.send(event);
+                    (pane_id, PollOutcome::Changed { bytes })
+                } else {
+                    drop(permit);
+                    (pane_id, PollOutcome::NoChange)
+                }
+            });
+        }
+
+        for (priority, started) in started_per_priority {
+            if started == 0 {
+                continue;
+            }
+            let group_len = ready_group_lengths
+                .iter()
+                .find_map(|(candidate, len)| (*candidate == priority).then_some(*len))
+                .unwrap_or(1);
+            let offset = self
+                .priority_round_robin_offsets
+                .entry(priority)
+                .or_insert(0);
+            *offset = (*offset + started) % group_len;
+        }
+    }
+
+    /// Handle the result of a completed poll task.
+    pub fn handle_poll_result(&mut self, pane_id: u64, outcome: PollOutcome) {
+        // Mark as no longer capturing so it can be polled again later
+        self.capturing_panes.remove(&pane_id);
+        let completed_stamp = self.capturing_stamps.remove(&pane_id);
+        if let Some(completed_stamp) = completed_stamp {
+            let current_stamp = self.capture_leases.get(&pane_id).map(CaptureLease::stamp);
+            if current_stamp != Some(completed_stamp) {
+                debug!(
+                    pane_id,
+                    pane_incarnation = completed_stamp.pane_incarnation().get(),
+                    source_epoch = completed_stamp.source_epoch().get(),
+                    "Ignoring stale polling task completion"
+                );
+                return;
+            }
+        }
+
+        if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+            match outcome {
+                PollOutcome::Changed { bytes } => {
+                    tailer.record_poll_outcome(
+                        true,
+                        true,
+                        CaptureSkipReason::Changed,
+                        &self.config,
+                    );
+                    tailer.consecutive_backpressure = 0;
+                    self.metrics.events_sent += 1;
+                    self.scheduler.record_capture(pane_id, bytes);
+                }
+                PollOutcome::NoChange => {
+                    tailer.record_poll_outcome(
+                        false,
+                        true,
+                        CaptureSkipReason::NoChange,
+                        &self.config,
+                    );
+                    tailer.consecutive_backpressure = 0;
+                    self.metrics.no_change_captures += 1;
+                    trace!(pane_id, "Tailer poll no change");
+                }
+                PollOutcome::Backpressure => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::SendBackpressure,
+                        &self.config,
+                    );
+                    self.metrics.send_timeouts += 1;
+                    tailer.consecutive_backpressure += 1;
+                    if tailer.consecutive_backpressure >= OVERFLOW_BACKPRESSURE_THRESHOLD {
+                        tailer.overflow_gap_pending = true;
+                        warn!(
+                            pane_id,
+                            consecutive = tailer.consecutive_backpressure,
+                            "Backpressure overflow: scheduling GAP insertion"
+                        );
+                    } else {
+                        warn!(pane_id, "Tailer backpressure: capture queue full");
+                    }
+                }
+                PollOutcome::OverflowGapEmitted => {
+                    tailer.record_poll_outcome(
+                        true,
+                        true,
+                        CaptureSkipReason::OverflowGapEmitted,
+                        &self.config,
+                    );
+                    tailer.overflow_gap_pending = false;
+                    tailer.consecutive_backpressure = 0;
+                    self.metrics.events_sent += 1;
+                    self.metrics.overflow_gaps_emitted += 1;
+                    debug!(pane_id, "Overflow GAP emitted");
+                }
+                PollOutcome::NoCursor => {
+                    // ft-0kdi9: a pane is only polled while it is observed, so
+                    // a missing cursor is a lost-capture bug, not routine
+                    // scheduling. Warn on entry into the state (a dead pane
+                    // polls at the backoff cadence forever, so warning every
+                    // time would be a log storm) and always count it.
+                    let first_occurrence = tailer.last_reason_code != CaptureSkipReason::NoCursor;
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::NoCursor,
+                        &self.config,
+                    );
+                    self.metrics.no_cursor_polls += 1;
+                    if first_occurrence {
+                        warn!(
+                            pane_id,
+                            no_cursor_polls = self.metrics.no_cursor_polls,
+                            "Tailer poll skipped: pane is observed but has no capture cursor; \
+                             output is being discarded until a cursor is re-created"
+                        );
+                    } else {
+                        debug!(pane_id, "Tailer poll skipped (no cursor, still)");
+                    }
+                }
+                PollOutcome::ChannelClosed => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::ChannelClosed,
+                        &self.config,
+                    );
+                    warn!(pane_id, "Tailer channel closed");
+                }
+                PollOutcome::CaptureTimeout => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureTimeout,
+                        &self.config,
+                    );
+                    self.metrics.capture_timeouts += 1;
+                    warn!(pane_id, "Tailer capture timed out");
+                }
+                PollOutcome::AuthorityRejected(error) => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::AuthorityRejected,
+                        &self.config,
+                    );
+                    debug!(
+                        source_kind = ?self
+                            .capture_leases
+                            .get(&pane_id)
+                            .map(|lease| lease.stamp().source_kind()),
+                        error = %error,
+                        "Tailer producer authority rejected stale poll"
+                    );
+                }
+                PollOutcome::CircuitOpen { retry_after_ms } => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureCircuitOpen,
+                        &self.config,
+                    );
+                    trace!(
+                        pane_id,
+                        retry_after_ms, "Tailer poll skipped (capture circuit breaker open)"
+                    );
+                }
+                PollOutcome::Error(error) => {
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureError,
+                        &self.config,
+                    );
+                    warn!(pane_id, error = %error, "Tailer poll failed");
+                }
+            }
+        }
+    }
+
+    /// Graceful shutdown of all tailers.
+    pub async fn shutdown(&mut self) {
+        // ft-tr5a0: ergonomic wrapper around `shutdown_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_cx(&cx).await;
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`].
+    pub async fn shutdown_with_cx(&mut self, _cx: &crate::cx::Cx) {
+        debug!(
+            active_count = self.tailers.len(),
+            "Shutting down tailer supervisor"
+        );
+        self.tailers.clear();
+        self.capturing_panes.clear();
+        self.capturing_stamps.clear();
+        self.capture_leases.clear();
+    }
+
+    /// Get current metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &TailerMetrics {
+        &self.metrics
+    }
+
+    /// Get supervisor metrics.
+    #[must_use]
+    pub fn supervisor_metrics(&self) -> &SupervisorMetrics {
+        &self.supervisor_metrics
+    }
+}
+
+#[derive(Debug)]
+pub enum PollOutcome {
+    /// Content changed; includes byte count of the captured segment.
+    Changed {
+        bytes: u64,
+    },
+    NoChange,
+    Backpressure,
+    /// An overflow GAP segment was emitted after sustained backpressure
+    OverflowGapEmitted,
+    NoCursor,
+    ChannelClosed,
+    CaptureTimeout,
+    /// Exact pane/source authority rejected this producer before mutation.
+    AuthorityRejected(CaptureAuthorityError),
+    CircuitOpen {
+        retry_after_ms: u64,
+    },
+    Error(String),
+}
+
+// ---------------------------------------------------------------------------
+// Streaming tailer integration (wa-nu4.4.2.3)
+// ---------------------------------------------------------------------------
+
+/// Capture mode for a pane — either polling-based or streaming-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TailerMode {
+    /// Traditional get_text polling with adaptive intervals.
+    Polling,
+    /// Vendored mux subscription with direct delta delivery.
+    Streaming,
+}
+
+impl std::fmt::Display for TailerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Polling => write!(f, "polling"),
+            Self::Streaming => write!(f, "streaming"),
+        }
+    }
+}
+
+/// Detect the best available tailer mode at runtime.
+///
+/// Returns `Streaming` only when the vendored feature is compiled in, the mux
+/// socket is discoverable, and vendored compatibility is positively
+/// established. Otherwise returns `Polling`.
+#[cfg(feature = "vendored")]
+fn streaming_socket_configured(config: &crate::config::Config) -> bool {
+    // When the user explicitly sets mux_socket_path to empty/whitespace,
+    // treat that as "streaming disabled" — do not fall through to env or
+    // canonical discovery.
+    if let Some(ref path) = config.vendored.mux_socket_path {
+        if path.trim().is_empty() {
+            return false;
+        }
+    }
+    // Use the shared resolver that checks config, env, AND canonical WezTerm
+    // unix-domain defaults (GH #48).
+    crate::wezterm::discover_mux_socket(config.vendored.mux_socket_path.as_deref()).is_some()
+}
+
+#[cfg(feature = "vendored")]
+fn detect_tailer_mode_with_allow_vendored(
+    config: &crate::config::Config,
+    allow_vendored: bool,
+) -> TailerMode {
+    if allow_vendored && streaming_socket_configured(config) {
+        TailerMode::Streaming
+    } else {
+        TailerMode::Polling
+    }
+}
+
+#[must_use]
+pub fn detect_tailer_mode(config: &crate::config::Config) -> TailerMode {
+    #[cfg(feature = "vendored")]
+    {
+        let local_version = crate::vendored::read_local_wezterm_version();
+        let compatibility = crate::vendored::compatibility_report(local_version.as_ref());
+        detect_tailer_mode_with_allow_vendored(config, compatibility.allow_vendored)
+    }
+    #[cfg(not(feature = "vendored"))]
+    {
+        let _ = config; // suppress unused warning when vendored is off
+        TailerMode::Polling
+    }
+}
+
+/// Typed metadata retained from the latest vendored render mutation.
+#[cfg(feature = "vendored")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingRenderMetadata {
+    /// Diagnostic terminal mutation version; never delivery continuity.
+    pub source_version: u64,
+    /// Pane title observed with this render mutation.
+    pub title: String,
+    /// Number of dirty line ranges reported by the mux.
+    pub dirty_range_count: usize,
+    /// Total dirty rows reported by the mux.
+    pub dirty_row_count: usize,
+}
+
+/// Bridges vendored `PaneDelta` events through the caller's shared capture
+/// cursor, retaining persistence sequence corrections across capture sources.
+///
+/// The bridge converts each delta kind:
+/// - `Output` → a delta segment only when `delta_text` contains
+///   actual best-effort terminal text; empty projections remain typed metadata
+/// - `Gap` → an explicit overflow gap without a fabricated empty delta
+/// - `Ended` → a closing gap only for an active streaming pane; shared cursor
+///   retirement belongs to the transition coordinator, not this bridge
+pub struct StreamingBridge {
+    /// Diagnostic streaming membership, not ownership of capture cursors.
+    active_panes: HashSet<u64>,
+    segments_emitted: u64,
+    gaps_emitted: u64,
+    /// Number of PaneDelta events processed.
+    events_processed: u64,
+    /// Number of fallback-to-polling transitions.
+    fallback_count: u64,
+    /// Aggregate dirty range count observed from render-change deltas.
+    dirty_range_total: u64,
+    /// Aggregate dirty row count observed from render-change deltas.
+    dirty_row_total: u64,
+    /// Last observed mux mutation version per pane for regression diagnostics.
+    #[cfg(feature = "vendored")]
+    last_mux_seqno: HashMap<u64, u64>,
+    /// Latest typed render metadata per pane. It deliberately stays out of
+    /// process-global metric labels so pane titles cannot create unbounded or
+    /// sensitive metric cardinality.
+    #[cfg(feature = "vendored")]
+    last_render_metadata: HashMap<u64, StreamingRenderMetadata>,
+    /// Number of non-increasing mux mutation versions observed.
+    seq_anomaly_count: u64,
+}
+
+static GLOBAL_STREAMING_HEALTH: OnceLock<StdRwLock<Option<StreamingHealth>>> = OnceLock::new();
+
+impl StreamingBridge {
+    /// Create a new streaming bridge.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active_panes: HashSet::new(),
+            segments_emitted: 0,
+            gaps_emitted: 0,
+            events_processed: 0,
+            fallback_count: 0,
+            dirty_range_total: 0,
+            dirty_row_total: 0,
+            #[cfg(feature = "vendored")]
+            last_mux_seqno: HashMap::new(),
+            #[cfg(feature = "vendored")]
+            last_render_metadata: HashMap::new(),
+            seq_anomaly_count: 0,
+        }
+    }
+
+    /// Issue at most one capture through the caller's authoritative cursor.
+    ///
+    /// The caller must retain exclusive cursor access through issuance and is
+    /// responsible for persisting the returned segment. A pane identity mismatch
+    /// is refused before any cursor or bridge state changes.
+    #[cfg(feature = "vendored")]
+    pub fn process_delta(
+        &mut self,
+        delta: crate::vendored::PaneDelta,
+        cursor: &mut PaneCursor,
+    ) -> Result<Option<CapturedSegment>, String> {
+        let pane_id = match &delta {
+            crate::vendored::PaneDelta::Output { pane_id, .. }
+            | crate::vendored::PaneDelta::Gap { pane_id, .. }
+            | crate::vendored::PaneDelta::Ended { pane_id, .. } => *pane_id,
+        };
+        if cursor.pane_id != pane_id {
+            return Err("streaming delta pane does not match capture cursor".to_string());
+        }
+        // Preserve ingest-stage telemetry for capture-bearing events without
+        // counting metadata-only projections as capture work.
+        let capacity_timer = (!matches!(
+            &delta,
+            crate::vendored::PaneDelta::Output { delta_text, .. } if delta_text.is_empty()
+        ))
+        .then(|| {
+            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                crate::runtime_telemetry::SwarmCapacityStage::IngestCapture,
+                u64::try_from(self.active_panes()).unwrap_or(u64::MAX),
+            )
+        });
+        self.events_processed = self.events_processed.saturating_add(1);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+
+        let segment = match delta {
+            crate::vendored::PaneDelta::Output {
+                pane_id,
+                seqno,
+                delta_text,
+                title,
+                dirty_range_count,
+                dirty_row_count,
+            } => {
+                self.note_output_seqno(pane_id, seqno);
+                self.dirty_range_total = self
+                    .dirty_range_total
+                    .saturating_add(u64::try_from(dirty_range_count).unwrap_or(u64::MAX));
+                self.dirty_row_total = self
+                    .dirty_row_total
+                    .saturating_add(u64::try_from(dirty_row_count).unwrap_or(u64::MAX));
+                self.last_render_metadata.insert(
+                    pane_id,
+                    StreamingRenderMetadata {
+                        source_version: seqno,
+                        title,
+                        dirty_range_count,
+                        dirty_row_count,
+                    },
+                );
+                if delta_text.is_empty() {
+                    None
+                } else {
+                    self.active_panes.insert(pane_id);
+                    Some(cursor.capture_delta(delta_text, now_ms))
+                }
+            }
+            crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
+                // After an explicit upstream gap we reset local seq tracking so
+                // the next output delta establishes a fresh baseline.
+                self.last_mux_seqno.remove(&pane_id);
+                self.active_panes.insert(pane_id);
+                Some(cursor.emit_gap("stream_overflow"))
+            }
+            crate::vendored::PaneDelta::Ended { pane_id, reason: _ } => {
+                self.last_mux_seqno.remove(&pane_id);
+                self.last_render_metadata.remove(&pane_id);
+                self.active_panes
+                    .remove(&pane_id)
+                    .then(|| cursor.emit_gap("pane_closed"))
+            }
+        };
+
+        if let Some(segment) = &segment {
+            self.segments_emitted = self.segments_emitted.saturating_add(1);
+            if matches!(segment.kind, crate::ingest::CapturedSegmentKind::Gap { .. }) {
+                self.gaps_emitted = self.gaps_emitted.saturating_add(1);
+            }
+        }
+        if let Some(capacity_timer) = capacity_timer {
+            capacity_timer.finish_completion();
+        }
+        StreamingHealth::update_global(self.snapshot_health());
+        Ok(segment)
+    }
+
+    /// Record that a fallback to polling occurred.
+    pub fn record_fallback(&mut self) {
+        self.fallback_count = self.fallback_count.saturating_add(1);
+        StreamingHealth::update_global(self.snapshot_health());
+    }
+
+    /// Number of events processed.
+    #[must_use]
+    pub fn events_processed(&self) -> u64 {
+        self.events_processed
+    }
+
+    /// Number of fallback transitions.
+    #[must_use]
+    pub fn fallback_count(&self) -> u64 {
+        self.fallback_count
+    }
+
+    /// Aggregate number of dirty ranges observed from output deltas.
+    #[must_use]
+    pub fn dirty_range_total(&self) -> u64 {
+        self.dirty_range_total
+    }
+
+    /// Aggregate number of dirty rows observed from output deltas.
+    #[must_use]
+    pub fn dirty_row_total(&self) -> u64 {
+        self.dirty_row_total
+    }
+
+    /// Number of non-increasing terminal mutation versions observed.
+    ///
+    /// This is diagnostic only and never creates a capture gap. Forward jumps
+    /// are ordinary when multiple terminal mutations occur between polls.
+    #[must_use]
+    pub fn seq_anomaly_count(&self) -> u64 {
+        self.seq_anomaly_count
+    }
+
+    /// Latest typed render metadata observed for `pane_id`.
+    ///
+    /// Empty best-effort text projections still update this state without
+    /// entering the terminal-output capture pipeline.
+    #[cfg(feature = "vendored")]
+    #[must_use]
+    pub fn render_metadata(&self, pane_id: u64) -> Option<&StreamingRenderMetadata> {
+        self.last_render_metadata.get(&pane_id)
+    }
+
+    /// Number of streaming panes with a capture and no closing event.
+    #[must_use]
+    pub fn active_panes(&self) -> usize {
+        self.active_panes.len()
+    }
+
+    /// Total issued captures, including gaps.
+    #[must_use]
+    pub fn total_segments(&self) -> u64 {
+        self.segments_emitted
+    }
+
+    /// Total issued gap captures.
+    #[must_use]
+    pub fn total_gaps(&self) -> u64 {
+        self.gaps_emitted
+    }
+
+    #[cfg(feature = "vendored")]
+    fn note_output_seqno(&mut self, pane_id: u64, seqno: u64) {
+        if let Some(prev) = self.last_mux_seqno.insert(pane_id, seqno) {
+            if seqno <= prev {
+                self.seq_anomaly_count = self.seq_anomaly_count.saturating_add(1);
+                debug!(
+                    pane_id,
+                    previous_seqno = prev,
+                    current_seqno = seqno,
+                    "non-increasing terminal mutation version observed; retaining diagnostic only"
+                );
+            }
+        }
+    }
+
+    fn snapshot_health(&self) -> StreamingHealth {
+        StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: self.events_processed,
+            dirty_ranges_total: self.dirty_range_total,
+            dirty_rows_total: self.dirty_row_total,
+            gaps_emitted: self.total_gaps(),
+            fallback_count: self.fallback_count,
+            active_panes: self.active_panes(),
+        }
+    }
+}
+
+impl Default for StreamingBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Health snapshot for streaming diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamingHealth {
+    /// Current capture mode.
+    pub mode: TailerMode,
+    /// Events processed through the streaming bridge.
+    pub events_processed: u64,
+    /// Aggregate dirty range count observed from output deltas.
+    pub dirty_ranges_total: u64,
+    /// Aggregate dirty row count observed from output deltas.
+    pub dirty_rows_total: u64,
+    /// Gaps emitted through the streaming bridge.
+    pub gaps_emitted: u64,
+    /// Number of times streaming fell back to polling.
+    pub fallback_count: u64,
+    /// Streaming panes with an issued capture and no closing event.
+    pub active_panes: usize,
+}
+
+fn streaming_health_read_guard(
+    lock: &StdRwLock<Option<StreamingHealth>>,
+) -> std::sync::RwLockReadGuard<'_, Option<StreamingHealth>> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn streaming_health_write_guard(
+    lock: &StdRwLock<Option<StreamingHealth>>,
+) -> std::sync::RwLockWriteGuard<'_, Option<StreamingHealth>> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+impl StreamingHealth {
+    /// Update the latest global streaming health snapshot.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
+        let mut guard = streaming_health_write_guard(lock);
+        *guard = Some(snapshot);
+    }
+
+    /// Get the latest global streaming health snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
+        streaming_health_read_guard(lock).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tailer test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn capture_resync_receipt_is_single_assignment_and_drop_safe() {
+        let (mut decision, receipt) = CaptureResyncDecision::channel();
+        let cloned_receipt = receipt.clone();
+        assert_eq!(receipt.outcome(), None);
+        decision.finish(Ok(7));
+        decision.finish(Err("late overwrite".to_string()));
+        assert_eq!(receipt.outcome(), Some(Ok(7)));
+        assert_eq!(cloned_receipt.outcome(), Some(Ok(7)));
+        drop(decision);
+        assert_eq!(receipt.outcome(), Some(Ok(7)));
+        assert_eq!(cloned_receipt.outcome(), Some(Ok(7)));
+
+        let (undecided, dropped_receipt) = CaptureResyncDecision::channel();
+        drop(undecided);
+        assert!(
+            dropped_receipt
+                .outcome()
+                .is_some_and(|outcome| outcome.is_err()),
+            "every pipeline exit must leave a terminal receipt"
+        );
+    }
+
+    #[test]
+    fn nonblocking_poll_reap_advances_ready_work_without_waiting() {
+        let mut ready = TailerPollTaskSet::new();
+        ready.spawn_poll_task(async { (7, PollOutcome::NoChange) });
+        let outcome = ready
+            .try_join_next()
+            .expect("immediately ready poll must be reaped");
+        assert_eq!(outcome.0, 7);
+        assert!(matches!(outcome.1, PollOutcome::NoChange));
+        assert!(ready.is_empty());
+
+        let mut pending = TailerPollTaskSet::new();
+        pending.spawn_poll_task(async { std::future::pending::<(u64, PollOutcome)>().await });
+        assert!(pending.try_join_next().is_none());
+        assert_eq!(pending.len(), 1, "pending work remains owned by the set");
+    }
+
+    /// ft-l8uk7: a pre-cancelled `Cx` must short-circuit
+    /// `TailerPollTaskSet::join_next_with_cx` (draining no outcome -> `None`)
+    /// instead of hanging on a never-completing poll task. The previous body
+    /// discarded the `Cx` and awaited `inner.next()` directly, so this test
+    /// would hit the outer 2s safety timeout. Mirrors
+    /// `runtime_async`'s `join_set_join_next_with_cx_observes_pre_cancel`.
+    #[test]
+    fn join_next_with_cx_observes_pre_cancel() {
+        run_async_test(async {
+            let mut set = TailerPollTaskSet::new();
+            // A poll task that never completes — only Cx observation can return.
+            set.spawn_poll_task(async { std::future::pending::<(u64, PollOutcome)>().await });
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-l8uk7 pre-cancel TailerPollTaskSet::join_next_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_request(),
+                std::time::Duration::from_secs(2),
+                set.join_next_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit join_next_with_cx promptly; \
+                 took {elapsed:?} (outer 2s safety timeout likely fired)"
+            );
+            let inner =
+                result.expect("outer safety timeout must not fire with cx-cancel observation");
+            assert!(
+                inner.is_none(),
+                "a pre-cancelled cx drains no outcome (None), got {inner:?}"
+            );
+        });
+    }
+
+    async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    fn make_pane(id: u64) -> PaneInfo {
+        PaneInfo {
+            pane_id: id,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: Some(24),
+            cols: Some(80),
+            cwd: None,
+            title: None,
+            tty_name: None,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: id == 1,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticSource;
+
+    impl PaneTextSource for StaticSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct FixedSource;
+
+    impl PaneTextSource for FixedSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            Box::pin(async move { Ok(format!("pane-{pane_id}")) })
+        }
+    }
+
+    struct CountingSource {
+        active: Arc<AtomicUsize>,
+        max: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingSource {
+        fn new(active: Arc<AtomicUsize>, max: Arc<AtomicUsize>, delay: Duration) -> Self {
+            Self { active, max, delay }
+        }
+    }
+
+    impl PaneTextSource for CountingSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let active = Arc::clone(&self.active);
+            let max = Arc::clone(&self.max);
+            let delay = self.delay;
+            Box::pin(async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                loop {
+                    let observed = max.load(Ordering::SeqCst);
+                    if current <= observed {
+                        break;
+                    }
+                    if max
+                        .compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+
+                crate::runtime_async::sleep(delay).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(format!("pane-{pane_id}-tick"))
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct HangingSource {
+        delay: Duration,
+    }
+
+    impl HangingSource {
+        fn new(delay: Duration) -> Self {
+            Self { delay }
+        }
+    }
+
+    impl PaneTextSource for HangingSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let delay = self.delay;
+            Box::pin(async move {
+                crate::runtime_async::sleep(delay).await;
+                Ok(String::from("late"))
+            })
+        }
+    }
+
+    #[test]
+    fn tailer_config_default() {
+        let config = TailerConfig::default();
+        assert_eq!(config.min_interval, Duration::from_millis(50));
+        assert_eq!(config.max_interval, Duration::from_secs(1));
+        assert_eq!(config.capture_timeout, Duration::from_secs(2));
+        assert!(config.backoff_multiplier > 1.0);
+    }
+
+    #[test]
+    fn pane_tailer_adaptive_interval() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 2.0,
+            ..Default::default()
+        };
+
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        // No changes - interval should increase
+        tailer.record_poll(false, &config);
+        assert_eq!(tailer.current_interval, Duration::from_millis(200));
+
+        // Still no changes - continue increasing
+        tailer.record_poll(false, &config);
+        assert_eq!(tailer.current_interval, Duration::from_millis(400));
+
+        // Changes detected - snap back to min
+        tailer.record_poll(true, &config);
+        assert_eq!(tailer.current_interval, config.min_interval);
+    }
+
+    #[test]
+    fn m7_backoff_mode_reproduces_legacy_schedule_golden() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.5,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(7, config.min_interval);
+        let start = Instant::now();
+        let expected = [
+            Duration::from_millis(75),
+            Duration::from_micros(112_500),
+            Duration::from_micros(168_750),
+            Duration::from_micros(253_125),
+            Duration::from_nanos(379_687_500),
+            Duration::from_nanos(569_531_250),
+            Duration::from_nanos(854_296_875),
+            Duration::from_secs(1),
+        ];
+
+        for (idx, expected_interval) in expected.into_iter().enumerate() {
+            let now = start + Duration::from_millis(u64::try_from(idx + 1).unwrap_or(u64::MAX));
+            tailer.record_poll_outcome_at(
+                false,
+                true,
+                CaptureSkipReason::NoChange,
+                &config,
+                now,
+                PollCadenceModel::Backoff,
+            );
+            assert_eq!(tailer.current_interval, expected_interval);
+        }
+    }
+
+    #[test]
+    fn m7_predictive_cold_start_nan_falls_back_to_legacy_backoff() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: f64::NAN,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(7, config.min_interval);
+
+        tailer.record_poll_outcome_at(
+            false,
+            true,
+            CaptureSkipReason::NoChange,
+            &config,
+            Instant::now(),
+            PollCadenceModel::Predictive,
+        );
+
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    #[derive(Debug)]
+    struct M7ReplayStats {
+        captures: u64,
+        p95_latency: Duration,
+    }
+
+    fn m7_p95_latency(mut latencies: Vec<Duration>) -> Duration {
+        assert!(
+            !latencies.is_empty(),
+            "replay trace must contain at least one output burst"
+        );
+        latencies.sort_unstable();
+        let idx = latencies.len().saturating_mul(95).saturating_add(99) / 100;
+        latencies[idx.saturating_sub(1).min(latencies.len() - 1)]
+    }
+
+    fn m7_replay_trace(model: PollCadenceModel) -> M7ReplayStats {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.5,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(42, config.min_interval);
+        let start = Instant::now();
+        tailer.last_poll = start;
+
+        let bursts = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            Duration::from_secs(6),
+            Duration::from_secs(7),
+            Duration::from_secs(8),
+            Duration::from_secs(9),
+            Duration::from_secs(10),
+            Duration::from_secs(11),
+            Duration::from_secs(12),
+        ];
+
+        let mut burst_idx = 0;
+        let mut captures = 0_u64;
+        let mut latencies = Vec::with_capacity(bursts.len());
+
+        while burst_idx < bursts.len() {
+            let now = tailer.last_poll + tailer.current_interval;
+            assert!(tailer.should_poll_at(now));
+            captures = captures.saturating_add(1);
+
+            let mut had_changes = false;
+            while burst_idx < bursts.len() {
+                let burst_at = start + bursts[burst_idx];
+                if burst_at > now {
+                    break;
+                }
+                had_changes = true;
+                latencies.push(now.saturating_duration_since(burst_at));
+                burst_idx += 1;
+            }
+
+            let reason = if had_changes {
+                CaptureSkipReason::Changed
+            } else {
+                CaptureSkipReason::NoChange
+            };
+            tailer.record_poll_outcome_at(had_changes, true, reason, &config, now, model);
+        }
+
+        M7ReplayStats {
+            captures,
+            p95_latency: m7_p95_latency(latencies),
+        }
+    }
+
+    #[test]
+    fn m7_predictive_replay_reduces_captures_without_p95_latency_regression() {
+        let backoff = m7_replay_trace(PollCadenceModel::Backoff);
+        let predictive = m7_replay_trace(PollCadenceModel::Predictive);
+
+        assert!(
+            predictive.captures.saturating_mul(100) <= backoff.captures.saturating_mul(85),
+            "predictive should reduce captures by at least 15%: backoff={backoff:?}, \
+             predictive={predictive:?}"
+        );
+        assert!(
+            predictive.p95_latency <= backoff.p95_latency,
+            "predictive must not raise p95 capture latency: backoff={backoff:?}, \
+             predictive={predictive:?}"
+        );
+    }
+
+    #[test]
+    fn pane_tailer_interval_capped_at_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: 10.0,
+            ..Default::default()
+        };
+
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        // Should cap at max_interval
+        tailer.record_poll(false, &config);
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: a NaN backoff_multiplier must not panic
+    /// `Duration::from_secs_f64`; the idle backoff saturates to max_interval.
+    #[test]
+    fn pane_tailer_nan_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: f64::NAN,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: a negative backoff_multiplier (which would make
+    /// `from_secs_f64` panic on a negative value) saturates to max_interval.
+    #[test]
+    fn pane_tailer_negative_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: -2.0,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: an infinite backoff_multiplier saturates to max_interval
+    /// rather than overflowing/panicking in `from_secs_f64`.
+    #[test]
+    fn pane_tailer_infinite_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: f64::INFINITY,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    #[test]
+    fn supervisor_sync_tailers() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            assert_eq!(supervisor.active_count(), 0);
+
+            // Add some panes
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+
+            supervisor.sync_tailers(&panes);
+            assert_eq!(supervisor.active_count(), 2);
+
+            // Remove a pane
+            panes.remove(&1);
+            supervisor.sync_tailers(&panes);
+            assert_eq!(supervisor.active_count(), 1);
+        });
+    }
+
+    #[test]
+    fn supervisor_respects_concurrency_limit() {
+        run_async_test(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSource::new(
+                Arc::clone(&active),
+                Arc::clone(&max),
+                Duration::from_millis(20),
+            ));
+
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 2,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=4 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=4 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            // Wait for a bit to let tasks start
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let max_seen = max.load(Ordering::SeqCst);
+            assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
+
+            // Cleanup
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        });
+    }
+
+    #[test]
+    fn supervisor_spawns_higher_priority_panes_first() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 1,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let (tx, rx) = mpsc::channel(10);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+                cursor_guard.insert(2, PaneCursor::new(2));
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+
+            // Lower value => higher priority. Pane 2 should be spawned before pane 1.
+            supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
+
+            // Wait for tailers to become ready to poll.
+            crate::runtime_async::sleep(Duration::from_millis(2)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            let (pane_id, outcome) = poll_tasks.join_next().await.expect("expected one task");
+            supervisor.handle_poll_result(pane_id, outcome);
+
+            assert_eq!(pane_id, 2, "higher priority pane should spawn first");
+        });
+    }
+
+    #[test]
+    fn supervisor_round_robins_equal_priority_panes_under_saturation() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(5),
+                max_concurrent: 10,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let (tx, rx) = mpsc::channel(64);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=20 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=20 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+
+            let mut seen = HashSet::new();
+            for _round in 0..2 {
+                crate::runtime_async::sleep(Duration::from_millis(2)).await;
+                let mut poll_tasks = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut poll_tasks);
+                while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                    seen.insert(pane_id);
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+            }
+
+            assert_eq!(
+                seen.len(),
+                20,
+                "equal-priority panes should all receive turns under sustained load, saw {:?}",
+                seen
+            );
+        });
+    }
+
+    #[test]
+    fn supervisor_backpressure_records_timeout() {
+        run_async_test(async {
+            // Use a slow source that holds the permit long enough for the second
+            // tailer to timeout waiting for channel capacity.
+            let active = Arc::new(AtomicUsize::new(0));
+            let max = Arc::new(AtomicUsize::new(0));
+            // Source delay must be longer than send_timeout so second tailer times out
+            let source = Arc::new(CountingSource::new(
+                active.clone(),
+                max.clone(),
+                Duration::from_millis(50), // Longer than send_timeout
+            ));
+
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 2,
+                send_timeout: Duration::from_millis(10), // Short timeout
+                ..Default::default()
+            };
+
+            // Channel capacity of 1 + keep receiver alive (but don't consume)
+            // so second send times out instead of getting ChannelClosed
+            let (tx, rx) = mpsc::channel(1);
+            let _keep_rx_alive = rx; // Prevent receiver from being dropped
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+                cursor_guard.insert(2, PaneCursor::new(2));
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+
+            // Wait for tailers to become ready to poll (min_interval must elapse)
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            let mut outcomes = Vec::new();
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                outcomes.push((pane_id, format!("{outcome:?}")));
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+
+            let metrics = supervisor.metrics();
+            assert!(
+                metrics.send_timeouts >= 1,
+                "Expected at least 1 backpressure timeout, got 0. Outcomes: {outcomes:?}, metrics: {metrics:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn supervisor_capture_timeout_records_metric() {
+        run_async_test(async {
+            let source = Arc::new(HangingSource::new(Duration::from_millis(50)));
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 1,
+                send_timeout: Duration::from_millis(100),
+                capture_timeout: Duration::from_millis(5),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
+
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            let (pane_id, outcome) = poll_tasks
+                .join_next()
+                .await
+                .expect("expected timeout outcome");
+            assert!(matches!(outcome, PollOutcome::CaptureTimeout));
+            supervisor.handle_poll_result(pane_id, outcome);
+
+            assert_eq!(supervisor.metrics().capture_timeouts, 1);
+            assert!(!supervisor.capturing_panes.contains(&pane_id));
+        });
+    }
+
+    #[test]
+    fn capture_event_wraps_captured_segment() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[allow(clippy::cast_possible_truncation)]
+        // Epoch millis won't overflow i64 until year 292 million
+        let captured_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+
+        let seg = CapturedSegment {
+            pane_id: 42,
+            seq: 10,
+            seq_correction: 0,
+            content: "test content".to_string(),
+            kind: crate::ingest::CapturedSegmentKind::Delta,
+            captured_at,
+        };
+
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(42).expect("test pane authority");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("test polling authority");
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 42)
+            .expect("test producer authority");
+        let event = CaptureEvent::from_producer(seg, &guard).expect("stamped capture event");
+
+        assert_eq!(event.segment.pane_id, 42);
+        assert_eq!(event.segment.seq, 10);
+        assert_eq!(event.segment.content, "test content");
+        assert!(event.segment.captured_at > 0);
+        assert_eq!(event.stamp(), lease.stamp());
+    }
+
+    #[test]
+    fn overflow_threshold_constant_is_reasonable() {
+        const {
+            assert!(
+                OVERFLOW_BACKPRESSURE_THRESHOLD >= 2,
+                "threshold must be at least 2 to avoid spurious gap emission"
+            );
+            assert!(
+                OVERFLOW_BACKPRESSURE_THRESHOLD <= 100,
+                "threshold should not be excessively large"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_backpressure_tracks_correctly() {
+        let config = TailerConfig::default();
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        assert_eq!(tailer.consecutive_backpressure, 0);
+        assert!(!tailer.overflow_gap_pending);
+
+        // Simulate backpressure events below threshold
+        for i in 1..OVERFLOW_BACKPRESSURE_THRESHOLD {
+            tailer.consecutive_backpressure = i;
+        }
+        assert!(!tailer.overflow_gap_pending);
+
+        // A successful capture resets the counter
+        tailer.consecutive_backpressure = 0;
+        assert_eq!(tailer.consecutive_backpressure, 0);
+    }
+
+    #[test]
+    fn handle_poll_result_increments_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Simulate backpressure events
+        for _ in 0..(OVERFLOW_BACKPRESSURE_THRESHOLD - 1) {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            OVERFLOW_BACKPRESSURE_THRESHOLD - 1
+        );
+        assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+
+        // One more should trigger overflow
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+
+        assert!(supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+    }
+
+    /// ft-0kdi9: a `NoCursor` poll means an observed pane is discarding output.
+    /// It used to be the only poll outcome with neither a counter nor a
+    /// warn-level log, which is what let capture die silently after an
+    /// `Observed -> Ignored -> Observed` round trip.
+    #[test]
+    fn ft_0kdi9_no_cursor_polls_are_counted() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // The pane is observed (it has a tailer) but the shared cursor map is
+        // empty — exactly the post-compaction state of a re-observed pane.
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 0);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 1);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().last_reason_code,
+            CaptureSkipReason::NoCursor
+        );
+
+        // Every repeat is counted, so the counter measures how much output was
+        // discarded rather than only that it happened once.
+        for _ in 0..4 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+        }
+        assert_eq!(supervisor.metrics().no_cursor_polls, 5);
+
+        // A healthy outcome must not bump it.
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoChange);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 5);
+    }
+
+    #[test]
+    fn changed_resets_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Accumulate some backpressure
+        for _ in 0..3 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            3
+        );
+
+        // Changed resets it
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 0 });
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            0
+        );
+    }
+
+    #[test]
+    fn no_change_resets_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Accumulate backpressure
+        for _ in 0..3 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+
+        // NoChange also resets
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoChange);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            0
+        );
+    }
+
+    #[test]
+    fn overflow_gap_emitted_clears_pending_flag() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Force overflow state
+        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+        supervisor
+            .tailers
+            .get_mut(&1)
+            .unwrap()
+            .consecutive_backpressure = OVERFLOW_BACKPRESSURE_THRESHOLD;
+
+        // Emit overflow gap
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::OverflowGapEmitted);
+
+        let tailer = supervisor.tailers.get(&1).unwrap();
+        assert!(!tailer.overflow_gap_pending);
+        assert_eq!(tailer.consecutive_backpressure, 0);
+        assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+        assert_eq!(supervisor.metrics().events_sent, 1);
+    }
+
+    #[test]
+    fn overflow_gap_emitted_via_spawn_ready() {
+        run_async_test(async {
+            let source = Arc::new(FixedSource);
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 4,
+                send_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
+
+            let (tx, mut rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
+
+            // Force overflow_gap_pending
+            supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+
+            // Wait for min_interval
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            // Collect outcomes
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                assert_eq!(pane_id, 1);
+                assert!(
+                    matches!(outcome, PollOutcome::OverflowGapEmitted),
+                    "Expected OverflowGapEmitted, got {outcome:?}"
+                );
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+
+            // Verify the gap event was sent
+            let event = recv_next(&mut rx)
+                .await
+                .expect("should have received overflow gap event");
+            assert_eq!(event.segment.pane_id, 1);
+            assert_eq!(event.segment.content, "");
+            assert!(matches!(
+                event.segment.kind,
+                crate::ingest::CapturedSegmentKind::Gap { ref reason } if reason == "backpressure_overflow"
+            ));
+
+            // Verify pending flag was cleared
+            assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+            assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+        });
+    }
+
+    #[test]
+    fn overflow_gap_advances_cursor_seq() {
+        run_async_test(async {
+            let source = Arc::new(FixedSource);
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 4,
+                send_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
+
+            let (tx, mut rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                let mut cursor = PaneCursor::new(1);
+                // Advance seq to 5 to verify gap gets seq=5
+                cursor.next_seq = 5;
+                cursor_guard.insert(1, cursor);
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, Arc::clone(&cursors), registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
+            supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+
+            let event = recv_next(&mut rx)
+                .await
+                .expect("should have received gap event");
+            assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");
+
+            // Cursor should have advanced to 6
+            let cursor_guard = cursors.read().await;
+            let cursor = cursor_guard.get(&1).unwrap();
+            assert_eq!(cursor.next_seq, 6);
+            assert!(cursor.in_gap, "cursor should be in gap state");
+        });
+    }
+
+    #[test]
+    fn overflow_gap_emitted_metric_starts_at_zero() {
+        let metrics = TailerMetrics::default();
+        assert_eq!(metrics.overflow_gaps_emitted, 0);
+    }
+
+    // ─── CaptureScheduler tests ─────────────────────────────────────
+
+    struct SchedulerSelectionModel {
+        scheduler: CaptureScheduler,
+        priority_round_robin_offsets: HashMap<u32, usize>,
+    }
+
+    impl SchedulerSelectionModel {
+        fn new(budget: CaptureBudgetConfig) -> Self {
+            Self {
+                scheduler: CaptureScheduler::new(budget),
+                priority_round_robin_offsets: HashMap::new(),
+            }
+        }
+
+        fn tick(&mut self, panes: &[(u64, u32)], available_permits: usize) -> Vec<u64> {
+            if self.scheduler.is_byte_budget_exhausted() {
+                return Vec::new();
+            }
+
+            let mut ready_panes = panes.to_vec();
+            ready_panes.sort_by_key(|&(pane_id, priority)| (priority, pane_id));
+            let group_lengths = self.rotate_equal_priority_ready_panes(&mut ready_panes);
+            let selected = self.scheduler.select_panes(&ready_panes, available_permits);
+            self.advance_offsets(&ready_panes, &selected, &group_lengths);
+            selected
+        }
+
+        fn record_capture(&mut self, pane_id: u64, bytes: u64) {
+            self.scheduler.record_capture(pane_id, bytes);
+        }
+
+        fn rotate_equal_priority_ready_panes(
+            &self,
+            ready_panes: &mut [(u64, u32)],
+        ) -> Vec<(u32, usize)> {
+            let mut group_lengths = Vec::new();
+            let mut start = 0usize;
+            while start < ready_panes.len() {
+                let priority = ready_panes[start].1;
+                let mut end = start + 1;
+                while end < ready_panes.len() && ready_panes[end].1 == priority {
+                    end += 1;
+                }
+
+                let group_len = end - start;
+                group_lengths.push((priority, group_len));
+                if group_len > 1 {
+                    let rotate_by = self
+                        .priority_round_robin_offsets
+                        .get(&priority)
+                        .copied()
+                        .unwrap_or(0)
+                        % group_len;
+                    ready_panes[start..end].rotate_left(rotate_by);
+                }
+
+                start = end;
+            }
+
+            group_lengths
+        }
+
+        fn advance_offsets(
+            &mut self,
+            ready_panes: &[(u64, u32)],
+            selected: &[u64],
+            group_lengths: &[(u32, usize)],
+        ) {
+            let mut started_per_priority = Vec::<(u32, usize)>::new();
+            for pane_id in selected {
+                let priority = ready_panes
+                    .iter()
+                    .find_map(|(candidate, priority)| (*candidate == *pane_id).then_some(*priority))
+                    .expect("selected pane must come from ready set");
+                TailerSupervisor::<StaticSource>::increment_started_priority(
+                    &mut started_per_priority,
+                    priority,
+                );
+            }
+
+            for (priority, started) in started_per_priority {
+                let group_len = group_lengths
+                    .iter()
+                    .find_map(|(candidate, len)| (*candidate == priority).then_some(*len))
+                    .unwrap_or(1);
+                let offset = self
+                    .priority_round_robin_offsets
+                    .entry(priority)
+                    .or_insert(0);
+                *offset = (*offset + started) % group_len;
+            }
+        }
+    }
+
+    struct SchedulerFairnessCase {
+        scenario_id: &'static str,
+        total_panes: u64,
+        high_priority_panes: u64,
+        available_permits: usize,
+        rounds: usize,
+        expected_low_first_round: usize,
+    }
+
+    fn scheduler_fairness_panes(case: &SchedulerFairnessCase) -> Vec<(u64, u32)> {
+        (1..=case.total_panes)
+            .map(|pane_id| {
+                if pane_id <= case.high_priority_panes {
+                    (pane_id, 10)
+                } else {
+                    (pane_id, 100)
+                }
+            })
+            .collect()
+    }
+
+    fn increment_count(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
+        let entry = map.entry(key.into()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn percentile_u64(values: &[u64], percentile: u64) -> u64 {
+        assert!(!values.is_empty(), "percentile input must not be empty");
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let index = ((sorted.len() - 1) as u64 * percentile).div_ceil(100) as usize;
+        sorted[index.min(sorted.len() - 1)]
+    }
+
+    fn service_gap_bucket(gap: u64) -> &'static str {
+        match gap {
+            0 => "0",
+            1 => "1",
+            2..=5 => "2_to_5",
+            6..=10 => "6_to_10",
+            11..=20 => "11_to_20",
+            _ => "gt_20",
+        }
+    }
+
+    fn poll_outcome_name(outcome: &PollOutcome) -> &'static str {
+        match outcome {
+            PollOutcome::Changed { .. } => "changed",
+            PollOutcome::NoChange => "no_change",
+            PollOutcome::Backpressure => "send_backpressure",
+            PollOutcome::ChannelClosed => "channel_closed",
+            PollOutcome::CaptureTimeout => "capture_timeout",
+            PollOutcome::AuthorityRejected(_) => "authority_rejected",
+            PollOutcome::CircuitOpen { .. } => "capture_circuit_open",
+            PollOutcome::Error(_) => "capture_error",
+            PollOutcome::NoCursor => "no_cursor",
+            PollOutcome::OverflowGapEmitted => "overflow_gap_emitted",
+        }
+    }
+
+    fn priority_label(priority: u32) -> &'static str {
+        match priority {
+            0..=50 => "priority_010_high",
+            51..=150 => "priority_100_low",
+            _ => "priority_200_lower_low",
+        }
+    }
+
+    fn write_capture_fairness_artifact(summary: &serde_json::Value) {
+        let Some(artifact_dir) = std::env::var_os("FT_N447Z5_ARTIFACT_DIR") else {
+            return;
+        };
+        let artifact_dir = std::path::PathBuf::from(artifact_dir);
+        std::fs::create_dir_all(&artifact_dir).expect("create ft-n447z.5 artifact dir");
+        let summary_path = artifact_dir.join("capture_fairness_200_pane_summary.json");
+        let summary_text =
+            serde_json::to_string_pretty(summary).expect("serialize ft-n447z.5 summary");
+        std::fs::write(&summary_path, summary_text).expect("write ft-n447z.5 summary artifact");
+    }
+
+    #[test]
+    fn scheduler_unlimited_budget_allows_all() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let panes = vec![(1, 10), (2, 50), (3, 100)];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scheduler_global_rate_limits_captures() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 2,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let panes = vec![(1, 10), (2, 50), (3, 100), (4, 200)];
+        let selected = sched.select_panes(&panes, 10);
+        // Budget is 2/sec, so only 2 are selected.
+        assert_eq!(selected.len(), 2);
+        // Highest priority first, with 20% reserved for low priority (which gets 1 slot)
+        assert_eq!(selected, vec![1, 3]);
+    }
+
+    #[test]
+    fn scheduler_permits_limit_takes_precedence() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 100,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let panes = vec![(1, 10), (2, 50), (3, 100)];
+        // Only 1 permit available, despite 100 budget.
+        let selected = sched.select_panes(&panes, 1);
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn scheduler_depletes_budget_across_calls() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 3,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // First call: takes 2 of 3.
+        let selected1 = sched.select_panes(&[(1, 10), (2, 50)], 5);
+        assert_eq!(selected1.len(), 2);
+
+        // Second call: only 1 remains.
+        let selected2 = sched.select_panes(&[(3, 10), (4, 50)], 5);
+        assert_eq!(selected2.len(), 1);
+
+        // Third call: budget exhausted.
+        let selected3 = sched.select_panes(&[(5, 10)], 5);
+        assert!(selected3.is_empty());
+    }
+
+    #[test]
+    fn scheduler_check_global_budget_tracks_metrics() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 1,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        assert!(sched.check_global_budget()); // Consume the 1 token.
+        assert!(!sched.check_global_budget()); // Exhausted.
+
+        assert_eq!(sched.metrics().global_rate_limited, 1);
+        assert_eq!(sched.metrics().throttle_events, 1);
+    }
+
+    #[test]
+    fn scheduler_byte_budget_exhaustion() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 100,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        assert!(!sched.is_byte_budget_exhausted());
+
+        // Record 100 bytes — exhausts the budget.
+        sched.record_capture(1, 100);
+        assert!(sched.is_byte_budget_exhausted());
+        assert_eq!(sched.metrics().pane_byte_budget_exceeded, 1);
+    }
+
+    #[test]
+    fn scheduler_per_pane_tracking() {
+        let budget = CaptureBudgetConfig::default();
+        let mut sched = CaptureScheduler::new(budget);
+
+        sched.record_capture(1, 500);
+        sched.record_capture(2, 300);
+        sched.record_capture(1, 200);
+
+        assert!(sched.pane_trackers.contains_key(&1));
+        assert!(sched.pane_trackers.contains_key(&2));
+
+        let t1 = &sched.pane_trackers[&1];
+        assert_eq!(t1.captures_in_window, 2);
+        assert_eq!(t1.bytes_in_window, 700);
+    }
+
+    #[test]
+    fn scheduler_remove_pane_cleans_tracker() {
+        let budget = CaptureBudgetConfig::default();
+        let mut sched = CaptureScheduler::new(budget);
+
+        sched.record_capture(42, 100);
+        assert!(sched.pane_trackers.contains_key(&42));
+
+        sched.remove_pane(42);
+        assert!(!sched.pane_trackers.contains_key(&42));
+    }
+
+    #[test]
+    fn scheduler_update_budget_preserves_window() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Consume some budget.
+        let _ = sched.select_panes(&[(1, 10), (2, 50)], 5);
+        assert_eq!(sched.global_captures_remaining, 3);
+
+        // Update to higher budget — window continues.
+        sched.update_budget(CaptureBudgetConfig {
+            max_captures_per_sec: 100,
+            max_bytes_per_sec: 0,
+        });
+
+        // Remaining is still from the old window (3), not the new budget (100).
+        // The new budget takes effect on the next window refill.
+        assert_eq!(sched.global_captures_remaining, 3);
+    }
+
+    #[test]
+    fn scheduler_empty_panes_returns_empty() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let selected = sched.select_panes(&[], 10);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn scheduler_metrics_default() {
+        let metrics = SchedulerMetrics::default();
+        assert_eq!(metrics.global_rate_limited, 0);
+        assert_eq!(metrics.pane_byte_budget_exceeded, 0);
+        assert_eq!(metrics.throttle_events, 0);
+    }
+
+    #[test]
+    fn scheduler_high_priority_always_first() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 2,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Panes sorted by priority (pre-sorted input).
+        // Priority 10 gets the high slot, priority 100 gets the low slot (20% reserve).
+        let panes = vec![(1, 10), (2, 50), (3, 100), (4, 200)];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected, vec![1, 3]);
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_table_driven_load_fixtures_cover_starvation_cases() {
+        let cases = [
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_10_panes/all_high",
+                total_panes: 10,
+                high_priority_panes: 10,
+                available_permits: 4,
+                rounds: 3,
+                expected_low_first_round: 0,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_50_panes/mixed_high_low",
+                total_panes: 50,
+                high_priority_panes: 40,
+                available_permits: 10,
+                rounds: 5,
+                expected_low_first_round: 2,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_200_panes/mixed_high_low",
+                total_panes: 200,
+                high_priority_panes: 160,
+                available_permits: 10,
+                rounds: 20,
+                expected_low_first_round: 2,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_1000_panes_synthetic/equal_priority",
+                total_panes: 1_000,
+                high_priority_panes: 0,
+                available_permits: 10,
+                rounds: 100,
+                expected_low_first_round: 10,
+            },
+        ];
+
+        for case in cases {
+            let panes = scheduler_fairness_panes(&case);
+            let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+                max_captures_per_sec: 0,
+                max_bytes_per_sec: 0,
+            });
+            let mut seen = HashSet::<u64>::new();
+            let mut low_seen = HashSet::<u64>::new();
+
+            for round in 0..case.rounds {
+                let selected = model.tick(&panes, case.available_permits);
+                assert!(
+                    selected.len() <= case.available_permits,
+                    "{} round {round}: selected {} panes with only {} permits",
+                    case.scenario_id,
+                    selected.len(),
+                    case.available_permits
+                );
+                if round == 0 {
+                    let low_selected = selected
+                        .iter()
+                        .filter(|pane_id| **pane_id > case.high_priority_panes)
+                        .count();
+                    assert_eq!(
+                        low_selected, case.expected_low_first_round,
+                        "{} first round low-priority service count drifted",
+                        case.scenario_id
+                    );
+                }
+
+                for pane_id in selected {
+                    seen.insert(pane_id);
+                    if pane_id > case.high_priority_panes {
+                        low_seen.insert(pane_id);
+                    }
+                }
+            }
+
+            assert_eq!(
+                seen.len() as u64,
+                case.total_panes,
+                "{}: round-robin model did not service every pane",
+                case.scenario_id
+            );
+
+            let expected_low = case.total_panes - case.high_priority_panes;
+            assert_eq!(
+                low_seen.len() as u64,
+                expected_low,
+                "{}: low-tier floor did not service every low-priority pane",
+                case.scenario_id
+            );
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_rotates_under_pressure() {
+        let scenario_id = "scheduler_low_subtier_starvation_probe";
+        let mut panes = (1_u64..=8).map(|pane_id| (pane_id, 10)).collect::<Vec<_>>();
+        panes.extend((100_u64..120).map(|pane_id| (pane_id, 100)));
+        panes.extend((200_u64..204).map(|pane_id| (pane_id, 200)));
+
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+
+        let first_round = model.tick(&panes, 10);
+        assert_eq!(
+            first_round.iter().filter(|pane_id| **pane_id <= 8).count(),
+            8,
+            "{scenario_id}: high-priority panes should keep the non-reserved slots"
+        );
+        assert_eq!(
+            first_round
+                .iter()
+                .filter(|pane_id| (100_u64..120).contains(*pane_id))
+                .count(),
+            2,
+            "{scenario_id}: first low-tier floor still honors low-priority order"
+        );
+        assert!(
+            first_round
+                .iter()
+                .all(|pane_id| !(200_u64..204).contains(pane_id)),
+            "{scenario_id}: lower low-priority subtiers should not jump the initial floor"
+        );
+
+        let mut lowest_low_seen = HashSet::<u64>::new();
+        for pane_id in first_round {
+            if (200_u64..204).contains(&pane_id) {
+                lowest_low_seen.insert(pane_id);
+            }
+        }
+
+        for _round in 1..12 {
+            for pane_id in model.tick(&panes, 10) {
+                if (200_u64..204).contains(&pane_id) {
+                    lowest_low_seen.insert(pane_id);
+                }
+            }
+        }
+
+        assert!(
+            (200_u64..204).all(|pane_id| lowest_low_seen.contains(&pane_id)),
+            "{scenario_id}: reserved low-tier floor must eventually reach lower low-priority subtiers"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_preserves_order_without_pressure() {
+        let scenario_id = "scheduler_low_subtier_no_pressure_order";
+        let mut scheduler = CaptureScheduler::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+        let panes = vec![(100, 100), (101, 100), (200, 200), (201, 200)];
+
+        for round in 0..4 {
+            let selected = scheduler.select_panes(&panes, 10);
+            assert_eq!(
+                selected,
+                vec![100, 101, 200, 201],
+                "{scenario_id} round {round}: low-priority order should stay stable when all low panes fit"
+            );
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_rotates_without_high_prio_pressure() {
+        let scenario_id = "scheduler_low_subtier_low_only_pressure";
+        let mut scheduler = CaptureScheduler::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+        let mut panes = (100_u64..112)
+            .map(|pane_id| (pane_id, 100))
+            .collect::<Vec<_>>();
+        panes.extend((200_u64..204).map(|pane_id| (pane_id, 200)));
+
+        let mut lowest_low_seen = HashSet::<u64>::new();
+        for _round in 0..20 {
+            for pane_id in scheduler.select_panes(&panes, 5) {
+                if (200_u64..204).contains(&pane_id) {
+                    lowest_low_seen.insert(pane_id);
+                }
+            }
+        }
+
+        assert!(
+            (200_u64..204).all(|pane_id| lowest_low_seen.contains(&pane_id)),
+            "{scenario_id}: reserved low-tier floor must rotate lower low-priority subtiers even when high-priority panes are absent"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_capture_budget_window_exhaustion_is_explicit() {
+        let scenario_id = "capture.capture_budget_window";
+        let panes = vec![(1, 10), (2, 10), (3, 100), (4, 100)];
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 3,
+            max_bytes_per_sec: 0,
+        });
+
+        let selected = model.tick(&panes, 10);
+        assert_eq!(
+            selected,
+            vec![1, 2, 3],
+            "{scenario_id}: expected two high-priority panes plus the low-tier floor"
+        );
+
+        let blocked = model.tick(&panes, 10);
+        assert!(
+            blocked.is_empty(),
+            "{scenario_id}: exhausted capture window must not schedule more panes"
+        );
+        assert_eq!(
+            model.scheduler.metrics().global_rate_limited,
+            1,
+            "{scenario_id}: exhausted capture window must be counted"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_byte_budget_stop_prevents_selection() {
+        let scenario_id = "capture.byte_budget_stop";
+        let panes = vec![(1, 10), (2, 10), (3, 100), (4, 100)];
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 100,
+        });
+
+        let selected = model.tick(&panes, 10);
+        assert_eq!(
+            selected.len(),
+            panes.len(),
+            "{scenario_id}: byte budget is checked before capture bytes are known"
+        );
+
+        let first_selected = selected
+            .first()
+            .copied()
+            .expect("initial byte-budget selection should not be empty");
+        model.record_capture(first_selected, 100);
+        let blocked = model.tick(&panes, 10);
+        assert!(
+            blocked.is_empty(),
+            "{scenario_id}: exhausted byte budget must stop scheduling"
+        );
+        assert_eq!(
+            model.scheduler.metrics().pane_byte_budget_exceeded,
+            1,
+            "{scenario_id}: byte-budget stop must be counted"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_overflow_gap_pending_after_backpressure_threshold() {
+        let scenario_id = "capture.overflow_gap_after_backpressure_threshold";
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        for _ in 0..OVERFLOW_BACKPRESSURE_THRESHOLD {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+
+        let tailer = supervisor.tailers.get(&1).expect("tailer exists");
+        assert!(
+            tailer.overflow_gap_pending,
+            "{scenario_id}: sustained backpressure must mark an overflow gap pending"
+        );
+        assert_eq!(
+            tailer.consecutive_backpressure, OVERFLOW_BACKPRESSURE_THRESHOLD,
+            "{scenario_id}: backpressure counter should preserve threshold evidence"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_priority_override_effective_updates_are_reversible() {
+        let scenario_id = "capture.priority_override_effective_map";
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+
+        let override_active = vec![(1, 100), (2, 10)];
+        assert_eq!(
+            model.tick(&override_active, 1),
+            vec![2],
+            "{scenario_id}: runtime effective priority override should win while active"
+        );
+
+        let override_expired = vec![(1, 10), (2, 100)];
+        assert_eq!(
+            model.tick(&override_expired, 1),
+            vec![1],
+            "{scenario_id}: tailer scheduler must honor the reverted effective priority map after TTL purge upstream"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_200_pane_reduced_fairness_proof_artifact() {
+        run_async_test(async {
+            let scenario_id = "capture.service_lag_200_panes/reduced_rch_proof";
+            let total_panes = 200_u64;
+            let high_panes = 160_u64;
+            let low_panes = 32_u64;
+            let lower_low_panes = 8_u64;
+            let max_concurrent = 20_usize;
+            let rounds = 40_usize;
+
+            let config = TailerConfig {
+                min_interval: Duration::ZERO,
+                max_interval: Duration::ZERO,
+                backoff_multiplier: 1.0,
+                max_concurrent,
+                send_timeout: Duration::from_millis(100),
+                capture_timeout: Duration::from_millis(500),
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::channel(4096);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(FixedSource);
+
+            let mut panes = HashMap::new();
+            let mut priorities = HashMap::new();
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=total_panes {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                    panes.insert(pane_id, make_pane(pane_id));
+                    let priority = if pane_id <= high_panes {
+                        10
+                    } else if pane_id <= high_panes + low_panes {
+                        100
+                    } else {
+                        200
+                    };
+                    priorities.insert(pane_id, priority);
+                }
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(priorities.clone());
+
+            let mut selected_counts = HashMap::<u64, u64>::new();
+            let mut first_service_round = HashMap::<u64, usize>::new();
+            let mut last_service_round = HashMap::<u64, usize>::new();
+            let mut service_gaps = Vec::<u64>::new();
+            let mut service_gap_histogram = BTreeMap::<String, u64>::new();
+            let mut selected_by_priority = BTreeMap::<String, u64>::new();
+            let mut outcome_counts = BTreeMap::<String, u64>::new();
+            let mut skip_reason_counts = BTreeMap::<String, u64>::new();
+            let mut round_selection_counts = Vec::<usize>::new();
+            let mut representative_snapshots = Vec::<serde_json::Value>::new();
+            let mut timeout_events = 0_u64;
+            let mut backpressure_events = 0_u64;
+
+            for round in 0..rounds {
+                let mut poll_tasks = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut poll_tasks);
+
+                let mut selected = Vec::<u64>::new();
+                while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                    if matches!(outcome, PollOutcome::CaptureTimeout) {
+                        timeout_events = timeout_events.saturating_add(1);
+                    }
+                    if matches!(outcome, PollOutcome::Backpressure) {
+                        backpressure_events = backpressure_events.saturating_add(1);
+                    }
+                    increment_count(&mut outcome_counts, poll_outcome_name(&outcome));
+                    selected.push(pane_id);
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+
+                selected.sort_unstable();
+                assert_eq!(
+                    selected.len(),
+                    max_concurrent,
+                    "{scenario_id} round {round}: should admit exactly the concurrency limit"
+                );
+
+                let selected_high = selected
+                    .iter()
+                    .filter(|pane_id| **pane_id <= high_panes)
+                    .count();
+                let selected_low = selected
+                    .iter()
+                    .filter(|pane_id| {
+                        (**pane_id > high_panes) && (**pane_id <= high_panes + low_panes)
+                    })
+                    .count();
+                let selected_lower_low = selected
+                    .iter()
+                    .filter(|pane_id| **pane_id > high_panes + low_panes)
+                    .count();
+                if round == 0 {
+                    assert_eq!(
+                        selected_high, 16,
+                        "{scenario_id}: first round should preserve high-tier precedence"
+                    );
+                    assert_eq!(
+                        selected_low, 4,
+                        "{scenario_id}: first round should reserve the low-tier floor"
+                    );
+                    assert_eq!(
+                        selected_lower_low, 0,
+                        "{scenario_id}: lower low-priority panes should not jump first-round order"
+                    );
+                }
+
+                for pane_id in &selected {
+                    let priority = priorities
+                        .get(pane_id)
+                        .copied()
+                        .expect("selected pane priority exists");
+                    increment_count(&mut selected_by_priority, priority_label(priority));
+                    *selected_counts.entry(*pane_id).or_insert(0) += 1;
+                    first_service_round.entry(*pane_id).or_insert(round);
+                    let gap = if let Some(last_round) = last_service_round.insert(*pane_id, round) {
+                        round.saturating_sub(last_round) as u64
+                    } else {
+                        round as u64
+                    };
+                    service_gaps.push(gap);
+                    increment_count(&mut service_gap_histogram, service_gap_bucket(gap));
+                }
+
+                let snapshot = supervisor.scheduler_snapshot();
+                assert_eq!(
+                    snapshot.pane_rows_total, total_panes as usize,
+                    "{scenario_id}: snapshot should account for all synthetic panes"
+                );
+                assert!(
+                    !snapshot.pane_rows_truncated,
+                    "{scenario_id}: 200-pane proof must not truncate scheduler rows"
+                );
+                for row in &snapshot.panes {
+                    increment_count(&mut skip_reason_counts, row.last_reason_code.as_str());
+                }
+
+                if matches!(round, 0 | 19 | 39) {
+                    representative_snapshots.push(serde_json::json!({
+                        "round": round,
+                        "selected_total": selected.len(),
+                        "selected_high": selected_high,
+                        "selected_low": selected_low,
+                        "selected_lower_low": selected_lower_low,
+                        "selected_panes": selected,
+                        "captures_remaining": snapshot.captures_remaining,
+                        "bytes_remaining": snapshot.bytes_remaining,
+                        "tracked_panes": snapshot.tracked_panes,
+                        "pane_rows_total": snapshot.pane_rows_total,
+                        "pane_rows_truncated": snapshot.pane_rows_truncated,
+                        "tiers": snapshot.tiers,
+                    }));
+                }
+                round_selection_counts.push(selected.len());
+            }
+
+            let high_seen = (1..=high_panes)
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            let low_seen = ((high_panes + 1)..=(high_panes + low_panes))
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            let lower_low_seen = ((high_panes + low_panes + 1)..=total_panes)
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            assert_eq!(
+                high_seen, high_panes as usize,
+                "{scenario_id}: high pane coverage"
+            );
+            assert_eq!(
+                low_seen, low_panes as usize,
+                "{scenario_id}: low pane coverage"
+            );
+            assert_eq!(
+                lower_low_seen, lower_low_panes as usize,
+                "{scenario_id}: lower low-priority pane coverage"
+            );
+            assert_eq!(
+                selected_counts.len(),
+                total_panes as usize,
+                "{scenario_id}: every synthetic pane must receive service"
+            );
+            assert_eq!(
+                timeout_events, 0,
+                "{scenario_id}: synthetic source should not time out"
+            );
+            assert_eq!(
+                backpressure_events, 0,
+                "{scenario_id}: artifact channel should not backpressure"
+            );
+
+            let max_first_service_round = first_service_round
+                .values()
+                .copied()
+                .max()
+                .expect("at least one service round");
+            let max_service_gap = service_gaps
+                .iter()
+                .copied()
+                .max()
+                .expect("service gaps collected");
+            let selected_total = selected_counts.values().copied().sum::<u64>();
+            let opportunity_total = total_panes * rounds as u64;
+            let skipped_total = opportunity_total.saturating_sub(selected_total);
+
+            let summary = serde_json::json!({
+                "schema_version": 1,
+                "bead_id": "ft-n447z.5",
+                "scenario_id": scenario_id,
+                "proof_interpretation": {
+                    "evidence_level": "remote_reduced_when_run_through_rch",
+                    "target_class_hardware": "skipped_not_proven",
+                    "target_class_requirement": {
+                        "logical_cpus": 64,
+                        "memory_gib": 256
+                    },
+                    "live_gui_dependency": false,
+                    "source_kind": "synthetic_pane_source"
+                },
+                "inputs": {
+                    "total_panes": total_panes,
+                    "high_priority_panes": high_panes,
+                    "low_priority_panes": low_panes,
+                    "lower_low_priority_panes": lower_low_panes,
+                    "rounds": rounds,
+                    "available_permits": max_concurrent
+                },
+                "pass_fail": {
+                    "status": "passed",
+                    "failure_classification": "none",
+                    "every_pane_serviced": selected_counts.len() == total_panes as usize,
+                    "snapshot_rows_untruncated": true,
+                    "timeout_events": timeout_events,
+                    "backpressure_events": backpressure_events
+                },
+                "throughput_counters": {
+                    "selection_opportunities": opportunity_total,
+                    "selected_total": selected_total,
+                    "skipped_total": skipped_total,
+                    "round_selection_counts": round_selection_counts,
+                    "selected_by_priority": selected_by_priority
+                },
+                "capture_lag_histograms": {
+                    "unit": "scheduler_rounds_between_service",
+                    "max_first_service_round": max_first_service_round,
+                    "max_service_gap": max_service_gap,
+                    "p50_service_gap": percentile_u64(&service_gaps, 50),
+                    "p99_service_gap": percentile_u64(&service_gaps, 99),
+                    "buckets": service_gap_histogram
+                },
+                "skipped_poll_reasons": skip_reason_counts,
+                "poll_outcomes": outcome_counts,
+                "representative_scheduler_snapshots": representative_snapshots
+            });
+
+            write_capture_fairness_artifact(&summary);
+        });
+    }
+
+    #[test]
+    fn tailer_scheduler_reason_codes_are_stable() {
+        let cases = [
+            (CaptureSkipReason::NotObserved, "not_observed"),
+            (CaptureSkipReason::StreamingMode, "streaming_mode"),
+            (CaptureSkipReason::StreamingFallback, "streaming_fallback"),
+            (CaptureSkipReason::NotDue, "not_due"),
+            (CaptureSkipReason::AlreadyCapturing, "already_capturing"),
+            (
+                CaptureSkipReason::GlobalCaptureBudgetExhausted,
+                "global_capture_budget_exhausted",
+            ),
+            (
+                CaptureSkipReason::GlobalByteBudgetExhausted,
+                "global_byte_budget_exhausted",
+            ),
+            (CaptureSkipReason::NoPermit, "no_permit"),
+            (CaptureSkipReason::SendBackpressure, "send_backpressure"),
+            (
+                CaptureSkipReason::OverflowGapPending,
+                "overflow_gap_pending",
+            ),
+            (
+                CaptureSkipReason::OverflowGapEmitted,
+                "overflow_gap_emitted",
+            ),
+            (CaptureSkipReason::NoCursor, "no_cursor"),
+            (CaptureSkipReason::ChannelClosed, "channel_closed"),
+            (CaptureSkipReason::CaptureTimeout, "capture_timeout"),
+            (
+                CaptureSkipReason::CaptureCircuitOpen,
+                "capture_circuit_open",
+            ),
+            (CaptureSkipReason::CaptureError, "capture_error"),
+            (CaptureSkipReason::AuthorityRejected, "authority_rejected"),
+            (CaptureSkipReason::NoChange, "no_change"),
+            (CaptureSkipReason::Changed, "changed"),
+            (CaptureSkipReason::Shutdown, "shutdown"),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+            let encoded = serde_json::to_string(&reason).expect("serialize reason");
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: CaptureSkipReason =
+                serde_json::from_str(&encoded).expect("deserialize reason");
+            assert_eq!(decoded, reason);
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_marks_new_panes_not_observed() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(7, make_pane(7));
+        supervisor.sync_tailers(&panes);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.pane_rows_total, 1);
+        let row = snap.panes.first().expect("new pane row");
+        assert_eq!(row.pane_id, 7);
+        assert_eq!(row.last_reason_code, CaptureSkipReason::NotObserved);
+        assert_eq!(row.selection_opportunities, 0);
+        assert_eq!(row.selected_count, 0);
+        assert_eq!(row.skipped_count, 0);
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_tracks_pane_reasons_and_tiers() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                ..Default::default()
+            };
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(HashMap::from([(1, 10), (2, 100)]));
+
+            supervisor
+                .tailers
+                .get_mut(&1)
+                .expect("pane 1 tailer")
+                .record_selected();
+            supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 128 });
+            supervisor.handle_poll_result(2, PollOutcome::Backpressure);
+
+            let snap = supervisor.scheduler_snapshot();
+            assert_eq!(snap.pane_rows_total, 2);
+            assert!(!snap.pane_rows_truncated);
+            assert_eq!(snap.panes.len(), 2);
+
+            let pane_1 = snap
+                .panes
+                .iter()
+                .find(|row| row.pane_id == 1)
+                .expect("pane 1 row");
+            assert_eq!(pane_1.priority, 10);
+            assert_eq!(pane_1.tier, CapturePriorityTier::High);
+            assert_eq!(pane_1.mode, TailerMode::Polling);
+            assert_eq!(pane_1.last_reason_code, CaptureSkipReason::Changed);
+            assert!(
+                pane_1.last_successful_capture_age_ms.unwrap_or(u64::MAX) < 100,
+                "successful capture age should be fresh"
+            );
+            assert_eq!(pane_1.selected_count, 1);
+            assert_eq!(pane_1.starvation_warning, CaptureStarvationWarning::None);
+
+            let pane_2 = snap
+                .panes
+                .iter()
+                .find(|row| row.pane_id == 2)
+                .expect("pane 2 row");
+            assert_eq!(pane_2.priority, 100);
+            assert_eq!(pane_2.tier, CapturePriorityTier::Low);
+            assert_eq!(pane_2.last_reason_code, CaptureSkipReason::SendBackpressure);
+            assert_eq!(pane_2.last_successful_capture_age_ms, None);
+            assert_eq!(pane_2.consecutive_backpressure, 1);
+
+            let high = snap
+                .tiers
+                .iter()
+                .find(|tier| tier.tier == CapturePriorityTier::High)
+                .expect("high tier");
+            assert_eq!(high.selected_count, 1);
+            let low = snap
+                .tiers
+                .iter()
+                .find(|tier| tier.tier == CapturePriorityTier::Low)
+                .expect("low tier");
+            assert_eq!(low.selected_count, 0);
+        });
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_records_capture_budget_deferrals() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                ..Default::default()
+            };
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 1,
+                max_bytes_per_sec: 0,
+            };
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=3 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(HashMap::from([(1, 10), (2, 10), (3, 10)]));
+            crate::runtime_async::sleep(Duration::from_millis(2)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+            assert_eq!(poll_tasks.len(), 1);
+
+            let snap = supervisor.scheduler_snapshot();
+            let admitted = snap
+                .panes
+                .iter()
+                .filter(|row| row.selected_count == 1)
+                .count();
+            assert_eq!(admitted, 1);
+            let deferred = snap
+                .panes
+                .iter()
+                .filter(|row| {
+                    row.last_reason_code == CaptureSkipReason::GlobalCaptureBudgetExhausted
+                })
+                .count();
+            assert_eq!(deferred, 2);
+            assert!(
+                snap.panes
+                    .iter()
+                    .all(|row| row.selection_opportunities == 1)
+            );
+        });
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_pane_rows_are_bounded_under_250_panes() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        for pane_id in 1..=250 {
+            panes.insert(pane_id, make_pane(pane_id));
+        }
+        supervisor.sync_tailers(&panes);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.pane_rows_total, 250);
+        assert!(snap.pane_rows_truncated);
+        assert_eq!(snap.panes.len(), MAX_SCHEDULER_SNAPSHOT_PANES);
+        assert_eq!(snap.tiers.len(), 2);
+    }
+
+    #[test]
+    fn supervisor_with_budget_limits_captures() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 1,
+                max_bytes_per_sec: 0,
+            };
+
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=4 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
+            }
+
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=4 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+
+            // Wait for tailers to become ready.
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            // With budget of 1 capture/sec and 10 permits, only 1 should spawn.
+            assert!(
+                poll_tasks.len() <= 1,
+                "Expected at most 1 task spawned with budget=1, got {}",
+                poll_tasks.len()
+            );
+        });
+    }
+
+    // ─── bd-1tem: determinism + burst + edge-case coverage ──────────
+
+    #[test]
+    fn scheduler_equal_priority_deterministic_by_pane_id() {
+        // When all panes have the same priority, pane_id is the tiebreaker.
+        // This ensures deterministic scheduling regardless of HashMap ordering.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 3,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // All priority 100, budget allows 3.
+        let panes = vec![(42, 100), (7, 100), (99, 100), (1, 100)];
+        let selected = sched.select_panes(&panes, 10);
+        // Pre-sorted input: caller sorts by (priority, pane_id).
+        // So the input order should already be (1,100), (7,100), (42,100), (99,100).
+        // But we're testing with the input as-given — select_panes trusts the order.
+        assert_eq!(selected.len(), 3);
+        // First 3 from the input order (which is pre-sorted by caller).
+        assert_eq!(selected, vec![42, 7, 99]);
+    }
+
+    #[test]
+    fn scheduler_burst_then_exhaustion() {
+        // Simulate a burst of captures that exhausts the budget, then verify
+        // that subsequent calls are properly rate-limited.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Burst: 5 panes at once, exhausts full budget.
+        let burst = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)];
+        let selected = sched.select_panes(&burst, 10);
+        assert_eq!(selected.len(), 5);
+
+        // Immediately after: budget exhausted, nothing scheduled.
+        let more = vec![(6, 10), (7, 20)];
+        let selected2 = sched.select_panes(&more, 10);
+        assert!(
+            selected2.is_empty(),
+            "Budget should be exhausted after burst"
+        );
+
+        // Metrics should reflect the rate limiting.
+        assert!(sched.metrics().global_rate_limited >= 1);
+    }
+
+    #[test]
+    fn scheduler_byte_budget_partial_consumption() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 1000,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Consume 300 bytes.
+        sched.record_capture(1, 300);
+        assert!(!sched.is_byte_budget_exhausted());
+        assert_eq!(sched.global_bytes_remaining, 700);
+
+        // Consume 700 more — exactly at limit.
+        sched.record_capture(2, 700);
+        assert!(sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn scheduler_byte_budget_saturating_sub() {
+        // Verify that recording more bytes than remaining doesn't underflow.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 50,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Record way more bytes than budget allows.
+        sched.record_capture(1, 10_000);
+        assert_eq!(sched.global_bytes_remaining, 0);
+        assert!(sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn scheduler_mixed_priorities_budget_favors_high() {
+        // With a tight budget, only the highest-priority panes should be selected.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 2,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Pre-sorted by (priority, pane_id):
+        let panes = vec![
+            (10, 5),   // priority 5 (critical)
+            (20, 50),  // priority 50 (high)
+            (30, 100), // priority 100 (normal)
+            (40, 200), // priority 200 (low)
+        ];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected, vec![10, 30]);
+    }
+
+    #[test]
+    fn scheduler_zero_permits_returns_empty() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 100,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let panes = vec![(1, 10), (2, 50)];
+        let selected = sched.select_panes(&panes, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn scheduler_per_pane_window_resets_after_one_second() {
+        let budget = CaptureBudgetConfig::default();
+        let mut sched = CaptureScheduler::new(budget);
+
+        sched.record_capture(1, 500);
+        let tracker = sched.pane_trackers.get_mut(&1).unwrap();
+        assert_eq!(tracker.captures_in_window, 1);
+        assert_eq!(tracker.bytes_in_window, 500);
+
+        // Manually move the window start back to force a reset.
+        tracker.window_start = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        tracker.maybe_reset();
+
+        assert_eq!(tracker.captures_in_window, 0);
+        assert_eq!(tracker.bytes_in_window, 0);
+    }
+
+    #[test]
+    fn scheduler_combined_capture_and_byte_budget() {
+        // Both limits active: the more restrictive one wins.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 200,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Select 3 panes (under capture limit).
+        let panes = vec![(1, 10), (2, 20), (3, 30)];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected.len(), 3);
+
+        // Record large bytes that exhaust byte budget.
+        sched.record_capture(1, 100);
+        sched.record_capture(2, 100);
+        // Byte budget is now 0.
+        assert!(sched.is_byte_budget_exhausted());
+
+        // Capture budget still has tokens (7 remaining), but byte budget blocks.
+        assert_eq!(sched.global_captures_remaining, 7);
+    }
+
+    #[test]
+    fn scheduler_throttle_events_accumulate() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 1,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Exhaust capture budget.
+        let _ = sched.select_panes(&[(1, 10)], 5);
+
+        // Three more attempts, all throttled.
+        let _ = sched.select_panes(&[(2, 10)], 5);
+        let _ = sched.select_panes(&[(3, 10)], 5);
+        let _ = sched.select_panes(&[(4, 10)], 5);
+
+        assert!(sched.metrics().throttle_events >= 3);
+    }
+
+    #[test]
+    fn supervisor_changed_outcome_records_bytes() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 0,
+                max_bytes_per_sec: 1000,
+            };
+
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
+
+            // Simulate a capture that produced 256 bytes.
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 256 });
+
+            // The scheduler should have recorded the bytes.
+            let tracker = &supervisor.scheduler.pane_trackers[&1];
+            assert_eq!(tracker.bytes_in_window, 256);
+            assert_eq!(tracker.captures_in_window, 1);
+
+            // Global bytes should be debited.
+            assert_eq!(supervisor.scheduler.global_bytes_remaining, 744);
+        });
+    }
+
+    #[test]
+    fn supervisor_budget_hot_reload() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 0,
+        };
+
+        let mut supervisor =
+            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+
+        assert_eq!(supervisor.scheduler.budget.max_captures_per_sec, 5);
+
+        // Hot-reload to new budget.
+        supervisor.update_budget(CaptureBudgetConfig {
+            max_captures_per_sec: 50,
+            max_bytes_per_sec: 10_000,
+        });
+
+        assert_eq!(supervisor.scheduler.budget.max_captures_per_sec, 50);
+        assert_eq!(supervisor.scheduler.budget.max_bytes_per_sec, 10_000);
+    }
+
+    // --- Streaming tailer tests (wa-nu4.4.2.3) ---
+
+    #[test]
+    fn tailer_mode_display() {
+        assert_eq!(TailerMode::Polling.to_string(), "polling");
+        assert_eq!(TailerMode::Streaming.to_string(), "streaming");
+    }
+
+    #[test]
+    fn tailer_mode_eq() {
+        assert_eq!(TailerMode::Polling, TailerMode::Polling);
+        assert_eq!(TailerMode::Streaming, TailerMode::Streaming);
+        assert_ne!(TailerMode::Polling, TailerMode::Streaming);
+    }
+
+    #[test]
+    fn detect_mode_without_vendored_returns_polling() {
+        // Without the vendored feature, or without a socket path,
+        // detection should always return Polling.
+        let config = crate::config::Config::default();
+        let mode = detect_tailer_mode(&config);
+        // Can be Streaming if vendored is on + WEZTERM_UNIX_SOCKET is set in env,
+        // but by default should be Polling.
+        if cfg!(feature = "vendored") {
+            // Mode depends on env var — just check it's valid
+            assert!(mode == TailerMode::Polling || mode == TailerMode::Streaming);
+        } else {
+            assert_eq!(mode, TailerMode::Polling);
+        }
+    }
+
+    #[test]
+    fn detect_mode_with_socket_path_config() {
+        // `discover_mux_socket` requires a real unix-domain socket, not merely
+        // an existing path (a9e67ef23, "require real mux socket paths"). This
+        // test used to create a regular file with `fs::write`, which that commit
+        // made unusable, so it has asserted Streaming against a path the
+        // implementation correctly rejects ever since. Bind a listener instead
+        // so the streaming branch is genuinely exercised; the companion test
+        // below pins the regular-file rejection.
+        let sock_path =
+            std::env::temp_dir().join(format!("ft-test-mux-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        #[cfg(unix)]
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind temp mux socket");
+        #[cfg(not(unix))]
+        std::fs::write(&sock_path, b"").expect("create temp socket file");
+
+        let mut config = crate::config::Config::default();
+        config.vendored.mux_socket_path = Some(sock_path.to_string_lossy().to_string());
+        #[cfg(feature = "vendored")]
+        {
+            assert_eq!(
+                detect_tailer_mode_with_allow_vendored(&config, true),
+                TailerMode::Streaming
+            );
+            assert_eq!(
+                detect_tailer_mode_with_allow_vendored(&config, false),
+                TailerMode::Polling
+            );
+        }
+        #[cfg(not(feature = "vendored"))]
+        {
+            assert_eq!(detect_tailer_mode(&config), TailerMode::Polling);
+        }
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// A regular file at the configured mux-socket path must not enable
+    /// streaming capture: connecting to it can never succeed, so treating it as
+    /// a mux socket would silently disable capture for every pane
+    /// (a9e67ef23 tightened this; nothing pinned it until now).
+    #[test]
+    fn detect_mode_with_regular_file_socket_path_is_rejected() {
+        let file_path =
+            std::env::temp_dir().join(format!("ft-test-not-a-mux-{}.sock", std::process::id()));
+        std::fs::write(&file_path, b"").expect("create temp regular file");
+
+        // Asserted at the discovery level rather than through
+        // `detect_tailer_mode`, because discovery falls back to
+        // `WEZTERM_UNIX_SOCKET` and canonical paths: on a host with a live mux
+        // the mode could legitimately be Streaming for an unrelated socket. The
+        // invariant under test is narrower — this path must not be the one
+        // accepted.
+        let discovered =
+            crate::wezterm::discover_mux_socket(Some(file_path.to_string_lossy().as_ref()));
+        assert_ne!(
+            discovered.as_deref(),
+            Some(file_path.as_path()),
+            "a regular file must never be accepted as a mux socket"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn detect_mode_empty_socket_path_is_polling() {
+        let mut config = crate::config::Config::default();
+        config.vendored.mux_socket_path = Some("  ".to_string());
+        // Empty/whitespace path should not trigger streaming
+        #[cfg(feature = "vendored")]
+        {
+            assert_eq!(
+                detect_tailer_mode_with_allow_vendored(&config, true),
+                TailerMode::Polling
+            );
+        }
+        #[cfg(not(feature = "vendored"))]
+        {
+            assert_eq!(detect_tailer_mode(&config), TailerMode::Polling);
+        }
+    }
+
+    #[test]
+    fn streaming_bridge_new_defaults() {
+        let bridge = StreamingBridge::new();
+        assert_eq!(bridge.events_processed(), 0);
+        assert_eq!(bridge.fallback_count(), 0);
+        assert_eq!(bridge.dirty_range_total(), 0);
+        assert_eq!(bridge.dirty_row_total(), 0);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+        #[cfg(feature = "vendored")]
+        assert!(bridge.render_metadata(1).is_none());
+        assert_eq!(bridge.active_panes(), 0);
+        assert_eq!(bridge.total_segments(), 0);
+        assert_eq!(bridge.total_gaps(), 0);
+    }
+
+    #[test]
+    fn streaming_bridge_default_matches_new() {
+        let a = StreamingBridge::new();
+        let b = StreamingBridge::default();
+        assert_eq!(a.events_processed(), b.events_processed());
+        assert_eq!(a.fallback_count(), b.fallback_count());
+        assert_eq!(a.dirty_range_total(), b.dirty_range_total());
+        assert_eq!(a.dirty_row_total(), b.dirty_row_total());
+        assert_eq!(a.seq_anomaly_count(), b.seq_anomaly_count());
+        assert_eq!(a.active_panes(), b.active_panes());
+        assert_eq!(a.total_segments(), b.total_segments());
+        assert_eq!(a.total_gaps(), b.total_gaps());
+    }
+
+    #[test]
+    fn streaming_bridge_record_fallback() {
+        let mut bridge = StreamingBridge::new();
+        assert_eq!(bridge.fallback_count(), 0);
+        bridge.record_fallback();
+        assert_eq!(bridge.fallback_count(), 1);
+        bridge.record_fallback();
+        assert_eq!(bridge.fallback_count(), 2);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_output_delta() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
+        let delta = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 5,
+            delta_text: "hello from pane".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 2,
+            dirty_row_count: 8,
+        };
+
+        let segments: Vec<_> = bridge
+            .process_delta(delta, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].pane_id, 1);
+        assert_eq!(segments[0].seq, 0); // first segment for this pane
+        assert_eq!(segments[0].content, "hello from pane");
+        assert_eq!(bridge.events_processed(), 1);
+        assert_eq!(bridge.dirty_range_total(), 2);
+        assert_eq!(bridge.dirty_row_total(), 8);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+        assert_eq!(
+            bridge.render_metadata(1),
+            Some(&StreamingRenderMetadata {
+                source_version: 5,
+                title: "bash".to_string(),
+                dirty_range_count: 2,
+                dirty_row_count: 8,
+            })
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_empty_projection_emits_no_segments_or_capture_cursor() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::from_seq(5, 41);
+        let cursor_before = format!("{cursor:?}");
+        let segments = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 5,
+                    seqno: 9,
+                    delta_text: String::new(),
+                    title: "metadata-only".to_string(),
+                    dirty_range_count: 3,
+                    dirty_row_count: 11,
+                },
+                &mut cursor,
+            )
+            .unwrap();
+
+        assert!(segments.is_none());
+        assert_eq!(bridge.events_processed(), 1);
+        assert_eq!(bridge.dirty_range_total(), 3);
+        assert_eq!(bridge.dirty_row_total(), 11);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+        assert_eq!(bridge.active_panes(), 0);
+        assert_eq!(bridge.total_segments(), 0);
+        assert_eq!(bridge.total_gaps(), 0);
+        assert_eq!(format!("{cursor:?}"), cursor_before);
+        assert_eq!(
+            bridge.render_metadata(5),
+            Some(&StreamingRenderMetadata {
+                source_version: 9,
+                title: "metadata-only".to_string(),
+                dirty_range_count: 3,
+                dirty_row_count: 11,
+            })
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_terminal_seq_jump_does_not_emit_gap() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(7);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 10,
+                    delta_text: "base".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 2,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
+
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 13,
+                    delta_text: "jump".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 2,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "jump");
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_terminal_seq_regression_is_diagnostic_only() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(11);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 11,
+                    seqno: 50,
+                    delta_text: "newest".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
+
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 11,
+                    seqno: 49,
+                    delta_text: "older".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "older");
+        assert_eq!(bridge.seq_anomaly_count(), 1);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_explicit_gap_resets_diagnostic_seq_baseline() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(23);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 23,
+                    seqno: 3,
+                    delta_text: "before-gap".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("initial output capture");
+
+        let _ = bridge
+            .process_delta(
+                PaneDelta::Gap {
+                    pane_id: 23,
+                    reason: "bounded transport loss".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(!bridge.last_mux_seqno.contains_key(&23));
+
+        let segments: Vec<_> = bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 23,
+                    seqno: 100,
+                    delta_text: "after-gap".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "after-gap");
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_gap_emits_gap_segment() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
+
+        // First, send a normal output to establish the pane cursor
+        let output = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 1,
+            delta_text: "first".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 4,
+        };
+        bridge
+            .process_delta(output, &mut cursor)
+            .unwrap()
+            .expect("initial output capture");
+
+        // Now send a gap
+        let gap = PaneDelta::Gap {
+            pane_id: 1,
+            reason: "bounded transport loss".to_string(),
+        };
+        let segments: Vec<_> = bridge
+            .process_delta(gap, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(segments.len(), 1);
+        assert!(
+            matches!(segments[0].kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert_eq!(segments[0].content, "");
+        assert_eq!(bridge.events_processed(), 2);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_ended_emits_pane_closed() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::new(1);
+
+        // Establish cursor
+        let output = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 1,
+            delta_text: "first".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 4,
+        };
+        bridge
+            .process_delta(output, &mut cursor)
+            .unwrap()
+            .expect("initial output capture");
+
+        // End the subscription
+        let ended = PaneDelta::Ended {
+            pane_id: 1,
+            reason: "cancelled".to_string(),
+        };
+        let segments: Vec<_> = bridge
+            .process_delta(ended, &mut cursor)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        // PaneClosed → final gap segment
+        assert_eq!(segments.len(), 1);
+        match &segments[0].kind {
+            CapturedSegmentKind::Gap { reason } => {
+                assert!(reason.contains("pane_closed"));
+            }
+            CapturedSegmentKind::Delta => panic!("expected Gap segment for pane close"),
+        }
+        assert!(bridge.render_metadata(1).is_none());
+    }
+
+    #[test]
+    fn streaming_bridge_source_forbids_render_metadata_marker() {
+        let forbidden = ["[render_", "changes:"].concat();
+        assert!(
+            !include_str!("tailer.rs").contains(&forbidden),
+            "render metadata must never be materialized as terminal output"
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_rejects_mismatched_cursor_without_any_state_change() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let mut matching = PaneCursor::new(7);
+        bridge
+            .process_delta(
+                PaneDelta::Output {
+                    pane_id: 7,
+                    seqno: 10,
+                    delta_text: "established".to_string(),
+                    title: "original".to_string(),
+                    dirty_range_count: 2,
+                    dirty_row_count: 3,
+                },
+                &mut matching,
+            )
+            .unwrap()
+            .expect("initial capture");
+        bridge.record_fallback();
+        let mut wrong = PaneCursor::from_seq(8, 41);
+        let previous = wrong.capture_delta("prior capture".to_string(), 0);
+        assert_eq!(wrong.realign_next_seq(&previous, 40), -1);
+        let cursor_before = format!("{wrong:?}");
+        let health_before = bridge.snapshot_health();
+        let active_before = bridge.active_panes.clone();
+        let metadata_before = bridge.last_render_metadata.clone();
+        let versions_before = bridge.last_mux_seqno.clone();
+        let segments_before = bridge.total_segments();
+        let anomalies_before = bridge.seq_anomaly_count();
+
+        for delta in [
+            PaneDelta::Output {
+                pane_id: 7,
+                seqno: 1,
+                delta_text: "must not capture".to_string(),
+                title: "must not replace metadata".to_string(),
+                dirty_range_count: 99,
+                dirty_row_count: 99,
+            },
+            PaneDelta::Gap {
+                pane_id: 7,
+                reason: "must not reset version".to_string(),
+            },
+            PaneDelta::Ended {
+                pane_id: 7,
+                reason: "must not close".to_string(),
+            },
+        ] {
+            assert_eq!(
+                bridge.process_delta(delta, &mut wrong).unwrap_err(),
+                "streaming delta pane does not match capture cursor"
+            );
+            assert_eq!(format!("{wrong:?}"), cursor_before);
+            assert_eq!(bridge.snapshot_health(), health_before);
+            assert_eq!(bridge.active_panes, active_before);
+            assert_eq!(bridge.last_render_metadata, metadata_before);
+            assert_eq!(bridge.last_mux_seqno, versions_before);
+            assert_eq!(bridge.total_segments(), segments_before);
+            assert_eq!(bridge.seq_anomaly_count(), anomalies_before);
+        }
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_uses_resumed_cursor_and_preserves_external_correction() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        // Cursor-state control: external persistence realignment is exercised
+        // directly here; this test does not claim a database write occurred.
+        let mut bridge = StreamingBridge::new();
+        let mut cursor = PaneCursor::from_seq(7, 41);
+        let output = |seqno, text: &str| PaneDelta::Output {
+            pane_id: 7,
+            seqno,
+            delta_text: text.to_string(),
+            title: "resumed".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 2,
+        };
+        let first = bridge
+            .process_delta(output(10, "first"), &mut cursor)
+            .unwrap()
+            .expect("resumed capture");
+        assert_eq!((first.pane_id, first.seq, first.seq_correction), (7, 41, 0));
+        assert_eq!(first.content, "first");
+        assert!(matches!(first.kind, CapturedSegmentKind::Delta));
+        assert_eq!(cursor.next_seq, 42);
+        assert_eq!(cursor.realign_next_seq(&first, 40), -1);
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (41, -1));
+
+        let second = bridge
+            .process_delta(output(20, "second"), &mut cursor)
+            .unwrap()
+            .expect("corrected capture");
+        assert_eq!((second.seq, second.seq_correction), (41, -1));
+        assert_eq!(second.content, "second");
+        assert!(matches!(second.kind, CapturedSegmentKind::Delta));
+        let gap = bridge
+            .process_delta(
+                PaneDelta::Gap {
+                    pane_id: 7,
+                    reason: "transport loss".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("explicit gap");
+        assert_eq!((gap.seq, gap.seq_correction), (42, -1));
+        assert!(
+            matches!(gap.kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert!(!bridge.last_mux_seqno.contains_key(&7));
+        let closed = bridge
+            .process_delta(
+                PaneDelta::Ended {
+                    pane_id: 7,
+                    reason: "cancelled".to_string(),
+                },
+                &mut cursor,
+            )
+            .unwrap()
+            .expect("active pane close gap");
+        assert_eq!((closed.seq, closed.seq_correction), (43, -1));
+        assert!(
+            matches!(closed.kind, CapturedSegmentKind::Gap { ref reason } if reason == "pane_closed")
+        );
+        assert_eq!(bridge.active_panes(), 0);
+        assert!(bridge.render_metadata(7).is_none());
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (44, -1));
+        let cursor_after_close = format!("{cursor:?}");
+        assert!(
+            bridge
+                .process_delta(
+                    PaneDelta::Ended {
+                        pane_id: 7,
+                        reason: "already ended".to_string(),
+                    },
+                    &mut cursor
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(format!("{cursor:?}"), cursor_after_close);
+        assert_eq!((bridge.total_segments(), bridge.total_gaps()), (4, 2));
+
+        let resumed = bridge
+            .process_delta(output(1, "resumed again"), &mut cursor)
+            .unwrap()
+            .expect("shared cursor survives stream close");
+        assert_eq!((resumed.seq, resumed.seq_correction), (44, -1));
+        assert_eq!(resumed.content, "resumed again");
+        assert_eq!((cursor.next_seq, cursor.seq_correction()), (45, -1));
+        assert_eq!(bridge.active_panes(), 1);
+        assert_eq!((bridge.total_segments(), bridge.total_gaps()), (5, 2));
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_multiple_panes() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+
+        for pane_id in [1, 2, 3] {
+            let mut cursor = PaneCursor::new(pane_id);
+            let delta = PaneDelta::Output {
+                pane_id,
+                seqno: 1,
+                delta_text: format!("pane-{pane_id}-delta"),
+                title: format!("pane-{pane_id}"),
+                dirty_range_count: 1,
+                dirty_row_count: 4,
+            };
+            bridge
+                .process_delta(delta, &mut cursor)
+                .unwrap()
+                .expect("pane output capture");
+        }
+
+        assert_eq!(bridge.events_processed(), 3);
+        assert_eq!(bridge.dirty_range_total(), 3);
+        assert_eq!(bridge.dirty_row_total(), 12);
+        assert_eq!(bridge.active_panes(), 3);
+    }
+
+    #[test]
+    fn streaming_health_snapshot() {
+        let bridge = StreamingBridge::new();
+        let health = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: bridge.events_processed(),
+            dirty_ranges_total: bridge.dirty_range_total(),
+            dirty_rows_total: bridge.dirty_row_total(),
+            gaps_emitted: bridge.total_gaps(),
+            fallback_count: bridge.fallback_count(),
+            active_panes: bridge.active_panes(),
+        };
+        assert_eq!(health.mode, TailerMode::Streaming);
+        assert_eq!(health.events_processed, 0);
+        assert_eq!(health.dirty_ranges_total, 0);
+        assert_eq!(health.dirty_rows_total, 0);
+        assert_eq!(health.active_panes, 0);
+    }
+
+    #[test]
+    fn streaming_health_lock_helpers_recover_from_poison() {
+        let lock = StdRwLock::new(None);
+        let poisoned_snapshot = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 7,
+            dirty_ranges_total: 2,
+            dirty_rows_total: 8,
+            gaps_emitted: 1,
+            fallback_count: 0,
+            active_panes: 3,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock.write().expect("test lock should start unpoisoned");
+            *guard = Some(poisoned_snapshot.clone());
+            panic!("poison streaming health read path");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            streaming_health_read_guard(&lock).clone(),
+            Some(poisoned_snapshot)
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().expect("read helper should clear poison");
+            panic!("poison streaming health write path");
+        }));
+        assert!(result.is_err());
+
+        let replacement = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 11,
+            dirty_ranges_total: 4,
+            dirty_rows_total: 16,
+            gaps_emitted: 2,
+            fallback_count: 1,
+            active_panes: 5,
+        };
+        let mut guard = streaming_health_write_guard(&lock);
+        *guard = Some(replacement.clone());
+        drop(guard);
+        assert_eq!(
+            streaming_health_read_guard(&lock).clone(),
+            Some(replacement)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch — RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tailer_config_custom_fields() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(10),
+            max_interval: Duration::from_secs(5),
+            backoff_multiplier: 3.0,
+            max_concurrent: 20,
+            overlap_size: 512,
+            send_timeout: Duration::from_millis(200),
+            capture_timeout: Duration::from_secs(1),
+        };
+        assert_eq!(config.min_interval, Duration::from_millis(10));
+        assert_eq!(config.max_interval, Duration::from_secs(5));
+        assert!((config.backoff_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.max_concurrent, 20);
+        assert_eq!(config.overlap_size, 512);
+        assert_eq!(config.send_timeout, Duration::from_millis(200));
+        assert_eq!(config.capture_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tailer_config_clone() {
+        let config = TailerConfig::default();
+        let clone = config.clone();
+        assert_eq!(config.min_interval, clone.min_interval);
+        assert_eq!(config.max_interval, clone.max_interval);
+        assert_eq!(config.max_concurrent, clone.max_concurrent);
+    }
+
+    #[test]
+    fn tailer_metrics_fields_mutate() {
+        let m = TailerMetrics {
+            events_sent: 10,
+            send_timeouts: 3,
+            capture_timeouts: 2,
+            no_change_captures: 7,
+            overflow_gaps_emitted: 1,
+            no_cursor_polls: 4,
+        };
+        assert_eq!(m.events_sent, 10);
+        assert_eq!(m.send_timeouts, 3);
+        assert_eq!(m.capture_timeouts, 2);
+        assert_eq!(m.no_change_captures, 7);
+        assert_eq!(m.overflow_gaps_emitted, 1);
+        assert_eq!(m.no_cursor_polls, 4);
+    }
+
+    #[test]
+    fn supervisor_metrics_default_and_fields() {
+        let mut sm = SupervisorMetrics::default();
+        assert_eq!(sm.tailers_started, 0);
+        assert_eq!(sm.tailers_stopped, 0);
+        assert_eq!(sm.sync_count, 0);
+        sm.tailers_started = 5;
+        sm.tailers_stopped = 2;
+        sm.sync_count = 10;
+        assert_eq!(sm.tailers_started, 5);
+        assert_eq!(sm.tailers_stopped, 2);
+        assert_eq!(sm.sync_count, 10);
+    }
+
+    #[test]
+    fn pane_tailer_should_poll_initially_false() {
+        // With a non-trivial interval, should_poll is false immediately after creation
+        let tailer = PaneTailer::new(1, Duration::from_secs(10));
+        assert!(!tailer.should_poll());
+    }
+
+    #[test]
+    fn pane_tailer_had_changes_tracks_last_poll() {
+        let config = TailerConfig::default();
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        assert!(!tailer.had_changes);
+
+        tailer.record_poll(true, &config);
+        assert!(tailer.had_changes);
+
+        tailer.record_poll(false, &config);
+        assert!(!tailer.had_changes);
+    }
+
+    #[test]
+    fn pane_tailer_backoff_multiplier_one_keeps_interval() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.0,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        tailer.record_poll(false, &config);
+        // With multiplier 1.0, interval stays the same
+        assert_eq!(tailer.current_interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn scheduler_snapshot_unlimited_budget() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let sched = CaptureScheduler::new(budget);
+        let snap = sched.snapshot();
+        assert!(!snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 0);
+        assert_eq!(snap.max_bytes_per_sec, 0);
+        assert_eq!(snap.tracked_panes, 0);
+        assert_eq!(snap.total_rate_limited, 0);
+        assert_eq!(snap.total_byte_budget_exceeded, 0);
+        assert_eq!(snap.total_throttle_events, 0);
+    }
+
+    #[test]
+    fn scheduler_snapshot_active_budget() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 5000,
+        };
+        let sched = CaptureScheduler::new(budget);
+        let snap = sched.snapshot();
+        assert!(snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 10);
+        assert_eq!(snap.max_bytes_per_sec, 5000);
+        assert_eq!(snap.captures_remaining, 10);
+        assert_eq!(snap.bytes_remaining, 5000);
+    }
+
+    #[test]
+    fn scheduler_snapshot_after_consumption() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 1000,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        sched.record_capture(1, 300);
+        let _ = sched.select_panes(&[(1, 10), (2, 20)], 5);
+
+        let snap = sched.snapshot();
+        assert_eq!(snap.tracked_panes, 1);
+        assert_eq!(snap.bytes_remaining, 700);
+        assert_eq!(snap.captures_remaining, 3);
+    }
+
+    #[test]
+    fn scheduler_snapshot_serde_roundtrip() {
+        let snap = SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 42,
+            max_bytes_per_sec: 8192,
+            captures_remaining: 10,
+            bytes_remaining: 4096,
+            total_rate_limited: 3,
+            total_byte_budget_exceeded: 1,
+            total_throttle_events: 4,
+            tracked_panes: 7,
+            ..SchedulerSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let deser: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.budget_active, snap.budget_active);
+        assert_eq!(deser.max_captures_per_sec, snap.max_captures_per_sec);
+        assert_eq!(deser.max_bytes_per_sec, snap.max_bytes_per_sec);
+        assert_eq!(deser.captures_remaining, snap.captures_remaining);
+        assert_eq!(deser.bytes_remaining, snap.bytes_remaining);
+        assert_eq!(deser.total_rate_limited, snap.total_rate_limited);
+        assert_eq!(
+            deser.total_byte_budget_exceeded,
+            snap.total_byte_budget_exceeded
+        );
+        assert_eq!(deser.total_throttle_events, snap.total_throttle_events);
+        assert_eq!(deser.tracked_panes, snap.tracked_panes);
+    }
+
+    #[test]
+    fn scheduler_snapshot_default_is_inactive() {
+        let snap = SchedulerSnapshot::default();
+        assert!(!snap.budget_active);
+        assert_eq!(snap.max_captures_per_sec, 0);
+        assert_eq!(snap.max_bytes_per_sec, 0);
+    }
+
+    #[test]
+    fn scheduler_check_global_budget_unlimited_always_allows() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        // Should always return true with unlimited budget
+        for _ in 0..100 {
+            assert!(sched.check_global_budget());
+        }
+        assert_eq!(sched.metrics().global_rate_limited, 0);
+    }
+
+    #[test]
+    fn scheduler_byte_budget_unlimited_never_exhausted() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+        sched.record_capture(1, 1_000_000);
+        assert!(!sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn handle_poll_result_circuit_open() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(
+            1,
+            PollOutcome::CircuitOpen {
+                retry_after_ms: 500,
+            },
+        );
+
+        // CircuitOpen should not increment events_sent or send_timeouts
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        // Pane should be removed from capturing set
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_error() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Error("connection refused".to_string()));
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_channel_closed() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::ChannelClosed);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_capture_timeout() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::CaptureTimeout);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().send_timeouts, 0);
+        assert_eq!(supervisor.metrics().capture_timeouts, 1);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_no_cursor() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+
+        assert_eq!(supervisor.metrics().events_sent, 0);
+        assert_eq!(supervisor.metrics().no_change_captures, 0);
+        assert!(!supervisor.capturing_panes.contains(&1));
+    }
+
+    #[test]
+    fn handle_poll_result_unknown_pane_is_noop() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // No panes synced, handling result for unknown pane should not panic
+        supervisor.handle_poll_result(999, PollOutcome::Changed { bytes: 100 });
+        assert_eq!(supervisor.metrics().events_sent, 0);
+    }
+
+    #[test]
+    fn supervisor_update_config_changes_concurrency() {
+        let config = TailerConfig {
+            max_concurrent: 5,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+        assert_eq!(supervisor.semaphore.available_permits(), 5);
+
+        supervisor.update_config(TailerConfig {
+            max_concurrent: 20,
+            ..Default::default()
+        });
+        assert_eq!(supervisor.semaphore.available_permits(), 20);
+    }
+
+    #[test]
+    fn supervisor_update_config_zero_concurrent_floors_to_one() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        supervisor.update_config(TailerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        });
+        // max_concurrent.max(1) floors to 1
+        assert_eq!(supervisor.semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn supervisor_shutdown_clears_all_state() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+            supervisor.capturing_panes.insert(1);
+            assert_eq!(supervisor.active_count(), 2);
+
+            supervisor.shutdown().await;
+            assert_eq!(supervisor.active_count(), 0);
+            assert!(supervisor.capturing_panes.is_empty());
+        });
+    }
+
+    #[test]
+    fn supervisor_sync_idempotent_for_same_panes() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 2);
+        let sm = supervisor.supervisor_metrics();
+        assert_eq!(sm.tailers_started, 2);
+        assert_eq!(sm.sync_count, 1);
+
+        // Syncing again with the same panes should not add duplicates
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 2);
+        let sm = supervisor.supervisor_metrics();
+        assert_eq!(sm.tailers_started, 2); // still 2, not 4
+        assert_eq!(sm.sync_count, 2);
+    }
+
+    #[test]
+    fn standalone_sync_readd_allocates_a_fresh_capture_stamp() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let predecessor_stamp = supervisor.capture_leases[&1].stamp();
+
+        panes.clear();
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 0);
+
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let successor_stamp = supervisor.capture_leases[&1].stamp();
+        assert_ne!(successor_stamp, predecessor_stamp);
+        assert_eq!(
+            supervisor
+                .standalone_capture_authority
+                .try_acquire_persistence(predecessor_stamp, 1)
+                .unwrap_err(),
+            CaptureAuthorityError::StalePaneIncarnation { global_pane_id: 1 }
+        );
+    }
+
+    #[test]
+    fn standalone_sync_refuses_readd_until_predecessor_guard_drains() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        let predecessor = supervisor.capture_leases[&1].clone();
+        let predecessor_stamp = predecessor.stamp();
+        let held = predecessor
+            .try_acquire_producer(predecessor_stamp, 1)
+            .expect("predecessor producer guard");
+
+        panes.clear();
+        supervisor.sync_tailers(&panes);
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 0);
+        assert!(!supervisor.capture_leases.contains_key(&1));
+
+        drop(held);
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.active_count(), 1);
+        assert_ne!(supervisor.capture_leases[&1].stamp(), predecessor_stamp);
+    }
+
+    #[test]
+    fn supervisor_metrics_tracks_sync_and_start_stop() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // Add 3 panes
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+        panes.insert(3, make_pane(3));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.supervisor_metrics().tailers_started, 3);
+        assert_eq!(supervisor.supervisor_metrics().tailers_stopped, 0);
+
+        // Remove 2 panes
+        panes.remove(&1);
+        panes.remove(&2);
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.supervisor_metrics().tailers_started, 3);
+        assert_eq!(supervisor.supervisor_metrics().tailers_stopped, 2);
+    }
+
+    #[test]
+    fn tailer_mode_serde_roundtrip() {
+        let polling_json = serde_json::to_string(&TailerMode::Polling).unwrap();
+        let streaming_json = serde_json::to_string(&TailerMode::Streaming).unwrap();
+        assert_eq!(polling_json, "\"polling\"");
+        assert_eq!(streaming_json, "\"streaming\"");
+
+        let deser_polling: TailerMode = serde_json::from_str(&polling_json).unwrap();
+        let deser_streaming: TailerMode = serde_json::from_str(&streaming_json).unwrap();
+        assert_eq!(deser_polling, TailerMode::Polling);
+        assert_eq!(deser_streaming, TailerMode::Streaming);
+    }
+
+    #[test]
+    fn streaming_health_serde_roundtrip() {
+        let health = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 42,
+            dirty_ranges_total: 10,
+            dirty_rows_total: 80,
+            gaps_emitted: 2,
+            fallback_count: 1,
+            active_panes: 3,
+        };
+        let json = serde_json::to_string(&health).expect("serialize");
+        let deser: StreamingHealth = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.mode, TailerMode::Streaming);
+        assert_eq!(deser.events_processed, 42);
+        assert_eq!(deser.dirty_ranges_total, 10);
+        assert_eq!(deser.dirty_rows_total, 80);
+        assert_eq!(deser.gaps_emitted, 2);
+        assert_eq!(deser.fallback_count, 1);
+        assert_eq!(deser.active_panes, 3);
+    }
+
+    #[test]
+    fn supervisor_record_capture_bytes_debits_scheduler() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 1000,
+        };
+
+        let mut supervisor =
+            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+
+        supervisor.record_capture_bytes(1, 400);
+        supervisor.record_capture_bytes(1, 300);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.bytes_remaining, 300);
+        assert_eq!(snap.tracked_panes, 1);
+    }
+
+    #[test]
+    fn supervisor_scheduler_metrics_accessor() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let sm = supervisor.scheduler_metrics();
+        assert_eq!(sm.global_rate_limited, 0);
+        assert_eq!(sm.pane_byte_budget_exceeded, 0);
+        assert_eq!(sm.throttle_events, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for tailer primitives (wa-124z4)
+    //
+    // Exercises the Cx-aware channel primitives and pure-data tailer types
+    // under LabRuntime virtual time. Real-capture tests (PaneTailer,
+    // TailerSupervisor with mock WezTerm backends) run through the
+    // existing CompatRuntime suite above. These LabRuntime tests add
+    // the deterministic scheduling dimension for:
+    //   - CaptureEvent channel delivery and backpressure
+    //   - Cancelled Cx propagation through channel recv
+    //   - CaptureScheduler budget enforcement logic
+    //   - TailerConfig / SchedulerSnapshot data contracts
+    // -------------------------------------------------------------------------
+
+    mod labruntime_tailer {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, mut handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::Quiescent
+                ),
+                "LabRuntime did not finish; termination: {:?}",
+                report.termination,
+            );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
+            );
+        }
+
+        /// 1. TailerConfig defaults are stable: the tailer supervisor's
+        ///    adaptive-polling and concurrency semantics depend on these
+        ///    exact defaults.
+        #[test]
+        fn tailer_config_defaults_under_labruntime() {
+            run_lab(2001, || async move {
+                let config = TailerConfig::default();
+                assert_eq!(config.min_interval, Duration::from_millis(50));
+                assert_eq!(config.max_interval, Duration::from_secs(1));
+                assert_eq!(config.max_concurrent, 10);
+                assert_eq!(config.overlap_size, 256);
+                assert_eq!(config.capture_timeout, Duration::from_secs(2));
+            });
+        }
+
+        /// 2. CaptureScheduler budget enforcement under LabRuntime:
+        ///    a finite captures-per-sec limit throttles after exhaustion.
+        #[test]
+        fn capture_scheduler_rate_limit_under_labruntime() {
+            run_lab(2002, || async move {
+                let budget = CaptureBudgetConfig {
+                    max_captures_per_sec: 3,
+                    max_bytes_per_sec: 0,
+                };
+                let mut sched = CaptureScheduler::new(budget);
+
+                // First 3 should pass.
+                for _ in 0..3 {
+                    assert!(sched.check_global_budget());
+                }
+                // Fourth should be throttled.
+                assert!(
+                    !sched.check_global_budget(),
+                    "budget exhausted; fourth capture should be throttled"
+                );
+                assert_eq!(sched.metrics().global_rate_limited, 1);
+                assert_eq!(sched.metrics().throttle_events, 1);
+            });
+        }
+
+        /// 3. CaptureScheduler byte budget tracking under LabRuntime:
+        ///    recording bytes deducts from the global budget.
+        #[test]
+        fn capture_scheduler_byte_budget_under_labruntime() {
+            run_lab(2003, || async move {
+                let budget = CaptureBudgetConfig {
+                    max_captures_per_sec: 0,
+                    max_bytes_per_sec: 100,
+                };
+                let mut sched = CaptureScheduler::new(budget);
+
+                assert!(!sched.is_byte_budget_exhausted());
+                sched.record_capture(1, 60);
+                assert!(!sched.is_byte_budget_exhausted());
+                sched.record_capture(2, 50);
+                assert!(
+                    sched.is_byte_budget_exhausted(),
+                    "110 bytes consumed against 100-byte budget"
+                );
+            });
+        }
+
+        /// 4. SchedulerSnapshot serde roundtrip under LabRuntime: pins
+        ///    the telemetry shape downstream health reporting depends on.
+        #[test]
+        fn scheduler_snapshot_serde_roundtrip_under_labruntime() {
+            run_lab(2004, || async move {
+                let snap = SchedulerSnapshot {
+                    budget_active: true,
+                    max_captures_per_sec: 10,
+                    max_bytes_per_sec: 1024,
+                    captures_remaining: 7,
+                    bytes_remaining: 512,
+                    total_rate_limited: 3,
+                    total_byte_budget_exceeded: 0,
+                    total_throttle_events: 3,
+                    tracked_panes: 4,
+                    ..SchedulerSnapshot::default()
+                };
+                let json = serde_json::to_string(&snap).expect("serialize");
+                let restored: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(restored.captures_remaining, 7);
+                assert_eq!(restored.tracked_panes, 4);
+                assert_eq!(restored.total_rate_limited, 3);
+            });
+        }
+
+        /// 5. mpsc channel for CaptureEvent delivery under LabRuntime:
+        ///    messages arrive in order via two-phase reserve/commit.
+        #[test]
+        fn capture_event_channel_delivery_under_labruntime() {
+            run_lab(2005, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<u64>(4);
+
+                for seq in 0u64..3 {
+                    tx.reserve(&cx).await.expect("reserve").send(seq);
+                }
+
+                for expected in 0u64..3 {
+                    let got = rx.recv(&cx).await.expect("recv");
+                    assert_eq!(got, expected, "FIFO violated");
+                }
+            });
+        }
+
+        /// 6. mpsc backpressure under LabRuntime: a full channel rejects
+        ///    try_reserve, then accepts after a consumer drains.
+        #[test]
+        fn capture_event_channel_backpressure_under_labruntime() {
+            run_lab(2006, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<u64>(1);
+
+                tx.reserve(&cx).await.expect("reserve").send(1);
+                assert!(
+                    tx.try_reserve().is_err(),
+                    "channel at capacity must reject try_reserve"
+                );
+
+                let got = rx.recv(&cx).await.expect("recv");
+                assert_eq!(got, 1);
+
+                tx.reserve(&cx).await.expect("reserve after drain").send(2);
+                let got2 = rx.recv(&cx).await.expect("recv2");
+                assert_eq!(got2, 2);
+            });
+        }
+
+        /// 7. Cancelled Cx propagation through capture event recv under
+        ///    LabRuntime: mirrors the tailer supervisor's behavior when
+        ///    the runtime's Cx is cancelled during a capture batch.
+        #[test]
+        fn capture_recv_cancelled_cx_under_labruntime() {
+            run_lab(2007, || async move {
+                let (_tx, mut rx) = mpsc::channel::<u64>(4);
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("wa-124z4 tailer cancel"),
+                );
+                let result = rx.recv(&cx).await;
+                assert!(
+                    result.is_err(),
+                    "cancelled Cx must surface as recv error, got {result:?}"
+                );
+            });
+        }
+
+        /// 8. TailerMetrics defaults are all zero under LabRuntime: the
+        ///    supervisor's metric counters start clean.
+        #[test]
+        fn tailer_metrics_defaults_under_labruntime() {
+            run_lab(2008, || async move {
+                let m = TailerMetrics::default();
+                assert_eq!(m.events_sent, 0);
+                assert_eq!(m.send_timeouts, 0);
+                assert_eq!(m.capture_timeouts, 0);
+                assert_eq!(m.no_change_captures, 0);
+                assert_eq!(m.overflow_gaps_emitted, 0);
+
+                let sm = SupervisorMetrics::default();
+                assert_eq!(sm.tailers_started, 0);
+                assert_eq!(sm.tailers_stopped, 0);
+                assert_eq!(sm.sync_count, 0);
+            });
+        }
+    }
+}

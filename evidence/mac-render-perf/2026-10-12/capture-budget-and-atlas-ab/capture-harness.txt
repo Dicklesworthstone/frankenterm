@@ -1,0 +1,37 @@
+22:36:22.528Z run directory /Users/jemanuel/ft-build/capture-ab/harness; argv --gui-bin /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --ft-bin /Users/jemanuel/ft-staging/5351e/app/FrankenTerm.app/Contents/MacOS/ft --corpus-file /Users/jemanuel/color-emoji-random.bin --no-fps --no-beachball-probe --baseline ft --baseline-env FRANKENTERM_RENDER_CAPTURE_WAIT_MS=1 --reps 3 --out /Users/jemanuel/ft-build/capture-ab/harness
+22:36:22.803Z preflight: screen capture False, accessibility False
+22:36:23.161Z display refresh 60 Hz; FrankenTerm max_fps 120 (throttle 8.333334 ms, within one refresh period)
+22:36:23.174Z hashing /Users/jemanuel/color-emoji-random.bin (read-only)
+22:36:23.596Z corpus T0 color_emoji_random: /Users/jemanuel/color-emoji-random.bin (749801000 bytes, sha256 a442d89593da3bbfd1d059e186b999387098c2aa7d8d4a8df88f47b811c43767)
+22:36:24.362Z isolation probe: no mux visible under the harness environment (ft exit 1)
+22:36:24.377Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/00-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/00-ft /Users/jemanuel/color-emoji-random.bin 1 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-00-ft
+22:36:26.163Z run 0 ft: terminal pid 59859, pane shell pid 60347
+22:36:29.339Z run 0 ft: go (load [66.76, 100.74, 102.38])
+22:36:54.702Z cat pid 62176: 101 offset samples, drain 25.221 s
+22:37:03.188Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/01-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/01-ft_baseline /Users/jemanuel/color-emoji-random.bin 1 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-01-ft_baseline
+22:37:03.834Z run 1 ft_baseline: terminal pid 72945, pane shell pid 73059
+22:37:06.864Z run 1 ft_baseline: go (load [59.98, 95.13, 100.26])
+22:37:23.302Z cat pid 74122: 66 offset samples, drain 16.346 s
+22:37:30.291Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/02-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/02-ft_baseline /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-02-ft_baseline
+22:37:30.650Z run 2 ft_baseline: terminal pid 81449, pane shell pid 81564
+22:37:33.729Z run 2 ft_baseline: go (load [52.32, 90.46, 98.42])
+22:37:52.026Z cat pid 82508: 73 offset samples, drain 18.258 s
+22:37:57.860Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/03-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/03-ft /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-03-ft
+22:37:58.434Z run 3 ft: terminal pid 91446, pane shell pid 91638
+22:38:01.469Z run 3 ft: go (load [54.52, 87.48, 97.07])
+22:38:19.317Z cat pid 92552: 72 offset samples, drain 17.817 s
+22:38:24.906Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/04-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/04-ft /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-04-ft
+22:38:25.223Z run 4 ft: terminal pid 1610, pane shell pid 1731
+22:38:28.245Z run 4 ft: go (load [47.24, 83.15, 95.23])
+22:38:43.594Z cat pid 2833: 61 offset samples, drain 15.229 s
+22:38:48.699Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/harness/runs/05-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/harness/runs/05-ft_baseline /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/harness/width_probe.py ftgt-harness-05-ft_baseline
+22:38:49.227Z run 5 ft_baseline: terminal pid 10686, pane shell pid 10831
+22:38:52.253Z run 5 ft_baseline: go (load [44.65, 79.71, 93.64])
+22:39:09.220Z cat pid 11623: 67 offset samples, drain 16.776 s
+T0 color_emoji_random 749801000 bytes, load at go [[66.76, 100.74, 102.38], [59.98, 95.13, 100.26], [52.32, 90.46, 98.42], [54.52, 87.48, 97.07], [47.24, 83.15, 95.23], [44.65, 79.71, 93.64]]
+  ft: time total 17.836 s, FPS unavailable, beach balls 0
+  ft_baseline: time total 16.787 s, FPS unavailable, beach balls 0
+  drain verdict: NO_ADMISSIBLE_RATIO (ft total_s CV 26.7% > 5.0%; ft_baseline total_s CV 5.8% > 5.0%)
+  FPS verdict:   NO_ADMISSIBLE_RATIO (FPS not measured (--no-fps); ft has no mean_fps values; ft_baseline has no mean_fps values)
+  width parity:  0 disagreement(s) over 1376 codepoints
+receipt: /Users/jemanuel/ft-build/capture-ab/harness/receipt.json

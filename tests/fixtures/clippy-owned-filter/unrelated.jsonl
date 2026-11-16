@@ -1,0 +1,1 @@
+{"reason":"compiler-message","message":{"level":"error","message":"unrelated storage diagnostic","code":{"code":"clippy::unrelated"},"spans":[{"file_name":"crates/frankenterm-core/src/storage.rs","line_start":10,"line_end":10}],"rendered":"error: unrelated storage diagnostic\n"}}

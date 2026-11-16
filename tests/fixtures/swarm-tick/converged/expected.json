@@ -1,0 +1,52 @@
+{
+  "ts": "<scrubbed>",
+  "session": "frankenterm",
+  "git": {
+    "commits_1h": 5,
+    "commits_since_last_tick": 0
+  },
+  "beads": {
+    "open": 0,
+    "in_progress": 0,
+    "blocked": 1,
+    "ready": 0
+  },
+  "disk": {
+    "data_avail": "900Gi",
+    "data_used_pct": "50%",
+    "stale_targets_12h": 0,
+    "total_targets": 2,
+    "targets_size_mb": 4096
+  },
+  "swarm": {
+    "panes_count": 3,
+    "agents": [
+      { "idx": 0, "type": "user", "pane": "%41" },
+      { "idx": 1, "type": "claude", "pane": "%42" },
+      { "idx": 2, "type": "claude", "pane": "%43" }
+    ]
+  },
+  "coordinator": {
+    "mode": "ntm_robot_equivalents",
+    "native_coordinator_available": false,
+    "status": {
+      "total_agents": 2,
+      "healthy": 2,
+      "degraded": 0,
+      "unhealthy": 0,
+      "rate_limited": 0
+    },
+    "digest": {
+      "active_alerts": 0,
+      "critical_or_error_alerts": 0
+    },
+    "conflicts": {
+      "count": 0
+    },
+    "auto_assign": {
+      "idle_agents": 0,
+      "recommendations": 0,
+      "blocked_beads": 0
+    }
+  }
+}

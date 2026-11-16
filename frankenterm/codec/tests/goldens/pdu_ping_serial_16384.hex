@@ -1,0 +1,3 @@
+# Pdu::Ping(Ping {}) encoded with serial=16384.
+# tagged_len=4, serial=16384, ident=1
+04 80 80 01 01

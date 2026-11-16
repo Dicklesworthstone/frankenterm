@@ -1,0 +1,29 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 1,
+  "pane_filter": null,
+  "query": "panic",
+  "reasons": [
+    {
+      "code": "FTS_INDEX_INCONSISTENT",
+      "confidence": 0.85,
+      "evidence": [
+        {
+          "key": "pane_3_segments",
+          "value": "100"
+        },
+        {
+          "key": "pane_3_fts_rows",
+          "value": "0"
+        }
+      ],
+      "suggestions": [
+        "Run diagnostics: ft doctor",
+        "The FTS index may need rebuilding."
+      ],
+      "summary": "FTS index is inconsistent for 1 pane(s). Some content may not be searchable."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 100
+}

@@ -1,0 +1,16 @@
+[[artifacts]]
+path = "trace-a.ftreplay"
+label = "incident-a"
+
+[[artifacts]]
+path = "trace-b.ftreplay"
+label = "incident-b"
+
+[[overrides]]
+path = "strict.ftoverride"
+label = "strict"
+
+[config]
+concurrency = 2
+timeout_per_scenario_ms = 60000
+fail_fast = false

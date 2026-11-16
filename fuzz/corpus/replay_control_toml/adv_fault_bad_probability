@@ -1,0 +1,7 @@
+name = "bad-drop"
+seed = 1
+
+[[faults]]
+type = "drop"
+probability = 1.5
+[faults.filter]

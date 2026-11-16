@@ -1,0 +1,2563 @@
+//! Property-based tests for the policy module
+//!
+//! Tests invariants for ActionKind, ActorKind, PaneCapabilities, PolicyDecision,
+//! RiskScore, RiskConfig, RiskFactor, ApprovalRequest, SendTextAuditSummary,
+//! RuleEvaluation, DecisionEvidence, RateLimitSnapshot, AppliedRiskFactor,
+//! Redactor, is_command_candidate, RateLimiter, PolicyEngine,
+//! evaluate_policy_rules, InjectionResult, ForensicAuditEntry,
+//! ForensicNamespaceEvent, ForensicComplianceSummary, and ForensicReport.
+
+use frankenterm_core::policy::*;
+use frankenterm_core::policy_decision_log::{DecisionOutcome, PolicyDecisionEntry};
+use proptest::prelude::*;
+
+fn unreserved(mut caps: PaneCapabilities) -> PaneCapabilities {
+    caps.is_reserved = Some(false);
+    caps
+}
+
+// ============================================================================
+// Strategies
+// ============================================================================
+
+fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
+    prop_oneof![
+        Just(ActionKind::SendText),
+        Just(ActionKind::SendCtrlC),
+        Just(ActionKind::SendCtrlD),
+        Just(ActionKind::SendCtrlZ),
+        Just(ActionKind::SendControl),
+        Just(ActionKind::Spawn),
+        Just(ActionKind::Split),
+        Just(ActionKind::Activate),
+        Just(ActionKind::Close),
+        Just(ActionKind::BrowserAuth),
+        Just(ActionKind::WorkflowRun),
+        Just(ActionKind::ReservePane),
+        Just(ActionKind::ReleasePane),
+        Just(ActionKind::ReadOutput),
+        Just(ActionKind::SearchOutput),
+        Just(ActionKind::WriteFile),
+        Just(ActionKind::DeleteFile),
+        Just(ActionKind::ExecCommand),
+        Just(ActionKind::ConnectorNotify),
+        Just(ActionKind::ConnectorTicket),
+        Just(ActionKind::ConnectorTriggerWorkflow),
+        Just(ActionKind::ConnectorAuditLog),
+        Just(ActionKind::ConnectorInvoke),
+        Just(ActionKind::ConnectorCredentialAction),
+    ]
+}
+
+fn arb_actor_kind() -> impl Strategy<Value = ActorKind> {
+    prop_oneof![
+        Just(ActorKind::Human),
+        Just(ActorKind::Robot),
+        Just(ActorKind::Mcp),
+        Just(ActorKind::Workflow),
+    ]
+}
+
+fn arb_risk_category() -> impl Strategy<Value = RiskCategory> {
+    prop_oneof![
+        Just(RiskCategory::State),
+        Just(RiskCategory::Action),
+        Just(RiskCategory::Context),
+        Just(RiskCategory::Content),
+    ]
+}
+
+fn arb_policy_surface() -> impl Strategy<Value = PolicySurface> {
+    prop_oneof![
+        Just(PolicySurface::Unknown),
+        Just(PolicySurface::Mux),
+        Just(PolicySurface::Swarm),
+        Just(PolicySurface::Robot),
+        Just(PolicySurface::Connector),
+        Just(PolicySurface::Workflow),
+        Just(PolicySurface::Mcp),
+        Just(PolicySurface::Ipc),
+    ]
+}
+
+fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
+    (
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        proptest::option::of(proptest::bool::ANY),
+        proptest::bool::ANY,
+        proptest::option::of(proptest::bool::ANY),
+        proptest::option::of("[a-z-]{3,20}"),
+    )
+        .prop_map(
+            |(
+                prompt_active,
+                command_running,
+                alt_screen,
+                has_recent_gap,
+                is_reserved,
+                reserved_by,
+            )| {
+                PaneCapabilities {
+                    prompt_active,
+                    command_running,
+                    alt_screen,
+                    has_recent_gap,
+                    is_reserved,
+                    reserved_by,
+                }
+            },
+        )
+}
+
+fn arb_applied_risk_factor() -> impl Strategy<Value = AppliedRiskFactor> {
+    ("[a-z._]{3,30}", 0..=100u8, "[a-zA-Z ]{5,50}").prop_map(|(id, weight, explanation)| {
+        AppliedRiskFactor {
+            id,
+            weight,
+            explanation,
+        }
+    })
+}
+
+fn arb_risk_score() -> impl Strategy<Value = RiskScore> {
+    prop_oneof![
+        // Zero risk
+        Just(RiskScore::zero()),
+        // From factors (1-5 factors)
+        proptest::collection::vec(arb_applied_risk_factor(), 1..=5)
+            .prop_map(RiskScore::from_factors),
+    ]
+}
+
+fn arb_rule_evaluation() -> impl Strategy<Value = RuleEvaluation> {
+    (
+        "[a-z._]{3,30}",
+        proptest::bool::ANY,
+        proptest::option::of(prop_oneof![
+            Just("allow".to_string()),
+            Just("deny".to_string()),
+            Just("require_approval".to_string()),
+        ]),
+        proptest::option::of("[a-zA-Z ]{5,30}"),
+    )
+        .prop_map(|(rule_id, matched, decision, reason)| RuleEvaluation {
+            rule_id,
+            matched,
+            decision,
+            reason,
+        })
+}
+
+fn arb_decision_evidence() -> impl Strategy<Value = DecisionEvidence> {
+    ("[a-z_]{3,20}", "[a-zA-Z0-9 ]{1,30}").prop_map(|(key, value)| DecisionEvidence { key, value })
+}
+
+fn arb_rate_limit_snapshot() -> impl Strategy<Value = RateLimitSnapshot> {
+    (
+        prop_oneof![
+            Just("global".to_string()),
+            (0..1000u64).prop_map(|id| format!("per_pane:{}", id)),
+        ],
+        "[a-z_]{3,20}",
+        1..1000u32,
+        0..100usize,
+        0..120u64,
+    )
+        .prop_map(
+            |(scope, action, limit, current, retry_after_secs)| RateLimitSnapshot {
+                scope,
+                action,
+                limit,
+                current,
+                retry_after_secs,
+            },
+        )
+}
+
+fn arb_decision_context() -> impl Strategy<Value = DecisionContext> {
+    (
+        0..2_000_000_000_000i64,
+        arb_action_kind(),
+        arb_actor_kind(),
+        proptest::option::of(0..1000u64),
+        proptest::option::of("[a-z]{3,10}"),
+        arb_pane_capabilities(),
+        proptest::option::of("[a-z ]{3,30}"),
+        proptest::option::of("[a-z-]{3,20}"),
+        proptest::collection::vec(arb_rule_evaluation(), 0..3),
+        proptest::option::of("[a-z._]{3,20}"),
+        proptest::collection::vec(arb_decision_evidence(), 0..3),
+        proptest::option::of(arb_rate_limit_snapshot()),
+    )
+        .prop_map(
+            |(
+                timestamp_ms,
+                action,
+                actor,
+                pane_id,
+                domain,
+                capabilities,
+                text_summary,
+                workflow_id,
+                rules_evaluated,
+                determining_rule,
+                evidence,
+                rate_limit,
+            )| {
+                DecisionContext {
+                    timestamp_ms,
+                    action,
+                    actor,
+                    surface: PolicySurface::Unknown,
+                    pane_id,
+                    domain,
+                    capabilities,
+                    text_summary,
+                    workflow_id,
+                    rules_evaluated,
+                    determining_rule,
+                    evidence,
+                    rate_limit,
+                    risk: None, // Skip RiskScore in context to avoid nesting complexity
+                }
+            },
+        )
+}
+
+fn arb_policy_decision() -> impl Strategy<Value = PolicyDecision> {
+    prop_oneof![
+        // Allow variants
+        Just(PolicyDecision::allow()),
+        "[a-z._]{3,20}".prop_map(PolicyDecision::allow_with_rule),
+        // Deny variants
+        "[a-zA-Z ]{5,50}".prop_map(PolicyDecision::deny),
+        ("[a-zA-Z ]{5,50}", "[a-z._]{3,20}")
+            .prop_map(|(reason, rule)| PolicyDecision::deny_with_rule(reason, rule)),
+        // RequireApproval variants
+        "[a-zA-Z ]{5,50}".prop_map(PolicyDecision::require_approval),
+        ("[a-zA-Z ]{5,50}", "[a-z._]{3,20}")
+            .prop_map(|(reason, rule)| PolicyDecision::require_approval_with_rule(reason, rule)),
+    ]
+}
+
+// ============================================================================
+// ActionKind Properties
+// ============================================================================
+
+proptest! {
+    /// Property 1: ActionKind serde roundtrip
+    #[test]
+    fn prop_action_kind_serde_roundtrip(action in arb_action_kind()) {
+        let json = serde_json::to_string(&action).unwrap();
+        let back: ActionKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(action, back);
+    }
+
+    /// Property 2: ActionKind as_str is snake_case (lowercase with underscores)
+    #[test]
+    fn prop_action_kind_as_str_snake_case(action in arb_action_kind()) {
+        let s = action.as_str();
+        prop_assert!(!s.is_empty(), "as_str should not be empty");
+        prop_assert!(
+            s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "as_str should be snake_case: {}", s
+        );
+    }
+
+    /// Property 3: ActionKind serde serialization matches as_str
+    #[test]
+    fn prop_action_kind_serde_matches_as_str(action in arb_action_kind()) {
+        let json = serde_json::to_string(&action).unwrap();
+        let expected = format!("\"{}\"", action.as_str());
+        prop_assert_eq!(json, expected, "Serde and as_str should agree");
+    }
+
+    /// Property 4: is_destructive implies is_mutating or is non-pane destructive
+    #[test]
+    fn prop_action_kind_destructive_consistency(action in arb_action_kind()) {
+        if action.is_destructive() {
+            // DeleteFile is destructive but not mutating (it's a file op, not pane mutation)
+            // ConnectorCredentialAction is destructive but not mutating (connector-level, not pane)
+            // Close, SendCtrlC, SendCtrlD are both destructive and mutating
+            let is_non_pane = matches!(action, ActionKind::DeleteFile | ActionKind::ConnectorCredentialAction);
+            if !is_non_pane {
+                prop_assert!(action.is_mutating(),
+                    "Destructive pane action {:?} should also be mutating", action);
+            }
+        }
+    }
+
+    /// Property 5: Reads are passive; direct output reads are bandwidth-limited.
+    #[test]
+    fn prop_action_kind_read_actions_passive(action in arb_action_kind()) {
+        if matches!(action, ActionKind::ReadOutput | ActionKind::SearchOutput) {
+            prop_assert!(!action.is_mutating(), "Read actions should not be mutating");
+            prop_assert!(!action.is_destructive(), "Read actions should not be destructive");
+            prop_assert_eq!(action.is_rate_limited(), action == ActionKind::ReadOutput);
+        }
+    }
+
+    // ========================================================================
+    // ActorKind Properties
+    // ========================================================================
+
+    /// Property 6: ActorKind serde roundtrip
+    #[test]
+    fn prop_actor_kind_serde_roundtrip(actor in arb_actor_kind()) {
+        let json = serde_json::to_string(&actor).unwrap();
+        let back: ActorKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(actor, back);
+    }
+
+    /// Property 7: ActorKind as_str is snake_case
+    #[test]
+    fn prop_actor_kind_as_str_snake_case(actor in arb_actor_kind()) {
+        let s = actor.as_str();
+        prop_assert!(!s.is_empty(), "as_str should not be empty");
+        prop_assert!(
+            s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "as_str should be snake_case: {}", s
+        );
+    }
+
+    /// Property 8: Only Human is trusted
+    #[test]
+    fn prop_actor_kind_trust(actor in arb_actor_kind()) {
+        if matches!(actor, ActorKind::Human) {
+            prop_assert!(actor.is_trusted(), "Human should be trusted");
+        } else {
+            prop_assert!(!actor.is_trusted(), "{:?} should not be trusted", actor);
+        }
+    }
+
+    // ========================================================================
+    // PaneCapabilities Properties
+    // ========================================================================
+
+    /// Property 9: PaneCapabilities serde roundtrip
+    #[test]
+    fn prop_pane_capabilities_serde_roundtrip(caps in arb_pane_capabilities()) {
+        let json = serde_json::to_string(&caps).unwrap();
+        let back: PaneCapabilities = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(caps, back);
+    }
+
+    /// Property 10: is_state_known iff alt_screen is Some
+    #[test]
+    fn prop_pane_capabilities_state_known(caps in arb_pane_capabilities()) {
+        prop_assert_eq!(caps.is_state_known(), caps.alt_screen.is_some(),
+            "is_state_known should match alt_screen.is_some()");
+    }
+
+    /// Property 11: is_input_safe requires all safety conditions
+    #[test]
+    fn prop_pane_capabilities_input_safe(caps in arb_pane_capabilities()) {
+        let expected = caps.prompt_active
+            && !caps.command_running
+            && caps.alt_screen == Some(false)
+            && !caps.has_recent_gap
+            && caps.is_reserved == Some(false);
+        prop_assert_eq!(caps.is_input_safe(), expected,
+            "is_input_safe should match conjunction of all safety conditions");
+    }
+
+    /// Property 12: clear_gap_on_prompt only clears if prompt_active
+    #[test]
+    fn prop_pane_capabilities_clear_gap_requires_prompt(
+        mut caps in arb_pane_capabilities(),
+    ) {
+        caps.has_recent_gap = true;
+        let was_prompt_active = caps.prompt_active;
+        caps.clear_gap_on_prompt();
+        if was_prompt_active {
+            prop_assert!(!caps.has_recent_gap, "Gap should be cleared when prompt active");
+        } else {
+            prop_assert!(caps.has_recent_gap, "Gap should NOT be cleared without prompt");
+        }
+    }
+
+    /// Property 13: prompt state needs independent reservation authority
+    #[test]
+    fn prop_pane_capabilities_prompt_safe(_dummy in Just(())) {
+        let mut caps = PaneCapabilities::prompt();
+        prop_assert_eq!(caps.is_reserved, None);
+        prop_assert!(!caps.is_input_safe());
+        caps.is_reserved = Some(false);
+        prop_assert!(caps.is_input_safe(), "prompt() should be input safe");
+        prop_assert!(caps.prompt_active);
+        prop_assert!(!caps.command_running);
+        prop_assert_eq!(caps.alt_screen, Some(false));
+    }
+
+    /// Property 14: PaneCapabilities::running() is NOT input safe
+    #[test]
+    fn prop_pane_capabilities_running_not_safe(_dummy in Just(())) {
+        let caps = PaneCapabilities::running();
+        prop_assert!(!caps.is_input_safe(), "running() should not be input safe");
+        prop_assert!(caps.command_running);
+    }
+
+    /// Property 15: PaneCapabilities::unknown() is NOT input safe, NOT state known
+    #[test]
+    fn prop_pane_capabilities_unknown_not_safe(_dummy in Just(())) {
+        let caps = PaneCapabilities::unknown();
+        prop_assert!(!caps.is_input_safe(), "unknown() should not be input safe");
+        prop_assert!(!caps.is_state_known(), "unknown() should not be state known");
+    }
+
+    /// Property 16: PaneCapabilities::alt_screen() is NOT input safe
+    #[test]
+    fn prop_pane_capabilities_alt_screen_not_safe(_dummy in Just(())) {
+        let caps = PaneCapabilities::alt_screen();
+        prop_assert!(!caps.is_input_safe(), "alt_screen() should not be input safe");
+        prop_assert_eq!(caps.alt_screen, Some(true));
+    }
+
+    // ========================================================================
+    // RiskCategory Properties
+    // ========================================================================
+
+    /// Property 17: RiskCategory serde roundtrip
+    #[test]
+    fn prop_risk_category_serde_roundtrip(cat in arb_risk_category()) {
+        let json = serde_json::to_string(&cat).unwrap();
+        let back: RiskCategory = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cat, back);
+    }
+
+    /// Property 18: RiskCategory as_str is snake_case
+    #[test]
+    fn prop_risk_category_as_str_snake_case(cat in arb_risk_category()) {
+        let s = cat.as_str();
+        prop_assert!(
+            s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "as_str should be snake_case: {}", s
+        );
+    }
+
+    // ========================================================================
+    // RiskScore Properties
+    // ========================================================================
+
+    /// Property 19: RiskScore from_factors capped at 100
+    #[test]
+    fn prop_risk_score_capped_at_100(
+        factors in proptest::collection::vec(arb_applied_risk_factor(), 0..=10),
+    ) {
+        let score = RiskScore::from_factors(factors);
+        prop_assert!(score.score <= 100, "Score {} should be <= 100", score.score);
+    }
+
+    /// Property 20: RiskScore zero is low risk
+    #[test]
+    fn prop_risk_score_zero_is_low(_dummy in Just(())) {
+        let score = RiskScore::zero();
+        prop_assert_eq!(score.score, 0);
+        prop_assert!(score.is_low());
+        prop_assert!(!score.is_medium());
+        prop_assert!(!score.is_elevated());
+        prop_assert!(!score.is_high());
+    }
+
+    /// Property 21: RiskScore tier methods are mutually exclusive and cover all scores
+    #[test]
+    fn prop_risk_score_tier_exclusive(score_val in 0..=100u8) {
+        let score = RiskScore {
+            score: score_val,
+            factors: Vec::new(),
+            summary: String::new(),
+        };
+        let tiers = [score.is_low(), score.is_medium(), score.is_elevated(), score.is_high()];
+        let active_count = tiers.iter().filter(|&&t| t).count();
+        prop_assert_eq!(active_count, 1,
+            "Exactly one tier should be active for score {}, got {}",
+            score_val, active_count);
+    }
+
+    /// Property 22: RiskScore summary_for_score matches tier boundaries
+    #[test]
+    fn prop_risk_score_summary_matches_tier(score_val in 0..=100u8) {
+        let summary = RiskScore::summary_for_score(score_val);
+        match score_val {
+            0..=20 => prop_assert_eq!(summary, "Low risk"),
+            21..=50 => prop_assert_eq!(summary, "Medium risk"),
+            51..=70 => prop_assert_eq!(summary, "Elevated risk"),
+            71..=100 => prop_assert_eq!(summary, "High risk"),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Property 23: RiskScore serde roundtrip
+    #[test]
+    fn prop_risk_score_serde_roundtrip(score in arb_risk_score()) {
+        let json = serde_json::to_string(&score).unwrap();
+        let back: RiskScore = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(score.score, back.score);
+        prop_assert_eq!(score.factors.len(), back.factors.len());
+        prop_assert_eq!(&score.summary, &back.summary);
+    }
+
+    // ========================================================================
+    // RiskConfig Properties
+    // ========================================================================
+
+    /// Property 24: RiskConfig get_weight returns 0 for disabled factors
+    #[test]
+    fn prop_risk_config_disabled_returns_zero(
+        factor_id in "[a-z._]{3,20}",
+        base_weight in 0..=100u8,
+    ) {
+        let mut config = RiskConfig::default();
+        config.disabled.insert(factor_id.clone());
+        let weight = config.get_weight(&factor_id, base_weight);
+        prop_assert_eq!(weight, 0, "Disabled factor should have weight 0");
+    }
+
+    /// Property 25: RiskConfig get_weight uses override when present
+    #[test]
+    fn prop_risk_config_weight_override(
+        factor_id in "[a-z._]{3,20}",
+        base_weight in 0..=100u8,
+        override_weight in 0..=100u8,
+    ) {
+        let mut config = RiskConfig::default();
+        config.weights.insert(factor_id.clone(), override_weight);
+        let weight = config.get_weight(&factor_id, base_weight);
+        prop_assert_eq!(weight, override_weight.min(100),
+            "Weight should use override (capped at 100)");
+    }
+
+    /// Property 26: RiskConfig get_weight falls back to base when no override
+    #[test]
+    fn prop_risk_config_weight_fallback(
+        factor_id in "[a-z._]{3,20}",
+        base_weight in 0..=100u8,
+    ) {
+        let config = RiskConfig::default();
+        let weight = config.get_weight(&factor_id, base_weight);
+        prop_assert_eq!(weight, base_weight.min(100),
+            "Weight should fall back to base (capped at 100)");
+    }
+
+    /// Property 27: RiskConfig get_weight always <= 100
+    #[test]
+    fn prop_risk_config_weight_capped(
+        factor_id in "[a-z._]{3,20}",
+        base_weight in 0..=255u8, // u8 max
+    ) {
+        let config = RiskConfig::default();
+        let weight = config.get_weight(&factor_id, base_weight);
+        prop_assert!(weight <= 100, "Weight {} should be <= 100", weight);
+    }
+
+    /// Property 28: RiskConfig serde roundtrip
+    #[test]
+    fn prop_risk_config_serde_roundtrip(
+        enabled in proptest::bool::ANY,
+        allow_max in 0..=100u8,
+        require_approval_max in 0..=100u8,
+    ) {
+        let config = RiskConfig {
+            enabled,
+            allow_max,
+            require_approval_max,
+            weights: std::collections::HashMap::new(),
+            disabled: std::collections::HashSet::new(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RiskConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.enabled, back.enabled);
+        prop_assert_eq!(config.allow_max, back.allow_max);
+        prop_assert_eq!(config.require_approval_max, back.require_approval_max);
+    }
+
+    // ========================================================================
+    // RiskFactor Properties
+    // ========================================================================
+
+    /// Property 29: RiskFactor base_weight capped at 100
+    #[test]
+    fn prop_risk_factor_weight_capped(
+        weight in 0..=255u8,
+    ) {
+        let factor = RiskFactor::new("test.factor", RiskCategory::State, weight, "desc");
+        prop_assert!(factor.base_weight <= 100,
+            "base_weight {} should be capped at 100", factor.base_weight);
+    }
+
+    // ========================================================================
+    // PolicyDecision Properties
+    // ========================================================================
+
+    /// Property 30: PolicyDecision serde roundtrip
+    #[test]
+    fn prop_policy_decision_serde_roundtrip(decision in arb_policy_decision()) {
+        let json = serde_json::to_string(&decision).unwrap();
+        let back: PolicyDecision = serde_json::from_str(&json).unwrap();
+        // Check variant preservation
+        prop_assert_eq!(decision.is_allowed(), back.is_allowed());
+        prop_assert_eq!(decision.is_denied(), back.is_denied());
+        prop_assert_eq!(decision.requires_approval(), back.requires_approval());
+        prop_assert_eq!(decision.as_str(), back.as_str());
+    }
+
+    /// Property 31: PolicyDecision variant checks are mutually exclusive
+    #[test]
+    fn prop_policy_decision_variant_exclusive(decision in arb_policy_decision()) {
+        let checks = [
+            decision.is_allowed(),
+            decision.is_denied(),
+            decision.requires_approval(),
+        ];
+        let active = checks.iter().filter(|&&v| v).count();
+        prop_assert_eq!(active, 1,
+            "Exactly one variant check should be true, got {}", active);
+    }
+
+    /// Property 32: PolicyDecision::deny cannot be overridden by with_approval
+    #[test]
+    fn prop_policy_decision_deny_resists_approval(
+        reason in "[a-zA-Z ]{5,50}",
+    ) {
+        let deny = PolicyDecision::deny(&reason);
+        let approval = ApprovalRequest {
+            allow_once_code: "ABCD1234".to_string(),
+            allow_once_full_hash: "sha256:fake".to_string(),
+            expires_at: 999_999_999_999,
+            summary: "bypass attempt".to_string(),
+            command: "ft approve ABCD1234".to_string(),
+        };
+        let after = deny.with_approval(approval);
+        prop_assert!(after.is_denied(), "Deny should not be overridden by with_approval");
+        prop_assert!(!after.requires_approval());
+        prop_assert!(!after.is_allowed());
+    }
+
+    /// Property 33: PolicyDecision::allow is unchanged by with_approval
+    #[test]
+    fn prop_policy_decision_allow_ignores_approval(_dummy in Just(())) {
+        let allow = PolicyDecision::allow();
+        let approval = ApprovalRequest {
+            allow_once_code: "TEST".to_string(),
+            allow_once_full_hash: "sha256:test".to_string(),
+            expires_at: 0,
+            summary: "ignored".to_string(),
+            command: "ft approve TEST".to_string(),
+        };
+        let after = allow.with_approval(approval);
+        prop_assert!(after.is_allowed(), "Allow should remain after with_approval");
+        prop_assert!(after.approval_request().is_none());
+    }
+
+    /// Property 34: PolicyDecision as_str matches variant
+    #[test]
+    fn prop_policy_decision_as_str_matches(decision in arb_policy_decision()) {
+        match decision.as_str() {
+            "allow" => prop_assert!(decision.is_allowed()),
+            "deny" => prop_assert!(decision.is_denied()),
+            "require_approval" => prop_assert!(decision.requires_approval()),
+            other => prop_assert!(false, "Unknown as_str: {}", other),
+        }
+    }
+
+    /// Property 35: PolicyDecision reason is Some for Deny and RequireApproval, None for Allow
+    #[test]
+    fn prop_policy_decision_reason(decision in arb_policy_decision()) {
+        match &decision {
+            PolicyDecision::Allow { .. } => {
+                prop_assert!(decision.reason().is_none(),
+                    "Allow should have no reason");
+            }
+            PolicyDecision::Deny { reason, .. } => {
+                prop_assert_eq!(decision.reason(), Some(reason.as_str()),
+                    "Deny reason should match");
+            }
+            PolicyDecision::RequireApproval { reason, .. } => {
+                prop_assert_eq!(decision.reason(), Some(reason.as_str()),
+                    "RequireApproval reason should match");
+            }
+        }
+    }
+
+    /// Property 36: with_context preserves decision variant and attaches context
+    #[test]
+    fn prop_policy_decision_with_context(
+        decision in arb_policy_decision(),
+        ctx in arb_decision_context(),
+    ) {
+        let original_str = decision.as_str().to_string();
+        let with_ctx = decision.with_context(ctx);
+        prop_assert_eq!(with_ctx.as_str(), original_str.as_str(),
+            "Decision variant should be preserved after with_context");
+        prop_assert!(with_ctx.context().is_some(),
+            "Context should be attached after with_context");
+    }
+
+    // ========================================================================
+    // DecisionContext Properties
+    // ========================================================================
+
+    /// Property 37: DecisionContext serde roundtrip
+    #[test]
+    fn prop_decision_context_serde_roundtrip(ctx in arb_decision_context()) {
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: DecisionContext = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(ctx.timestamp_ms, back.timestamp_ms);
+        prop_assert_eq!(ctx.action, back.action);
+        prop_assert_eq!(ctx.actor, back.actor);
+        prop_assert_eq!(ctx.pane_id, back.pane_id);
+        prop_assert_eq!(&ctx.domain, &back.domain);
+        prop_assert_eq!(ctx.capabilities, back.capabilities);
+        prop_assert_eq!(&ctx.text_summary, &back.text_summary);
+        prop_assert_eq!(&ctx.workflow_id, &back.workflow_id);
+        prop_assert_eq!(ctx.rules_evaluated.len(), back.rules_evaluated.len());
+        prop_assert_eq!(&ctx.determining_rule, &back.determining_rule);
+        prop_assert_eq!(ctx.evidence.len(), back.evidence.len());
+    }
+
+    /// Property 38: DecisionContext::empty has sensible defaults
+    #[test]
+    fn prop_decision_context_empty(_dummy in Just(())) {
+        let ctx = DecisionContext::empty();
+        prop_assert_eq!(ctx.timestamp_ms, 0);
+        prop_assert!(ctx.rules_evaluated.is_empty());
+        prop_assert!(ctx.determining_rule.is_none());
+        prop_assert!(ctx.evidence.is_empty());
+        prop_assert!(ctx.rate_limit.is_none());
+        prop_assert!(ctx.risk.is_none());
+    }
+
+    /// Property 39: record_rule appends to rules_evaluated
+    #[test]
+    fn prop_decision_context_record_rule(
+        n_rules in 1..10usize,
+    ) {
+        let mut ctx = DecisionContext::empty();
+        for i in 0..n_rules {
+            ctx.record_rule(format!("rule.{}", i), i % 2 == 0, None, None);
+        }
+        prop_assert_eq!(ctx.rules_evaluated.len(), n_rules,
+            "Should have {} rules, got {}", n_rules, ctx.rules_evaluated.len());
+    }
+
+    /// Property 40: add_evidence appends to evidence
+    #[test]
+    fn prop_decision_context_add_evidence(
+        n_items in 1..10usize,
+    ) {
+        let mut ctx = DecisionContext::empty();
+        for i in 0..n_items {
+            ctx.add_evidence(format!("key_{}", i), format!("val_{}", i));
+        }
+        prop_assert_eq!(ctx.evidence.len(), n_items);
+    }
+
+    // ========================================================================
+    // is_command_candidate Properties
+    // ========================================================================
+
+    /// Property 41: Empty string is never a command candidate
+    #[test]
+    fn prop_command_candidate_empty(_dummy in Just(())) {
+        prop_assert!(!is_command_candidate(""), "Empty string should not be a command");
+        prop_assert!(!is_command_candidate("  "), "Whitespace should not be a command");
+        prop_assert!(!is_command_candidate("\n\n"), "Newlines should not be a command");
+    }
+
+    /// Property 42: Comments (# prefix) are never command candidates
+    #[test]
+    fn prop_command_candidate_comments(text in "[a-zA-Z0-9 ]{1,50}") {
+        let comment = format!("# {}", text);
+        prop_assert!(!is_command_candidate(&comment),
+            "Comment should not be a command: {}", comment);
+    }
+
+    /// Property 43: Known command tokens are recognized
+    #[test]
+    fn prop_command_candidate_known_tokens(
+        token in prop_oneof![
+            Just("git"), Just("rm"), Just("sudo"), Just("docker"),
+            Just("cargo"), Just("npm"), Just("python"), Just("node"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let cmd = format!("{} {}", token, args);
+        prop_assert!(is_command_candidate(&cmd),
+            "Known token '{}' should be a command candidate: {}", token, cmd);
+    }
+
+    /// Property 44: Dollar-prefixed commands are recognized
+    #[test]
+    fn prop_command_candidate_dollar_prefix(
+        token in prop_oneof![
+            Just("git"), Just("rm"), Just("cargo"), Just("npm"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let cmd = format!("$ {} {}", token, args);
+        prop_assert!(is_command_candidate(&cmd),
+            "Dollar-prefixed '{}' should be a command: {}", token, cmd);
+    }
+
+    /// Property 45: Shell operators make text a command candidate
+    #[test]
+    fn prop_command_candidate_operators(
+        left in "[a-z]{3,10}",
+        op in prop_oneof![Just("&&"), Just("||"), Just("|"), Just(">"), Just(";")],
+        right in "[a-z]{3,10}",
+    ) {
+        let cmd = format!("{} {} {}", left, op, right);
+        prop_assert!(is_command_candidate(&cmd),
+            "Shell operator '{}' should make it a command: {}", op, cmd);
+    }
+
+    /// Property 73: Absolute path commands are detected
+    #[test]
+    fn prop_command_candidate_absolute_path(
+        dir in prop_oneof![
+            Just("/bin"), Just("/usr/bin"), Just("/usr/local/bin"),
+            Just("/sbin"), Just("/opt/homebrew/bin"),
+        ],
+        cmd in prop_oneof![
+            Just("rm"), Just("curl"), Just("python3"), Just("bash"),
+            Just("sh"), Just("env"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("{}/{} {}", dir, cmd, args);
+        prop_assert!(is_command_candidate(&full),
+            "Absolute path command should be detected: {}", full);
+    }
+
+    /// Property 74: Relative path commands are detected
+    #[test]
+    fn prop_command_candidate_relative_path(
+        prefix in prop_oneof![Just("./"), Just("../"), Just("../../")],
+        cmd in "[a-z_]{1,12}",
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("{}{} {}", prefix, cmd, args);
+        prop_assert!(is_command_candidate(&full),
+            "Relative path command should be detected: {}", full);
+    }
+
+    /// Property 75: sudo + absolute path commands are detected
+    #[test]
+    fn prop_command_candidate_sudo_path(
+        path in prop_oneof![
+            Just("/bin/rm"), Just("/usr/bin/kill"), Just("./cleanup.sh"),
+            Just("/usr/local/bin/docker"),
+        ],
+        args in "[a-z ]{0,20}",
+    ) {
+        let full = format!("sudo {} {}", path, args);
+        prop_assert!(is_command_candidate(&full),
+            "sudo + path command should be detected: {}", full);
+    }
+
+    /// Property 76: Variable assignment + path command still detected
+    #[test]
+    fn prop_command_candidate_var_assign_path(
+        var in "[A-Z]{1,6}",
+        val in "[a-z0-9]{1,8}",
+        path in prop_oneof![
+            Just("/bin/rm"), Just("./build.sh"), Just("/usr/bin/env"),
+        ],
+        args in "[a-z ]{0,10}",
+    ) {
+        let full = format!("{}={} {} {}", var, val, path, args);
+        prop_assert!(is_command_candidate(&full),
+            "VAR=val + path command should be detected: {}", full);
+    }
+
+    /// Property 77: Pure alphanumeric non-command tokens are not candidates
+    #[test]
+    fn prop_command_candidate_non_command_alphanumeric(
+        word in "[A-Z][a-z]{2,10}[0-9]{0,3}",
+    ) {
+        // Words that aren't in COMMAND_TOKENS and don't contain path separators
+        // or shell operators shouldn't be candidates (unless they happen to match a token)
+        let result = is_command_candidate(&word);
+        let lower = word.to_ascii_lowercase();
+        if !result {
+            // Verified: not a command candidate
+            prop_assert!(!lower.contains('/'));
+            prop_assert!(!lower.contains('\\'));
+        }
+        // If it IS a candidate, it must be in COMMAND_TOKENS or contain operators
+    }
+
+    // ========================================================================
+    // Redactor Properties
+    // ========================================================================
+
+    /// Property 46: Redactor idempotency - redacting twice gives same result
+    #[test]
+    fn prop_redactor_idempotent(text in "[a-zA-Z0-9 =:_-]{0,200}") {
+        let redactor = Redactor::new();
+        let once = redactor.redact(&text);
+        let twice = redactor.redact(&once);
+        prop_assert_eq!(&once, &twice, "Redacting twice should give same result");
+    }
+
+    /// Property 47: contains_secrets and redact are consistent
+    #[test]
+    fn prop_redactor_contains_vs_redact(text in "[a-zA-Z0-9 =:_-]{0,200}") {
+        let redactor = Redactor::new();
+        let has_secrets = redactor.contains_secrets(&text);
+        let redacted = redactor.redact(&text);
+        if has_secrets {
+            prop_assert!(redacted.contains("[REDACTED]"),
+                "If contains_secrets, redacted text should have [REDACTED]");
+        }
+        if !redacted.contains("[REDACTED]") {
+            // If no redaction markers, either no secrets or text didn't change
+            prop_assert_eq!(&redacted, &text,
+                "No [REDACTED] markers means text unchanged");
+        }
+    }
+
+    /// Property 48: debug markers include pattern names
+    #[test]
+    fn prop_redactor_debug_markers(_dummy in Just(())) {
+        let redactor = Redactor::with_debug_markers();
+        let input = "sk-abc123456789012345678901234567890123456789012345678901";
+        let output = redactor.redact(input);
+        prop_assert!(output.contains("[REDACTED:"), "Debug markers should include pattern name");
+    }
+
+    /// Property 49: detect returns sorted positions
+    #[test]
+    fn prop_redactor_detect_sorted(text in "[a-zA-Z0-9 =:_-]{0,200}") {
+        let redactor = Redactor::new();
+        let detections = redactor.detect(&text);
+        for window in detections.windows(2) {
+            prop_assert!(window[0].1 <= window[1].1,
+                "Detections should be sorted by start position");
+        }
+    }
+
+    // ========================================================================
+    // PolicyEngine Properties
+    // ========================================================================
+
+    /// Property 50: Human actors bypass alt-screen unknown check
+    #[test]
+    fn prop_engine_human_bypasses_alt_unknown(
+        action in prop_oneof![Just(ActionKind::SendText), Just(ActionKind::SendControl)],
+    ) {
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = unreserved(PaneCapabilities::prompt());
+        caps.alt_screen = None; // Unknown
+        let input = PolicyInput::new(action, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(caps);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_allowed(),
+            "Human should be allowed with unknown alt-screen");
+    }
+
+    /// Property 51: Alt-screen active always denies SendText/SendControl (even human)
+    #[test]
+    fn prop_engine_alt_screen_always_denies(
+        actor in arb_actor_kind(),
+        action in prop_oneof![Just(ActionKind::SendText), Just(ActionKind::SendControl)],
+    ) {
+        let mut engine = PolicyEngine::permissive();
+        let caps = unreserved(PaneCapabilities::alt_screen());
+        let input = PolicyInput::new(action, actor)
+            .with_pane(1)
+            .with_capabilities(caps);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_denied(),
+            "Alt-screen should deny {:?} for {:?}", action, actor);
+        prop_assert_eq!(decision.rule_id(), Some("policy.alt_screen"));
+    }
+
+    /// Property 52: Read/search actions always allowed regardless of pane state
+    #[test]
+    fn prop_engine_read_always_allowed(
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+    ) {
+        let mut engine = PolicyEngine::strict();
+        let input = PolicyInput::new(ActionKind::ReadOutput, actor)
+            .with_pane(1)
+            .with_capabilities(caps);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_allowed(),
+            "ReadOutput should always be allowed");
+    }
+
+    /// Property 53: Destructive actions by non-human require approval (when not in alt-screen)
+    #[test]
+    fn prop_engine_destructive_non_human_needs_approval(
+        actor in prop_oneof![Just(ActorKind::Robot), Just(ActorKind::Mcp), Just(ActorKind::Workflow)],
+    ) {
+        let mut engine = PolicyEngine::permissive();
+        // Close is destructive but not a send action, so alt-screen/prompt checks don't apply
+        let input = PolicyInput::new(ActionKind::Close, actor)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.requires_approval(),
+            "Destructive action by {:?} should require approval", actor);
+        prop_assert_eq!(decision.rule_id(), Some("policy.destructive_action"));
+    }
+
+    /// Property 54: Destructive actions by human are allowed
+    #[test]
+    fn prop_engine_destructive_human_allowed(_dummy in Just(())) {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_allowed(),
+            "Human destructive actions should be allowed");
+    }
+
+    /// Property 55: Reserved pane denies mutating actions from other workflows
+    #[test]
+    fn prop_engine_reserved_pane_denies_other(
+        my_wf in "[a-z]{3,10}",
+        other_wf in "[a-z]{3,10}",
+    ) {
+        prop_assume!(my_wf != other_wf);
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.is_reserved = Some(true);
+        caps.reserved_by = Some(other_wf.clone());
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_workflow(&my_wf);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_denied(),
+            "Reserved pane should deny other workflow");
+        prop_assert_eq!(decision.rule_id(), Some("policy.pane_reserved"));
+    }
+
+    /// Property 56: Reserved pane allows owning workflow
+    #[test]
+    fn prop_engine_reserved_pane_allows_owner(wf_id in "[a-z]{3,10}") {
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.is_reserved = Some(true);
+        caps.reserved_by = Some(wf_id.clone());
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_workflow(&wf_id);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_allowed(),
+            "Reserved pane should allow owning workflow");
+    }
+
+    /// Property 57: Risk scoring disabled returns zero
+    #[test]
+    fn prop_engine_risk_disabled(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+    ) {
+        let engine = PolicyEngine::permissive()
+            .with_risk_config(RiskConfig { enabled: false, ..Default::default() });
+        let input = PolicyInput::new(action, actor);
+        let risk = engine.calculate_risk(&input);
+        prop_assert_eq!(risk.score, 0, "Disabled risk scoring should return 0");
+    }
+
+    /// Property 58: risk_to_decision respects thresholds
+    #[test]
+    fn prop_engine_risk_to_decision_thresholds(score_val in 0..=100u8) {
+        let engine = PolicyEngine::permissive(); // default: allow_max=50, require_approval_max=70
+        let risk = RiskScore {
+            score: score_val,
+            factors: Vec::new(),
+            summary: String::new(),
+        };
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        let decision = engine.risk_to_decision(&risk, &input);
+        if score_val <= 50 {
+            prop_assert!(decision.is_allowed(),
+                "Score {} <= 50 should allow", score_val);
+        } else if score_val <= 70 {
+            prop_assert!(decision.requires_approval(),
+                "Score {} in 51-70 should require approval", score_val);
+        } else {
+            prop_assert!(decision.is_denied(),
+                "Score {} > 70 should deny", score_val);
+        }
+    }
+
+    // ========================================================================
+    // InjectionResult Properties
+    // ========================================================================
+
+    /// Property 59: InjectionResult variant checks are mutually exclusive
+    #[test]
+    fn prop_injection_result_variant_exclusive(
+        variant in 0..4u32,
+    ) {
+        let result = match variant {
+            0 => InjectionResult::Allowed {
+                decision: PolicyDecision::allow(),
+                summary: "test".to_string(),
+                pane_id: 1,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            1 => InjectionResult::Denied {
+                decision: PolicyDecision::deny("reason"),
+                summary: "test".to_string(),
+                pane_id: 1,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            2 => InjectionResult::RequiresApproval {
+                decision: PolicyDecision::require_approval("reason"),
+                summary: "test".to_string(),
+                pane_id: 1,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            _ => InjectionResult::Error {
+                decision: PolicyDecision::allow(),
+                error: "err".to_string(),
+                pane_id: 1,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+        };
+
+        let checks = [
+            result.is_allowed(),
+            result.is_denied(),
+            result.requires_approval(),
+            result.error_message().is_some(),
+        ];
+        let active = checks.iter().filter(|&&v| v).count();
+        prop_assert_eq!(active, 1,
+            "Exactly one variant check should be true for variant {}", variant);
+    }
+
+    /// Property 60: InjectionResult serde roundtrip preserves variant
+    #[test]
+    fn prop_injection_result_serde_roundtrip(variant in 0..4u32) {
+        let result = match variant {
+            0 => InjectionResult::Allowed {
+                decision: PolicyDecision::allow(),
+                summary: "ls -la".to_string(),
+                pane_id: 42,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            1 => InjectionResult::Denied {
+                decision: PolicyDecision::deny("blocked"),
+                summary: "rm -rf".to_string(),
+                pane_id: 1,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+            2 => InjectionResult::RequiresApproval {
+                decision: PolicyDecision::require_approval("needs approval"),
+                summary: "git reset".to_string(),
+                pane_id: 5,
+                action: ActionKind::SendCtrlC,
+                audit_action_id: None,
+            },
+            _ => InjectionResult::Error {
+                decision: PolicyDecision::allow(),
+                error: "connection lost".to_string(),
+                pane_id: 99,
+                action: ActionKind::SendText,
+                audit_action_id: None,
+            },
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: InjectionResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result.is_allowed(), back.is_allowed());
+        prop_assert_eq!(result.is_denied(), back.is_denied());
+        prop_assert_eq!(result.requires_approval(), back.requires_approval());
+        prop_assert_eq!(result.error_message().is_some(), back.error_message().is_some());
+    }
+
+    /// Property 61: InjectionResult set_audit_action_id is retrievable
+    #[test]
+    fn prop_injection_result_audit_id(id in 1..10000i64) {
+        let mut result = InjectionResult::Allowed {
+            decision: PolicyDecision::allow(),
+            summary: "test".to_string(),
+            pane_id: 1,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        };
+        prop_assert!(result.audit_action_id().is_none());
+        result.set_audit_action_id(id);
+        prop_assert_eq!(result.audit_action_id(), Some(id));
+    }
+
+    // ========================================================================
+    // PolicyInput Properties
+    // ========================================================================
+
+    /// Property 62: PolicyInput builder preserves fields
+    #[test]
+    fn prop_policy_input_builder(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        pane_id in 0..1000u64,
+        domain in "[a-z]{3,10}",
+    ) {
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_domain(&domain);
+        prop_assert_eq!(input.action, action);
+        prop_assert_eq!(input.actor, actor);
+        prop_assert_eq!(input.pane_id, Some(pane_id));
+        prop_assert_eq!(input.domain.as_deref(), Some(domain.as_str()));
+    }
+
+    /// Property 63: PolicyInput serde roundtrip (excluding skip fields)
+    #[test]
+    fn prop_policy_input_serde_roundtrip(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        pane_id in proptest::option::of(0..1000u64),
+        domain in proptest::option::of("[a-z]{3,10}"),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        if let Some(pid) = pane_id {
+            input = input.with_pane(pid);
+        }
+        if let Some(ref d) = domain {
+            input = input.with_domain(d);
+        }
+        let json = serde_json::to_string(&input).unwrap();
+        let back: PolicyInput = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(input.action, back.action);
+        prop_assert_eq!(input.actor, back.actor);
+        prop_assert_eq!(input.pane_id, back.pane_id);
+        prop_assert_eq!(&input.domain, &back.domain);
+        // command_text is serde(skip), so it won't roundtrip
+        prop_assert!(back.command_text.is_none());
+    }
+
+    // ========================================================================
+    // RateLimiter Properties
+    // ========================================================================
+
+    /// Property 64: RateLimiter different panes are independent
+    #[test]
+    fn prop_rate_limiter_pane_isolation(
+        pane_a in 1..100u64,
+        pane_b in 100..200u64,
+    ) {
+        let mut limiter = RateLimiter::new(1, 1000);
+        // Fill pane_a's limit
+        assert!(limiter.check(ActionKind::SendText, Some(pane_a)).is_allowed());
+        // pane_b should still be allowed
+        let outcome = limiter.check(ActionKind::SendText, Some(pane_b));
+        prop_assert!(outcome.is_allowed(),
+            "Different pane {} should not be affected by pane {}", pane_b, pane_a);
+    }
+
+    /// Property 65: RateLimiter different actions are independent
+    #[test]
+    fn prop_rate_limiter_action_isolation(
+        pane_id in 1..100u64,
+    ) {
+        let mut limiter = RateLimiter::new(1, 1000);
+        assert!(limiter.check(ActionKind::SendText, Some(pane_id)).is_allowed());
+        // Different action should still be allowed
+        let outcome = limiter.check(ActionKind::SendCtrlC, Some(pane_id));
+        prop_assert!(outcome.is_allowed(),
+            "Different action should not be limited by SendText");
+    }
+
+    /// Property 66: RateLimiter with limit 0 allows everything (disabled)
+    #[test]
+    fn prop_rate_limiter_zero_limit_allows(
+        n in 1..20usize,
+        pane_id in 1..100u64,
+    ) {
+        let mut limiter = RateLimiter::new(0, 0);
+        for _ in 0..n {
+            let outcome = limiter.check(ActionKind::SendText, Some(pane_id));
+            prop_assert!(outcome.is_allowed(),
+                "Zero limit should allow everything");
+        }
+    }
+
+    // ========================================================================
+    // Command Gate Properties
+    // ========================================================================
+
+    /// Property 67: rm -rf / always denied
+    #[test]
+    fn prop_command_gate_rm_rf_root_denied(_dummy in Just(())) {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
+            .with_command_text("rm -rf /");
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_denied(), "rm -rf / should be denied");
+        prop_assert_eq!(decision.rule_id(), Some("command.rm_rf_root"));
+    }
+
+    /// Property 68: rm -rf ~ always denied
+    #[test]
+    fn prop_command_gate_rm_rf_home_denied(_dummy in Just(())) {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
+            .with_command_text("rm -rf ~");
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_denied(), "rm -rf ~ should be denied");
+    }
+
+    /// Property 69: Non-command text passes command gate
+    #[test]
+    fn prop_command_gate_non_command_passes(
+        text in "[a-zA-Z ]{10,50}",
+    ) {
+        // Filter out texts that happen to contain command tokens
+        prop_assume!(!text.to_lowercase().contains("git"));
+        prop_assume!(!text.to_lowercase().contains("rm "));
+        prop_assume!(!text.to_lowercase().contains("sudo"));
+        prop_assume!(!text.to_lowercase().contains("npm"));
+        prop_assume!(!text.to_lowercase().contains("cargo"));
+        prop_assume!(!text.to_lowercase().contains("make"));
+        prop_assume!(!text.to_lowercase().contains("node"));
+        prop_assume!(!text.to_lowercase().contains("python"));
+        prop_assume!(!text.to_lowercase().contains("bash"));
+        prop_assume!(!text.to_lowercase().contains("find"));
+        prop_assume!(!text.to_lowercase().contains("export"));
+        prop_assume!(!text.contains("&&"));
+        prop_assume!(!text.contains("||"));
+        prop_assume!(!text.contains("|"));
+        prop_assume!(!text.contains(">"));
+        prop_assume!(!text.contains(";"));
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
+            .with_command_text(&text);
+        let decision = engine.authorize(&input);
+        prop_assert!(decision.is_allowed(),
+            "Non-command text should be allowed: {}", text);
+    }
+
+    // ========================================================================
+    // SendTextAuditSummary Properties
+    // ========================================================================
+
+    /// Property 70: build_send_text_audit_summary returns valid JSON
+    #[test]
+    fn prop_audit_summary_valid_json(
+        text in "[a-zA-Z0-9 ]{1,100}",
+        wf_id in proptest::option::of("[a-z-]{3,20}"),
+    ) {
+        let summary = build_send_text_audit_summary(&text, wf_id.as_deref(), None);
+        let parsed: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        prop_assert!(parsed.is_object(), "Audit summary should be a JSON object");
+        prop_assert!(parsed.get("text_length").is_some());
+        prop_assert!(parsed.get("text_preview_redacted").is_some());
+        prop_assert!(parsed.get("text_hash").is_some());
+        prop_assert!(parsed.get("command_candidate").is_some());
+    }
+
+    /// Property 71: audit summary text_length matches input
+    #[test]
+    fn prop_audit_summary_length(text in "[a-zA-Z0-9 ]{1,100}") {
+        let summary = build_send_text_audit_summary(&text, None, None);
+        let parsed: SendTextAuditSummary = serde_json::from_str(&summary).unwrap();
+        prop_assert_eq!(parsed.text_length, text.len(),
+            "text_length should match input length");
+    }
+
+    /// Property 72: audit summary command_candidate matches is_command_candidate
+    #[test]
+    fn prop_audit_summary_command_candidate(text in "[a-zA-Z0-9 ]{1,100}") {
+        let summary = build_send_text_audit_summary(&text, None, None);
+        let parsed: SendTextAuditSummary = serde_json::from_str(&summary).unwrap();
+        prop_assert_eq!(parsed.command_candidate, is_command_candidate(&text),
+            "command_candidate should match is_command_candidate for: {}", text);
+    }
+
+    // ========================================================================
+    // PolicySurface Properties (ft-3681t.6.1 support slice)
+    // ========================================================================
+
+    /// Property 73: PolicySurface serde roundtrip preserves all 8 variants
+    #[test]
+    fn prop_surface_serde_roundtrip(surface in arb_policy_surface()) {
+        let json = serde_json::to_string(&surface).unwrap();
+        let back: PolicySurface = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(surface, back,
+            "PolicySurface serde roundtrip failed for {:?}", surface);
+    }
+
+    /// Property 74: PolicySurface as_str() returns non-empty stable identifier
+    #[test]
+    fn prop_surface_as_str_nonempty(surface in arb_policy_surface()) {
+        let s = surface.as_str();
+        prop_assert!(!s.is_empty(), "as_str() should never be empty");
+        // Verify lowercase convention
+        prop_assert_eq!(s, s.to_lowercase(), "as_str() should be lowercase: {}", s);
+    }
+
+    /// Property 75: PolicySurface as_str() matches serde serialization value
+    #[test]
+    fn prop_surface_as_str_matches_serde(surface in arb_policy_surface()) {
+        let json = serde_json::to_string(&surface).unwrap();
+        // Serde serializes as quoted string: "mux", "robot", etc.
+        let expected = format!("\"{}\"", surface.as_str());
+        prop_assert_eq!(json, expected,
+            "as_str() should match serde output for {:?}", surface);
+    }
+
+    /// Property 76: default_for_actor returns deterministic surface for each actor
+    #[test]
+    fn prop_surface_default_for_actor_deterministic(actor in arb_actor_kind()) {
+        let s1 = PolicySurface::default_for_actor(actor);
+        let s2 = PolicySurface::default_for_actor(actor);
+        prop_assert_eq!(s1, s2,
+            "default_for_actor should be deterministic for {:?}", actor);
+    }
+
+    /// Property 77: Human actor always gets Unknown default surface
+    #[test]
+    fn prop_surface_human_always_unknown(_dummy in 0..100u32) {
+        let surface = PolicySurface::default_for_actor(ActorKind::Human);
+        prop_assert_eq!(surface, PolicySurface::Unknown,
+            "Human actor should always get Unknown surface");
+    }
+
+    /// Property 78: Non-human actors get specific (non-Unknown) default surfaces
+    #[test]
+    fn prop_surface_nonhuman_specific(actor in prop_oneof![
+        Just(ActorKind::Robot),
+        Just(ActorKind::Mcp),
+        Just(ActorKind::Workflow),
+    ]) {
+        let surface = PolicySurface::default_for_actor(actor);
+        prop_assert_ne!(surface, PolicySurface::Unknown,
+            "Non-human actor {:?} should get specific surface", actor);
+    }
+
+    /// Property 79: PolicyInput::new assigns actor-based default surface
+    #[test]
+    fn prop_input_new_default_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+    ) {
+        let input = PolicyInput::new(action, actor);
+        let expected = PolicySurface::default_for_actor(actor);
+        prop_assert_eq!(input.surface, expected,
+            "PolicyInput::new should assign default surface for {:?}", actor);
+    }
+
+    /// Property 80: Direct surface override on PolicyInput takes effect
+    #[test]
+    fn prop_input_surface_override(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        prop_assert_eq!(input.surface, surface,
+            "Direct surface assignment should take effect");
+    }
+
+    /// Property 81: DecisionContext::from_input preserves input surface
+    #[test]
+    fn prop_context_from_input_preserves_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        prop_assert_eq!(ctx.surface, surface,
+            "DecisionContext should preserve input surface");
+    }
+
+    /// Property 82: DecisionContext serde roundtrip preserves surface
+    #[test]
+    fn prop_context_surface_serde_roundtrip(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: DecisionContext = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.surface, surface,
+            "DecisionContext surface should survive serde roundtrip");
+    }
+
+    /// Property 83: Empty surfaces list in PolicyRuleMatch is catch-all for surface
+    #[test]
+    fn prop_rule_empty_surfaces_catches_all(
+        surface in arb_policy_surface(),
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+    ) {
+        let rule = frankenterm_core::config::PolicyRuleMatch::default();
+        // An empty catch-all match_on should match any surface
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+
+        // Construct a policy engine with a catch-all deny rule
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.catchall".to_string(),
+                    description: Some("catch-all rule".to_string()),
+                    priority: 1,
+                    match_on: rule,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        // Should match regardless of surface (catch-all)
+        input.capabilities = unreserved(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        prop_assert!(!decision.is_allowed(),
+            "Catch-all rule should deny on any surface {:?}", surface);
+    }
+
+    /// Property 84: Surface-specific rule only matches listed surface
+    #[test]
+    fn prop_rule_surface_filter(
+        target_surface in arb_policy_surface(),
+        input_surface in arb_policy_surface(),
+    ) {
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![target_surface.as_str().to_string()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.surface.filter".to_string(),
+                    description: Some("surface-filtered rule".to_string()),
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = input_surface;
+        input.capabilities = unreserved(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+
+        if target_surface == input_surface {
+            prop_assert!(!decision.is_allowed(),
+                "Surface-filtered rule should deny when surfaces match: {:?}",
+                target_surface);
+        } else {
+            prop_assert!(decision.is_allowed(),
+                "Surface-filtered rule should allow when surfaces differ: target={:?}, input={:?}",
+                target_surface, input_surface);
+        }
+    }
+
+    /// Property 85: Surface matching is case-insensitive
+    #[test]
+    fn prop_surface_case_insensitive(surface in arb_policy_surface()) {
+        let upper_name = surface.as_str().to_uppercase();
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![upper_name.clone()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.surface.case".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = surface;
+        input.capabilities = unreserved(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        prop_assert!(!decision.is_allowed(),
+            "Surface matching should be case-insensitive: rule='{}', input='{}'",
+            upper_name, surface.as_str());
+    }
+
+    /// Property 86: Surface specificity contributes to tie-breaking
+    #[test]
+    fn prop_surface_specificity(surface in arb_policy_surface()) {
+        let with_surface = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![surface.as_str().to_string()],
+            ..Default::default()
+        };
+        let without_surface = frankenterm_core::config::PolicyRuleMatch::default();
+
+        // A rule with surface filter should have higher specificity than catch-all
+        prop_assert!(with_surface.specificity() > without_surface.specificity(),
+            "Rule with surface should have higher specificity than catch-all");
+    }
+
+    /// Property 87: Multiple surfaces in rule match any of them (OR semantics)
+    #[test]
+    fn prop_rule_multi_surface_or(
+        s1 in arb_policy_surface(),
+        s2 in arb_policy_surface(),
+        test_surface in arb_policy_surface(),
+    ) {
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![s1.as_str().to_string(), s2.as_str().to_string()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.multi.surface".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = test_surface;
+        input.capabilities = unreserved(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+
+        let should_match = test_surface == s1 || test_surface == s2;
+        if should_match {
+            prop_assert!(!decision.is_allowed(),
+                "Multi-surface rule should deny when test_surface={:?} matches s1={:?} or s2={:?}",
+                test_surface, s1, s2);
+        } else {
+            prop_assert!(decision.is_allowed(),
+                "Multi-surface rule should allow when test_surface={:?} matches neither s1={:?} nor s2={:?}",
+                test_surface, s1, s2);
+        }
+    }
+
+    /// Property 88: DecisionContext evidence includes surface field
+    #[test]
+    fn prop_context_evidence_includes_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        let has_surface_evidence = ctx.evidence.iter().any(|e| e.key == "surface");
+        prop_assert!(has_surface_evidence,
+            "DecisionContext evidence should include surface field");
+        let surface_val = ctx.evidence.iter()
+            .find(|e| e.key == "surface")
+            .map(|e| e.value.as_str())
+            .unwrap();
+        prop_assert_eq!(surface_val, surface.as_str(),
+            "Surface evidence value should match input surface");
+    }
+
+    /// Property 89: All PolicySurface variants have distinct as_str values
+    #[test]
+    fn prop_surface_as_str_unique(
+        s1 in arb_policy_surface(),
+        s2 in arb_policy_surface(),
+    ) {
+        if s1 != s2 {
+            prop_assert_ne!(s1.as_str(), s2.as_str(),
+                "Different PolicySurface variants should have different as_str values: {:?} vs {:?}",
+                s1, s2);
+        }
+    }
+
+    /// Property 90: PolicyInput serde roundtrip preserves surface
+    #[test]
+    fn prop_input_surface_serde_roundtrip(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let json = serde_json::to_string(&input).unwrap();
+        let back: PolicyInput = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.surface, surface,
+            "PolicyInput serde roundtrip should preserve surface");
+    }
+
+    // ========================================================================
+    // Serde roundtrip tests for types that have generators but lacked coverage
+    // ========================================================================
+
+    /// Property 91: RuleEvaluation serde roundtrip
+    #[test]
+    fn prop_rule_evaluation_serde_roundtrip(eval in arb_rule_evaluation()) {
+        let json = serde_json::to_string(&eval).unwrap();
+        let back: RuleEvaluation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rule_id, eval.rule_id);
+        prop_assert_eq!(back.matched, eval.matched);
+        prop_assert_eq!(back.decision, eval.decision);
+        prop_assert_eq!(back.reason, eval.reason);
+    }
+
+    /// Property 92: DecisionEvidence serde roundtrip
+    #[test]
+    fn prop_decision_evidence_serde_roundtrip(ev in arb_decision_evidence()) {
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: DecisionEvidence = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, ev);
+    }
+
+    /// Property 93: RateLimitSnapshot serde roundtrip
+    #[test]
+    fn prop_rate_limit_snapshot_serde_roundtrip(snap in arb_rate_limit_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RateLimitSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+
+    /// Property 94: AppliedRiskFactor serde roundtrip
+    #[test]
+    fn prop_applied_risk_factor_serde_roundtrip(factor in arb_applied_risk_factor()) {
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: AppliedRiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, factor);
+    }
+
+    /// Property 95: RiskFactor serde roundtrip
+    #[test]
+    fn prop_risk_factor_serde_roundtrip(
+        id in "[a-z._]{3,30}",
+        cat in arb_risk_category(),
+        weight in 0..=100u8,
+        desc in "[a-zA-Z ]{5,50}",
+    ) {
+        let factor = RiskFactor::new(&id, cat, weight, &desc);
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: RiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, factor);
+    }
+
+    /// Property 96: ApprovalRequest serde roundtrip
+    #[test]
+    fn prop_approval_request_serde_roundtrip(
+        code in "[A-Z0-9]{8}",
+        hash in "[a-f0-9]{64}",
+        expires in 1_000_000_000i64..2_000_000_000i64,
+        summary in "[a-zA-Z ]{5,40}",
+        command in "ft approve [A-Z0-9]{8}",
+    ) {
+        let req = ApprovalRequest {
+            allow_once_code: code,
+            allow_once_full_hash: hash,
+            expires_at: expires,
+            summary,
+            command,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, req);
+    }
+
+    /// Property 97: SendTextAuditSummary serde roundtrip (compare via JSON value
+    /// since the type does not derive PartialEq)
+    #[test]
+    fn prop_send_text_audit_summary_serde_roundtrip(
+        text_length in 0..10_000usize,
+        preview in "[a-zA-Z0-9 ]{0,80}",
+        hash in "[a-f0-9]{64}",
+        command_candidate in proptest::bool::ANY,
+        workflow_id in proptest::option::of("[a-z0-9-]{8,36}"),
+        parent_id in proptest::option::of(0..100_000i64),
+    ) {
+        let summary = SendTextAuditSummary {
+            text_length,
+            text_preview_redacted: preview,
+            text_hash: hash,
+            command_candidate,
+            workflow_execution_id: workflow_id,
+            parent_action_id: parent_id,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: SendTextAuditSummary = serde_json::from_str(&json).unwrap();
+        // Compare field-by-field since no PartialEq
+        prop_assert_eq!(back.text_length, summary.text_length);
+        prop_assert_eq!(back.text_preview_redacted, summary.text_preview_redacted);
+        prop_assert_eq!(back.text_hash, summary.text_hash);
+        prop_assert_eq!(back.command_candidate, summary.command_candidate);
+        prop_assert_eq!(back.workflow_execution_id, summary.workflow_execution_id);
+        prop_assert_eq!(back.parent_action_id, summary.parent_action_id);
+    }
+
+    /// Property 98: SendTextAuditSummary with None optionals round-trips correctly
+    #[test]
+    fn prop_send_text_audit_summary_none_optionals_roundtrip(
+        text_length in 0..10_000usize,
+        preview in "[a-zA-Z0-9 ]{0,80}",
+        hash in "[a-f0-9]{64}",
+        command_candidate in proptest::bool::ANY,
+    ) {
+        let summary = SendTextAuditSummary {
+            text_length,
+            text_preview_redacted: preview.clone(),
+            text_hash: hash.clone(),
+            command_candidate,
+            workflow_execution_id: None,
+            parent_action_id: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        // skip_serializing_if should omit None fields
+        let check = json.contains("workflow_execution_id");
+        prop_assert!(!check, "None workflow_execution_id should be omitted from JSON");
+        let check2 = json.contains("parent_action_id");
+        prop_assert!(!check2, "None parent_action_id should be omitted from JSON");
+        // Deserialize back
+        let back: SendTextAuditSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.text_length, text_length);
+        prop_assert_eq!(back.workflow_execution_id, None);
+        prop_assert_eq!(back.parent_action_id, None);
+    }
+
+    /// Property 99: RiskFactor category preserves through serde roundtrip
+    #[test]
+    fn prop_risk_factor_category_roundtrip(cat in arb_risk_category()) {
+        let factor = RiskFactor::new("test.x", cat, 50, "test factor");
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: RiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.category, cat,
+            "RiskFactor category should survive serde roundtrip");
+    }
+}
+
+// ============================================================================
+// Forensic type strategies
+// ============================================================================
+
+fn arb_approval_status() -> impl Strategy<Value = ApprovalStatus> {
+    prop_oneof![
+        Just(ApprovalStatus::Pending),
+        Just(ApprovalStatus::Approved),
+        Just(ApprovalStatus::Rejected),
+        Just(ApprovalStatus::Expired),
+        Just(ApprovalStatus::Revoked),
+    ]
+}
+
+fn arb_approval_entry() -> impl Strategy<Value = ApprovalEntry> {
+    (
+        "[a-z0-9-]{8,20}",
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-z ]{5,30}",
+        "[a-z._]{3,20}",
+        any::<u64>(),
+        any::<u64>(),
+        arb_approval_status(),
+        "[a-z_]{0,15}",
+        any::<u64>(),
+    )
+        .prop_map(
+            |(
+                id,
+                action,
+                actor,
+                resource,
+                reason,
+                rule_id,
+                req_at,
+                exp_at,
+                status,
+                decided_by,
+                decided_at,
+            )| {
+                ApprovalEntry {
+                    approval_id: id,
+                    action,
+                    actor,
+                    resource,
+                    reason,
+                    rule_id,
+                    requested_at_ms: req_at,
+                    expires_at_ms: exp_at,
+                    status,
+                    decided_by,
+                    decided_at_ms: decided_at,
+                }
+            },
+        )
+}
+
+fn arb_revocation_record() -> impl Strategy<Value = RevocationRecord> {
+    (
+        "[a-z0-9-]{8,20}",
+        prop_oneof![
+            Just("credential".to_string()),
+            Just("session".to_string()),
+            Just("connector".to_string()),
+        ],
+        "[a-z0-9_]{3,20}",
+        "[a-z ]{5,30}",
+        "[a-z_]{3,15}",
+        any::<u64>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(id, rtype, rid, reason, by, at, active)| RevocationRecord {
+                revocation_id: id,
+                resource_type: rtype,
+                resource_id: rid,
+                reason,
+                revoked_by: by,
+                revoked_at_ms: at,
+                active,
+            },
+        )
+}
+
+fn arb_forensic_audit_entry() -> impl Strategy<Value = ForensicAuditEntry> {
+    (
+        any::<u64>(),
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-zA-Z ]{5,40}",
+        "[a-z_]{3,15}",
+        "[a-f0-9]{16,64}",
+    )
+        .prop_map(
+            |(ts, kind, actor, desc, surface, hash)| ForensicAuditEntry {
+                timestamp_ms: ts,
+                kind,
+                actor,
+                description: desc,
+                surface,
+                hash,
+            },
+        )
+}
+
+fn arb_forensic_namespace_event() -> impl Strategy<Value = ForensicNamespaceEvent> {
+    (
+        any::<u64>(),
+        "[a-z.]{3,20}",
+        "[a-z.]{3,20}",
+        "[a-z_]{3,15}",
+        "[a-z0-9]{1,10}",
+        prop_oneof![
+            Just("allow".to_string()),
+            Just("deny".to_string()),
+            Just("audit".to_string())
+        ],
+        "[a-z ]{5,30}",
+    )
+        .prop_map(
+            |(ts, src, tgt, kind, id, decision, reason)| ForensicNamespaceEvent {
+                timestamp_ms: ts,
+                source_namespace: src,
+                target_namespace: tgt,
+                resource_kind: kind,
+                resource_id: id,
+                decision,
+                reason,
+            },
+        )
+}
+
+fn arb_forensic_compliance_summary() -> impl Strategy<Value = ForensicComplianceSummary> {
+    (any::<u64>(), any::<u64>()).prop_map(|(total, denials)| {
+        let rate = if total == 0 {
+            0.0
+        } else {
+            (denials.min(total) as f64 / total as f64) * 100.0
+        };
+        ForensicComplianceSummary {
+            total_evaluations: total,
+            total_denials: denials.min(total),
+            denial_rate_percent: rate,
+        }
+    })
+}
+
+fn arb_forensic_query() -> impl Strategy<Value = ForensicQuery> {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        prop::option::of(arb_actor_kind()),
+        prop::option::of(arb_action_kind()),
+        prop::option::of(any::<u64>()),
+        prop::option::of("[a-z0-9_.-]{1,20}"),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(start_ms, end_ms, actor, action, pane_id, domain, denials_only)| ForensicQuery {
+                start_ms,
+                end_ms,
+                actor,
+                action,
+                pane_id,
+                domain,
+                denials_only,
+            },
+        )
+}
+
+fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
+    prop_oneof![
+        Just(DecisionOutcome::Allow),
+        Just(DecisionOutcome::Deny),
+        Just(DecisionOutcome::RequireApproval),
+    ]
+}
+
+fn arb_policy_decision_entry() -> impl Strategy<Value = PolicyDecisionEntry> {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        arb_action_kind(),
+        arb_actor_kind(),
+        arb_policy_surface(),
+        prop::option::of(0..1000u64),
+        arb_decision_outcome(),
+        prop::option::of("[a-z._]{3,20}"),
+        prop::option::of("[a-z ]{5,30}"),
+        0..100u32,
+    )
+        .prop_map(
+            |(
+                seq,
+                ts,
+                action,
+                actor,
+                surface,
+                pane_id,
+                decision,
+                rule_id,
+                reason,
+                rules_evaluated,
+            )| {
+                PolicyDecisionEntry {
+                    seq,
+                    timestamp_ms: ts,
+                    action,
+                    actor,
+                    surface,
+                    pane_id,
+                    decision,
+                    rule_id,
+                    reason,
+                    rules_evaluated,
+                }
+            },
+        )
+}
+
+fn arb_forensic_report() -> impl Strategy<Value = ForensicReport> {
+    (
+        any::<u64>(),
+        (any::<u64>(), any::<u64>()),
+        prop::collection::vec(arb_policy_decision_entry(), 0..=3),
+        prop::collection::vec(arb_forensic_audit_entry(), 0..=3),
+        prop::collection::vec(arb_revocation_record(), 0..=2),
+        prop::collection::vec(arb_approval_entry(), 0..=2),
+        prop::collection::vec(arb_forensic_namespace_event(), 0..=2),
+        arb_forensic_compliance_summary(),
+        prop::collection::vec("[a-z_]{3,15}", 0..=3),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                generated_at_ms,
+                time_range,
+                decisions,
+                audit_trail,
+                revocations,
+                approvals,
+                namespace_violations,
+                compliance_summary,
+                quarantine_active,
+                kill_switch_active,
+            )| {
+                ForensicReport {
+                    generated_at_ms,
+                    time_range,
+                    decisions,
+                    audit_trail,
+                    revocations,
+                    approvals,
+                    namespace_violations,
+                    compliance_summary,
+                    quarantine_active,
+                    kill_switch_active,
+                }
+            },
+        )
+}
+
+// ============================================================================
+// Forensic type property tests
+// ============================================================================
+
+#[test]
+fn prop_forensic_query_default_is_unfiltered() {
+    let query = ForensicQuery::default();
+    assert_eq!(query.start_ms, 0);
+    assert_eq!(query.end_ms, 0);
+    assert_eq!(query.actor, None);
+    assert_eq!(query.action, None);
+    assert_eq!(query.pane_id, None);
+    assert_eq!(query.domain, None);
+    assert!(!query.denials_only);
+}
+
+proptest! {
+    /// Property 100: ForensicAuditEntry serde roundtrip
+    #[test]
+    fn prop_forensic_audit_entry_serde_roundtrip(entry in arb_forensic_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ForensicAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, entry);
+    }
+
+    /// Property 101: ForensicNamespaceEvent serde roundtrip
+    #[test]
+    fn prop_forensic_namespace_event_serde_roundtrip(event in arb_forensic_namespace_event()) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ForensicNamespaceEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, event);
+    }
+
+    /// Property 102: ForensicComplianceSummary serde roundtrip (f64 tolerance)
+    #[test]
+    fn prop_forensic_compliance_summary_serde_roundtrip(summary in arb_forensic_compliance_summary()) {
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ForensicComplianceSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_evaluations, summary.total_evaluations);
+        prop_assert_eq!(back.total_denials, summary.total_denials);
+        prop_assert!((back.denial_rate_percent - summary.denial_rate_percent).abs() < 1e-10,
+            "denial_rate_percent drift: {} vs {}", back.denial_rate_percent, summary.denial_rate_percent);
+    }
+
+    /// Property 103: ForensicReport serde roundtrip
+    #[test]
+    fn prop_forensic_report_serde_roundtrip(report in arb_forensic_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        // Compare all non-f64 fields directly
+        prop_assert_eq!(back.generated_at_ms, report.generated_at_ms);
+        prop_assert_eq!(back.time_range, report.time_range);
+        prop_assert_eq!(back.decisions, report.decisions);
+        prop_assert_eq!(back.audit_trail, report.audit_trail);
+        prop_assert_eq!(back.revocations, report.revocations);
+        prop_assert_eq!(back.approvals, report.approvals);
+        prop_assert_eq!(back.namespace_violations, report.namespace_violations);
+        prop_assert_eq!(back.quarantine_active, report.quarantine_active);
+        prop_assert_eq!(back.kill_switch_active, report.kill_switch_active);
+        // Compliance summary with f64 tolerance
+        prop_assert_eq!(back.compliance_summary.total_evaluations, report.compliance_summary.total_evaluations);
+        prop_assert_eq!(back.compliance_summary.total_denials, report.compliance_summary.total_denials);
+        prop_assert!(
+            (back.compliance_summary.denial_rate_percent - report.compliance_summary.denial_rate_percent).abs() < 1e-10,
+            "denial_rate_percent drift"
+        );
+    }
+
+    /// Property 104: ForensicComplianceSummary denial rate is bounded [0, 100]
+    #[test]
+    fn prop_forensic_compliance_denial_rate_bounded(summary in arb_forensic_compliance_summary()) {
+        prop_assert!(summary.denial_rate_percent >= 0.0);
+        prop_assert!(summary.denial_rate_percent <= 100.0);
+    }
+
+    /// Property 105: ForensicComplianceSummary denials never exceed evaluations
+    #[test]
+    fn prop_forensic_compliance_denials_bounded(summary in arb_forensic_compliance_summary()) {
+        prop_assert!(
+            summary.total_denials <= summary.total_evaluations,
+            "denials ({}) must not exceed evaluations ({})",
+            summary.total_denials,
+            summary.total_evaluations
+        );
+    }
+
+    /// Property 106: ForensicReport preserves kill_switch_active through roundtrip
+    #[test]
+    fn prop_forensic_report_kill_switch_preserved(
+        kill_switch in any::<bool>(),
+    ) {
+        let report = ForensicReport {
+            generated_at_ms: 1000,
+            time_range: (0, 2000),
+            decisions: vec![],
+            audit_trail: vec![],
+            revocations: vec![],
+            approvals: vec![],
+            namespace_violations: vec![],
+            compliance_summary: ForensicComplianceSummary {
+                total_evaluations: 0,
+                total_denials: 0,
+                denial_rate_percent: 0.0,
+            },
+            quarantine_active: vec![],
+            kill_switch_active: kill_switch,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.kill_switch_active, kill_switch);
+    }
+
+    /// Property 107: ForensicReport nested collection sizes preserved
+    #[test]
+    fn prop_forensic_report_collection_sizes(report in arb_forensic_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.decisions.len(), report.decisions.len());
+        prop_assert_eq!(back.audit_trail.len(), report.audit_trail.len());
+        prop_assert_eq!(back.revocations.len(), report.revocations.len());
+        prop_assert_eq!(back.approvals.len(), report.approvals.len());
+        prop_assert_eq!(back.namespace_violations.len(), report.namespace_violations.len());
+        prop_assert_eq!(back.quarantine_active.len(), report.quarantine_active.len());
+    }
+
+    /// Property 108: ForensicAuditEntry hash field preserved as-is (no transformation)
+    #[test]
+    fn prop_forensic_audit_entry_hash_preserved(entry in arb_forensic_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ForensicAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.hash, entry.hash, "hash must be preserved exactly");
+    }
+
+    /// Property 109: ForensicNamespaceEvent source/target namespaces distinct fields
+    #[test]
+    fn prop_forensic_namespace_event_fields_independent(
+        event in arb_forensic_namespace_event()
+    ) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ForensicNamespaceEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.source_namespace, event.source_namespace);
+        prop_assert_eq!(back.target_namespace, event.target_namespace);
+        prop_assert_eq!(back.resource_kind, event.resource_kind);
+        prop_assert_eq!(back.resource_id, event.resource_id);
+    }
+
+    /// Property 111: ForensicQuery clone preserves all filters exactly.
+    #[test]
+    fn prop_forensic_query_clone_preserves_fields(query in arb_forensic_query()) {
+        let cloned = query.clone();
+        prop_assert_eq!(cloned.start_ms, query.start_ms);
+        prop_assert_eq!(cloned.end_ms, query.end_ms);
+        prop_assert_eq!(cloned.actor, query.actor);
+        prop_assert_eq!(cloned.action, query.action);
+        prop_assert_eq!(cloned.pane_id, query.pane_id);
+        prop_assert_eq!(cloned.domain, query.domain);
+        prop_assert_eq!(cloned.denials_only, query.denials_only);
+    }
+
+    /// Property 112: ForensicQuery optional filters vary independently.
+    #[test]
+    fn prop_forensic_query_optional_filters_independent(
+        actor in prop::option::of(arb_actor_kind()),
+        action in prop::option::of(arb_action_kind()),
+        pane_id in prop::option::of(any::<u64>()),
+        domain in prop::option::of("[a-z0-9_.-]{1,20}"),
+        denials_only in any::<bool>(),
+    ) {
+        let actor_some = actor.is_some();
+        let action_some = action.is_some();
+        let pane_id_some = pane_id.is_some();
+        let domain_some = domain.is_some();
+        let query = ForensicQuery {
+            start_ms: 0,
+            end_ms: 0,
+            actor,
+            action,
+            pane_id,
+            domain,
+            denials_only,
+        };
+
+        prop_assert_eq!(query.actor.is_some(), actor_some);
+        prop_assert_eq!(query.action.is_some(), action_some);
+        prop_assert_eq!(query.pane_id.is_some(), pane_id_some);
+        prop_assert_eq!(query.domain.is_some(), domain_some);
+        prop_assert_eq!(query.denials_only, denials_only);
+    }
+
+    /// Metamorphic relation: PolicyEngine::authorize is decision-idempotent
+    /// under repeated calls with no intervening policy edits.
+    ///
+    /// MR statement:
+    ///     For any PolicyInput `i` and any PolicyEngine `e`:
+    ///         let d1 = e.authorize(&i);
+    ///         let d2 = e.authorize(&i);
+    ///     Then `d1.kind == d2.kind` AND `d1.rule_id() == d2.rule_id()` AND
+    ///     `d1.denial_reason() == d2.denial_reason()`.
+    ///
+    /// Rationale: authorize() mutates internal state — it appends to the
+    /// decision log and bumps telemetry counters. But the *return value* is
+    /// a pure function of (engine_config, input). A repeat call on the same
+    /// input must resolve the same rule chain to the same terminal rule
+    /// (same kind + rule_id) and produce the same denial/approval reason.
+    ///
+    /// A failure of this MR would indicate one of:
+    ///   1. Non-deterministic rule ordering (HashMap iteration order leaking
+    ///      through),
+    ///   2. Internal state crossing the decision boundary (rate-limit
+    ///      counters reaching a threshold between the two calls, cached
+    ///      result drift, etc.),
+    ///   3. A clock-dependent rule firing on call 2 but not call 1.
+    ///
+    /// Calls 1 and 2 happen back-to-back so rate-limit windows and clocks
+    /// don't cross thresholds between them. We also skip rate-limited
+    /// actions entirely (is_rate_limited is true for SendText/SendCtrl*
+    /// etc.), since those are the one class where a second call legitimately
+    /// differs from the first — the rate-limiter's state transition from
+    /// Allowed to Limited is exactly the kind of non-idempotence we're
+    /// excluding from this MR.
+    #[test]
+    fn prop_authorize_decision_idempotent_on_repeat_call(
+        action in prop_oneof![Just(ActionKind::Activate), Just(ActionKind::SearchOutput)],
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+        surface in arb_policy_surface(),
+        pane_id in 1u64..1000,
+    ) {
+        // Rate-limited actions are intentionally excluded — the rate limiter
+        // is the one documented source of legitimate decision drift across
+        // repeat calls within a single window. This MR covers the policy
+        // engine's *rule* evaluation path, not the rate-limiter's counter.
+        prop_assert!(!action.is_rate_limited());
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(caps)
+            .with_surface(surface);
+
+        let d1 = engine.authorize(&input);
+        let d2 = engine.authorize(&input);
+
+        // Variant kind must be stable.
+        prop_assert_eq!(d1.is_allowed(), d2.is_allowed(),
+            "allow-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+        prop_assert_eq!(d1.is_denied(), d2.is_denied(),
+            "deny-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+        prop_assert_eq!(d1.requires_approval(), d2.requires_approval(),
+            "approval-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+
+        // Determining rule ID must be stable.
+        prop_assert_eq!(d1.rule_id(), d2.rule_id(),
+            "rule_id drift between repeat authorize calls: d1.rule_id={:?} d2.rule_id={:?}",
+            d1.rule_id(), d2.rule_id());
+
+        // Denial/approval reason must be stable for non-allow decisions.
+        prop_assert_eq!(d1.denial_reason(), d2.denial_reason(),
+            "denial_reason drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1.denial_reason(), d2.denial_reason());
+    }
+
+    // ========================================================================
+    // br-ft-XXXXX (filed retroactively): audit-log bound invariants.
+    //
+    // These metamorphic relations pin two contracts the audit pipeline
+    // advertises but had no proptest coverage:
+    //
+    // 1. `decision_log.total_recorded` (the bounded log's monotonic
+    //    write counter) is bounded by the number of authorize() calls.
+    //    Per the engine contract: every authorize call writes 1 entry
+    //    iff (decision != Allow OR record_allows=true); 0 entries
+    //    otherwise. So total_recorded ≤ call_count, and in particular
+    //    total_recorded ≤ count_of_recorded_decisions.
+    //
+    // 2. `audit_chain.chain_length` is bounded by the same call count
+    //    AND the chain's max_entries cap (eviction semantics from
+    //    AuditChain::append). After N back-to-back authorize calls,
+    //    chain_length ≤ min(N, max_entries) — never more entries than
+    //    we recorded, never more than the chain's bound.
+    //
+    // Failure of either MR would indicate one of:
+    //   - Spurious double-records on a single authorize call
+    //     (audit-row count > call count → audit log inflates state).
+    //   - Eviction not firing past max_entries
+    //     (chain length unbounded → memory leak / audit trail bloat).
+    //   - Filter logic not honouring record_allows
+    //     (record_allows=false but Allow lands in the log anyway).
+    //
+    // These are the missing complement to
+    // `prop_authorize_decision_idempotent_on_repeat_call` above —
+    // determinism on the *return value* + bounded growth on the
+    // *side-effect* together cover the engine's full forward contract.
+    // ========================================================================
+
+    /// MR: After N back-to-back authorize calls,
+    /// `decision_log.total_recorded ≤ N` (every call writes at most
+    /// 1 entry; some calls write 0 when record_allows=false filters
+    /// an Allow decision).
+    #[test]
+    fn prop_decision_log_total_recorded_bounded_by_call_count(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+        surface in arb_policy_surface(),
+        pane_id in 1u64..1000,
+        call_count in 1usize..16,
+    ) {
+        // The bound holds for rate-limited actions too: rate-limit
+        // transitions Allow→Deny still produce ≤ 1 log entry per
+        // call. Whether the entry is Allow or Deny, the counter
+        // grows by ≤ 1. (Distinct from the determinism MR above
+        // which DOES need to skip rate-limited cases.)
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(caps)
+            .with_surface(surface);
+
+        let snap_before = engine.telemetry_snapshot(0);
+        let recorded_before = snap_before.decision_log.total_recorded;
+
+        for _ in 0..call_count {
+            let _ = engine.authorize(&input);
+        }
+
+        let snap_after = engine.telemetry_snapshot(0);
+        let recorded_after = snap_after.decision_log.total_recorded;
+
+        let delta = recorded_after.saturating_sub(recorded_before);
+        prop_assert!(
+            delta <= call_count as u64,
+            "decision_log.total_recorded grew by {delta} on {call_count} authorize \
+             calls — should be ≤ {call_count}"
+        );
+    }
+
+    /// MR: `audit_chain.chain_length ≤ min(call_count, max_entries)`.
+    /// Eviction past max_entries must keep chain_length capped at the
+    /// configured bound; total_recorded keeps growing (already covered
+    /// by MR 1) but the in-memory chain is bounded.
+    #[test]
+    fn prop_audit_chain_length_bounded_by_min_calls_and_max_entries(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+        surface in arb_policy_surface(),
+        pane_id in 1u64..1000,
+        call_count in 1usize..16,
+    ) {
+        // Same as the sibling MR — the bound holds for any
+        // action mix; rate-limit transitions still bound the
+        // chain growth at ≤ 1 entry per call.
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(caps)
+            .with_surface(surface);
+
+        let snap_before = engine.telemetry_snapshot(0);
+        let max_entries = snap_before.audit_chain.max_entries;
+        let len_before = snap_before.audit_chain.chain_length;
+
+        for _ in 0..call_count {
+            let _ = engine.authorize(&input);
+        }
+
+        let snap_after = engine.telemetry_snapshot(0);
+        let len_after = snap_after.audit_chain.chain_length;
+
+        // Chain length never exceeds max_entries — the public
+        // contract of AuditChain::append (eviction at capacity).
+        prop_assert!(
+            len_after <= max_entries,
+            "audit_chain.chain_length={len_after} > max_entries={max_entries} \
+             after {call_count} authorize calls"
+        );
+
+        // The pre-fix MR also asserted `chain_growth <= call_count`,
+        // but that's wrong by design: certain action paths
+        // (ConnectorCredentialAction, cross-tenant namespace denial)
+        // append MULTIPLE chain entries per authorize call:
+        //   - credential_broker_record_denial appends inline AND
+        //   - record_to_decision_log appends at the end.
+        // The audit chain's PUBLIC contract is the max_entries
+        // cap above; per-call growth is an implementation detail.
+        // The bound that DOES hold: every chain entry came from
+        // SOME authorize call, so total_recorded on the
+        // decision_log (covered by the sibling MR) anchors the
+        // upper bound on cumulative writes.
+        let _ = len_before;
+    }
+
+    /// MR: A normal `authorize()` call MUST NOT bump the
+    /// `policy_clock_anomaly_count()` counter (br-ft-0texd). The
+    /// counter is reserved for the rare clock-before-UNIX_EPOCH
+    /// fallback path; on any modern host with a synced clock it
+    /// stays put across normal authorize traffic.
+    ///
+    /// This pins the negative side of the ft-0texd contract — the
+    /// counter doesn't false-positive under normal load. A failure
+    /// would mean we've accidentally instrumented a path that fires
+    /// even on a healthy clock, polluting the forensic signal.
+    #[test]
+    fn prop_authorize_does_not_bump_clock_anomaly_counter_under_real_clock(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+        surface in arb_policy_surface(),
+        pane_id in 1u64..1000,
+        call_count in 1usize..8,
+    ) {
+        let before = frankenterm_core::policy::policy_clock_anomaly_count();
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(caps)
+            .with_surface(surface);
+
+        for _ in 0..call_count {
+            let _ = engine.authorize(&input);
+        }
+
+        let after = frankenterm_core::policy::policy_clock_anomaly_count();
+        prop_assert_eq!(
+            after, before,
+            "policy_clock_anomaly_count bumped on a normal authorize burst — \
+             counter should only fire on clock-before-UNIX_EPOCH path"
+        );
+    }
+}

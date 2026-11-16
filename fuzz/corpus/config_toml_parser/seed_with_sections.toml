@@ -1,0 +1,15 @@
+[wa]
+watcher_poll_ms = 500
+capture_max_bytes = 65536
+enable_search = true
+
+[wa.patterns]
+enable_builtin = true
+
+[wa.tuning.runtime]
+tick_interval_ms = 100
+max_concurrent_panes = 64
+
+[[ssh_domains]]
+name = "server1"
+remote_address = "10.0.0.1"

@@ -1,0 +1,1882 @@
+//! Cass session correlation utilities.
+//!
+//! Provides a deterministic correlation algorithm for matching wa-observed
+//! agent sessions to cass sessions using project path and start-time windows.
+
+use crate::cass::{
+    CassAgent, CassClient, CassSession, CassSessionSummary, parse_cass_timestamp_ms,
+};
+use crate::storage::{AgentSessionRecord, StorageHandle};
+use crate::wezterm::CwdInfo;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// br-ft-175qi: cass-summary metadata deserialization observability.
+// `extract_summary_from_meta` reads the persisted CassSessionSummary
+// from session metadata via:
+//     meta.get("cass_summary").and_then(|v| serde_json::from_value(v.clone()).ok())
+// On schema bump or hand-edit the .ok() drop is silent — the refresh
+// path falls through to "summary unavailable" with no signal whether
+// (a) summary was never persisted, (b) it was persisted but in a
+// different shape, or (c) extraction succeeded but produced a None.
+// Different remediation paths.
+//
+// Same observability defect family as ft-iwg7x
+// (robot_profile_bootstrap_serde_drop_count), ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), ft-bn6qi (epoch_clock_anomaly_count),
+// ft-ncijf (mcp_workflow_plan_serde_drop_count), ft-r3d4e
+// (backup_manifest_parse_drop_count), ft-jtcrv
+// (ars_federation_payload_serde_drop_count), and ft-zs9v0
+// (lock_metadata_parse_drop_count).
+static CASS_SUMMARY_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-175qi: cumulative count of cass-summary metadata
+/// deserialization failures observed in `extract_summary_from_meta`.
+/// Each increment represents one session-summary refresh where the
+/// persisted `cass_summary` value was schema-skewed and the refresh
+/// path silently fell through to "summary unavailable". > 0 means
+/// investigate session metadata authoring (likely a schema bump or
+/// upstream cass response shape change).
+#[must_use]
+pub fn cass_summary_parse_drop_count() -> u64 {
+    CASS_SUMMARY_PARSE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_cass_summary_parse_drop_count_for_test() {
+    CASS_SUMMARY_PARSE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_cass_summary_parse_drop() {
+    CASS_SUMMARY_PARSE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Correlation algorithm version (for metadata/auditing).
+pub const CASS_CORRELATION_VERSION: &str = "v1";
+
+const DEFAULT_WINDOW_MS: i64 = 10 * 60 * 1_000; // 10 minutes
+
+/// Options controlling cass correlation behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CassCorrelationOptions {
+    /// Time window before session start to consider (ms).
+    pub window_before_ms: i64,
+    /// Time window after session start to consider (ms).
+    pub window_after_ms: i64,
+    /// Manual override for cass session id (skips cass lookup).
+    pub override_session_id: Option<String>,
+}
+
+impl Default for CassCorrelationOptions {
+    fn default() -> Self {
+        Self {
+            window_before_ms: DEFAULT_WINDOW_MS,
+            window_after_ms: DEFAULT_WINDOW_MS,
+            override_session_id: None,
+        }
+    }
+}
+
+/// Correlation outcome status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationStatus {
+    Linked,
+    Unlinked,
+    Error,
+}
+
+/// Correlation result for a cass session lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCorrelation {
+    pub status: CorrelationStatus,
+    pub external_id: Option<String>,
+    pub confidence: f64,
+    pub reasons: Vec<String>,
+    pub candidates_considered: usize,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub selected_started_at_ms: Option<i64>,
+    pub algorithm_version: String,
+    pub error: Option<String>,
+}
+
+impl SessionCorrelation {
+    fn linked(
+        external_id: String,
+        confidence: f64,
+        reasons: Vec<String>,
+        candidates_considered: usize,
+        window_start_ms: i64,
+        window_end_ms: i64,
+        selected_started_at_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            status: CorrelationStatus::Linked,
+            external_id: Some(external_id),
+            confidence,
+            reasons,
+            candidates_considered,
+            window_start_ms,
+            window_end_ms,
+            selected_started_at_ms,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        }
+    }
+
+    fn unlinked(
+        reasons: Vec<String>,
+        candidates_considered: usize,
+        window_start_ms: i64,
+        window_end_ms: i64,
+    ) -> Self {
+        Self {
+            status: CorrelationStatus::Unlinked,
+            external_id: None,
+            confidence: 0.0,
+            reasons,
+            candidates_considered,
+            window_start_ms,
+            window_end_ms,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        }
+    }
+
+    fn error(
+        message: String,
+        reasons: Vec<String>,
+        window_start_ms: i64,
+        window_end_ms: i64,
+    ) -> Self {
+        Self {
+            status: CorrelationStatus::Error,
+            external_id: None,
+            confidence: 0.0,
+            reasons,
+            candidates_considered: 0,
+            window_start_ms,
+            window_end_ms,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: Some(message),
+        }
+    }
+
+    #[must_use]
+    pub fn to_external_meta(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            serde_json::json!({
+                "status": "error",
+                "error": "correlation_meta_serialize_failed",
+                "algorithm_version": CASS_CORRELATION_VERSION,
+            })
+        })
+    }
+}
+
+/// Correlate a cass session list using a start-time window.
+#[must_use]
+pub fn correlate_from_sessions(
+    sessions: &[CassSession],
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> SessionCorrelation {
+    if let Some(override_id) = options.override_session_id.as_ref() {
+        return SessionCorrelation::linked(
+            override_id.clone(),
+            1.0,
+            vec!["manual_override".to_string()],
+            sessions.len(),
+            window_start(session_started_at_ms, options),
+            window_end(session_started_at_ms, options),
+            None,
+        );
+    }
+
+    let window_start_ms = window_start(session_started_at_ms, options);
+    let window_end_ms = window_end(session_started_at_ms, options);
+
+    let mut skipped_missing_id = 0usize;
+    let mut skipped_missing_time = 0usize;
+    let mut skipped_outside_window = 0usize;
+    let mut candidates = Vec::new();
+
+    for session in sessions {
+        let Some(session_id) = session.session_id.clone() else {
+            skipped_missing_id += 1;
+            continue;
+        };
+        let Some(started_at_raw) = session.started_at.as_deref() else {
+            skipped_missing_time += 1;
+            continue;
+        };
+        let Some(started_at_ms) = parse_cass_timestamp_ms(started_at_raw) else {
+            skipped_missing_time += 1;
+            continue;
+        };
+
+        if started_at_ms < window_start_ms || started_at_ms > window_end_ms {
+            skipped_outside_window += 1;
+            continue;
+        }
+
+        let diff_ms = if session_started_at_ms >= started_at_ms {
+            session_started_at_ms - started_at_ms
+        } else {
+            started_at_ms - session_started_at_ms
+        };
+        candidates.push(Candidate {
+            session_id,
+            started_at_ms,
+            diff_ms,
+        });
+    }
+
+    let mut reasons = vec![format!(
+        "sessions_total={} in_window={} skipped_missing_id={} skipped_missing_time={} skipped_outside_window={}",
+        sessions.len(),
+        candidates.len(),
+        skipped_missing_id,
+        skipped_missing_time,
+        skipped_outside_window
+    )];
+
+    if candidates.is_empty() {
+        reasons.push("no_candidates_in_window".to_string());
+        return SessionCorrelation::unlinked(reasons, 0, window_start_ms, window_end_ms);
+    }
+
+    candidates.sort_by(|a, b| {
+        a.diff_ms
+            .cmp(&b.diff_ms)
+            .then_with(|| b.started_at_ms.cmp(&a.started_at_ms))
+    });
+
+    if candidates.len() > 1 {
+        reasons.push("ambiguous_candidates".to_string());
+    }
+
+    let selected = &candidates[0];
+    let tie_breaker = if candidates.len() > 1 && candidates[0].diff_ms == candidates[1].diff_ms {
+        "latest_started_at"
+    } else {
+        "closest_start_time"
+    };
+
+    let gap_ms = candidates
+        .get(1)
+        .map(|second| second.diff_ms.saturating_sub(selected.diff_ms).max(0));
+
+    let confidence = compute_confidence(
+        candidates.len(),
+        selected.diff_ms,
+        gap_ms,
+        options.window_before_ms + options.window_after_ms,
+    );
+
+    reasons.push(format!(
+        "selected session_id={} diff_ms={} tie_breaker={}",
+        selected.session_id, selected.diff_ms, tie_breaker
+    ));
+    if let Some(gap) = gap_ms {
+        reasons.push(format!("runner_up_gap_ms={gap}"));
+    }
+
+    SessionCorrelation::linked(
+        selected.session_id.clone(),
+        confidence,
+        reasons,
+        candidates.len(),
+        window_start_ms,
+        window_end_ms,
+        Some(selected.started_at_ms),
+    )
+}
+
+/// Correlate a session by querying cass for a project path.
+pub async fn correlate_with_cass(
+    cass: &CassClient,
+    project_path: &Path,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> SessionCorrelation {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    correlate_with_cass_with_cx(
+        &cx,
+        cass,
+        project_path,
+        agent,
+        session_started_at_ms,
+        options,
+    )
+    .await
+}
+
+/// Cx-first [`correlate_with_cass`] (ft-xbnl0.2.3). Routes the
+/// cass subprocess call through `search_sessions_with_cx` so
+/// caller cancellation propagates into the `cass` invocation.
+/// The override-session-id fast path short-circuits identically
+/// to the legacy function.
+pub async fn correlate_with_cass_with_cx(
+    cx: &crate::cx::Cx,
+    cass: &CassClient,
+    project_path: &Path,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> SessionCorrelation {
+    if options.override_session_id.is_some() {
+        return correlate_from_sessions(&[], session_started_at_ms, options);
+    }
+
+    match cass
+        .search_sessions_with_cx(cx, project_path, Some(agent))
+        .await
+    {
+        Ok(sessions) => correlate_from_sessions(&sessions, session_started_at_ms, options),
+        Err(err) => SessionCorrelation::error(
+            err.to_string(),
+            vec!["cass_search_failed".to_string()],
+            window_start(session_started_at_ms, options),
+            window_end(session_started_at_ms, options),
+        ),
+    }
+}
+
+/// Correlate and persist the cass session for a pane/session.
+pub async fn correlate_and_persist_for_pane(
+    storage: &StorageHandle,
+    cass: &CassClient,
+    pane_id: u64,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> Result<SessionCorrelation, String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    correlate_and_persist_for_pane_with_cx(
+        &cx,
+        storage,
+        cass,
+        pane_id,
+        agent,
+        session_started_at_ms,
+        options,
+    )
+    .await
+}
+
+/// Cx-first [`correlate_and_persist_for_pane`] (ft-xbnl0.2.3).
+/// Routes the cass correlation through
+/// [`correlate_with_cass_with_cx`] so the subprocess call
+/// honors caller cancellation. Tick 126 upgrade: all three
+/// storage calls (`get_pane`, `select_session_record` internal
+/// `get_sessions_for_pane`, `upsert_agent_session`) now route
+/// through their cx-first siblings so caller cancellation
+/// propagates into storage's pre-flight checkpoints. Explicit
+/// `cx.checkpoint()` seams also bracket the cass call.
+pub async fn correlate_and_persist_for_pane_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    pane_id: u64,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> Result<SessionCorrelation, String> {
+    cx.checkpoint()
+        .map_err(|err| format!("correlate_and_persist_for_pane cancelled pre-start: {err}"))?;
+
+    let window_start_ms = window_start(session_started_at_ms, options);
+    let window_end_ms = window_end(session_started_at_ms, options);
+
+    let correlation = if options.override_session_id.is_some() {
+        correlate_from_sessions(&[], session_started_at_ms, options)
+    } else {
+        let pane = storage
+            .get_pane_with_cx(cx, pane_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let project_path = pane
+            .as_ref()
+            .and_then(|record| record.cwd.as_ref())
+            .and_then(|cwd| resolve_project_path(cwd));
+
+        if let Some(path) = project_path {
+            correlate_with_cass_with_cx(cx, cass, &path, agent, session_started_at_ms, options)
+                .await
+        } else {
+            SessionCorrelation::unlinked(
+                vec!["missing_or_remote_cwd".to_string()],
+                0,
+                window_start_ms,
+                window_end_ms,
+            )
+        }
+    };
+
+    cx.checkpoint().map_err(|err| {
+        format!("correlate_and_persist_for_pane cancelled between cass and persist: {err}")
+    })?;
+
+    let mut session_record =
+        select_session_record_with_cx(cx, storage, pane_id, agent, session_started_at_ms)
+            .await
+            .map_err(|e| e.to_string())?;
+    session_record.external_id = correlation.external_id.clone();
+    session_record.external_meta = Some(correlation.to_external_meta());
+
+    storage
+        .upsert_agent_session_with_cx(cx, session_record)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(correlation)
+}
+
+/// Options controlling cass summary refresh behavior.
+///
+/// Typical trigger points:
+/// - manual: invoked by a status/diagnostic command that asks for a refresh
+/// - workflow: invoked after usage-limit handling to capture final totals
+/// - periodic: optional background refresh with a guard interval
+#[derive(Debug, Clone)]
+pub struct CassSummaryRefreshOptions {
+    /// Minimum interval between cass refreshes (ms).
+    pub min_refresh_interval_ms: i64,
+    /// Force refresh even if the cached summary is recent.
+    pub force: bool,
+}
+
+impl Default for CassSummaryRefreshOptions {
+    fn default() -> Self {
+        Self {
+            min_refresh_interval_ms: 5 * 60 * 1_000,
+            force: false,
+        }
+    }
+}
+
+/// Refresh token/message accounting from cass and persist to agent_sessions.
+///
+/// This is designed to be called by higher-level surfaces (CLI, workflow steps,
+/// or periodic health checks) rather than automatically polling cass on ingest.
+pub async fn refresh_cass_summary_for_session(
+    storage: &StorageHandle,
+    cass: &CassClient,
+    session_id: i64,
+    options: &CassSummaryRefreshOptions,
+) -> Result<CassSessionSummary, String> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    refresh_cass_summary_for_session_with_cx(&cx, storage, cass, session_id, options).await
+}
+
+/// Cx-first [`refresh_cass_summary_for_session`] (ft-xbnl0.2.3).
+/// Routes the cass subprocess call through
+/// [`CassClient::query_session_with_cx`] so caller cancellation
+/// propagates into the `cass` invocation. TTL-gated refresh
+/// semantics preserved — a recently-refreshed session returns
+/// its cached summary without touching cass (and without
+/// firing any checkpoints beyond the pre-flight one).
+///
+/// Pre-flight checkpoint gates the initial storage read; a
+/// checkpoint between the cass call and the persist step lets
+/// a late-cancelled caller abort before updating the session
+/// record.
+pub async fn refresh_cass_summary_for_session_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    session_id: i64,
+    options: &CassSummaryRefreshOptions,
+) -> Result<CassSessionSummary, String> {
+    cx.checkpoint()
+        .map_err(|err| format!("refresh_cass_summary_for_session cancelled pre-start: {err}"))?;
+
+    let mut record = storage
+        .get_agent_session_with_cx(cx, session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("agent session not found: {session_id}"))?;
+
+    let Some(external_id) = record.external_id.clone() else {
+        return Err("cass external_id missing on agent session".to_string());
+    };
+
+    let now = now_ms();
+    if !options.force {
+        if let Some(last_refresh) = record.external_meta.as_ref().and_then(extract_refresh_ms) {
+            let elapsed = now.saturating_sub(last_refresh);
+            if elapsed < options.min_refresh_interval_ms {
+                if let Some(summary) = record
+                    .external_meta
+                    .as_ref()
+                    .and_then(extract_summary_from_meta)
+                {
+                    return Ok(summary);
+                }
+            }
+        }
+    }
+
+    let session = cass
+        .query_session_with_cx(cx, &external_id)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    cx.checkpoint().map_err(|err| {
+        format!(
+            "refresh_cass_summary_for_session cancelled between cass and persist (session_id={session_id}): {err}"
+        )
+    })?;
+
+    let summary = CassSessionSummary::from_session(&session);
+    record.total_tokens = summary.total_tokens;
+    record.input_tokens = summary.input_tokens;
+    record.output_tokens = summary.output_tokens;
+
+    if record.ended_at.is_none() {
+        record.ended_at = summary.session_ended_at_ms;
+    }
+
+    record.external_meta = Some(merge_external_meta(
+        record.external_meta.take(),
+        &summary,
+        now,
+        &external_id,
+    ));
+
+    storage
+        .upsert_agent_session_with_cx(cx, record)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(summary)
+}
+
+fn window_start(session_started_at_ms: i64, options: &CassCorrelationOptions) -> i64 {
+    session_started_at_ms.saturating_sub(options.window_before_ms.max(0))
+}
+
+fn window_end(session_started_at_ms: i64, options: &CassCorrelationOptions) -> i64 {
+    session_started_at_ms.saturating_add(options.window_after_ms.max(0))
+}
+
+/// Select an existing active session or construct a new record under `cx`.
+async fn select_session_record_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+) -> Result<AgentSessionRecord, crate::Error> {
+    let agent_type = agent.as_str();
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
+    if let Some(existing) = sessions
+        .iter()
+        .find(|record| record.agent_type == agent_type && record.ended_at.is_none())
+    {
+        return Ok(existing.clone());
+    }
+
+    let mut record = AgentSessionRecord::new_start(pane_id, agent_type);
+    record.started_at = session_started_at_ms;
+    Ok(record)
+}
+
+/// Ensure `pane_id` has an open `agent_sessions` row for `agent_type`
+/// (ft-ngbfu): the watcher calls this when a detection first attributes the
+/// pane to an agent. An open session of the same type is reused; open sessions
+/// of another type end with `agent_changed` (a pane runs one agent at a time);
+/// otherwise a session starts at `started_at_ms`. Returns the session id.
+pub async fn ensure_active_agent_session_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    agent_type: &str,
+    started_at_ms: i64,
+) -> Result<i64, crate::Error> {
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
+    let mut active = None;
+    for session in sessions.into_iter().filter(|s| s.ended_at.is_none()) {
+        if session.agent_type == agent_type && active.is_none() {
+            active = Some(session.id);
+        } else {
+            let mut ended = session;
+            ended.ended_at = Some(started_at_ms.max(ended.started_at));
+            ended.end_reason = Some("agent_changed".to_string());
+            storage.upsert_agent_session_with_cx(cx, ended).await?;
+        }
+    }
+    if let Some(id) = active {
+        return Ok(id);
+    }
+    let mut record = AgentSessionRecord::new_start(pane_id, agent_type);
+    record.started_at = started_at_ms;
+    storage.upsert_agent_session_with_cx(cx, record).await
+}
+
+/// Minimum spacing between cass attempts for one session.
+pub const CASS_ENRICHMENT_RETRY_MS: i64 = 5 * 60 * 1_000;
+
+/// What one enrichment pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CassEnrichmentOutcome {
+    /// Unlinked sessions sent through cass correlation.
+    pub correlated: usize,
+    /// Linked sessions whose token summary was refreshed.
+    pub refreshed: usize,
+    /// Attempts that failed (cass missing, search error, storage error).
+    pub failed: usize,
+}
+
+fn cass_agent_for_session(agent_type: &str) -> Option<CassAgent> {
+    match agent_type {
+        "codex" => Some(CassAgent::Codex),
+        "claude_code" => Some(CassAgent::ClaudeCode),
+        "gemini" => Some(CassAgent::Gemini),
+        _ => None,
+    }
+}
+
+/// Enrich open `agent_sessions` rows from cass (ft-ngbfu follow-on): an
+/// unlinked session is correlated (external id), a linked one gets its token
+/// summary refreshed (the refresh itself honors its minimum interval). At most
+/// `budget` sessions per pass, and each session at most every
+/// [`CASS_ENRICHMENT_RETRY_MS`] (`attempted_at` is the caller's per-process
+/// memory). A missing cass binary only counts as failures.
+pub async fn enrich_active_agent_sessions_with_cx<S: std::hash::BuildHasher>(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    attempted_at: &mut std::collections::HashMap<i64, i64, S>,
+    now_ms: i64,
+    budget: usize,
+) -> Result<CassEnrichmentOutcome, crate::Error> {
+    let sessions = storage.get_active_sessions_with_cx(cx).await?;
+    attempted_at.retain(|id, _| sessions.iter().any(|session| session.id == *id));
+    let mut outcome = CassEnrichmentOutcome::default();
+    let due: Vec<AgentSessionRecord> = sessions
+        .into_iter()
+        .filter(|session| {
+            cass_agent_for_session(&session.agent_type).is_some()
+                && attempted_at
+                    .get(&session.id)
+                    .is_none_or(|last| now_ms.saturating_sub(*last) >= CASS_ENRICHMENT_RETRY_MS)
+        })
+        .take(budget)
+        .collect();
+    for session in due {
+        let Some(agent) = cass_agent_for_session(&session.agent_type) else {
+            continue;
+        };
+        attempted_at.insert(session.id, now_ms);
+        let succeeded = if session.external_id.is_none() {
+            outcome.correlated += 1;
+            correlate_and_persist_for_pane_with_cx(
+                cx,
+                storage,
+                cass,
+                session.pane_id,
+                agent,
+                session.started_at,
+                &CassCorrelationOptions::default(),
+            )
+            .await
+            .is_ok_and(|correlation| correlation.status != CorrelationStatus::Error)
+        } else {
+            outcome.refreshed += 1;
+            refresh_cass_summary_for_session_with_cx(
+                cx,
+                storage,
+                cass,
+                session.id,
+                &CassSummaryRefreshOptions::default(),
+            )
+            .await
+            .is_ok()
+        };
+        if !succeeded {
+            outcome.failed += 1;
+        }
+    }
+    Ok(outcome)
+}
+
+/// End every open `agent_sessions` row for `pane_id` (ft-ngbfu), e.g. when the
+/// pane closes. Returns how many sessions were ended.
+pub async fn end_active_agent_sessions_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    end_reason: &str,
+    ended_at_ms: i64,
+) -> Result<usize, crate::Error> {
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
+    let mut ended_count = 0;
+    for mut session in sessions.into_iter().filter(|s| s.ended_at.is_none()) {
+        session.ended_at = Some(ended_at_ms.max(session.started_at));
+        session.end_reason = Some(end_reason.to_string());
+        storage.upsert_agent_session_with_cx(cx, session).await?;
+        ended_count += 1;
+    }
+    Ok(ended_count)
+}
+
+fn resolve_project_path(cwd: &str) -> Option<PathBuf> {
+    let parsed = CwdInfo::parse(cwd);
+    if parsed.is_remote || parsed.path.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(parsed.path);
+    find_repo_root(&path).or(Some(path))
+}
+
+fn find_repo_root(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let git_path = ancestor.join(".git");
+        if let Ok(meta) = std::fs::metadata(&git_path) {
+            if meta.is_dir() || meta.is_file() {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+fn merge_external_meta(
+    existing: Option<Value>,
+    summary: &CassSessionSummary,
+    refreshed_at_ms: i64,
+    external_id: &str,
+) -> Value {
+    let mut map = match existing {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+
+    map.insert(
+        "cass_summary".to_string(),
+        serde_json::to_value(summary).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "cass_refreshed_at_ms".to_string(),
+        Value::Number(refreshed_at_ms.into()),
+    );
+    map.insert(
+        "cass_session_id".to_string(),
+        Value::String(external_id.to_string()),
+    );
+
+    Value::Object(map)
+}
+
+fn extract_refresh_ms(meta: &Value) -> Option<i64> {
+    meta.get("cass_refreshed_at_ms").and_then(Value::as_i64)
+}
+
+fn extract_summary_from_meta(meta: &Value) -> Option<CassSessionSummary> {
+    let value = meta.get("cass_summary")?;
+    if !cass_summary_value_has_known_shape(value) {
+        record_cass_summary_parse_drop();
+        tracing::warn!(
+            target: "frankenterm::session_correlation",
+            event = "br-ft-175qi",
+            "session metadata cass_summary did not contain any known CassSessionSummary fields; \
+             refresh path will report summary as unavailable"
+        );
+        return None;
+    }
+    // br-ft-175qi: `cass_summary` key is present — a parse failure
+    // here is a schema-skew or hand-edit, distinct from the
+    // intentional "key absent" case (the early `?` above). Bump the
+    // counter and emit a structured warn so operators can surface the
+    // silent drop via metrics scrape AND log search.
+    match serde_json::from_value::<CassSessionSummary>(value.clone()) {
+        Ok(summary) => Some(summary),
+        Err(err) => {
+            record_cass_summary_parse_drop();
+            tracing::warn!(
+                target: "frankenterm::session_correlation",
+                event = "br-ft-175qi",
+                error = %err,
+                "session metadata cass_summary failed to deserialize as CassSessionSummary; \
+                 refresh path will report summary as unavailable"
+            );
+            None
+        }
+    }
+}
+
+fn cass_summary_value_has_known_shape(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        // Arrays must be rejected HERE: serde derive deserializes
+        // structs from sequences positionally, and every
+        // CassSessionSummary field is #[serde(default)], so an array
+        // would otherwise "succeed" and fabricate a summary from
+        // garbage. Scalars fall through so the serde type error
+        // (with its diagnostic detail) is what lands in the warn.
+        return !value.is_array();
+    };
+
+    const KNOWN_CASS_SUMMARY_FIELDS: [&str; 8] = [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "message_count",
+        "session_started_at_ms",
+        "session_ended_at_ms",
+        "first_message_at_ms",
+        "last_message_at_ms",
+    ];
+
+    KNOWN_CASS_SUMMARY_FIELDS
+        .iter()
+        .any(|field| map.contains_key(*field))
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn compute_confidence(
+    candidate_count: usize,
+    selected_diff_ms: i64,
+    runner_up_gap_ms: Option<i64>,
+    window_span_ms: i64,
+) -> f64 {
+    let span = window_span_ms.max(1) as f64;
+    let closeness = 1.0 - (selected_diff_ms as f64 / span).clamp(0.0, 1.0);
+
+    let mut confidence = if candidate_count <= 1 {
+        0.25_f64.mul_add(closeness, 0.7)
+    } else {
+        0.2_f64.mul_add(closeness, 0.5)
+    };
+
+    if let Some(gap) = runner_up_gap_ms {
+        if gap >= 120_000 {
+            confidence += 0.1;
+        } else {
+            confidence -= 0.05;
+        }
+    }
+
+    confidence.clamp(0.0, 0.95)
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    session_id: String,
+    started_at_ms: i64,
+    diff_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::PaneRecord;
+
+    fn make_session(id: &str, started_at: &str) -> CassSession {
+        CassSession {
+            session_id: Some(id.to_string()),
+            started_at: Some(started_at.to_string()),
+            ..CassSession::default()
+        }
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build session_correlation test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn correlate_single_candidate() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![make_session("cass-1", "2026-01-29T17:01:00Z")];
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+
+        assert_eq!(result.status, CorrelationStatus::Linked);
+        assert_eq!(result.external_id.as_deref(), Some("cass-1"));
+        assert!(result.confidence > 0.5);
+    }
+
+    #[test]
+    fn correlate_tie_breaks_latest_start() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![
+            make_session("cass-old", "2026-01-29T16:58:00Z"),
+            make_session("cass-new", "2026-01-29T17:02:00Z"),
+        ];
+
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.external_id.as_deref(), Some("cass-new"));
+    }
+
+    #[test]
+    fn correlate_no_candidates_in_window() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![make_session("cass-1", "2026-01-29T14:00:00Z")];
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert!(result.external_id.is_none());
+        assert_eq!(result.confidence.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn correlate_manual_override() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let options = CassCorrelationOptions {
+            override_session_id: Some("cass-override".to_string()),
+            ..Default::default()
+        };
+
+        let result = correlate_from_sessions(&[], start_ms, &options);
+        assert_eq!(result.external_id.as_deref(), Some("cass-override"));
+        assert!((result.confidence - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── Pure function tests ──
+
+    #[test]
+    fn default_correlation_options() {
+        let opts = CassCorrelationOptions::default();
+        assert_eq!(opts.window_before_ms, 10 * 60 * 1_000);
+        assert_eq!(opts.window_after_ms, 10 * 60 * 1_000);
+        assert!(opts.override_session_id.is_none());
+    }
+
+    #[test]
+    fn correlation_options_serde_roundtrip() {
+        let opts = CassCorrelationOptions {
+            window_before_ms: 5000,
+            window_after_ms: 15000,
+            override_session_id: Some("abc".to_string()),
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: CassCorrelationOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.window_before_ms, 5000);
+        assert_eq!(back.window_after_ms, 15000);
+        assert_eq!(back.override_session_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn correlation_status_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Linked).unwrap(),
+            "\"linked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Unlinked).unwrap(),
+            "\"unlinked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    #[test]
+    fn correlation_status_serde_roundtrip() {
+        for s in [
+            CorrelationStatus::Linked,
+            CorrelationStatus::Unlinked,
+            CorrelationStatus::Error,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: CorrelationStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn session_correlation_linked_constructor() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(),
+            0.9,
+            vec!["reason1".to_string()],
+            3,
+            1000,
+            2000,
+            Some(1500),
+        );
+        assert_eq!(c.status, CorrelationStatus::Linked);
+        assert_eq!(c.external_id.as_deref(), Some("ext-1"));
+        assert!((c.confidence - 0.9).abs() < f64::EPSILON);
+        assert_eq!(c.candidates_considered, 3);
+        assert_eq!(c.window_start_ms, 1000);
+        assert_eq!(c.window_end_ms, 2000);
+        assert_eq!(c.selected_started_at_ms, Some(1500));
+        assert_eq!(c.algorithm_version, CASS_CORRELATION_VERSION);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn session_correlation_unlinked_constructor() {
+        let c = SessionCorrelation::unlinked(vec!["no_match".to_string()], 0, 100, 200);
+        assert_eq!(c.status, CorrelationStatus::Unlinked);
+        assert!(c.external_id.is_none());
+        assert!(c.confidence.abs() < f64::EPSILON);
+        assert_eq!(c.candidates_considered, 0);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn session_correlation_error_constructor() {
+        let c = SessionCorrelation::error(
+            "timeout".to_string(),
+            vec!["cass_fail".to_string()],
+            100,
+            200,
+        );
+        assert_eq!(c.status, CorrelationStatus::Error);
+        assert!(c.external_id.is_none());
+        assert_eq!(c.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn session_correlation_serde_roundtrip() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(),
+            0.85,
+            vec!["ok".to_string()],
+            2,
+            1000,
+            2000,
+            Some(1500),
+        );
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Linked);
+        assert_eq!(back.external_id.as_deref(), Some("ext-1"));
+        assert!((back.confidence - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn to_external_meta_is_valid_json() {
+        let c = SessionCorrelation::linked("ext-1".to_string(), 0.9, vec![], 1, 0, 0, None);
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "linked");
+        assert_eq!(meta["external_id"], "ext-1");
+    }
+
+    #[test]
+    fn compute_confidence_single_candidate_close() {
+        // Single candidate, diff=0 → closeness=1.0 → 0.7 + 0.25*1.0 = 0.95
+        let c = compute_confidence(1, 0, None, 1_200_000);
+        assert!((c - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_single_candidate_far() {
+        // Single candidate, diff=window → closeness=0.0 → 0.7 + 0 = 0.7
+        let c = compute_confidence(1, 1_200_000, None, 1_200_000);
+        assert!((c - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_multi_candidate_close() {
+        // Multiple candidates, diff=0 → 0.5 + 0.2*1.0 = 0.7
+        let c = compute_confidence(3, 0, Some(200_000), 1_200_000);
+        // gap >= 120000 → +0.1 → 0.8
+        assert!((c - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_multi_candidate_small_gap() {
+        // Multiple candidates, diff=0, gap=10000 (<120000) → 0.7 - 0.05 = 0.65
+        let c = compute_confidence(2, 0, Some(10_000), 1_200_000);
+        assert!((c - 0.65).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_clamped_to_095() {
+        // Even extreme best-case shouldn't exceed 0.95
+        let c = compute_confidence(1, 0, Some(500_000), 1_200_000);
+        assert!(c <= 0.95);
+    }
+
+    #[test]
+    fn compute_confidence_clamped_to_zero() {
+        // Even worst case shouldn't go below 0
+        let c = compute_confidence(100, 1_200_000, Some(0), 1_200_000);
+        assert!(c >= 0.0);
+    }
+
+    #[test]
+    fn correlate_empty_sessions() {
+        let result = correlate_from_sessions(&[], 1_000_000, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert_eq!(result.candidates_considered, 0);
+    }
+
+    #[test]
+    fn correlate_skips_sessions_without_id() {
+        let sessions = vec![CassSession {
+            session_id: None,
+            started_at: Some("2026-01-29T17:00:00Z".to_string()),
+            ..CassSession::default()
+        }];
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert!(result.reasons[0].contains("skipped_missing_id=1"));
+    }
+
+    #[test]
+    fn correlate_skips_sessions_without_timestamp() {
+        let sessions = vec![CassSession {
+            session_id: Some("cass-1".to_string()),
+            started_at: None,
+            ..CassSession::default()
+        }];
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert!(result.reasons[0].contains("skipped_missing_time=1"));
+    }
+
+    #[test]
+    fn correlate_closest_start_time_wins() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![
+            make_session("far", "2026-01-29T16:55:00Z"), // 5 min before
+            make_session("close", "2026-01-29T17:00:30Z"), // 30 sec after
+        ];
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.external_id.as_deref(), Some("close"));
+    }
+
+    #[test]
+    fn correlate_ambiguous_shows_in_reasons() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![
+            make_session("a", "2026-01-29T17:01:00Z"),
+            make_session("b", "2026-01-29T17:02:00Z"),
+        ];
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Linked);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.contains("ambiguous_candidates"))
+        );
+    }
+
+    #[test]
+    fn window_functions_symmetric() {
+        let opts = CassCorrelationOptions::default();
+        let center = 1_000_000i64;
+        let start = window_start(center, &opts);
+        let end = window_end(center, &opts);
+        assert!(start < center);
+        assert!(end > center);
+        assert_eq!(center - start, opts.window_before_ms);
+        assert_eq!(end - center, opts.window_after_ms);
+    }
+
+    #[test]
+    fn window_functions_handle_negative_values() {
+        let opts = CassCorrelationOptions {
+            window_before_ms: -100,
+            window_after_ms: -100,
+            override_session_id: None,
+        };
+        let center = 1_000_000i64;
+        // Negative windows are clamped to 0 via .max(0)
+        assert_eq!(window_start(center, &opts), center);
+        assert_eq!(window_end(center, &opts), center);
+    }
+
+    #[test]
+    fn merge_external_meta_creates_new() {
+        let summary = CassSessionSummary {
+            total_tokens: Some(100),
+            input_tokens: Some(60),
+            output_tokens: Some(40),
+            message_count: 5,
+            ..Default::default()
+        };
+        let meta = merge_external_meta(None, &summary, 12345, "ext-1");
+        assert!(meta.is_object());
+        assert_eq!(meta["cass_refreshed_at_ms"], 12345);
+        assert_eq!(meta["cass_session_id"], "ext-1");
+        assert!(meta.get("cass_summary").is_some());
+    }
+
+    #[test]
+    fn merge_external_meta_preserves_existing_keys() {
+        let existing = serde_json::json!({
+            "custom_field": "keep_me",
+            "cass_refreshed_at_ms": 1000,
+        });
+        let summary = CassSessionSummary::default();
+        let meta = merge_external_meta(Some(existing), &summary, 2000, "ext-2");
+        assert_eq!(meta["custom_field"], "keep_me");
+        assert_eq!(meta["cass_refreshed_at_ms"], 2000); // updated
+        assert_eq!(meta["cass_session_id"], "ext-2");
+    }
+
+    #[test]
+    fn extract_refresh_ms_present() {
+        let meta = serde_json::json!({"cass_refreshed_at_ms": 12345});
+        assert_eq!(extract_refresh_ms(&meta), Some(12345));
+    }
+
+    #[test]
+    fn extract_refresh_ms_missing() {
+        let meta = serde_json::json!({"other": "data"});
+        assert!(extract_refresh_ms(&meta).is_none());
+    }
+
+    #[test]
+    fn extract_summary_valid() {
+        let summary = CassSessionSummary {
+            total_tokens: Some(100),
+            message_count: 3,
+            ..Default::default()
+        };
+        let meta = serde_json::json!({
+            "cass_summary": serde_json::to_value(&summary).unwrap(),
+        });
+        let extracted = extract_summary_from_meta(&meta);
+        assert!(extracted.is_some());
+        assert_eq!(extracted.unwrap().total_tokens, Some(100));
+    }
+
+    #[test]
+    fn extract_summary_missing() {
+        let meta = serde_json::json!({"other": 1});
+        assert!(extract_summary_from_meta(&meta).is_none());
+    }
+
+    #[test]
+    fn default_summary_refresh_options() {
+        let opts = CassSummaryRefreshOptions::default();
+        assert_eq!(opts.min_refresh_interval_ms, 5 * 60 * 1_000);
+        assert!(!opts.force);
+    }
+
+    #[test]
+    fn resolve_project_path_local() {
+        // Tests that a local path is returned (or git root is found)
+        let result = resolve_project_path("/tmp/some/path");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn resolve_project_path_empty_string() {
+        let result = resolve_project_path("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cass_correlation_version_is_v1() {
+        assert_eq!(CASS_CORRELATION_VERSION, "v1");
+    }
+
+    // ── Batch: DarkBadger wa-1u90p.7.1 ──
+
+    #[test]
+    fn correlation_status_debug_format() {
+        let dbg = format!("{:?}", CorrelationStatus::Linked);
+        assert!(dbg.contains("Linked"));
+    }
+
+    #[test]
+    fn correlation_status_copy_semantics() {
+        let a = CorrelationStatus::Unlinked;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn correlation_options_debug_clone() {
+        let opts = CassCorrelationOptions::default();
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("CassCorrelationOptions"));
+        let c = opts.clone();
+        assert_eq!(c.window_before_ms, opts.window_before_ms);
+    }
+
+    #[test]
+    fn session_correlation_debug_clone() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(),
+            0.9,
+            vec!["ok".to_string()],
+            1,
+            100,
+            200,
+            None,
+        );
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("SessionCorrelation"));
+        let c2 = c.clone();
+        assert_eq!(c2.status, c.status);
+        assert_eq!(c2.external_id, c.external_id);
+    }
+
+    #[test]
+    fn to_external_meta_unlinked_variant() {
+        let c = SessionCorrelation::unlinked(vec!["no_match".to_string()], 0, 100, 200);
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "unlinked");
+        assert!(meta["external_id"].is_null());
+    }
+
+    #[test]
+    fn to_external_meta_error_variant() {
+        let c =
+            SessionCorrelation::error("timeout".to_string(), vec!["fail".to_string()], 100, 200);
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "error");
+        assert_eq!(meta["error"], "timeout");
+    }
+
+    #[test]
+    fn session_correlation_unlinked_serde_roundtrip() {
+        let c = SessionCorrelation::unlinked(vec!["no_cass".to_string()], 5, 1000, 2000);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Unlinked);
+        assert!(back.external_id.is_none());
+        assert_eq!(back.candidates_considered, 5);
+    }
+
+    #[test]
+    fn session_correlation_error_serde_roundtrip() {
+        let c =
+            SessionCorrelation::error("api_fail".to_string(), vec!["reason".to_string()], 500, 600);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Error);
+        assert_eq!(back.error.as_deref(), Some("api_fail"));
+    }
+
+    #[test]
+    fn summary_refresh_options_debug_clone() {
+        let opts = CassSummaryRefreshOptions::default();
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("CassSummaryRefreshOptions"));
+        let c = opts.clone();
+        assert_eq!(c.min_refresh_interval_ms, opts.min_refresh_interval_ms);
+        assert_eq!(c.force, opts.force);
+    }
+
+    #[test]
+    fn session_correlation_algorithm_version_always_set() {
+        let linked = SessionCorrelation::linked("e".to_string(), 0.5, vec![], 1, 0, 0, None);
+        let unlinked = SessionCorrelation::unlinked(vec![], 0, 0, 0);
+        let error = SessionCorrelation::error("e".to_string(), vec![], 0, 0);
+        assert_eq!(linked.algorithm_version, CASS_CORRELATION_VERSION);
+        assert_eq!(unlinked.algorithm_version, CASS_CORRELATION_VERSION);
+        assert_eq!(error.algorithm_version, CASS_CORRELATION_VERSION);
+    }
+
+    // ── DB-backed tests ──
+
+    #[test]
+    fn agent_session_lifecycle_starts_reuses_switches_and_ends() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db").to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle
+                .upsert_pane(PaneRecord {
+                    pane_id: 4,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let cx = crate::cx::for_testing();
+
+            let first = ensure_active_agent_session_with_cx(&cx, &handle, 4, "codex", 1_000)
+                .await
+                .unwrap();
+            let again = ensure_active_agent_session_with_cx(&cx, &handle, 4, "codex", 2_000)
+                .await
+                .unwrap();
+            assert_eq!(first, again, "an open session of the same agent is reused");
+
+            let switched =
+                ensure_active_agent_session_with_cx(&cx, &handle, 4, "claude_code", 3_000)
+                    .await
+                    .unwrap();
+            assert_ne!(first, switched);
+            let codex = handle.get_agent_session(first).await.unwrap().unwrap();
+            assert_eq!(codex.started_at, 1_000);
+            assert_eq!(codex.ended_at, Some(3_000));
+            assert_eq!(codex.end_reason.as_deref(), Some("agent_changed"));
+
+            assert_eq!(
+                end_active_agent_sessions_with_cx(&cx, &handle, 4, "pane_closed", 4_000)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let claude = handle.get_agent_session(switched).await.unwrap().unwrap();
+            assert_eq!(claude.agent_type, "claude_code");
+            assert_eq!(claude.ended_at, Some(4_000));
+            assert_eq!(claude.end_reason.as_deref(), Some("pane_closed"));
+            assert!(handle.get_active_sessions().await.unwrap().is_empty());
+            assert_eq!(
+                end_active_agent_sessions_with_cx(&cx, &handle, 4, "pane_closed", 5_000)
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cass_enrichment_is_budgeted_spaced_and_survives_a_missing_cass() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db").to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            for pane_id in [1, 2, 3] {
+                handle
+                    .upsert_pane(PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1,
+                        last_seen_at: 1,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let cx = crate::cx::for_testing();
+            for (pane_id, agent) in [(1, "codex"), (2, "claude_code"), (3, "unknown")] {
+                ensure_active_agent_session_with_cx(&cx, &handle, pane_id, agent, 1_000)
+                    .await
+                    .unwrap();
+            }
+            let cass = CassClient::new().with_binary("/nonexistent/ft-test-cass");
+            let mut attempted = std::collections::HashMap::new();
+
+            let first = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000,
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.correlated + first.refreshed, 1, "budget of one");
+            assert_eq!(attempted.len(), 1);
+
+            let second = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                second.correlated, 1,
+                "the other cass-indexed session; unknown agents are skipped"
+            );
+            let third = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000 + CASS_ENRICHMENT_RETRY_MS - 1,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                third,
+                CassEnrichmentOutcome::default(),
+                "retry spacing holds"
+            );
+            let later = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000 + CASS_ENRICHMENT_RETRY_MS,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(later.correlated, 2, "both are due again");
+            assert!(
+                handle.get_active_sessions().await.unwrap().len() == 3,
+                "a failed enrichment never ends or drops a session"
+            );
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn correlate_and_persist_override_updates_session() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
+
+            let now = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some(dir.path().to_string_lossy().to_string()),
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            handle.upsert_pane(pane).await.unwrap();
+
+            let mut session = AgentSessionRecord::new_start(1, "claude_code");
+            session.started_at = now;
+            let session_id = handle.upsert_agent_session(session).await.unwrap();
+
+            let options = CassCorrelationOptions {
+                override_session_id: Some("cass-override".to_string()),
+                ..Default::default()
+            };
+
+            let cass = CassClient::new();
+            let correlation = correlate_and_persist_for_pane(
+                &handle,
+                &cass,
+                1,
+                CassAgent::ClaudeCode,
+                now,
+                &options,
+            )
+            .await
+            .unwrap();
+
+            let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
+            assert_eq!(updated.external_id.as_deref(), Some("cass-override"));
+            assert!(updated.external_meta.is_some());
+            assert_eq!(correlation.status, CorrelationStatus::Linked);
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `refresh_cass_summary_for_session_with_cx`
+    /// must match the legacy `refresh_cass_summary_for_session`
+    /// on the missing-session error branch. Both variants
+    /// surface `"agent session not found: <id>"`. Proves the
+    /// pre-flight checkpoint on the Cx-first path doesn't
+    /// short-circuit uncancelled cx — the storage read still
+    /// fires and the same error surfaces.
+    #[test]
+    fn refresh_cass_summary_with_cx_missing_session_matches_legacy() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft-refresh-cx.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
+
+            let cass = CassClient::new();
+            let options = CassSummaryRefreshOptions::default();
+            let cx = crate::cx::for_request();
+
+            // No session with id=999 exists — both paths must
+            // return "agent session not found: 999".
+            let legacy_err = refresh_cass_summary_for_session(&handle, &cass, 999, &options)
+                .await
+                .expect_err("legacy must error on missing session");
+            let cx_err =
+                refresh_cass_summary_for_session_with_cx(&cx, &handle, &cass, 999, &options)
+                    .await
+                    .expect_err("cx-first must error on missing session");
+
+            assert_eq!(legacy_err, cx_err);
+            assert!(
+                cx_err.contains("agent session not found: 999"),
+                "expected 'agent session not found: 999', got: {cx_err}"
+            );
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `correlate_and_persist_for_pane_with_cx`
+    /// must match the legacy `correlate_and_persist_for_pane` on
+    /// the override-session-id fast path. Same fixture as
+    /// `correlate_and_persist_override_updates_session` but
+    /// drives the Cx-first entry point.
+    #[test]
+    fn correlate_and_persist_with_cx_override_updates_session() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft-cx.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
+
+            let now = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                window_id: None,
+                tab_id: None,
+                domain: "local".to_string(),
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            handle.upsert_pane(pane).await.unwrap();
+
+            let mut session = AgentSessionRecord::new_start(1, "claude_code");
+            session.started_at = now;
+            let session_id = handle.upsert_agent_session(session).await.unwrap();
+
+            let options = CassCorrelationOptions {
+                override_session_id: Some("cass-override-cx".to_string()),
+                ..Default::default()
+            };
+
+            let cass = CassClient::new();
+            let cx = crate::cx::for_request();
+            let correlation = correlate_and_persist_for_pane_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                1,
+                CassAgent::ClaudeCode,
+                now,
+                &options,
+            )
+            .await
+            .unwrap();
+
+            let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
+            assert_eq!(updated.external_id.as_deref(), Some("cass-override-cx"));
+            assert!(updated.external_meta.is_some());
+            assert_eq!(correlation.status, CorrelationStatus::Linked);
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+}
+
+// br-ft-175qi: serialize tests that touch the process-global
+// CASS_SUMMARY_PARSE_DROP_COUNT counter so concurrent test threads
+// don't race on reset/observe pairs.
+#[cfg(test)]
+mod summary_parse_drop_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SUMMARY_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        SUMMARY_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn missing_key_does_not_bump_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"unrelated": "value"});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        // br-ft-175qi: absent key is the intentional None-return path.
+        assert_eq!(cass_summary_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn null_value_in_key_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // The key is present but the value is null — that's a parse
+        // failure (CassSessionSummary is a struct, not Option).
+        let meta = json!({"cass_summary": null});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn primitive_in_key_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"cass_summary": 42});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn empty_object_bumps_counter_instead_of_defaulting_to_empty_summary() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // serde defaults would otherwise turn {} into an all-empty
+        // CassSessionSummary. The writer never emits that shape, so
+        // treating it as a cache hit hides hand-edited or truncated
+        // metadata.
+        let meta = json!({"cass_summary": {}});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn partial_known_summary_object_succeeds_via_serde_defaults_no_bump() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"cass_summary": {"message_count": 3}});
+        let summary = extract_summary_from_meta(&meta).expect("known summary field should parse");
+        assert_eq!(summary.message_count, 3);
+        assert_eq!(cass_summary_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn wrong_field_type_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // total_tokens is Option<i64> — a string in that slot is
+        // unambiguously a parse failure regardless of serde defaults.
+        let meta = json!({"cass_summary": {"total_tokens": "not a number"}});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_failures_bump_monotonically() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // String at root is a clear parse failure (struct expected).
+        let meta = json!({"cass_summary": "not an object at all"});
+        for _ in 0..7 {
+            let _ = extract_summary_from_meta(&meta);
+        }
+        assert_eq!(cass_summary_parse_drop_count(), 7);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        // br-ft-175qi: malformed or object-shaped-but-unknown values
+        // must bump the counter exactly once. Known summary fields can
+        // still rely on CassSessionSummary serde defaults for fields
+        // omitted by older cache writers.
+        #[test]
+        fn arbitrary_malformed_or_unknown_summary_value_always_bumps(
+            shape in proptest::sample::select(vec![
+                json!(null),
+                json!(true),
+                json!(false),
+                json!(0),
+                json!(-1),
+                json!(""),
+                json!("a string"),
+                json!([]),
+                json!([1, 2, 3]),
+                json!({}),
+                json!({"random": "object"}),
+                json!({"id": 5}),
+                json!({"summary": "missing other fields"}),
+            ]),
+        ) {
+            let _g = lock();
+            reset_cass_summary_parse_drop_count_for_test();
+            let meta = json!({"cass_summary": shape});
+            let summary = extract_summary_from_meta(&meta);
+            proptest::prop_assert!(summary.is_none());
+            proptest::prop_assert_eq!(cass_summary_parse_drop_count(), 1);
+        }
+    }
+}

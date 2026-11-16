@@ -1,0 +1,19 @@
+{
+  "args": [
+    {
+      "Unix": [
+        47,
+        98,
+        105,
+        110,
+        47,
+        102,
+        116
+      ]
+    }
+  ],
+  "envs": [],
+  "cwd": null,
+  "umask": null,
+  "controlling_tty": true
+}

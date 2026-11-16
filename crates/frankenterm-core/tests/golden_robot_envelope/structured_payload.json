@@ -1,0 +1,16 @@
+{
+  "timestamp": "[TIMESTAMP]",
+  "source": "bridge.structured",
+  "data": {
+    "pane": {
+      "id": 7,
+      "title": "main",
+      "cwd": "/tmp/demo"
+    },
+    "metrics": {
+      "cpu": 0.1256,
+      "memory_mb": 64.4444
+    }
+  },
+  "degraded": false
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-reserve.json",
+  "title": "WA Robot Reserve Response",
+  "description": "Schema for the data field when calling 'wa robot reservations reserve <pane_id>'. Creates a pane reservation.",
+  "type": "object",
+  "required": ["reservation"],
+  "properties": {
+    "reservation": {
+      "$ref": "#/$defs/reservation_info",
+      "description": "The created or renewed reservation"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "reservation_info": {
+      "type": "object",
+      "description": "Reservation details",
+      "required": ["id", "pane_id", "owner_kind", "owner_id", "created_at", "expires_at", "status"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Reservation identifier"
+        },
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reserved pane ID"
+        },
+        "owner_kind": {
+          "type": "string",
+          "description": "Type of actor holding the reservation"
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Identifier of the reservation owner"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the pane was reserved"
+        },
+        "created_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation was created"
+        },
+        "expires_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation expires"
+        },
+        "released_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation was released (null if active)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Reservation status (e.g., 'active', 'released', 'expired')"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

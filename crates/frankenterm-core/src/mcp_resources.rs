@@ -1,0 +1,3672 @@
+//! MCP resource/template handlers extracted from legacy `mcp.rs`.
+//!
+//! This module is extraction-only and keeps resource behavior/URIs stable.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+use crate::mcp_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkResource as Resource,
+    FrameworkResourceContent as ResourceContent, FrameworkResourceHandler as ResourceHandler,
+    FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
+};
+
+use crate::agent_correlator::{
+    AgentCorrelator, DEFAULT_SWARM_SCENT_TTL_MS, SwarmScentReport, SwarmScentReservation,
+    SwarmScentSourceStatus, SwarmScentTxIntent, SwarmScentWorkClaim,
+};
+use crate::agent_mail_outbox::{DEFAULT_OUTBOX_MANIFEST_PATH, load_agent_mail_outbox_surface};
+use crate::attention_router::{
+    ATTENTION_ROUTER_MCP_CURRENT_URI, ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE,
+    AttentionRouterSourceAdapterInput, AttentionRouterSurface,
+    build_attention_router_surface_payload,
+};
+use crate::context_horizon::predict_context_horizon_from_sqlite;
+use crate::mcp_error::{
+    MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_WEZTERM,
+};
+use crate::operating_envelope::{
+    OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+};
+use crate::policy::{
+    ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyInput, PolicySurface,
+    SharedRateLimiter,
+};
+use crate::proof_lane::{
+    ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
+    ProofState,
+};
+use crate::redactor::Redactor;
+use crate::rehearsal_score::{
+    REHEARSAL_SCORE_MCP_CURRENT_URI, REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE,
+};
+use crate::render_quality::{
+    RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_MCP_RESOURCE_URI,
+    renderer_slos_doctor_report,
+};
+use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+use crate::runtime_telemetry::{
+    ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+    SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE, SwarmCapacityOperatorSummary,
+};
+use crate::swarm_scheduler::{
+    HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
+};
+use crate::wezterm::PaneInfo;
+
+use super::mcp_missions::{
+    mcp_load_mission_tx_contract_from_path, mcp_resolve_mission_tx_file_path,
+};
+use super::mcp_tools::{
+    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaOperatingEnvelopeTool,
+    WaRehearsalScoreTool, WaReservationsTool, WaRulesListTool, WaStateTool,
+};
+use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
+use super::{build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter};
+use crate::config::{Config, PaneFilterConfig};
+
+const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
+const PROOF_HISTORY_RELEASE_BLOCKING_URI: &str = "wa://proof-history/release-blocking";
+const SWARM_SCENT_RESOURCE_URI: &str = "wa://swarm/scent";
+pub(super) const AGENT_MAIL_OUTBOX_RESOURCE_URI: &str = "wa://agent-mail/outbox";
+
+fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
+    let Some(text) = contents.into_iter().find_map(|content| match content {
+        Content::Text { text } => Some(text),
+        _ => None,
+    }) else {
+        return envelope_as_resource(
+            uri,
+            McpEnvelope::<()>::error(
+                MCP_ERR_INTERNAL,
+                "Tool output missing text payload",
+                Some("Expected MCP tool wrapper to return text JSON content.".to_string()),
+                0,
+            ),
+        );
+    };
+
+    Ok(vec![ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("application/json".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
+}
+
+fn envelope_as_resource<T: Serialize>(
+    uri: &str,
+    envelope: McpEnvelope<T>,
+) -> McpResult<Vec<ResourceContent>> {
+    let text = serde_json::to_string(&envelope)
+        .map_err(|e| McpError::internal_error(format!("Serialize resource payload: {e}")))?;
+    Ok(vec![ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("application/json".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
+}
+
+fn read_events_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    limit: usize,
+    unhandled: bool,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaEventsTool::new(Arc::clone(db_path));
+    let contents = tool.call(
+        ctx,
+        serde_json::json!({
+            "limit": limit.clamp(1, 1000),
+            "unhandled": unhandled,
+        }),
+    )?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_accounts_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    service: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaAccountsTool::new(Arc::clone(db_path));
+    let contents = tool.call(ctx, serde_json::json!({ "service": service }))?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_rules_resource(
+    ctx: &McpContext,
+    uri: &str,
+    agent_type: Option<&str>,
+) -> McpResult<Vec<ResourceContent>> {
+    let args = if let Some(agent_type) = agent_type {
+        serde_json::json!({ "verbose": true, "agent_type": agent_type })
+    } else {
+        serde_json::json!({ "verbose": true })
+    };
+    let tool = WaRulesListTool;
+    let contents = tool.call(ctx, args)?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_mission_objective_plan_resource(
+    ctx: &McpContext,
+    uri: &str,
+    objective: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaMissionObjectivePlanTool;
+    let contents = tool.call(
+        ctx,
+        serde_json::json!({
+            "objective": objective,
+            "source_unavailable": ["agent-mail", "rch"],
+        }),
+    )?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_rehearsal_score_resource(
+    ctx: &McpContext,
+    config: &Arc<Config>,
+    uri: &str,
+    surface: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaRehearsalScoreTool::new(Arc::clone(config));
+    let contents = tool.call(ctx, serde_json::json!({ "surface": surface }))?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_reservations_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    pane_id: Option<u64>,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaReservationsTool::new(Arc::clone(db_path));
+    let args = if let Some(pane_id) = pane_id {
+        serde_json::json!({ "pane_id": pane_id })
+    } else {
+        serde_json::Value::Null
+    };
+    let contents = tool.call(ctx, args)?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn attestation_retractions_root(config: &Config) -> Result<(PathBuf, PathBuf), String> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|err| format!("resolve workspace layout: {err}"))?;
+    let root = std::env::var_os("FT_ATTESTATION_RETRACTIONS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            layout
+                .root
+                .join("docs")
+                .join("attestations")
+                .join("retractions")
+        });
+    Ok((layout.root, root))
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn collect_attestation_retraction_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let entries =
+        std::fs::read_dir(root).map_err(|err| format!("read {}: {err}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read entry in {}: {err}", root.display()))?;
+        let path = entry.path();
+        if path
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new("archive"))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_attestation_retraction_files(&path, files)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            && !name.ends_with(".canonical.json")
+            && !name.ends_with(".payload.json")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_attestation_retractions_for_resource(
+    workspace_root: &Path,
+    root: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut files = Vec::new();
+    collect_attestation_retraction_files(root, &mut files)?;
+    files.sort();
+
+    let mut rows = Vec::new();
+    for path in files {
+        let bytes =
+            std::fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("parse {} as JSON: {err}", path.display()))?;
+        let rel = path
+            .strip_prefix(workspace_root)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        if let Some(object) = value.as_object_mut() {
+            object.insert("path".to_string(), serde_json::Value::String(rel));
+        }
+        rows.push(value);
+    }
+    Ok(rows)
+}
+
+fn proof_history_artifact_roots(config: &Config) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|err| format!("resolve workspace layout: {err}"))?;
+    let roots = std::env::var_os("FT_PROOF_HISTORY_ROOT")
+        .map(|root| vec![PathBuf::from(root)])
+        .unwrap_or_else(|| vec![layout.root.join("tests").join("e2e").join("artifacts")]);
+    Ok((layout.root, roots))
+}
+
+fn load_proof_history_query_for_resource(
+    config: &Config,
+    query: ProofHistoryQuery,
+) -> Result<crate::proof_lane::ProofHistoryQueryResult, String> {
+    let (workspace_root, roots) = proof_history_artifact_roots(config)?;
+    load_proof_history_query_from_roots(&workspace_root, roots, query)
+}
+
+fn load_proof_history_query_from_roots(
+    workspace_root: &Path,
+    roots: Vec<PathBuf>,
+    query: ProofHistoryQuery,
+) -> Result<crate::proof_lane::ProofHistoryQueryResult, String> {
+    let mut paths = Vec::new();
+    for root in roots {
+        collect_proof_history_jsonl_paths(&root, &mut paths)?;
+    }
+    paths.sort();
+    paths.dedup();
+
+    let artifacts = paths
+        .into_iter()
+        .map(|path| proof_history_artifact_input_from_path(workspace_root, &path))
+        .collect::<Vec<_>>();
+    let index = ProofHistoryIndex::from_artifacts(&artifacts);
+    let scoreboard = ProofReleaseScoreboard::from_history(&index);
+    Ok(scoreboard.query(&query))
+}
+
+fn collect_proof_history_jsonl_paths(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+    if path.is_file() {
+        if is_proof_history_jsonl(path) {
+            paths.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !path.is_dir() {
+        paths.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    let entries =
+        std::fs::read_dir(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read entry in {}: {err}", path.display()))?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_proof_history_jsonl_paths(&entry_path, paths)?;
+        } else if is_proof_history_jsonl(&entry_path) {
+            paths.push(entry_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_proof_history_jsonl(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && (file_name.contains("proof-record") || file_name.contains("proof_record"))
+}
+
+fn proof_history_artifact_input_from_path(
+    workspace_root: &Path,
+    path: &Path,
+) -> ProofHistoryArtifactInput {
+    let artifact_path = path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let content_sha256 = proof_history_sha256_hex(&bytes);
+            match String::from_utf8(bytes) {
+                Ok(content) => {
+                    let mut input = ProofHistoryArtifactInput::new(artifact_path, content);
+                    input.content_sha256 = Some(content_sha256);
+                    input
+                }
+                Err(error) => ProofHistoryArtifactInput::unavailable(
+                    artifact_path,
+                    Some(format!("artifact is not UTF-8: {error}")),
+                ),
+            }
+        }
+        Err(error) => {
+            ProofHistoryArtifactInput::unavailable(artifact_path, Some(error.to_string()))
+        }
+    }
+}
+
+fn proof_history_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    hex::encode(digest)
+}
+
+fn proof_history_state_from_resource_param(value: &str) -> Option<ProofState> {
+    match percent_decode_resource_param(value)
+        .replace('-', "_")
+        .as_str()
+    {
+        "not_run" => Some(ProofState::NotRun),
+        "reached_remote_cargo" => Some(ProofState::ReachedRemoteCargo),
+        "source_compile_fail" => Some(ProofState::SourceCompileFail),
+        "test_fail" => Some(ProofState::TestFail),
+        "pass" => Some(ProofState::Pass),
+        "infra_blocked_pre_cargo" => Some(ProofState::InfraBlockedPreCargo),
+        "infra_blocked_post_cargo" => Some(ProofState::InfraBlockedPostCargo),
+        "local_invalid" => Some(ProofState::LocalInvalid),
+        "skipped_not_proven" => Some(ProofState::SkippedNotProven),
+        "inconclusive" => Some(ProofState::Inconclusive),
+        _ => None,
+    }
+}
+
+fn percent_decode_resource_param(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((high << 4) | low);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+pub(super) struct WaPanesResource {
+    // GH#72: carried so the delegated WaStateTool lists panes through the
+    // config-aware unified handle (vendored mux socket when configured).
+    config: Arc<Config>,
+    filter: PaneFilterConfig,
+    db_path: Option<Arc<PathBuf>>,
+}
+
+impl WaPanesResource {
+    pub(super) fn new(
+        config: Arc<Config>,
+        filter: PaneFilterConfig,
+        db_path: Option<Arc<PathBuf>>,
+    ) -> Self {
+        Self {
+            config,
+            filter,
+            db_path,
+        }
+    }
+}
+
+impl ResourceHandler for WaPanesResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://panes".to_string(),
+            name: "ft panes".to_string(),
+            description: Some("Pane snapshot (same data surface as wa.state)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "panes".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaStateTool::new(
+            Arc::clone(&self.config),
+            self.filter.clone(),
+            self.db_path.as_ref().map(Arc::clone),
+        );
+        let contents = tool.call(ctx, serde_json::Value::Null)?;
+        tool_output_as_resource("wa://panes", contents)
+    }
+}
+
+pub(super) struct WaEventsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events".to_string(),
+            name: "ft events".to_string(),
+            description: Some("Recent detection events (default limit 50)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_events_resource(ctx, &self.db_path, "wa://events", 50, false)
+    }
+}
+
+pub(super) struct WaEventsTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsTemplateResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events/template".to_string(),
+            name: "ft events template".to_string(),
+            description: Some("Template for page-sized events resource".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://events/{limit}".to_string(),
+            name: "ft events (paged)".to_string(),
+            description: Some("Override page size for events resource".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_events_resource(ctx, &self.db_path, "wa://events", 50, false)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 1000);
+        read_events_resource(ctx, &self.db_path, uri, limit, false)
+    }
+}
+
+pub(super) struct WaEventsUnhandledTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsUnhandledTemplateResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsUnhandledTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events/unhandled/template".to_string(),
+            name: "ft events unhandled template".to_string(),
+            description: Some("Template for unhandled events resource".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://events/unhandled/{limit}".to_string(),
+            name: "ft events (unhandled)".to_string(),
+            description: Some("Read only unhandled events with configurable limit".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "events".to_string(),
+                "unhandled".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_events_resource(ctx, &self.db_path, "wa://events/unhandled/50", 50, true)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 1000);
+        read_events_resource(ctx, &self.db_path, uri, limit, true)
+    }
+}
+
+pub(super) struct WaAccountsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAccountsResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaAccountsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://accounts".to_string(),
+            name: "ft accounts".to_string(),
+            description: Some("Account usage snapshot (default service openai)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_accounts_resource(ctx, &self.db_path, "wa://accounts", "openai")
+    }
+}
+
+pub(super) struct WaAccountsByServiceTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAccountsByServiceTemplateResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaAccountsByServiceTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://accounts/template".to_string(),
+            name: "ft accounts template".to_string(),
+            description: Some("Template for service-specific account snapshots".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://accounts/{service}".to_string(),
+            name: "ft accounts by service".to_string(),
+            description: Some("Read account snapshot for a specific service".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_accounts_resource(ctx, &self.db_path, "wa://accounts/openai", "openai")
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let service = params
+            .get("service")
+            .cloned()
+            .unwrap_or_else(|| "openai".to_string());
+        read_accounts_resource(ctx, &self.db_path, uri, &service)
+    }
+}
+
+pub(super) struct WaRulesResource;
+
+impl ResourceHandler for WaRulesResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rules".to_string(),
+            name: "ft rules".to_string(),
+            description: Some(
+                "Rule catalog (same data surface as wa.rules_list with verbose output)".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_rules_resource(ctx, "wa://rules", None)
+    }
+}
+
+pub(super) struct WaRulesByAgentTemplateResource;
+
+impl ResourceHandler for WaRulesByAgentTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rules/template".to_string(),
+            name: "ft rules template".to_string(),
+            description: Some("Template for rules filtered by agent type".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://rules/{agent_type}".to_string(),
+            name: "ft rules by agent".to_string(),
+            description: Some("Filter rule catalog by agent type".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_rules_resource(ctx, "wa://rules", None)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        read_rules_resource(ctx, uri, params.get("agent_type").map(String::as_str))
+    }
+}
+
+pub(super) struct WaMissionObjectivePlanTemplateResource;
+
+impl ResourceHandler for WaMissionObjectivePlanTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://mission/objective-plan/template".to_string(),
+            name: "ft mission objective plan template".to_string(),
+            description: Some("Template for dry-run mission objective planning".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "mission".to_string(), "robot".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://mission/objective-plan/{objective}".to_string(),
+            name: "ft mission objective plan".to_string(),
+            description: Some(
+                "Compile an objective into the same dry-run surface as wa.mission_objective_plan"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "mission".to_string(), "robot".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_mission_objective_plan_resource(
+            ctx,
+            "wa://mission/objective-plan",
+            "continue current operator objective",
+        )
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let objective = params
+            .get("objective")
+            .map(String::as_str)
+            .unwrap_or("continue current operator objective");
+        read_mission_objective_plan_resource(ctx, uri, objective)
+    }
+}
+
+pub(super) struct WaRehearsalScoreCurrentResource {
+    config: Arc<Config>,
+}
+
+impl WaRehearsalScoreCurrentResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaRehearsalScoreCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: REHEARSAL_SCORE_MCP_CURRENT_URI.to_string(),
+            name: "ft rehearsal score current".to_string(),
+            description: Some(
+                "Read-only rehearsal score receipt from the default demo manifest".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_rehearsal_score_resource(ctx, &self.config, REHEARSAL_SCORE_MCP_CURRENT_URI, "score")
+    }
+}
+
+pub(super) struct WaRehearsalScoreSurfaceTemplateResource {
+    config: Arc<Config>,
+}
+
+impl WaRehearsalScoreSurfaceTemplateResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaRehearsalScoreSurfaceTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rehearsal-score/template".to_string(),
+            name: "ft rehearsal score surface template".to_string(),
+            description: Some(
+                "Template for read-only rehearsal score/explain receipts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE.to_string(),
+            name: "ft rehearsal score surface".to_string(),
+            description: Some(
+                "Read-only score or explain receipt using the default demo manifest".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let current = WaRehearsalScoreCurrentResource::new(Arc::clone(&self.config));
+        current.read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let surface = params.get("surface").map_or("score", String::as_str);
+        read_rehearsal_score_resource(ctx, &self.config, uri, surface)
+    }
+}
+
+pub(super) struct WaWorkflowsResource {
+    config: Arc<Config>,
+}
+
+impl WaWorkflowsResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaWorkflowsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://workflows".to_string(),
+            name: "ft workflows".to_string(),
+            description: Some("Builtin workflow catalog and metadata".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "workflows".to_string()],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let workflows: Vec<McpWorkflowItem> = builtin_workflows(&self.config)
+            .iter()
+            .map(|workflow| McpWorkflowItem {
+                name: workflow.name().to_string(),
+                description: workflow.description().to_string(),
+                step_count: workflow.step_count(),
+                trigger_event_types: workflow
+                    .trigger_event_types()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                trigger_rule_ids: workflow
+                    .trigger_rule_ids()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                supported_agent_types: workflow
+                    .supported_agent_types()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                requires_pane: workflow.requires_pane(),
+                requires_approval: workflow.requires_approval(),
+                can_abort: workflow.can_abort(),
+                destructive: workflow.is_destructive(),
+            })
+            .collect();
+
+        let data = McpWorkflowsData {
+            total: workflows.len(),
+            workflows,
+        };
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_as_resource("wa://workflows", envelope)
+    }
+}
+
+pub(super) struct WaAgentMailOutboxResource {
+    config: Arc<Config>,
+}
+
+impl WaAgentMailOutboxResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaAgentMailOutboxResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: AGENT_MAIL_OUTBOX_RESOURCE_URI.to_string(),
+            name: "ft agent mail outbox".to_string(),
+            description: Some(
+                "Read-only Agent Mail fallback outbox entries and replay state".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "agent-mail".to_string(),
+                "outbox".to_string(),
+                "coordination".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let layout = match self.config.workspace_layout(None) {
+            Ok(layout) => layout,
+            Err(error) => {
+                return envelope_as_resource(
+                    AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                    McpEnvelope::<serde_json::Value>::error(
+                        MCP_ERR_CONFIG,
+                        format!("Resolve workspace layout: {error}"),
+                        Some(
+                            "Set FT_WORKSPACE or run the MCP server from the workspace root."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    ),
+                );
+            }
+        };
+
+        match load_agent_mail_outbox_surface(&layout.root, None, &[]) {
+            Ok(surface) => envelope_as_resource(
+                AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                McpEnvelope::success(surface, elapsed_ms(start)),
+            ),
+            Err(error) => envelope_as_resource(
+                AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                McpEnvelope::<serde_json::Value>::error(
+                    MCP_ERR_INTERNAL,
+                    format!("Load Agent Mail outbox surface: {error}"),
+                    Some(format!(
+                        "Expected retained outbox manifest at {DEFAULT_OUTBOX_MANIFEST_PATH}."
+                    )),
+                    elapsed_ms(start),
+                ),
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SwarmScentLoadError {
+    Runtime(String),
+    PaneDiscovery(String),
+    Policy { reason: String, hint: String },
+}
+
+impl SwarmScentLoadError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Runtime(_) => MCP_ERR_INTERNAL,
+            Self::PaneDiscovery(_) => MCP_ERR_WEZTERM,
+            Self::Policy { .. } => MCP_ERR_POLICY,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Runtime(message) | Self::PaneDiscovery(message) => message,
+            Self::Policy { reason, .. } => reason,
+        }
+    }
+
+    fn hint(&self) -> &str {
+        match self {
+            Self::Runtime(_) => "Could not initialize the runtime for swarm scent generation.",
+            Self::PaneDiscovery(_) => {
+                "Check that the live mux is reachable; stale swarm scent is not emitted."
+            }
+            Self::Policy { hint, .. } => hint,
+        }
+    }
+}
+
+fn swarm_scent_read_policy_input(pane: &PaneInfo) -> PolicyInput {
+    let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mux)
+        .with_pane(pane.pane_id)
+        .with_domain(pane.inferred_domain())
+        .with_capabilities(PaneCapabilities::unknown())
+        .with_text_summary(format!("wa://swarm/scent pane_id={}", pane.pane_id));
+
+    if let Some(title) = &pane.title {
+        input = input.with_pane_title(title.clone());
+    }
+    if let Some(cwd) = &pane.cwd {
+        input = input.with_pane_cwd(cwd.clone());
+    }
+
+    input
+}
+
+fn swarm_scent_policy_error(
+    pane_id: u64,
+    decision: &PolicyDecision,
+) -> Option<SwarmScentLoadError> {
+    if decision.is_denied() {
+        let reason = decision
+            .reason()
+            .unwrap_or("Swarm scent read denied by policy")
+            .to_string();
+        return Some(SwarmScentLoadError::Policy {
+            reason,
+            hint: "Hard policy deny: review config.safety.rules for MCP read_output access to wa://swarm/scent."
+                .to_string(),
+        });
+    }
+
+    if decision.requires_approval() {
+        let reason = decision
+            .reason()
+            .unwrap_or("Swarm scent read requires approval")
+            .to_string();
+        return Some(SwarmScentLoadError::Policy {
+            reason,
+            hint: format!(
+                "Policy returned RequireApproval for wa://swarm/scent pane_id={pane_id}; \
+                 resource reads fail closed and do not emit partial scent payloads."
+            ),
+        });
+    }
+
+    None
+}
+
+fn authorize_swarm_scent_panes(
+    config: &Config,
+    shared_rate_limiter: SharedRateLimiter,
+    panes: &[PaneInfo],
+) -> Result<(), SwarmScentLoadError> {
+    let mut engine =
+        build_policy_engine_with_shared_rate_limiter(config, false, shared_rate_limiter);
+
+    for pane in panes {
+        let input = swarm_scent_read_policy_input(pane);
+        let decision = engine.authorize(&input);
+        if let Some(error) = swarm_scent_policy_error(pane.pane_id, &decision) {
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn redact_optional_string(value: &mut Option<String>, redactor: &Redactor) {
+    if let Some(text) = value.as_mut() {
+        *text = redactor.redact(text.as_str());
+    }
+}
+
+fn redact_string(value: &mut String, redactor: &Redactor) {
+    *value = redactor.redact(value.as_str());
+}
+
+fn redact_swarm_scent_report(report: &mut SwarmScentReport, redactor: &Redactor) {
+    for agent in &mut report.agents {
+        redact_string(&mut agent.slug, redactor);
+        redact_string(&mut agent.agent_type, redactor);
+        redact_string(&mut agent.state, redactor);
+        redact_optional_string(&mut agent.cwd, redactor);
+        redact_optional_string(&mut agent.session_id, redactor);
+        redact_optional_string(&mut agent.last_rule_id, redactor);
+    }
+
+    for reservation in &mut report.reservations {
+        redact_string(&mut reservation.owner_kind, redactor);
+        redact_string(&mut reservation.owner_id, redactor);
+        redact_optional_string(&mut reservation.reason, redactor);
+    }
+
+    for claim in &mut report.work_claims {
+        redact_string(&mut claim.claim_id, redactor);
+        redact_string(&mut claim.owner, redactor);
+        for label in &mut claim.labels {
+            redact_string(label, redactor);
+        }
+        redact_optional_string(&mut claim.summary, redactor);
+    }
+
+    for intent in &mut report.tx_intents {
+        redact_string(&mut intent.tx_id, redactor);
+        redact_string(&mut intent.plan_id, redactor);
+        redact_string(&mut intent.requested_by, redactor);
+        redact_string(&mut intent.lifecycle_state, redactor);
+        redact_string(&mut intent.outcome, redactor);
+        redact_string(&mut intent.summary, redactor);
+        redact_string(&mut intent.correlation_id, redactor);
+        redact_string(&mut intent.contract_file, redactor);
+    }
+
+    for source in &mut report.sources {
+        redact_string(&mut source.source, redactor);
+        redact_string(&mut source.status, redactor);
+        redact_string(&mut source.detail, redactor);
+    }
+}
+
+pub(super) struct WaSwarmScentResource {
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
+}
+
+impl WaSwarmScentResource {
+    pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
+    }
+}
+
+impl ResourceHandler for WaSwarmScentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: SWARM_SCENT_RESOURCE_URI.to_string(),
+            name: "ft swarm scent".to_string(),
+            description: Some(
+                "Read-only sibling-agent scent with live CWDs, reservations, and TTL freshness"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "scent".to_string(),
+                "attention".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = attention_router_resource_now_ms();
+        match load_swarm_scent_report(
+            Arc::clone(&self.config),
+            self.db_path.as_ref().map(Arc::clone),
+            Arc::clone(&self.policy_rate_limiter),
+            generated_at_ms,
+        ) {
+            Ok(mut report) => {
+                let redactor = Redactor::new();
+                redact_swarm_scent_report(&mut report, &redactor);
+                envelope_as_resource(
+                    SWARM_SCENT_RESOURCE_URI,
+                    McpEnvelope::success(report, elapsed_ms(start)),
+                )
+            }
+            Err(error) => envelope_as_resource(
+                SWARM_SCENT_RESOURCE_URI,
+                McpEnvelope::<serde_json::Value>::error(
+                    error.code(),
+                    error.message(),
+                    Some(error.hint().to_string()),
+                    elapsed_ms(start),
+                ),
+            ),
+        }
+    }
+}
+
+fn load_swarm_scent_report(
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
+    generated_at_ms: u64,
+) -> Result<SwarmScentReport, SwarmScentLoadError> {
+    let runtime = CompatRuntimeBuilder::current_thread()
+        .build()
+        .map_err(|err| SwarmScentLoadError::Runtime(format!("Runtime init failed: {err}")))?;
+
+    runtime.block_on(async move {
+        // GH#72: honor any configured vendored mux socket.
+        let panes = crate::wezterm::wezterm_handle_from_config(config.as_ref())
+            .list_panes()
+            .await
+            .map_err(|err| SwarmScentLoadError::PaneDiscovery(format!("List live panes: {err}")))?;
+        authorize_swarm_scent_panes(config.as_ref(), policy_rate_limiter, &panes)?;
+        let mut correlator = AgentCorrelator::new();
+        for pane in &panes {
+            correlator.update_from_pane_info(pane);
+        }
+
+        let (reservations, reservation_source) = load_swarm_scent_reservations(
+            db_path.as_ref().map(|path| path.as_path()),
+            generated_at_ms,
+        );
+        let (work_claims, work_claim_source) =
+            load_swarm_scent_work_claims(db_path.as_ref().map(|path| path.as_path()));
+        let (tx_intents, tx_intent_source) = load_swarm_scent_tx_intents(config.as_ref());
+        Ok(correlator.swarm_scent_report_with_sources(
+            generated_at_ms,
+            DEFAULT_SWARM_SCENT_TTL_MS,
+            reservations,
+            reservation_source,
+            work_claims,
+            work_claim_source,
+            tx_intents,
+            tx_intent_source,
+        ))
+    })
+}
+
+fn load_swarm_scent_reservations(
+    db_path: Option<&Path>,
+    generated_at_ms: u64,
+) -> (Vec<SwarmScentReservation>, SwarmScentSourceStatus) {
+    let Some(db_path) = db_path else {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                "No storage path was available for active pane reservations.",
+            ),
+        );
+    };
+    if !db_path.exists() {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                format!("Reservation storage does not exist: {}", db_path.display()),
+            ),
+        );
+    }
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Open reservation storage read-only: {err}"),
+                ),
+            );
+        }
+    };
+    if let Err(err) = conn.busy_timeout(Duration::from_secs(2)) {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                format!("Configure reservation storage busy timeout: {err}"),
+            ),
+        );
+    }
+
+    let now_ms = i64::try_from(generated_at_ms).unwrap_or(i64::MAX);
+    let mut stmt = match conn.prepare(
+        r"
+        SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at
+        FROM pane_reservations
+        WHERE status = 'active' AND expires_at > ?1
+        ORDER BY created_at ASC, id ASC
+        LIMIT 200
+        ",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Prepare active-reservation query: {err}"),
+                ),
+            );
+        }
+    };
+
+    let rows = match stmt.query_map([now_ms], |row| {
+        swarm_scent_reservation_from_row(row, now_ms)
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Read active reservation rows: {err}"),
+                ),
+            );
+        }
+    };
+
+    let mut reservations = Vec::new();
+    for row in rows {
+        match row {
+            Ok(reservation) => reservations.push(reservation),
+            Err(err) => {
+                return (
+                    Vec::new(),
+                    SwarmScentSourceStatus::unavailable(
+                        "reservations",
+                        format!("Decode active reservation row: {err}"),
+                    ),
+                );
+            }
+        }
+    }
+
+    (
+        reservations,
+        SwarmScentSourceStatus::live(
+            "reservations",
+            "Active pane reservations were read from storage.",
+        ),
+    )
+}
+
+fn swarm_scent_reservation_from_row(
+    row: &rusqlite::Row<'_>,
+    now_ms: i64,
+) -> rusqlite::Result<SwarmScentReservation> {
+    let pane_id_i64: i64 = row.get(1)?;
+    let pane_id = u64::try_from(pane_id_i64).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Integer, Box::new(err))
+    })?;
+    let expires_at_ms: i64 = row.get(6)?;
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+    let ttl_remaining_ms: u64 = u64::try_from(remaining_ms).unwrap_or_default();
+    Ok(SwarmScentReservation {
+        id: row.get(0)?,
+        pane_id,
+        owner_kind: row.get(2)?,
+        owner_id: row.get(3)?,
+        reason: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        expires_at_ms,
+        ttl_remaining_ms,
+    })
+}
+
+fn load_swarm_scent_work_claims(
+    db_path: Option<&Path>,
+) -> (Vec<SwarmScentWorkClaim>, SwarmScentSourceStatus) {
+    let Some(db_path) = db_path else {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                "No storage path was available for native work claims.",
+            ),
+        );
+    };
+    if !db_path.exists() {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                format!("Work-claim storage does not exist: {}", db_path.display()),
+            ),
+        );
+    }
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Open work-claim storage read-only: {err}"),
+                ),
+            );
+        }
+    };
+    if let Err(err) = conn.busy_timeout(Duration::from_secs(2)) {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                format!("Configure work-claim storage busy timeout: {err}"),
+            ),
+        );
+    }
+
+    let mut stmt = match conn.prepare(
+        r"
+        SELECT claim_id, owner, priority, labels_json, claimed_at_ms, updated_at_ms, summary
+        FROM work_claims
+        WHERE state = 'claimed' AND owner IS NOT NULL
+        ORDER BY priority ASC, updated_at_ms DESC, claim_id ASC
+        LIMIT 200
+        ",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Prepare claimed-work query: {err}"),
+                ),
+            );
+        }
+    };
+
+    let rows = match stmt.query_map([], swarm_scent_work_claim_from_row) {
+        Ok(rows) => rows,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Read claimed work rows: {err}"),
+                ),
+            );
+        }
+    };
+
+    let mut claims = Vec::new();
+    for row in rows {
+        match row {
+            Ok(claim) => claims.push(claim),
+            Err(err) => {
+                return (
+                    Vec::new(),
+                    SwarmScentSourceStatus::unavailable(
+                        "work_claims",
+                        format!("Decode claimed work row: {err}"),
+                    ),
+                );
+            }
+        }
+    }
+
+    (
+        claims,
+        SwarmScentSourceStatus::live(
+            "work_claims",
+            "Currently claimed native work-queue rows were read from storage.",
+        ),
+    )
+}
+
+fn swarm_scent_work_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SwarmScentWorkClaim> {
+    let priority: i64 = row.get(2)?;
+    let labels_json: String = row.get(3)?;
+    Ok(SwarmScentWorkClaim {
+        claim_id: row.get(0)?,
+        owner: row.get(1)?,
+        priority: u32::try_from(priority).unwrap_or(3),
+        labels: serde_json::from_str::<Vec<String>>(&labels_json).unwrap_or_default(),
+        claimed_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+        summary: row.get(6)?,
+    })
+}
+
+fn load_swarm_scent_tx_intents(
+    config: &Config,
+) -> (Vec<SwarmScentTxIntent>, SwarmScentSourceStatus) {
+    let contract_path = match mcp_resolve_mission_tx_file_path(config, None) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!("Resolve active mission tx path: {}", err.message),
+                ),
+            );
+        }
+    };
+
+    match contract_path.try_exists() {
+        Ok(false) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::live(
+                    "tx_intents",
+                    format!(
+                        "No active mission tx contract exists at {}.",
+                        contract_path.display()
+                    ),
+                ),
+            );
+        }
+        Ok(true) => {}
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!(
+                        "Inspect active mission tx contract path {}: {err}",
+                        contract_path.display()
+                    ),
+                ),
+            );
+        }
+    }
+
+    let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+        Ok(contract) => contract,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!("Read active mission tx contract: {}", err.message),
+                ),
+            );
+        }
+    };
+
+    let intent = SwarmScentTxIntent {
+        tx_id: contract.intent.tx_id.0.clone(),
+        plan_id: contract.plan.plan_id.0.clone(),
+        requested_by: format!("{:?}", contract.intent.requested_by),
+        lifecycle_state: format!("{:?}", contract.lifecycle_state),
+        outcome: format!("{:?}", contract.outcome),
+        summary: contract.intent.summary.clone(),
+        correlation_id: contract.intent.correlation_id.clone(),
+        created_at_ms: contract.intent.created_at_ms,
+        contract_file: contract_path.display().to_string(),
+    };
+
+    (
+        vec![intent],
+        SwarmScentSourceStatus::live(
+            "tx_intents",
+            "Active mission transaction intent was read from the configured tx contract file.",
+        ),
+    )
+}
+
+pub(super) struct WaHerdWaveResource;
+
+impl ResourceHandler for WaHerdWaveResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://herd-wave".to_string(),
+            name: "ft herd wave".to_string(),
+            description: Some(
+                "Read-only herd-wave contract and dry-run planner surface".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "herd-wave".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let report = build_herd_wave_surface_report(
+            "mcp.herd_wave",
+            generated_at_ms,
+            &[],
+            HerdWaveEventKind::Wake,
+            10,
+            60_000,
+            HerdWaveMcpResourceSurface::implemented("wa://herd-wave"),
+        );
+        envelope_as_resource(
+            "wa://herd-wave",
+            McpEnvelope::success(report, elapsed_ms(start)),
+        )
+    }
+}
+
+fn attention_router_resource_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn attention_router_resource_payload(
+    surface: AttentionRouterSurface,
+    item_id: Option<&str>,
+) -> crate::attention_router::AttentionRouterSurfacePayload {
+    let input = AttentionRouterSourceAdapterInput::new(attention_router_resource_now_ms(), ".");
+    build_attention_router_surface_payload(
+        &input,
+        surface,
+        "mcp.resource.attention_router",
+        item_id,
+    )
+}
+
+pub(super) struct WaAttentionCurrentResource;
+
+impl ResourceHandler for WaAttentionCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: ATTENTION_ROUTER_MCP_CURRENT_URI.to_string(),
+            name: "ft attention router current".to_string(),
+            description: Some(
+                "Read-only attention-router status surface with degraded source health".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let envelope = McpEnvelope::success(
+            attention_router_resource_payload(AttentionRouterSurface::Status, None),
+            elapsed_ms(start),
+        );
+        envelope_as_resource(ATTENTION_ROUTER_MCP_CURRENT_URI, envelope)
+    }
+}
+
+pub(super) struct WaAttentionItemTemplateResource;
+
+impl ResourceHandler for WaAttentionItemTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://attention-router/items/template".to_string(),
+            name: "ft attention router item template".to_string(),
+            description: Some(
+                "Template for read-only attention-router item explanations".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE.to_string(),
+            name: "ft attention router item".to_string(),
+            description: Some(
+                "Read-only explanation for a scored attention-router item".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let current = WaAttentionCurrentResource;
+        current.read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let item_id = params.get("item_id").map(String::as_str);
+        let envelope = McpEnvelope::success(
+            attention_router_resource_payload(AttentionRouterSurface::Explain, item_id),
+            elapsed_ms(start),
+        );
+        envelope_as_resource(uri, envelope)
+    }
+}
+
+pub(super) struct WaOperatingEnvelopeCurrentResource;
+
+impl ResourceHandler for WaOperatingEnvelopeCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: OPERATING_ENVELOPE_MCP_CURRENT_URI.to_string(),
+            name: "ft operating envelope current".to_string(),
+            description: Some("Read-only fail-closed swarm operating-envelope status".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaOperatingEnvelopeTool;
+        let contents = tool.call(
+            ctx,
+            serde_json::json!({
+                "scenario": "current",
+                "surface": "status",
+            }),
+        )?;
+        tool_output_as_resource(OPERATING_ENVELOPE_MCP_CURRENT_URI, contents)
+    }
+}
+
+pub(super) struct WaOperatingEnvelopeRunTemplateResource;
+
+impl ResourceHandler for WaOperatingEnvelopeRunTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://operating-envelope/runs/template".to_string(),
+            name: "ft operating envelope run artifact template".to_string(),
+            description: Some(
+                "Template for read-only per-run operating-envelope artifacts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE.to_string(),
+            name: "ft operating envelope run artifact".to_string(),
+            description: Some("Read-only operating-envelope run artifact shape".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.read_with_uri(ctx, "wa://operating-envelope/runs/current", &HashMap::new())
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let run_id = params
+            .get("run_id")
+            .map(String::as_str)
+            .unwrap_or("current");
+        let tool = WaOperatingEnvelopeTool;
+        let contents = tool.call(
+            ctx,
+            serde_json::json!({
+                "scenario": "current",
+                "surface": "status",
+                "envelope_id": format!("wa-operating-envelope-{run_id}"),
+            }),
+        )?;
+        tool_output_as_resource(uri, contents)
+    }
+}
+
+fn swarm_capacity_resource_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn swarm_capacity_resource_run_id(generated_at_ms: u64) -> String {
+    format!("swarm-capacity-{generated_at_ms}")
+}
+
+fn swarm_capacity_resource_run_uri(run_id: &str) -> String {
+    format!("wa://swarm-capacity/runs/{run_id}")
+}
+
+fn swarm_capacity_resource_mcp_resources(generated_at_ms: u64) -> serde_json::Value {
+    let run_id = swarm_capacity_resource_run_id(generated_at_ms);
+    serde_json::json!([
+        {
+            "kind": "current",
+            "uri": SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        },
+        {
+            "kind": "run_artifact",
+            "uri": swarm_capacity_resource_run_uri(&run_id),
+            "uri_template": SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE,
+            "run_id": run_id,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        }
+    ])
+}
+
+fn swarm_capacity_resource_sha256_prefixed(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{}", hex::encode(digest))
+}
+
+fn swarm_capacity_resource_payload(
+    source: &str,
+    generated_at_ms: u64,
+    run_id: Option<&str>,
+) -> serde_json::Value {
+    let summary = SwarmCapacityOperatorSummary::unavailable(generated_at_ms, 2, source);
+    let run_id_hash = swarm_capacity_resource_sha256_prefixed(run_id.unwrap_or("current"));
+    serde_json::json!({
+        "schema_version": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "contract_id": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "surface": "mcp_resource",
+        "generated_at_ms": generated_at_ms,
+        "source": source,
+        "dry_run": true,
+        "raw_pane_content_stored": false,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "run_id_hash": run_id_hash,
+        "run_id_redacted": true,
+        "summary": summary,
+        "mcp_resources": swarm_capacity_resource_mcp_resources(generated_at_ms),
+        "doctor": {
+            "status": "stale_or_missing_evidence",
+            "evidence_state": "unavailable",
+            "stale_evidence": true,
+            "safe_remediation": [
+                {
+                    "command": "ft robot swarm-capacity status",
+                    "reason_code": "capacity.operator.refresh_robot_status",
+                    "live_mutation_allowed": false
+                },
+                {
+                    "command": "ft doctor --json",
+                    "reason_code": "capacity.operator.inspect_doctor_context",
+                    "live_mutation_allowed": false
+                }
+            ],
+            "reason_codes": ["capacity.operator.unavailable"]
+        }
+    })
+}
+
+pub(super) struct WaSwarmCapacityCurrentResource;
+
+impl ResourceHandler for WaSwarmCapacityCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI.to_string(),
+            name: "ft swarm capacity current".to_string(),
+            description: Some(
+                "Read-only swarm-capacity status, doctor, and MCP resource shape".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = swarm_capacity_resource_now_ms();
+        envelope_as_resource(
+            SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+            McpEnvelope::success(
+                swarm_capacity_resource_payload(
+                    "mcp.swarm_capacity.current",
+                    generated_at_ms,
+                    None,
+                ),
+                elapsed_ms(start),
+            ),
+        )
+    }
+}
+
+pub(super) struct WaSwarmCapacityRunTemplateResource;
+
+impl ResourceHandler for WaSwarmCapacityRunTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://swarm-capacity/runs/template".to_string(),
+            name: "ft swarm capacity run artifact template".to_string(),
+            description: Some(
+                "Template for read-only per-run swarm-capacity operator artifacts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE.to_string(),
+            name: "ft swarm capacity run artifact".to_string(),
+            description: Some("Read-only swarm-capacity run artifact shape".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.read_with_uri(ctx, "wa://swarm-capacity/runs/current", &HashMap::new())
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = swarm_capacity_resource_now_ms();
+        let run_id = params
+            .get("run_id")
+            .map(String::as_str)
+            .unwrap_or("current");
+        envelope_as_resource(
+            uri,
+            McpEnvelope::success(
+                swarm_capacity_resource_payload(
+                    "mcp.swarm_capacity.run_artifact",
+                    generated_at_ms,
+                    Some(run_id),
+                ),
+                elapsed_ms(start),
+            ),
+        )
+    }
+}
+
+pub(super) struct WaRendererInputToPhotonResource;
+
+impl ResourceHandler for WaRendererInputToPhotonResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI.to_string(),
+            name: "ft renderer input-to-photon SLO".to_string(),
+            description: Some(
+                "Read-only input-to-photon renderer SLO status and evidence pointers".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "perf".to_string(),
+                "renderer-slo".to_string(),
+                "input-to-photon".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let report = renderer_slos_doctor_report();
+        let envelope = McpEnvelope::success(report.input_to_photon, elapsed_ms(start));
+        envelope_as_resource(RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, envelope)
+    }
+}
+
+pub(super) struct WaRendererSsimParityResource;
+
+impl ResourceHandler for WaRendererSsimParityResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: RENDERER_SSIM_PARITY_MCP_RESOURCE_URI.to_string(),
+            name: "ft renderer SSIM parity SLO".to_string(),
+            description: Some(
+                "Read-only SSIM parity renderer SLO status and evidence pointers".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "perf".to_string(),
+                "renderer-slo".to_string(),
+                "ssim-parity".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let report = renderer_slos_doctor_report();
+        let envelope = McpEnvelope::success(report.ssim_parity, elapsed_ms(start));
+        envelope_as_resource(RENDERER_SSIM_PARITY_MCP_RESOURCE_URI, envelope)
+    }
+}
+
+pub(super) struct WaProofHistoryResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PROOF_HISTORY_RESOURCE_URI.to_string(),
+            name: "ft proof history".to_string(),
+            description: Some(
+                "Read-only proof-history rows with release-blocking summary".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(
+            &self.config,
+            ProofHistoryQuery {
+                limit: 100,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(PROOF_HISTORY_RESOURCE_URI, envelope)
+    }
+}
+
+pub(super) struct WaProofHistoryReleaseBlockingResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryReleaseBlockingResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryReleaseBlockingResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PROOF_HISTORY_RELEASE_BLOCKING_URI.to_string(),
+            name: "ft proof history release blockers".to_string(),
+            description: Some("Read-only proof-history rows blocking release".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+                "release-blocking".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(
+            &self.config,
+            ProofHistoryQuery {
+                release_blocking_only: true,
+                limit: 100,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(PROOF_HISTORY_RELEASE_BLOCKING_URI, envelope)
+    }
+}
+
+pub(super) struct WaProofHistoryTemplateResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryTemplateResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://proof-history/template".to_string(),
+            name: "ft proof history template".to_string(),
+            description: Some("Template for filtered proof-history rows".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://proof-history/{filter}/{value}/{limit}".to_string(),
+            name: "ft proof history filtered".to_string(),
+            description: Some(
+                "Filter proof history by bead, category, status, or release-blocking".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        WaProofHistoryResource::new(Arc::clone(&self.config)).read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let filter = params.get("filter").map(String::as_str).unwrap_or("all");
+        let value = params
+            .get("value")
+            .map(|value| percent_decode_resource_param(value))
+            .unwrap_or_default();
+        let limit = params
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        let mut query = ProofHistoryQuery {
+            limit,
+            ..ProofHistoryQuery::default()
+        };
+
+        match filter {
+            "all" => {}
+            "bead" => query.bead_id = Some(value),
+            "category" => query.proof_category = Some(value),
+            "status" => {
+                query.status = proof_history_state_from_resource_param(&value);
+                if query.status.is_none() {
+                    return Err(McpError::invalid_params(
+                        "Unsupported proof-history status filter",
+                    ));
+                }
+            }
+            "release-blocking" => query.release_blocking_only = true,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Unsupported proof-history filter. Use all, bead, category, status, or release-blocking.",
+                ));
+            }
+        }
+
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(&self.config, query)
+            .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(uri, envelope)
+    }
+}
+
+pub(super) struct WaAttestationRetractionsResource {
+    config: Arc<Config>,
+}
+
+impl WaAttestationRetractionsResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaAttestationRetractionsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://attestation/retractions".to_string(),
+            name: "ft attestation retractions".to_string(),
+            description: Some("Active signed attestation retractions".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attestation".to_string(),
+                "retractions".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let envelope = match attestation_retractions_root(&self.config) {
+            Ok((workspace_root, root)) => {
+                match load_attestation_retractions_for_resource(&workspace_root, &root) {
+                    Ok(retractions) => {
+                        let payload = serde_json::json!({
+                            "schema_version": "ft.attestation.retractions.resource.v1",
+                            "root": root.to_string_lossy(),
+                            "active_retractions": retractions.len(),
+                            "retractions": retractions,
+                        });
+                        McpEnvelope::success(payload, elapsed_ms(start))
+                    }
+                    Err(err) => McpEnvelope::<serde_json::Value>::error(
+                        MCP_ERR_CONFIG,
+                        format!("Failed to load attestation retractions: {err}"),
+                        Some("Check docs/attestations/retractions JSON records.".to_string()),
+                        elapsed_ms(start),
+                    ),
+                }
+            }
+            Err(err) => McpEnvelope::<serde_json::Value>::error(
+                MCP_ERR_CONFIG,
+                format!("Failed to resolve attestation retractions root: {err}"),
+                Some("Set FT_WORKSPACE or run the MCP server from the workspace root.".to_string()),
+                elapsed_ms(start),
+            ),
+        };
+        envelope_as_resource("wa://attestation/retractions", envelope)
+    }
+}
+
+pub(super) struct WaContextHorizonResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaContextHorizonResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaContextHorizonResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://context/horizon".to_string(),
+            name: "ft context horizon".to_string(),
+            description: Some("Read-only context pressure and handoff risk forecast".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "context".to_string(),
+                "horizon".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let envelope = match predict_context_horizon_from_sqlite(
+            self.db_path.as_ref().as_path(),
+            None,
+            generated_at_ms,
+            15 * 60 * 1000,
+            "mcp.context_horizon",
+        ) {
+            Ok(report) => McpEnvelope::success(
+                serde_json::to_value(report).map_err(|err| {
+                    McpError::internal_error(format!("Serialize context horizon: {err}"))
+                })?,
+                elapsed_ms(start),
+            ),
+            Err(err) => McpEnvelope::<serde_json::Value>::error(
+                MCP_ERR_STORAGE,
+                format!("Failed to build context horizon: {err}"),
+                Some(
+                    "Check the workspace database path; this MCP resource is read-only."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            ),
+        };
+        envelope_as_resource("wa://context/horizon", envelope)
+    }
+}
+
+pub(super) struct WaReservationsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaReservationsResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaReservationsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://reservations".to_string(),
+            name: "ft reservations".to_string(),
+            description: Some(
+                "Active pane reservations (same data surface as wa.reservations)".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_reservations_resource(ctx, &self.db_path, "wa://reservations", None)
+    }
+}
+
+pub(super) struct WaReservationsByPaneTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaReservationsByPaneTemplateResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaReservationsByPaneTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://reservations/template".to_string(),
+            name: "ft reservations template".to_string(),
+            description: Some("Template for pane-filtered reservations".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://reservations/{pane_id}".to_string(),
+            name: "ft reservations by pane".to_string(),
+            description: Some("Filter reservations by pane id".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_reservations_resource(ctx, &self.db_path, "wa://reservations", None)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let pane_id = params
+            .get("pane_id")
+            .ok_or_else(|| McpError::invalid_params("Missing pane_id in resource URI"))?
+            .parse::<u64>()
+            .map_err(|_| McpError::invalid_params("pane_id must be an unsigned integer"))?;
+        read_reservations_resource(ctx, &self.db_path, uri, Some(pane_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpEnvelope;
+    use super::{
+        AGENT_MAIL_OUTBOX_RESOURCE_URI, WaAccountsByServiceTemplateResource, WaAccountsResource,
+        WaAgentMailOutboxResource, WaAttestationRetractionsResource, WaContextHorizonResource,
+        WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
+        WaHerdWaveResource, WaMissionObjectivePlanTemplateResource,
+        WaOperatingEnvelopeCurrentResource, WaOperatingEnvelopeRunTemplateResource,
+        WaPanesResource, WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
+        WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
+        WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
+        WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
+        WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
+        WaSwarmCapacityRunTemplateResource, WaSwarmScentResource, WaWorkflowsResource,
+        envelope_as_resource, load_proof_history_query_from_roots, redact_swarm_scent_report,
+        swarm_scent_policy_error, swarm_scent_read_policy_input, tool_output_as_resource,
+    };
+    use crate::agent_correlator::{
+        DetectionSource, SwarmScentAgent, SwarmScentReport, SwarmScentReservation,
+        SwarmScentSourceStatus, SwarmScentSummary, SwarmScentTxIntent, SwarmScentWorkClaim,
+    };
+    use crate::config::{Config, PaneFilterConfig};
+    use crate::mcp_framework::{
+        FrameworkContent as Content, FrameworkResourceHandler as ResourceHandler,
+    };
+    use crate::policy::{ActionKind, ActorKind, PolicyDecision, PolicySurface};
+    use crate::proof_lane::{
+        ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofHistoryQuery,
+        ProofRedactionStatus, ProofScope, ProofState,
+    };
+    use crate::redactor::{REDACTED_MARKER, Redactor};
+    use crate::wezterm::PaneInfo;
+    use proptest::prelude::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn db_path() -> Arc<PathBuf> {
+        Arc::new(PathBuf::from("/tmp/test-mcp.db"))
+    }
+
+    fn proof_history_test_record(state: ProofState, bead_id: &str) -> ProofAttemptRecord {
+        let mut record = ProofAttemptRecord::new(
+            format!("proof-{bead_id}"),
+            bead_id,
+            state,
+            "proof.test",
+            "test proof record",
+        );
+        record.attempted_at_utc = "2026-05-13T00:00:00Z".into();
+        record.finished_at_utc = Some("2026-05-13T00:01:00Z".into());
+        record.agent_name = "McpTest".into();
+        record.cwd = "/repo".into();
+        record.command = vec!["rch".into(), "exec".into(), "cargo".into(), "test".into()];
+        record.proof_scope = ProofScope::CargoTest;
+        record.required_backend = ProofBackend::Rch;
+        record.observed_backend = ProofBackend::Rch;
+        record
+    }
+
+    fn proof_records_to_jsonl(records: &[ProofAttemptRecord]) -> String {
+        let mut jsonl = String::new();
+        for record in records {
+            jsonl.push_str(&serde_json::to_string(record).expect("serialize proof record"));
+            jsonl.push('\n');
+        }
+        jsonl
+    }
+
+    // ========================================================================
+    // tool_output_as_resource Tests
+    // ========================================================================
+
+    #[test]
+    fn tool_output_as_resource_extracts_text() {
+        let contents = vec![Content::Text {
+            text: r#"{"ok":true}"#.to_string(),
+        }];
+        let result = tool_output_as_resource("wa://test", contents).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+        assert_eq!(result[0].text.as_deref(), Some(r#"{"ok":true}"#));
+        assert!(result[0].blob.is_none());
+    }
+
+    #[test]
+    fn tool_output_as_resource_missing_text_returns_error_envelope() {
+        let contents = vec![Content::Image {
+            data: "sk-ant-api03-resource-secret".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let result = tool_output_as_resource("wa://test", contents)
+            .expect("missing text payload should return an FT-MCP resource envelope");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+        let payload: serde_json::Value =
+            serde_json::from_str(result[0].text.as_ref().expect("resource text"))
+                .expect("error envelope JSON");
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["error_code"], crate::mcp_error::MCP_ERR_INTERNAL);
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("Tool output missing text payload")
+        );
+        assert!(
+            !payload.to_string().contains("sk-ant-api03-"),
+            "non-text MCP resource payload leaked through error envelope"
+        );
+    }
+
+    // ========================================================================
+    // envelope_as_resource Tests
+    // ========================================================================
+
+    #[test]
+    fn envelope_as_resource_serializes_to_json() {
+        let envelope = McpEnvelope::success("hello", 42);
+        let result = envelope_as_resource("wa://test", envelope).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result[0].text.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"], "hello");
+    }
+
+    // ========================================================================
+    // Resource Definition Stability Tests
+    // ========================================================================
+
+    #[test]
+    fn panes_resource_definition_uri() {
+        let resource = WaPanesResource::new(
+            Arc::new(Config::default()),
+            PaneFilterConfig::default(),
+            None,
+        );
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://panes");
+        assert_eq!(def.mime_type.as_deref(), Some("application/json"));
+        assert!(def.tags.contains(&"wa".to_string()));
+        assert!(def.tags.contains(&"panes".to_string()));
+    }
+
+    #[test]
+    fn events_resource_definition_uri() {
+        let resource = WaEventsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://events");
+        assert!(def.tags.contains(&"events".to_string()));
+    }
+
+    #[test]
+    fn events_template_resource_has_template() {
+        let resource = WaEventsTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://events/{limit}");
+    }
+
+    #[test]
+    fn events_unhandled_template_resource_has_template() {
+        let resource = WaEventsUnhandledTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://events/unhandled/{limit}");
+        assert!(template.tags.contains(&"unhandled".to_string()));
+    }
+
+    #[test]
+    fn accounts_resource_definition_uri() {
+        let resource = WaAccountsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://accounts");
+        assert!(def.tags.contains(&"accounts".to_string()));
+    }
+
+    #[test]
+    fn accounts_by_service_template_has_template() {
+        let resource = WaAccountsByServiceTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://accounts/{service}");
+    }
+
+    #[test]
+    fn rules_resource_definition_uri() {
+        let def = WaRulesResource.definition();
+        assert_eq!(def.uri, "wa://rules");
+        assert!(def.tags.contains(&"rules".to_string()));
+    }
+
+    #[test]
+    fn rules_by_agent_template_has_template() {
+        let template = WaRulesByAgentTemplateResource
+            .template()
+            .expect("should have template");
+        assert_eq!(template.uri_template, "wa://rules/{agent_type}");
+    }
+
+    #[test]
+    fn workflows_resource_definition_uri() {
+        let resource = WaWorkflowsResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://workflows");
+        assert!(def.tags.contains(&"workflows".to_string()));
+    }
+
+    #[test]
+    fn herd_wave_resource_definition_uri() {
+        let def = WaHerdWaveResource.definition();
+        assert_eq!(def.uri, "wa://herd-wave");
+        assert!(def.tags.contains(&"herd-wave".to_string()));
+        assert!(def.tags.contains(&"operator".to_string()));
+    }
+
+    #[test]
+    fn mission_objective_plan_template_resource_uri() {
+        let resource = WaMissionObjectivePlanTemplateResource;
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://mission/objective-plan/template");
+        assert!(def.tags.contains(&"mission".to_string()));
+        let template = resource.template().expect("objective-plan template");
+        assert_eq!(
+            template.uri_template,
+            "wa://mission/objective-plan/{objective}"
+        );
+    }
+
+    #[test]
+    fn rehearsal_score_resources_define_current_and_surface_template() {
+        let config = Arc::new(Config::default());
+        let current = WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition();
+        assert_eq!(
+            current.uri,
+            crate::rehearsal_score::REHEARSAL_SCORE_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"rehearsal".to_string()));
+        assert!(current.tags.contains(&"operator".to_string()));
+
+        let template = WaRehearsalScoreSurfaceTemplateResource::new(config)
+            .template()
+            .expect("rehearsal score surface template");
+        assert_eq!(
+            template.uri_template,
+            crate::rehearsal_score::REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"rehearsal".to_string()));
+    }
+
+    #[test]
+    fn swarm_capacity_resources_define_current_and_run_template() {
+        let current = WaSwarmCapacityCurrentResource.definition();
+        assert_eq!(
+            current.uri,
+            crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"swarm-capacity".to_string()));
+        assert!(current.tags.contains(&"operator".to_string()));
+
+        let template = WaSwarmCapacityRunTemplateResource
+            .template()
+            .expect("swarm-capacity run template");
+        assert_eq!(
+            template.uri_template,
+            crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"swarm-capacity".to_string()));
+    }
+
+    #[test]
+    fn operating_envelope_resources_define_current_and_run_template() {
+        let current = WaOperatingEnvelopeCurrentResource.definition();
+        assert_eq!(
+            current.uri,
+            crate::operating_envelope::OPERATING_ENVELOPE_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"operating-envelope".to_string()));
+        assert!(current.tags.contains(&"swarm".to_string()));
+
+        let template = WaOperatingEnvelopeRunTemplateResource
+            .template()
+            .expect("operating-envelope run template");
+        assert_eq!(
+            template.uri_template,
+            crate::operating_envelope::OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"operating-envelope".to_string()));
+    }
+
+    #[test]
+    fn renderer_input_to_photon_resource_definition_uri() {
+        let def = WaRendererInputToPhotonResource.definition();
+        assert_eq!(
+            def.uri,
+            crate::render_quality::RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI
+        );
+        assert!(def.tags.contains(&"perf".to_string()));
+        assert!(def.tags.contains(&"renderer-slo".to_string()));
+        assert!(def.tags.contains(&"input-to-photon".to_string()));
+    }
+
+    #[test]
+    fn renderer_ssim_parity_resource_definition_uri() {
+        let def = WaRendererSsimParityResource.definition();
+        assert_eq!(
+            def.uri,
+            crate::render_quality::RENDERER_SSIM_PARITY_MCP_RESOURCE_URI
+        );
+        assert!(def.tags.contains(&"perf".to_string()));
+        assert!(def.tags.contains(&"renderer-slo".to_string()));
+        assert!(def.tags.contains(&"ssim-parity".to_string()));
+    }
+
+    #[test]
+    fn attestation_retractions_resource_definition_uri() {
+        let resource = WaAttestationRetractionsResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://attestation/retractions");
+        assert!(def.tags.contains(&"attestation".to_string()));
+        assert!(def.tags.contains(&"retractions".to_string()));
+    }
+
+    #[test]
+    fn swarm_scent_resource_definition_uri() {
+        let def = WaSwarmScentResource::new(Arc::new(Config::default()), None).definition();
+        assert_eq!(def.uri, "wa://swarm/scent");
+        assert_eq!(def.mime_type.as_deref(), Some("application/json"));
+        assert!(def.tags.contains(&"swarm".to_string()));
+        assert!(def.tags.contains(&"scent".to_string()));
+        assert!(def.tags.contains(&"attention".to_string()));
+    }
+
+    #[test]
+    fn swarm_scent_redaction_scrubs_report_free_text() {
+        let probe_prefix = ["sk", "ant", "api03"].join("-");
+        let redaction_probe = format!("{probe_prefix}-{}", "a".repeat(80));
+        let mut report = SwarmScentReport {
+            schema_version: 1,
+            generated_at_ms: 1,
+            ttl_ms: 60_000,
+            agents: vec![SwarmScentAgent {
+                pane_id: 7,
+                slug: "codex".to_string(),
+                agent_type: "codex".to_string(),
+                state: "active".to_string(),
+                source: DetectionSource::PaneTitle,
+                cwd: Some(format!("file:///repo/{redaction_probe}")),
+                session_id: Some(format!("session-{redaction_probe}")),
+                last_rule_id: Some(format!("codex.{redaction_probe}")),
+                state_age_ms: 10,
+                ttl_remaining_ms: 59_990,
+            }],
+            reservations: vec![SwarmScentReservation {
+                id: 1,
+                pane_id: 7,
+                owner_kind: "agent".to_string(),
+                owner_id: format!("cod7-{redaction_probe}"),
+                reason: Some(format!("touching {redaction_probe}")),
+                created_at_ms: 1,
+                expires_at_ms: 2,
+                ttl_remaining_ms: 1,
+            }],
+            work_claims: vec![SwarmScentWorkClaim {
+                claim_id: format!("claim-{redaction_probe}"),
+                owner: format!("owner-{redaction_probe}"),
+                priority: 1,
+                labels: vec![format!("label-{redaction_probe}")],
+                claimed_at_ms: Some(1),
+                updated_at_ms: 2,
+                summary: Some(format!("summary {redaction_probe}")),
+            }],
+            tx_intents: vec![SwarmScentTxIntent {
+                tx_id: format!("tx-{redaction_probe}"),
+                plan_id: format!("plan-{redaction_probe}"),
+                requested_by: format!("operator-{redaction_probe}"),
+                lifecycle_state: "Prepared".to_string(),
+                outcome: "Pending".to_string(),
+                summary: format!("deploy {redaction_probe}"),
+                correlation_id: format!("corr-{redaction_probe}"),
+                created_at_ms: 1,
+                contract_file: format!("/tmp/{redaction_probe}/tx.json"),
+            }],
+            sources: vec![SwarmScentSourceStatus::unavailable(
+                "pane_cwd",
+                format!("source detail {redaction_probe}"),
+            )],
+            summary: SwarmScentSummary {
+                tracked_agents: 1,
+                fresh_agents: 1,
+                expired_agents: 0,
+                active_reservations: 1,
+                active_work_claims: 1,
+                active_tx_intents: 1,
+                unavailable_sources: 1,
+            },
+        };
+
+        redact_swarm_scent_report(&mut report, &Redactor::new());
+        let rendered = serde_json::to_string(&report).expect("serialize redacted scent report");
+
+        assert!(
+            !rendered.contains(&redaction_probe),
+            "wa://swarm/scent report leaked raw secret: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED_MARKER),
+            "wa://swarm/scent report should contain a redaction marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn swarm_scent_policy_input_is_mcp_read_output_with_pane_metadata() {
+        let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": 42,
+            "tab_id": 2,
+            "window_id": 3,
+            "domain_name": "local",
+            "title": "codex build",
+            "cwd": "file:///repo/secret"
+        }))
+        .expect("pane info");
+
+        let input = swarm_scent_read_policy_input(&pane);
+
+        assert_eq!(input.action, ActionKind::ReadOutput);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Mux);
+        assert_eq!(input.pane_id, Some(42));
+        assert_eq!(input.domain.as_deref(), Some("local"));
+        assert_eq!(input.pane_title.as_deref(), Some("codex build"));
+        assert_eq!(input.pane_cwd.as_deref(), Some("file:///repo/secret"));
+        assert_eq!(
+            input.text_summary.as_deref(),
+            Some("wa://swarm/scent pane_id=42")
+        );
+    }
+
+    #[test]
+    fn swarm_scent_policy_error_fails_closed_for_denied_and_approval() {
+        let denied = swarm_scent_policy_error(7, &PolicyDecision::deny("blocked"))
+            .expect("deny must become resource error");
+        assert_eq!(denied.code(), crate::mcp_error::MCP_ERR_POLICY);
+        assert_eq!(denied.message(), "blocked");
+
+        let approval =
+            swarm_scent_policy_error(7, &PolicyDecision::require_approval("needs approval"))
+                .expect("approval must become resource error");
+        assert_eq!(approval.code(), crate::mcp_error::MCP_ERR_POLICY);
+        assert_eq!(approval.message(), "needs approval");
+        assert!(
+            approval.hint().contains("fail closed"),
+            "approval hint should explain no partial payload is emitted"
+        );
+
+        assert!(
+            swarm_scent_policy_error(7, &PolicyDecision::allow()).is_none(),
+            "allowed policy decision should not produce a resource error"
+        );
+    }
+
+    #[test]
+    fn herd_wave_resource_reads_v1_contract_without_mutation() {
+        let resource = WaHerdWaveResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource.read(&ctx).expect("read herd-wave resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::swarm_scheduler::HERD_WAVE_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["source"].as_str(), Some("mcp.herd_wave"));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["dry_run_plan"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resource"]["implemented"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resource"]["uri"].as_str(),
+            Some("wa://herd-wave")
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_current_resource_reads_without_pane_mutation_or_raw_content() {
+        let resource = WaSwarmCapacityCurrentResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource
+            .read(&ctx)
+            .expect("read swarm-capacity current resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::runtime_telemetry::ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resources"][0]["uri"].as_str(),
+            Some(crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI)
+        );
+        let rendered = serde_json::to_string(&payload).expect("render payload");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-"),
+            concat!("Cookie: ft_session", "="),
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "swarm-capacity MCP payload leaked {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn operating_envelope_current_resource_reads_without_pane_mutation_or_raw_content() {
+        let resource = WaOperatingEnvelopeCurrentResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource
+            .read(&ctx)
+            .expect("read operating-envelope current resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::operating_envelope::OPERATING_ENVELOPE_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resources"][0]["uri"].as_str(),
+            Some(crate::operating_envelope::OPERATING_ENVELOPE_MCP_CURRENT_URI)
+        );
+        let rendered = serde_json::to_string(&payload).expect("render payload");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-"),
+            concat!("Cookie: ft_session", "="),
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "operating-envelope MCP payload leaked {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_input_to_photon_resource_reads_doctor_contract() {
+        let resource = WaRendererInputToPhotonResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource
+            .read(&ctx)
+            .expect("read renderer input-to-photon resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["mcp_resource_uri"].as_str(),
+            Some(crate::render_quality::RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI)
+        );
+        assert_eq!(
+            payload["data"]["status"].as_str(),
+            Some(crate::render_quality::RENDERER_INPUT_TO_PHOTON_STATUS)
+        );
+        assert_eq!(
+            payload["data"]["structured_log_template"].as_str(),
+            Some("target/criterion/slo-input_to_photon_<platform>.jsonl")
+        );
+    }
+
+    #[test]
+    fn renderer_ssim_parity_resource_reads_doctor_contract() {
+        let resource = WaRendererSsimParityResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource
+            .read(&ctx)
+            .expect("read renderer SSIM parity resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["mcp_resource_uri"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_MCP_RESOURCE_URI)
+        );
+        assert_eq!(
+            payload["data"]["status"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_STATUS)
+        );
+        assert_eq!(
+            payload["data"]["current_degradation"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_CURRENT_DEGRADATION)
+        );
+        assert_eq!(
+            payload["data"]["corpus_path"].as_str(),
+            Some("tests/golden/gpu")
+        );
+        assert_eq!(
+            payload["data"]["default_min_ssim_ppm"].as_u64(),
+            Some(u64::from(
+                crate::render_quality::RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
+            ))
+        );
+        assert_eq!(
+            payload["data"]["release_gate_script"].as_str(),
+            Some("tests/e2e/test_ssim_parity_release_gate.sh")
+        );
+    }
+
+    #[test]
+    fn proof_history_resources_define_read_only_surfaces() {
+        let config = Arc::new(Config::default());
+
+        let def = WaProofHistoryResource::new(Arc::clone(&config)).definition();
+        assert_eq!(def.uri, "wa://proof-history");
+        assert!(def.tags.contains(&"proof-history".to_string()));
+
+        let blocking = WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition();
+        assert_eq!(blocking.uri, "wa://proof-history/release-blocking");
+        assert!(blocking.tags.contains(&"release-blocking".to_string()));
+
+        let template = WaProofHistoryTemplateResource::new(config)
+            .template()
+            .expect("template definition");
+        assert_eq!(
+            template.uri_template,
+            "wa://proof-history/{filter}/{value}/{limit}"
+        );
+    }
+
+    #[test]
+    fn agent_mail_outbox_resource_definition_uri() {
+        let resource = WaAgentMailOutboxResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, AGENT_MAIL_OUTBOX_RESOURCE_URI);
+        assert!(def.tags.contains(&"agent-mail".to_string()));
+        assert!(def.tags.contains(&"outbox".to_string()));
+        assert!(def.description.as_deref().is_some_and(|description| {
+            description.contains("fallback outbox") && description.contains("replay state")
+        }));
+    }
+
+    #[test]
+    fn proof_history_resource_loader_uses_canonical_query_contract() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let artifact_root = root.join("tests").join("e2e").join("artifacts");
+        std::fs::create_dir_all(&artifact_root).expect("artifact root");
+
+        let mut pass = proof_history_test_record(ProofState::Pass, "ft-mcp-pass");
+        pass.proof_id = "proof-mcp-pass".into();
+        pass.selected_worker = Some("vmi-proof".into());
+        pass.remote_cargo_reached = true;
+        pass.rustc_reached = true;
+        pass.test_binary_started = true;
+        pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        pass.redaction_status = ProofRedactionStatus::NoneNeeded;
+
+        let mut blocked =
+            proof_history_test_record(ProofState::InfraBlockedPreCargo, "ft-mcp-blocked");
+        blocked.proof_id = "proof-mcp-blocked".into();
+        blocked.reason_code = "proof.rch.pre_cargo_timeout_exec_missing".into();
+
+        let proof_path = artifact_root.join("proof-records.jsonl");
+        std::fs::write(&proof_path, proof_records_to_jsonl(&[pass, blocked]))
+            .expect("write proof records");
+
+        let result = load_proof_history_query_from_roots(
+            root,
+            vec![artifact_root],
+            ProofHistoryQuery {
+                release_blocking_only: true,
+                limit: 10,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .expect("load proof history");
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.rows[0].bead_id, "ft-mcp-blocked");
+        assert_eq!(result.release_blocking_summary.total_blocking_rows, 1);
+        assert!(
+            result.rows[0]
+                .artifact_path
+                .ends_with("proof-records.jsonl")
+        );
+        assert!(!result.rows[0].artifact_path.starts_with('/'));
+    }
+
+    #[test]
+    fn context_horizon_resource_definition_uri() {
+        let resource = WaContextHorizonResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://context/horizon");
+        assert!(def.tags.contains(&"context".to_string()));
+        assert!(def.tags.contains(&"horizon".to_string()));
+    }
+
+    #[test]
+    fn context_horizon_resource_reads_same_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("context-horizon.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            r"
+            CREATE TABLE pane_contexts (
+                context_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                archived_at_ms INTEGER,
+                token_budget INTEGER NOT NULL,
+                tokens_consumed INTEGER NOT NULL,
+                pressure_tier TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE context_rotations (
+                rotation_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                previous_context_id TEXT,
+                new_context_id TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                reason TEXT,
+                caller_idempotency_key TEXT,
+                rotated_at_ms INTEGER NOT NULL,
+                tokens_before INTEGER NOT NULL,
+                tokens_after INTEGER NOT NULL,
+                tokens_freed INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO pane_contexts
+                (context_id, pane_id, state, depth, created_at_ms, token_budget,
+                 tokens_consumed, pressure_tier, source)
+            VALUES ('ctx-mcp', 11, 'active', 1, 1700000000000, 1000, 800,
+                    'yellow', 'test');
+            ",
+        )
+        .expect("seed context horizon db");
+        drop(conn);
+
+        let resource = WaContextHorizonResource::new(Arc::new(db_path));
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(
+            crate::mcp_framework::FrameworkCx::for_testing(),
+            1,
+        );
+        let contents = resource.read(&ctx).expect("read context horizon resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::context_horizon::CONTEXT_HORIZON_CONTRACT_ID)
+        );
+        assert_eq!(
+            payload["data"]["raw_context_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["pane_risks"][0]["pane_id"].as_u64(),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn reservations_resource_definition_uri() {
+        let resource = WaReservationsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://reservations");
+        assert!(def.tags.contains(&"reservations".to_string()));
+    }
+
+    #[test]
+    fn reservations_by_pane_template_has_template() {
+        let resource = WaReservationsByPaneTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://reservations/{pane_id}");
+    }
+
+    // ========================================================================
+    // All resource URIs are unique
+    // ========================================================================
+
+    #[test]
+    fn all_resource_uris_are_unique() {
+        let db = db_path();
+        let config = Arc::new(Config::default());
+        let uris = [
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition()
+            .uri,
+            WaEventsResource::new(Arc::clone(&db)).definition().uri,
+            WaEventsTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaEventsUnhandledTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaAccountsResource::new(Arc::clone(&db)).definition().uri,
+            WaAccountsByServiceTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaRulesResource.definition().uri,
+            WaRulesByAgentTemplateResource.definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaAgentMailOutboxResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaSwarmScentResource::new(Arc::new(Config::default()), None)
+                .definition()
+                .uri,
+            WaSwarmCapacityCurrentResource.definition().uri,
+            WaSwarmCapacityRunTemplateResource.definition().uri,
+            WaOperatingEnvelopeCurrentResource.definition().uri,
+            WaOperatingEnvelopeRunTemplateResource.definition().uri,
+            WaRendererInputToPhotonResource.definition().uri,
+            WaRendererSsimParityResource.definition().uri,
+            WaProofHistoryResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaAttestationRetractionsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaContextHorizonResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaReservationsResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaReservationsByPaneTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for uri in &uris {
+            assert!(seen.insert(uri.as_str()), "Duplicate URI: {uri}");
+        }
+    }
+
+    // ========================================================================
+    // All resource URIs use wa:// scheme
+    // ========================================================================
+
+    #[test]
+    fn all_resource_uris_use_wa_scheme() {
+        let db = db_path();
+        let config = Arc::new(Config::default());
+        let uris = [
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition()
+            .uri,
+            WaEventsResource::new(Arc::clone(&db)).definition().uri,
+            WaRulesResource.definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaAgentMailOutboxResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaSwarmScentResource::new(Arc::new(Config::default()), None)
+                .definition()
+                .uri,
+            WaSwarmCapacityCurrentResource.definition().uri,
+            WaSwarmCapacityRunTemplateResource.definition().uri,
+            WaOperatingEnvelopeCurrentResource.definition().uri,
+            WaOperatingEnvelopeRunTemplateResource.definition().uri,
+            WaRendererInputToPhotonResource.definition().uri,
+            WaRendererSsimParityResource.definition().uri,
+            WaProofHistoryResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaAttestationRetractionsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaContextHorizonResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaReservationsResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+        ];
+        for uri in &uris {
+            assert!(uri.starts_with("wa://"), "URI {uri} missing wa:// scheme");
+        }
+    }
+
+    // ========================================================================
+    // All definitions have JSON mime type
+    // ========================================================================
+
+    #[test]
+    fn all_definitions_have_json_mime_type() {
+        let db = db_path();
+        let config = Arc::new(Config::default());
+        let defs = [
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition(),
+            WaEventsResource::new(Arc::clone(&db)).definition(),
+            WaRulesResource.definition(),
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmScentResource::new(Arc::new(Config::default()), None).definition(),
+            WaSwarmCapacityCurrentResource.definition(),
+            WaSwarmCapacityRunTemplateResource.definition(),
+            WaOperatingEnvelopeCurrentResource.definition(),
+            WaOperatingEnvelopeRunTemplateResource.definition(),
+            WaRendererInputToPhotonResource.definition(),
+            WaRendererSsimParityResource.definition(),
+            WaProofHistoryResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config)).definition(),
+            WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
+            WaMissionObjectivePlanTemplateResource.definition(),
+            WaContextHorizonResource::new(Arc::clone(&db)).definition(),
+            WaReservationsResource::new(Arc::clone(&db)).definition(),
+        ];
+        for def in &defs {
+            assert_eq!(
+                def.mime_type.as_deref(),
+                Some("application/json"),
+                "Resource {} missing JSON mime type",
+                def.uri
+            );
+        }
+    }
+
+    // ========================================================================
+    // All definitions have version
+    // ========================================================================
+
+    #[test]
+    fn all_definitions_have_version() {
+        let db = db_path();
+        let config = Arc::new(Config::default());
+        let defs = [
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition(),
+            WaEventsResource::new(Arc::clone(&db)).definition(),
+            WaRulesResource.definition(),
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmScentResource::new(Arc::new(Config::default()), None).definition(),
+            WaSwarmCapacityCurrentResource.definition(),
+            WaSwarmCapacityRunTemplateResource.definition(),
+            WaOperatingEnvelopeCurrentResource.definition(),
+            WaOperatingEnvelopeRunTemplateResource.definition(),
+            WaRendererInputToPhotonResource.definition(),
+            WaRendererSsimParityResource.definition(),
+            WaProofHistoryResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config)).definition(),
+            WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
+            WaContextHorizonResource::new(Arc::clone(&db)).definition(),
+            WaReservationsResource::new(Arc::clone(&db)).definition(),
+        ];
+        for def in &defs {
+            assert!(
+                def.version.is_some(),
+                "Resource {} missing version",
+                def.uri
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_tool_output_as_resource_preserves_uri_and_first_text(
+            uri in "wa://[A-Za-z0-9/_-]{1,32}",
+            first in "[A-Za-z0-9 _.,:/{}\\[\\]\"]{1,64}",
+            second in "[A-Za-z0-9 _.,:/{}\\[\\]\"]{1,64}",
+        ) {
+            let contents = vec![
+                Content::Text { text: first.clone() },
+                Content::Text { text: second },
+            ];
+            let result = tool_output_as_resource(&uri, contents).expect("resource output");
+
+            prop_assert_eq!(result.len(), 1);
+            prop_assert_eq!(&result[0].uri, &uri);
+            prop_assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+            prop_assert_eq!(result[0].text.as_deref(), Some(first.as_str()));
+            prop_assert!(result[0].blob.is_none());
+        }
+
+        #[test]
+        fn prop_envelope_as_resource_preserves_success_payload(
+            uri in "wa://[A-Za-z0-9/_-]{1,32}",
+            data in "[A-Za-z0-9 _.,:/-]{1,64}",
+            elapsed_ms in any::<u64>(),
+        ) {
+            let envelope = McpEnvelope::success(data.clone(), elapsed_ms);
+            let result = envelope_as_resource(&uri, envelope).expect("envelope resource");
+            let parsed: serde_json::Value =
+                serde_json::from_str(result[0].text.as_ref().expect("text payload")).expect("json");
+
+            prop_assert_eq!(&result[0].uri, &uri);
+            prop_assert_eq!(parsed["ok"].as_bool(), Some(true));
+            prop_assert_eq!(parsed["data"].as_str(), Some(data.as_str()));
+            prop_assert_eq!(parsed["elapsed_ms"].as_u64(), Some(elapsed_ms));
+            prop_assert_eq!(parsed["mcp_version"].as_str(), Some("v1"));
+        }
+
+        #[test]
+        fn prop_template_resources_keep_json_contract(service in "[A-Za-z0-9_-]{1,24}") {
+            let db = db_path();
+            let accounts = WaAccountsByServiceTemplateResource::new(Arc::clone(&db));
+            let events = WaEventsTemplateResource::new(db);
+
+            let accounts_template = accounts.template().expect("accounts template");
+            let events_template = events.template().expect("events template");
+
+            prop_assert_eq!(accounts_template.uri_template, "wa://accounts/{service}");
+            prop_assert_eq!(events_template.uri_template, "wa://events/{limit}");
+            prop_assert_eq!(accounts_template.mime_type.as_deref(), Some("application/json"));
+            prop_assert_eq!(events_template.mime_type.as_deref(), Some("application/json"));
+            prop_assert!(accounts_template.tags.contains(&"accounts".to_string()));
+            prop_assert!(events_template.tags.contains(&"events".to_string()));
+            prop_assert!(!service.is_empty());
+        }
+    }
+}

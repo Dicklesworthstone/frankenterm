@@ -1,0 +1,6 @@
+/tmp/ft-cc-1-target
+/tmp/ft-cc-2-target
+/tmp/ft-cod-1-target
+/tmp/ft-cod-2-target
+/tmp/ft-cod-3-target
+/tmp/ft-stale-a-target

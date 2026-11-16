@@ -1,0 +1,340 @@
+{
+  "schema_version": "1.0.0",
+  "artifact": "ntm-fcp-traceability-matrix",
+  "bead_id": "ft-3681t.1.5.1",
+  "generated_at_utc": "2026-03-12T00:27:00Z",
+  "required_capability_ids": [
+    "ft.runtime.observation",
+    "ft.runtime.canonical_async_surface",
+    "ft.robot.api.envelope",
+    "ft.patterns.detection",
+    "ft.events.bounded_fanout",
+    "ft.workflow.event_runtime",
+    "ft.policy.authorization",
+    "ft.storage.workflow_audit",
+    "ft.telemetry.unified_schema",
+    "ft.session.snapshot_restore",
+    "ntm.swarm.launcher_weighted",
+    "ntm.work_claim_kernel",
+    "fcp.host_runtime_native",
+    "fcp.connector_bridge_inbound_outbound"
+  ],
+  "entries": [
+    {
+      "capability_id": "ft.runtime.observation",
+      "capability_name": "Runtime observation loop with discovery/capture/delta flow",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.2.1", "ft-3681t.2.2"],
+      "surfaces": ["ft watch", "ft status"],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/runtime.rs",
+        "crates/frankenterm-core/src/ingest.rs"
+      ],
+      "evidence_notes": "Watcher bootstraps ObservationRuntime and enforces periodic discovery/capture loops."
+    },
+    {
+      "capability_id": "ft.runtime.canonical_async_surface",
+      "capability_name": "Canonical asupersync runtime API for project sync, channel, task and time operations",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": ["ft-e34d9.10.2.3", "ft-3681t.2", "ft-3681t.3"],
+      "surfaces": [
+        "ft watch bootstrap",
+        "ft distributed agent",
+        "robot/distributed IPC helper paths"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/runtime_async.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "runtime_async is the canonical project-owned asupersync API. The runtime_compat alias and SURFACE_CONTRACT_V1 migration inventory were retired. These anchors establish the API and its CLI integration; they do not independently qualify every runtime consumer."
+    },
+    {
+      "capability_id": "ft.runtime.single_writer_lock",
+      "capability_name": "Single-writer daemon lock for watcher safety",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.2.1"],
+      "surfaces": ["ft watch", "ft status"],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/lock.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "Watcher lock metadata tracks pid/start time and blocks concurrent writers."
+    },
+    {
+      "capability_id": "ft.robot.api.envelope",
+      "capability_name": "Machine-readable robot envelope and schema contract",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.4.1", "ft-3681t.4.4"],
+      "surfaces": ["ft robot state/get-text/send/wait-for/search/events", "ft mcp serve"],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/robot_types.rs",
+        "docs/json-schema/wa-robot-envelope.json"
+      ],
+      "evidence_notes": "Robot responses consistently expose ok/data/error/error_code/hint/elapsed/version/now."
+    },
+    {
+      "capability_id": "ft.robot.search.diagnostics",
+      "capability_name": "Robot search explainability and index diagnostics surfaces",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.4.1", "ft-3681t.4.5", "ft-3681t.7.1"],
+      "surfaces": [
+        "ft robot search-explain",
+        "ft robot search-index stats",
+        "ft robot search-index reindex"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/search/facade.rs",
+        "crates/frankenterm-core/src/search_explain.rs",
+        "docs/json-schema/wa-robot-search-explain.json",
+        "docs/json-schema/wa-robot-search-index-stats.json",
+        "docs/json-schema/wa-robot-search-index-reindex.json"
+      ],
+      "evidence_notes": "Robot search diagnostics now expose explainability reasons, index freshness/count telemetry, and machine-triggerable reindex metadata with documented JSON schemas."
+    },
+    {
+      "capability_id": "ft.robot.agent_inventory",
+      "capability_name": "Robot-visible installed/running agent inventory and detection surfaces",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.3.1.1", "ft-3681t.4.1", "ft-3681t.8.5"],
+      "surfaces": ["ft robot agents list", "ft robot agents running", "ft robot agents detect"],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/agent_correlator.rs",
+        "docs/json-schema/wa-robot-agents-list.json",
+        "docs/json-schema/wa-robot-agents-running.json",
+        "docs/json-schema/wa-robot-agents-detect.json"
+      ],
+      "evidence_notes": "Robot agent inventory surfaces already serialize installed/running/configured summaries plus per-pane or per-install inventory entries, which makes local swarm-awareness machine-readable today."
+    },
+    {
+      "capability_id": "ft.robot.mission.tx_introspection",
+      "capability_name": "Mission explainability and transaction contract control surfaces",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": ["ft-3681t.3.7.1", "ft-3681t.4.3", "ft-3681t.4.4", "ft-3681t.4.5"],
+      "surfaces": [
+        "ft robot mission state",
+        "ft robot mission decisions",
+        "ft robot tx plan",
+        "ft robot tx run",
+        "ft robot tx rollback",
+        "ft robot tx show"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/plan.rs",
+        "crates/frankenterm-core/src/mcp_missions.rs",
+        "crates/frankenterm-core/src/mission_events.rs",
+        "crates/frankenterm-core/src/tx_plan_compiler.rs"
+      ],
+      "evidence_notes": "Machine clients can already inspect filtered assignment state, decision payloads, tx legal transitions, and deterministic prepare/commit/compensation reports; schema stabilization and replay-compat hardening remain open in the downstream robot contract beads."
+    },
+    {
+      "capability_id": "ft.patterns.detection",
+      "capability_name": "Pattern detection with telemetry and structured extraction",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.3.5"],
+      "surfaces": ["ft rules *", "ft robot rules *", "ft events"],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/patterns.rs",
+        "crates/frankenterm-core/src/events.rs"
+      ],
+      "evidence_notes": "Pattern engine emits typed detections with confidence/severity and extraction payloads."
+    },
+    {
+      "capability_id": "ft.events.bounded_fanout",
+      "capability_name": "Bounded event-bus fanout with lag/drop accounting",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.3.5", "ft-3681t.7.1"],
+      "surfaces": ["workflow triggers", "notification routing", "robot events feed"],
+      "implementation_anchors": ["crates/frankenterm-core/src/events.rs"],
+      "evidence_notes": "EventBus routes by channel type and tracks subscriber lag/drop telemetry."
+    },
+    {
+      "capability_id": "ft.workflow.event_runtime",
+      "capability_name": "Event-driven workflow runtime with deterministic lock-mediated execution",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.3.5"],
+      "surfaces": ["ft workflow *", "ft robot workflow run", "ft robot workflow status"],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/workflows/engine.rs",
+        "crates/frankenterm-core/src/workflows/runner.rs"
+      ],
+      "evidence_notes": "Workflow execution is already driven from detections through the workflow engine/runner pair, with CLI and robot status/query surfaces riding the same runtime."
+    },
+    {
+      "capability_id": "ft.policy.authorization",
+      "capability_name": "Action authorization with deny/approval/rate-limit semantics",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.6.1", "ft-3681t.6.2"],
+      "surfaces": ["ft send", "ft robot send", "workflow action execution"],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/policy.rs",
+        "crates/frankenterm-core/src/approval.rs",
+        "crates/frankenterm-core/src/command_guard.rs"
+      ],
+      "evidence_notes": "Policy action kinds and actor kinds are explicit and audit-friendly."
+    },
+    {
+      "capability_id": "ft.storage.workflow_audit",
+      "capability_name": "Durable event/workflow/audit persistence with FTS support",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": ["ft-3681t.7.1", "ft-3681t.7.5"],
+      "surfaces": ["ft search", "ft events", "ft workflow status", "ft audit"],
+      "implementation_anchors": ["crates/frankenterm-core/src/storage.rs"],
+      "evidence_notes": "SQLite schema tracks output segments, events, workflows, approvals, and audit actions."
+    },
+    {
+      "capability_id": "ft.telemetry.unified_schema",
+      "capability_name": "Unified telemetry schema with correlation, reason-code, and health enrichment",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": ["ft-3681t.7.1", "ft-e34d9.10.7"],
+      "surfaces": [
+        "runtime health incident enrichment",
+        "policy metrics dashboard snapshots",
+        "telemetry export/logging"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/runtime_telemetry.rs",
+        "crates/frankenterm-core/src/runtime_health.rs",
+        "crates/frankenterm-core-policy-types/src/policy_metrics.rs"
+      ],
+      "evidence_notes": "UnifiedTelemetryRecord and the runtime-health enrichment path are live, but full convergence coverage across every downstream subsystem is still being normalized under ft-3681t.7.x."
+    },
+    {
+      "capability_id": "ft.session.snapshot_restore",
+      "capability_name": "Session snapshot/restore foundation",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "low",
+      "mapped_bead_ids": ["ft-3681t.2.5", "ft-3681t.8.3"],
+      "surfaces": ["ft snapshot *", "ft session *", "ft watch restore prompts"],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/snapshot_engine.rs",
+        "crates/frankenterm-core/src/session_restore.rs"
+      ],
+      "evidence_notes": "Core snapshot/restore primitives exist; migration/import hardening continues in ft-3681t.8.*."
+    },
+    {
+      "capability_id": "ft.distributed.agent_streaming",
+      "capability_name": "Distributed agent/aggregator streaming mode",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": ["ft-nu4.4.3", "ft-nu4.4.3.2"],
+      "surfaces": ["ft distributed agent"],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/distributed.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "Feature-gated pathway exists; production hardening and protocol maturity remain open."
+    },
+    {
+      "capability_id": "ntm.swarm.launcher_weighted",
+      "capability_name": "Native weighted swarm launcher and live rebalance",
+      "source_domain": "ntm",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": ["ft-3681t.3.1", "ft-3681t.3.2"],
+      "surfaces": [
+        "fleet launch plan metadata",
+        "deterministic phase ordering",
+        "program weight and launch-order queries"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/session_profiles.rs",
+        "crates/frankenterm-core/src/mission_loop.rs"
+      ],
+      "evidence_notes": "FleetLaunchPlan already exposes deterministic slot metadata, phase ordering, program weight rollups, and invariant diagnostics; live launch/rebalance operator surfaces remain downstream."
+    },
+    {
+      "capability_id": "ntm.work_claim_kernel",
+      "capability_name": "Dependency-aware work claim and handoff semantics",
+      "source_domain": "ntm",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": ["ft-3681t.3.3", "ft-3681t.3.4"],
+      "surfaces": [
+        "swarm work queue sync",
+        "mission deconfliction/conflict reports",
+        "mission Agent Mail contention signals"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/swarm_work_queue.rs",
+        "crates/frankenterm-core/src/mission_loop.rs",
+        "crates/frankenterm-core/src/mission_agent_mail.rs"
+      ],
+      "evidence_notes": "Beads-to-queue sync, claim collision detection, reservation overlap handling, and Agent Mail conflict signaling all exist in-core today; full NTM-parity handoff UX and scheduler integration remain open."
+    },
+    {
+      "capability_id": "fcp.host_runtime_native",
+      "capability_name": "Connector host runtime and protocol embedding",
+      "source_domain": "fcp",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": ["ft-3681t.5.1", "ft-3681t.5.2", "ft-3681t.5.3"],
+      "surfaces": [
+        "connector host lifecycle/runtime APIs",
+        "connector health and liveness snapshots",
+        "connector protocol operation envelopes"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/connector_host_runtime.rs",
+        "tests/e2e/test_ft_3681t_5_1_connector_host_runtime.sh"
+      ],
+      "evidence_notes": "Deterministic connector host runtime core is now merged (lifecycle/protocol envelope/budget guardrails). Registry verification, sandbox zones, and bridge adapters remain in downstream ft-3681t.5.x beads."
+    },
+    {
+      "capability_id": "fcp.connector_bridge_inbound_outbound",
+      "capability_name": "Connector-to-workflow and workflow-to-connector bridges",
+      "source_domain": "fcp",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": ["ft-3681t.5.6", "ft-3681t.5.7", "ft-3681t.5.8"],
+      "surfaces": [
+        "connector inbound signal routing",
+        "connector outbound action dispatch",
+        "connector event/audit normalization"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/connector_inbound_bridge.rs",
+        "crates/frankenterm-core/src/connector_outbound_bridge.rs",
+        "crates/frankenterm-core/src/connector_event_model.rs"
+      ],
+      "evidence_notes": "Inbound/outbound bridge primitives, telemetry counters, redaction behavior, and connector event normalization are implemented, but full lifecycle wiring and federated rollout semantics remain downstream."
+    }
+  ]
+}

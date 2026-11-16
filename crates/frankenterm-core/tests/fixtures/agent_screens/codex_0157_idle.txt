@@ -1,0 +1,24 @@
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.157.0)                     │
+│                                                │
+│ model:     GPT-6-Sol medium   /model to change │
+│ directory: ~/projects/frankenterm              │
+╰────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+            Tip: You can resume a previous conversation by running codex resume
+
+› Ask Codex to do anything
+
+  GPT-6-Sol medium · ~/projects/frankenterm · GPT-6-Sol · medium · frankenterm …
+  ← for agents · ? for shortcuts                      ⚠ 2 warnings · f2 to view

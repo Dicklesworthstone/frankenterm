@@ -1,0 +1,4845 @@
+use crate::background::{BackgroundLayer, Gradient};
+use crate::bell::{AudibleBell, EasingFunction, VisualBell};
+use crate::cell::validate_cell_widths;
+use crate::color::{
+    ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
+};
+use crate::daemon::DaemonOptions;
+#[cfg(feature = "lua")]
+use crate::default_config_with_overrides_applied;
+use crate::exec_domain::ExecDomain;
+use crate::font::{
+    AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
+    FontShaperSelection, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule,
+    TextStyle,
+};
+use crate::frontend::FrontEndSelection;
+use crate::keyassignment::{
+    KeyAssignment, KeyTable, KeyTableEntry, KeyTables, MouseEventTrigger, SpawnCommand,
+};
+use crate::keys::{Key, LeaderKey, Mouse};
+#[cfg(feature = "lua")]
+use crate::lua::make_lua_context;
+use crate::ssh::{SshBackend, SshDomain};
+use crate::tls::{TlsDomainClient, TlsDomainServer};
+use crate::units::Dimension;
+use crate::unix::UnixDomain;
+use crate::wsl::WslDomain;
+#[cfg(feature = "lua")]
+use crate::{config_file_override_snapshot, config_overrides_snapshot, CONFIG_SKIP, HOME_DIR};
+use crate::{
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
+    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
+    WebGpuPowerPreference, CONFIG_DIRS,
+};
+use anyhow::Context;
+use frankenterm_bidi::ParagraphDirectionHint;
+use frankenterm_config_derive::ConfigMeta;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_input_types::{
+    IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, Modifiers,
+    UIKeyCapRendering, WindowDecorations,
+};
+use frankenterm_term::TerminalSize;
+#[cfg(feature = "lua")]
+use luahelper::impl_lua_conversion_dynamic;
+#[cfg(feature = "lua")]
+use mlua::FromLua;
+use portable_pty::CommandBuilder;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+#[cfg(feature = "lua")]
+use std::io::Read;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "lua")]
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use termwiz::hyperlink;
+use termwiz::surface::CursorShape;
+
+#[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
+pub struct Config {
+    /// The font size, measured in points
+    #[dynamic(default = "default_font_size")]
+    pub font_size: f64,
+
+    #[dynamic(
+        default = "default_one_point_oh_f64",
+        validate = "validate_line_height"
+    )]
+    pub line_height: f64,
+
+    #[dynamic(default = "default_one_point_oh_f64")]
+    pub cell_width: f64,
+
+    #[dynamic(try_from = "crate::units::OptPixelUnit", default)]
+    pub cursor_thickness: Option<Dimension>,
+
+    #[dynamic(try_from = "crate::units::OptPixelUnit", default)]
+    pub underline_thickness: Option<Dimension>,
+
+    #[dynamic(try_from = "crate::units::OptPixelUnit", default)]
+    pub underline_position: Option<Dimension>,
+
+    #[dynamic(try_from = "crate::units::OptPixelUnit", default)]
+    pub strikethrough_position: Option<Dimension>,
+
+    #[dynamic(default)]
+    pub allow_square_glyphs_to_overflow_width: AllowSquareGlyphOverflow,
+
+    #[dynamic(default)]
+    pub window_decorations: WindowDecorations,
+
+    #[dynamic(default = "default_integrated_title_buttons")]
+    pub integrated_title_buttons: Vec<IntegratedTitleButton>,
+
+    #[dynamic(default)]
+    pub log_unknown_escape_sequences: bool,
+
+    /// Native OSC 52 writes and clears require one visible consent by default.
+    /// `Allow` permits writes within the byte cap; `Deny` refuses them.
+    /// A headless embedding without a consent handler cannot approve `Prompt`.
+    #[dynamic(default = "default_osc52_write_policy")]
+    pub osc52_write_policy: frankenterm_term::config::Osc52WritePolicy,
+
+    /// Maximum decoded OSC 52 payload bytes, including deferred prompts.
+    /// Zero permits only empty Set or Clear requests, still subject to policy.
+    #[dynamic(default = "default_osc52_write_max_bytes")]
+    pub osc52_write_max_bytes: usize,
+
+    #[dynamic(default)]
+    pub integrated_title_button_alignment: IntegratedTitleButtonAlignment,
+
+    #[dynamic(default)]
+    pub integrated_title_button_style: IntegratedTitleButtonStyle,
+
+    #[dynamic(default)]
+    pub integrated_title_button_color: IntegratedTitleButtonColor,
+
+    /// When using FontKitXXX font systems, a set of directories to
+    /// search ahead of the standard font locations for fonts.
+    /// Relative paths are taken to be relative to the directory
+    /// from which the config was loaded.
+    #[dynamic(default)]
+    pub font_dirs: Vec<PathBuf>,
+
+    #[dynamic(default)]
+    pub color_scheme_dirs: Vec<PathBuf>,
+
+    /// The DPI to assume
+    pub dpi: Option<f64>,
+
+    #[dynamic(default)]
+    pub dpi_by_screen: HashMap<String, f64>,
+
+    /// The baseline font to use
+    #[dynamic(default)]
+    pub font: TextStyle,
+
+    /// An optional set of style rules to select the font based
+    /// on the cell attributes
+    #[dynamic(default)]
+    pub font_rules: Vec<StyleRule>,
+
+    /// When true (the default), PaletteIndex 0-7 are shifted to
+    /// bright when the font intensity is bold.  The brightening
+    /// doesn't apply to text that is the default color.
+    #[dynamic(default)]
+    pub bold_brightens_ansi_colors: BoldBrightening,
+
+    /// The color palette
+    pub colors: Option<Palette>,
+
+    #[dynamic(default)]
+    pub switch_to_last_active_tab_when_closing_tab: bool,
+
+    /// When true, launching a new wezterm instance will prefer
+    /// to spawn a new tab into an existing instance.
+    /// Otherwise, it will spawn a new window.
+    #[dynamic(default)]
+    pub prefer_to_spawn_tabs: bool,
+
+    #[dynamic(default)]
+    pub window_frame: WindowFrameConfig,
+
+    /// Font to use for CharSelect
+    #[dynamic(default)]
+    pub char_select_font: Option<TextStyle>,
+
+    #[dynamic(default = "default_char_select_font_size")]
+    pub char_select_font_size: f64,
+
+    #[dynamic(default = "default_char_select_fg_color")]
+    pub char_select_fg_color: RgbaColor,
+
+    #[dynamic(default = "default_char_select_bg_color")]
+    pub char_select_bg_color: RgbaColor,
+
+    /// Font to use for ActivateCommandPalette
+    #[dynamic(default)]
+    pub command_palette_font: Option<TextStyle>,
+
+    #[dynamic(default = "default_command_palette_font_size")]
+    pub command_palette_font_size: f64,
+
+    pub command_palette_rows: Option<usize>,
+    #[dynamic(default = "default_command_palette_fg_color")]
+    pub command_palette_fg_color: RgbaColor,
+
+    #[dynamic(default = "default_command_palette_bg_color")]
+    pub command_palette_bg_color: RgbaColor,
+
+    /// Font to use for PaneSelect
+    #[dynamic(default)]
+    pub pane_select_font: Option<TextStyle>,
+
+    #[dynamic(default = "default_pane_select_font_size")]
+    pub pane_select_font_size: f64,
+
+    #[dynamic(default = "default_pane_select_fg_color")]
+    pub pane_select_fg_color: RgbaColor,
+
+    #[dynamic(default = "default_pane_select_bg_color")]
+    pub pane_select_bg_color: RgbaColor,
+
+    #[dynamic(default)]
+    pub tab_bar_style: TabBarStyle,
+
+    #[dynamic(default)]
+    pub resolved_palette: Palette,
+
+    /// Use a named color scheme rather than the palette specified
+    /// by the colors setting.
+    pub color_scheme: Option<String>,
+
+    /// Named color schemes
+    #[dynamic(default)]
+    pub color_schemes: HashMap<String, Palette>,
+
+    /// How many lines of scrollback you want to retain
+    #[dynamic(
+        default = "default_scrollback_lines",
+        validate = "validate_scrollback_lines"
+    )]
+    pub scrollback_lines: usize,
+
+    /// Enables tier-aware scrollback budgeting in the terminal model.
+    #[dynamic(default = "default_scrollback_tiered_enabled")]
+    pub scrollback_tiered_enabled: bool,
+
+    /// Hot-tier in-memory scrollback line budget when tiering is enabled.
+    #[dynamic(
+        default = "default_scrollback_hot_lines",
+        validate = "validate_scrollback_hot_lines"
+    )]
+    pub scrollback_hot_lines: usize,
+
+    /// Warm-tier accounting budget (MiB) when tiering is enabled.
+    #[dynamic(
+        default = "default_scrollback_warm_max_mb",
+        validate = "validate_scrollback_warm_max_mb"
+    )]
+    pub scrollback_warm_max_mb: usize,
+
+    /// Warm-tier budget (MiB) shared by every live local pane; 0 disables it.
+    /// Each pane's warm cap becomes the smaller of `scrollback_warm_max_mb`
+    /// and this budget divided by the live pane count, so a many-pane host
+    /// bounds total warm scrollback instead of multiplying it by pane count.
+    #[dynamic(default)]
+    pub scrollback_warm_fleet_max_mb: usize,
+
+    /// Byte budget (MiB) for scrollback rows queued behind the durability
+    /// writer, shared by every pane in the process. Past it, a pane's oldest
+    /// queued rows are dropped from durability and recorded as an explicit
+    /// gap marker instead of throttling the pane (ft-yccm0.2.1.6).
+    #[dynamic(default = "default_scrollback_durability_queue_max_mb")]
+    pub scrollback_durability_queue_max_mb: usize,
+
+    /// Commit window (ms) of the durability writer (ft-yccm0.2.1.2): a pane's
+    /// queued rows wait up to this long after the first one, then go to the
+    /// store in one transaction. 0 commits every request at once.
+    /// `FT_DURABILITY_COMMIT_WINDOW_MS` overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_window_ms: u64,
+
+    /// A commit window closes early once this many MiB are queued.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_mb",
+        validate = "validate_scrollback_durability_commit_window_mb"
+    )]
+    pub scrollback_durability_commit_window_mb: usize,
+
+    /// A commit window closes early once its pane has queued no row for
+    /// this many milliseconds (the burst ended).
+    #[dynamic(
+        default = "default_scrollback_durability_commit_idle_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_idle_ms: u64,
+
+    /// Shortest interval (ms) between two manifest publications of one pane
+    /// (ft-yccm0.2.1.2). Between them, each commit window appends its rows
+    /// under one sync and recovery adopts that durable tail; a publication
+    /// (also on pane close or flush) names it in a cumulative WAL. 0
+    /// publishes every transaction. `FT_DURABILITY_MANIFEST_PUBLISH_MS`
+    /// overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_manifest_publish_ms",
+        validate = "validate_scrollback_durability_manifest_publish_ms"
+    )]
+    pub scrollback_durability_manifest_publish_ms: u64,
+
+    // -- Agent pane state detection --
+    /// Enable agent pane state detection and visual indicators.
+    #[dynamic(default = "default_true")]
+    pub agent_detection_enabled: bool,
+
+    /// Output recency threshold for Active state (ms). Default: 5000.
+    #[dynamic(default = "default_agent_active_threshold_ms")]
+    pub agent_active_threshold_ms: u64,
+
+    /// Silence after input before Thinking state (ms). Default: 5000.
+    #[dynamic(default = "default_agent_thinking_threshold_ms")]
+    pub agent_thinking_threshold_ms: u64,
+
+    /// Silence after input before Stuck state (ms). Default: 30000.
+    #[dynamic(default = "default_agent_stuck_threshold_ms")]
+    pub agent_stuck_threshold_ms: u64,
+
+    /// No input+output silence before Idle state (ms). Default: 60000.
+    #[dynamic(default = "default_agent_idle_threshold_ms")]
+    pub agent_idle_threshold_ms: u64,
+
+    /// Show agent name overlay in pane title bar.
+    #[dynamic(default = "default_true")]
+    pub agent_show_name_overlay: bool,
+
+    /// Show backpressure tier indicator in pane chrome.
+    #[dynamic(default = "default_true")]
+    pub agent_show_backpressure: bool,
+
+    /// Border width (px) for agent state indicator. Default: 2.
+    #[dynamic(default = "default_agent_border_width")]
+    pub agent_border_width: u32,
+
+    /// Auto-layout policy for agent panes: by_status, by_activity, by_domain, manual.
+    #[dynamic(default = "default_agent_auto_layout")]
+    pub agent_auto_layout: String,
+
+    /// Cubic slack multiplier used by resize-time bounded KP wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_badness_scale")]
+    pub resize_wrap_kp_badness_scale: u64,
+
+    /// Overflow/force-break penalty used by resize-time bounded KP wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_forced_break_penalty")]
+    pub resize_wrap_kp_forced_break_penalty: u64,
+
+    /// DP lookahead cap used by resize-time bounded KP wrapping.
+    #[dynamic(
+        default = "default_resize_wrap_kp_lookahead_limit",
+        validate = "validate_resize_wrap_kp_lookahead_limit"
+    )]
+    pub resize_wrap_kp_lookahead_limit: usize,
+
+    /// Maximum DP states before deterministic fallback during resize wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_max_dp_states")]
+    pub resize_wrap_kp_max_dp_states: usize,
+
+    /// Enables wrap-quality scorecard telemetry during resize.
+    /// When true, each resize records per-line wrap quality metrics (DP vs
+    /// fallback usage, badness deltas) so operators can diagnose reflow issues.
+    #[dynamic(default = "default_true")]
+    pub resize_wrap_scorecard_enabled: bool,
+
+    /// Enables readability gate evaluation over resize wrap scorecards.
+    /// When true, aggregate wrap quality is checked after resize; if
+    /// quality falls below thresholds a warning is logged.
+    #[dynamic(default = "default_true")]
+    pub resize_wrap_readability_gate_enabled: bool,
+
+    /// Max allowed per-line badness delta versus greedy baseline.
+    #[dynamic(default = "default_resize_wrap_readability_max_line_badness_delta")]
+    pub resize_wrap_readability_max_line_badness_delta: i64,
+
+    /// Max allowed aggregate badness delta versus greedy baseline.
+    #[dynamic(default = "default_resize_wrap_readability_max_total_badness_delta")]
+    pub resize_wrap_readability_max_total_badness_delta: i64,
+
+    /// Max allowed percent of fallback-mode lines during resize wrapping.
+    #[dynamic(
+        default = "default_resize_wrap_readability_max_fallback_ratio_percent",
+        validate = "validate_percent_0_100"
+    )]
+    pub resize_wrap_readability_max_fallback_ratio_percent: u8,
+
+    /// If no `prog` is specified on the command line, use this
+    /// instead of running the user's shell.
+    /// For example, to have `wezterm` always run `top` by default,
+    /// you'd use this:
+    ///
+    /// ```toml
+    /// default_prog = ["top"]
+    /// ```
+    ///
+    /// `default_prog` is implemented as an array where the 0th element
+    /// is the command to run and the rest of the elements are passed
+    /// as the positional arguments to that command.
+    pub default_prog: Option<Vec<String>>,
+
+    #[dynamic(default = "default_gui_startup_args")]
+    pub default_gui_startup_args: Vec<String>,
+
+    /// Specifies the default current working directory if none is specified
+    /// through configuration or OSC 7 (see docs for `default_cwd` for more
+    /// info!)
+    pub default_cwd: Option<PathBuf>,
+
+    #[dynamic(default)]
+    pub exit_behavior: ExitBehavior,
+
+    #[dynamic(default)]
+    pub exit_behavior_messaging: ExitBehaviorMessaging,
+
+    #[dynamic(default = "default_clean_exits")]
+    pub clean_exit_codes: Vec<u32>,
+
+    #[dynamic(default = "default_true")]
+    pub detect_password_input: bool,
+
+    /// Specifies a map of environment variables that should be set
+    /// when spawning commands in the local domain.
+    /// This is not used when working with remote domains.
+    #[dynamic(default)]
+    pub set_environment_variables: HashMap<String, String>,
+
+    /// Specifies the height of a new window, expressed in character cells.
+    #[dynamic(default = "default_initial_rows", validate = "validate_row_or_col")]
+    pub initial_rows: u16,
+
+    #[dynamic(default = "default_true")]
+    pub enable_kitty_graphics: bool,
+    #[dynamic(default)]
+    pub enable_kitty_keyboard: bool,
+
+    // Note: kitty_image_budget_bytes is configurable via the term crate's
+    // TerminalConfiguration trait (kitty_image_budget_bytes()). The default is
+    // 320 MiB, set in KittyImageState::default(). Full config-file wiring for
+    // this vendored parameter is tracked by bead ft-ou001.
+    /// Maximum number of user variables (iTerm2 SetUserVar) per terminal.
+    /// Prevents unbounded memory growth. Default: 512.
+    #[dynamic(default = "default_max_user_vars")]
+    pub max_user_vars: usize,
+
+    /// Maximum depth of the unicode version stack.
+    /// Prevents unbounded growth from unbalanced Push operations.
+    /// Default: 64.
+    #[dynamic(default = "default_max_unicode_version_stack_depth")]
+    pub max_unicode_version_stack_depth: usize,
+
+    /// Maximum length (bytes) for the accumulating OSC title string.
+    /// Prevents unbounded growth from malformed escape sequences.
+    /// Default: 8192.
+    #[dynamic(default = "default_max_accumulating_title_len")]
+    pub max_accumulating_title_len: usize,
+
+    /// Maximum entries in the sixel color register map.
+    /// Default: 4096.
+    #[dynamic(default = "default_max_color_map_entries")]
+    pub max_color_map_entries: usize,
+
+    /// Whether the terminal should respond to requests to read the
+    /// title string.
+    /// Disabled by default for security concerns with shells that might
+    /// otherwise attempt to execute the response.
+    /// <https://marc.info/?l=bugtraq&m=104612710031920&w=2>
+    #[dynamic(default)]
+    pub enable_title_reporting: bool,
+
+    /// Whether the terminal should respond to DECRQCRA checksum requests.
+    /// Disabled by default because it allows programs to read screen contents.
+    /// <https://vt100.net/docs/vt510-rm/DECRQCRA.html>
+    #[dynamic(default)]
+    pub enable_checksum_rectangular_area: bool,
+
+    /// Specifies the width of a new window, expressed in character cells
+    #[dynamic(default = "default_initial_cols", validate = "validate_row_or_col")]
+    pub initial_cols: u16,
+
+    #[dynamic(default = "default_hyperlink_rules")]
+    pub hyperlink_rules: Vec<hyperlink::Rule>,
+
+    /// What to set the TERM variable to
+    #[dynamic(default = "default_term")]
+    pub term: String,
+
+    #[dynamic(default)]
+    pub font_locator: FontLocatorSelection,
+    #[dynamic(default)]
+    pub font_rasterizer: FontRasterizerSelection,
+    #[dynamic(default = "default_colr_rasterizer")]
+    pub font_colr_rasterizer: FontRasterizerSelection,
+    #[dynamic(default)]
+    pub font_shaper: FontShaperSelection,
+
+    #[dynamic(default)]
+    pub display_pixel_geometry: DisplayPixelGeometry,
+    #[dynamic(default)]
+    pub freetype_load_target: FreeTypeLoadTarget,
+    #[dynamic(default)]
+    pub freetype_render_target: Option<FreeTypeLoadTarget>,
+    #[dynamic(default)]
+    pub freetype_load_flags: Option<FreeTypeLoadFlags>,
+
+    /// The LCD filter FreeType applies to subpixel text (a
+    /// `freetype_render_target` of `HorizontalLcd` or `VerticalLcd`):
+    /// `Default`, `Light` or `None`. Read when fonts load.
+    #[dynamic(default)]
+    pub freetype_lcd_filter: FreeTypeLcdFilter,
+
+    /// Five LCD filter taps in 1/256 units that replace the ones of
+    /// `freetype_lcd_filter`, for example `[8, 77, 86, 77, 8]`. Taps that
+    /// add up to 256 keep the brightness; a zero center tap turns filtering
+    /// off. Read when fonts load.
+    #[dynamic(default, validate = "validate_freetype_lcd_filter_weights")]
+    pub freetype_lcd_filter_weights: Option<Vec<u8>>,
+
+    /// Selects the freetype interpret version to use.
+    /// Likely values are 35, 38 and 40 which have different
+    /// characteristics with respective to subpixel hinting.
+    /// See https://freetype.org/freetype2/docs/subpixel-hinting.html
+    pub freetype_interpreter_version: Option<u32>,
+
+    #[dynamic(default)]
+    pub freetype_pcf_long_family_names: bool,
+
+    /// Specify the features to enable when using harfbuzz for font shaping.
+    /// There is some light documentation here:
+    /// <https://harfbuzz.github.io/shaping-opentype-features.html>
+    /// but it boils down to allowing opentype feature names to be specified
+    /// using syntax similar to the CSS font-feature-settings options:
+    /// <https://developer.mozilla.org/en-US/docs/Web/CSS/font-feature-settings>.
+    /// The OpenType spec lists a number of features here:
+    /// <https://docs.microsoft.com/en-us/typography/opentype/spec/featurelist>
+    ///
+    /// Options of likely interest will be:
+    ///
+    /// * `calt` - <https://docs.microsoft.com/en-us/typography/opentype/spec/features_ae#tag-calt>
+    /// * `clig` - <https://docs.microsoft.com/en-us/typography/opentype/spec/features_ae#tag-clig>
+    ///
+    /// If you want to disable ligatures in most fonts, then you may want to
+    /// use a setting like this:
+    ///
+    /// ```toml
+    /// harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
+    /// ```
+    ///
+    /// Some fonts make available extended options via stylistic sets.
+    /// If you use the [Fira Code font](https://github.com/tonsky/FiraCode),
+    /// it lists available stylistic sets here:
+    /// <https://github.com/tonsky/FiraCode/wiki/How-to-enable-stylistic-sets>
+    ///
+    /// and you can set them in wezterm:
+    ///
+    /// ```toml
+    /// # Use this for a zero with a dot rather than a line through it
+    /// # when using the Fira Code font
+    /// harfbuzz_features = ["zero"]
+    /// ```
+    #[dynamic(default = "default_harfbuzz_features")]
+    pub harfbuzz_features: Vec<String>,
+
+    #[dynamic(default)]
+    pub front_end: FrontEndSelection,
+
+    /// Whether to select the higher powered discrete GPU when
+    /// the system has a choice of integrated or discrete.
+    /// Defaults to low power.
+    #[dynamic(default)]
+    pub webgpu_power_preference: WebGpuPowerPreference,
+
+    #[dynamic(default)]
+    pub webgpu_force_fallback_adapter: bool,
+
+    #[dynamic(default)]
+    pub webgpu_preferred_adapter: Option<GpuInfo>,
+
+    #[dynamic(default)]
+    pub wsl_domains: Option<Vec<WslDomain>>,
+
+    #[dynamic(default)]
+    pub exec_domains: Vec<ExecDomain>,
+
+    #[dynamic(default)]
+    pub serial_ports: Vec<SerialDomain>,
+
+    /// The set of unix domains
+    #[dynamic(default = "UnixDomain::default_unix_domains")]
+    pub unix_domains: Vec<UnixDomain>,
+
+    #[dynamic(default)]
+    pub ssh_domains: Option<Vec<SshDomain>>,
+
+    #[dynamic(default)]
+    pub ssh_backend: SshBackend,
+
+    /// When running in server mode, defines configuration for
+    /// each of the endpoints that we'll listen for connections
+    #[dynamic(default)]
+    pub tls_servers: Vec<TlsDomainServer>,
+
+    /// The set of tls domains that we can connect to as a client
+    #[dynamic(default)]
+    pub tls_clients: Vec<TlsDomainClient>,
+
+    /// Constrains the rate at which the multiplexer client will
+    /// speculatively fetch line data.
+    /// This helps to avoid saturating the link between the client
+    /// and server if the server is dumping a large amount of output
+    /// to the client.
+    #[dynamic(default = "default_ratelimit_line_prefetches_per_second")]
+    pub ratelimit_mux_line_prefetches_per_second: u32,
+
+    /// The buffer size used by parse_buffered_data in the mux module.
+    /// This should not be too large, otherwise the processing cost
+    /// of applying a batch of actions to the terminal will be too
+    /// high and the user experience will be laggy and less responsive.
+    #[dynamic(
+        default = "default_mux_output_parser_buffer_size",
+        validate = "validate_mux_output_parser_buffer_size"
+    )]
+    pub mux_output_parser_buffer_size: usize,
+
+    #[dynamic(default = "default_true")]
+    pub mux_enable_ssh_agent: bool,
+
+    #[dynamic(default)]
+    pub default_ssh_auth_sock: Option<String>,
+
+    /// How many ms to delay after reading a chunk of output
+    /// in order to try to coalesce fragmented writes into
+    /// a single bigger chunk of output and reduce the chances
+    /// observing "screen tearing" with un-synchronized output
+    #[dynamic(default = "default_mux_output_parser_coalesce_delay_ms")]
+    pub mux_output_parser_coalesce_delay_ms: u64,
+
+    /// Size of the mux socket read/write buffer, in bytes.
+    /// Also used as the initial read buffer for PTY output.
+    /// Default: 1MB (1048576).
+    #[dynamic(default = "default_mux_socket_buffer_size")]
+    pub mux_socket_buffer_size: usize,
+
+    /// Slots in each pane's reader -> parser byte ring (ft-yccm0.3.1.1).
+    /// The pane reader publishes PTY output into free slots and the parser
+    /// releases each slot once parsed. When every slot is full the reader
+    /// parks and stops reading, so the kernel throttles the child.
+    #[dynamic(
+        default = "default_mux_output_ring_slots",
+        validate = "validate_mux_output_ring_slots"
+    )]
+    pub mux_output_ring_slots: usize,
+
+    /// Bytes per slot of the reader -> parser byte ring (ft-yccm0.3.1.1).
+    #[dynamic(
+        default = "default_mux_output_ring_slot_bytes",
+        validate = "validate_mux_output_ring_slot_bytes"
+    )]
+    pub mux_output_ring_slot_bytes: usize,
+
+    /// Pane reader gather policy (ft-yccm0.3.1.2). A first read below this
+    /// many bytes is published at once, so interactive echo never waits.
+    /// From it on the reader keeps reading what is already there. macOS
+    /// returns about 1 KiB per PTY read under load, hence the default.
+    #[dynamic(
+        default = "default_mux_output_gather_min_bytes",
+        validate = "validate_mux_output_gather_min_bytes"
+    )]
+    pub mux_output_gather_min_bytes: usize,
+
+    /// Zero-timeout readiness checks before the gathering reader starts to
+    /// poll with a timeout (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_spin_checks",
+        validate = "validate_mux_output_gather_spin_checks"
+    )]
+    pub mux_output_gather_spin_checks: u32,
+
+    /// Longest single poll of a gathering reader, in microseconds
+    /// (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_poll_us",
+        validate = "validate_mux_output_gather_poll_us"
+    )]
+    pub mux_output_gather_poll_us: u64,
+
+    /// Total time a reader may gather one batch, in microseconds; 0 turns
+    /// gathering off (ft-yccm0.3.1.2). A full ring slot, EOF or an idle
+    /// parser end the batch sooner.
+    #[dynamic(
+        default = "default_mux_output_gather_max_wait_us",
+        validate = "validate_mux_output_gather_max_wait_us"
+    )]
+    pub mux_output_gather_max_wait_us: u64,
+
+    /// Maximum bytes of output to hold during synchronized rendering mode
+    /// before force-flushing. Prevents unbounded memory growth from buggy
+    /// apps that enter synchronized-output mode and never reset it.
+    /// Default: 8MB (8388608).
+    #[dynamic(default = "default_mux_max_synchronized_output_bytes")]
+    pub mux_max_synchronized_output_bytes: usize,
+
+    /// Maximum queued output per tmux pane, in bytes, across pre-attach
+    /// backlog and the live nonblocking output lane. Exceeding this records a
+    /// gap and fails closed; an arbitrary terminal-stream suffix is never
+    /// replayed. Default: 1MB (1048576).
+    #[dynamic(default = "default_mux_tmux_max_backlog_bytes_per_pane")]
+    pub mux_tmux_max_backlog_bytes_per_pane: usize,
+
+    /// Maximum aggregate payload retained for tmux panes whose local mirrors
+    /// have not materialized yet. Default: 32MB (33554432).
+    #[dynamic(default = "default_mux_tmux_max_backlog_bytes")]
+    pub mux_tmux_max_backlog_bytes: usize,
+
+    /// Maximum number of not-yet-materialized tmux pane identities with
+    /// retained output. Default: 1024.
+    #[dynamic(default = "default_mux_tmux_max_backlog_entries")]
+    pub mux_tmux_max_backlog_entries: usize,
+
+    /// Maximum aggregate number of owned output chunks retained for tmux
+    /// panes whose local mirrors have not materialized yet. Default: 16384.
+    #[dynamic(default = "default_mux_tmux_max_backlog_items")]
+    pub mux_tmux_max_backlog_items: usize,
+
+    /// Maximum age of output retained for an unknown tmux pane identity.
+    /// Expiry records a global resynchronization requirement rather than
+    /// silently forgetting terminal bytes. Default: 30000ms.
+    #[dynamic(default = "default_mux_tmux_backlog_expiry_ms")]
+    pub mux_tmux_backlog_expiry_ms: u64,
+
+    /// Maximum number of owned output chunks queued for one materialized tmux
+    /// pane. The byte cap above is enforced independently. Default: 1024.
+    #[dynamic(default = "default_mux_tmux_max_output_queue_items_per_pane")]
+    pub mux_tmux_max_output_queue_items_per_pane: usize,
+
+    /// Maximum exact pane registrations retaining GUI state in one window,
+    /// including retired panes awaiting cleanup. This is an entry-count bound,
+    /// separate from cache byte budgets. New GUI state waits for local cleanup
+    /// credit; other windows and mux pane creation remain independent. Increase
+    /// for windows displaying larger fleets. Reloading a larger limit wakes
+    /// waiting state; lowering it preserves accepted entries until cleanup and
+    /// blocks new entries above the limit. Must be non-zero. Default: 4096.
+    #[dynamic(
+        default = "default_gui_retained_pane_state_limit",
+        validate = "validate_gui_retained_pane_state_limit"
+    )]
+    pub gui_retained_pane_state_limit: usize,
+
+    /// Maximum bytes one tmux pane may write during a fair output-drain
+    /// quantum before another ready pane runs. Default: 256KB (262144).
+    #[dynamic(default = "default_mux_tmux_output_write_quantum_bytes")]
+    pub mux_tmux_output_write_quantum_bytes: usize,
+
+    /// Maximum time, in milliseconds, for an admitted tmux launcher write
+    /// to start on its dedicated I/O lane. Default: 500ms.
+    #[dynamic(default = "default_mux_tmux_io_start_timeout_ms")]
+    pub mux_tmux_io_start_timeout_ms: u64,
+
+    /// Maximum time, in milliseconds, for one tmux launcher write after its
+    /// dedicated I/O worker starts it. Default: 2000ms.
+    #[dynamic(default = "default_mux_tmux_io_write_timeout_ms")]
+    pub mux_tmux_io_write_timeout_ms: u64,
+
+    /// Maximum time, in milliseconds, for tmux to produce the final guarded
+    /// response for a successfully written command, or to exit control mode
+    /// after an explicit detach request. Default: 10000ms.
+    #[dynamic(default = "default_mux_tmux_response_timeout_ms")]
+    pub mux_tmux_response_timeout_ms: u64,
+
+    /// Minimum width in cells for floating panes. Default: 5.
+    #[dynamic(default = "default_min_floating_pane_width")]
+    pub min_floating_pane_width: usize,
+
+    /// Minimum height in cells for floating panes. Default: 3.
+    #[dynamic(default = "default_min_floating_pane_height")]
+    pub min_floating_pane_height: usize,
+
+    /// Initial SSH poll delay in milliseconds. Default: 100.
+    #[dynamic(default = "default_ssh_initial_poll_delay_ms")]
+    pub ssh_initial_poll_delay_ms: u64,
+
+    /// Maximum SSH poll delay in milliseconds. Default: 2000.
+    #[dynamic(default = "default_ssh_max_poll_delay_ms")]
+    pub ssh_max_poll_delay_ms: u64,
+
+    /// Base interval for client reconnect backoff in milliseconds. Must be
+    /// greater than zero. Default: 1000. A plain local unix socket, with no
+    /// `proxy_command`, uses at most 500 here.
+    #[dynamic(default = "default_client_reconnect_base_interval_ms")]
+    pub client_reconnect_base_interval_ms: u64,
+
+    /// Maximum interval for client reconnect backoff in milliseconds. Must be
+    /// at least `client_reconnect_base_interval_ms`. Default: 10000. A plain
+    /// local unix socket, with no `proxy_command`, uses at most 1000 here.
+    #[dynamic(default = "default_client_reconnect_max_interval_ms")]
+    pub client_reconnect_max_interval_ms: u64,
+
+    /// How many failed reconnect cycles or dial attempts a client domain may
+    /// tolerate before giving up for this session. Default: 0 (unlimited). A
+    /// nonzero value is an explicit operator opt-in to terminal detach after
+    /// that retry budget is exhausted.
+    ///
+    /// The same nonzero value bounds both the dial loop while a host is down
+    /// and repeated cycles where a host accepts the connection and immediately
+    /// drops the session. Each such cycle used to reset the backoff and open a
+    /// fresh connection window, so a machine that was down but still reachable
+    /// produced an endless stream of windows.
+    ///
+    /// A plain local unix socket redials about once a second, so there a dial
+    /// budget of N runs out in about N seconds, which can be less than its mux
+    /// takes to restart. Without a budget it gives up after two minutes.
+    ///
+    /// A connection that stays up for at least
+    /// `client_reconnect_healthy_session_ms` is treated as genuinely
+    /// recovered and resets the counter, so ordinary transient drops over a
+    /// long session still reconnect indefinitely.
+    #[dynamic(default = "default_client_reconnect_max_attempts")]
+    pub client_reconnect_max_attempts: u32,
+
+    /// How long a reconnected session must survive before it counts as
+    /// recovered and resets `client_reconnect_max_attempts`. Must be greater
+    /// than zero. Default: 30000.
+    #[dynamic(default = "default_client_reconnect_healthy_session_ms")]
+    pub client_reconnect_healthy_session_ms: u64,
+
+    /// Base poll interval for pane rendering in milliseconds. Default: 20.
+    #[dynamic(default = "default_render_base_poll_interval_ms")]
+    pub render_base_poll_interval_ms: u64,
+
+    /// Maximum poll interval for pane rendering in milliseconds. Default: 30000.
+    #[dynamic(default = "default_render_max_poll_interval_ms")]
+    pub render_max_poll_interval_ms: u64,
+
+    /// Connection UI poll timeout in milliseconds. Default: 200.
+    #[dynamic(default = "default_connui_poll_timeout_ms")]
+    pub connui_poll_timeout_ms: u64,
+
+    /// SSH terminal shim input poll timeout in milliseconds. Default: 200.
+    #[dynamic(default = "default_ssh_terminal_poll_timeout_ms")]
+    pub ssh_terminal_poll_timeout_ms: u64,
+
+    #[dynamic(default = "default_mux_env_remove")]
+    pub mux_env_remove: Vec<String>,
+
+    #[dynamic(default)]
+    pub keys: Vec<Key>,
+    #[dynamic(default)]
+    pub key_tables: HashMap<String, Vec<Key>>,
+
+    #[dynamic(default = "default_bypass_mouse_reporting_modifiers")]
+    pub bypass_mouse_reporting_modifiers: Modifiers,
+
+    #[dynamic(default)]
+    pub debug_key_events: bool,
+
+    #[dynamic(default)]
+    pub normalize_output_to_unicode_nfc: bool,
+
+    #[dynamic(default)]
+    pub disable_default_key_bindings: bool,
+    pub leader: Option<LeaderKey>,
+
+    #[dynamic(default = "default_num_alphabet")]
+    pub launcher_alphabet: String,
+
+    #[dynamic(default)]
+    pub disable_default_quick_select_patterns: bool,
+    #[dynamic(default)]
+    pub quick_select_patterns: Vec<String>,
+    #[dynamic(default = "default_alphabet")]
+    pub quick_select_alphabet: String,
+    #[dynamic(default)]
+    pub quick_select_remove_styling: bool,
+
+    #[dynamic(default)]
+    pub mouse_bindings: Vec<Mouse>,
+    #[dynamic(default)]
+    pub disable_default_mouse_bindings: bool,
+
+    #[dynamic(default)]
+    pub daemon_options: DaemonOptions,
+
+    #[dynamic(default)]
+    pub send_composed_key_when_left_alt_is_pressed: bool,
+
+    #[dynamic(default = "default_true")]
+    pub send_composed_key_when_right_alt_is_pressed: bool,
+
+    #[dynamic(default = "default_macos_forward_mods")]
+    pub macos_forward_to_ime_modifier_mask: Modifiers,
+
+    #[dynamic(default)]
+    pub treat_left_ctrlalt_as_altgr: bool,
+
+    /// If true, the `Backspace` and `Delete` keys generate `Delete` and `Backspace`
+    /// keypresses, respectively, rather than their normal keycodes.
+    /// On macOS the default for this is true because its Backspace key
+    /// is labeled as Delete and things are backwards.
+    #[dynamic(default = "default_swap_backspace_and_delete")]
+    pub swap_backspace_and_delete: bool,
+
+    /// If true, display the tab bar UI at the top of the window.
+    /// The tab bar shows the titles of the tabs and which is the
+    /// active tab.  Clicking on a tab activates it.
+    #[dynamic(default = "default_true")]
+    pub enable_tab_bar: bool,
+    #[dynamic(default = "default_true")]
+    pub use_fancy_tab_bar: bool,
+
+    #[dynamic(default)]
+    pub tab_bar_at_bottom: bool,
+
+    #[dynamic(default = "default_true")]
+    pub mouse_wheel_scrolls_tabs: bool,
+
+    /// If true, tab bar titles are prefixed with the tab index
+    #[dynamic(default = "default_true")]
+    pub show_tab_index_in_tab_bar: bool,
+
+    #[dynamic(default = "default_true")]
+    pub show_tabs_in_tab_bar: bool,
+
+    #[dynamic(default = "default_true")]
+    pub show_new_tab_button_in_tab_bar: bool,
+
+    #[dynamic(default = "default_true")]
+    pub show_close_tab_button_in_tabs: bool,
+
+    /// If true, show_tab_index_in_tab_bar uses a zero-based index.
+    /// The default is false and the tab shows a one-based index.
+    #[dynamic(default)]
+    pub tab_and_split_indices_are_zero_based: bool,
+
+    /// Specifies the maximum width that a tab can have in the
+    /// tab bar.  Defaults to 16 glyphs in width.
+    #[dynamic(default = "default_tab_max_width")]
+    pub tab_max_width: usize,
+
+    /// If true, hide the tab bar if the window only has a single tab.
+    #[dynamic(default)]
+    pub hide_tab_bar_if_only_one_tab: bool,
+
+    #[dynamic(default)]
+    pub enable_scroll_bar: bool,
+
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_half_cell")]
+    pub min_scroll_bar_height: Dimension,
+
+    /// If false, do not try to use a Wayland protocol connection
+    /// when starting the gui frontend, and instead use X11.
+    /// This option is only considered on X11/Wayland systems and
+    /// has no effect on macOS or Windows.
+    /// The default is true.
+    #[dynamic(default = "default_true")]
+    pub enable_wayland: bool,
+    #[dynamic(default)]
+    pub enable_zwlr_output_manager: bool,
+
+    /// When the Wayland compositor offers `wp_fractional_scale_v1` and
+    /// `wp_viewporter`, render each window at the output's fractional scale
+    /// (for example 1.25) instead of rounding up to the next integer scale
+    /// and letting the compositor shrink the result. Set this to false to
+    /// keep the integer buffer-scale path. Read when the Wayland connection
+    /// starts. Only builds with Wayland support use it.
+    /// The default is true.
+    #[dynamic(default = "default_true")]
+    pub enable_wayland_fractional_scale: bool,
+
+    /// Whether to prefer EGL over other GL implementations.
+    /// EGL on Windows has jankier resize behavior than WGL (which
+    /// is used if EGL is unavailable), but EGL survives graphics
+    /// driver updates without breaking and losing your work.
+    #[dynamic(default = "default_prefer_egl")]
+    pub prefer_egl: bool,
+
+    #[dynamic(default = "default_true")]
+    pub custom_block_glyphs: bool,
+    #[dynamic(default = "default_true")]
+    pub anti_alias_custom_block_glyphs: bool,
+
+    /// Controls the amount of padding to use around the terminal cell area
+    #[dynamic(default)]
+    pub window_padding: WindowPadding,
+
+    #[dynamic(default)]
+    pub window_content_alignment: WindowContentAlignment,
+
+    /// Specifies the path to a background image attachment file.
+    /// The file can be any image format that the rust `image`
+    /// crate is able to identify and load.
+    /// A window background image is rendered into the background
+    /// of the window before any other content.
+    ///
+    /// The image will be scaled to fit the window.
+    #[dynamic(default)]
+    pub window_background_image: Option<PathBuf>,
+    #[dynamic(default)]
+    pub window_background_gradient: Option<Gradient>,
+    #[dynamic(default)]
+    pub window_background_image_hsb: Option<HsbTransform>,
+    #[dynamic(default)]
+    pub foreground_text_hsb: HsbTransform,
+
+    #[dynamic(default)]
+    pub background: Vec<BackgroundLayer>,
+
+    /// Only works on MacOS
+    #[dynamic(default)]
+    pub macos_window_background_blur: i64,
+
+    /// Only works on KDE Wayland
+    #[dynamic(default)]
+    pub kde_window_background_blur: bool,
+
+    /// Only works on Windows
+    #[dynamic(default)]
+    pub win32_system_backdrop: SystemBackdrop,
+
+    #[dynamic(default = "default_win32_acrylic_accent_color")]
+    pub win32_acrylic_accent_color: RgbaColor,
+
+    /// Specifies the alpha value to use when rendering the background
+    /// of the window.  The background is taken either from the
+    /// window_background_image, or if there is none, the background
+    /// color of the cell in the current position.
+    /// The default is 1.0 which is 100% opaque.  Setting it to a number
+    /// between 0.0 and 1.0 will allow for the screen behind the window
+    /// to "shine through" to varying degrees.
+    /// This only works on systems with a compositing window manager.
+    /// Setting opacity to a value other than 1.0 can impact render
+    /// performance.
+    #[dynamic(default = "default_one_point_oh")]
+    pub window_background_opacity: f32,
+
+    /// inactive_pane_hue, inactive_pane_saturation and
+    /// inactive_pane_brightness allow for transforming the color
+    /// of inactive panes.
+    /// The pane colors are converted to HSV values and multiplied
+    /// by these values before being converted back to RGB to
+    /// use in the display.
+    ///
+    /// The default is 1.0 which leaves the values as-is.
+    ///
+    /// Modifying the hue changes the hue of the color by rotating
+    /// it through the color wheel.  It is not as useful as the
+    /// other components, but is available "for free" as part of
+    /// the colorspace conversion.
+    ///
+    /// Modifying the saturation can add or reduce the amount of
+    /// "colorfulness".  Making the value smaller can make it appear
+    /// more washed out.
+    ///
+    /// Modifying the brightness can be used to dim or increase
+    /// the perceived amount of light.
+    ///
+    /// The range of these values is 0.0 and up; they are used to
+    /// multiply the existing values, so the default of 1.0
+    /// preserves the existing component, whilst 0.5 will reduce
+    /// it by half, and 2.0 will double the value.
+    ///
+    /// A subtle dimming effect can be achieved by setting:
+    /// inactive_pane_saturation = 0.9
+    /// inactive_pane_brightness = 0.8
+    #[dynamic(default = "default_inactive_pane_hsb")]
+    pub inactive_pane_hsb: HsbTransform,
+
+    #[dynamic(default = "default_one_point_oh")]
+    pub text_background_opacity: f32,
+
+    /// Specifies how often a blinking cursor transitions between visible
+    /// and invisible, expressed in milliseconds.
+    /// Setting this to 0 disables blinking.
+    /// Note that this value is approximate due to the way that the system
+    /// event loop schedulers manage timers; non-zero values will be at
+    /// least the interval specified with some degree of slop.
+    #[dynamic(default = "default_cursor_blink_rate")]
+    pub cursor_blink_rate: u64,
+    #[dynamic(default = "linear_ease")]
+    pub cursor_blink_ease_in: EasingFunction,
+    #[dynamic(default = "linear_ease")]
+    pub cursor_blink_ease_out: EasingFunction,
+
+    #[dynamic(default = "default_anim_fps")]
+    pub animation_fps: u8,
+
+    #[dynamic(default)]
+    pub text_min_contrast_ratio: Option<f32>,
+
+    /// Glyph coverage gamma, after kitty's `text_composition_strategy`:
+    /// 0.01 or more. Higher values make text heavier, fully for dark text
+    /// on a light background and hardly at all for light text on a dark
+    /// one. Setting this or `text_contrast` also blends text in linear
+    /// light. Applies to the OpenGL and WebGpu front ends.
+    #[dynamic(default, validate = "validate_text_gamma")]
+    pub text_gamma: Option<f32>,
+
+    /// Extra glyph coverage contrast, a percentage from 0 to 100, after
+    /// kitty's `text_composition_strategy`. Setting this or `text_gamma`
+    /// also blends text in linear light. Applies to the OpenGL and WebGpu
+    /// front ends.
+    #[dynamic(default, validate = "validate_text_contrast")]
+    pub text_contrast: Option<f32>,
+
+    #[dynamic(default)]
+    pub force_reverse_video_cursor: bool,
+    #[dynamic(default = "default_reverse_video_cursor_min_contrast")]
+    pub reverse_video_cursor_min_contrast: f32,
+
+    /// Specifies the default cursor style.  various escape sequences
+    /// can override the default style in different situations (eg:
+    /// an editor can change it depending on the mode), but this value
+    /// controls how the cursor appears when it is reset to default.
+    /// The default is `SteadyBlock`.
+    /// Acceptable values are `SteadyBlock`, `BlinkingBlock`,
+    /// `SteadyUnderline`, `BlinkingUnderline`, `SteadyBar`,
+    /// and `BlinkingBar`.
+    #[dynamic(default)]
+    pub default_cursor_style: DefaultCursorStyle,
+
+    /// Specifies how often blinking text (normal speed) transitions
+    /// between visible and invisible, expressed in milliseconds.
+    /// Setting this to 0 disables slow text blinking.  Note that this
+    /// value is approximate due to the way that the system event loop
+    /// schedulers manage timers; non-zero values will be at least the
+    /// interval specified with some degree of slop.
+    #[dynamic(default = "default_text_blink_rate")]
+    pub text_blink_rate: u64,
+    #[dynamic(default = "linear_ease")]
+    pub text_blink_ease_in: EasingFunction,
+    #[dynamic(default = "linear_ease")]
+    pub text_blink_ease_out: EasingFunction,
+
+    /// Specifies how often blinking text (rapid speed) transitions
+    /// between visible and invisible, expressed in milliseconds.
+    /// Setting this to 0 disables rapid text blinking.  Note that this
+    /// value is approximate due to the way that the system event loop
+    /// schedulers manage timers; non-zero values will be at least the
+    /// interval specified with some degree of slop.
+    #[dynamic(default = "default_text_blink_rate_rapid")]
+    pub text_blink_rate_rapid: u64,
+    #[dynamic(default = "linear_ease")]
+    pub text_blink_rapid_ease_in: EasingFunction,
+    #[dynamic(default = "linear_ease")]
+    pub text_blink_rapid_ease_out: EasingFunction,
+
+    /// If true, the mouse cursor will be hidden while typing.
+    /// This option is true by default.
+    #[dynamic(default = "default_true")]
+    pub hide_mouse_cursor_when_typing: bool,
+
+    /// If non-zero, specifies the period (in seconds) at which various
+    /// statistics are logged.  Note that there is a minimum period of
+    /// 10 seconds.
+    #[dynamic(default)]
+    pub periodic_stat_logging: u64,
+
+    /// If false, do not scroll to the bottom of the terminal when
+    /// you send input to the terminal.
+    /// The default is to scroll to the bottom when you send input
+    /// to the terminal.
+    #[dynamic(default = "default_true")]
+    pub scroll_to_bottom_on_input: bool,
+
+    #[dynamic(default = "default_true")]
+    pub use_ime: bool,
+    #[dynamic(default)]
+    pub xim_im_name: Option<String>,
+    #[dynamic(default)]
+    pub ime_preedit_rendering: ImePreeditRendering,
+
+    #[dynamic(default)]
+    pub notification_handling: NotificationHandling,
+
+    #[dynamic(default = "default_true")]
+    pub use_dead_keys: bool,
+
+    #[dynamic(default)]
+    pub launch_menu: Vec<SpawnCommand>,
+
+    #[dynamic(
+        default,
+        deprecated = "the abandoned box-model pane renderer is disabled because it rendered no terminal content"
+    )]
+    pub use_box_model_render: bool,
+
+    /// When true, watch the config file and reload it automatically
+    /// when it is detected as changing.
+    #[dynamic(default = "default_true")]
+    pub automatically_reload_config: bool,
+
+    #[dynamic(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
+    #[dynamic(
+        default,
+        deprecated = "this option no longer does anything and will be removed in a future release"
+    )]
+    pub show_update_window: bool,
+
+    #[dynamic(default = "default_update_interval")]
+    pub check_for_updates_interval_seconds: u64,
+
+    /// When set to true, use the CSI-U encoding scheme as described
+    /// in http://www.leonerd.org.uk/hacks/fixterms/
+    /// This is off by default because @wez and @jsgf find the shift-space
+    /// mapping annoying in vim :-p
+    #[dynamic(default)]
+    pub enable_csi_u_key_encoding: bool,
+
+    #[dynamic(default)]
+    pub window_close_confirmation: WindowCloseConfirmation,
+
+    #[dynamic(default)]
+    pub native_macos_fullscreen_mode: bool,
+
+    #[dynamic(default)]
+    pub macos_fullscreen_extend_behind_notch: bool,
+
+    #[dynamic(default = "default_word_boundary")]
+    pub selection_word_boundary: String,
+
+    /// Maximum interval in milliseconds between successive clicks that should
+    /// count as a double-click or triple-click selection. Increase this for
+    /// accessibility if the default cadence is too fast.
+    #[dynamic(
+        default = "default_click_interval_ms",
+        validate = "validate_click_interval_ms"
+    )]
+    pub click_interval_ms: u64,
+
+    #[dynamic(default = "default_enq_answerback")]
+    pub enq_answerback: String,
+
+    /// Font zoom preserves the native window size and reflows its terminal
+    /// grid by default. Opt in to resizing the window to preserve rows/cols.
+    #[dynamic(default)]
+    pub adjust_window_size_when_changing_font_size: bool,
+
+    #[dynamic(default)]
+    pub use_resize_increments: bool,
+
+    #[dynamic(default = "default_alternate_buffer_wheel_scroll_speed")]
+    pub alternate_buffer_wheel_scroll_speed: u8,
+
+    #[dynamic(default = "default_status_update_interval")]
+    pub status_update_interval: u64,
+
+    #[dynamic(default)]
+    pub experimental_pixel_positioning: bool,
+
+    #[dynamic(default)]
+    pub ignore_svg_fonts: bool,
+
+    #[dynamic(default)]
+    pub bidi_enabled: bool,
+
+    #[dynamic(default)]
+    pub bidi_direction: ParagraphDirectionHint,
+
+    #[dynamic(default = "default_stateless_process_list")]
+    pub skip_close_confirmation_for_processes_named: Vec<String>,
+
+    #[dynamic(default = "default_true")]
+    pub quit_when_all_windows_are_closed: bool,
+
+    #[dynamic(default = "default_true")]
+    pub warn_about_missing_glyphs: bool,
+
+    #[dynamic(default)]
+    pub sort_fallback_fonts_by_coverage: bool,
+
+    #[dynamic(default)]
+    pub search_font_dirs_for_fallback: bool,
+
+    #[dynamic(default)]
+    pub use_cap_height_to_scale_fallback_fonts: bool,
+
+    #[dynamic(default)]
+    pub swallow_mouse_click_on_pane_focus: bool,
+
+    #[dynamic(default = "default_swallow_mouse_click_on_window_focus")]
+    pub swallow_mouse_click_on_window_focus: bool,
+
+    #[dynamic(default)]
+    pub pane_focus_follows_mouse: bool,
+
+    /// A click in a shell's command line moves its cursor there, by the
+    /// arrow keys it takes, as if typed. Needs shell integration (OSC 133)
+    /// to mark the command line; a click anywhere else does what it did.
+    #[dynamic(default = "default_true")]
+    pub cursor_click_to_move: bool,
+
+    /// Also move the cursor for a click in its own row when no shell
+    /// integration marks a command line there, as in an agent's or an
+    /// editor's input box that shows the cursor. Off by default: a program
+    /// that reads the arrow keys as anything but cursor motion would see
+    /// them.
+    #[dynamic(default)]
+    pub cursor_click_to_move_on_cursor_row: bool,
+
+    #[dynamic(default = "default_true")]
+    pub unzoom_on_switch_pane: bool,
+
+    /// Maximum timer-backed repaint rate. Valid values are 1 through 1,000.
+    #[dynamic(default = "default_max_fps", validate = "validate_max_fps")]
+    pub max_fps: u64,
+
+    /// Repaint-rate limit for a window without keyboard focus; unset uses
+    /// `max_fps`, and a value above `max_fps` is capped at it. Honored on
+    /// macOS. Unfocused windows keep updating, just less often. Translucent
+    /// windows stacked on one another all count as visible to the OS, so
+    /// without this each one repaints at `max_fps` while the pane it shows
+    /// animates, even when no one can see it.
+    #[dynamic(default, validate = "validate_unfocused_max_fps")]
+    pub unfocused_max_fps: Option<u64>,
+
+    #[dynamic(default = "default_shape_cache_size")]
+    pub shape_cache_size: usize,
+    #[dynamic(default = "default_line_state_cache_size")]
+    pub line_state_cache_size: usize,
+    #[dynamic(default = "default_line_quad_cache_size")]
+    pub line_quad_cache_size: usize,
+    #[dynamic(default = "default_line_to_ele_shape_cache_size")]
+    pub line_to_ele_shape_cache_size: usize,
+    #[dynamic(default = "default_glyph_cache_image_cache_size")]
+    pub glyph_cache_image_cache_size: usize,
+    /// Side in pixels of a window's first glyph atlas (ft-yccm0.2.6). It
+    /// grows by doubling within the GPU budget when full; starting large
+    /// avoids the rebuild-and-repaint cascade a small atlas goes through at
+    /// startup with a real font. Rounded up to a power of two.
+    #[dynamic(default = "default_glyph_atlas_initial_size")]
+    pub glyph_atlas_initial_size: usize,
+
+    #[dynamic(default)]
+    pub visual_bell: VisualBell,
+
+    #[dynamic(default)]
+    pub audible_bell: AudibleBell,
+
+    #[dynamic(default)]
+    pub canonicalize_pasted_newlines: Option<NewlineCanon>,
+
+    #[dynamic(default = "default_unicode_version")]
+    pub unicode_version: u8,
+
+    #[dynamic(default)]
+    pub treat_east_asian_ambiguous_width_as_wide: bool,
+
+    #[dynamic(default, validate = "validate_cell_widths")]
+    pub cell_widths: Option<Vec<CellWidth>>,
+
+    #[dynamic(default = "default_true")]
+    pub allow_download_protocols: bool,
+
+    #[dynamic(default = "default_true")]
+    pub allow_win32_input_mode: bool,
+
+    #[dynamic(default)]
+    pub default_domain: Option<String>,
+
+    #[dynamic(default)]
+    pub default_mux_server_domain: Option<String>,
+
+    #[dynamic(default)]
+    pub default_workspace: Option<String>,
+
+    #[dynamic(default)]
+    pub xcursor_theme: Option<String>,
+
+    #[dynamic(default)]
+    pub xcursor_size: Option<u32>,
+
+    #[dynamic(default)]
+    pub key_map_preference: KeyMapPreference,
+
+    #[dynamic(default)]
+    pub quote_dropped_files: DroppedFileQuoting,
+
+    #[dynamic(default)]
+    pub ui_key_cap_rendering: UIKeyCapRendering,
+
+    #[dynamic(default = "default_one")]
+    pub palette_max_key_assigments_for_action: usize,
+
+    #[dynamic(default = "default_ulimit_nofile")]
+    pub ulimit_nofile: u64,
+
+    #[dynamic(default = "default_ulimit_nproc")]
+    pub ulimit_nproc: u64,
+}
+#[cfg(feature = "lua")]
+impl_lua_conversion_dynamic!(Config);
+
+fn default_one() -> usize {
+    1
+}
+
+fn default_ulimit_nofile() -> u64 {
+    2048
+}
+
+fn default_ulimit_nproc() -> u64 {
+    2048
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // Ask FromDynamic to provide the defaults based on the attributes
+        // specified in the struct so that we don't have to repeat
+        // the same thing in a different form down here
+        Config::from_dynamic(
+            &frankenterm_dynamic::Value::Object(Default::default()),
+            Default::default(),
+        )
+        .expect("Config default deserialization must succeed; check that all fields have defaults")
+    }
+}
+
+impl Config {
+    /// Whether the window draws only opaque pixels: it is not translucent,
+    /// and it has no background layers or its bottom layer fills the window
+    /// with opaque color, which everything else is drawn over. Decided from
+    /// the configuration, not the loaded layers, which arrive after the first
+    /// frames; until a layer loads the window paints its opaque terminal
+    /// background. The legacy `window_background_image` and
+    /// `window_background_gradient` options are `background` layers by now.
+    pub fn window_content_is_opaque(&self) -> bool {
+        self.window_background_opacity >= 1.0
+            && self
+                .background
+                .first()
+                .is_none_or(BackgroundLayer::fills_window_opaquely)
+    }
+
+    /// The repaint-rate limit for a window, by whether it has keyboard focus.
+    pub fn max_fps_for_focus(&self, focused: bool) -> u64 {
+        match self.unfocused_max_fps {
+            Some(unfocused) if !focused => unfocused.min(self.max_fps),
+            _ => self.max_fps,
+        }
+    }
+
+    pub fn load() -> LoadedConfig {
+        Self::load_with_overrides(&frankenterm_dynamic::Value::default())
+    }
+
+    fn defaults_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        let empty_overrides;
+        let overrides = match overrides {
+            frankenterm_dynamic::Value::Null => {
+                empty_overrides = frankenterm_dynamic::Value::Object(Default::default());
+                &empty_overrides
+            }
+            overrides => overrides,
+        };
+
+        let (config, warnings) =
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+                let cfg = Config::from_dynamic(
+                    overrides,
+                    frankenterm_dynamic::FromDynamicOptions {
+                        unknown_fields: frankenterm_dynamic::UnknownFieldAction::Warn,
+                        deprecated_fields: frankenterm_dynamic::UnknownFieldAction::Warn,
+                    },
+                )
+                .context("Error converting override config to Config struct")?;
+
+                cfg.check_consistency()
+                    .context("check_consistency on override config")?;
+                let _ = cfg.key_bindings();
+
+                Ok(cfg.compute_extra_defaults(None))
+            });
+
+        LoadedConfig {
+            config,
+            file_name: None,
+            lua: None,
+            warnings,
+        }
+    }
+
+    /// It is relatively expensive to parse all the ssh config files,
+    /// so we defer producing the default list until someone explicitly
+    /// asks for it
+    pub fn ssh_domains(&self) -> Vec<SshDomain> {
+        if let Some(domains) = &self.ssh_domains {
+            domains.clone()
+        } else {
+            SshDomain::default_domains()
+        }
+    }
+
+    pub fn wsl_domains(&self) -> Vec<WslDomain> {
+        if let Some(domains) = &self.wsl_domains {
+            domains.clone()
+        } else {
+            WslDomain::default_domains()
+        }
+    }
+
+    pub fn update_ulimit(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use std::convert::TryInto;
+
+            let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
+
+            let ulimit_nofile: rlim_t = self.ulimit_nofile.try_into().with_context(|| {
+                format!(
+                    "ulimit_nofile value {} is out of range for this system",
+                    self.ulimit_nofile
+                )
+            })?;
+
+            if no_file_soft < ulimit_nofile {
+                setrlimit(
+                    Resource::RLIMIT_NOFILE,
+                    ulimit_nofile.min(no_file_hard),
+                    no_file_hard,
+                )
+                .with_context(|| {
+                    format!(
+                        "raise RLIMIT_NOFILE from {no_file_soft} to ulimit_nofile {}",
+                        ulimit_nofile
+                    )
+                })?;
+            }
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use std::convert::TryInto;
+
+            let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
+
+            let ulimit_nproc: rlim_t = self.ulimit_nproc.try_into().with_context(|| {
+                format!(
+                    "ulimit_nproc value {} is out of range for this system",
+                    self.ulimit_nproc
+                )
+            })?;
+
+            if nproc_soft < ulimit_nproc {
+                setrlimit(
+                    Resource::RLIMIT_NPROC,
+                    ulimit_nproc.min(nproc_hard),
+                    nproc_hard,
+                )
+                .with_context(|| {
+                    format!(
+                        "raise RLIMIT_NPROC from {nproc_soft} to ulimit_nproc {}",
+                        ulimit_nproc
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "lua"))]
+    pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        // Without Lua, try TOML config first, then fall back to defaults
+        if let Some(loaded) = crate::toml_config::try_load_toml_config(overrides) {
+            return loaded;
+        }
+        Self::defaults_with_overrides(overrides)
+    }
+
+    #[cfg(feature = "lua")]
+    pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        // Try TOML config first — frankenterm.toml doesn't require Lua and
+        // takes precedence when present. If no TOML config is found, fall
+        // through to the Lua config search.
+        if let Some(loaded) = crate::toml_config::try_load_toml_config(overrides) {
+            return loaded;
+        }
+
+        // An explicit --config-file already selects its configuration format;
+        // non-TOML paths above deliberately fall through to this loader.
+        // Implicit Lua discovery still requires FRANKENTERM_LUA_CONFIG=1.
+        let lua_enabled = config_file_override_snapshot().is_some()
+            || std::env::var("FRANKENTERM_LUA_CONFIG")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        if !lua_enabled {
+            log::info!(
+                "No frankenterm.toml found; Lua config disabled (set FRANKENTERM_LUA_CONFIG=1 to enable)"
+            );
+            return Self::defaults_with_overrides(overrides);
+        }
+
+        // Note that the directories crate has methods for locating project
+        // specific config directories, but only returns one of them, not
+        // multiple.  In addition, it spawns a lot of subprocesses,
+        // so we do this bit "by-hand"
+
+        // Priority order (first match wins):
+        //   1. ~/.frankenterm.lua              — explicit FrankenTerm-only top-level config
+        //   2. dir/frankenterm.lua  ∀ dir       — per-config-dir FrankenTerm-named config
+        //   3. ~/.wezterm.lua                  — back-compat with users sharing config
+        //   4. dir/wezterm.lua      ∀ dir       — back-compat
+        // `CONFIG_DIRS` itself lists FrankenTerm-namespaced dirs first
+        // (~/.config/frankenterm/) and the wezterm-namespaced dirs after, so
+        // a FrankenTerm-namespaced `wezterm.lua` still beats a wezterm-namespaced
+        // one if a user prefers the wezterm filename inside the FrankenTerm dir.
+        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".frankenterm.lua"))];
+        for dir in CONFIG_DIRS.iter() {
+            paths.push(PathPossibility::optional(dir.join("frankenterm.lua")));
+        }
+        paths.push(PathPossibility::optional(HOME_DIR.join(".wezterm.lua")));
+        for dir in CONFIG_DIRS.iter() {
+            paths.push(PathPossibility::optional(dir.join("wezterm.lua")));
+        }
+
+        // Last-resort fallback: bundled default config that ships inside the
+        // FrankenTerm.app on macOS (Contents/Resources/{frankenterm,wezterm}.lua).
+        // Lets a freshly-installed app launch with sensible defaults — fonts,
+        // ssh-domain remotes, keybindings, host-aware colors — without the user
+        // having to author a config first. User configs above still win.
+        #[cfg(target_os = "macos")]
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
+                    if let Some(contents_dir) = exe_dir.parent() {
+                        let resources = contents_dir.join("Resources");
+                        paths.push(PathPossibility::optional(resources.join("frankenterm.lua")));
+                        paths.push(PathPossibility::optional(resources.join("wezterm.lua")));
+                    }
+                }
+            }
+        }
+
+        if cfg!(windows) {
+            // On Windows, a common use case is to maintain a thumb drive
+            // with a set of portable tools that don't need to be installed
+            // to run on a target system.  In that scenario, the user would
+            // like to run with the config from their thumbdrive because
+            // either the target system won't have any config, or will have
+            // the config of another user.
+            // So we prioritize that here: if there is a config in the same
+            // dir as the executable that will take precedence. The
+            // FrankenTerm-namespaced filename `frankenterm.lua` is inserted
+            // LAST so it ends up at index 0 (winning over wezterm.lua if
+            // both happen to exist alongside the binary).
+            if let Ok(exe_name) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_name.parent() {
+                    paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
+                    paths.insert(
+                        0,
+                        PathPossibility::optional(exe_dir.join("frankenterm.lua")),
+                    );
+                }
+            }
+        }
+        // Env-var override. Both insertions go to index 0, so the LAST one
+        // inserted ends up at the front — we want
+        // `FRANKENTERM_CONFIG_FILE` to win when both are set, so it's
+        // inserted second.
+        if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
+            log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
+            paths.insert(0, PathPossibility::required(path.into()));
+        }
+        if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
+            log::trace!("Note: FRANKENTERM_CONFIG_FILE is set in the environment");
+            paths.insert(0, PathPossibility::required(path.into()));
+        }
+
+        if let Some(path) = config_file_override_snapshot().as_ref() {
+            log::trace!("Note: config file override is set");
+            paths.insert(0, PathPossibility::required(path.clone()));
+        }
+
+        for path_item in &paths {
+            if CONFIG_SKIP.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match Self::try_load(path_item, overrides) {
+                Err(err) => {
+                    return LoadedConfig {
+                        config: Err(err),
+                        file_name: Some(path_item.path.clone()),
+                        lua: None,
+                        warnings: vec![],
+                    };
+                }
+                Ok(None) => continue,
+                Ok(Some(loaded)) => return loaded,
+            }
+        }
+
+        // We didn't find (or were asked to skip) a wezterm.lua file, so
+        // update the environment to make it simpler to understand this
+        // state.
+        std::env::remove_var("WEZTERM_CONFIG_FILE");
+        std::env::remove_var("WEZTERM_CONFIG_DIR");
+
+        match Self::try_default() {
+            Err(err) => LoadedConfig {
+                config: Err(err),
+                file_name: None,
+                lua: None,
+                warnings: vec![],
+            },
+            Ok(cfg) => cfg,
+        }
+    }
+
+    #[cfg(not(feature = "lua"))]
+    pub fn try_default() -> anyhow::Result<LoadedConfig> {
+        Ok(LoadedConfig {
+            config: Ok(Self::default_config()),
+            file_name: None,
+            lua: None,
+            warnings: vec![],
+        })
+    }
+
+    #[cfg(feature = "lua")]
+    pub fn try_default() -> anyhow::Result<LoadedConfig> {
+        let (config, warnings) =
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+                Ok(default_config_with_overrides_applied()?.compute_extra_defaults(None))
+            });
+
+        Ok(LoadedConfig {
+            config: Ok(config?),
+            file_name: None,
+            lua: Some(make_lua_context(Path::new(""))?),
+            warnings,
+        })
+    }
+
+    #[cfg(feature = "lua")]
+    fn try_load(
+        path_item: &PathPossibility,
+        overrides: &frankenterm_dynamic::Value,
+    ) -> anyhow::Result<Option<LoadedConfig>> {
+        let p = path_item.path.as_path();
+        log::trace!("consider config: {}", p.display());
+        let mut file = match std::fs::File::open(p) {
+            Ok(file) => file,
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::NotFound if !path_item.is_required => return Ok(None),
+                _ => anyhow::bail!("Error opening {}: {}", p.display(), err),
+            },
+        };
+
+        let mut s = String::new();
+        file.read_to_string(&mut s)?;
+        let lua = make_lua_context(p)?;
+
+        let (config, warnings) =
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+                let cfg: Config;
+
+                // Config evaluation is synchronous CPU-bound Lua: it builds a
+                // config table and returns it. Use the synchronous `eval()`
+                // rather than `block_on(eval_async())`. The latter calls
+                // `promise::spawn::block_on`, whose main-thread-dispatch guard
+                // panics when config is (re)loaded on the GUI main thread
+                // (e.g. TermWindow::config_was_reloaded). Upstream relied on
+                // the prior runtime's block_on tolerating that; the
+                // asupersync-era block_on does not. Sync eval avoids the
+                // runtime entirely.
+                //
+                // Skip a potential BOM that Windows software may have placed in
+                // the file. Note that we can't catch this happening for files
+                // that are imported via the lua require function.
+                let config: mlua::Value = lua
+                    .load(s.trim_start_matches('\u{FEFF}'))
+                    .set_name(p.to_string_lossy())
+                    .eval()?;
+                let config = Config::apply_overrides_to(&lua, config)?;
+                let config = Config::apply_overrides_obj_to(&lua, config, overrides)?;
+                cfg = Config::from_lua(config, &lua).with_context(|| {
+                    format!(
+                        "Error converting lua value returned by script {} to Config struct",
+                        p.display()
+                    )
+                })?;
+                cfg.check_consistency()?;
+
+                // Compute but discard the key bindings here so that we raise any
+                // problems earlier than we use them.
+                let _ = cfg.key_bindings();
+
+                std::env::set_var("WEZTERM_CONFIG_FILE", p);
+                if let Some(dir) = p.parent() {
+                    std::env::set_var("WEZTERM_CONFIG_DIR", dir);
+                }
+                Ok(cfg)
+            });
+        let cfg = config?;
+
+        Ok(Some(LoadedConfig {
+            config: Ok(cfg.compute_extra_defaults(Some(p))),
+            file_name: Some(p.to_path_buf()),
+            lua: Some(lua),
+            warnings,
+        }))
+    }
+
+    #[cfg(feature = "lua")]
+    pub(crate) fn apply_overrides_obj_to(
+        lua: &mlua::Lua,
+        mut config: mlua::Value,
+        overrides: &frankenterm_dynamic::Value,
+    ) -> anyhow::Result<mlua::Value> {
+        // config may be a table, or it may be a config builder.
+        // We'll leave it up to lua to call the appropriate
+        // index function as managing that from Rust is a PITA.
+        let setter: mlua::Function = lua
+            .load(
+                r#"
+                    return function(config, key, value)
+                        config[key] = value;
+                        return config;
+                    end
+                    "#,
+            )
+            .eval()?;
+
+        match overrides {
+            frankenterm_dynamic::Value::Object(obj) => {
+                for (key, value) in obj {
+                    let key = luahelper::dynamic_to_lua_value(lua, key.clone())?;
+                    let value = luahelper::dynamic_to_lua_value(lua, value.clone())?;
+                    config = setter.call((config, key, value))?;
+                }
+                Ok(config)
+            }
+            _ => Ok(config),
+        }
+    }
+
+    #[cfg(feature = "lua")]
+    pub(crate) fn apply_overrides_to(
+        lua: &mlua::Lua,
+        mut config: mlua::Value,
+    ) -> anyhow::Result<mlua::Value> {
+        let overrides = config_overrides_snapshot();
+        for (key, value) in &overrides {
+            if value == "nil" {
+                // Literal nil as the value is the same as not specifying the value.
+                // We special case this here as we want to explicitly check for
+                // the value evaluating as nil, as can happen in the case where the
+                // user specifies something like: `--config term=xterm`.
+                // The RHS references a global that doesn't exist and evaluates as
+                // nil. We want to raise this as an error.
+                continue;
+            }
+            let literal = value.escape_debug();
+            let code = format!(
+                r#"
+                local wezterm = require 'wezterm';
+                local value = {value};
+                if value == nil then
+                    error("{literal} evaluated as nil. Check for missing quotes or other syntax issues")
+                end
+                config.{key} = value;
+                return config;
+                "#,
+            );
+            let chunk = lua.load(&code);
+            let chunk = chunk.set_name(format!("--config {}={}", key, value));
+            lua.globals().set("config", config.clone())?;
+            log::debug!("Apply {}={} to config", key, value);
+            config = chunk.eval()?;
+        }
+        Ok(config)
+    }
+
+    /// Check for logical conflicts in the config
+    pub fn check_consistency(&self) -> anyhow::Result<()> {
+        self.check_domain_consistency()?;
+        self.check_client_reconnect_consistency()?;
+        Ok(())
+    }
+
+    fn check_client_reconnect_consistency(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.client_reconnect_base_interval_ms > 0,
+            "client_reconnect_base_interval_ms must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.client_reconnect_max_interval_ms >= self.client_reconnect_base_interval_ms,
+            "client_reconnect_max_interval_ms must be greater than or equal to client_reconnect_base_interval_ms"
+        );
+        anyhow::ensure!(
+            self.client_reconnect_healthy_session_ms > 0,
+            "client_reconnect_healthy_session_ms must be greater than zero"
+        );
+        Ok(())
+    }
+
+    fn check_domain_consistency(&self) -> anyhow::Result<()> {
+        let mut domains = HashMap::new();
+
+        let mut check_domain = |name: &str, kind: &str| {
+            if let Some(exists) = domains.get(name) {
+                anyhow::bail!(
+                    "{kind} with name \"{name}\" conflicts with \
+                     another existing {exists} with the same name"
+                );
+            }
+            domains.insert(name.to_string(), kind.to_string());
+            Ok(())
+        };
+
+        for d in &self.unix_domains {
+            check_domain(&d.name, "unix domain")?;
+        }
+        if let Some(domains) = &self.ssh_domains {
+            for d in domains {
+                check_domain(&d.name, "ssh domain")?;
+            }
+        }
+        for d in &self.exec_domains {
+            check_domain(&d.name, "exec domain")?;
+        }
+        if let Some(domains) = &self.wsl_domains {
+            for d in domains {
+                check_domain(&d.name, "wsl domain")?;
+            }
+        }
+        for d in &self.tls_clients {
+            check_domain(&d.name, "tls domain")?;
+        }
+        Ok(())
+    }
+
+    pub fn default_config() -> Self {
+        Self::default().compute_extra_defaults(None)
+    }
+
+    pub fn key_bindings(&self) -> KeyTables {
+        let mut tables = KeyTables::default();
+
+        for k in &self.keys {
+            let (key, mods) = k
+                .key
+                .key
+                .resolve(self.key_map_preference)
+                .normalize_shift(k.key.mods);
+            tables.default.insert(
+                (key, mods),
+                KeyTableEntry {
+                    action: k.action.clone(),
+                },
+            );
+        }
+
+        for (name, keys) in &self.key_tables {
+            let mut table = KeyTable::default();
+            for k in keys {
+                let (key, mods) = k
+                    .key
+                    .key
+                    .resolve(self.key_map_preference)
+                    .normalize_shift(k.key.mods);
+                table.insert(
+                    (key, mods),
+                    KeyTableEntry {
+                        action: k.action.clone(),
+                    },
+                );
+            }
+            tables.by_name.insert(name.to_string(), table);
+        }
+
+        tables
+    }
+
+    pub fn mouse_bindings(
+        &self,
+    ) -> HashMap<(MouseEventTrigger, MouseEventTriggerMods), KeyAssignment> {
+        let mut map = HashMap::new();
+
+        for m in &self.mouse_bindings {
+            map.insert((m.event.clone(), m.mods), m.action.clone());
+        }
+
+        map
+    }
+
+    /// In some cases we need to compute expanded values based
+    /// on those provided by the user.  This is where we do that.
+    pub fn compute_extra_defaults(&self, config_path: Option<&Path>) -> Self {
+        let mut cfg = self.clone();
+
+        // Convert any relative font dirs to their config file relative locations
+        if let Some(config_dir) = config_path.as_ref().and_then(|p| p.parent()) {
+            for font_dir in &mut cfg.font_dirs {
+                if !font_dir.is_absolute() {
+                    let dir = config_dir.join(&font_dir);
+                    *font_dir = dir;
+                }
+            }
+
+            if let Some(path) = &self.window_background_image {
+                if !path.is_absolute() {
+                    cfg.window_background_image.replace(config_dir.join(path));
+                }
+            }
+        }
+
+        prepend_bundled_app_font_dirs(&mut cfg.font_dirs);
+
+        // Add some reasonable default font rules
+        let reduced = self.font.reduce_first_font_to_family();
+
+        let italic = reduced.make_italic();
+
+        let bold = reduced.make_bold();
+        let bold_italic = bold.make_italic();
+
+        let half_bright = reduced.make_half_bright();
+        let half_bright_italic = half_bright.make_italic();
+
+        cfg.font_rules.push(StyleRule {
+            italic: Some(true),
+            intensity: Some(frankenterm_term::Intensity::Half),
+            font: half_bright_italic,
+            ..Default::default()
+        });
+
+        cfg.font_rules.push(StyleRule {
+            italic: Some(false),
+            intensity: Some(frankenterm_term::Intensity::Half),
+            font: half_bright,
+            ..Default::default()
+        });
+
+        cfg.font_rules.push(StyleRule {
+            italic: Some(false),
+            intensity: Some(frankenterm_term::Intensity::Bold),
+            font: bold,
+            ..Default::default()
+        });
+
+        cfg.font_rules.push(StyleRule {
+            italic: Some(true),
+            intensity: Some(frankenterm_term::Intensity::Bold),
+            font: bold_italic,
+            ..Default::default()
+        });
+
+        cfg.font_rules.push(StyleRule {
+            italic: Some(true),
+            intensity: Some(frankenterm_term::Intensity::Normal),
+            font: italic,
+            ..Default::default()
+        });
+
+        // Load any additional color schemes into the color_schemes map
+        cfg.load_color_schemes(&cfg.compute_color_scheme_dirs())
+            .ok();
+
+        if let Some(scheme) = cfg.color_scheme.as_ref() {
+            match cfg.resolve_color_scheme() {
+                None => {
+                    log::error!(
+                        "Your configuration specifies color_scheme=\"{}\" \
+                        but that scheme was not found",
+                        scheme
+                    );
+                }
+                Some(p) => {
+                    cfg.resolved_palette = p.clone();
+                }
+            }
+        }
+
+        if let Some(colors) = &cfg.colors {
+            cfg.resolved_palette = cfg.resolved_palette.overlay_with(colors);
+        }
+
+        if let Some(bg) = BackgroundLayer::with_legacy(self) {
+            cfg.background.insert(0, bg);
+        }
+
+        cfg
+    }
+
+    fn compute_color_scheme_dirs(&self) -> Vec<PathBuf> {
+        let mut paths = self.color_scheme_dirs.clone();
+        for dir in CONFIG_DIRS.iter() {
+            paths.push(dir.join("colors"));
+        }
+        if cfg!(windows) {
+            // See commentary re: portable tools above!
+            if let Ok(exe_name) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_name.parent() {
+                    paths.insert(0, exe_dir.join("colors"));
+                }
+            }
+        }
+        paths
+    }
+
+    fn load_color_schemes(&mut self, paths: &[PathBuf]) -> anyhow::Result<()> {
+        fn extract_scheme_name(name: &str) -> Option<&str> {
+            if name.ends_with(".toml") {
+                let len = name.len();
+                Some(&name[..len - 5])
+            } else {
+                None
+            }
+        }
+
+        fn load_scheme(path: &Path) -> anyhow::Result<ColorSchemeFile> {
+            let s = std::fs::read_to_string(path)?;
+            ColorSchemeFile::from_toml_str(&s).context("parsing TOML")
+        }
+
+        for colors_dir in paths {
+            if let Ok(dir) = std::fs::read_dir(colors_dir) {
+                for entry in dir {
+                    if let Ok(entry) = entry {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if let Some(scheme_name) = extract_scheme_name(name) {
+                                if self.color_schemes.contains_key(scheme_name) {
+                                    // This scheme has already been defined
+                                    continue;
+                                }
+
+                                let path = entry.path();
+                                match load_scheme(&path) {
+                                    Ok(scheme) => {
+                                        let name = scheme
+                                            .metadata
+                                            .name
+                                            .unwrap_or_else(|| scheme_name.to_string());
+                                        log::trace!(
+                                            "Loaded color scheme `{}` from {}",
+                                            name,
+                                            path.display()
+                                        );
+                                        self.color_schemes.insert(name, scheme.colors);
+                                    }
+                                    Err(err) => {
+                                        log::error!(
+                                            "Color scheme in `{}` failed to load: {:#}",
+                                            path.display(),
+                                            err
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn resolve_color_scheme(&self) -> Option<&Palette> {
+        let scheme_name = self.color_scheme.as_ref()?;
+
+        if let Some(palette) = self.color_schemes.get(scheme_name) {
+            Some(palette)
+        } else {
+            crate::COLOR_SCHEMES.get(scheme_name)
+        }
+    }
+
+    pub fn initial_size(&self, dpi: u32, cell_pixel_dims: Option<(usize, usize)>) -> TerminalSize {
+        // If we aren't passed the actual values, guess at a plausible
+        // default set of pixel dimensions.
+        // This is based on "typical" 10 point font at "normal"
+        // pixel density.
+        // This will get filled in by the gui layer, but there is
+        // an edge case where we emit an iTerm image escape in
+        // the software update banner through the mux layer before
+        // the GUI has had a chance to update the pixel dimensions
+        // when running under X11.
+        // This is a bit gross.
+        let (cell_pixel_width, cell_pixel_height) = cell_pixel_dims.unwrap_or((8, 16));
+
+        TerminalSize {
+            rows: self.initial_rows as usize,
+            cols: self.initial_cols as usize,
+            pixel_width: cell_pixel_width * self.initial_cols as usize,
+            pixel_height: cell_pixel_height * self.initial_rows as usize,
+            dpi,
+        }
+    }
+
+    pub fn build_prog(
+        &self,
+        prog: Option<Vec<&OsStr>>,
+        default_prog: Option<&Vec<String>>,
+        default_cwd: Option<&PathBuf>,
+    ) -> anyhow::Result<CommandBuilder> {
+        let mut cmd = match prog {
+            Some(args) => {
+                let mut args = args.iter();
+                let mut cmd = CommandBuilder::new(args.next().expect("executable name"));
+                cmd.args(args);
+                cmd
+            }
+            None => {
+                if let Some(prog) = default_prog {
+                    let mut args = prog.iter();
+                    let mut cmd = CommandBuilder::new(args.next().expect("executable name"));
+                    cmd.args(args);
+                    cmd
+                } else {
+                    CommandBuilder::new_default_prog()
+                }
+            }
+        };
+
+        self.apply_cmd_defaults(&mut cmd, None, default_cwd);
+
+        Ok(cmd)
+    }
+
+    pub fn apply_cmd_defaults(
+        &self,
+        cmd: &mut CommandBuilder,
+        default_prog: Option<&Vec<String>>,
+        default_cwd: Option<&PathBuf>,
+    ) {
+        // Apply `default_cwd` only if `cwd` is not already set, allows `--cwd`
+        // option to take precedence
+        if let (None, Some(cwd)) = (cmd.get_cwd(), default_cwd) {
+            cmd.cwd(cwd);
+        }
+
+        if let Some(default_prog) = default_prog {
+            if cmd.is_default_prog() {
+                cmd.replace_default_prog(default_prog);
+            }
+        }
+
+        // Augment WSLENV so that TERM related environment propagates
+        // across the win32/wsl boundary
+        let mut wsl_env = std::env::var("WSLENV").ok();
+
+        // If we are running as an appimage, we will have "$APPIMAGE"
+        // and "$APPDIR" set in the wezterm process. These will be
+        // propagated to the child processes. Since some apps (including
+        // wezterm) use these variables to detect if they are running in
+        // an appimage, those child processes will be misconfigured.
+        // Ensure that they are unset.
+        // https://docs.appimage.org/packaging-guide/environment-variables.html#id2
+        cmd.env_remove("APPIMAGE");
+        cmd.env_remove("APPDIR");
+        cmd.env_remove("OWD");
+
+        for (k, v) in &self.set_environment_variables {
+            if k == "WSLENV" {
+                wsl_env.replace(v.clone());
+            } else {
+                cmd.env(k, v);
+            }
+        }
+
+        if wsl_env.is_some() || cfg!(windows) || crate::version::running_under_wsl() {
+            let mut wsl_env = wsl_env.unwrap_or_default();
+            if !wsl_env.is_empty() {
+                wsl_env.push(':');
+            }
+            wsl_env.push_str("TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION");
+            cmd.env("WSLENV", wsl_env);
+        }
+
+        #[cfg(unix)]
+        cmd.umask(umask::UmaskSaver::saved_umask());
+        cmd.env("TERM", &self.term);
+        cmd.env("COLORTERM", "truecolor");
+        // TERM_PROGRAM and TERM_PROGRAM_VERSION are an emerging
+        // de-facto standard for identifying the terminal.
+        cmd.env("TERM_PROGRAM", "WezTerm");
+        cmd.env("TERM_PROGRAM_VERSION", crate::wezterm_version());
+    }
+}
+
+fn default_check_for_updates() -> bool {
+    cfg!(not(feature = "distro-defaults"))
+}
+
+fn default_pane_select_fg_color() -> RgbaColor {
+    SrgbaTuple(0.75, 0.75, 0.75, 1.0).into()
+}
+
+fn default_pane_select_bg_color() -> RgbaColor {
+    SrgbaTuple(0., 0., 0., 0.5).into()
+}
+
+fn default_pane_select_font_size() -> f64 {
+    36.0
+}
+
+fn default_integrated_title_buttons() -> Vec<IntegratedTitleButton> {
+    use IntegratedTitleButton::*;
+    vec![Hide, Maximize, Close]
+}
+
+fn default_char_select_font_size() -> f64 {
+    18.0
+}
+
+fn default_char_select_fg_color() -> RgbaColor {
+    SrgbaTuple(0.75, 0.75, 0.75, 1.0).into()
+}
+
+fn default_char_select_bg_color() -> RgbaColor {
+    (0x33, 0x33, 0x33).into()
+}
+
+fn default_command_palette_font_size() -> f64 {
+    14.0
+}
+
+fn default_command_palette_fg_color() -> RgbaColor {
+    SrgbaTuple(0.75, 0.75, 0.75, 1.0).into()
+}
+
+fn default_command_palette_bg_color() -> RgbaColor {
+    (0x33, 0x33, 0x33).into()
+}
+
+fn default_swallow_mouse_click_on_window_focus() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn default_mux_output_parser_coalesce_delay_ms() -> u64 {
+    3
+}
+
+fn default_mux_output_parser_buffer_size() -> usize {
+    128 * 1024
+}
+
+fn default_gui_retained_pane_state_limit() -> usize {
+    4096
+}
+
+fn validate_gui_retained_pane_state_limit(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("gui_retained_pane_state_limit must be non-zero".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_mux_output_parser_buffer_size(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("mux_output_parser_buffer_size must be non-zero".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn default_mux_socket_buffer_size() -> usize {
+    1024 * 1024
+}
+
+pub const MUX_OUTPUT_RING_SLOTS_RANGE: std::ops::RangeInclusive<usize> = 2..=1024;
+pub const MUX_OUTPUT_RING_SLOT_BYTES_RANGE: std::ops::RangeInclusive<usize> =
+    4 * 1024..=16 * 1024 * 1024;
+
+fn default_mux_output_ring_slots() -> usize {
+    8
+}
+
+fn default_mux_output_ring_slot_bytes() -> usize {
+    64 * 1024
+}
+
+fn validate_mux_output_ring_slots(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOTS_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slots must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOTS_RANGE.start(),
+            MUX_OUTPUT_RING_SLOTS_RANGE.end(),
+            value
+        ))
+    }
+}
+
+pub const MUX_OUTPUT_GATHER_MIN_BYTES_RANGE: std::ops::RangeInclusive<usize> = 0..=1024 * 1024;
+pub const MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE: std::ops::RangeInclusive<u32> = 0..=1024;
+pub const MUX_OUTPUT_GATHER_POLL_US_RANGE: std::ops::RangeInclusive<u64> = 1..=100_000;
+pub const MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE: std::ops::RangeInclusive<u64> = 0..=100_000;
+
+fn default_mux_output_gather_min_bytes() -> usize {
+    1024
+}
+
+fn default_mux_output_gather_spin_checks() -> u32 {
+    16
+}
+
+fn default_mux_output_gather_poll_us() -> u64 {
+    1000
+}
+
+fn default_mux_output_gather_max_wait_us() -> u64 {
+    3000
+}
+
+fn validate_in_range<T: PartialOrd + std::fmt::Display>(
+    key: &str,
+    value: &T,
+    range: &std::ops::RangeInclusive<T>,
+) -> Result<(), String> {
+    if range.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} must be in {}..={}, got {}",
+            key,
+            range.start(),
+            range.end(),
+            value
+        ))
+    }
+}
+
+fn validate_mux_output_gather_min_bytes(value: &usize) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_min_bytes",
+        value,
+        &MUX_OUTPUT_GATHER_MIN_BYTES_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_spin_checks(value: &u32) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_spin_checks",
+        value,
+        &MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_poll_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_poll_us",
+        value,
+        &MUX_OUTPUT_GATHER_POLL_US_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_max_wait_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_max_wait_us",
+        value,
+        &MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE,
+    )
+}
+
+fn validate_mux_output_ring_slot_bytes(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOT_BYTES_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slot_bytes must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.start(),
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.end(),
+            value
+        ))
+    }
+}
+
+fn default_osc52_write_policy() -> frankenterm_term::config::Osc52WritePolicy {
+    frankenterm_term::config::Osc52WritePolicy::Prompt
+}
+
+fn default_osc52_write_max_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_mux_max_synchronized_output_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_mux_tmux_max_backlog_bytes_per_pane() -> usize {
+    1_048_576
+}
+
+fn default_mux_tmux_max_backlog_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_mux_tmux_max_backlog_entries() -> usize {
+    1024
+}
+
+fn default_mux_tmux_max_backlog_items() -> usize {
+    16_384
+}
+
+fn default_mux_tmux_backlog_expiry_ms() -> u64 {
+    30_000
+}
+
+fn default_mux_tmux_max_output_queue_items_per_pane() -> usize {
+    1024
+}
+
+fn default_mux_tmux_output_write_quantum_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_mux_tmux_io_start_timeout_ms() -> u64 {
+    500
+}
+
+fn default_mux_tmux_io_write_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_mux_tmux_response_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_ssh_initial_poll_delay_ms() -> u64 {
+    100
+}
+
+fn default_ssh_max_poll_delay_ms() -> u64 {
+    2000
+}
+
+fn default_client_reconnect_base_interval_ms() -> u64 {
+    1000
+}
+
+fn default_client_reconnect_max_interval_ms() -> u64 {
+    10000
+}
+
+fn default_client_reconnect_max_attempts() -> u32 {
+    0
+}
+
+fn default_client_reconnect_healthy_session_ms() -> u64 {
+    30_000
+}
+
+fn default_render_base_poll_interval_ms() -> u64 {
+    20
+}
+
+fn default_render_max_poll_interval_ms() -> u64 {
+    30000
+}
+
+fn default_connui_poll_timeout_ms() -> u64 {
+    200
+}
+
+fn default_ssh_terminal_poll_timeout_ms() -> u64 {
+    200
+}
+
+fn default_min_floating_pane_width() -> usize {
+    5
+}
+
+fn default_min_floating_pane_height() -> usize {
+    3
+}
+
+fn default_max_user_vars() -> usize {
+    512
+}
+
+fn default_max_unicode_version_stack_depth() -> usize {
+    64
+}
+
+fn default_max_accumulating_title_len() -> usize {
+    8192
+}
+
+fn default_max_color_map_entries() -> usize {
+    4096
+}
+
+fn default_ratelimit_line_prefetches_per_second() -> u32 {
+    50
+}
+
+fn default_cursor_blink_rate() -> u64 {
+    800
+}
+
+fn default_text_blink_rate() -> u64 {
+    500
+}
+
+fn default_text_blink_rate_rapid() -> u64 {
+    250
+}
+
+fn default_swap_backspace_and_delete() -> bool {
+    // cfg!(target_os = "macos")
+    // See: https://github.com/wezterm/wezterm/issues/88
+    false
+}
+
+fn default_scrollback_lines() -> usize {
+    3500
+}
+
+fn default_scrollback_tiered_enabled() -> bool {
+    true
+}
+
+fn default_scrollback_hot_lines() -> usize {
+    1000
+}
+
+fn default_scrollback_warm_max_mb() -> usize {
+    50
+}
+
+fn default_scrollback_durability_queue_max_mb() -> usize {
+    64
+}
+
+/// Longest durability commit window or idle threshold, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS: u64 = 5_000;
+/// Largest durability commit window, in MiB.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB: usize = 256;
+
+fn default_scrollback_durability_commit_window_ms() -> u64 {
+    250
+}
+
+fn default_scrollback_durability_commit_window_mb() -> usize {
+    8
+}
+
+fn default_scrollback_durability_commit_idle_ms() -> u64 {
+    25
+}
+
+fn validate_scrollback_durability_commit_window_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "durability commit times must be in 0..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS} ms, got {value}"
+        ))
+    }
+}
+
+/// Longest interval between manifest publications, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS: u64 = 60_000;
+
+fn default_scrollback_durability_manifest_publish_ms() -> u64 {
+    1_000
+}
+
+fn validate_scrollback_durability_manifest_publish_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_manifest_publish_ms must be in 0..={MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS}, got {value}"
+        ))
+    }
+}
+
+fn validate_scrollback_durability_commit_window_mb(value: &usize) -> Result<(), String> {
+    if (1..=MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB).contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_commit_window_mb must be in 1..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB}, got {value}"
+        ))
+    }
+}
+
+fn default_agent_active_threshold_ms() -> u64 {
+    5_000
+}
+
+fn default_agent_thinking_threshold_ms() -> u64 {
+    5_000
+}
+
+fn default_agent_stuck_threshold_ms() -> u64 {
+    30_000
+}
+
+fn default_agent_idle_threshold_ms() -> u64 {
+    60_000
+}
+
+fn default_agent_border_width() -> u32 {
+    2
+}
+
+fn default_agent_auto_layout() -> String {
+    "by_status".to_string()
+}
+
+fn default_resize_wrap_kp_badness_scale() -> u64 {
+    10_000
+}
+
+fn default_resize_wrap_kp_forced_break_penalty() -> u64 {
+    5_000
+}
+
+fn default_resize_wrap_kp_lookahead_limit() -> usize {
+    64
+}
+
+fn default_resize_wrap_kp_max_dp_states() -> usize {
+    8_192
+}
+
+fn default_resize_wrap_readability_max_line_badness_delta() -> i64 {
+    500
+}
+
+fn default_resize_wrap_readability_max_total_badness_delta() -> i64 {
+    2000
+}
+
+fn default_resize_wrap_readability_max_fallback_ratio_percent() -> u8 {
+    20
+}
+
+const MAX_SCROLLBACK_LINES: usize = 999_999_999;
+fn validate_scrollback_lines(value: &usize) -> Result<(), String> {
+    if *value > MAX_SCROLLBACK_LINES {
+        return Err(format!(
+            "Illegal value {value} for scrollback_lines; it must be <= {MAX_SCROLLBACK_LINES}!"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scrollback_hot_lines(value: &usize) -> Result<(), String> {
+    if *value == 0 || *value > MAX_SCROLLBACK_LINES {
+        return Err(format!(
+            "Illegal value {value} for scrollback_hot_lines; it must be in 1..={MAX_SCROLLBACK_LINES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scrollback_warm_max_mb(value: &usize) -> Result<(), String> {
+    const MAX_SCROLLBACK_WARM_MB: usize = 1024;
+    if *value > MAX_SCROLLBACK_WARM_MB {
+        return Err(format!(
+            "Illegal value {value} for scrollback_warm_max_mb; it must be <= {MAX_SCROLLBACK_WARM_MB}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resize_wrap_kp_lookahead_limit(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("resize_wrap_kp_lookahead_limit must be >= 1".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_percent_0_100(value: &u8) -> Result<(), String> {
+    if *value > 100 {
+        Err(format!("value {value} must be between 0 and 100"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_click_interval_ms(value: &u64) -> Result<(), String> {
+    if *value == 0 {
+        Err("click_interval_ms must be >= 1".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Lowest supported repaint-rate limit.
+pub const MIN_MAX_FPS: u64 = 1;
+
+/// Highest supported repaint-rate limit.
+///
+/// The repaint throttles sleep on the runtime's timer wheel, whose finest
+/// level ticks once per millisecond. Limiting the configured rate to 1,000
+/// keeps their interval at one tick or more rather than turning throttling
+/// into a zero-duration reschedule loop.
+pub const MAX_MAX_FPS: u64 = 1_000;
+
+fn validate_max_fps(value: &u64) -> Result<(), String> {
+    if (MIN_MAX_FPS..=MAX_MAX_FPS).contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "max_fps must be in {MIN_MAX_FPS}..={MAX_MAX_FPS}, got {value}"
+        ))
+    }
+}
+
+/// The smallest `text_gamma`; kitty uses the same floor.
+pub const MIN_TEXT_GAMMA: f32 = 0.01;
+
+fn validate_text_gamma(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(gamma) if !(gamma.is_finite() && *gamma >= MIN_TEXT_GAMMA) => Err(format!(
+            "text_gamma must be a number of at least {MIN_TEXT_GAMMA}, got {gamma}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_contrast(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(contrast) if !(0.0..=100.0).contains(contrast) => Err(format!(
+            "text_contrast must be a percentage from 0 to 100, got {contrast}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_freetype_lcd_filter_weights(value: &Option<Vec<u8>>) -> Result<(), String> {
+    match value {
+        Some(weights) if weights.len() != 5 => Err(format!(
+            "freetype_lcd_filter_weights must list exactly 5 weights, got {}",
+            weights.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_unfocused_max_fps(value: &Option<u64>) -> Result<(), String> {
+    match value {
+        Some(fps) if !(MIN_MAX_FPS..=MAX_MAX_FPS).contains(fps) => Err(format!(
+            "unfocused_max_fps must be in {MIN_MAX_FPS}..={MAX_MAX_FPS}, got {fps}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Convert a configured repaint-rate limit into a nonzero repaint interval.
+///
+/// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
+/// [`MAX_MAX_FPS`]. The clamp is intentional defense in depth for internal
+/// callers that construct or mutate [`Config`] directly.
+///
+/// The interval is exact to the nanosecond, rounded up so that paints spaced
+/// by it never exceed the configured rate: `max_fps = 60` gives 16,666,667 ns.
+/// Rounding up to whole milliseconds instead (17 ms) capped FrankenTerm at
+/// 58.8 FPS on a 60 Hz display, below its own default limit (ft-1w85m).
+#[must_use]
+pub fn frame_interval_for_max_fps(max_fps: u64) -> Duration {
+    let bounded = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
+    Duration::from_nanos(1_000_000_000_u64.div_ceil(bounded))
+}
+
+fn default_initial_rows() -> u16 {
+    24
+}
+
+fn default_initial_cols() -> u16 {
+    80
+}
+
+pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
+    vec![
+        // First handle URLs wrapped with punctuation (i.e. brackets)
+        // e.g. [http://foo] (http://foo) <http://foo>
+        hyperlink::Rule::with_highlight(r"\((\w+://\S+)\)", "$1", 1).unwrap(),
+        hyperlink::Rule::with_highlight(r"\[(\w+://\S+)\]", "$1", 1).unwrap(),
+        hyperlink::Rule::with_highlight(r"<(\w+://\S+)>", "$1", 1).unwrap(),
+        // Then handle URLs not wrapped in brackets that
+        // 1) have a balanced ending parenthesis or
+        hyperlink::Rule::new(hyperlink::CLOSING_PARENTHESIS_HYPERLINK_PATTERN, "$0").unwrap(),
+        // 2) include terminating _, / or - characters, if any
+        hyperlink::Rule::new(hyperlink::GENERIC_HYPERLINK_PATTERN, "$0").unwrap(),
+        // implicit mailto link
+        hyperlink::Rule::new(r"\b\w+@[\w-]+(\.[\w-]+)+\b", "mailto:$0").unwrap(),
+    ]
+}
+
+fn default_harfbuzz_features() -> Vec<String> {
+    ["kern", "liga", "clig"]
+        .iter()
+        .map(|&s| s.to_string())
+        .collect()
+}
+
+fn default_term() -> String {
+    "xterm-256color".into()
+}
+
+fn default_font_size() -> f64 {
+    12.0
+}
+
+fn cache_dir_from_base(cache: Option<PathBuf>, home: &Path) -> PathBuf {
+    cache
+        .map(|cache| cache.join("frankenterm"))
+        .unwrap_or_else(|| home.join(".cache/frankenterm"))
+}
+
+pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(cache_dir_from_base(
+        dirs_next::cache_dir(),
+        crate::HOME_DIR.as_path(),
+    ))
+}
+
+/// How one artifact from FrankenTerm's former shared WezTerm namespace may be
+/// handled during the namespace transition.
+///
+/// `RetainLegacyOnly` is deliberately the fail-safe default. A new artifact
+/// must not be copied merely because it happens to live below the old data
+/// root; it needs an ownership proof and an artifact-specific validator first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyDataArtifactTreatment {
+    /// Decode and validate the old authority, then publish a fresh canonical
+    /// representation under both old/new namespace locks.
+    MigrateValidatedState,
+    /// Start clean in the canonical namespace because the content is derived
+    /// or can be fetched again.
+    RebuildInCanonicalNamespace,
+    /// Leave the old bytes in place and neither copy nor delete them because
+    /// they may belong to a side-by-side WezTerm installation.
+    RetainLegacyOnly,
+}
+
+pub const DATA_ARTIFACT_WINDOW_STATE: &str = "window-state.json";
+pub const DATA_ARTIFACT_DOMAIN_RECONNECT_PRIVATE: &str = "frankenterm-domain-reconnect-private-v1";
+pub const DATA_ARTIFACT_UPDATE_METADATA: &str = "check_update";
+pub const DATA_ARTIFACT_PLUGIN_ROOT: &str = "plugins";
+pub const DATA_ARTIFACT_REPL_HISTORY: &str = "repl-history";
+pub const DATA_ARTIFACT_RECENT_COMMANDS: &str = "recent-commands.json";
+pub const DATA_ARTIFACT_RECENT_EMOJI: &str = "recent-emoji.json";
+
+fn is_domain_reconnect_slot(relative_path: &Path) -> bool {
+    matches!(
+        relative_path.to_str(),
+        Some(
+            "domain-reconnect-manifest.slot-0"
+                | "domain-reconnect-manifest.slot-1"
+                | "domain-reconnect-manifest.slot-2"
+        )
+    )
+}
+
+/// Classify one path relative to the former shared data root.
+///
+/// The two migration-capable families are not bulk-copied. Their owning GUI
+/// modules decode bounded, checksummed state and reconstruct new canonical
+/// authorities transactionally. Everything unknown remains legacy-only.
+#[must_use]
+pub fn legacy_data_artifact_treatment(relative_path: &Path) -> LegacyDataArtifactTreatment {
+    if relative_path == Path::new(DATA_ARTIFACT_WINDOW_STATE)
+        || relative_path == Path::new("window-state.json.shadow")
+        || is_domain_reconnect_slot(relative_path)
+        || relative_path
+            .strip_prefix(DATA_ARTIFACT_DOMAIN_RECONNECT_PRIVATE)
+            .is_ok_and(is_domain_reconnect_slot)
+    {
+        LegacyDataArtifactTreatment::MigrateValidatedState
+    } else if relative_path == Path::new(DATA_ARTIFACT_UPDATE_METADATA) {
+        LegacyDataArtifactTreatment::RebuildInCanonicalNamespace
+    } else {
+        LegacyDataArtifactTreatment::RetainLegacyOnly
+    }
+}
+
+/// Return the former shared WezTerm cache namespace used by FrankenTerm.
+///
+/// Cache entries are deliberately not migrated: they are reproducible,
+/// version-sensitive derivatives and copying them would reintroduce stale
+/// WezTerm identities into the canonical FrankenTerm namespace. The path is
+/// exposed only so diagnostics can prove that legacy cache evidence remains
+/// untouched while [`CACHE_DIR`](crate::CACHE_DIR) starts clean.
+pub fn legacy_cache_dir() -> PathBuf {
+    dirs_next::cache_dir()
+        .map(|cache| cache.join("wezterm"))
+        .unwrap_or_else(|| crate::HOME_DIR.join(".local/share/wezterm"))
+}
+
+pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(data) = dirs_next::data_dir() {
+        return Ok(data.join("frankenterm"));
+    }
+
+    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
+}
+
+/// Return the former shared WezTerm data namespace used by FrankenTerm.
+///
+/// This path is migration input only. New writes must always target
+/// [`DATA_DIR`](crate::DATA_DIR), and migration code must recognize and copy
+/// individual FrankenTerm-owned artifacts without deleting legacy evidence.
+/// [`legacy_data_artifact_treatment`] is the fail-closed artifact inventory;
+/// there is intentionally no whole-directory migration operation.
+pub fn legacy_data_dir() -> PathBuf {
+    dirs_next::data_dir()
+        .map(|data| data.join("wezterm"))
+        .unwrap_or_else(|| crate::HOME_DIR.join(".local/share/wezterm"))
+}
+
+pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
+    if let Some(runtime) = dirs_next::runtime_dir() {
+        return Ok(runtime.join("frankenterm"));
+    }
+
+    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
+}
+
+pub fn pki_dir() -> anyhow::Result<PathBuf> {
+    compute_runtime_dir().map(|d| d.join("pki"))
+}
+
+pub fn default_read_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+pub fn default_write_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+pub fn default_local_echo_threshold_ms() -> Option<u64> {
+    // 20ms: low enough that predictive echo activates on moderate-latency remote
+    // links (~25ms), where it meaningfully hides round-trip latency, but above
+    // typical LAN/local-mux RTT so it stays off where echo is already instant.
+    // (Was 100ms, inherited from upstream -- too conservative for a remote-
+    // multiplexing terminal; the predictor's confidence model + glitchless cue
+    // keep it unobtrusive.) An explicit per-domain value is honored as-is.
+    Some(20)
+}
+
+fn default_bypass_mouse_reporting_modifiers() -> Modifiers {
+    Modifiers::SHIFT
+}
+
+fn default_gui_startup_args() -> Vec<String> {
+    vec!["start".to_string()]
+}
+
+// Coupled with term/src/config.rs:TerminalConfiguration::unicode_version,
+// which says why the default is 14 rather than 9.
+fn default_unicode_version() -> u8 {
+    14
+}
+
+fn default_mux_env_remove() -> Vec<String> {
+    vec![
+        "SSH_AUTH_SOCK".to_string(),
+        "SSH_CLIENT".to_string(),
+        "SSH_CONNECTION".to_string(),
+    ]
+}
+
+fn default_anim_fps() -> u8 {
+    10
+}
+
+fn default_max_fps() -> u64 {
+    60
+}
+
+fn default_stateless_process_list() -> Vec<String> {
+    // FrankenTerm panes often host long-running agent work behind ordinary
+    // shells, so the safe default is to prompt before closing any live pane.
+    Vec::new()
+}
+
+fn prepend_bundled_app_font_dirs(font_dirs: &mut Vec<PathBuf>) {
+    let mut bundled_dirs = bundled_app_font_dirs();
+    bundled_dirs.retain(|dir| !font_dirs.iter().any(|existing| existing == dir));
+
+    for dir in bundled_dirs.into_iter().rev() {
+        font_dirs.insert(0, dir);
+    }
+}
+
+fn bundled_app_font_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(exe_dir) = std::env::var_os("FRANKENTERM_EXECUTABLE_DIR").map(PathBuf::from) {
+        dirs.extend(bundled_app_font_dirs_from_executable_dir(&exe_dir));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.extend(bundled_app_font_dirs_from_executable_dir(exe_dir));
+        }
+    }
+
+    dirs.retain(|dir| dir.is_dir());
+
+    // Canonicalize each directory before deduplicating so logically
+    // equivalent paths that differ only in symlink resolution
+    // (e.g. `FRANKENTERM_EXECUTABLE_DIR` set to an unresolved path while
+    // `current_exe()` reports the resolved path) collapse to a single
+    // entry. `Vec::dedup` only removes consecutive duplicates, so a
+    // non-canonicalizing dedup left order-dependent doubles in the
+    // returned list and we'd then prepend the same directory twice into
+    // `font_dirs`.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    dirs.retain(|dir| {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        seen.insert(key)
+    });
+    dirs
+}
+
+fn bundled_app_font_dirs_from_executable_dir(exe_dir: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut dirs = Vec::new();
+        if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
+            if let Some(contents_dir) = exe_dir.parent() {
+                dirs.push(contents_dir.join("Resources").join("fonts"));
+            }
+        }
+        dirs
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe_dir;
+        Vec::new()
+    }
+}
+
+fn default_status_update_interval() -> u64 {
+    1_000
+}
+
+fn default_alternate_buffer_wheel_scroll_speed() -> u8 {
+    3
+}
+
+fn default_num_alphabet() -> String {
+    // Note: vi motion keys are intentionally excluded from this alphabet
+    "1234567890abcdefghilmnopqrstuvwxyz".to_string()
+}
+
+fn default_alphabet() -> String {
+    "asdfqwerzxcvjklmiuopghtybn".to_string()
+}
+
+fn default_word_boundary() -> String {
+    " \t\n{[}]()\"'`".to_string()
+}
+
+fn default_click_interval_ms() -> u64 {
+    500
+}
+
+fn default_enq_answerback() -> String {
+    "".to_string()
+}
+
+fn default_tab_max_width() -> usize {
+    16
+}
+
+fn default_update_interval() -> u64 {
+    86400
+}
+
+fn default_prefer_egl() -> bool {
+    !cfg!(windows)
+}
+
+fn default_clean_exits() -> Vec<u32> {
+    vec![]
+}
+
+fn default_inactive_pane_hsb() -> HsbTransform {
+    HsbTransform {
+        brightness: 0.8,
+        saturation: 0.9,
+        hue: 1.0,
+    }
+}
+
+#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
+pub enum DefaultCursorStyle {
+    BlinkingBlock,
+    #[default]
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
+impl DefaultCursorStyle {
+    pub fn effective_shape(self, shape: CursorShape) -> CursorShape {
+        match shape {
+            CursorShape::Default => match self {
+                Self::BlinkingBlock => CursorShape::BlinkingBlock,
+                Self::SteadyBlock => CursorShape::SteadyBlock,
+                Self::BlinkingUnderline => CursorShape::BlinkingUnderline,
+                Self::SteadyUnderline => CursorShape::SteadyUnderline,
+                Self::BlinkingBar => CursorShape::BlinkingBar,
+                Self::SteadyBar => CursorShape::SteadyBar,
+            },
+            _ => shape,
+        }
+    }
+}
+
+const fn linear_ease() -> EasingFunction {
+    EasingFunction::Linear
+}
+
+const fn default_one_cell() -> Dimension {
+    Dimension::Cells(1.)
+}
+
+const fn default_half_cell() -> Dimension {
+    Dimension::Cells(0.5)
+}
+
+const fn default_reverse_video_cursor_min_contrast() -> f32 {
+    2.5
+}
+
+#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug)]
+pub struct WindowPadding {
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_one_cell")]
+    pub left: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_half_cell")]
+    pub top: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_one_cell")]
+    pub right: Dimension,
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_half_cell")]
+    pub bottom: Dimension,
+}
+
+impl Default for WindowPadding {
+    fn default() -> Self {
+        Self {
+            left: default_one_cell(),
+            right: default_one_cell(),
+            top: default_half_cell(),
+            bottom: default_half_cell(),
+        }
+    }
+}
+
+#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
+pub struct WindowContentAlignment {
+    pub horizontal: HorizontalWindowContentAlignment,
+    pub vertical: VerticalWindowContentAlignment,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HorizontalWindowContentAlignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerticalWindowContentAlignment {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+#[derive(ToDynamic, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewlineCanon {
+    None,
+    LineFeed,
+    CarriageReturn,
+    CarriageReturnAndLineFeed,
+}
+
+impl NewlineCanon {
+    pub fn variants() -> &'static [&'static str] {
+        &[
+            "None",
+            "LineFeed",
+            "CarriageReturn",
+            "CarriageReturnAndLineFeed",
+        ]
+    }
+}
+
+impl FromDynamic for NewlineCanon {
+    fn from_dynamic(
+        value: &frankenterm_dynamic::Value,
+        _options: frankenterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        match value {
+            frankenterm_dynamic::Value::Bool(true) => Ok(Self::CarriageReturnAndLineFeed),
+            frankenterm_dynamic::Value::Bool(false) => Ok(Self::None),
+            frankenterm_dynamic::Value::String(s) => match s.as_str() {
+                "None" => Ok(Self::None),
+                "LineFeed" => Ok(Self::LineFeed),
+                "CarriageReturn" => Ok(Self::CarriageReturn),
+                "CarriageReturnAndLineFeed" => Ok(Self::CarriageReturnAndLineFeed),
+                _ => Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                    variant_name: s.clone(),
+                    type_name: "NewlineCanon",
+                    possible: Self::variants(),
+                }),
+            },
+            frankenterm_dynamic::Value::Object(place) => {
+                if place.len() == 1 {
+                    let (name, _value) = place.iter().next().unwrap();
+
+                    match name {
+                        frankenterm_dynamic::Value::String(name) => {
+                            Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                                variant_name: name.clone(),
+                                type_name: "NewlineCanon",
+                                possible: Self::variants(),
+                            })
+                        }
+                        _ => Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                            variant_name: name.variant_name().to_string(),
+                            type_name: "NewlineCanon",
+                            possible: Self::variants(),
+                        }),
+                    }
+                } else {
+                    Err(frankenterm_dynamic::Error::IncorrectNumberOfEnumKeys {
+                        type_name: "NewlineCanon",
+                        num_keys: place.len(),
+                    })
+                }
+            }
+            other => Err(frankenterm_dynamic::Error::NoConversion {
+                source_type: other.variant_name().to_string(),
+                dest_type: "NewlineCanon",
+            }),
+        }
+    }
+}
+
+#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
+pub enum WindowCloseConfirmation {
+    #[default]
+    AlwaysPrompt,
+    NeverPrompt,
+    // TODO: something smart where we see whether the
+    // running programs are stateful
+}
+
+#[cfg(feature = "lua")]
+struct PathPossibility {
+    path: PathBuf,
+    is_required: bool,
+}
+#[cfg(feature = "lua")]
+impl PathPossibility {
+    pub fn required(path: PathBuf) -> PathPossibility {
+        PathPossibility {
+            path,
+            is_required: true,
+        }
+    }
+    pub fn optional(path: PathBuf) -> PathPossibility {
+        PathPossibility {
+            path,
+            is_required: false,
+        }
+    }
+}
+
+/// Behavior when the program spawned by wezterm terminates
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExitBehavior {
+    /// Close the associated pane
+    #[default]
+    Close,
+    /// Close the associated pane if the process was successful
+    CloseOnCleanExit,
+    /// Hold the pane until it is explicitly closed
+    Hold,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExitBehaviorMessaging {
+    #[default]
+    Verbose,
+    Brief,
+    Terse,
+    None,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedFileQuoting {
+    /// No quoting is performed, the file name is passed through as-is
+    None,
+    /// Backslash escape only spaces, leaving all other characters as-is
+    SpacesOnly,
+    /// Use POSIX style shell word escaping
+    Posix,
+    /// Use Windows style shell word escaping
+    Windows,
+    /// Always double quote the file name
+    WindowsAlwaysQuoted,
+}
+
+impl Default for DroppedFileQuoting {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::SpacesOnly
+        }
+    }
+}
+
+impl DroppedFileQuoting {
+    pub fn escape(self, s: &str) -> String {
+        match self {
+            Self::None => s.to_string(),
+            Self::SpacesOnly => s.replace(" ", "\\ "),
+            // https://docs.rs/shlex/latest/shlex/fn.quote.html
+            Self::Posix => shlex::try_quote(s)
+                .unwrap_or_else(|_| "".into())
+                .into_owned(),
+            Self::Windows => {
+                let chars_need_quoting = [' ', '\t', '\n', '\x0b', '\"'];
+                if s.chars().any(|c| chars_need_quoting.contains(&c)) {
+                    format!("\"{}\"", s)
+                } else {
+                    s.to_string()
+                }
+            }
+            Self::WindowsAlwaysQuoted => format!("\"{}\"", s),
+        }
+    }
+}
+
+fn default_glyph_cache_image_cache_size() -> usize {
+    256
+}
+
+fn default_glyph_atlas_initial_size() -> usize {
+    1024
+}
+
+fn default_shape_cache_size() -> usize {
+    1024
+}
+
+fn default_line_state_cache_size() -> usize {
+    1024
+}
+
+fn default_line_quad_cache_size() -> usize {
+    1024
+}
+
+fn default_line_to_ele_shape_cache_size() -> usize {
+    1024
+}
+
+#[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoldBrightening {
+    /// Bold doesn't influence palette selection
+    No,
+    /// Bold Shifts palette from 0-7 to 8-15 and preserves bold font
+    #[default]
+    BrightAndBold,
+    /// Bold Shifts palette from 0-7 to 8-15 and removes bold intensity
+    BrightOnly,
+}
+
+impl FromDynamic for BoldBrightening {
+    fn from_dynamic(
+        value: &frankenterm_dynamic::Value,
+        options: frankenterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        match String::from_dynamic(value, options) {
+            Ok(s) => match s.as_str() {
+                "No" => Ok(Self::No),
+                "BrightAndBold" => Ok(Self::BrightAndBold),
+                "BrightOnly" => Ok(Self::BrightOnly),
+                s => Err(frankenterm_dynamic::Error::Message(format!(
+                    "`{s}` is not valid, use one of `No`, `BrightAndBold` or `BrightOnly`"
+                ))),
+            },
+            Err(err) => match bool::from_dynamic(value, options) {
+                Ok(true) => Ok(Self::BrightAndBold),
+                Ok(false) => Ok(Self::No),
+                Err(_) => Err(err),
+            },
+        }
+    }
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImePreeditRendering {
+    /// IME preedit is rendered by WezTerm itself
+    #[default]
+    Builtin,
+    /// IME preedit is rendered by system
+    System,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationHandling {
+    #[default]
+    AlwaysShow,
+    NeverShow,
+    SuppressFromFocusedPane,
+    SuppressFromFocusedTab,
+    SuppressFromFocusedWindow,
+}
+
+fn validate_row_or_col(value: &u16) -> Result<(), String> {
+    if *value < 1 {
+        Err("initial_cols and initial_rows must be non-zero".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_line_height(value: &f64) -> Result<(), String> {
+    if *value <= 0.0 {
+        Err(format!(
+            "Illegal value {value} for line_height; it must be positive and greater than zero!"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_domain_name(name: &str) -> Result<(), String> {
+    if name == "local" {
+        Err(format!(
+            "\"{name}\" is a built-in domain and cannot be redefined"
+        ))
+    } else if name == "" {
+        Err("the empty string is an invalid domain name".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// <https://github.com/wezterm/wezterm/pull/2435>
+/// <https://github.com/wezterm/wezterm/issues/2771>
+/// <https://github.com/wezterm/wezterm/issues/2630>
+fn default_macos_forward_mods() -> Modifiers {
+    Modifiers::SHIFT
+}
+
+fn default_colr_rasterizer() -> FontRasterizerSelection {
+    FontRasterizerSelection::Harfbuzz
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+
+    #[test]
+    fn reconnect_timer_consistency_rejects_zero_and_inverted_bounds() {
+        let mut config = Config::default();
+        config
+            .check_consistency()
+            .expect("default reconnect timer bounds are valid");
+
+        config.client_reconnect_base_interval_ms = 0;
+        let error = config
+            .check_consistency()
+            .expect_err("zero reconnect base interval must not create a busy retry loop");
+        assert!(error.to_string().contains("base_interval_ms"));
+
+        config.client_reconnect_base_interval_ms = 2_000;
+        config.client_reconnect_max_interval_ms = 1_000;
+        let error = config
+            .check_consistency()
+            .expect_err("reconnect maximum must not be below its initial delay");
+        assert!(error.to_string().contains("max_interval_ms"));
+
+        config.client_reconnect_base_interval_ms = 1_000;
+        config.client_reconnect_max_interval_ms = 10_000;
+        config.client_reconnect_healthy_session_ms = 0;
+        let error = config
+            .check_consistency()
+            .expect_err("zero healthy-session fence would erase every finite failure budget");
+        assert!(error.to_string().contains("healthy_session_ms"));
+    }
+
+    // ── DroppedFileQuoting::escape ─────────────────────────────
+
+    #[test]
+    fn dropped_file_quoting_none_passthrough() {
+        assert_eq!(
+            DroppedFileQuoting::None.escape("hello world"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_none_preserves_special_chars() {
+        assert_eq!(
+            DroppedFileQuoting::None.escape("file name!@#$%"),
+            "file name!@#$%"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_spaces_only_escapes_spaces() {
+        assert_eq!(
+            DroppedFileQuoting::SpacesOnly.escape("hello world"),
+            "hello\\ world"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_spaces_only_no_change_when_no_spaces() {
+        assert_eq!(
+            DroppedFileQuoting::SpacesOnly.escape("no-spaces"),
+            "no-spaces"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_posix_quotes_spaces() {
+        let result = DroppedFileQuoting::Posix.escape("hello world");
+        // shlex should quote strings with spaces
+        assert!(result.contains("hello"), "expected hello in {}", result);
+        assert!(result.contains("world"), "expected world in {}", result);
+    }
+
+    #[test]
+    fn dropped_file_quoting_posix_no_change_for_simple() {
+        assert_eq!(DroppedFileQuoting::Posix.escape("simple"), "simple");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_quotes_spaces() {
+        let result = DroppedFileQuoting::Windows.escape("hello world");
+        assert_eq!(result, "\"hello world\"");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_no_quote_simple() {
+        assert_eq!(DroppedFileQuoting::Windows.escape("simple"), "simple");
+    }
+
+    #[test]
+    fn defaults_with_null_overrides_uses_empty_override_object() {
+        let loaded = Config::defaults_with_overrides(&Value::default());
+        let cfg = loaded
+            .config
+            .expect("null overrides should mean no overrides");
+        let defaults = Config::default_config();
+
+        assert_eq!(cfg.initial_rows, defaults.initial_rows);
+        assert_eq!(cfg.initial_cols, defaults.initial_cols);
+        assert_eq!(cfg.scrollback_lines, defaults.scrollback_lines);
+    }
+
+    /// Build a `Config` from `key = value` pairs the way the TOML and Lua
+    /// loaders do, through `FromDynamic`.
+    fn config_from_pairs(pairs: Vec<(&str, Value)>) -> Result<Config, frankenterm_dynamic::Error> {
+        let mut object = frankenterm_dynamic::Object::default();
+        for (key, value) in pairs {
+            object.insert(Value::String(key.to_string()), value);
+        }
+        Config::from_dynamic(&Value::Object(object), FromDynamicOptions::default())
+    }
+
+    #[test]
+    fn wayland_fractional_scale_is_on_by_default_and_can_be_turned_off() {
+        assert!(Config::default_config().enable_wayland_fractional_scale);
+        let config = config_from_pairs(vec![(
+            "enable_wayland_fractional_scale",
+            Value::Bool(false),
+        )])
+        .expect("a boolean is a valid enable_wayland_fractional_scale");
+        assert!(!config.enable_wayland_fractional_scale);
+    }
+
+    fn float(value: f64) -> Value {
+        Value::F64(ordered_float::OrderedFloat(value))
+    }
+
+    fn weights(taps: &[u64]) -> Value {
+        Value::Array(
+            taps.iter()
+                .copied()
+                .map(Value::U64)
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    #[test]
+    fn text_rendering_options_default_to_the_existing_rendering() {
+        let config = Config::default_config();
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Default);
+        assert_eq!(config.freetype_lcd_filter_weights, None);
+        assert_eq!(config.text_gamma, None);
+        assert_eq!(config.text_contrast, None);
+    }
+
+    #[test]
+    fn text_rendering_options_parse() {
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("Light".to_string())),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77, 8])),
+            ("text_gamma", float(1.7)),
+            // Lua and TOML integers are accepted for the float options.
+            ("text_contrast", Value::U64(30)),
+        ])
+        .expect("valid text rendering options");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Light);
+        assert_eq!(
+            config.freetype_lcd_filter_weights,
+            Some(vec![8, 77, 86, 77, 8])
+        );
+        assert_eq!(config.text_gamma, Some(1.7));
+        assert_eq!(config.text_contrast, Some(30.0));
+
+        // The range ends are valid.
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("None".to_string())),
+            ("text_gamma", float(f64::from(MIN_TEXT_GAMMA))),
+            ("text_contrast", Value::U64(100)),
+        ])
+        .expect("range ends are valid");
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::None);
+        assert_eq!(config.text_gamma, Some(MIN_TEXT_GAMMA));
+        assert_eq!(config.text_contrast, Some(100.0));
+        let config = config_from_pairs(vec![("text_contrast", Value::U64(0))])
+            .expect("a contrast of 0 is valid");
+        assert_eq!(config.text_contrast, Some(0.0));
+    }
+
+    #[test]
+    fn text_rendering_options_reject_bad_values() {
+        let cases = [
+            ("text_gamma", float(0.0)),
+            ("text_gamma", float(0.009)),
+            ("text_gamma", Value::I64(-2)),
+            ("text_gamma", float(f64::NAN)),
+            ("text_gamma", float(f64::INFINITY)),
+            // Finite as an f64, infinite as the f32 the option holds.
+            ("text_gamma", float(1.0e39)),
+            ("text_contrast", Value::I64(-1)),
+            ("text_contrast", float(100.5)),
+            ("text_contrast", float(f64::NAN)),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 86, 77])),
+            (
+                "freetype_lcd_filter_weights",
+                weights(&[8, 77, 86, 77, 8, 0]),
+            ),
+            ("freetype_lcd_filter_weights", weights(&[])),
+            ("freetype_lcd_filter_weights", weights(&[8, 77, 256, 77, 8])),
+            // FreeType no longer has its pre-2.3 Legacy filter.
+            ("freetype_lcd_filter", Value::String("Legacy".to_string())),
+        ];
+        for (key, value) in cases {
+            // This crate is edition 2018: a lone panic! literal is not a
+            // format string, so the arguments are passed explicitly.
+            let shown = format!("{} = {:?}", key, value);
+            let err = match config_from_pairs(vec![(key, value)]) {
+                Ok(_) => panic!("{} was accepted", shown),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(key),
+                "{}: error does not name the key: {}",
+                shown,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_quotes_tab() {
+        let result = DroppedFileQuoting::Windows.escape("has\ttab");
+        assert_eq!(result, "\"has\ttab\"");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_always_quoted() {
+        assert_eq!(
+            DroppedFileQuoting::WindowsAlwaysQuoted.escape("simple"),
+            "\"simple\""
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_default_platform() {
+        let dfq = DroppedFileQuoting::default();
+        if cfg!(windows) {
+            assert_eq!(dfq.escape("a b"), "\"a b\"");
+        } else {
+            assert_eq!(dfq.escape("a b"), "a\\ b");
+        }
+    }
+
+    // ── DefaultCursorStyle::effective_shape ─────────────────────
+
+    #[test]
+    fn effective_shape_default_becomes_steady_block() {
+        let style = DefaultCursorStyle::SteadyBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyBlock
+        );
+    }
+
+    #[test]
+    fn effective_shape_default_becomes_blinking_bar() {
+        let style = DefaultCursorStyle::BlinkingBar;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    #[test]
+    fn effective_shape_default_becomes_blinking_underline() {
+        let style = DefaultCursorStyle::BlinkingUnderline;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingUnderline
+        );
+    }
+
+    #[test]
+    fn effective_shape_nondefault_preserved() {
+        let style = DefaultCursorStyle::SteadyBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::BlinkingBar),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    #[test]
+    fn effective_shape_steady_underline() {
+        let style = DefaultCursorStyle::SteadyUnderline;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyUnderline
+        );
+    }
+
+    #[test]
+    fn effective_shape_blinking_block() {
+        let style = DefaultCursorStyle::BlinkingBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingBlock
+        );
+    }
+
+    #[test]
+    fn effective_shape_steady_bar() {
+        let style = DefaultCursorStyle::SteadyBar;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyBar
+        );
+    }
+
+    // ── validate_domain_name ───────────────────────────────────
+
+    #[test]
+    fn validate_domain_name_local_is_rejected() {
+        assert!(validate_domain_name("local").is_err());
+    }
+
+    #[test]
+    fn validate_domain_name_empty_is_rejected() {
+        assert!(validate_domain_name("").is_err());
+    }
+
+    #[test]
+    fn validate_domain_name_valid_passes() {
+        assert!(validate_domain_name("my-domain").is_ok());
+    }
+
+    #[test]
+    fn validate_domain_name_single_char_passes() {
+        assert!(validate_domain_name("x").is_ok());
+    }
+
+    // ── validate_row_or_col ────────────────────────────────────
+
+    #[test]
+    fn validate_row_or_col_zero_rejected() {
+        assert!(validate_row_or_col(&0).is_err());
+    }
+
+    #[test]
+    fn validate_row_or_col_one_accepted() {
+        assert!(validate_row_or_col(&1).is_ok());
+    }
+
+    #[test]
+    fn validate_row_or_col_large_accepted() {
+        assert!(validate_row_or_col(&1000).is_ok());
+    }
+
+    // ── validate_line_height ───────────────────────────────────
+
+    #[test]
+    fn validate_line_height_zero_rejected() {
+        assert!(validate_line_height(&0.0).is_err());
+    }
+
+    #[test]
+    fn validate_line_height_negative_rejected() {
+        assert!(validate_line_height(&-1.0).is_err());
+    }
+
+    #[test]
+    fn validate_line_height_positive_accepted() {
+        assert!(validate_line_height(&1.5).is_ok());
+    }
+
+    #[test]
+    fn validate_click_interval_ms_zero_rejected() {
+        assert!(validate_click_interval_ms(&0).is_err());
+        assert!(validate_click_interval_ms(&1).is_ok());
+    }
+
+    #[test]
+    fn validate_mux_output_parser_buffer_size_zero_rejected() {
+        assert!(validate_mux_output_parser_buffer_size(&0).is_err());
+    }
+
+    #[test]
+    fn mux_output_ring_keys_default_inside_their_validated_ranges() {
+        assert!(validate_mux_output_ring_slots(&default_mux_output_ring_slots()).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&default_mux_output_ring_slot_bytes()).is_ok());
+        for slots in [0, 1, 1025] {
+            assert!(validate_mux_output_ring_slots(&slots).is_err(), "{}", slots);
+        }
+        for bytes in [0, 4095, 16 * 1024 * 1024 + 1] {
+            assert!(
+                validate_mux_output_ring_slot_bytes(&bytes).is_err(),
+                "{}",
+                bytes
+            );
+        }
+        assert!(validate_mux_output_ring_slots(&2).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&(16 * 1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn mux_output_gather_keys_default_inside_their_validated_ranges() {
+        assert!(
+            validate_mux_output_gather_min_bytes(&default_mux_output_gather_min_bytes()).is_ok()
+        );
+        assert!(
+            validate_mux_output_gather_spin_checks(&default_mux_output_gather_spin_checks())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_poll_us(&default_mux_output_gather_poll_us()).is_ok());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&default_mux_output_gather_max_wait_us())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_min_bytes(&(1024 * 1024 + 1)).is_err());
+        assert!(validate_mux_output_gather_spin_checks(&1025).is_err());
+        assert!(validate_mux_output_gather_poll_us(&0).is_err());
+        assert!(validate_mux_output_gather_poll_us(&100_001).is_err());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&0).is_ok(),
+            "0 turns gathering off"
+        );
+        assert!(validate_mux_output_gather_max_wait_us(&100_001).is_err());
+    }
+
+    #[test]
+    fn gui_retained_pane_state_budget_rejects_zero_and_accepts_large_fleets() {
+        use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+        for limit in [0_u64, 1, 4096, 65_536] {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert(
+                Value::String("gui_retained_pane_state_limit".into()),
+                Value::U64(limit),
+            );
+            let result =
+                Config::from_dynamic(&Value::Object(values.into()), FromDynamicOptions::default());
+            if limit == 0 {
+                assert!(result.is_err(), "zero must fail configuration loading");
+            } else {
+                assert_eq!(
+                    result.unwrap().gui_retained_pane_state_limit,
+                    limit as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_mux_output_parser_buffer_size_positive_accepted() {
+        assert!(validate_mux_output_parser_buffer_size(&1).is_ok());
+        assert!(
+            validate_mux_output_parser_buffer_size(&default_mux_output_parser_buffer_size())
+                .is_ok()
+        );
+        assert!(validate_mux_output_parser_buffer_size(&(512 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn validate_max_fps_accepts_exact_supported_boundaries() {
+        assert!(validate_max_fps(&MIN_MAX_FPS).is_ok());
+        assert!(validate_max_fps(&default_max_fps()).is_ok());
+        assert!(validate_max_fps(&MAX_MAX_FPS).is_ok());
+    }
+
+    #[test]
+    fn durability_commit_window_keys_validate_their_ranges() {
+        let config = Config::default_config();
+        assert_eq!(config.scrollback_durability_commit_window_ms, 250);
+        assert_eq!(config.scrollback_durability_commit_window_mb, 8);
+        assert_eq!(config.scrollback_durability_commit_idle_ms, 25);
+        for ms in [0, 250, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS] {
+            assert!(validate_scrollback_durability_commit_window_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_commit_window_ms(
+            &(MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS + 1)
+        )
+        .is_err());
+        for mb in [1, 8, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_ok());
+        }
+        for mb in [0, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB + 1] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_err());
+        }
+        assert_eq!(config.scrollback_durability_manifest_publish_ms, 1_000);
+        for ms in [0, 1_000, MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS] {
+            assert!(validate_scrollback_durability_manifest_publish_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_manifest_publish_ms(
+            &(MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS + 1)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_max_fps_rejects_zero_and_upper_bound_plus_one() {
+        assert!(validate_max_fps(&0).is_err());
+        assert!(validate_max_fps(&(MAX_MAX_FPS + 1)).is_err());
+    }
+
+    #[test]
+    fn unfocused_windows_repaint_at_their_own_cap() {
+        let mut config = Config::default_config();
+        config.max_fps = 30;
+        assert_eq!(config.unfocused_max_fps, None, "off by default");
+        assert_eq!(config.max_fps_for_focus(false), 30);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(10);
+        assert_eq!(config.max_fps_for_focus(false), 10);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(120);
+        assert_eq!(config.max_fps_for_focus(false), 30, "never above max_fps");
+
+        assert!(validate_unfocused_max_fps(&None).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(MIN_MAX_FPS)).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(0)).is_err());
+        assert!(validate_unfocused_max_fps(&Some(MAX_MAX_FPS + 1)).is_err());
+    }
+
+    #[test]
+    fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
+        assert_eq!(frame_interval_for_max_fps(0), Duration::from_secs(1));
+        assert_eq!(
+            frame_interval_for_max_fps(MIN_MAX_FPS),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(3),
+            Duration::from_nanos(333_333_334)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(999),
+            Duration::from_nanos(1_001_002)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(MAX_MAX_FPS),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(MAX_MAX_FPS + 1),
+            Duration::from_millis(1)
+        );
+    }
+
+    /// ft-1w85m: the interval is exact to the nanosecond, not whole
+    /// milliseconds. 17 ms for the default of 60 capped repaint at 58.8 FPS.
+    #[test]
+    fn frame_interval_is_nanosecond_exact_for_display_rates() {
+        assert_eq!(default_max_fps(), 60);
+        assert_eq!(
+            frame_interval_for_max_fps(60),
+            Duration::from_nanos(16_666_667)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(120),
+            Duration::from_nanos(8_333_334)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(144),
+            Duration::from_nanos(6_944_445)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(30),
+            Duration::from_nanos(33_333_334)
+        );
+        assert_eq!(frame_interval_for_max_fps(50), Duration::from_millis(20));
+        assert_eq!(
+            frame_interval_for_max_fps(240),
+            Duration::from_nanos(4_166_667)
+        );
+    }
+
+    /// Paints spaced by the interval reach every common refresh rate to
+    /// within a nanosecond per frame, so max_fps equal to the refresh rate
+    /// no longer caps repaint below the display.
+    #[test]
+    fn frame_interval_sustains_the_matching_refresh_rate() {
+        for hz in [
+            24_u64, 30, 48, 50, 59, 60, 75, 90, 100, 120, 144, 165, 240, 360,
+        ] {
+            let interval = frame_interval_for_max_fps(hz).as_nanos();
+            let one_second = 1_000_000_000_u128;
+            let frames = u128::from(hz);
+            assert!(
+                interval * frames >= one_second && interval * frames < one_second + frames,
+                "max_fps={}: {} frames of {} ns",
+                hz,
+                frames,
+                interval
+            );
+        }
+    }
+
+    #[test]
+    fn frame_interval_never_exceeds_the_valid_configured_rate() {
+        for max_fps in MIN_MAX_FPS..=MAX_MAX_FPS {
+            let interval_ns = frame_interval_for_max_fps(max_fps).as_nanos();
+            let fps = u128::from(max_fps);
+            assert!(interval_ns > 0, "max_fps={}", max_fps);
+            assert!(
+                interval_ns * fps >= 1_000_000_000,
+                "max_fps={}, interval_ns={}",
+                max_fps,
+                interval_ns
+            );
+            // The tightest such interval: one nanosecond less would exceed it.
+            assert!(
+                (interval_ns - 1) * fps < 1_000_000_000,
+                "max_fps={}, interval_ns={}",
+                max_fps,
+                interval_ns
+            );
+        }
+    }
+
+    // ── default_hyperlink_rules ────────────────────────────────
+
+    #[test]
+    fn default_hyperlink_rules_returns_six_rules() {
+        let rules = default_hyperlink_rules();
+        assert_eq!(rules.len(), 6, "expected 6 default hyperlink rules");
+    }
+
+    // ── default_*() helpers ────────────────────────────────────
+
+    #[test]
+    fn default_read_timeout_is_sixty_seconds() {
+        assert_eq!(default_read_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_write_timeout_is_sixty_seconds() {
+        assert_eq!(default_write_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_local_echo_threshold_ms_is_some_20() {
+        assert_eq!(default_local_echo_threshold_ms(), Some(20));
+    }
+
+    #[test]
+    fn default_font_size_is_twelve() {
+        assert_eq!(default_font_size(), 12.0);
+    }
+
+    #[test]
+    fn default_term_is_xterm_256color() {
+        assert_eq!(default_term(), "xterm-256color");
+    }
+
+    #[test]
+    fn default_initial_rows_is_24() {
+        assert_eq!(default_initial_rows(), 24);
+    }
+
+    #[test]
+    fn default_initial_cols_is_80() {
+        assert_eq!(default_initial_cols(), 80);
+    }
+
+    #[test]
+    fn default_unicode_version_widens_vs16_emoji() {
+        assert_eq!(default_unicode_version(), 14);
+    }
+
+    #[test]
+    fn default_click_interval_ms_is_five_hundred() {
+        assert_eq!(default_click_interval_ms(), 500);
+    }
+
+    #[test]
+    fn default_anim_fps_is_ten() {
+        assert_eq!(default_anim_fps(), 10);
+    }
+
+    #[test]
+    fn default_mux_env_remove_contains_ssh_auth_sock() {
+        let removes = default_mux_env_remove();
+        assert!(removes.contains(&"SSH_AUTH_SOCK".to_string()));
+    }
+
+    #[test]
+    fn default_gui_startup_args_starts_with_start() {
+        let args = default_gui_startup_args();
+        assert_eq!(args, vec!["start"]);
+    }
+
+    #[test]
+    fn default_harfbuzz_features_contains_kern() {
+        let features = default_harfbuzz_features();
+        assert!(features.contains(&"kern".to_string()));
+        assert!(features.contains(&"liga".to_string()));
+        assert!(features.contains(&"clig".to_string()));
+    }
+
+    // ── WindowPadding::default ─────────────────────────────────
+
+    #[test]
+    fn window_padding_default_values() {
+        let pad = WindowPadding::default();
+        assert_eq!(pad.left, Dimension::Cells(1.0));
+        assert_eq!(pad.right, Dimension::Cells(1.0));
+        assert_eq!(pad.top, Dimension::Cells(0.5));
+        assert_eq!(pad.bottom, Dimension::Cells(0.5));
+    }
+
+    // ── DefaultCursorStyle::default ────────────────────────────
+
+    #[test]
+    fn default_cursor_style_is_steady_block() {
+        let style = DefaultCursorStyle::default();
+        assert!(matches!(style, DefaultCursorStyle::SteadyBlock));
+    }
+
+    // ── ExitBehavior ───────────────────────────────────────────
+
+    #[test]
+    fn exit_behavior_default_is_close() {
+        assert_eq!(ExitBehavior::default(), ExitBehavior::Close);
+    }
+
+    #[test]
+    fn exit_behavior_eq() {
+        assert_ne!(ExitBehavior::Close, ExitBehavior::Hold);
+        assert_ne!(ExitBehavior::Close, ExitBehavior::CloseOnCleanExit);
+    }
+
+    // ── ExitBehaviorMessaging ──────────────────────────────────
+
+    #[test]
+    fn exit_behavior_messaging_default_is_verbose() {
+        assert_eq!(
+            ExitBehaviorMessaging::default(),
+            ExitBehaviorMessaging::Verbose
+        );
+    }
+
+    // ── WindowCloseConfirmation ────────────────────────────────
+
+    #[test]
+    fn window_close_confirmation_default_is_always_prompt() {
+        assert!(matches!(
+            WindowCloseConfirmation::default(),
+            WindowCloseConfirmation::AlwaysPrompt
+        ));
+    }
+
+    #[test]
+    fn close_confirmation_does_not_skip_shells_by_default() {
+        assert!(Config::default_config()
+            .skip_close_confirmation_for_processes_named
+            .is_empty());
+    }
+
+    #[test]
+    fn macos_bundle_font_dir_is_derived_from_executable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos_dir = dir.path().join("FrankenTerm.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos_dir).unwrap();
+
+        let dirs = bundled_app_font_dirs_from_executable_dir(&macos_dir);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            dirs,
+            vec![dir.path().join("FrankenTerm.app/Contents/Resources/fonts")]
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert!(dirs.is_empty());
+    }
+
+    /// Regression guard for the config-reload main-thread panic (#3).
+    ///
+    /// `TermWindow::config_was_reloaded` runs the config load on the GUI
+    /// main-thread spawn queue. `try_load` used to evaluate the Lua config via
+    /// `promise::spawn::block_on(chunk.eval_async())`, and that block_on aborts
+    /// when invoked under the main-thread dispatch scope ("block_on called while
+    /// running a task on the main-thread spawn queue"). The fix uses synchronous
+    /// `eval()`. This test loads a real Lua config file while inside the
+    /// main-thread dispatch scope and asserts it succeeds rather than panicking.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn config_loads_under_main_thread_dispatch_scope() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frankenterm.lua");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "return {{ font_size = 13.5 }}").unwrap();
+        drop(f);
+
+        let _scope = promise::spawn::enter_main_thread_dispatch_scope();
+        let overrides = Value::Null;
+        let loaded = Config::try_load(&PathPossibility::required(path), &overrides)
+            .expect("config load must not error on the main thread")
+            .expect("config file should be found");
+        assert!(
+            loaded.config.is_ok(),
+            "config eval must succeed under main-thread dispatch: {:?}",
+            loaded.config.as_ref().err()
+        );
+    }
+
+    // ── BoldBrightening ────────────────────────────────────────
+
+    #[test]
+    fn bold_brightening_default_is_bright_and_bold() {
+        assert!(matches!(
+            BoldBrightening::default(),
+            BoldBrightening::BrightAndBold
+        ));
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_string_no() {
+        let val = Value::String("No".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert!(matches!(result, BoldBrightening::No));
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_string_bright_only() {
+        let val = Value::String("BrightOnly".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert!(matches!(result, BoldBrightening::BrightOnly));
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_bool_true() {
+        let val = Value::Bool(true);
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert!(matches!(result, BoldBrightening::BrightAndBold));
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_bool_false() {
+        let val = Value::Bool(false);
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert!(matches!(result, BoldBrightening::No));
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_invalid_string() {
+        let val = Value::String("InvalidValue".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default());
+        assert!(result.is_err());
+    }
+
+    // ── HorizontalWindowContentAlignment ───────────────────────
+
+    #[test]
+    fn horizontal_alignment_default_is_left() {
+        assert_eq!(
+            HorizontalWindowContentAlignment::default(),
+            HorizontalWindowContentAlignment::Left,
+        );
+    }
+
+    // ── VerticalWindowContentAlignment ─────────────────────────
+
+    #[test]
+    fn vertical_alignment_default_is_top() {
+        assert_eq!(
+            VerticalWindowContentAlignment::default(),
+            VerticalWindowContentAlignment::Top,
+        );
+    }
+
+    // ── ImePreeditRendering ────────────────────────────────────
+
+    #[test]
+    fn ime_preedit_rendering_default_is_builtin() {
+        assert_eq!(ImePreeditRendering::default(), ImePreeditRendering::Builtin,);
+    }
+
+    // ── NotificationHandling ───────────────────────────────────
+
+    #[test]
+    fn notification_handling_default_is_always_show() {
+        assert_eq!(
+            NotificationHandling::default(),
+            NotificationHandling::AlwaysShow,
+        );
+    }
+
+    // ── Config::initial_size ───────────────────────────────────
+
+    #[test]
+    fn initial_size_default_config() {
+        let config = Config::default();
+        let size = config.initial_size(96, None);
+        assert_eq!(size.rows, config.initial_rows as usize);
+        assert_eq!(size.cols, config.initial_cols as usize);
+        assert_eq!(size.dpi, 96);
+    }
+
+    #[test]
+    fn initial_size_with_cell_pixel_dims() {
+        let config = Config::default();
+        let size = config.initial_size(144, Some((10, 20)));
+        assert_eq!(size.pixel_width, 10 * config.initial_cols as usize);
+        assert_eq!(size.pixel_height, 20 * config.initial_rows as usize);
+        assert_eq!(size.dpi, 144);
+    }
+
+    #[test]
+    fn initial_size_without_cell_pixel_dims_uses_default_8x16() {
+        let config = Config::default();
+        let size = config.initial_size(96, None);
+        assert_eq!(size.pixel_width, 8 * config.initial_cols as usize);
+        assert_eq!(size.pixel_height, 16 * config.initial_rows as usize);
+    }
+
+    #[test]
+    fn config_default_click_interval_ms_is_five_hundred() {
+        let config = Config::default();
+        assert_eq!(config.click_interval_ms, 500);
+    }
+
+    #[test]
+    fn font_zoom_defaults_to_reflow_without_resizing_the_window() {
+        assert!(!Config::default().adjust_window_size_when_changing_font_size);
+    }
+
+    #[test]
+    fn font_zoom_window_resize_requires_explicit_opt_in() {
+        for enabled in [false, true] {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(
+                Value::String("adjust_window_size_when_changing_font_size".into()),
+                Value::Bool(enabled),
+            );
+            let config =
+                Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                    .expect("explicit font zoom window-size policy should parse");
+            assert_eq!(config.adjust_window_size_when_changing_font_size, enabled);
+        }
+    }
+
+    #[test]
+    fn config_default_enables_tiered_scrollback_budgeting() {
+        let config = Config::default();
+        assert!(config.scrollback_tiered_enabled);
+        assert_eq!(config.scrollback_hot_lines, 1000);
+        assert_eq!(config.scrollback_warm_max_mb, 50);
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_click_interval_ms_override() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(Value::String("click_interval_ms".into()), Value::U64(1_500));
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("click_interval_ms override should parse");
+        assert_eq!(config.click_interval_ms, 1_500);
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_zero_max_fps() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(Value::String("max_fps".into()), Value::U64(0));
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("zero max_fps must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("max_fps"), "unexpected error: {}", message);
+        assert!(
+            message.contains("1..=1000"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(message.contains("got 0"), "unexpected error: {}", message);
+    }
+
+    #[test]
+    fn config_from_dynamic_reads_and_validates_unfocused_max_fps() {
+        let load = |fps: u64| {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(Value::String("unfocused_max_fps".into()), Value::U64(fps));
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+        };
+        let config = load(10).expect("a valid unfocused_max_fps loads");
+        assert_eq!(config.unfocused_max_fps, Some(10));
+        let message = load(0).expect_err("zero must be rejected").to_string();
+        assert!(
+            message.contains("unfocused_max_fps"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(message.contains("got 0"), "unexpected error: {}", message);
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_max_fps_above_timer_resolution() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(Value::String("max_fps".into()), Value::U64(MAX_MAX_FPS + 1));
+        let invalid_value = MAX_MAX_FPS + 1;
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("max_fps above timer resolution must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("max_fps"), "unexpected error: {}", message);
+        assert!(
+            message.contains("1..=1000"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(
+            message.contains(&format!("got {invalid_value}")),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_canonicalize_pasted_newlines_bool_true() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("canonicalize_pasted_newlines".into()),
+            Value::Bool(true),
+        );
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("canonicalize_pasted_newlines=true should parse");
+
+        assert_eq!(
+            config.canonicalize_pasted_newlines,
+            Some(NewlineCanon::CarriageReturnAndLineFeed)
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_canonicalize_pasted_newlines_bool_false() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("canonicalize_pasted_newlines".into()),
+            Value::Bool(false),
+        );
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("canonicalize_pasted_newlines=false should parse");
+
+        assert_eq!(
+            config.canonicalize_pasted_newlines,
+            Some(NewlineCanon::None)
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_default_mux_output_parser_buffer_size() {
+        let obj = std::collections::BTreeMap::new();
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("default config should parse successfully");
+        assert_eq!(
+            config.mux_output_parser_buffer_size,
+            default_mux_output_parser_buffer_size()
+        );
+        assert_eq!(config.mux_output_parser_buffer_size, 128 * 1024);
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_valid_mux_output_parser_buffer_size() {
+        for valid_size in [1, 4096, 128 * 1024, 512 * 1024, 1024 * 1024] {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(
+                Value::String("mux_output_parser_buffer_size".into()),
+                Value::U64(valid_size as u64),
+            );
+            let config =
+                Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                    .expect("valid mux_output_parser_buffer_size should parse");
+            assert_eq!(config.mux_output_parser_buffer_size, valid_size);
+        }
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_zero_mux_output_parser_buffer_size() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("mux_output_parser_buffer_size".into()),
+            Value::U64(0),
+        );
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("zero mux_output_parser_buffer_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("mux_output_parser_buffer_size"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(
+            message.contains("must be non-zero"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_negative_mux_output_parser_buffer_size() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("mux_output_parser_buffer_size".into()),
+            Value::I64(-1),
+        );
+        assert!(
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .is_err()
+        );
+    }
+
+    // ── compute_*_dir helpers ──────────────────────────────────
+
+    #[test]
+    fn compute_runtime_dir_returns_ok() {
+        assert!(compute_runtime_dir().is_ok());
+    }
+
+    #[test]
+    fn compute_cache_dir_returns_ok() {
+        let path = compute_cache_dir().expect("compute cache directory");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frankenterm")
+        );
+    }
+
+    #[test]
+    fn cache_fallback_is_distinct_from_the_data_fallback() {
+        let home = Path::new("/private/test-home");
+        assert_eq!(
+            cache_dir_from_base(None, home),
+            home.join(".cache/frankenterm")
+        );
+        assert_ne!(
+            cache_dir_from_base(None, home),
+            home.join(".local/share/frankenterm")
+        );
+    }
+
+    #[test]
+    fn compute_data_dir_returns_ok() {
+        let path = compute_data_dir().expect("compute data directory");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frankenterm")
+        );
+    }
+
+    #[test]
+    fn legacy_data_dir_is_read_only_wezterm_migration_input() {
+        let path = legacy_data_dir();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("wezterm")
+        );
+        assert_ne!(
+            path,
+            compute_data_dir().expect("compute canonical data directory")
+        );
+    }
+
+    #[test]
+    fn legacy_cache_dir_is_retained_but_never_canonical() {
+        let path = legacy_cache_dir();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("wezterm")
+        );
+        assert_ne!(
+            path,
+            compute_cache_dir().expect("compute canonical cache directory")
+        );
+    }
+
+    #[test]
+    fn legacy_data_artifact_policy_is_explicit_and_fail_closed() {
+        use LegacyDataArtifactTreatment::{
+            MigrateValidatedState, RebuildInCanonicalNamespace, RetainLegacyOnly,
+        };
+
+        for path in [
+            DATA_ARTIFACT_WINDOW_STATE,
+            "window-state.json.shadow",
+            "domain-reconnect-manifest.slot-0",
+            "domain-reconnect-manifest.slot-1",
+            "domain-reconnect-manifest.slot-2",
+            "frankenterm-domain-reconnect-private-v1/domain-reconnect-manifest.slot-0",
+        ] {
+            assert_eq!(
+                legacy_data_artifact_treatment(Path::new(path)),
+                MigrateValidatedState,
+                "validated FrankenTerm authority must have an artifact-specific migration: {path}"
+            );
+        }
+        assert_eq!(
+            legacy_data_artifact_treatment(Path::new(DATA_ARTIFACT_UPDATE_METADATA)),
+            RebuildInCanonicalNamespace
+        );
+        for path in [
+            "plugins/example/plugin/init.lua",
+            DATA_ARTIFACT_REPL_HISTORY,
+            DATA_ARTIFACT_RECENT_COMMANDS,
+            DATA_ARTIFACT_RECENT_EMOJI,
+            "foreign-wezterm-state",
+        ] {
+            assert_eq!(
+                legacy_data_artifact_treatment(Path::new(path)),
+                RetainLegacyOnly,
+                "ambiguous or unknown legacy artifact must never be copied: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn pki_dir_ends_with_pki() {
+        let dir = pki_dir().unwrap();
+        assert!(
+            dir.ends_with("pki"),
+            "expected pki dir to end with pki, got: {}",
+            dir.display()
+        );
+    }
+
+    // ── NewlineCanon enum ──────────────────────────────────────
+
+    #[test]
+    fn newline_canon_variants_are_distinct() {
+        assert_ne!(NewlineCanon::None, NewlineCanon::LineFeed);
+        assert_ne!(NewlineCanon::LineFeed, NewlineCanon::CarriageReturn);
+        assert_ne!(
+            NewlineCanon::CarriageReturn,
+            NewlineCanon::CarriageReturnAndLineFeed
+        );
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_string_variant() {
+        let val = Value::String("LineFeed".into());
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::LineFeed);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_bool_true_as_crlf() {
+        let val = Value::Bool(true);
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::CarriageReturnAndLineFeed);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_bool_false_as_none() {
+        let val = Value::Bool(false);
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::None);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_rejects_invalid_string() {
+        let val = Value::String("InvalidValue".into());
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_reports_type_name_for_invalid_type() {
+        let val = Value::U64(42);
+        let err = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("NewlineCanon"));
+    }
+
+    #[test]
+    fn osc52_native_policy_rejects_invalid_enum_and_negative_cap() {
+        for (key, value) in [
+            (
+                "osc52_write_policy",
+                Value::String("permit-everything".into()),
+            ),
+            ("osc52_write_max_bytes", Value::I64(-1)),
+        ] {
+            let mut overrides = std::collections::BTreeMap::new();
+            overrides.insert(Value::String(key.into()), value);
+            assert!(Config::from_dynamic(
+                &Value::Object(overrides.into()),
+                FromDynamicOptions::default()
+            )
+            .is_err());
+        }
+    }
+}

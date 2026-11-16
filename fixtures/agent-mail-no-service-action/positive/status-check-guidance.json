@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "positive.status_check_guidance",
+  "case_kind": "positive",
+  "expected_verdict": "allow",
+  "generated_guidance": [
+    "Add a Beads status-check comment before considering stale reopen.",
+    "Wait for fresh owner evidence when dirty overlap or active reservations are present."
+  ],
+  "side_effects": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "worker_mutation_attempted": false,
+    "build_cancellation_attempted": false,
+    "local_cargo_counted_as_proof": false
+  }
+}

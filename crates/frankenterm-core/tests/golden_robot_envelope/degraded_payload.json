@@ -1,0 +1,9 @@
+{
+  "timestamp": "[TIMESTAMP]",
+  "source": "bridge.degraded",
+  "data": {
+    "reason": "fallback",
+    "attempts": 3
+  },
+  "degraded": true
+}

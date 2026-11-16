@@ -1,0 +1,129 @@
+[package]
+name = "mux"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+# CONSTRAINT (gh #83): this crate is still on edition 2018 while the workspace
+# root is edition 2024, so Rust 2024-only syntax (e.g. `let` chains) does NOT
+# compile here — it has already broken `main` once (#83). Do not write 2024
+# syntax into mux sources, and gate edits with `cargo check -p mux --lib`.
+# Bumping to edition 2024 is the durable fix, but it is a deliberate migration
+# (this is inherited upstream WezTerm code under active rewrite), not a
+# one-line change to make in passing.
+edition = "2018"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["lua", "async-asupersync"]
+lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
+# ft-87qfi (round-3 moonshot): route the pane->render parsed-action hot path
+# through a lock-free LMAX-disruptor-style SPSC staging ring (crossbeam
+# ArrayQueue) so the single parser thread never blocks on the terminal mutex
+# under render contention. OFF by default — the mutex path is the fallback;
+# enabling this flag swaps in the ring. Clean revert = drop the flag.
+disruptor-pane-io = []
+# Bench-only hooks on LocalPane (benches/render_facts_publication.rs,
+# ft-yccm0.2.2.1). Never enable it in a product build.
+bench-hooks = []
+no-lua = ["config/no-lua"]
+# Legacy fallback path kept for staged migration/testing.
+async-smol = ["config/async-smol", "frankenterm-ssh/async-smol"]
+async-asupersync = [
+    "config/async-asupersync",
+    "promise/async-asupersync",
+    "frankenterm-ssh/async-asupersync",
+]
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1.9"
+async-trait.workspace = true
+base64.workspace = true
+bintree.workspace = true
+bitflags.workspace = true
+chrono.workspace = true
+chacha20poly1305.workspace = true
+config = { path = "../config", default-features = false }
+crossbeam.workspace = true
+downcast-rs.workspace = true
+fancy-regex.workspace = true
+filedescriptor.workspace = true
+finl_unicode.workspace = true
+futures.workspace = true
+frankenterm-alloc.workspace = true
+frankenterm-build-identity.workspace = true
+hmac.workspace = true
+hostname.workspace = true
+lazy_static.workspace = true
+libc.workspace = true
+log.workspace = true
+lru.workspace = true
+luahelper = { workspace=true, optional = true }
+metrics.workspace = true
+mlua = { workspace=true, optional = true }
+names.workspace = true
+parking_lot.workspace = true
+percent-encoding.workspace = true
+portable-pty = { workspace=true, features = ["serde_support"]}
+procinfo = { path = "../procinfo", default-features = false }
+promise.workspace = true
+rangeset.workspace = true
+rustix.workspace = true
+serde = {workspace=true, features = ["rc", "derive"]}
+serde_json.workspace = true
+sha2 = { workspace = true, features = ["zeroize"] }
+static_assertions = "1.1.0"
+serial2.workspace = true
+shell-words.workspace = true
+terminfo.workspace = true
+termwiz.workspace = true
+textwrap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4", "rng", "serde"] }
+zeroize.workspace = true
+frankenterm-dynamic.workspace = true
+frankenterm-sigpipe.workspace = true
+# Keep ssh backend selection explicit here so runtime selection is controlled
+# by mux feature flags instead of frankenterm-ssh defaults.
+frankenterm-ssh = { path = "../ssh", default-features = false, features = ["libssh-rs", "ssh2"] }
+frankenterm-term = { workspace=true, features=["use_serde"] }
+
+[target."cfg(unix)".dependencies]
+# time: thread CPU time in the slow parser-stretch log (ft-t162y).
+rustix = { workspace = true, features = ["time"] }
+nix = { workspace = true, features = ["term", "user"] }
+
+[target."cfg(windows)".dependencies]
+ntapi.workspace = true
+winapi = { workspace=true, features = [
+    "handleapi",
+    "memoryapi",
+    "psapi",
+    "processthreadsapi",
+    "tlhelp32",
+]}
+
+[dev-dependencies]
+criterion = "0.8.2"
+hex.workspace = true
+k9.workspace = true
+promise = { workspace = true, features = ["test-support"] }
+proptest = "1.8.0"
+syn = { workspace = true, features = ["extra-traits", "full", "visit"] }
+tempfile.workspace = true
+
+[target."cfg(unix)".dev-dependencies]
+# net: pin a test socket's send buffer (termwiztermtab OSC 52 backpressure).
+rustix = { workspace = true, features = ["net"] }
+
+[[bench]]
+name = "event_bus"
+harness = false
+
+[[bench]]
+name = "render_facts_publication"
+harness = false
+required-features = ["bench-hooks"]

@@ -1,0 +1,12 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "first pane\n\u001b[48;5;24m blue row \u001b[0m\nleft or top\u001b[?25l",
+    "snapshot": {
+      "split": {
+        "direction": "bottom",
+        "text": "second pane\n\u001b[48;5;130m brown row \u001b[0m\nactive\u001b[?25l"
+      }
+    }
+  }
+}

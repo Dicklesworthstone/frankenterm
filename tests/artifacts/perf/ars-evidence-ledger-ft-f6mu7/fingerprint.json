@@ -1,0 +1,41 @@
+{
+  "bead": "ft-f6mu7",
+  "scenario": "ars_evidence_ledger",
+  "git_head_before_commit": "e0388ad25604",
+  "generated_at_ms": 1777404701940,
+  "host": {
+    "os": "macos",
+    "kernel": "Darwin 25.2.0",
+    "arch": "aarch64",
+    "cpu": "Apple M4 Pro"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.97.0-nightly (e9e32aca5 2026-04-17)",
+    "profile": "bench",
+    "command": "scripts/cargo-local.sh bench -p frankenterm-core --bench ars_evidence_ledger -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.2 --noplot"
+  },
+  "workload": {
+    "entry_scales": [1000, 10000, 100000],
+    "operations": [
+      "EvidenceLedger::append",
+      "EvidenceLedger::verify_chain",
+      "serde_json::to_vec"
+    ],
+    "categories": [
+      "ChangeDetection",
+      "MdlExtraction",
+      "SafetyProof",
+      "SecretScan",
+      "ParameterBounds",
+      "TimeoutCalc",
+      "ContextSnapshot"
+    ],
+    "hash_chain_enabled": true
+  },
+  "criterion": {
+    "sample_size": 10,
+    "warm_up_time": "0.1s",
+    "measurement_time": "0.2s",
+    "plot_backend": "plotters"
+  }
+}

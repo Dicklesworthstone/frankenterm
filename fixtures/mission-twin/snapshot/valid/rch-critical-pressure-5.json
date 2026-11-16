@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_snapshot.v1",
+  "source_bead": "ft-u7r37.1",
+  "snapshot_id": "rch-critical-pressure-5",
+  "generated_at_ms": 1771376400000,
+  "raw_pane_content_stored": false,
+  "forbidden_actions": [
+    "agent_mail_service_repair_restart",
+    "rch_service_repair_restart",
+    "worker_mutation",
+    "build_cancellation",
+    "file_deletion",
+    "destructive_git",
+    "local_cargo_proof",
+    "pane_mutation",
+    "raw_pane_content_storage",
+    "beads_mutation"
+  ],
+  "artifact_paths": [
+    "crates/frankenterm-core/src/mission_twin_snapshot.rs",
+    "docs/json-schema/ft-mission-twin-snapshot.json",
+    "docs/robot-contracts/mission-twin-snapshot.md",
+    "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json",
+    "fixtures/mission-twin/snapshot/invalid/fragments.v1.json",
+    "tests/e2e/test_mission_twin_snapshot_contract.sh"
+  ],
+  "sources": {
+    "beads": {
+      "source_id": "beads",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "ready_count": 1,
+      "blocked_count": 3,
+      "in_progress_count": 2,
+      "dependency_blockers": [
+        {
+          "blocked_bead_id": "ft-u7r37.3",
+          "blocking_bead_id": "ft-u7r37.1",
+          "blocker_status": "in_progress",
+          "reason_codes": [
+            "mission_twin.snapshot_contract_required"
+          ]
+        }
+      ],
+      "owner_states": [],
+      "stale_owner_candidates": []
+    },
+    "rch": {
+      "source_id": "rch",
+      "status": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.critical_pressure"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "admission_state": "not_ready",
+      "healthy_workers": 3,
+      "total_workers": 8,
+      "critical_pressure_count": 5,
+      "admission_reasons": [
+        "critical_pressure=5"
+      ],
+      "blocked_proof_lanes": [
+        {
+          "bead_id": "ft-u7r37.1",
+          "command_family": "cargo",
+          "reason_codes": [
+            "rch.admission.not_ready",
+            "rch.critical_pressure"
+          ]
+        }
+      ]
+    },
+    "agent_mail": {
+      "source_id": "agent_mail",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "availability_state": "healthy",
+      "active_agents": [],
+      "fallback_reason_codes": []
+    },
+    "git": {
+      "source_id": "git",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "branch": "main",
+      "head": "3333333333333333333333333333333333333333",
+      "remote_heads": [],
+      "dirty_paths": [],
+      "overlap_paths": [],
+      "deletion_paths_present": false
+    },
+    "reservations": {
+      "source_id": "reservations",
+      "status": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "active_reservations": []
+    },
+    "operating_envelope": {
+      "source_id": "operating_envelope",
+      "status": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1771376399000,
+      "freshness_ms": 1000,
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.critical_pressure"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
+      "verdict": "shed",
+      "source_snapshot_artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ]
+    }
+  },
+  "validation": {
+    "validation_state": "accepted",
+    "rejected_inputs": [],
+    "destructive_action_hints": [],
+    "ambiguous_timestamps_rejected": true
+  }
+}

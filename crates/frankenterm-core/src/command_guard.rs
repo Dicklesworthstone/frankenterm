@@ -1,0 +1,3159 @@
+//! Native command guard — per-pane destructive command blocking.
+//!
+//! Replaces the dcg subprocess call with in-process Aho-Corasick + regex
+//! pattern matching. Provides per-pane trust levels and a centralized policy
+//! engine with audit logging.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Command text
+//!      │
+//!      ▼
+//! Quick Reject (Aho-Corasick keyword scan, O(n))
+//!      │ keyword hit
+//!      ▼
+//! Safe Patterns (regex whitelist, checked first)
+//!      │ no safe match
+//!      ▼
+//! Destructive Patterns (regex blacklist)
+//!      │ match found
+//!      ▼
+//! Trust Level → Block / Warn / Allow
+//! ```
+//!
+//! # Performance
+//!
+//! - Quick reject: 99%+ of benign commands exit in O(n) via Aho-Corasick
+//! - Safe patterns: regex whitelist short-circuits before destructive scan
+//! - Pattern matching target: <100μs per command
+//! - Policy lookup: <10μs via HashMap
+
+use aho_corasick::AhoCorasick;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::Instant;
+
+// ============================================================================
+// Telemetry
+// ============================================================================
+
+/// Operational telemetry counters for the command guard.
+///
+/// Counters saturate at `u64::MAX`; long-running guard processes should never
+/// panic or wrap telemetry back to zero.
+#[derive(Debug, Clone, Default)]
+pub struct CommandGuardTelemetry {
+    /// Total evaluate() calls.
+    evaluations: u64,
+    /// Total commands allowed (including quick-reject and read-only).
+    allowed: u64,
+    /// Total commands blocked (destructive pattern matched + Strict trust).
+    blocked: u64,
+    /// Total commands warned (destructive pattern matched + Permissive trust).
+    warned: u64,
+    /// Total commands quick-rejected (no keyword match, bypassed regex scan).
+    quick_rejects: u64,
+    /// Total clear_audit_log() calls.
+    audit_clears: u64,
+}
+
+impl CommandGuardTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CommandGuardTelemetrySnapshot {
+        CommandGuardTelemetrySnapshot {
+            evaluations: self.evaluations,
+            allowed: self.allowed,
+            blocked: self.blocked,
+            warned: self.warned,
+            quick_rejects: self.quick_rejects,
+            audit_clears: self.audit_clears,
+        }
+    }
+}
+
+/// Serializable snapshot of command guard telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandGuardTelemetrySnapshot {
+    /// Total evaluate() calls.
+    pub evaluations: u64,
+    /// Total commands allowed.
+    pub allowed: u64,
+    /// Total commands blocked.
+    pub blocked: u64,
+    /// Total commands warned.
+    pub warned: u64,
+    /// Total quick-reject bypasses.
+    pub quick_rejects: u64,
+    /// Total audit log clears.
+    pub audit_clears: u64,
+}
+
+// ============================================================================
+// Trust Levels
+// ============================================================================
+
+/// Per-pane trust level controlling how strictly commands are guarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    /// Agent panes: block all destructive operations by default.
+    #[default]
+    Strict,
+    /// Human panes: warn but allow with confirmation.
+    Permissive,
+    /// Monitoring/read-only panes: no command interception.
+    ReadOnly,
+}
+
+impl std::fmt::Display for TrustLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Permissive => write!(f, "permissive"),
+            Self::ReadOnly => write!(f, "read_only"),
+        }
+    }
+}
+
+// ============================================================================
+// Guard Decision
+// ============================================================================
+
+/// Result of evaluating a command through the guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum GuardDecision {
+    /// Command is safe to execute.
+    Allow,
+    /// Command blocked — destructive pattern matched.
+    Block {
+        rule_id: String,
+        pack: String,
+        reason: String,
+        suggestions: Vec<String>,
+    },
+    /// Command is destructive but trust level permits with warning.
+    Warn {
+        rule_id: String,
+        pack: String,
+        reason: String,
+    },
+}
+
+impl GuardDecision {
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Block { .. })
+    }
+
+    #[must_use]
+    pub fn is_warning(&self) -> bool {
+        matches!(self, Self::Warn { .. })
+    }
+
+    #[must_use]
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+
+    #[must_use]
+    pub fn rule_id(&self) -> Option<&str> {
+        match self {
+            Self::Block { rule_id, .. } | Self::Warn { rule_id, .. } => Some(rule_id),
+            Self::Allow => None,
+        }
+    }
+}
+
+/// Schema version for the compiled AGENTS doctrine policy bundle.
+pub const AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Stable bundle identifier for AGENTS-derived command doctrine.
+pub const AGENTS_DOCTRINE_POLICY_BUNDLE_ID: &str = "frankenterm.agents_doctrine.v1";
+
+const AGENTS_DOCTRINE_PACK_ID: &str = "agents.doctrine";
+
+/// Serializable policy bundle compiled from repository AGENTS doctrine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctrinePolicyBundle {
+    /// Bundle schema version.
+    pub schema_version: u32,
+    /// Stable bundle id.
+    pub bundle_id: String,
+    /// Human-readable policy source.
+    pub source: String,
+    /// Compiled doctrine rules.
+    pub rules: Vec<DoctrinePolicyRule>,
+}
+
+/// Serializable doctrine rule surfaced to robot/MCP callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctrinePolicyRule {
+    /// Stable rule id.
+    pub rule_id: String,
+    /// Guard pack id.
+    pub pack: String,
+    /// Rule category.
+    pub category: String,
+    /// Operator-facing denial reason.
+    pub reason: String,
+    /// Suggested remediation commands or workflow.
+    pub suggestions: Vec<String>,
+}
+
+/// Returns the compiled command policy derived from AGENTS doctrine.
+#[must_use]
+pub fn compiled_agents_doctrine_policy() -> DoctrinePolicyBundle {
+    DoctrinePolicyBundle {
+        schema_version: AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION,
+        bundle_id: AGENTS_DOCTRINE_POLICY_BUNDLE_ID.to_string(),
+        source: "AGENTS.md command safety doctrine".to_string(),
+        rules: DOCTRINE_RULES
+            .iter()
+            .map(DoctrineRule::to_policy_rule)
+            .collect(),
+    }
+}
+
+// ============================================================================
+// Security Packs
+// ============================================================================
+
+/// A single destructive pattern rule.
+struct DestructiveRule {
+    id: &'static str,
+    pattern: &'static LazyLock<Regex>,
+    reason: &'static str,
+    suggestions: &'static [&'static str],
+}
+
+/// A single safe pattern (whitelist).
+struct SafeRule {
+    pattern: &'static LazyLock<Regex>,
+}
+
+/// A security pack — collection of keyword triggers, safe patterns, and
+/// destructive patterns for a specific domain.
+struct SecurityPack {
+    id: &'static str,
+    keywords: &'static [&'static str],
+    safe_rules: &'static [SafeRule],
+    destructive_rules: &'static [DestructiveRule],
+}
+
+#[derive(Clone, Copy)]
+enum DoctrineMatcher {
+    Regex(&'static LazyLock<Regex>),
+    CargoProofWithoutFailClosedRch,
+}
+
+struct DoctrineRule {
+    id: &'static str,
+    category: &'static str,
+    matcher: DoctrineMatcher,
+    reason: &'static str,
+    suggestions: &'static [&'static str],
+}
+
+impl DoctrineRule {
+    fn matches(&self, command: &str) -> bool {
+        match self.matcher {
+            DoctrineMatcher::Regex(pattern) => pattern.is_match(command),
+            DoctrineMatcher::CargoProofWithoutFailClosedRch => {
+                CARGO_PROOF_COMMAND.is_match(command)
+                    && FRANKENTERM_PROOF_TARGET.is_match(command)
+                    && !has_fail_closed_rch_prefix(command)
+            }
+        }
+    }
+
+    fn to_policy_rule(&self) -> DoctrinePolicyRule {
+        DoctrinePolicyRule {
+            rule_id: self.id.to_string(),
+            pack: AGENTS_DOCTRINE_PACK_ID.to_string(),
+            category: self.category.to_string(),
+            reason: self.reason.to_string(),
+            suggestions: self.suggestions.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+}
+
+static GIT_WORKTREE_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+worktree\s+(add|remove|prune|move|repair)\b").unwrap()
+});
+static AGENT_MAIL_REPAIR_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bam\s+(?:service\s+(?:restart|stop)|doctor\s+(?:fix|repair|reconstruct))\b")
+        .unwrap()
+});
+static PROTECTED_CORE_MUTATION_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:rm|git\s+rm|mv)\b[^;&|\n]*\bcrates/frankenterm-core(?:/|\b)").unwrap()
+});
+static CARGO_PROOF_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[;&|\n]\s*|\benv\s+[^;&|\n]*\s+)\bcargo\s+(?:test|check|clippy|build|fmt)\b",
+    )
+    .unwrap()
+});
+// The doctrine rule is repo doctrine, not universal product policy: it
+// only applies when the command text itself proves it targets this
+// project (an explicit frankenterm package reference). Generic cargo
+// commands ("cargo build", "cargo fmt --check") must stay allowed at
+// this layer — the actor-aware RCH heavy-compute gate in policy.rs owns
+// the "agents must offload heavy cargo" nuance (ft-0eby0; pinned by
+// allows_safe_commands + robot_light_cargo_without_rch_is_allowed +
+// human_heavy_cargo_without_rch_is_not_forced_through_rch_policy).
+static FRANKENTERM_PROOF_TARGET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:-p|--package)(?:\s+|=)frankenterm(?:-[a-z0-9_-]+)?\b").unwrap()
+});
+static LEGACY_DEFAULT_BRANCH_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    let branch = legacy_default_branch_name();
+    Regex::new(&format!(
+        r"(?i)\bgit\s+(?:checkout|switch)\s+{branch}\b|\bgit\s+(?:push|pull)\s+\S+\s+{branch}\b"
+    ))
+    .unwrap()
+});
+
+static DOCTRINE_RULES: &[DoctrineRule] = &[
+    DoctrineRule {
+        id: "agents.doctrine:no-git-worktree",
+        category: "git_worktree_forbidden",
+        matcher: DoctrineMatcher::Regex(&GIT_WORKTREE_COMMAND),
+        reason: "Repository doctrine forbids git worktree operations in this checkout",
+        suggestions: &["Use the primary main checkout and coordinate through Beads"],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:no-agent-mail-repair",
+        category: "agent_mail_process_protection",
+        matcher: DoctrineMatcher::Regex(&AGENT_MAIL_REPAIR_COMMAND),
+        reason: "Repository doctrine forbids restarting or repairing the shared agent-mail service",
+        suggestions: &["Retry once, then proceed with Beads/git state as the coordination surface"],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:no-local-cargo-proof",
+        category: "fail_closed_remote_proof",
+        matcher: DoctrineMatcher::CargoProofWithoutFailClosedRch,
+        reason: "Frankenterm cargo proof commands must run through fail-closed remote rch",
+        suggestions: &[concat!(
+            "Prefix with RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 ",
+            "rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-<pane>-target"
+        )],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:protect-frankenterm-core",
+        category: "protected_core_crate",
+        matcher: DoctrineMatcher::Regex(&PROTECTED_CORE_MUTATION_COMMAND),
+        reason: "Repository doctrine forbids deletion or relocation of crates/frankenterm-core",
+        suggestions: &[
+            "Do not stage protected-crate deletions; restore missing protected files before committing",
+        ],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:main-branch-only",
+        category: "main_branch_only",
+        matcher: DoctrineMatcher::Regex(&LEGACY_DEFAULT_BRANCH_COMMAND),
+        reason: "Repository doctrine requires main as the working branch target",
+        suggestions: &[
+            "Use main for branch operations and synchronize the legacy remote ref only after main",
+        ],
+    },
+];
+
+fn legacy_default_branch_name() -> String {
+    ["mas", "ter"].concat()
+}
+
+fn has_fail_closed_rch_prefix(command: &str) -> bool {
+    command.contains("RCH_REQUIRE_REMOTE=1")
+        && command.contains("RCH_NO_SELF_HEALING=1")
+        && command.contains("rch --no-self-healing exec --")
+}
+
+fn evaluate_doctrine_stateless(command: &str) -> Option<(String, String, String, Vec<String>)> {
+    let normalized_command = normalize_command_for_guard(command);
+    DOCTRINE_RULES
+        .iter()
+        .find(|rule| rule.matches(&normalized_command))
+        .map(|rule| {
+            (
+                rule.id.to_string(),
+                AGENTS_DOCTRINE_PACK_ID.to_string(),
+                rule.reason.to_string(),
+                rule.suggestions.iter().map(|s| (*s).to_string()).collect(),
+            )
+        })
+}
+
+fn normalize_command_for_guard(command: &str) -> String {
+    let tokens = tokenize_command_for_guard(command);
+    if tokens.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    // ft-0eby0: only rewrite git/rm/chmod when the token is in COMMAND
+    // position (start of a simple command). A bare token match anywhere
+    // hoisted subcommand flags into rm(1) flags — `aws s3 rm s3://bucket
+    // --recursive` became `aws s3 rm -r s3://bucket`, which then matched
+    // core.filesystem:rm-rf instead of the cloud pack's own rule.
+    let mut command_position = true;
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            normalized.push(part.clone());
+            command_position = true;
+            index += 1;
+            continue;
+        }
+        if command_position && part.eq_ignore_ascii_case("git") {
+            index = normalize_git_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && part.eq_ignore_ascii_case("rm") {
+            index = normalize_rm_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && part.eq_ignore_ascii_case("chmod") {
+            index = normalize_chmod_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && !is_command_position_transparent(part) {
+            command_position = false;
+        }
+        normalized.push(part.clone());
+        index += 1;
+    }
+
+    normalized.join(" ")
+}
+
+/// Tokens that forward command position to the NEXT token: wrapper
+/// commands (`sudo rm …`, `xargs rm …`), wrapper flags (`xargs -0 rm …`),
+/// and environment assignments (`FOO=1 rm …`). Everything else consumes
+/// command position (it IS the command; what follows is its arguments).
+fn is_command_position_transparent(token: &str) -> bool {
+    const WRAPPERS: [&str; 8] = [
+        "sudo", "env", "xargs", "nohup", "time", "timeout", "command", "exec",
+    ];
+    if WRAPPERS
+        .iter()
+        .any(|wrapper| token.eq_ignore_ascii_case(wrapper))
+    {
+        return true;
+    }
+    token.starts_with('-') || token.contains('=')
+}
+
+fn tokenize_command_for_guard(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            push_token_if_present(&mut tokens, &mut current);
+            continue;
+        }
+
+        match ch {
+            ';' => {
+                push_token_if_present(&mut tokens, &mut current);
+                tokens.push(";".to_string());
+            }
+            '&' => {
+                push_token_if_present(&mut tokens, &mut current);
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push("&&".to_string());
+                } else {
+                    tokens.push("&".to_string());
+                }
+            }
+            '|' => {
+                push_token_if_present(&mut tokens, &mut current);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push("||".to_string());
+                } else {
+                    tokens.push("|".to_string());
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    push_token_if_present(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_token_if_present(tokens: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        tokens.push(std::mem::take(current));
+    }
+}
+
+fn is_command_separator(token: &str) -> bool {
+    matches!(token, ";" | "&" | "&&" | "|" | "||")
+}
+
+fn push_unique_flag(flags: &mut String, flag: char) {
+    if !flags.contains(flag) {
+        flags.push(flag);
+    }
+}
+
+fn normalize_rm_invocation(tokens: &[String], start: usize, normalized: &mut Vec<String>) -> usize {
+    normalized.push("rm".to_string());
+    let mut flags = String::new();
+    let mut rest = Vec::new();
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part.eq_ignore_ascii_case("--recursive") {
+            push_unique_flag(&mut flags, 'r');
+        } else if part.eq_ignore_ascii_case("--force") {
+            push_unique_flag(&mut flags, 'f');
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'r' || flag == 'R' {
+                    push_unique_flag(&mut flags, 'r');
+                } else if flag == 'f' {
+                    push_unique_flag(&mut flags, 'f');
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if flags.contains('r') && flags.contains('f') {
+        normalized.push("-rf".to_string());
+    } else if flags.contains('r') {
+        normalized.push("-r".to_string());
+    } else if flags.contains('f') {
+        normalized.push("-f".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_chmod_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    normalized.push("chmod".to_string());
+    let mut has_recursive = false;
+    let mut rest = Vec::new();
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part.eq_ignore_ascii_case("--recursive") {
+            has_recursive = true;
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'R' {
+                    has_recursive = true;
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if has_recursive {
+        normalized.push("-R".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_git_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    normalized.push("git".to_string());
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if git_global_option_has_inline_value(part) || git_global_boolean_option(part) {
+            index += 1;
+        } else if git_global_option_takes_value(part) {
+            index += 1;
+            if tokens
+                .get(index)
+                .is_some_and(|next_part| !is_command_separator(next_part))
+            {
+                index += 1;
+            }
+        } else {
+            let subcommand = part.to_ascii_lowercase();
+            normalized.push(part.clone());
+            index += 1;
+            return match subcommand.as_str() {
+                "branch" => normalize_git_branch_invocation(tokens, index, normalized),
+                "clean" => normalize_git_clean_invocation(tokens, index, normalized),
+                "push" => normalize_git_push_invocation(tokens, index, normalized),
+                _ => copy_until_separator(tokens, index, normalized),
+            };
+        }
+    }
+
+    index
+}
+
+fn git_global_option_takes_value(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "-c" | "--attr-source"
+            | "--config-env"
+            | "--exec-path"
+            | "--git-dir"
+            | "--namespace"
+            | "--object-format"
+            | "--path-format"
+            | "--super-prefix"
+            | "--work-tree"
+    )
+}
+
+fn git_global_option_has_inline_value(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ((token.starts_with("-c") || token.starts_with("-C"))
+        && token.len() > 2
+        && !token.starts_with("--"))
+        || lower.starts_with("--attr-source=")
+        || lower.starts_with("--config-env=")
+        || lower.starts_with("--exec-path=")
+        || lower.starts_with("--git-dir=")
+        || lower.starts_with("--namespace=")
+        || lower.starts_with("--object-format=")
+        || lower.starts_with("--path-format=")
+        || lower.starts_with("--super-prefix=")
+        || lower.starts_with("--work-tree=")
+}
+
+fn git_global_boolean_option(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "-p" | "--bare"
+            | "--glob-pathspecs"
+            | "--icase-pathspecs"
+            | "--literal-pathspecs"
+            | "--no-optional-locks"
+            | "--no-pager"
+            | "--no-replace-objects"
+            | "--noglob-pathspecs"
+            | "--paginate"
+    )
+}
+
+fn normalize_git_push_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut index = start;
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--force" {
+            normalized.push("-f".to_string());
+        } else {
+            normalized.push(part.clone());
+        }
+        index += 1;
+    }
+    index
+}
+
+fn normalize_git_clean_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut flags = String::new();
+    let mut rest = Vec::new();
+    let mut index = start;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--force" {
+            push_unique_flag(&mut flags, 'f');
+        } else if part == "--directory" {
+            push_unique_flag(&mut flags, 'd');
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'f' || flag == 'd' {
+                    push_unique_flag(&mut flags, flag);
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if flags.contains('f') && flags.contains('d') {
+        normalized.push("-fd".to_string());
+    } else if flags.contains('f') {
+        normalized.push("-f".to_string());
+    } else if flags.contains('d') {
+        normalized.push("-d".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_git_branch_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut has_delete = false;
+    let mut has_force = false;
+    let mut rest = Vec::new();
+    let mut index = start;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--delete" {
+            has_delete = true;
+        } else if part == "--force" {
+            has_force = true;
+        } else if part == "-D" {
+            has_delete = true;
+            has_force = true;
+        } else if part == "-d" {
+            has_delete = true;
+        } else if part == "-f" {
+            has_force = true;
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if has_delete && has_force {
+        normalized.push("-D".to_string());
+    } else if has_delete {
+        normalized.push("-d".to_string());
+    } else if has_force {
+        normalized.push("--force".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn copy_until_separator(tokens: &[String], start: usize, normalized: &mut Vec<String>) -> usize {
+    let mut index = start;
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        normalized.push(part.clone());
+        index += 1;
+    }
+    index
+}
+
+// ---------------------------------------------------------------------------
+// Pack: core.filesystem
+// ---------------------------------------------------------------------------
+
+// Destructive patterns run over `normalize_command_for_guard`, so GNU long
+// flags such as `--recursive` / `--force` are canonicalized before regex
+// matching instead of every rule carrying every spelling variant.
+//
+// ft-0eby0: the rm(1) rules only apply to COMMAND-POSITION rm. An `rm`
+// subcommand of another tool (`aws s3 rm`, `docker rm -f`) must fall
+// through to that tool's own pack for correct attribution (wrong rule id
+// means wrong reason and wrong remediation in the operator surface).
+// Mirrors the command-position rule in `normalize_command_for_guard`:
+// string start or a separator, then optionally wrapper commands, wrapper
+// flags, and VAR=value assignments.
+const RM_COMMAND_POSITION: &str = concat!(
+    r"(?:^|[;&|]\s+|\b(?:sudo|env|xargs|nohup|time|timeout|command|exec)\s+)",
+    r"(?:(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*"
+);
+static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\s+(/\s*$|~\s*$|\$HOME\s*$)"
+    ))
+    .unwrap()
+});
+static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\b"
+    ))
+    .unwrap()
+});
+static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\s*(?:;|$|&&|\|\||\||\n)").unwrap()
+});
+// Treat any world-writable octal mode as wide-open, not just the literal
+// `777|666|000`; `normalize_command_for_guard` canonicalizes `--recursive`.
+// `[0-7]{0,2}[2367]` matches a 1–3 digit octal whose final (other) digit has
+// the write bit set; `755`/`644`/`750` stay allowed.
+static CHMOD_RECURSIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bchmod\s+(?:-[a-z]*R[a-z]*\s+)?(?:000|[0-7]{0,2}[2367])\s").unwrap()
+});
+static DD_OF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdd\b.*\bof=\s*/dev/(sd[a-z]|nvme|disk|hd[a-z])").unwrap());
+static MKFS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(mkfs|mke2fs)\b").unwrap());
+
+static PACK_FILESYSTEM: SecurityPack = SecurityPack {
+    id: "core.filesystem",
+    keywords: &["rm", "chmod", "dd", "mkfs", "mke2fs", "shred"],
+    safe_rules: &[SafeRule {
+        pattern: &RM_RF_SAFE,
+    }],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "core.filesystem:rm-rf-root",
+            pattern: &RM_RF_ROOT,
+            reason: "rm -rf targeting root/home — catastrophic data loss",
+            suggestions: &["Use a specific subdirectory path instead"],
+        },
+        DestructiveRule {
+            id: "core.filesystem:rm-rf",
+            pattern: &RM_RF,
+            reason: "Recursive forced deletion — verify target path",
+            suggestions: &["Add --interactive or use trash-put instead"],
+        },
+        DestructiveRule {
+            id: "core.filesystem:chmod-recursive-wide",
+            pattern: &CHMOD_RECURSIVE,
+            reason: "Recursive chmod to wide-open permissions",
+            suggestions: &["Use more restrictive permissions (755 or 644)"],
+        },
+        DestructiveRule {
+            id: "core.filesystem:dd-device",
+            pattern: &DD_OF,
+            reason: "dd writing directly to block device — data loss",
+            suggestions: &["Double-check the of= target device"],
+        },
+        DestructiveRule {
+            id: "core.filesystem:mkfs",
+            pattern: &MKFS,
+            reason: "Filesystem creation destroys existing data",
+            suggestions: &["Verify the target partition is correct"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: core.git
+// ---------------------------------------------------------------------------
+
+// Git scans also run over `normalize_command_for_guard`, which strips known
+// global options (`--no-pager`, `-c x=y`, `--git-dir=/x`) before the subcommand.
+static GIT_PUSH_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap());
+static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
+        .unwrap()
+});
+static GIT_RESET_HARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
+static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+clean\b[^;&|\n]*(?:-[a-z]*f[a-z]*d[a-z]*|-[a-z]*d[a-z]*f[a-z]*)")
+        .unwrap()
+});
+static GIT_BRANCH_DELETE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\s+-D\b").unwrap());
+static GIT_CHECKOUT_DOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+checkout\s+--\s+[^;&|\n]+").unwrap());
+static GIT_STASH_DROP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+stash\s+(drop|clear)\b").unwrap());
+static GIT_REBASE_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+rebase\b.*\b(--force-rebase|--root)\b").unwrap());
+
+static PACK_GIT: SecurityPack = SecurityPack {
+    id: "core.git",
+    keywords: &["git"],
+    safe_rules: &[SafeRule {
+        pattern: &GIT_PUSH_FORCE_LEASE,
+    }],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "core.git:push-force",
+            pattern: &GIT_PUSH_FORCE,
+            reason: "Force push rewrites remote history",
+            suggestions: &["Use --force-with-lease for safer force push"],
+        },
+        DestructiveRule {
+            id: "core.git:reset-hard",
+            pattern: &GIT_RESET_HARD,
+            reason: "git reset --hard discards uncommitted changes",
+            suggestions: &["Use git stash to save changes first"],
+        },
+        DestructiveRule {
+            id: "core.git:clean-fd",
+            pattern: &GIT_CLEAN_FD,
+            reason: "git clean removes untracked files permanently",
+            suggestions: &["Use git clean -n for dry run first"],
+        },
+        DestructiveRule {
+            id: "core.git:branch-delete-force",
+            pattern: &GIT_BRANCH_DELETE,
+            reason: "git branch -D force-deletes without merge check",
+            suggestions: &["Use -d (lowercase) for safe delete with merge check"],
+        },
+        DestructiveRule {
+            id: "core.git:checkout-dot",
+            pattern: &GIT_CHECKOUT_DOT,
+            reason: "git checkout -- <path> discards unstaged changes in that path",
+            suggestions: &["Use git stash to save changes first"],
+        },
+        DestructiveRule {
+            id: "core.git:stash-drop",
+            pattern: &GIT_STASH_DROP,
+            reason: "Stash drop/clear permanently deletes stashed changes",
+            suggestions: &["Use git stash list to review before dropping"],
+        },
+        DestructiveRule {
+            id: "core.git:rebase-force",
+            pattern: &GIT_REBASE_FORCE,
+            reason: "Forced rebase rewrites commit history",
+            suggestions: &["Ensure no shared commits will be affected"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: database
+// ---------------------------------------------------------------------------
+
+static SQL_DROP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(DROP\s+(TABLE|DATABASE|SCHEMA|INDEX|VIEW|TRIGGER|FUNCTION|PROCEDURE))\b")
+        .unwrap()
+});
+static SQL_TRUNCATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bTRUNCATE\s+(TABLE\s+)?\w").unwrap());
+// Terminate on `;`, end-of-string, or a closing quote/backtick — not only a
+// semicolon. `DELETE FROM users` (no trailing `;`, the normal form for
+// `psql -c`, ORMs, and REPLs) previously slipped through. A `WHERE` clause
+// still keeps the statement allowed because the terminator can't follow the
+// table name when `WHERE` does.
+static SQL_DELETE_NO_WHERE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bDELETE\s+FROM\s+\w+\s*(?:;|$|["'`])"#).unwrap());
+static SQL_ALTER_DROP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bALTER\s+TABLE\s+\w+\s+DROP\s+(COLUMN|CONSTRAINT|INDEX)\b").unwrap()
+});
+
+static PACK_DATABASE: SecurityPack = SecurityPack {
+    id: "database",
+    keywords: &[
+        "DROP",
+        "drop",
+        "TRUNCATE",
+        "truncate",
+        "DELETE",
+        "delete",
+        "ALTER",
+        "alter",
+        "psql",
+        "mysql",
+        "sqlite3",
+        "mongosh",
+        "redis-cli",
+    ],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "database:drop",
+            pattern: &SQL_DROP,
+            reason: "DROP permanently destroys database objects",
+            suggestions: &["Use IF EXISTS and take a backup first"],
+        },
+        DestructiveRule {
+            id: "database:truncate",
+            pattern: &SQL_TRUNCATE,
+            reason: "TRUNCATE removes all rows without logging",
+            suggestions: &["Use DELETE with WHERE for selective removal"],
+        },
+        DestructiveRule {
+            id: "database:delete-no-where",
+            pattern: &SQL_DELETE_NO_WHERE,
+            reason: "DELETE without WHERE clause removes all rows",
+            suggestions: &["Add a WHERE clause to limit deletion scope"],
+        },
+        DestructiveRule {
+            id: "database:alter-drop",
+            pattern: &SQL_ALTER_DROP,
+            reason: "ALTER TABLE DROP permanently removes columns/constraints",
+            suggestions: &["Back up the table before altering"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: containers
+// ---------------------------------------------------------------------------
+
+static DOCKER_SYSTEM_PRUNE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+system\s+prune\b").unwrap());
+static DOCKER_RM_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+(rm|rmi)\s+(-[a-z]*f[a-z]*\s+)?").unwrap());
+static DOCKER_VOLUME_RM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+volume\s+(rm|prune)\b").unwrap());
+
+static PACK_CONTAINERS: SecurityPack = SecurityPack {
+    id: "containers",
+    keywords: &["docker", "podman", "docker-compose"],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "containers:system-prune",
+            pattern: &DOCKER_SYSTEM_PRUNE,
+            reason: "docker system prune removes all unused data",
+            suggestions: &["Use --filter to limit what gets pruned"],
+        },
+        DestructiveRule {
+            id: "containers:rm-force",
+            pattern: &DOCKER_RM_FORCE,
+            reason: "Force removing containers/images",
+            suggestions: &["Stop containers gracefully first"],
+        },
+        DestructiveRule {
+            id: "containers:volume-rm",
+            pattern: &DOCKER_VOLUME_RM,
+            reason: "Removing Docker volumes destroys persistent data",
+            suggestions: &["Back up volume data before removal"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: kubernetes
+// ---------------------------------------------------------------------------
+
+static KUBECTL_DELETE_NS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+delete\s+(namespace|ns)\b").unwrap());
+static KUBECTL_DELETE_ALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+delete\b.*--all\b").unwrap());
+static KUBECTL_DRAIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+drain\b").unwrap());
+static HELM_UNINSTALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bhelm\s+(uninstall|delete)\b").unwrap());
+
+static PACK_KUBERNETES: SecurityPack = SecurityPack {
+    id: "kubernetes",
+    keywords: &["kubectl", "helm", "kustomize"],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "kubernetes:delete-namespace",
+            pattern: &KUBECTL_DELETE_NS,
+            reason: "Deleting a namespace removes all resources within it",
+            suggestions: &["Verify the namespace and its contents first"],
+        },
+        DestructiveRule {
+            id: "kubernetes:delete-all",
+            pattern: &KUBECTL_DELETE_ALL,
+            reason: "kubectl delete --all removes all resources of that type",
+            suggestions: &["Use label selectors for targeted deletion"],
+        },
+        DestructiveRule {
+            id: "kubernetes:drain",
+            pattern: &KUBECTL_DRAIN,
+            reason: "Node drain evicts all pods",
+            suggestions: &["Use --dry-run first, ensure PDBs are configured"],
+        },
+        DestructiveRule {
+            id: "kubernetes:helm-uninstall",
+            pattern: &HELM_UNINSTALL,
+            reason: "Helm uninstall removes the release and its resources",
+            suggestions: &["Use --keep-history to allow rollback"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: cloud (AWS/GCP/Azure)
+// ---------------------------------------------------------------------------
+
+static AWS_S3_RM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\baws\s+s3\s+(rm|rb)\b.*--recursive\b").unwrap());
+static AWS_EC2_TERMINATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\baws\s+ec2\s+terminate-instances\b").unwrap());
+static TERRAFORM_DESTROY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bterraform\s+destroy\b").unwrap());
+
+static PACK_CLOUD: SecurityPack = SecurityPack {
+    id: "cloud",
+    keywords: &["aws", "gcloud", "az", "terraform", "pulumi"],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "cloud:aws-s3-rm-recursive",
+            pattern: &AWS_S3_RM,
+            reason: "Recursive S3 deletion can destroy entire buckets",
+            suggestions: &["Use --dryrun first to preview deletions"],
+        },
+        DestructiveRule {
+            id: "cloud:aws-ec2-terminate",
+            pattern: &AWS_EC2_TERMINATE,
+            reason: "Terminating EC2 instances is irreversible",
+            suggestions: &["Use stop-instances for recoverable shutdown"],
+        },
+        DestructiveRule {
+            id: "cloud:terraform-destroy",
+            pattern: &TERRAFORM_DESTROY,
+            reason: "terraform destroy removes all managed infrastructure",
+            suggestions: &["Use -target for selective destruction, or plan first"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: system
+// ---------------------------------------------------------------------------
+
+// Catch SIGKILL in all common spellings and the `pkill` variant: `-9`,
+// `-KILL`/`-SIGKILL`, and `-s 9` / `-s KILL`. The old rule only matched
+// `kill -9`, `kill -KILL`, `killall -9` — so `pkill -9`, `kill -s 9`,
+// `kill -SIGKILL`, and `killall -KILL` all bypassed it.
+static KILL_MINUS_9: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:p?kill|killall)\s+(?:-9\b|-(?:sig)?kill\b|-s\s*(?:9|(?:sig)?kill)\b)")
+        .unwrap()
+});
+static SYSTEMCTL_STOP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(systemctl|service)\s+(stop|disable|mask)\b").unwrap());
+static REBOOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(reboot|shutdown|halt|poweroff|init\s+[06])\b").unwrap());
+
+static PACK_SYSTEM: SecurityPack = SecurityPack {
+    id: "system",
+    keywords: &[
+        "kill",
+        "killall",
+        "pkill",
+        "systemctl",
+        "service",
+        "reboot",
+        "shutdown",
+        "halt",
+        "poweroff",
+        "init",
+    ],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "system:kill-9",
+            pattern: &KILL_MINUS_9,
+            reason: "SIGKILL does not allow graceful shutdown",
+            suggestions: &["Use SIGTERM (kill -15) first for graceful shutdown"],
+        },
+        DestructiveRule {
+            id: "system:service-stop",
+            pattern: &SYSTEMCTL_STOP,
+            reason: "Stopping/disabling system services can break functionality",
+            suggestions: &["Verify the service is not critical before stopping"],
+        },
+        DestructiveRule {
+            id: "system:reboot",
+            pattern: &REBOOT,
+            reason: "System reboot/shutdown affects all running processes",
+            suggestions: &["Save all work and notify users before rebooting"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Pack: package_managers
+// ---------------------------------------------------------------------------
+
+static NPM_UNPUBLISH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bnpm\s+unpublish\b").unwrap());
+static CARGO_YANK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bcargo\s+yank\b").unwrap());
+static PIP_UNINSTALL_ALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpip3?\s+uninstall\b.*-y\b").unwrap());
+
+static PACK_PACKAGE_MANAGERS: SecurityPack = SecurityPack {
+    id: "package_managers",
+    keywords: &["npm", "cargo", "pip", "pip3", "gem", "brew"],
+    safe_rules: &[],
+    destructive_rules: &[
+        DestructiveRule {
+            id: "package_managers:npm-unpublish",
+            pattern: &NPM_UNPUBLISH,
+            reason: "npm unpublish removes packages from the registry",
+            suggestions: &["Use npm deprecate instead"],
+        },
+        DestructiveRule {
+            id: "package_managers:cargo-yank",
+            pattern: &CARGO_YANK,
+            reason: "cargo yank prevents new downloads of a version",
+            suggestions: &["Publish a patched version instead"],
+        },
+        DestructiveRule {
+            id: "package_managers:pip-uninstall-all",
+            pattern: &PIP_UNINSTALL_ALL,
+            reason: "Bulk pip uninstall can break the environment",
+            suggestions: &["Uninstall specific packages instead"],
+        },
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// All packs
+// ---------------------------------------------------------------------------
+
+static ALL_PACKS: &[&SecurityPack] = &[
+    &PACK_FILESYSTEM,
+    &PACK_GIT,
+    &PACK_DATABASE,
+    &PACK_CONTAINERS,
+    &PACK_KUBERNETES,
+    &PACK_CLOUD,
+    &PACK_SYSTEM,
+    &PACK_PACKAGE_MANAGERS,
+];
+
+/// Build an Aho-Corasick automaton from all pack keywords.
+static KEYWORD_AUTOMATON: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    let mut keywords = Vec::new();
+    for pack in ALL_PACKS {
+        for kw in pack.keywords {
+            keywords.push(*kw);
+        }
+    }
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&keywords)
+        .expect("valid Aho-Corasick patterns")
+});
+
+/// Map keyword → pack IDs for quick-reject filtering.
+static KEYWORD_TO_PACKS: LazyLock<HashMap<String, Vec<&'static str>>> = LazyLock::new(|| {
+    let mut map: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for pack in ALL_PACKS {
+        for kw in pack.keywords {
+            map.entry(kw.to_ascii_lowercase())
+                .or_default()
+                .push(pack.id);
+        }
+    }
+    map
+});
+
+// ============================================================================
+// Per-pane Guard Configuration
+// ============================================================================
+
+/// Per-pane guard configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneGuardConfig {
+    /// Trust level for this pane.
+    pub trust_level: TrustLevel,
+    /// Override enabled packs (None = use global policy).
+    pub enabled_packs: Option<Vec<String>>,
+    /// Per-pane allowlist — commands matching these patterns are always allowed.
+    pub allowlist_patterns: Vec<String>,
+    /// Max evaluation time in microseconds before fail-open.
+    pub budget_us: u64,
+}
+
+impl Default for PaneGuardConfig {
+    fn default() -> Self {
+        Self {
+            trust_level: TrustLevel::Strict,
+            enabled_packs: None,
+            allowlist_patterns: Vec::new(),
+            budget_us: 100,
+        }
+    }
+}
+
+// ============================================================================
+// Guard Policy
+// ============================================================================
+
+/// Centralized guard policy for the FrankenTerm instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardPolicy {
+    /// Default trust level for new panes.
+    pub default_trust: TrustLevel,
+    /// Globally enabled security pack IDs.
+    pub enabled_packs: Vec<String>,
+    /// Globally disabled security pack IDs.
+    pub disabled_packs: Vec<String>,
+    /// Per-pane configuration overrides.
+    pub pane_overrides: HashMap<u64, PaneGuardConfig>,
+    /// Max audit log entries (ring buffer capacity).
+    pub audit_capacity: usize,
+}
+
+impl Default for GuardPolicy {
+    fn default() -> Self {
+        Self {
+            default_trust: TrustLevel::Strict,
+            enabled_packs: ALL_PACKS.iter().map(|p| p.id.to_string()).collect(),
+            disabled_packs: Vec::new(),
+            pane_overrides: HashMap::new(),
+            audit_capacity: 10_000,
+        }
+    }
+}
+
+// ============================================================================
+// Audit Log
+// ============================================================================
+
+/// Audit entry for a guard evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Pane that the command was evaluated for.
+    pub pane_id: u64,
+    /// The command text (truncated to 256 chars).
+    pub command: String,
+    /// Decision outcome.
+    pub decision: String,
+    /// Matched rule ID (if any).
+    pub rule_id: Option<String>,
+    /// Matched pack (if any).
+    pub pack: Option<String>,
+    /// Evaluation duration in microseconds.
+    pub eval_us: u64,
+    /// Epoch seconds timestamp.
+    pub timestamp_s: u64,
+}
+
+// ============================================================================
+// Command Guard Engine
+// ============================================================================
+
+/// Native command guard engine — evaluates commands against security packs
+/// with per-pane trust levels.
+pub struct CommandGuard {
+    policy: GuardPolicy,
+    /// Compiled per-pane allowlist regexes (lazily populated).
+    pane_allowlists: HashMap<u64, Vec<Regex>>,
+    /// Ring buffer of audit entries.
+    audit_log: Vec<AuditEntry>,
+    audit_write_idx: usize,
+    /// Operational telemetry counters.
+    telemetry: CommandGuardTelemetry,
+}
+
+fn elapsed_micros_u64(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+impl CommandGuard {
+    /// Create a new guard with the given policy.
+    #[must_use]
+    pub fn new(policy: GuardPolicy) -> Self {
+        let capacity = policy.audit_capacity;
+        Self {
+            policy,
+            pane_allowlists: HashMap::new(),
+            audit_log: Vec::with_capacity(capacity.min(1024)),
+            audit_write_idx: 0,
+            telemetry: CommandGuardTelemetry::new(),
+        }
+    }
+
+    /// Create a guard with default policy.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(GuardPolicy::default())
+    }
+
+    /// Evaluate a command for a specific pane.
+    pub fn evaluate(&mut self, command: &str, pane_id: u64) -> GuardDecision {
+        self.telemetry.evaluations = self.telemetry.evaluations.saturating_add(1);
+        let start = Instant::now();
+        let pane_config = self.pane_config(pane_id);
+        let trust = pane_config.trust_level;
+
+        if let Some(decision) = Self::scan_doctrine(command) {
+            let elapsed = elapsed_micros_u64(start);
+            if let GuardDecision::Block { rule_id, pack, .. } = &decision {
+                self.record(
+                    pane_id,
+                    command,
+                    "block",
+                    Some(rule_id.clone()),
+                    Some(pack.clone()),
+                    elapsed,
+                );
+                self.telemetry.blocked = self.telemetry.blocked.saturating_add(1);
+            }
+            return decision;
+        }
+
+        // ReadOnly panes skip evaluation entirely.
+        if trust == TrustLevel::ReadOnly {
+            self.record(pane_id, command, "allow", None, None, 0);
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            return GuardDecision::Allow;
+        }
+
+        // Check per-pane allowlist first.
+        if self.matches_pane_allowlist(command, pane_id) {
+            let elapsed = elapsed_micros_u64(start);
+            self.record(pane_id, command, "allow", None, None, elapsed);
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            return GuardDecision::Allow;
+        }
+
+        let normalized_command = normalize_command_for_guard(command);
+
+        // Quick-reject: check if command contains any pack keywords.
+        let relevant_packs = self.keyword_filter(&normalized_command, &pane_config);
+        if relevant_packs.is_empty() {
+            let elapsed = elapsed_micros_u64(start);
+            self.record(pane_id, command, "allow", None, None, elapsed);
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            self.telemetry.quick_rejects = self.telemetry.quick_rejects.saturating_add(1);
+            return GuardDecision::Allow;
+        }
+
+        // Scan relevant packs for destructive patterns.
+        let decision = Self::scan_packs(&normalized_command, &relevant_packs, trust);
+        let elapsed = elapsed_micros_u64(start);
+
+        let (dec_str, rule, pack) = match &decision {
+            GuardDecision::Allow => ("allow", None, None),
+            GuardDecision::Block { rule_id, pack, .. } => {
+                ("block", Some(rule_id.clone()), Some(pack.clone()))
+            }
+            GuardDecision::Warn { rule_id, pack, .. } => {
+                ("warn", Some(rule_id.clone()), Some(pack.clone()))
+            }
+        };
+        self.record(pane_id, command, dec_str, rule, pack, elapsed);
+
+        match &decision {
+            GuardDecision::Allow => {
+                self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            }
+            GuardDecision::Block { .. } => {
+                self.telemetry.blocked = self.telemetry.blocked.saturating_add(1);
+            }
+            GuardDecision::Warn { .. } => {
+                self.telemetry.warned = self.telemetry.warned.saturating_add(1);
+            }
+        }
+
+        decision
+    }
+
+    /// Evaluate a command and return the decision along with evaluation time in microseconds.
+    pub fn evaluate_timed(&mut self, command: &str, pane_id: u64) -> (GuardDecision, u64) {
+        let start = Instant::now();
+        let decision = self.evaluate(command, pane_id);
+        let elapsed = elapsed_micros_u64(start);
+        (decision, elapsed)
+    }
+
+    /// Pre-flight query: would this command be blocked for the given pane?
+    /// Does not record to audit log.
+    #[must_use]
+    pub fn preflight(&self, command: &str, pane_id: u64) -> GuardDecision {
+        let pane_config = self.pane_config(pane_id);
+        let trust = pane_config.trust_level;
+
+        if let Some(decision) = Self::scan_doctrine(command) {
+            return decision;
+        }
+
+        if trust == TrustLevel::ReadOnly {
+            return GuardDecision::Allow;
+        }
+
+        let normalized_command = normalize_command_for_guard(command);
+        let relevant_packs = self.keyword_filter(&normalized_command, &pane_config);
+        if relevant_packs.is_empty() {
+            return GuardDecision::Allow;
+        }
+
+        Self::scan_packs(&normalized_command, &relevant_packs, trust)
+    }
+
+    /// Get the current audit log entries.
+    #[must_use]
+    pub fn audit_log(&self) -> &[AuditEntry] {
+        &self.audit_log
+    }
+
+    /// Get the number of audit entries recorded.
+    #[must_use]
+    pub fn audit_count(&self) -> usize {
+        self.audit_log.len()
+    }
+
+    /// Clear the audit log.
+    pub fn clear_audit_log(&mut self) {
+        self.audit_log.clear();
+        self.audit_write_idx = 0;
+        self.telemetry.audit_clears = self.telemetry.audit_clears.saturating_add(1);
+    }
+
+    /// Get the telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &CommandGuardTelemetry {
+        &self.telemetry
+    }
+
+    /// Get the policy.
+    #[must_use]
+    pub fn policy(&self) -> &GuardPolicy {
+        &self.policy
+    }
+
+    /// Update the policy.
+    pub fn set_policy(&mut self, policy: GuardPolicy) {
+        self.policy = policy;
+        self.pane_allowlists.clear(); // Invalidate compiled allowlists.
+    }
+
+    /// Set per-pane configuration.
+    pub fn set_pane_config(&mut self, pane_id: u64, config: PaneGuardConfig) {
+        self.pane_allowlists.remove(&pane_id); // Invalidate cached allowlist.
+        self.policy.pane_overrides.insert(pane_id, config);
+    }
+
+    /// Drop all per-pane guard state for the given pane.
+    ///
+    /// Both `policy.pane_overrides` (set explicitly) and the lazy
+    /// `pane_allowlists` regex cache (populated on `evaluate`) are keyed by
+    /// `pane_id` and are otherwise long-lived, so without this hook a
+    /// high-churn fleet accumulates one stale entry per closed pane forever.
+    /// Callers should invoke this from their `PaneDestroyed` teardown, mirroring
+    /// `RateLimiter::remove_pane` (ft-yjt9e) and the agent-correlator /
+    /// bayesian-ledger per-pane cleanups. Returns `true` if any per-pane state
+    /// was actually removed.
+    pub fn remove_pane(&mut self, pane_id: u64) -> bool {
+        let had_override = self.policy.pane_overrides.remove(&pane_id).is_some();
+        let had_allowlist = self.pane_allowlists.remove(&pane_id).is_some();
+        had_override || had_allowlist
+    }
+
+    /// List available security pack IDs.
+    #[must_use]
+    pub fn available_packs() -> Vec<&'static str> {
+        ALL_PACKS.iter().map(|p| p.id).collect()
+    }
+
+    // ========================================================================
+    // Internal
+    // ========================================================================
+
+    fn pane_config(&self, pane_id: u64) -> PaneGuardConfig {
+        if let Some(override_config) = self.policy.pane_overrides.get(&pane_id) {
+            return override_config.clone();
+        }
+        PaneGuardConfig {
+            trust_level: self.policy.default_trust,
+            ..PaneGuardConfig::default()
+        }
+    }
+
+    fn matches_pane_allowlist(&mut self, command: &str, pane_id: u64) -> bool {
+        let patterns = if let Some(cached) = self.pane_allowlists.get(&pane_id) {
+            cached
+        } else {
+            let pane_config = self.pane_config(pane_id);
+            let compiled: Vec<Regex> = pane_config
+                .allowlist_patterns
+                .iter()
+                .filter_map(|p| Regex::new(p).ok())
+                .collect();
+            self.pane_allowlists.insert(pane_id, compiled);
+            self.pane_allowlists.get(&pane_id).unwrap()
+        };
+
+        patterns.iter().any(|r| r.is_match(command))
+    }
+
+    fn keyword_filter(&self, command: &str, pane_config: &PaneGuardConfig) -> Vec<&'static str> {
+        let mut pack_ids: Vec<&'static str> = Vec::new();
+        let enabled = pane_config
+            .enabled_packs
+            .as_ref()
+            .unwrap_or(&self.policy.enabled_packs);
+        let disabled = &self.policy.disabled_packs;
+
+        for mat in KEYWORD_AUTOMATON.find_iter(command) {
+            let matched = &command[mat.start()..mat.end()];
+            let key = matched.to_ascii_lowercase();
+            if let Some(packs) = KEYWORD_TO_PACKS.get(&key) {
+                for pack_id in packs {
+                    if enabled.iter().any(|e| e == pack_id)
+                        && !disabled.iter().any(|d| d == pack_id)
+                        && !pack_ids.contains(pack_id)
+                    {
+                        pack_ids.push(pack_id);
+                    }
+                }
+            }
+        }
+
+        pack_ids
+    }
+
+    fn scan_packs(command: &str, relevant_pack_ids: &[&str], trust: TrustLevel) -> GuardDecision {
+        for pack in ALL_PACKS {
+            if !relevant_pack_ids.contains(&pack.id) {
+                continue;
+            }
+
+            // Remove safe patterns (whitelist) from the command before checking destructive ones.
+            // ft-0eby0: replace with a neutral separator, not the empty string —
+            // a safe match can swallow the separator in front of a FOLLOWING
+            // dangerous command ("rm -rf node_modules && rm -rf /"), and the
+            // command-position-anchored rm rules would then miss it.
+            let mut check_command = command.to_string();
+            for safe in pack.safe_rules {
+                check_command = safe.pattern.replace_all(&check_command, " ; ").to_string();
+            }
+
+            // Check destructive patterns.
+            for rule in pack.destructive_rules {
+                if rule.pattern.is_match(&check_command) {
+                    let rule_id = rule.id.to_string();
+                    let pack_name = pack.id.to_string();
+                    let reason = rule.reason.to_string();
+                    let suggestions: Vec<String> =
+                        rule.suggestions.iter().map(|s| (*s).to_string()).collect();
+
+                    return match trust {
+                        TrustLevel::Strict => GuardDecision::Block {
+                            rule_id,
+                            pack: pack_name,
+                            reason,
+                            suggestions,
+                        },
+                        TrustLevel::Permissive => GuardDecision::Warn {
+                            rule_id,
+                            pack: pack_name,
+                            reason,
+                        },
+                        TrustLevel::ReadOnly => GuardDecision::Allow,
+                    };
+                }
+            }
+        }
+
+        GuardDecision::Allow
+    }
+
+    fn scan_doctrine(command: &str) -> Option<GuardDecision> {
+        evaluate_doctrine_stateless(command).map(|(rule_id, pack, reason, suggestions)| {
+            GuardDecision::Block {
+                rule_id,
+                pack,
+                reason,
+                suggestions,
+            }
+        })
+    }
+
+    fn record(
+        &mut self,
+        pane_id: u64,
+        command: &str,
+        decision: &str,
+        rule_id: Option<String>,
+        pack: Option<String>,
+        eval_us: u64,
+    ) {
+        let entry = AuditEntry {
+            pane_id,
+            command: if command.len() > 256 {
+                let end = (0..=253)
+                    .rev()
+                    .find(|&i| command.is_char_boundary(i))
+                    .unwrap_or(0);
+                format!("{}...", &command[..end])
+            } else {
+                command.to_string()
+            },
+            decision: decision.to_string(),
+            rule_id,
+            pack,
+            eval_us,
+            timestamp_s: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+
+        if self.policy.audit_capacity == 0 {
+            return;
+        }
+        if self.audit_log.len() < self.policy.audit_capacity {
+            self.audit_log.push(entry);
+        } else {
+            let idx = self.audit_write_idx % self.policy.audit_capacity;
+            self.audit_log[idx] = entry;
+        }
+        self.audit_write_idx = self.audit_write_idx.wrapping_add(1);
+    }
+}
+
+/// Evaluate a command without guard state (stateless, for integration with policy.rs).
+///
+/// Returns `(decision, pack, reason, suggestions)` or `None` for allow.
+#[must_use]
+pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<String>)> {
+    if let Some(doctrine_match) = evaluate_doctrine_stateless(command) {
+        return Some(doctrine_match);
+    }
+
+    let normalized_command = normalize_command_for_guard(command);
+
+    // Quick-reject via keyword scan.
+    let mut relevant_pack_ids: Vec<&str> = Vec::new();
+    for mat in KEYWORD_AUTOMATON.find_iter(&normalized_command) {
+        let matched = &normalized_command[mat.start()..mat.end()];
+        let key = matched.to_ascii_lowercase();
+        if let Some(packs) = KEYWORD_TO_PACKS.get(&key) {
+            for pack_id in packs {
+                if !relevant_pack_ids.contains(pack_id) {
+                    relevant_pack_ids.push(pack_id);
+                }
+            }
+        }
+    }
+
+    if relevant_pack_ids.is_empty() {
+        return None;
+    }
+
+    for pack in ALL_PACKS {
+        if !relevant_pack_ids.contains(&pack.id) {
+            continue;
+        }
+
+        // Safe patterns first - replace them with a neutral separator so they
+        // don't trigger destructive matches. ft-0eby0: " ; " (not "") so a
+        // safe match cannot swallow the command-position evidence of a
+        // FOLLOWING dangerous command.
+        let mut check_command = normalized_command.clone();
+        for safe in pack.safe_rules {
+            check_command = safe.pattern.replace_all(&check_command, " ; ").to_string();
+        }
+
+        // Destructive patterns.
+        for rule in pack.destructive_rules {
+            if rule.pattern.is_match(&check_command) {
+                return Some((
+                    rule.id.to_string(),
+                    pack.id.to_string(),
+                    rule.reason.to_string(),
+                    rule.suggestions.iter().map(|s| (*s).to_string()).collect(),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strict_guard() -> CommandGuard {
+        CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::Strict,
+            ..GuardPolicy::default()
+        })
+    }
+
+    fn permissive_guard() -> CommandGuard {
+        CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::Permissive,
+            ..GuardPolicy::default()
+        })
+    }
+
+    fn readonly_guard() -> CommandGuard {
+        CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::ReadOnly,
+            ..GuardPolicy::default()
+        })
+    }
+
+    // ========================================================================
+    // Trust level behavior
+    // ========================================================================
+
+    #[test]
+    fn strict_blocks_rm_rf() {
+        let mut guard = strict_guard();
+        let decision = guard.evaluate("rm -rf /tmp/important", 1);
+        assert!(decision.is_blocked());
+        assert_eq!(decision.rule_id(), Some("core.filesystem:rm-rf"));
+    }
+
+    #[test]
+    fn permissive_warns_rm_rf() {
+        let mut guard = permissive_guard();
+        let decision = guard.evaluate("rm -rf /tmp/important", 1);
+        assert!(decision.is_warning());
+        assert_eq!(decision.rule_id(), Some("core.filesystem:rm-rf"));
+    }
+
+    #[test]
+    fn readonly_allows_everything() {
+        let mut guard = readonly_guard();
+        let decision = guard.evaluate("rm -rf /", 1);
+        assert!(decision.is_allowed());
+    }
+
+    // ========================================================================
+    // Quick-reject: safe commands pass through
+    // ========================================================================
+
+    #[test]
+    fn allows_safe_commands() {
+        let mut guard = strict_guard();
+        assert!(guard.evaluate("ls -la", 1).is_allowed());
+        assert!(guard.evaluate("cat file.txt", 1).is_allowed());
+        assert!(guard.evaluate("echo hello", 1).is_allowed());
+        assert!(guard.evaluate("pwd", 1).is_allowed());
+        assert!(guard.evaluate("cargo build", 1).is_allowed());
+        assert!(guard.evaluate("rustc --version", 1).is_allowed());
+    }
+
+    #[test]
+    fn allows_git_safe_commands() {
+        let mut guard = strict_guard();
+        assert!(guard.evaluate("git status", 1).is_allowed());
+        assert!(guard.evaluate("git log --oneline", 1).is_allowed());
+        assert!(guard.evaluate("git diff HEAD", 1).is_allowed());
+        assert!(guard.evaluate("git add .", 1).is_allowed());
+        assert!(guard.evaluate("git commit -m 'test'", 1).is_allowed());
+        assert!(guard.evaluate("git pull origin main", 1).is_allowed());
+        assert!(guard.evaluate("git push origin main", 1).is_allowed());
+    }
+
+    // ========================================================================
+    // Filesystem pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_rm_rf_root() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("rm -rf /", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf-root"));
+    }
+
+    #[test]
+    fn blocks_rm_rf_home() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("rm -rf ~", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf-root"));
+    }
+
+    #[test]
+    fn allows_rm_rf_node_modules() {
+        let mut guard = strict_guard();
+        // Safe pattern whitelist: rm -rf node_modules
+        let d = guard.evaluate("rm -rf node_modules", 1);
+        assert!(d.is_allowed());
+    }
+
+    #[test]
+    fn allows_rm_rf_target() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("rm -rf target", 1);
+        assert!(d.is_allowed());
+    }
+
+    #[test]
+    fn safe_filesystem_span_does_not_hide_later_destructive_command() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("rm -rf target && rm -rf /", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf-root"));
+    }
+
+    #[test]
+    fn blocks_chmod_777() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("chmod -R 777 /var/www", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:chmod-recursive-wide"));
+    }
+
+    #[test]
+    fn blocks_dd_device() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("dd if=/dev/zero of=/dev/sda bs=1M", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:dd-device"));
+    }
+
+    #[test]
+    fn blocks_mkfs() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("mkfs.ext4 /dev/sdb1", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:mkfs"));
+    }
+
+    // ========================================================================
+    // Git pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_git_push_force() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git push --force origin main", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:push-force"));
+    }
+
+    #[test]
+    fn allows_git_push_force_with_lease() {
+        let mut guard = strict_guard();
+        // Safe pattern: --force-with-lease
+        let d = guard.evaluate("git push --force-with-lease origin main", 1);
+        assert!(d.is_allowed());
+    }
+
+    #[test]
+    fn safe_git_span_does_not_hide_later_destructive_command() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate(
+            "git push --force-with-lease origin main && git reset --hard HEAD",
+            1,
+        );
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:reset-hard"));
+    }
+
+    #[test]
+    fn blocks_git_reset_hard() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git reset --hard HEAD~1", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:reset-hard"));
+    }
+
+    #[test]
+    fn blocks_git_clean_fd() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git clean -fd", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+    }
+
+    #[test]
+    fn blocks_git_clean_split_force_and_directory_flags() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git clean -f -d", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -d -f", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -xdf", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean --force -d", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -d --force", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+    }
+
+    #[test]
+    fn blocks_git_checkout_path_even_when_chained() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git checkout -- . && echo done", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:checkout-dot"));
+
+        let d = guard.evaluate("git checkout -- crates/frankenterm-core/src/lib.rs", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:checkout-dot"));
+    }
+
+    #[test]
+    fn blocks_git_branch_d() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git branch -D feature-old", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:branch-delete-force"));
+    }
+
+    #[test]
+    fn blocks_git_stash_drop() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git stash drop stash@{0}", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:stash-drop"));
+    }
+
+    #[test]
+    fn blocks_git_stash_clear() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git stash clear", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:stash-drop"));
+    }
+
+    // ========================================================================
+    // Database pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_drop_table() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("DROP TABLE users", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("database:drop"));
+    }
+
+    #[test]
+    fn blocks_drop_database() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("DROP DATABASE production", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("database:drop"));
+    }
+
+    #[test]
+    fn blocks_truncate_table() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("TRUNCATE TABLE sessions", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("database:truncate"));
+    }
+
+    #[test]
+    fn blocks_delete_without_where() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("DELETE FROM users;", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("database:delete-no-where"));
+    }
+
+    // ========================================================================
+    // Container pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_docker_system_prune() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("docker system prune -af", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("containers:system-prune"));
+    }
+
+    #[test]
+    fn blocks_docker_volume_rm() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("docker volume prune", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("containers:volume-rm"));
+    }
+
+    // ========================================================================
+    // Kubernetes pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_kubectl_delete_namespace() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("kubectl delete namespace production", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("kubernetes:delete-namespace"));
+    }
+
+    #[test]
+    fn blocks_kubectl_delete_all() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("kubectl delete pods --all", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("kubernetes:delete-all"));
+    }
+
+    #[test]
+    fn blocks_helm_uninstall() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("helm uninstall my-release", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("kubernetes:helm-uninstall"));
+    }
+
+    // ========================================================================
+    // Cloud pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_terraform_destroy() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("terraform destroy -auto-approve", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("cloud:terraform-destroy"));
+    }
+
+    #[test]
+    fn blocks_aws_s3_rm_recursive() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("aws s3 rm s3://my-bucket --recursive", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("cloud:aws-s3-rm-recursive"));
+    }
+
+    /// ft-0eby0: an `rm` SUBCOMMAND of another tool must be attributed to
+    /// that tool's pack, not to core.filesystem — wrong rule id means wrong
+    /// reason and wrong remediation on the operator surface.
+    #[test]
+    fn rm_subcommands_attribute_to_their_own_pack_ft_0eby0() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("docker rm -f my-container", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("containers:rm-force"));
+    }
+
+    /// ft-0eby0: command-position gating must not weaken real rm(1) coverage
+    /// through wrappers, chains, or safe-rule blanking.
+    #[test]
+    fn command_position_rm_still_blocked_through_wrappers_and_chains_ft_0eby0() {
+        let mut guard = strict_guard();
+
+        let d = guard.evaluate("sudo rm -rf /etc/passwd", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+
+        let d = guard.evaluate("cd /tmp && rm --recursive --force stuff", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+
+        // A safe rm must not swallow the separator that proves the FOLLOWING
+        // dangerous rm is at command position.
+        let d = guard.evaluate("rm -rf node_modules && rm -rf /etc", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+    }
+
+    // ========================================================================
+    // System pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_kill_9() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("kill -9 1234", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("system:kill-9"));
+    }
+
+    #[test]
+    fn blocks_reboot() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("sudo reboot", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("system:reboot"));
+    }
+
+    // ========================================================================
+    // Package manager pack
+    // ========================================================================
+
+    #[test]
+    fn blocks_npm_unpublish() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("npm unpublish my-package@1.0.0", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("package_managers:npm-unpublish"));
+    }
+
+    #[test]
+    fn blocks_cargo_yank() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("cargo yank --version 1.0.0 my-crate", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("package_managers:cargo-yank"));
+    }
+
+    // ========================================================================
+    // Per-pane override
+    // ========================================================================
+
+    #[test]
+    fn per_pane_trust_override() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::Permissive,
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Pane 42 should warn (permissive), pane 1 should block (strict default).
+        let d42 = guard.evaluate("rm -rf /tmp/data", 42);
+        let d1 = guard.evaluate("rm -rf /tmp/data", 1);
+        assert!(d42.is_warning());
+        assert!(d1.is_blocked());
+    }
+
+    #[test]
+    fn per_pane_allowlist() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            10,
+            PaneGuardConfig {
+                trust_level: TrustLevel::Strict,
+                allowlist_patterns: vec![r"^rm -rf /tmp/test".to_string()],
+                ..PaneGuardConfig::default()
+            },
+        );
+        let d = guard.evaluate("rm -rf /tmp/test", 10);
+        assert!(d.is_allowed());
+    }
+
+    // ========================================================================
+    // Disabled packs
+    // ========================================================================
+
+    #[test]
+    fn disabled_pack_skipped() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::Strict,
+            disabled_packs: vec!["database".to_string()],
+            ..GuardPolicy::default()
+        });
+        // Database pack disabled, so DROP TABLE should be allowed.
+        let d = guard.evaluate("DROP TABLE users", 1);
+        assert!(d.is_allowed());
+    }
+
+    // ========================================================================
+    // Audit log
+    // ========================================================================
+
+    #[test]
+    fn audit_log_records_entries() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("rm -rf /tmp/data", 2);
+        assert_eq!(guard.audit_count(), 2);
+
+        let log = guard.audit_log();
+        assert_eq!(log[0].decision, "allow");
+        assert_eq!(log[0].pane_id, 1);
+        assert_eq!(log[1].decision, "block");
+        assert_eq!(log[1].pane_id, 2);
+    }
+
+    #[test]
+    fn audit_log_ring_buffer_wraps() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            audit_capacity: 3,
+            ..GuardPolicy::default()
+        });
+        for i in 0..5 {
+            guard.evaluate("ls", i);
+        }
+        // Ring buffer should have exactly 3 entries after wrapping.
+        assert_eq!(guard.audit_count(), 3);
+    }
+
+    // ========================================================================
+    // Stateless evaluation
+    // ========================================================================
+
+    #[test]
+    fn stateless_detects_destructive() {
+        let result = evaluate_stateless("git reset --hard HEAD");
+        assert!(result.is_some());
+        let (rule_id, pack, _, _) = result.unwrap();
+        assert_eq!(rule_id, "core.git:reset-hard");
+        assert_eq!(pack, "core.git");
+    }
+
+    #[test]
+    fn stateless_allows_safe() {
+        assert!(evaluate_stateless("git status").is_none());
+        assert!(evaluate_stateless("ls -la").is_none());
+        assert!(evaluate_stateless("echo hello").is_none());
+    }
+
+    #[test]
+    fn doctrine_policy_bundle_surfaces_compiled_rules() {
+        let bundle = compiled_agents_doctrine_policy();
+
+        assert_eq!(bundle.schema_version, AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION);
+        assert_eq!(bundle.bundle_id, AGENTS_DOCTRINE_POLICY_BUNDLE_ID);
+        assert!(
+            bundle
+                .rules
+                .iter()
+                .any(|rule| rule.rule_id == "agents.doctrine:no-git-worktree")
+        );
+        assert!(
+            bundle
+                .rules
+                .iter()
+                .all(|rule| rule.pack == AGENTS_DOCTRINE_PACK_ID)
+        );
+    }
+
+    #[test]
+    fn doctrine_blocks_worktree_commands_even_when_permissive() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::Permissive,
+            ..GuardPolicy::default()
+        });
+
+        let decision = guard.evaluate("git worktree add ../parallel main", 1);
+
+        assert!(matches!(
+            decision,
+            GuardDecision::Block { ref rule_id, ref pack, .. }
+                if rule_id == "agents.doctrine:no-git-worktree"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_worktree_commands_before_read_only_bypass() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::ReadOnly,
+                ..PaneGuardConfig::default()
+            },
+        );
+
+        let decision = guard.evaluate("git worktree prune", 42);
+
+        assert!(matches!(
+            decision,
+            GuardDecision::Block { ref rule_id, .. }
+                if rule_id == "agents.doctrine:no-git-worktree"
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_agent_mail_service_repair() {
+        let decision = evaluate_stateless("am service restart");
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:no-agent-mail-repair"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_local_cargo_proof_but_allows_fail_closed_rch() {
+        let blocked = evaluate_stateless("cargo test -p frankenterm-core --lib");
+        assert!(matches!(
+            blocked,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:no-local-cargo-proof"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+
+        let allowed = evaluate_stateless(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+             env CARGO_TARGET_DIR=/tmp/ft-example-target cargo test -p frankenterm-core --lib",
+        );
+        assert!(allowed.is_none());
+
+        // ft-0eby0: the doctrine rule is scoped to commands that provably
+        // target this project. Generic cargo commands are not repo doctrine
+        // territory — the actor-aware RCH heavy-compute policy gate owns
+        // that nuance.
+        assert!(evaluate_stateless("cargo build --workspace").is_none());
+        assert!(evaluate_stateless("cargo fmt --check").is_none());
+    }
+
+    #[test]
+    fn doctrine_blocks_protected_core_mutation() {
+        let decision = evaluate_stateless("rm -rf crates/frankenterm-core");
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:protect-frankenterm-core"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_legacy_default_branch_target() {
+        let command = format!("git push origin {}", legacy_default_branch_name());
+        let decision = evaluate_stateless(&command);
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:main-branch-only"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    // ========================================================================
+    // Preflight query (no audit)
+    // ========================================================================
+
+    #[test]
+    fn preflight_does_not_record_audit() {
+        let guard = strict_guard();
+        let d = guard.preflight("rm -rf /tmp/data", 1);
+        assert!(d.is_blocked());
+        assert_eq!(guard.audit_count(), 0);
+    }
+
+    // ========================================================================
+    // Available packs
+    // ========================================================================
+
+    #[test]
+    fn lists_available_packs() {
+        let packs = CommandGuard::available_packs();
+        assert!(packs.contains(&"core.filesystem"));
+        assert!(packs.contains(&"core.git"));
+        assert!(packs.contains(&"database"));
+        assert!(packs.contains(&"containers"));
+        assert!(packs.contains(&"kubernetes"));
+        assert!(packs.contains(&"cloud"));
+        assert!(packs.contains(&"system"));
+        assert!(packs.contains(&"package_managers"));
+        assert_eq!(packs.len(), 8);
+    }
+
+    // ========================================================================
+    // Decision serialization
+    // ========================================================================
+
+    #[test]
+    fn guard_decision_serializes() {
+        let d = GuardDecision::Block {
+            rule_id: "core.git:push-force".to_string(),
+            pack: "core.git".to_string(),
+            reason: "Force push rewrites remote history".to_string(),
+            suggestions: vec!["Use --force-with-lease".to_string()],
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"decision\":\"block\""));
+        assert!(json.contains("core.git:push-force"));
+    }
+
+    // ========================================================================
+    // Edge cases
+    // ========================================================================
+
+    #[test]
+    fn empty_command_allowed() {
+        let mut guard = strict_guard();
+        assert!(guard.evaluate("", 1).is_allowed());
+    }
+
+    #[test]
+    fn whitespace_command_allowed() {
+        let mut guard = strict_guard();
+        assert!(guard.evaluate("   ", 1).is_allowed());
+    }
+
+    #[test]
+    fn very_long_command_evaluated() {
+        let mut guard = strict_guard();
+        let long_cmd = format!("echo {} && rm -rf /tmp/data", "x".repeat(10_000));
+        let d = guard.evaluate(&long_cmd, 1);
+        assert!(d.is_blocked());
+    }
+
+    #[test]
+    fn audit_truncates_long_commands() {
+        let mut guard = strict_guard();
+        let long_cmd = "ls ".to_string() + &"x".repeat(500);
+        guard.evaluate(&long_cmd, 1);
+        let log = guard.audit_log();
+        assert!(log[0].command.len() <= 260);
+        assert!(log[0].command.ends_with("..."));
+    }
+
+    // -------------------------------------------------------------------
+    // Batch: DarkBadger wa-1u90p.7.1
+    // -------------------------------------------------------------------
+
+    // -- TrustLevel trait coverage --
+
+    #[test]
+    fn trust_level_debug() {
+        let dbg = format!("{:?}", TrustLevel::Strict);
+        assert!(dbg.contains("Strict"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn trust_level_clone_copy() {
+        let t = TrustLevel::Permissive;
+        let cloned = t;
+        let copied = t;
+        assert_eq!(cloned, copied);
+    }
+
+    #[test]
+    fn trust_level_default() {
+        assert_eq!(TrustLevel::default(), TrustLevel::Strict);
+    }
+
+    #[test]
+    fn trust_level_display_all() {
+        assert_eq!(TrustLevel::Strict.to_string(), "strict");
+        assert_eq!(TrustLevel::Permissive.to_string(), "permissive");
+        assert_eq!(TrustLevel::ReadOnly.to_string(), "read_only");
+    }
+
+    #[test]
+    fn trust_level_serde_roundtrip() {
+        let levels = [
+            TrustLevel::Strict,
+            TrustLevel::Permissive,
+            TrustLevel::ReadOnly,
+        ];
+        for level in &levels {
+            let json = serde_json::to_string(level).unwrap();
+            let back: TrustLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(*level, back);
+        }
+    }
+
+    #[test]
+    fn trust_level_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TrustLevel::Strict);
+        set.insert(TrustLevel::Permissive);
+        set.insert(TrustLevel::ReadOnly);
+        assert_eq!(set.len(), 3);
+        // Duplicate insertion doesn't increase size
+        set.insert(TrustLevel::Strict);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn trust_level_eq() {
+        assert_eq!(TrustLevel::Strict, TrustLevel::Strict);
+        assert_ne!(TrustLevel::Strict, TrustLevel::Permissive);
+        assert_ne!(TrustLevel::Permissive, TrustLevel::ReadOnly);
+    }
+
+    // -- GuardDecision trait coverage --
+
+    #[test]
+    fn guard_decision_debug() {
+        let d = GuardDecision::Allow;
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("Allow"), "got: {}", dbg);
+    }
+
+    #[test]
+    fn guard_decision_clone() {
+        let d = GuardDecision::Block {
+            rule_id: "r1".to_string(),
+            pack: "p1".to_string(),
+            reason: "test".to_string(),
+            suggestions: vec!["s1".to_string()],
+        };
+        let cloned = d.clone();
+        assert!(cloned.is_blocked());
+        assert_eq!(cloned.rule_id(), Some("r1"));
+    }
+
+    #[test]
+    fn guard_decision_allow_rule_id_none() {
+        let d = GuardDecision::Allow;
+        assert!(d.is_allowed());
+        assert!(!d.is_blocked());
+        assert!(!d.is_warning());
+        assert_eq!(d.rule_id(), None);
+    }
+
+    #[test]
+    fn guard_decision_warn_accessors() {
+        let d = GuardDecision::Warn {
+            rule_id: "test:warn".to_string(),
+            pack: "test".to_string(),
+            reason: "reason".to_string(),
+        };
+        assert!(d.is_warning());
+        assert!(!d.is_blocked());
+        assert!(!d.is_allowed());
+        assert_eq!(d.rule_id(), Some("test:warn"));
+    }
+
+    #[test]
+    fn guard_decision_serde_roundtrip_all() {
+        let decisions = vec![
+            GuardDecision::Allow,
+            GuardDecision::Block {
+                rule_id: "r1".to_string(),
+                pack: "p1".to_string(),
+                reason: "blocked".to_string(),
+                suggestions: vec!["fix".to_string()],
+            },
+            GuardDecision::Warn {
+                rule_id: "r2".to_string(),
+                pack: "p2".to_string(),
+                reason: "warned".to_string(),
+            },
+        ];
+        for d in &decisions {
+            let json = serde_json::to_string(d).unwrap();
+            let back: GuardDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(d.is_blocked(), back.is_blocked());
+            assert_eq!(d.is_warning(), back.is_warning());
+            assert_eq!(d.is_allowed(), back.is_allowed());
+        }
+    }
+
+    // -- PaneGuardConfig --
+
+    #[test]
+    fn pane_guard_config_debug_clone() {
+        let config = PaneGuardConfig::default();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("PaneGuardConfig"), "got: {}", dbg);
+        let cloned = config.clone();
+        assert_eq!(cloned.trust_level, config.trust_level);
+    }
+
+    #[test]
+    fn pane_guard_config_default_values() {
+        let config = PaneGuardConfig::default();
+        assert_eq!(config.trust_level, TrustLevel::Strict);
+        assert!(config.enabled_packs.is_none());
+        assert_eq!(config.allowlist_patterns, [] as [std::string::String; 0]);
+        assert_eq!(config.budget_us, 100);
+    }
+
+    #[test]
+    fn pane_guard_config_serde_roundtrip() {
+        let config = PaneGuardConfig {
+            trust_level: TrustLevel::Permissive,
+            enabled_packs: Some(vec!["core.git".to_string()]),
+            allowlist_patterns: vec!["^safe_.*".to_string()],
+            budget_us: 500,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PaneGuardConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trust_level, TrustLevel::Permissive);
+        assert_eq!(back.budget_us, 500);
+    }
+
+    // -- GuardPolicy --
+
+    #[test]
+    fn guard_policy_debug_clone() {
+        let policy = GuardPolicy::default();
+        let dbg = format!("{:?}", policy);
+        assert!(dbg.contains("GuardPolicy"), "got: {}", dbg);
+        let cloned = policy.clone();
+        assert_eq!(cloned.default_trust, policy.default_trust);
+    }
+
+    #[test]
+    fn guard_policy_default_values() {
+        let policy = GuardPolicy::default();
+        assert_eq!(policy.default_trust, TrustLevel::Strict);
+        assert_eq!(policy.enabled_packs.len(), 8);
+        assert_eq!(policy.disabled_packs, [] as [std::string::String; 0]);
+        assert!(policy.pane_overrides.is_empty());
+        assert_eq!(policy.audit_capacity, 10_000);
+    }
+
+    #[test]
+    fn guard_policy_serde_roundtrip() {
+        let policy = GuardPolicy::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: GuardPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_trust, TrustLevel::Strict);
+        assert_eq!(back.enabled_packs.len(), policy.enabled_packs.len());
+    }
+
+    // -- AuditEntry --
+
+    #[test]
+    fn audit_entry_debug_clone() {
+        let entry = AuditEntry {
+            pane_id: 1,
+            command: "ls".to_string(),
+            decision: "allow".to_string(),
+            rule_id: None,
+            pack: None,
+            eval_us: 5,
+            timestamp_s: 1000,
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("AuditEntry"), "got: {}", dbg);
+        let cloned = entry.clone();
+        assert_eq!(cloned.pane_id, 1);
+    }
+
+    #[test]
+    fn audit_entry_serde_roundtrip() {
+        let entry = AuditEntry {
+            pane_id: 42,
+            command: "rm -rf /tmp".to_string(),
+            decision: "block".to_string(),
+            rule_id: Some("core.filesystem:rm-rf".to_string()),
+            pack: Some("core.filesystem".to_string()),
+            eval_us: 50,
+            timestamp_s: 1700000000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pane_id, 42);
+        assert_eq!(back.rule_id, Some("core.filesystem:rm-rf".to_string()));
+    }
+
+    // -- CommandGuard --
+
+    #[test]
+    fn guard_with_defaults() {
+        let guard = CommandGuard::with_defaults();
+        assert_eq!(guard.policy().default_trust, TrustLevel::Strict);
+        assert_eq!(guard.audit_count(), 0);
+    }
+
+    #[test]
+    fn guard_policy_accessor() {
+        let guard = strict_guard();
+        let policy = guard.policy();
+        assert_eq!(policy.default_trust, TrustLevel::Strict);
+    }
+
+    #[test]
+    fn guard_set_policy() {
+        let mut guard = strict_guard();
+        let new_policy = GuardPolicy {
+            default_trust: TrustLevel::ReadOnly,
+            ..GuardPolicy::default()
+        };
+        guard.set_policy(new_policy);
+        assert_eq!(guard.policy().default_trust, TrustLevel::ReadOnly);
+    }
+
+    #[test]
+    fn guard_clear_audit_log() {
+        let mut guard = strict_guard();
+        guard.evaluate("rm -rf /tmp/x", 1);
+        assert!(guard.audit_count() > 0);
+        guard.clear_audit_log();
+        assert_eq!(guard.audit_count(), 0);
+    }
+
+    #[test]
+    fn guard_evaluate_timed_returns_duration() {
+        let mut guard = strict_guard();
+        let (decision, elapsed_us) = guard.evaluate_timed("ls -la", 1);
+        assert!(decision.is_allowed());
+        // Elapsed should be reasonable (< 10ms = 10_000 us)
+        assert!(elapsed_us < 10_000, "elapsed_us={}", elapsed_us);
+    }
+
+    #[test]
+    fn guard_set_pane_config() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::ReadOnly,
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Pane 42 should now be ReadOnly
+        let decision = guard.evaluate("rm -rf /", 42);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn guard_audit_records_pane_id() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls", 99);
+        let log = guard.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].pane_id, 99);
+    }
+
+    #[test]
+    fn stateless_safe_returns_none() {
+        let result = evaluate_stateless("echo hello");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn stateless_destructive_returns_some() {
+        let result = evaluate_stateless("rm -rf /tmp/important");
+        assert!(result.is_some());
+        let (rule_id, pack, _reason, _suggestions) = result.unwrap();
+        assert_ne!(rule_id, "");
+        assert_ne!(pack, "");
+    }
+
+    #[test]
+    fn command_normalization_canonicalizes_flags_and_git_globals() {
+        assert_eq!(
+            normalize_command_for_guard("rm --force --recursive target"),
+            "rm -rf target"
+        );
+        assert_eq!(
+            normalize_command_for_guard("chmod --recursive 777 /x"),
+            "chmod -R 777 /x"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager -c color.ui=always -C /repo push --force"),
+            "git push -f"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --git-dir=/tmp/git --work-tree /repo reset --hard"),
+            "git reset --hard"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager clean --directory --force ignored"),
+            "git clean -fd ignored"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager branch --delete --force stale"),
+            "git branch -D stale"
+        );
+    }
+
+    /// Regression: long-flag (`--recursive`/`--force`) spellings and global
+    /// options must not bypass destructive-command denies. The scanner now runs
+    /// over a normalized command form instead of depending on every regex to
+    /// carry every surface spelling.
+    #[test]
+    fn stateless_long_flag_bypasses_are_now_denied() {
+        // rm: catastrophic hard-deny (root/home) + general recursive deny.
+        let rid = |cmd: &str| evaluate_stateless(cmd).map(|r| r.0);
+        assert_eq!(
+            rid("rm --recursive --force /").as_deref(),
+            Some("core.filesystem:rm-rf-root")
+        );
+        assert_eq!(
+            rid("rm --force --recursive ~").as_deref(),
+            Some("core.filesystem:rm-rf-root")
+        );
+        assert!(evaluate_stateless("rm --recursive --force /home/u/project").is_some());
+        // chmod: long flag + world-writable mode the old `777|666|000` missed.
+        assert!(evaluate_stateless("chmod --recursive 777 /x").is_some());
+        assert!(evaluate_stateless("chmod -R 757 /x").is_some());
+        // git: global options between `git` and the subcommand.
+        assert!(evaluate_stateless("git --no-pager push --force").is_some());
+        assert!(evaluate_stateless("git -c color.ui=always push --force").is_some());
+        assert!(evaluate_stateless("git --git-dir=/x reset --hard").is_some());
+        assert!(evaluate_stateless("git -C /repo --no-pager push --force").is_some());
+        assert!(evaluate_stateless("git --no-pager clean --force --directory").is_some());
+        assert!(evaluate_stateless("git --no-pager branch --delete --force stale").is_some());
+        assert!(
+            evaluate_stateless("git --no-pager rm crates/frankenterm-core/src/lib.rs").is_some()
+        );
+        // kill: pkill + signal-name + `-s` spellings.
+        assert!(evaluate_stateless("pkill -9 node").is_some());
+        assert!(evaluate_stateless("kill -s 9 1234").is_some());
+        assert!(evaluate_stateless("kill -SIGKILL 1234").is_some());
+        assert!(evaluate_stateless("killall -KILL node").is_some());
+        // DELETE without a trailing semicolon.
+        assert!(evaluate_stateless("DELETE FROM users").is_some());
+    }
+
+    /// Guard against false positives introduced by broadening the denies:
+    /// safe forms must still be allowed.
+    #[test]
+    fn stateless_broadened_denies_do_not_overmatch_safe_commands() {
+        assert!(evaluate_stateless("rm -rf /tmp/scratch").is_some()); // recursive elsewhere still denied
+        assert!(evaluate_stateless("rm file.txt").is_none());
+        assert!(evaluate_stateless("rm --recursive --force target").is_none());
+        assert!(evaluate_stateless("rm --force --recursive node_modules").is_none());
+        assert!(evaluate_stateless("chmod -R 755 /x").is_none());
+        assert!(evaluate_stateless("chmod 644 file").is_none());
+        // --force-with-lease is the SAFE alternative — exempt via the safe rule,
+        // including with global options in front of `push`.
+        assert!(evaluate_stateless("git push --force-with-lease").is_none());
+        assert!(evaluate_stateless("git --no-pager push --force-with-lease").is_none());
+        assert!(evaluate_stateless("git -C /repo --no-pager push --force-with-lease").is_none());
+        // a non-flag subcommand named like a flag target must not match.
+        assert!(evaluate_stateless("git config push.default current").is_none());
+        assert!(evaluate_stateless("git -C /repo config push.default current").is_none());
+        assert!(evaluate_stateless("git reset --soft HEAD~1").is_none());
+        // graceful signals stay allowed.
+        assert!(evaluate_stateless("kill -15 1234").is_none());
+        assert!(evaluate_stateless("kill -TERM 1234").is_none());
+        // DELETE with a WHERE clause is allowed.
+        assert!(evaluate_stateless("DELETE FROM users WHERE id = 1").is_none());
+    }
+
+    #[test]
+    fn per_pane_enabled_packs_override() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::Strict,
+                enabled_packs: Some(vec!["core.git".to_string()]),
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Global policy has core.filesystem enabled.
+        // Pane 42 ONLY has core.git enabled.
+        // So rm -rf should be ALLOWED for pane 42!
+        let d = guard.evaluate("rm -rf /tmp/data", 42);
+        assert!(d.is_allowed());
+
+        // But core.git commands should still be blocked.
+        let d2 = guard.evaluate("git push --force origin main", 42);
+        assert!(d2.is_blocked());
+    }
+
+    // ── Telemetry tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let guard = CommandGuard::with_defaults();
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, 0);
+        assert_eq!(snap.allowed, 0);
+        assert_eq!(snap.blocked, 0);
+        assert_eq!(snap.warned, 0);
+        assert_eq!(snap.quick_rejects, 0);
+        assert_eq!(snap.audit_clears, 0);
+    }
+
+    #[test]
+    fn telemetry_evaluations_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        assert_eq!(guard.telemetry().snapshot().evaluations, 2);
+    }
+
+    #[test]
+    fn telemetry_allowed_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        guard.evaluate("cat /etc/hosts", 3);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.allowed, 3);
+    }
+
+    #[test]
+    fn telemetry_blocked_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("rm -rf /tmp/data", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(snap.evaluations, 1);
+    }
+
+    #[test]
+    fn telemetry_warned_counted() {
+        let mut guard = permissive_guard();
+        guard.evaluate("rm -rf /tmp/data", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.warned, 1);
+    }
+
+    #[test]
+    fn telemetry_quick_rejects_counted() {
+        let mut guard = strict_guard();
+        // Benign commands with no destructive keywords → quick reject
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        let snap = guard.telemetry().snapshot();
+        assert!(
+            snap.quick_rejects >= 2,
+            "quick_rejects={}",
+            snap.quick_rejects
+        );
+    }
+
+    #[test]
+    fn telemetry_audit_clears_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls", 1);
+        guard.clear_audit_log();
+        guard.clear_audit_log();
+        assert_eq!(guard.telemetry().snapshot().audit_clears, 2);
+    }
+
+    #[test]
+    fn telemetry_allowed_plus_blocked_plus_warned_equals_evaluations() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("rm -rf /tmp/data", 2);
+        guard.evaluate("echo hello", 3);
+
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(
+            snap.allowed + snap.blocked + snap.warned,
+            snap.evaluations,
+            "allowed({}) + blocked({}) + warned({}) != evaluations({})",
+            snap.allowed,
+            snap.blocked,
+            snap.warned,
+            snap.evaluations,
+        );
+    }
+
+    #[test]
+    fn telemetry_readonly_pane_counted_as_allowed() {
+        let mut guard = readonly_guard();
+        guard.evaluate("rm -rf /", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, 1);
+        assert_eq!(snap.allowed, 1);
+        assert_eq!(snap.blocked, 0);
+    }
+
+    #[test]
+    fn telemetry_counters_saturate_and_audit_index_wraps() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            audit_capacity: 1,
+            ..GuardPolicy::default()
+        });
+        guard.telemetry.evaluations = u64::MAX;
+        guard.telemetry.allowed = u64::MAX;
+        guard.telemetry.quick_rejects = u64::MAX;
+        guard.audit_write_idx = usize::MAX;
+
+        let d = guard.evaluate("echo hello", 1);
+        assert!(d.is_allowed());
+
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, u64::MAX);
+        assert_eq!(snap.allowed, u64::MAX);
+        assert_eq!(snap.quick_rejects, u64::MAX);
+        assert_eq!(guard.audit_write_idx, 0);
+
+        guard.telemetry.blocked = u64::MAX;
+        let d = guard.evaluate("rm -rf /tmp/important", 1);
+        assert!(d.is_blocked());
+        assert_eq!(guard.telemetry().snapshot().blocked, u64::MAX);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = CommandGuardTelemetrySnapshot {
+            evaluations: 100,
+            allowed: 80,
+            blocked: 15,
+            warned: 5,
+            quick_rejects: 70,
+            audit_clears: 3,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CommandGuardTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn command_guard_remove_pane_drops_per_pane_state() {
+        // Regression for the per-pane-map leak class (mirrors
+        // RateLimiter::remove_pane / ft-yjt9e). Both pane_overrides and the lazy
+        // pane_allowlists regex cache are pane_id-keyed and long-lived;
+        // remove_pane must evict both so a closed pane leaves no residual entry
+        // under fleet churn.
+        let mut guard = CommandGuard::new(GuardPolicy::default());
+        let pane = 42u64;
+        guard.set_pane_config(
+            pane,
+            PaneGuardConfig {
+                allowlist_patterns: vec!["^ls".to_string()],
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Evaluate to lazily populate the pane_allowlists regex cache.
+        let _ = guard.evaluate("ls -la", pane);
+        assert!(guard.policy.pane_overrides.contains_key(&pane));
+        assert!(
+            guard.pane_allowlists.contains_key(&pane),
+            "evaluate should have populated the lazy allowlist cache"
+        );
+
+        assert!(
+            guard.remove_pane(pane),
+            "remove_pane should report that per-pane state was removed"
+        );
+        assert!(
+            !guard.policy.pane_overrides.contains_key(&pane),
+            "pane_overrides entry leaked after remove_pane"
+        );
+        assert!(
+            !guard.pane_allowlists.contains_key(&pane),
+            "pane_allowlists cache entry leaked after remove_pane"
+        );
+        assert!(
+            !guard.remove_pane(pane),
+            "second remove_pane for the same pane must be a no-op"
+        );
+    }
+}

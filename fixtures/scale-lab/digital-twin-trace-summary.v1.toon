@@ -1,0 +1,9 @@
+schema_version: ft.digital_twin_trace.v1
+generated_at_ms: 4000
+trace_hash: 232d5d2fb6db8ad94f5cc71c613e9a1f5e01605d3db647e350413e0d96a85ee3
+quality_flags: missing_queue_telemetry|missing_fleet_telemetry|missing_memory_tier_telemetry|missing_latency_telemetry|derived_source_hash
+steps[4]:
+  - id=healthy source=resource_admission t=10 pressure=0 action=admit fleet=normal memory=normal proof=- evidence=- flags=-
+  - id=pressured source=resource_admission t=20 pressure=1 action=defer fleet=elevated memory=elevated proof=- evidence=- flags=-
+  - id=degraded source=resource_admission t=30 pressure=2 action=degrade fleet=critical memory=critical proof=- evidence=- flags=-
+  - id=missing_telemetry source=resource_admission t=40 pressure=1 action=defer fleet=- memory=- proof=- evidence=- flags=missing_queue_telemetry|missing_fleet_telemetry|missing_memory_tier_telemetry|missing_latency_telemetry|derived_source_hash

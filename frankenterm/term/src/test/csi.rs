@@ -1,0 +1,339 @@
+use super::*;
+
+/// In this issue, the `CSI 2 P` sequence incorrectly removed two
+/// cells from the line, leaving them effectively blank, when those
+/// two cells should have been erased to the current background
+/// color as set by `CSI 40 m`
+#[test]
+fn test_789() {
+    let mut term = TestTerm::new(1, 8, 0);
+    term.print("\x1b[40m\x1b[Kfoo\x1b[2P");
+
+    // Cell Debug intentionally redacts text. Assert the actual characters and
+    // all cell attributes so this still detects lost text or unpainted blanks.
+    let attrs = CellAttributes::default()
+        .set_background(color::AnsiColor::Black)
+        .clone();
+    let expected = Line::from_text("foo     ", &attrs, SEQ_ZERO, None);
+    assert_lines_equal(
+        file!(),
+        line!(),
+        &term.screen().visible_lines(),
+        &[expected],
+        Compare::TEXT | Compare::ATTRS,
+    );
+}
+
+#[test]
+fn test_vpa() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.assert_cursor_pos(0, 0, None, Some(0));
+    term.print("a\r\nb\r\nc");
+    term.assert_cursor_pos(1, 2, None, None);
+    term.print("\x1b[d");
+    term.assert_cursor_pos(1, 0, None, None);
+    term.print("\r\n\r\n");
+    term.assert_cursor_pos(0, 2, None, None);
+
+    // escapes are 1-based, so check that we're handling that
+    // when we parse them!
+    term.print("\x1b[2d");
+    term.assert_cursor_pos(0, 1, None, None);
+    term.print("\x1b[-2d");
+    term.assert_cursor_pos(0, 1, None, Some(term.current_seqno() - 1));
+}
+
+#[test]
+fn test_rep() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.print("h");
+    term.cup(1, 0);
+    term.print("\x1b[2ba");
+    assert_visible_contents(&term, file!(), line!(), &["hhha", "", ""]);
+}
+
+#[test]
+fn test_irm() {
+    let mut term = TestTerm::new(3, 8, 0);
+    term.print("foo");
+    term.cup(0, 0);
+    term.print("\x1b[4hBAR");
+    assert_visible_contents(&term, file!(), line!(), &["BARfoo", "", ""]);
+}
+
+#[test]
+fn test_ich() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.print("hey!wat?");
+    term.cup(1, 0);
+    term.print("\x1b[2@");
+    assert_visible_contents(&term, file!(), line!(), &["h  e", "wat?", ""]);
+    // check how we handle overflowing the width
+    term.print("\x1b[12@");
+    assert_visible_contents(&term, file!(), line!(), &["h   ", "wat?", ""]);
+    term.print("\x1b[-12@");
+    assert_visible_contents(&term, file!(), line!(), &["h   ", "wat?", ""]);
+}
+
+#[test]
+fn test_ech() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.print("hey!wat?");
+    term.cup(1, 0);
+    term.print("\x1b[2X");
+    assert_visible_contents(&term, file!(), line!(), &["h  !", "wat?", ""]);
+    // check how we handle overflowing the width
+    term.print("\x1b[12X");
+    assert_visible_contents(&term, file!(), line!(), &["h   ", "wat?", ""]);
+    term.print("\x1b[-12X");
+    assert_visible_contents(&term, file!(), line!(), &["h   ", "wat?", ""]);
+}
+
+#[test]
+fn test_dch() {
+    let mut term = TestTerm::new(1, 12, 0);
+    term.print("hello world");
+    term.cup(1, 0);
+    term.print("\x1b[P");
+    assert_visible_contents(&term, file!(), line!(), &["hllo world"]);
+
+    term.cup(4, 0);
+    term.print("\x1b[2P");
+    assert_visible_contents(&term, file!(), line!(), &["hlloorld"]);
+
+    term.print("\x1b[-2P");
+    assert_visible_contents(&term, file!(), line!(), &["hlloorld"]);
+}
+
+#[test]
+fn test_cup() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.cup(1, 1);
+    term.assert_cursor_pos(1, 1, None, None);
+    term.cup(-1, -1);
+    term.assert_cursor_pos(0, 0, None, None);
+    term.cup(2, 2);
+    term.assert_cursor_pos(2, 2, None, None);
+    term.cup(-1, -1);
+    term.assert_cursor_pos(0, 0, None, None);
+    // VT510 and xterm stop at the last column and row (ft-3e1yj).
+    term.cup(500, 500);
+    term.assert_cursor_pos(3, 2, None, None);
+}
+
+#[test]
+fn test_hvp() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.hvp(1, 1);
+    term.assert_cursor_pos(1, 1, None, None);
+    term.hvp(-1, -1);
+    term.assert_cursor_pos(0, 0, None, None);
+    term.hvp(2, 2);
+    term.assert_cursor_pos(2, 2, None, None);
+    term.hvp(-1, -1);
+    term.assert_cursor_pos(0, 0, None, None);
+    // VT510 and xterm stop at the last column and row (ft-3e1yj).
+    term.hvp(500, 500);
+    term.assert_cursor_pos(3, 2, None, None);
+}
+
+#[test]
+fn test_dl() {
+    let mut term = TestTerm::new(3, 1, 0);
+    term.print("a\r\nb\r\nc");
+    term.cup(0, 1);
+    let seqno = term.current_seqno();
+    term.delete_lines(1);
+    assert_visible_contents(&term, file!(), line!(), &["a", "c", ""]);
+    term.assert_cursor_pos(0, 1, None, Some(seqno));
+    term.cup(0, 0);
+    term.delete_lines(2);
+    assert_visible_contents(&term, file!(), line!(), &["", "", ""]);
+    term.print("1\r\n2\r\n3");
+    term.cup(0, 1);
+    term.delete_lines(-2);
+    assert_visible_contents(&term, file!(), line!(), &["1", "2", "3"]);
+}
+
+#[test]
+fn test_cha() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.cup(1, 1);
+    term.assert_cursor_pos(1, 1, None, None);
+
+    term.print("\x1b[G");
+    term.assert_cursor_pos(0, 1, None, None);
+
+    term.print("\x1b[2G");
+    term.assert_cursor_pos(1, 1, None, None);
+
+    term.print("\x1b[0G");
+    term.assert_cursor_pos(0, 1, None, None);
+
+    let seqno = term.current_seqno();
+    term.print("\x1b[-1G");
+    term.assert_cursor_pos(0, 1, None, Some(seqno));
+
+    // VT510 and xterm stop at the last column (ft-3e1yj).
+    term.print("\x1b[100G");
+    term.assert_cursor_pos(3, 1, None, None);
+}
+
+/// ft-3e1yj: a character printed after CUP past the edge lands in the last
+/// column, on screen, where ED 2 erases it; widening the window shows no
+/// ghost of it in a column past the old edge.
+#[test]
+fn cup_past_the_edge_prints_in_the_last_column_and_ed_erases_it() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.print("\x1b[999;999HZ");
+    assert_visible_contents(&term, file!(), line!(), &["", "", "   Z"]);
+    term.print("\x1b[2J");
+    assert_visible_contents(&term, file!(), line!(), &["", "", ""]);
+    term.resize(TerminalSize {
+        rows: 3,
+        cols: 8,
+        ..Default::default()
+    });
+    assert_visible_contents(&term, file!(), line!(), &["", "", ""]);
+}
+
+#[test]
+fn test_ed() {
+    let mut term = TestTerm::new(3, 3, 0);
+    term.print("abc\r\ndef\r\nghi");
+    term.cup(1, 2);
+    term.print("\x1b[J");
+    assert_visible_contents(&term, file!(), line!(), &["abc", "def", "g"]);
+
+    // Set background color to blue
+    term.print("\x1b[44m");
+    // Clear whole screen
+    term.print("\x1b[2J");
+
+    // Check that the background color paints all of the cells;
+    // this is also known as BCE - Background Color Erase.
+    let attr = CellAttributes::default()
+        .set_background(color::AnsiColor::Navy)
+        .clone();
+    let mut line: Line = "   ".into();
+    line.fill_range(0..3, &Cell::new(' ', attr.clone()), SEQ_ZERO);
+    assert_lines_equal(
+        file!(),
+        line!(),
+        &term.screen().visible_lines(),
+        &[line.clone(), line.clone(), line],
+        Compare::TEXT | Compare::ATTRS,
+    );
+}
+
+#[test]
+fn test_ed2_severs_scrollback_wrap_before_repaint_and_resize() {
+    for tiered in [false, true] {
+        let mut term = TestTerm::new_with_scrollback_tier(
+            2,
+            5,
+            8,
+            crate::config::ScrollbackTierConfig {
+                enabled: tiered,
+                hot_lines: 1,
+                warm_max_bytes: std::mem::size_of::<Line>(),
+            },
+        );
+        // The viewport begins in the middle of a soft-wrapped logical line.
+        term.print("abcdefghijk");
+        assert_all_contents(&term, file!(), line!(), &["abcde", "fghij", "k"]);
+        let predecessor = term.screen().phys_row(0) - 1;
+        assert!(term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+        term.print("\x1b[2J\x1b[HXYZ");
+        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ", ""]);
+        assert!(
+            !term.screen().all_lines()[predecessor].last_cell_was_wrapped(),
+            "erased continuation must not join replacement text to retained history"
+        );
+        term.resize(TerminalSize {
+            rows: 2,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 32,
+            dpi: 0,
+        });
+        // Resize prunes unused blank rows below the cursor and pads only to
+        // the viewport height. Both retained text rows must stay separate.
+        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ"]);
+    }
+}
+
+#[test]
+fn test_full_first_row_erases_sever_only_destroyed_history_continuations() {
+    for erase in ["\x1b[H\x1b[J", "\x1b[2;5H\x1b[1J", "\x1b[H\x1b[2K"] {
+        let mut term = TestTerm::new(2, 5, 8);
+        term.print("abcdefghijk");
+        let predecessor = term.screen().phys_row(0) - 1;
+        assert!(term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+        term.print(erase);
+        std::assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        assert!(!term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+    }
+    for erase in ["\x1b[1;3H\x1b[J", "\x1b[1;2H\x1b[1J"] {
+        let mut term = TestTerm::new(2, 5, 8);
+        term.print("abcdefghijk");
+        let predecessor = term.screen().phys_row(0) - 1;
+        term.print(erase);
+        std::assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        assert!(
+            term.screen().all_lines()[predecessor].last_cell_was_wrapped(),
+            "partial erase retains the surviving history continuation"
+        );
+    }
+}
+
+#[test]
+fn test_ed_erase_scrollback() {
+    let mut term = TestTerm::new(3, 3, 3);
+    term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na\x1b[3J");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "a"]);
+    term.print("b");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "ab"]);
+}
+
+#[test]
+fn test_ed_erase_scrollback_with_tiering_enabled() {
+    let mut term = TestTerm::new_with_scrollback_tier(
+        3,
+        3,
+        6,
+        crate::config::ScrollbackTierConfig {
+            enabled: true,
+            hot_lines: 1,
+            warm_max_bytes: std::mem::size_of::<Line>(),
+        },
+    );
+    term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na\x1b[3J");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "a"]);
+    term.print("b");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "ab"]);
+}
+
+#[test]
+fn test_erase_scrollback_and_viewport_with_tiering_enabled() {
+    let mut term = TestTerm::new_with_scrollback_tier(
+        3,
+        3,
+        6,
+        crate::config::ScrollbackTierConfig {
+            enabled: true,
+            hot_lines: 1,
+            warm_max_bytes: std::mem::size_of::<Line>(),
+        },
+    );
+    term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na");
+
+    term.erase_scrollback_and_viewport();
+
+    // ft divergence (ft-3q4r2 / 9ed3073d2): the two erased viewport rows are
+    // all default blanks, which `prune_trailing_blanks` collapses to zero stored
+    // cells, so they render as "" rather than materialized spaces.
+    assert_all_contents(&term, file!(), line!(), &["a", "", ""]);
+    term.print("b");
+    assert_all_contents(&term, file!(), line!(), &["ab", "", ""]);
+}

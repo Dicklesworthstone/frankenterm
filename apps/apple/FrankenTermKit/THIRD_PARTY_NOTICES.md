@@ -1,0 +1,182 @@
+# Multipart UR consensus and Bytewords
+
+The UR consensus sampler/PRNG/fragment choices and Bytewords alphabet in
+`OpticalTransfer.swift` follow Blockchain Commons URKit and the published
+BCR-2024-001 implementation guide. Reference repository revision:
+`ebba59b2e1538cb368d98147dd58c452e6d1dc47`.
+
+Reference: https://github.com/BlockchainCommons/URKit/tree/ebba59b2e1538cb368d98147dd58c452e6d1dc47
+
+FrankenTerm supplies bounded framing, a bounded Gaussian-elimination receiver,
+page digests, application authorization, and resource/identity checks. Published
+CRC, Bytewords, PRNG, degree, fragment-index, and CBOR vectors are regression
+tests; this does not claim physical camera interoperability has been qualified.
+
+## BSD-2-Clause Plus Patent License
+
+SPDX-License-Identifier: BSD-2-Clause-Patent
+
+Copyright © 2020 Blockchain Commons, LLC
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+Subject to the terms and conditions of this license, each copyright holder and contributor hereby grants to those receiving rights under this license a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except for failure to satisfy the conditions of this license) patent license to make, have made, use, offer to sell, sell, import, and otherwise transfer this software, where such license applies only to those patent claims, already acquired or hereafter acquired, licensable by such copyright holder or contributor that are necessarily infringed by:
+
+(a) their Contribution(s) (the licensed copyrights of copyright holders and non-copyrightable additions of contributors, in source or binary form) alone; or
+(b) combination of their Contribution(s) with the work of authorship to which such Contribution(s) was added by such copyright holder or contributor, if, at the time the Contribution is added, such addition causes such combination to be necessarily infringed. The patent license shall not apply to any other combinations which include the Contribution.
+
+Except as expressly stated above, no rights or licenses from any copyright holder or contributor is granted under this license, whether expressly, by implication, estoppel or otherwise.
+
+DISCLAIMER
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Fixed-version QR encoder
+
+`Sources/CQRCodeGen/qrcodegen.c` and `include/qrcodegen.h` are unmodified copies
+of Project Nayuki's QR Code generator v1.8.0, pinned to commit
+`720f62bddb7226106071d4728c292cb1df519ceb`.
+
+Reference: https://github.com/nayuki/QR-Code-generator/tree/720f62bddb7226106071d4728c292cb1df519ceb/c
+
+Upstream Git blob identities:
+
+- `qrcodegen.c`: `861704426a9ed38723b7089de8579c6f332ab600`
+- `qrcodegen.h`: `6bbc15762a8af18c792a344632e2e538974df1a0`
+
+FrankenTerm supplies bounded FTQR1 validation, one fixed version-22 level-Q
+profile with ECC boosting disabled, and a shared integer-scaled grayscale
+raster for live, APNG, and MP4 presentation. The encoder allocates no heap
+memory and performs no I/O. Independent decoder tests exercise the generated
+symbols; physical screen/camera qualification remains a separate native test.
+
+## MIT License
+
+Copyright (c) Project Nayuki.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+- The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+- The Software is provided "as is", without warranty of any kind, express or
+  implied, including but not limited to the warranties of merchantability,
+  fitness for a particular purpose and noninfringement. In no event shall the
+  authors or copyright holders be liable for any claim, damages or other
+  liability, whether in an action of contract, tort or otherwise, arising from,
+  out of or in connection with the Software or the use or other dealings in the
+  Software.
+
+# Encrypted OpenSSH source-key unlocking
+
+`Sources/COpenSSHBcrypt` includes `bcrypt_pbkdf.c`, `blowfish.c`, and `blf.h`
+from OpenSSH portable commit `26b1363c7cbf5d01c730f45fc0b4abc5686beaf7`,
+under their original licenses below. Local adaptations provide portability
+includes, private symbol names, a per-call maintained SHA-512 primitive,
+bounded admission, and clearing of owned temporary buffers. The bcrypt PBKDF
+and Blowfish algorithms are unchanged.
+
+Reference: https://github.com/openssh/openssh-portable/tree/26b1363c7cbf5d01c730f45fc0b4abc5686beaf7/openbsd-compat
+
+## bcrypt_pbkdf.c license
+
+Copyright (c) 2013 Ted Unangst <tedu@openbsd.org>
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+## blowfish.c and blf.h license
+
+Copyright 1997 Niels Provos <provos@physnet.uni-hamburg.de>
+All rights reserved.
+
+Implementation advice by David Mazieres <dm@lcs.mit.edu>.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Recipient HPKE implementation and Linux validation dependencies
+
+`RecipientHPKE.swift` delegates the fixed RFC 9180 Base-mode
+X25519/HKDF-SHA256/ChaCha20-Poly1305 suite to system CryptoKit on Apple.
+On Linux, `Package.swift` selects the maintained `Crypto` product from
+Apple's Swift Crypto package; no HPKE key schedule is implemented in the
+production target. The independent deterministic OpenSSL test oracle remains
+confined to the test target.
+The adapter additionally enforces RFC 9180 section 7.1.4's all-zero X25519
+agreement rejection through the maintained key-agreement primitive.
+
+The exact Linux dependency graph is recorded in `Package.resolved`:
+
+| Package | Version | Git revision | License and upstream notices |
+| --- | --- | --- | --- |
+| apple/swift-crypto | 4.5.2 | `da9d28d69ebe3894b18376c8f2395c2f37b8448f` | [Apache-2.0](https://github.com/apple/swift-crypto/blob/da9d28d69ebe3894b18376c8f2395c2f37b8448f/LICENSE.txt), [NOTICE](https://github.com/apple/swift-crypto/blob/da9d28d69ebe3894b18376c8f2395c2f37b8448f/NOTICE.txt) |
+| apple/swift-asn1 (transitive) | 1.7.3 | `3b6410f7dee09eb33cdd26260c5fd47fda19b0e2` | [Apache-2.0](https://github.com/apple/swift-asn1/blob/3b6410f7dee09eb33cdd26260c5fd47fda19b0e2/LICENSE.txt), [NOTICE](https://github.com/apple/swift-asn1/blob/3b6410f7dee09eb33cdd26260c5fd47fda19b0e2/NOTICE.txt) |
+
+Copyright 2019 The SwiftCrypto Project.
+
+Copyright 2022 The SwiftASN1 Project.
+
+These projects are licensed under the Apache License, Version 2.0. The license
+is available at https://www.apache.org/licenses/LICENSE-2.0. Unless required
+by applicable law or agreed to in writing, the software is provided on an
+"AS IS" basis, without warranties or conditions of any kind, express or
+implied. See each linked license for its governing permissions and limitations.
+
+Swift Crypto carries its own BoringSSL/XKCP implementation and component
+copyright/license notices; its upstream NOTICE also identifies Wycheproof
+test vectors and SwiftNIO-derived files. Swift ASN.1's NOTICE identifies
+SwiftNIO- and Swift OpenAPI Generator-derived scripts. Linux distributions
+that include these dependencies must retain their full upstream LICENSE,
+NOTICE, and component notices. This repository does not vendor or alter
+those sources. Apple package resolution excludes both dependencies and their
+native backends; Apple products use system CryptoKit.
+
+The optional `Tests/validate_recipient_hpke.py` cross-check uses installed
+pyhpke with public synthetic fixtures. These independent test
+tools are not package or application dependencies and are not redistributed
+by FrankenTerm.
+
+## Platform dependencies
+
+Apple products use system CryptoKit, CommonCrypto, Security, and zlib. Linux cryptographic
+oracles use system OpenSSL solely in the test target, while the recipient
+adapter uses the Linux-only Swift Crypto dependency described above. No OpenSSL
+implementation is copied into or linked by the Apple product. Distribution must retain all
+notices above in the native app's licenses surface and release materials.

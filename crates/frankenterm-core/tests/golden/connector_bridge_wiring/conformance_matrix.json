@@ -1,0 +1,34 @@
+[
+  {
+    "bead": "ft-7h5da.5.9",
+    "bridge": "inbound",
+    "contract": "runtime-owned ingress routes ConnectorSignal into EventBus",
+    "production_caller_wired": true,
+    "fail_closed": true,
+    "no_silent_drop": true
+  },
+  {
+    "bead": "ft-7h5da.5.10",
+    "bridge": "outbound",
+    "contract": "runtime EventBus feeds outbound admission; unavailable delivery fails closed without success or retry",
+    "production_caller_wired": true,
+    "fail_closed": true,
+    "no_silent_drop": true
+  },
+  {
+    "bead": "ft-7h5da.5.11",
+    "bridge": "lifecycle_mesh",
+    "contract": "PolicyEngine exposes lifecycle/mesh admission models; runtime refuses delivery without transport",
+    "production_caller_wired": true,
+    "fail_closed": true,
+    "no_silent_drop": true
+  },
+  {
+    "bead": "ft-7h5da.5.13",
+    "bridge": "conformance",
+    "contract": "golden and zero-RCH e2e harness preserve connector bridge wiring contracts",
+    "production_caller_wired": true,
+    "fail_closed": true,
+    "no_silent_drop": true
+  }
+]

@@ -1,0 +1,38 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9005",
+    "description": "A background task panicked unexpectedly. The panic has been caught and propagated as an error.",
+    "error": "Task panicked: worker thread panicked: index out of bounds",
+    "hint": "A task panicked. Check logs for the panic backtrace and retry.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "If the panic persists, report the issue with the backtrace."
+      ],
+      "commands": [
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "A task panicked. Check logs for the panic backtrace and retry."
+    },
+    "title": "Task panicked"
+  },
+  "plain_lines": [
+    "Error: Task panicked",
+    "",
+    "A background task panicked unexpectedly. The panic has been caught and propagated as an error.",
+    "",
+    "Suggestions:",
+    "  • A task panicked. Check logs for the panic backtrace and retry.",
+    "  → Diagnostics: `ft doctor`",
+    "  • If the panic persists, report the issue with the backtrace.",
+    "",
+    "Error code: FT-9005",
+    "Run `ft why FT-9005` for more details."
+  ]
+}

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Stub `br` for swarm-tick tests. Routes `br list --status X --json`
+# and `br ready --json` to fixtures.
+sub="${1:-}"
+shift || true
+
+if [ "$sub" = "ready" ]; then
+    cat "$FIXTURE_DIR/br_ready.json"
+    exit 0
+fi
+
+if [ "$sub" = "list" ]; then
+    status=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --status) status="$2"; shift 2 ;;
+            --status=*) status="${1#--status=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+    case "$status" in
+        open)        cat "$FIXTURE_DIR/br_open.json" ;;
+        in_progress) cat "$FIXTURE_DIR/br_in_progress.json" ;;
+        blocked)     cat "$FIXTURE_DIR/br_blocked.json" ;;
+        *) echo '{"issues":[]}' ;;
+    esac
+    exit 0
+fi

@@ -1,0 +1,49 @@
+# Local development overrides — copy this to config.toml and adjust paths.
+#
+# These [patch] entries redirect git dependencies to local checkouts,
+# so you can iterate on sibling repos without pushing first.
+# config.toml is gitignored; this example is committed for reference.
+
+[patch."https://github.com/Dicklesworthstone/asupersync"]
+asupersync = { path = "../asupersync" }
+
+[patch."https://github.com/Dicklesworthstone/rich_rust"]
+rich_rust = { path = "../rich_rust" }
+
+[patch."https://github.com/Dicklesworthstone/frankentui"]
+ftui = { path = "../frankentui/crates/ftui" }
+ftui-core = { path = "../frankentui/crates/ftui-core" }
+ftui-render = { path = "../frankentui/crates/ftui-render" }
+ftui-layout = { path = "../frankentui/crates/ftui-layout" }
+ftui-style = { path = "../frankentui/crates/ftui-style" }
+ftui-text = { path = "../frankentui/crates/ftui-text" }
+ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
+ftui-widgets = { path = "../frankentui/crates/ftui-widgets" }
+ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
+ftui-backend = { path = "../frankentui/crates/ftui-backend" }
+
+[patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
+fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-client = { path = "../fastmcp_rust/crates/fastmcp-client" }
+fastmcp-derive = { path = "../fastmcp_rust/crates/fastmcp-macros" }
+fastmcp-console = { path = "../fastmcp_rust/crates/fastmcp-console" }
+
+[patch."https://github.com/Dicklesworthstone/fastapi_rust"]
+fastapi-rust = { path = "../fastapi_rust/crates/fastapi" }
+fastapi-core = { path = "../fastapi_rust/crates/fastapi-core" }
+fastapi-http = { path = "../fastapi_rust/crates/fastapi-http" }
+fastapi-router = { path = "../fastapi_rust/crates/fastapi-router" }
+fastapi-macros = { path = "../fastapi_rust/crates/fastapi-macros" }
+fastapi-openapi = { path = "../fastapi_rust/crates/fastapi-openapi" }
+fastapi-output = { path = "../fastapi_rust/crates/fastapi-output" }
+
+[patch."https://github.com/Dicklesworthstone/frankenredis"]
+fr-store = { path = "../frankenredis/crates/fr-store" }
+fr-protocol = { path = "../frankenredis/crates/fr-protocol" }
+fr-config = { path = "../frankenredis/crates/fr-config" }
+fr-expire = { path = "../frankenredis/crates/fr-expire" }
+fr-persist = { path = "../frankenredis/crates/fr-persist" }

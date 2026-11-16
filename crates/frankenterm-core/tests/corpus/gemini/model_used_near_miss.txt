@@ -1,0 +1,5 @@
+Gemini CLI help
+
+Using model: edit the config file to choose a model alias.
+Model: choose one of the presets from the menu below.
+Switched to model picker after pressing /model.

@@ -1,0 +1,10239 @@
+use crate::client::{
+    reserve_client_main_thread, with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind,
+    RpcGenerationAbortGuard, RpcGenerationScope, RpcTopologySnapshot,
+};
+use crate::pane::{ClientPane, ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
+use anyhow::{anyhow, bail, ensure, Context};
+use async_trait::async_trait;
+use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, PduWireIdent, SpawnV2, SplitPane};
+use config::keyassignment::SpawnTabDomain;
+use config::{SshDomain, TlsDomainClient, UnixDomain};
+use futures::StreamExt;
+use mux::client::ClientId;
+use mux::connui::{ConnectionUI, ConnectionUIParams};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
+use mux::pane::{reserve_pane_ids, Pane, PaneId};
+use mux::tab::{
+    prepare_pane_tree_from_arena_with_scratch, DomainFloatingPaneState, PaneArena, PaneArenaNode,
+    PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
+};
+use mux::window::WindowId;
+use mux::{
+    CurrentPane, DomainOperationGuard, MoveCommitReceipt, Mux, MuxNotification,
+    MuxSessionIncarnation, MuxWindowBuilder, PaneOperationGuard, PaneRegistrationHandle,
+    SplitCommitReceipt,
+};
+use portable_pty::CommandBuilder;
+use promise::spawn::spawn_into_new_thread;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
+use std::future::Future;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::num::NonZeroU64;
+use std::pin::Pin;
+use std::rc::Rc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
+use wezterm_term::TerminalSize;
+
+thread_local! {
+    /// Remote metadata application is synchronous with mux notification
+    /// delivery. Keep suppression thread-local so an unrelated local mutation
+    /// on another thread is never mistaken for an echo from this attachment.
+    static REMOTE_METADATA_APPLICATION_DEPTHS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Sample synchronously while handling a mux notification, before queueing
+/// GUI work: a later callback no longer has the remote application's origin.
+pub fn remote_layout_application_in_progress() -> bool {
+    REMOTE_METADATA_APPLICATION_DEPTHS
+        .try_with(|depths| {
+            depths
+                .try_borrow()
+                .map(|depths| !depths.is_empty())
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+/// One attachment-generation-scoped bijection between remote and local ids.
+///
+/// Keeping both directions behind the same mutex makes reverse lookups bounded
+/// without creating a second lock or a torn forward/reverse update window.
+/// Numeric local ids may be recycled by the mux, but the complete mapping is
+/// owned by one [`ClientInner`] generation and is discarded with it.
+struct ExactIdMappings<Remote, Local> {
+    remote_to_local: HashMap<Remote, Local>,
+    local_to_remote: HashMap<Local, Remote>,
+    #[cfg(test)]
+    reverse_lookup_probes: AtomicUsize,
+}
+
+impl<Remote, Local> Default for ExactIdMappings<Remote, Local> {
+    fn default() -> Self {
+        Self {
+            remote_to_local: HashMap::new(),
+            local_to_remote: HashMap::new(),
+            #[cfg(test)]
+            reverse_lookup_probes: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<Remote, Local> ExactIdMappings<Remote, Local>
+where
+    Remote: Copy + Eq + Hash,
+    Local: Copy + Eq + Hash,
+{
+    fn len(&self) -> usize {
+        self.remote_to_local.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.remote_to_local.is_empty()
+    }
+
+    fn get(&self, remote: &Remote) -> Option<&Local> {
+        self.remote_to_local.get(remote)
+    }
+
+    fn get_remote(&self, local: &Local) -> Option<&Remote> {
+        #[cfg(test)]
+        {
+            self.reverse_lookup_probes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.local_to_remote.get(local)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Remote, &Local)> {
+        self.remote_to_local.iter()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &Remote> {
+        self.remote_to_local.keys()
+    }
+
+    /// Insert one authoritative mapping while retaining a strict bijection.
+    ///
+    /// Reusing either side retires its previous opposite-side association in
+    /// the same critical section. This matches resync semantics: the newest
+    /// exact attachment generation owns the local identity.
+    fn insert(&mut self, remote: Remote, local: Local) -> Option<Local> {
+        let prior_local = self.remote_to_local.get(&remote).copied();
+        if prior_local == Some(local) {
+            if self.local_to_remote.get(&local) != Some(&remote) {
+                // This is corruption repair, so reserve before changing the
+                // conflicting reverse edge. The forward cardinality cannot
+                // grow on an idempotent insert.
+                self.local_to_remote.reserve(1);
+                if let Some(old_remote) = self.local_to_remote.remove(&local) {
+                    self.remote_to_local.remove(&old_remote);
+                }
+                self.local_to_remote.insert(local, remote);
+            }
+            return prior_local;
+        }
+
+        // Under the maintained bijection, cardinality grows only when neither
+        // side is currently owned. Reserve both tables before the first
+        // semantic write so allocation cannot tear a recovered poisoned map.
+        if prior_local.is_none() && !self.local_to_remote.contains_key(&local) {
+            self.remote_to_local.reserve(1);
+            self.local_to_remote.reserve(1);
+        }
+        if let Some(old_local) = prior_local {
+            self.local_to_remote.remove(&old_local);
+        }
+        if let Some(old_remote) = self.local_to_remote.remove(&local) {
+            self.remote_to_local.remove(&old_remote);
+        }
+        self.remote_to_local.insert(remote, local);
+        self.local_to_remote.insert(local, remote);
+        prior_local
+    }
+
+    fn remove(&mut self, remote: &Remote) -> Option<Local> {
+        let local = self.remote_to_local.remove(remote)?;
+        let removed_remote = self.local_to_remote.remove(&local);
+        debug_assert!(removed_remote == Some(*remote));
+        Some(local)
+    }
+
+    fn retain(&mut self, mut retain: impl FnMut(&Remote, &Local) -> bool) {
+        // Evaluate caller policy completely before the first semantic write.
+        // HashMap::retain mutates incrementally, so a panicking predicate could
+        // otherwise poison the mutex after changing only the forward half.
+        let mut removals = Vec::with_capacity(self.remote_to_local.len());
+        for (remote, local) in &self.remote_to_local {
+            if !retain(remote, local) {
+                removals.push(*remote);
+            }
+        }
+        for remote in removals {
+            self.remove(&remote);
+        }
+    }
+
+    fn extend(&mut self, mappings: impl IntoIterator<Item = (Remote, Local)>) {
+        for (remote, local) in mappings {
+            self.insert(remote, local);
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_forward_alias_for_test(&mut self, remote: Remote, local: Local) {
+        self.remote_to_local.insert(remote, local);
+    }
+
+    #[cfg(test)]
+    fn reverse_lookup_probes(&self) -> usize {
+        self.reverse_lookup_probes.load(Ordering::Relaxed)
+    }
+}
+
+/// Identity available for the lifetime of a local client attachment, rather
+/// than only one transport connection. Legacy peers cannot prove continuity;
+/// their best-effort mappings must never silently acquire current authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientTopologySession {
+    Current(MuxSessionIncarnation),
+    Legacy46,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum ClientTopologySessionError {
+    #[error("remote topology carries a reserved mux session identity")]
+    ReservedIdentity,
+    #[error("remote mux session identity changed; a fresh domain attachment is required")]
+    Changed,
+    #[error(
+        "remote topology dialect changed without proof of session continuity; a fresh domain attachment is required"
+    )]
+    DialectChanged,
+}
+
+/// Whether a failed reattach found a different server session (the remote
+/// mux restarted, or its dialect changed). Such an attachment can never
+/// resume: it is detached, and only a fresh attachment shows the domain again.
+pub(crate) fn reattach_needs_fresh_attachment(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ClientTopologySessionError>(),
+            Some(ClientTopologySessionError::Changed | ClientTopologySessionError::DialectChanged)
+        )
+    })
+}
+
+#[derive(Default)]
+enum ClientTopologySessionState {
+    #[default]
+    Unbound,
+    Bound(ClientTopologySession),
+    Revoked(ClientTopologySessionError),
+}
+
+/// The session a layout receipt is scoped to, so the GUI can remember tab
+/// order across restarts. A current-codec server supplies its incarnation. A
+/// codec-46 server has none, but its numeric tab IDs stay valid for the life
+/// of that server process, which outlives many GUI restarts; its tabs are
+/// scoped to a session derived from the durable binding instead. Without this,
+/// order on legacy hosts was never saved and every reopen fell back to the
+/// server's creation order. If such a server restarts, a saved ID can match an
+/// unrelated new tab: the cost is a misplaced tab, never a lost one.
+fn layout_session(
+    state: &ClientTopologySessionState,
+    binding: DurableClientBinding,
+) -> Option<MuxSessionIncarnation> {
+    match state {
+        ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => {
+            Some(*session)
+        }
+        ClientTopologySessionState::Bound(ClientTopologySession::Legacy46) => {
+            let mut hasher = openssl::sha::Sha256::new();
+            hasher.update(b"frankenterm-legacy46-layout-session-v1");
+            hasher.update(&binding.binding_id.as_bytes());
+            let digest = hasher.finish();
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            Some(MuxSessionIncarnation::from_bytes(bytes))
+        }
+        ClientTopologySessionState::Unbound | ClientTopologySessionState::Revoked(_) => None,
+    }
+}
+
+/// What one attempt to publish an attachment's layout receipt achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutPublication {
+    Published,
+    /// The domain has no durable layout binding, so there is nothing to
+    /// restore and input is never fenced on it.
+    NoDurableBinding,
+    /// No receipt can be published in the attachment's current state.
+    Unavailable(&'static str),
+}
+
+/// Ends a topology resync's layout restore attempt if the resync exits after
+/// withdrawing the layout receipt but before republishing it, so typed input
+/// is never fenced on a restore that can no longer land (GitHub #132).
+struct LayoutRestoreSettlement<'a> {
+    domain: &'a ClientDomain,
+    inner: &'a ClientInner,
+    receipt_withdrawn: AtomicBool,
+}
+
+impl<'a> LayoutRestoreSettlement<'a> {
+    fn new(domain: &'a ClientDomain, inner: &'a ClientInner) -> Self {
+        Self {
+            domain,
+            inner,
+            receipt_withdrawn: AtomicBool::new(false),
+        }
+    }
+
+    /// Record that the layout receipt is about to be withdrawn.
+    fn receipt_withdrawn(&self) {
+        self.receipt_withdrawn.store(true, Ordering::Release);
+    }
+
+    /// The caller republishes the receipt itself. Consumes the guard, which
+    /// also releases its borrow of the attachment.
+    fn disarm(self) {
+        self.receipt_withdrawn.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for LayoutRestoreSettlement<'_> {
+    fn drop(&mut self) {
+        if self.receipt_withdrawn.load(Ordering::Acquire) {
+            self.domain.end_layout_restore(
+                self.inner,
+                &"the topology resync ended before the layout was restored",
+                true,
+            );
+        }
+    }
+}
+
+/// Focus changes this client advised (SetFocusedPane) whose `PaneFocused`
+/// echo has not arrived yet, oldest first.
+///
+/// Servers broadcast every focus change to all clients, including the one that
+/// made it; current servers do too, not only legacy (codec-46) ones, so this
+/// applies to every attachment. Applying our own late echoes as remote
+/// commands made two quick local focus changes (attach focusing the server's
+/// active tab, then layout restore selecting the saved one) chase each other:
+/// each stale echo moved local focus back and was advised again, and whichever
+/// echo landed last won (ft-ox00h).
+#[derive(Debug, Default)]
+pub(crate) struct FocusAdvisories {
+    in_flight: VecDeque<(PaneId, Instant)>,
+}
+
+impl FocusAdvisories {
+    /// Generous for a loaded SSH proxy; an advisory the server never echoes
+    /// (focus was already there) must not mask a genuine remote change forever.
+    const ECHO_WINDOW: Duration = Duration::from_secs(10);
+    const MAX_IN_FLIGHT: usize = 32;
+
+    pub(crate) fn advised(&mut self, pane_id: PaneId, now: Instant) {
+        if self.in_flight.len() == Self::MAX_IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back((pane_id, now));
+    }
+
+    /// Whether a remote `PaneFocused` should move local focus. An echo of one
+    /// of our own in-flight advisories only confirms what we already applied
+    /// locally (and settles every older advisory); anything else is a genuine
+    /// remote focus change.
+    pub(crate) fn is_remote_change(&mut self, pane_id: PaneId, now: Instant) -> bool {
+        self.in_flight
+            .retain(|(_, at)| now.saturating_duration_since(*at) < Self::ECHO_WINDOW);
+        match self.in_flight.iter().position(|(id, _)| *id == pane_id) {
+            Some(echo) => {
+                self.in_flight.drain(..=echo);
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+pub struct ClientInner {
+    pub client: Client,
+    pub local_domain_id: DomainId,
+    owner_client_id: Option<Arc<ClientId>>,
+    pub local_echo_threshold_ms: Option<u64>,
+    pub overlay_lag_indicator: bool,
+    remote_to_local_window: Mutex<ExactIdMappings<WindowId, WindowId>>,
+    remote_to_local_tab: Mutex<ExactIdMappings<TabId, TabId>>,
+    remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
+    spare_local_pane_ids: Mutex<Vec<PaneId>>,
+    pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// The server has not been sent `focused_remote_pane_id`: the GUI focused
+    /// the pane before the connection was ready, or the send failed.
+    /// `ClientDomain::flush_pending_focus` sends it once the connection is
+    /// ready.
+    pub(crate) focus_delivery_pending: Arc<AtomicBool>,
+    pub(crate) focus_advisories: Mutex<FocusAdvisories>,
+    pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
+    pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
+    pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
+    pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
+    topology_session: Mutex<ClientTopologySessionState>,
+    layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
+    layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
+    layout_failed: AtomicBool,
+    user_var_hydration: Mutex<UserVarHydrationState>,
+    detached: AtomicBool,
+}
+
+#[derive(Default)]
+struct UserVarHydrationState {
+    generation: Option<NonZeroU64>,
+    running: bool,
+    census_requested: bool,
+    pending_panes: BTreeSet<PaneId>,
+    waiters: Vec<async_channel::Sender<anyhow::Result<()>>>,
+}
+
+impl UserVarHydrationState {
+    fn request(&mut self, pane_id: Option<PaneId>) {
+        match pane_id {
+            Some(pane_id)
+                if !self.census_requested
+                    && (self.pending_panes.len() < 4096
+                        || self.pending_panes.contains(&pane_id)) =>
+            {
+                self.pending_panes.insert(pane_id);
+            }
+            Some(_) if self.census_requested => {}
+            // A burst beyond the bounded targeted set becomes one complete
+            // census rather than losing a refresh or retaining more IDs.
+            _ => {
+                self.census_requested = true;
+                self.pending_panes.clear();
+            }
+        }
+    }
+}
+
+fn user_var_snapshot_may_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::client::RemoteRejectionError>()
+        .is_some_and(|error| {
+            error.response.request_ident == codec::GetPaneUserVarsV1::IDENT
+                && error.response.effect == codec::MuxErrorEffect::NOT_APPLIED
+                && error.response.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF
+        })
+}
+
+struct UserVarHydrationGuard {
+    inner: Arc<ClientInner>,
+    rpc: RpcGenerationScope,
+    armed: bool,
+}
+
+impl Drop for UserVarHydrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let waiters = {
+            let mut state = lock_or_recover(&self.inner.user_var_hydration, "user_var_hydration");
+            if state.generation != self.rpc.connection_generation() {
+                return;
+            }
+            state.running = false;
+            state.census_requested = false;
+            state.pending_panes.clear();
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.try_send(Err(anyhow!(
+                "user-variable hydration failed or was cancelled"
+            )));
+        }
+        self.rpc
+            .abort_exact_generation("user-variable hydration failed or was cancelled");
+    }
+}
+
+/// A committed attachment's remote identities. Construction is private: a
+/// configured endpoint or a legacy numeric mapping cannot mint this receipt.
+pub struct RemoteLayoutSnapshot {
+    inner: Weak<ClientInner>,
+    rpc: RpcGenerationScope,
+    binding: DurableClientBinding,
+    session: MuxSessionIncarnation,
+    tabs: Vec<RemoteLayoutTab>,
+}
+
+pub struct RemoteLayoutTab {
+    tab: Arc<Tab>,
+    remote_tab_id: TabId,
+    remote_window_id: WindowId,
+}
+
+impl RemoteLayoutTab {
+    fn validate(&self, mux: &Mux, inner: &Arc<ClientInner>) -> anyhow::Result<()> {
+        ensure!(
+            mux.get_tab(self.tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &self.tab)),
+            "layout tab was replaced"
+        );
+        let mapped = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .get(&self.remote_tab_id)
+            .copied();
+        ensure!(
+            mapped == Some(self.tab.tab_id()),
+            "layout tab mapping changed"
+        );
+        let panes = self.tab.iter_all_panes();
+        ensure!(!panes.is_empty(), "remote layout tab has no owned panes");
+        for pane in panes {
+            ensure!(
+                mux.get_pane(pane.pane_id())
+                    .is_some_and(|current| Arc::ptr_eq(&current, &pane)),
+                "layout pane registration was replaced"
+            );
+            let client_pane = pane
+                .downcast_ref::<ClientPane>()
+                .context("remote layout tab contains a local pane")?;
+            ensure!(
+                pane.domain_id() == inner.local_domain_id
+                    && client_pane.belongs_to_client(inner)
+                    && client_pane.remote_tab_id() == self.remote_tab_id,
+                "remote layout tab contains a pane from another attachment"
+            );
+            ensure!(
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+                    .get(&client_pane.remote_pane_id())
+                    .copied()
+                    == Some(pane.pane_id()),
+                "layout pane mapping changed"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn tab(&self) -> &Arc<Tab> {
+        &self.tab
+    }
+
+    pub fn remote_tab_id(&self) -> TabId {
+        self.remote_tab_id
+    }
+
+    pub fn remote_window_id(&self) -> WindowId {
+        self.remote_window_id
+    }
+}
+
+impl RemoteLayoutSnapshot {
+    pub fn binding(&self) -> DurableClientBinding {
+        self.binding
+    }
+
+    pub fn session(&self) -> MuxSessionIncarnation {
+        self.session
+    }
+
+    pub fn tabs(&self) -> &[RemoteLayoutTab] {
+        &self.tabs
+    }
+
+    /// Hold the original transport's consumer lease across the local commit.
+    /// Reconnecting to the same endpoint does not validate an old receipt.
+    pub fn with_current<T>(
+        &self,
+        mux: &Arc<Mux>,
+        apply: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _lease = self
+            .rpc
+            .retain_consumer_commit(RpcConsumerKind::TopologySnapshot)?;
+        self.validate_current(mux)?;
+        apply()
+    }
+
+    pub fn with_current_batch<T>(
+        snapshots: &[Arc<Self>],
+        mux: &Arc<Mux>,
+        apply: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        ensure!(
+            snapshots.len() <= 4_096,
+            "too many layout attachment receipts"
+        );
+        let mut leases = Vec::new();
+        leases.try_reserve_exact(snapshots.len())?;
+        for snapshot in snapshots {
+            leases.push(
+                snapshot
+                    .rpc
+                    .retain_consumer_commit(RpcConsumerKind::TopologySnapshot)?,
+            );
+        }
+        for snapshot in snapshots {
+            snapshot.validate_current(mux)?;
+        }
+        apply()
+    }
+
+    fn validate_current(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .context("layout attachment was released")?;
+        ensure!(!inner.is_detached(), "layout attachment was detached");
+        let domain = mux
+            .get_domain(inner.local_domain_id)
+            .context("layout domain was removed")?;
+        let domain = domain
+            .downcast_ref::<ClientDomain>()
+            .context("layout domain was replaced")?;
+        ensure!(
+            domain.inner_is_current(&inner),
+            "layout attachment was replaced"
+        );
+        ensure!(
+            domain.durable_layout_binding() == Some(self.binding),
+            "layout binding changed"
+        );
+        let current = lock_or_recover(&inner.layout_snapshot, "layout_snapshot");
+        ensure!(
+            current
+                .as_ref()
+                .is_some_and(|snapshot| std::ptr::eq(snapshot.as_ref(), self)),
+            "layout snapshot was superseded"
+        );
+        drop(current);
+        for entry in &self.tabs {
+            entry.validate(mux, &inner)?;
+        }
+        Ok(())
+    }
+}
+
+/// Owns one attachment's pending title update, including its RPC. Producers
+/// mark the same entry dirty while it is in flight. Completion and new-writer
+/// admission share the map lock, so the final update cannot lose its wakeup.
+struct PendingWindowTitle {
+    inner: Arc<ClientInner>,
+    window_mapping: (WindowId, WindowId),
+    dirty: Arc<AtomicBool>,
+}
+
+impl PendingWindowTitle {
+    fn begin_update(&self) {
+        // Clear before reading the authoritative mux title. A mutation before
+        // this cut is included in that read; one after it requests another pass.
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    fn finish_if_clean(&self) -> bool {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_titles, "pending_window_titles");
+        if self.dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        if pending
+            .get(&self.window_mapping)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.window_mapping);
+        }
+        true
+    }
+}
+
+impl Drop for PendingWindowTitle {
+    fn drop(&mut self) {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_titles, "pending_window_titles");
+        if pending
+            .get(&self.window_mapping)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.window_mapping);
+        }
+    }
+}
+
+/// Suppresses only this exact client attachment's outbound metadata echo while
+/// an authoritative remote mutation is synchronously applied to the local mux.
+pub(crate) struct RemoteMetadataApplicationGuard<'a> {
+    inner_key: usize,
+    _attachment: PhantomData<&'a ClientInner>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for RemoteMetadataApplicationGuard<'_> {
+    fn drop(&mut self) {
+        let released = REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| {
+                let Ok(mut depths) = depths.try_borrow_mut() else {
+                    return false;
+                };
+                let Some(depth) = depths.get_mut(&self.inner_key) else {
+                    return false;
+                };
+                if *depth == 1 {
+                    depths.remove(&self.inner_key);
+                } else if let Some(next) = depth.checked_sub(1) {
+                    *depth = next;
+                } else {
+                    return false;
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !released {
+            log::error!("remote metadata suppression guard lost its thread-local attachment depth");
+        }
+    }
+}
+
+pub(crate) fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("recovering poisoned {label} lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn collect_remote_pane_ids(
+    node: &PaneNode,
+    expected_tree_identity: &mut Option<(WindowId, TabId)>,
+    seen_pane_ids: &mut HashSet<PaneId>,
+    pane_ids: &mut Vec<PaneId>,
+    pane_tab_ids: &mut HashMap<PaneId, TabId>,
+) -> anyhow::Result<()> {
+    match node {
+        PaneNode::Empty => {}
+        PaneNode::Split { left, right, .. } => {
+            collect_remote_pane_ids(
+                left,
+                expected_tree_identity,
+                seen_pane_ids,
+                pane_ids,
+                pane_tab_ids,
+            )?;
+            collect_remote_pane_ids(
+                right,
+                expected_tree_identity,
+                seen_pane_ids,
+                pane_ids,
+                pane_tab_ids,
+            )?;
+        }
+        PaneNode::Leaf(entry) => {
+            let identity = (entry.window_id, entry.tab_id);
+            if expected_tree_identity.is_some_and(|expected| expected != identity) {
+                bail!(
+                    "malformed ListPanes response: one tab tree mixes window/tab identities {:?} \
+                     and {:?}",
+                    expected_tree_identity,
+                    identity
+                );
+            }
+            *expected_tree_identity = Some(identity);
+            if !seen_pane_ids.insert(entry.pane_id) {
+                bail!(
+                    "malformed ListPanes response: remote pane {} appears more than once",
+                    entry.pane_id
+                );
+            }
+            if pane_tab_ids.insert(entry.pane_id, entry.tab_id).is_some() {
+                bail!(
+                    "malformed ListPanes response: remote pane {} has conflicting tab owners",
+                    entry.pane_id
+                );
+            }
+            pane_ids.push(entry.pane_id);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PaneArenaTabPlan {
+    node_count: usize,
+    root_size: TerminalSize,
+    remote_window_id: WindowId,
+    remote_tab_id: TabId,
+}
+
+struct PreparedPaneArenaTab {
+    plan: PaneArenaTabPlan,
+    workspace: String,
+    tab_title: String,
+    tree: PreparedPaneTree,
+}
+
+struct StagedPaneArenaTab {
+    prepared: PreparedPaneArenaTab,
+    tab: Arc<Tab>,
+}
+
+#[derive(Default)]
+struct PendingPaneArenaPublication {
+    new_panes: Vec<(PaneId, Arc<dyn Pane>)>,
+    existing_sync: Vec<(Arc<dyn Pane>, bool)>,
+}
+
+struct PaneArenaPublicationRollback {
+    mux: Arc<Mux>,
+    pane_registrations: Vec<PaneRegistrationHandle>,
+    new_tabs: Vec<Arc<Tab>>,
+    new_windows: Vec<MuxWindowBuilder>,
+    committed: bool,
+}
+
+impl PaneArenaPublicationRollback {
+    fn new(mux: &Arc<Mux>) -> Self {
+        Self {
+            mux: Arc::clone(mux),
+            pane_registrations: Vec::new(),
+            new_tabs: Vec::new(),
+            new_windows: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PaneArenaPublicationRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for tab in self.new_tabs.drain(..).rev() {
+            self.mux.remove_tab_local_only_if_same(&tab);
+        }
+        for window in self.new_windows.drain(..).rev() {
+            window.cancel();
+        }
+        for registration in self.pane_registrations.drain(..).rev() {
+            registration.detach_local_if_current();
+        }
+    }
+}
+
+struct PaneArenaPreflight {
+    tabs: Vec<PaneArenaTabPlan>,
+    remote_pane_ids: Vec<PaneId>,
+    remote_pane_tabs: Vec<(PaneId, TabId)>,
+    window_ids: Vec<WindowId>,
+}
+
+/// Validate every descriptor, child edge, and remote identity before a direct
+/// flat-arena application is allowed to reserve an identifier or mutate the
+/// mux. `PaneArena::from_unvalidated_parts` is public for codec admission, so
+/// the dormant client application seam must not assume that its caller used
+/// the codec validator.
+fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight> {
+    codec::validate_ordered_pane_arena(panes)
+        .context("validate ordered pane arena resource and topology admission")?;
+    let mut cursor = 0usize;
+    let mut tabs = Vec::new();
+    tabs.try_reserve_exact(panes.trees().len())
+        .context("reserve ordered pane arena tab preflight")?;
+    let mut remote_pane_ids = Vec::new();
+    remote_pane_ids
+        .try_reserve_exact(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena pane identities")?;
+    let mut remote_pane_tabs = Vec::new();
+    remote_pane_tabs
+        .try_reserve_exact(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena pane/tab identities")?;
+    let mut seen_remote_pane_ids = HashSet::new();
+    seen_remote_pane_ids
+        .try_reserve(panes.nodes().len().div_ceil(2))
+        .context("reserve ordered pane arena unique pane identities")?;
+    let mut seen_remote_tab_ids = HashSet::new();
+    seen_remote_tab_ids
+        .try_reserve(panes.trees().len())
+        .context("reserve ordered pane arena unique tab identities")?;
+    let mut seen_remote_window_ids = HashSet::new();
+    seen_remote_window_ids
+        .try_reserve(panes.window_titles().len())
+        .context("reserve ordered pane arena unique window identities")?;
+
+    for (tree_index, descriptor) in panes.trees().iter().enumerate() {
+        let node_count = usize::try_from(descriptor.node_count).with_context(|| {
+            format!("ordered pane arena tree {tree_index} node count does not fit usize")
+        })?;
+        let root_index = descriptor
+            .root_index
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} has no root index"))?;
+        let root_index = usize::try_from(root_index).with_context(|| {
+            format!("ordered pane arena tree {tree_index} root index does not fit usize")
+        })?;
+        if node_count == 0 || root_index != cursor {
+            bail!(
+                "ordered pane arena tree {tree_index} has root {root_index} and {node_count} \
+                 nodes; expected one non-empty range rooted at {cursor}"
+            );
+        }
+        let arena_end = cursor
+            .checked_add(node_count)
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} range overflows usize"))?;
+        if arena_end > panes.nodes().len() {
+            bail!(
+                "ordered pane arena tree {tree_index} ends at {arena_end}, beyond {} nodes",
+                panes.nodes().len()
+            );
+        }
+
+        let root_size = match &panes.nodes()[root_index] {
+            PaneArenaNode::Empty => {
+                bail!("ordered pane arena tree {tree_index} has an empty root")
+            }
+            PaneArenaNode::Split { node, .. } => node.size(),
+            PaneArenaNode::Leaf(entry) => entry.size,
+        };
+        let mut tree_identity = None;
+        let mut workspace: Option<&str> = None;
+        for node in &panes.nodes()[root_index..arena_end] {
+            if let PaneArenaNode::Leaf(entry) = node {
+                if matches!(u64::try_from(entry.window_id), Ok(u64::MAX))
+                    || matches!(u64::try_from(entry.tab_id), Ok(u64::MAX))
+                    || entry.pane_id == usize::MAX
+                {
+                    bail!(
+                        "ordered pane arena tree {tree_index} uses a reserved terminal \
+                         window, tab, or pane identity"
+                    );
+                }
+                let identity = (entry.window_id, entry.tab_id);
+                if tree_identity.is_some_and(|expected| expected != identity) {
+                    bail!(
+                        "ordered pane arena tree {tree_index} mixes window/tab identities \
+                         {tree_identity:?} and {identity:?}"
+                    );
+                }
+                tree_identity = Some(identity);
+                if workspace
+                    .as_ref()
+                    .is_some_and(|expected| *expected != entry.workspace.as_str())
+                {
+                    bail!("ordered pane arena tree {tree_index} mixes workspace identities");
+                }
+                if workspace.is_none() {
+                    workspace = Some(entry.workspace.as_str());
+                }
+                if !seen_remote_pane_ids.insert(entry.pane_id) {
+                    bail!(
+                        "ordered pane arena remote pane {} appears more than once",
+                        entry.pane_id
+                    );
+                }
+                remote_pane_ids.push(entry.pane_id);
+                remote_pane_tabs.push((entry.pane_id, entry.tab_id));
+            }
+        }
+        let (remote_window_id, remote_tab_id) = tree_identity
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} has no pane identity"))?;
+        if !seen_remote_tab_ids.insert(remote_tab_id) {
+            bail!("ordered pane arena remote tab {remote_tab_id} appears more than once");
+        }
+        workspace.ok_or_else(|| {
+            anyhow!("ordered pane arena tree {tree_index} has no workspace authority")
+        })?;
+        seen_remote_window_ids.insert(remote_window_id);
+        tabs.push(PaneArenaTabPlan {
+            node_count,
+            root_size,
+            remote_window_id,
+            remote_tab_id,
+        });
+        cursor = arena_end;
+    }
+
+    if cursor != panes.nodes().len() {
+        bail!(
+            "ordered pane arena descriptors reference {cursor} of {} nodes",
+            panes.nodes().len()
+        );
+    }
+
+    let mut window_ids = Vec::new();
+    window_ids
+        .try_reserve_exact(panes.window_titles().len())
+        .context("reserve ordered pane arena window-title preflight")?;
+    let mut title_window_ids = HashSet::new();
+    title_window_ids
+        .try_reserve(panes.window_titles().len())
+        .context("reserve ordered pane arena title identities")?;
+    let mut prior_window_id = None;
+    for entry in panes.window_titles() {
+        if entry.window_id == u64::MAX {
+            bail!("ordered pane arena window title uses the reserved terminal identity");
+        }
+        let remote_window_id = usize::try_from(entry.window_id).with_context(|| {
+            format!(
+                "ordered pane arena window id {} does not fit this process",
+                entry.window_id
+            )
+        })?;
+        if prior_window_id.is_some_and(|prior| prior >= remote_window_id) {
+            bail!("ordered pane arena window titles are not in canonical id order");
+        }
+        prior_window_id = Some(remote_window_id);
+        if !title_window_ids.insert(remote_window_id) {
+            bail!("ordered pane arena repeats window title {remote_window_id}");
+        }
+        window_ids.push(remote_window_id);
+    }
+    if !seen_remote_window_ids.is_subset(&title_window_ids) {
+        bail!("ordered pane arena has a pane-tree window without matching title authority");
+    }
+
+    Ok(PaneArenaPreflight {
+        tabs,
+        remote_pane_ids,
+        remote_pane_tabs,
+        window_ids,
+    })
+}
+
+/// The flat path can append new mirrors in descriptor order, but it cannot
+/// soundly rewrite an already-published window permutation with the current
+/// client-facing mux API. Reject such a snapshot before pane preparation has
+/// any registration side effect.
+fn ensure_pane_arena_append_order_is_sound(
+    mux: &Mux,
+    inner: &ClientInner,
+    tabs: &[PaneArenaTabPlan],
+    remote_pane_tabs: &[(PaneId, TabId)],
+    window_ids: &[WindowId],
+) -> anyhow::Result<()> {
+    let mut desired_by_window: HashMap<WindowId, Vec<TabId>> = HashMap::new();
+    desired_by_window
+        .try_reserve(window_ids.len())
+        .context("reserve ordered pane arena desired windows")?;
+    let mut desired_tabs = HashSet::new();
+    desired_tabs
+        .try_reserve(tabs.len())
+        .context("reserve ordered pane arena desired tabs")?;
+    for tab in tabs {
+        desired_tabs.insert(tab.remote_tab_id);
+        desired_by_window
+            .entry(tab.remote_window_id)
+            .or_default()
+            .push(tab.remote_tab_id);
+    }
+
+    let mut desired_windows = HashSet::new();
+    desired_windows
+        .try_reserve(window_ids.len())
+        .context("reserve ordered pane arena desired window identities")?;
+    desired_windows.extend(window_ids.iter().copied());
+
+    let mut desired_pane_tabs = HashMap::new();
+    desired_pane_tabs
+        .try_reserve(remote_pane_tabs.len())
+        .context("reserve ordered pane arena desired pane ownership")?;
+    for &(remote_pane_id, remote_tab_id) in remote_pane_tabs {
+        if desired_pane_tabs
+            .insert(remote_pane_id, remote_tab_id)
+            .is_some()
+        {
+            bail!("ordered pane arena repeats remote pane {remote_pane_id}");
+        }
+    }
+
+    let tab_mappings = {
+        let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(mappings.len())
+            .context("reserve ordered pane arena tab-mapping snapshot")?;
+        snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+        snapshot
+    };
+    let window_mappings = {
+        let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(mappings.len())
+            .context("reserve ordered pane arena window-mapping snapshot")?;
+        snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+        snapshot
+    };
+
+    let mut local_to_remote_tab = HashMap::new();
+    local_to_remote_tab
+        .try_reserve(tab_mappings.len())
+        .context("reserve ordered pane arena reverse tab mappings")?;
+    let mut remote_to_local_tab = HashMap::new();
+    remote_to_local_tab
+        .try_reserve(tab_mappings.len())
+        .context("reserve ordered pane arena tab mappings")?;
+    for &(remote_tab_id, local_tab_id) in &tab_mappings {
+        if let Some(prior_remote_tab_id) = local_to_remote_tab.insert(local_tab_id, remote_tab_id) {
+            bail!(
+                "ordered pane arena mappings alias remote tabs {prior_remote_tab_id} and \
+                 {remote_tab_id} onto local tab {local_tab_id}"
+            );
+        }
+        remote_to_local_tab.insert(remote_tab_id, local_tab_id);
+    }
+
+    let mut local_to_remote_window = HashMap::new();
+    local_to_remote_window
+        .try_reserve(window_mappings.len())
+        .context("reserve ordered pane arena reverse window mappings")?;
+    let mut remote_to_local_window = HashMap::new();
+    remote_to_local_window
+        .try_reserve(window_mappings.len())
+        .context("reserve ordered pane arena window mappings")?;
+    for &(remote_window_id, local_window_id) in &window_mappings {
+        if let Some(prior_remote_window_id) =
+            local_to_remote_window.insert(local_window_id, remote_window_id)
+        {
+            bail!(
+                "ordered pane arena mappings alias remote windows {prior_remote_window_id} and \
+                 {remote_window_id} onto local window {local_window_id}"
+            );
+        }
+        remote_to_local_window.insert(remote_window_id, local_window_id);
+    }
+
+    let mut parent_by_local_tab = HashMap::new();
+    parent_by_local_tab
+        .try_reserve(tab_mappings.len().max(tabs.len()))
+        .context("reserve ordered pane arena tab-parent index")?;
+    for local_window_id in mux.iter_windows() {
+        let window = mux.get_window(local_window_id).ok_or_else(|| {
+            anyhow!("local window {local_window_id} disappeared while indexing tab parents")
+        })?;
+        for tab in window.iter() {
+            if let Some(prior_window_id) = parent_by_local_tab.insert(tab.tab_id(), local_window_id)
+            {
+                bail!(
+                    "local tab {} is attached to windows {prior_window_id} and {local_window_id}",
+                    tab.tab_id()
+                );
+            }
+        }
+    }
+
+    let mut live_remote_panes = HashMap::new();
+    live_remote_panes
+        .try_reserve(remote_pane_tabs.len())
+        .context("reserve ordered pane arena live pane ownership")?;
+    for pane in mux.iter_panes() {
+        let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+            continue;
+        };
+        if !client_pane.belongs_to_client(inner) {
+            continue;
+        }
+        let remote_pane_id = client_pane.remote_pane_id();
+        if let Some(prior_local_pane_id) = live_remote_panes.insert(remote_pane_id, pane.pane_id())
+        {
+            bail!(
+                "remote pane {remote_pane_id} is mirrored by local panes \
+                 {prior_local_pane_id} and {}",
+                pane.pane_id()
+            );
+        }
+        let Some(&desired_remote_tab_id) = desired_pane_tabs.get(&remote_pane_id) else {
+            bail!(
+                "ordered pane arena removes live remote pane {remote_pane_id}; atomic stale-pane \
+                 removal is required"
+            );
+        };
+        if client_pane.remote_tab_id() != desired_remote_tab_id {
+            bail!(
+                "ordered pane arena moves remote pane {remote_pane_id} from tab {} to tab \
+                 {desired_remote_tab_id}; atomic pane migration is required",
+                client_pane.remote_tab_id()
+            );
+        }
+    }
+
+    for &(remote_tab_id, local_tab_id) in &tab_mappings {
+        let Some(tab) = mux.get_tab(local_tab_id) else {
+            continue;
+        };
+        if !desired_tabs.contains(&remote_tab_id) {
+            bail!(
+                "ordered pane arena removes live remote tab {remote_tab_id}; atomic stale-tab \
+                 removal is required"
+            );
+        }
+        let panes = tab.iter_all_panes();
+        if panes.is_empty() {
+            bail!(
+                "ordered pane arena mapping {remote_tab_id}->{local_tab_id} targets an empty \
+                 local tab whose client ownership cannot be proven"
+            );
+        }
+        for pane in panes {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                bail!(
+                    "ordered pane arena mapping {remote_tab_id}->{local_tab_id} targets a tab \
+                     containing a non-client pane"
+                );
+            };
+            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id() != remote_tab_id
+            {
+                bail!(
+                    "ordered pane arena mapping {remote_tab_id}->{local_tab_id} does not belong \
+                     exactly to this client and remote tab"
+                );
+            }
+        }
+    }
+
+    for &(remote_window_id, local_window_id) in &window_mappings {
+        let Some(window) = mux.get_window(local_window_id) else {
+            continue;
+        };
+        if !desired_windows.contains(&remote_window_id) {
+            bail!(
+                "ordered pane arena removes live remote window {remote_window_id}; atomic \
+                 stale-window removal is required"
+            );
+        }
+        if window.is_empty() {
+            bail!(
+                "ordered pane arena mapping {remote_window_id}->{local_window_id} targets an \
+                 empty local window whose client ownership cannot be proven"
+            );
+        }
+    }
+
+    for remote_window_id in window_ids {
+        if desired_by_window.contains_key(remote_window_id) {
+            continue;
+        }
+        bail!(
+            "ordered pane arena window {remote_window_id} has no tab tree; applying a title-only \
+             window requires exact ordered workspace and client ownership authority"
+        );
+    }
+
+    for (remote_window_id, desired_remote_tabs) in desired_by_window {
+        let live_local_window_id = remote_to_local_window
+            .get(&remote_window_id)
+            .copied()
+            .filter(|id| mux.get_window(*id).is_some());
+        let Some(local_window_id) = live_local_window_id else {
+            for remote_tab_id in &desired_remote_tabs {
+                let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
+                    continue;
+                };
+                if mux.get_tab(local_tab_id).is_some() {
+                    bail!(
+                        "ordered pane arena remote window {remote_window_id} has no live local \
+                         window mapping, but tab {remote_tab_id} already has a live local mirror; \
+                         atomic snapshot mirroring is required"
+                    );
+                }
+            }
+            continue;
+        };
+
+        let window = mux.get_window(local_window_id).ok_or_else(|| {
+            anyhow!("local window {local_window_id} disappeared during preflight")
+        })?;
+        if window.len() > desired_remote_tabs.len() {
+            bail!(
+                "ordered pane arena window {remote_window_id} requires an atomic existing-window \
+                 reorder because it has {} attached tabs but authority has {}",
+                window.len(),
+                desired_remote_tabs.len()
+            );
+        }
+        for (index, tab) in window.iter().enumerate() {
+            let attached_remote_tab =
+                local_to_remote_tab
+                    .get(&tab.tab_id())
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                        "ordered pane arena mapped window {remote_window_id} contains unmapped or \
+                         foreign local tab {}",
+                        tab.tab_id()
+                    )
+                    })?;
+            if desired_remote_tabs[index] != attached_remote_tab {
+                bail!(
+                    "ordered pane arena window {remote_window_id} requires an atomic existing-window \
+                     reorder at index {index}: attached remote tab {attached_remote_tab}, desired {}",
+                    desired_remote_tabs[index]
+                );
+            }
+        }
+        // `get_tab` takes `mux.tabs`; holding this `mux.windows` read guard
+        // across it would invert the mux's tabs-then-windows lock order.
+        drop(window);
+
+        for remote_tab_id in &desired_remote_tabs {
+            let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
+                continue;
+            };
+            if mux.get_tab(local_tab_id).is_none() {
+                continue;
+            }
+            if let Some(parent) = parent_by_local_tab.get(&local_tab_id).copied() {
+                if parent != local_window_id {
+                    bail!(
+                        "ordered pane arena tab {remote_tab_id} is attached to local window \
+                         {parent}, not mapped window {local_window_id}; atomic snapshot mirroring \
+                        is required"
+                    );
+                }
+            } else {
+                bail!(
+                    "ordered pane arena tab {remote_tab_id} has a live but unattached local \
+                     mirror; transactional attachment rollback is required"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_pane_arena_entry(
+    mux: &Arc<Mux>,
+    inner: &Arc<ClientInner>,
+    entry: PaneEntry,
+    remote_panes_to_forget: &mut HashSet<PaneId>,
+    local_pane_ids_by_remote: &mut HashMap<PaneId, PaneId>,
+    reserved_local_pane_ids: &mut LocalPaneIdReservations<'_>,
+    pending: &mut PendingPaneArenaPublication,
+) -> anyhow::Result<Arc<dyn Pane>> {
+    remote_panes_to_forget.remove(&entry.pane_id);
+    let pane = if let Some(local_pane_id) = local_pane_ids_by_remote.get(&entry.pane_id).copied() {
+        match mux.get_pane(local_pane_id) {
+            Some(pane)
+                if pane
+                    .downcast_ref::<ClientPane>()
+                    .is_some_and(|client_pane| {
+                        client_pane.belongs_to_client(inner)
+                            && client_pane.remote_pane_id() == entry.pane_id
+                            && client_pane.remote_tab_id() == entry.tab_id
+                    }) =>
+            {
+                pending
+                    .existing_sync
+                    .push((Arc::clone(&pane), entry.alt_screen_active));
+                pane
+            }
+            Some(_) | None => {
+                let local_pane_id =
+                    reserved_local_pane_ids.take(entry.pane_id).ok_or_else(|| {
+                        anyhow!(
+                            "remote pane {} needs a local identifier, but no identifier was \
+                             reserved",
+                            entry.pane_id
+                        )
+                    })?;
+                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                    inner,
+                    local_pane_id,
+                    entry.tab_id,
+                    entry.pane_id,
+                    entry.size,
+                    &entry.title,
+                    entry.alt_screen_active,
+                )?);
+                local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
+                pane
+            }
+        }
+    } else {
+        let local_pane_id = reserved_local_pane_ids.take(entry.pane_id).ok_or_else(|| {
+            anyhow!(
+                "remote pane {} needs a local identifier, but no identifier was reserved",
+                entry.pane_id
+            )
+        })?;
+        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+            inner,
+            local_pane_id,
+            entry.tab_id,
+            entry.pane_id,
+            entry.size,
+            &entry.title,
+            entry.alt_screen_active,
+        )?);
+        local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+        pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
+        pane
+    };
+    Ok(pane)
+}
+
+fn index_live_client_pane(
+    by_remote_pane: &mut HashMap<PaneId, PaneId>,
+    remote_pane_id: PaneId,
+    local_pane_id: PaneId,
+) -> anyhow::Result<()> {
+    match by_remote_pane.entry(remote_pane_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(local_pane_id);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == local_pane_id => {
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            let existing_local_pane_id = *entry.get();
+            bail!(
+                "inconsistent live client topology: remote pane {remote_pane_id} is mirrored by \
+                 local panes {existing_local_pane_id} and {local_pane_id}"
+            )
+        }
+    }
+}
+
+struct LocalPaneIdReservations<'a> {
+    spare_pool: &'a Mutex<Vec<PaneId>>,
+    by_remote_pane: HashMap<PaneId, PaneId>,
+}
+
+impl LocalPaneIdReservations<'_> {
+    fn take(&mut self, remote_pane_id: PaneId) -> Option<PaneId> {
+        self.by_remote_pane.remove(&remote_pane_id)
+    }
+
+    fn restore(&mut self, remote_pane_id: PaneId, local_pane_id: PaneId) {
+        match self.by_remote_pane.entry(remote_pane_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(local_pane_id);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                log::error!(
+                    "remote pane {remote_pane_id} already retained a local identifier \
+                     reservation; returning duplicate reservation {local_pane_id} to the spare pool"
+                );
+                lock_or_recover(self.spare_pool, "spare_local_pane_ids").push(local_pane_id);
+            }
+        }
+    }
+}
+
+struct PendingFloatingPaneMappings<'reservations, 'pool> {
+    reservations: &'reservations mut LocalPaneIdReservations<'pool>,
+    mappings: Vec<(PaneId, PaneId)>,
+    committed: bool,
+}
+
+impl<'reservations, 'pool> PendingFloatingPaneMappings<'reservations, 'pool> {
+    fn new(
+        reservations: &'reservations mut LocalPaneIdReservations<'pool>,
+        capacity: usize,
+    ) -> anyhow::Result<Self> {
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(capacity)
+            .context("reserve pending floating-pane mappings")?;
+        Ok(Self {
+            reservations,
+            mappings,
+            committed: false,
+        })
+    }
+
+    fn take(&mut self, remote_pane_id: PaneId) -> Option<PaneId> {
+        let local_pane_id = self.reservations.take(remote_pane_id)?;
+        self.mappings.push((remote_pane_id, local_pane_id));
+        Some(local_pane_id)
+    }
+
+    fn commit(mut self) -> Vec<(PaneId, PaneId)> {
+        self.committed = true;
+        std::mem::take(&mut self.mappings)
+    }
+}
+
+impl Drop for PendingFloatingPaneMappings<'_, '_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (remote_pane_id, local_pane_id) in self.mappings.drain(..) {
+            self.reservations.restore(remote_pane_id, local_pane_id);
+        }
+    }
+}
+
+impl Drop for LocalPaneIdReservations<'_> {
+    fn drop(&mut self) {
+        if self.by_remote_pane.is_empty() {
+            return;
+        }
+        let mut spare_pool = lock_or_recover(self.spare_pool, "spare_local_pane_ids");
+        spare_pool.extend(
+            self.by_remote_pane
+                .drain()
+                .map(|(_, local_pane_id)| local_pane_id),
+        );
+    }
+}
+
+impl ClientInner {
+    fn remote_to_local_window(&self, remote_window_id: WindowId) -> Option<WindowId> {
+        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
+        map.get(&remote_window_id).cloned()
+    }
+
+    pub(crate) fn expire_stale_mappings(&self, current: &CurrentPane<'_>) {
+        self.remote_to_local_pane
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_pane lock");
+                poisoned.into_inner()
+            })
+            .retain(|_remote_pane_id, local_pane_id| current.contains_pane_id(*local_pane_id));
+
+        self.remote_to_local_tab
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_tab lock");
+                poisoned.into_inner()
+            })
+            .retain(|remote_tab_id, local_tab_id| {
+                if current.tab_has_panes_in_domain(*local_tab_id, self.local_domain_id) {
+                    true
+                } else {
+                    log::trace!(
+                        "expire_stale_mappings: domain: {}. will remove \
+                            {remote_tab_id} -> {local_tab_id} tab mapping \
+                            because tab contains no panes from this domain",
+                        self.local_domain_id,
+                    );
+                    false
+                }
+            });
+
+        self.remote_to_local_window
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_window lock");
+                poisoned.into_inner()
+            })
+            .retain(|_remote_window_id, local_window_id| {
+                current.window_has_panes_in_domain(*local_window_id, self.local_domain_id)
+            });
+    }
+
+    fn record_remote_to_local_window_mapping(
+        &self,
+        remote_window_id: WindowId,
+        local_window_id: WindowId,
+    ) {
+        let mut map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
+        map.insert(remote_window_id, local_window_id);
+        log::trace!(
+            "record_remote_to_local_window_mapping: {} -> {}",
+            remote_window_id,
+            local_window_id
+        );
+    }
+
+    fn local_to_remote_tab(&self, local_tab_id: TabId) -> Option<TabId> {
+        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        map.get_remote(&local_tab_id).copied()
+    }
+
+    fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
+        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
+        map.get_remote(&local_window_id).copied()
+    }
+
+    /// The remote window a spawn or move aimed at `local_window_id` belongs
+    /// in. The GUI moves tabs between local windows (a restored layout does
+    /// this at startup) without updating the window mapping, so ask the remote
+    /// tabs the window actually holds first, active tab first, using the
+    /// owners from the latest topology snapshot; fall back to the mapping.
+    /// Read-only: one local window can show tabs of several remote windows,
+    /// which the one-to-one mapping cannot express, so it is never repointed.
+    fn remote_window_for_local_window(
+        &self,
+        mux: &Mux,
+        local_window_id: WindowId,
+    ) -> Option<WindowId> {
+        // Copy tab ids under the `mux.windows` read guard and release it
+        // before taking any other lock.
+        let local_tab_ids = mux.get_window(local_window_id).map(|window| {
+            let active = window.get_active_idx();
+            let mut ids = window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>();
+            if active < ids.len() {
+                let active_id = ids.remove(active);
+                ids.insert(0, active_id);
+            }
+            ids
+        });
+        if let Some(local_tab_ids) = local_tab_ids {
+            let owners = lock_or_recover(&self.layout_tab_owners, "layout_tab_owners").clone();
+            for local_tab_id in local_tab_ids {
+                if let Some(remote_window_id) = self
+                    .local_to_remote_tab(local_tab_id)
+                    .and_then(|remote_tab_id| owners.get(&remote_tab_id).copied())
+                {
+                    return Some(remote_window_id);
+                }
+            }
+        }
+        self.local_to_remote_window(local_window_id)
+    }
+
+    /// Send the focused remote pane on `rpc` if its advice is still pending,
+    /// taking the pending mark so that only one sender sends it. A failed send
+    /// marks it pending again, for the next time the connection is ready.
+    ///
+    /// The server reports focus in and out to the programs in its panes
+    /// (DECSET 1004) and answers which pane is active from it. A GUI launch
+    /// focuses its windows while they attach, before the connection is ready;
+    /// that advice failed and was never sent again, so the server kept its
+    /// previous focus (twice at each GUI launch on 2026-11-13).
+    pub(crate) fn take_pending_focus_delivery(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> Option<impl Future<Output = anyhow::Result<()>> + Send + 'static> {
+        if !self.focus_delivery_pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let pane_id = (*lock_or_recover(&self.focused_remote_pane_id, "focused_remote_pane_id"))?;
+        lock_or_recover(&self.focus_advisories, "focus_advisories")
+            .advised(pane_id, Instant::now());
+        let request = rpc.set_focused_pane_id(codec::SetFocusedPane { pane_id });
+        let pending = Arc::clone(&self.focus_delivery_pending);
+        Some(async move {
+            let delivered = request.await.map(|_| ());
+            if delivered.is_err() {
+                pending.store(true, Ordering::Release);
+            }
+            delivered
+        })
+    }
+
+    /// How many remote panes this attachment maps.
+    pub(crate) fn attached_pane_count(&self) -> usize {
+        lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane").len()
+    }
+
+    pub fn remote_to_local_pane_id(&self, mux: &Mux, remote_pane_id: PaneId) -> Option<PaneId> {
+        let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
+
+        if let Some(id) = pane_map.get(&remote_pane_id).copied() {
+            let mapping_is_current = mux.get_pane(id).is_some_and(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .is_some_and(|client_pane| {
+                        client_pane.belongs_to_client(self)
+                            && client_pane.remote_pane_id() == remote_pane_id
+                    })
+            });
+            if mapping_is_current {
+                return Some(id);
+            }
+            pane_map.remove(&remote_pane_id);
+        }
+
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != self.local_domain_id {
+                continue;
+            }
+            if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                if pane.belongs_to_client(self) && pane.remote_pane_id() == remote_pane_id {
+                    let local_pane_id = pane.pane_id();
+                    pane_map.insert(remote_pane_id, local_pane_id);
+                    return Some(local_pane_id);
+                }
+            }
+        }
+        None
+    }
+    pub fn remove_old_pane_mapping(&self, remote_pane_id: PaneId) {
+        let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
+        pane_map.remove(&remote_pane_id);
+    }
+
+    pub(crate) fn record_remote_to_local_pane_mapping(
+        &self,
+        remote_pane_id: PaneId,
+        local_pane_id: PaneId,
+    ) {
+        let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
+        pane_map.insert(remote_pane_id, local_pane_id);
+    }
+
+    fn reserve_local_pane_ids(
+        &self,
+        remote_pane_ids: Vec<PaneId>,
+    ) -> Result<LocalPaneIdReservations<'_>, mux::IdAllocationError> {
+        let mut spare_pool = lock_or_recover(&self.spare_local_pane_ids, "spare_local_pane_ids");
+        let additional = remote_pane_ids.len().saturating_sub(spare_pool.len());
+        if additional > 0 {
+            spare_pool.extend(reserve_pane_ids(additional)?);
+        }
+        let first_reserved = spare_pool.len() - remote_pane_ids.len();
+        let local_pane_ids = spare_pool.split_off(first_reserved);
+        drop(spare_pool);
+
+        Ok(LocalPaneIdReservations {
+            spare_pool: &self.spare_local_pane_ids,
+            by_remote_pane: remote_pane_ids.into_iter().zip(local_pane_ids).collect(),
+        })
+    }
+
+    pub fn remove_old_tab_mapping(&self, remote_tab_id: TabId) {
+        let mut tab_map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        let old = tab_map.remove(&remote_tab_id);
+        log::trace!("remove_old_tab_mapping: {remote_tab_id} -> {old:?}");
+    }
+
+    fn record_remote_to_local_tab_mapping(&self, remote_tab_id: TabId, local_tab_id: TabId) {
+        let mut map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        let prior = map.insert(remote_tab_id, local_tab_id);
+        log::trace!(
+            "record_remote_to_local_tab_mapping: {} -> {} \
+             (prior={prior:?}, domain={})",
+            remote_tab_id,
+            local_tab_id,
+            self.local_domain_id,
+        );
+    }
+
+    pub fn remote_to_local_tab_id(&self, remote_tab_id: TabId) -> Option<TabId> {
+        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        map.get(&remote_tab_id).copied()
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.client.is_local
+    }
+}
+
+/// Stable client-side endpoint identity. Only this digest is persisted; it is
+/// not authentication evidence for the mux session reached by a transport.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ClientEndpointFingerprint([u8; 32]);
+
+impl ClientEndpointFingerprint {
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+pub type DomainBindingFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<codec::DomainBindingId>> + Send>>;
+pub type DomainBindingResolver = fn(ClientEndpointFingerprint) -> DomainBindingFuture;
+
+static DOMAIN_BINDING_RESOLVER: OnceLock<DomainBindingResolver> = OnceLock::new();
+static LAYOUT_READY_OBSERVER: OnceLock<fn(DomainId)> = OnceLock::new();
+
+/// Wake the GUI only after a coherent snapshot and transport readiness commit.
+pub fn install_layout_ready_observer(observer: fn(DomainId)) -> anyhow::Result<()> {
+    match LAYOUT_READY_OBSERVER.set(observer) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if LAYOUT_READY_OBSERVER
+                .get()
+                .is_some_and(|current| std::ptr::fn_addr_eq(*current, observer)) =>
+        {
+            Ok(())
+        }
+        Err(_) => bail!("a different layout readiness observer is already installed"),
+    }
+}
+const LAYOUT_BINDING_RESOLUTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// Install the GUI's asynchronous durable store without making this crate
+/// depend on the GUI. Headless callers may omit it and have no layout binding.
+pub fn install_domain_binding_resolver(resolver: DomainBindingResolver) -> anyhow::Result<()> {
+    match DOMAIN_BINDING_RESOLVER.set(resolver) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if DOMAIN_BINDING_RESOLVER
+                .get()
+                .is_some_and(|current| std::ptr::fn_addr_eq(*current, resolver)) =>
+        {
+            Ok(())
+        }
+        Err(_) => bail!("a different durable domain binding resolver is already installed"),
+    }
+}
+
+/// A durable client namespace only. Ordered topology still requires the exact
+/// live transport, authenticated server session and committed snapshot fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableClientBinding {
+    pub fingerprint: ClientEndpointFingerprint,
+    pub binding_id: codec::DomainBindingId,
+}
+
+struct EndpointHasher(openssl::sha::Sha256);
+
+impl EndpointHasher {
+    fn new(transport: &[u8]) -> Self {
+        let mut this = Self(openssl::sha::Sha256::new());
+        this.bytes(b"frankenterm-client-endpoint-v1");
+        this.bytes(transport);
+        this
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.number(value.len() as u64);
+        self.0.update(value);
+    }
+
+    fn number(&mut self, value: u64) {
+        self.0.update(&value.to_le_bytes());
+    }
+
+    fn flag(&mut self, value: bool) {
+        self.0.update(&[u8::from(value)]);
+    }
+
+    fn optional<T>(&mut self, value: &Option<T>, write: impl FnOnce(&mut Self, &T)) {
+        self.flag(value.is_some());
+        if let Some(value) = value {
+            write(self, value);
+        }
+    }
+
+    fn strings(&mut self, values: &[String]) {
+        self.number(values.len() as u64);
+        for value in values {
+            self.bytes(value.as_bytes());
+        }
+    }
+
+    fn path(&mut self, value: &std::path::Path) {
+        // Never canonicalize/read a path or lossy-convert an OS string. These
+        // encodings are stable on the client platform across app restarts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            self.bytes(b"unix-path-bytes");
+            self.bytes(value.as_os_str().as_bytes());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            self.bytes(b"windows-path-utf16le");
+            self.number(value.as_os_str().encode_wide().count() as u64);
+            for unit in value.as_os_str().encode_wide() {
+                self.0.update(&unit.to_le_bytes());
+            }
+        }
+    }
+
+    fn duration(&mut self, value: std::time::Duration) {
+        self.number(value.as_secs());
+        self.number(u64::from(value.subsec_nanos()));
+    }
+
+    fn finish(self) -> ClientEndpointFingerprint {
+        ClientEndpointFingerprint(self.0.finish())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientDomainConfig {
+    Unix(UnixDomain),
+    Tls(TlsDomainClient),
+    Ssh(SshDomain),
+}
+
+impl ClientDomainConfig {
+    /// Versioned, length-prefixed endpoint/trust/session-policy digest. Display
+    /// names and live UI policy do not change the durable namespace, except
+    /// where TLS uses the name to select its credential-cache directory. Exhaustive
+    /// destructuring forces new transport fields to receive an explicit choice.
+    pub fn endpoint_fingerprint(&self) -> ClientEndpointFingerprint {
+        match self {
+            Self::Unix(unix) => {
+                let UnixDomain {
+                    name: _,
+                    socket_path: _,
+                    connect_automatically: _,
+                    no_serve_automatically,
+                    serve_command,
+                    proxy_command,
+                    skip_permissions_check,
+                    read_timeout,
+                    write_timeout,
+                    local_echo_threshold_ms: _,
+                    overlay_lag_indicator: _,
+                } = unix;
+                let mut hash = EndpointHasher::new(b"unix");
+                hash.path(&unix.socket_path());
+                hash.flag(*no_serve_automatically);
+                hash.optional(serve_command, |hash, value| hash.strings(value));
+                hash.optional(proxy_command, |hash, value| hash.strings(value));
+                hash.flag(*skip_permissions_check);
+                hash.duration(*read_timeout);
+                hash.duration(*write_timeout);
+                hash.finish()
+            }
+            Self::Tls(tls) => {
+                let TlsDomainClient {
+                    name,
+                    bootstrap_via_ssh,
+                    remote_address,
+                    pem_private_key,
+                    pem_cert,
+                    pem_ca,
+                    pem_root_certs,
+                    accept_invalid_hostnames,
+                    expected_cn,
+                    connect_automatically: _,
+                    read_timeout,
+                    write_timeout,
+                    local_echo_threshold_ms: _,
+                    remote_wezterm_path,
+                    overlay_lag_indicator: _,
+                } = tls;
+                let mut hash = EndpointHasher::new(b"tls");
+                hash.bytes(remote_address.as_bytes());
+                // Reconnectable::tls_creds_path selects stored credentials by
+                // this name. It is consequently more than a display label.
+                hash.bytes(name.as_bytes());
+                hash.optional(bootstrap_via_ssh, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                for path in [pem_private_key, pem_cert, pem_ca] {
+                    hash.optional(path, |hash, value| hash.path(value));
+                }
+                hash.number(pem_root_certs.len() as u64);
+                for path in pem_root_certs {
+                    hash.path(path);
+                }
+                hash.flag(*accept_invalid_hostnames);
+                hash.optional(expected_cn, |hash, value| hash.bytes(value.as_bytes()));
+                hash.duration(*read_timeout);
+                hash.duration(*write_timeout);
+                hash.optional(remote_wezterm_path, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.finish()
+            }
+            Self::Ssh(ssh) => {
+                let SshDomain {
+                    name: _,
+                    remote_address,
+                    no_agent_auth,
+                    username,
+                    connect_automatically: _,
+                    timeout,
+                    local_echo_threshold_ms: _,
+                    overlay_lag_indicator: _,
+                    remote_wezterm_path,
+                    override_proxy_command,
+                    ssh_backend,
+                    multiplexing,
+                    ssh_option,
+                    ssh_config_file,
+                    default_prog,
+                    assume_shell,
+                } = ssh;
+                let mut hash = EndpointHasher::new(b"ssh");
+                hash.bytes(remote_address.as_bytes());
+                hash.flag(*no_agent_auth);
+                hash.optional(username, |hash, value| hash.bytes(value.as_bytes()));
+                hash.duration(*timeout);
+                hash.optional(remote_wezterm_path, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.optional(override_proxy_command, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.optional(ssh_backend, |hash, value| {
+                    hash.number(match value {
+                        config::SshBackend::Ssh2 => 0,
+                        config::SshBackend::LibSsh => 1,
+                    })
+                });
+                hash.number(match multiplexing {
+                    config::SshMultiplexing::WezTerm => 0,
+                    config::SshMultiplexing::None => 1,
+                });
+                let mut options: Vec<_> = ssh_option.iter().collect();
+                options.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                hash.number(options.len() as u64);
+                for (key, value) in options {
+                    hash.bytes(key.as_bytes());
+                    hash.bytes(value.as_bytes());
+                }
+                hash.optional(ssh_config_file, |hash, value| hash.bytes(value.as_bytes()));
+                hash.optional(default_prog, |hash, value| hash.strings(value));
+                hash.number(match assume_shell {
+                    config::Shell::Unknown => 0,
+                    config::Shell::Posix => 1,
+                });
+                hash.finish()
+            }
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            ClientDomainConfig::Unix(unix) => &unix.name,
+            ClientDomainConfig::Tls(tls) => &tls.name,
+            ClientDomainConfig::Ssh(ssh) => &ssh.name,
+        }
+    }
+
+    pub fn local_echo_threshold_ms(&self) -> Option<u64> {
+        match self {
+            ClientDomainConfig::Unix(unix) => unix.local_echo_threshold_ms,
+            ClientDomainConfig::Tls(tls) => tls.local_echo_threshold_ms,
+            ClientDomainConfig::Ssh(ssh) => ssh.local_echo_threshold_ms,
+        }
+    }
+
+    pub fn overlay_lag_indicator(&self) -> bool {
+        match self {
+            ClientDomainConfig::Unix(unix) => unix.overlay_lag_indicator,
+            ClientDomainConfig::Tls(tls) => tls.overlay_lag_indicator,
+            ClientDomainConfig::Ssh(ssh) => ssh.overlay_lag_indicator,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            ClientDomainConfig::Unix(unix) => format!("unix mux {}", unix.socket_path().display()),
+            ClientDomainConfig::Tls(tls) => format!("TLS mux {}", tls.remote_address),
+            ClientDomainConfig::Ssh(ssh) => {
+                if let Some(user) = &ssh.username {
+                    format!("SSH mux {}@{}", user, ssh.remote_address)
+                } else {
+                    format!("SSH mux {}", ssh.remote_address)
+                }
+            }
+        }
+    }
+
+    pub fn connect_automatically(&self) -> bool {
+        match self {
+            ClientDomainConfig::Unix(unix) => unix.connect_automatically,
+            ClientDomainConfig::Tls(tls) => tls.connect_automatically,
+            ClientDomainConfig::Ssh(ssh) => ssh.connect_automatically,
+        }
+    }
+
+    pub fn transport_configuration_matches(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.clear_runtime_policy_fields();
+        right.clear_runtime_policy_fields();
+        left == right
+    }
+
+    fn clear_runtime_policy_fields(&mut self) {
+        match self {
+            Self::Unix(unix) => {
+                unix.connect_automatically = false;
+                unix.local_echo_threshold_ms = None;
+                unix.overlay_lag_indicator = false;
+            }
+            Self::Tls(tls) => {
+                tls.connect_automatically = false;
+                tls.local_echo_threshold_ms = None;
+                tls.overlay_lag_indicator = false;
+            }
+            Self::Ssh(ssh) => {
+                ssh.connect_automatically = false;
+                ssh.local_echo_threshold_ms = None;
+                ssh.overlay_lag_indicator = false;
+            }
+        }
+    }
+}
+
+impl ClientInner {
+    pub fn new(
+        local_domain_id: DomainId,
+        client: Client,
+        owner_client_id: Option<Arc<ClientId>>,
+        local_echo_threshold_ms: Option<u64>,
+        overlay_lag_indicator: bool,
+    ) -> Self {
+        Self {
+            client,
+            local_domain_id,
+            owner_client_id,
+            local_echo_threshold_ms,
+            overlay_lag_indicator,
+            remote_to_local_window: Mutex::new(ExactIdMappings::default()),
+            remote_to_local_tab: Mutex::new(ExactIdMappings::default()),
+            remote_to_local_pane: Mutex::new(HashMap::new()),
+            spare_local_pane_ids: Mutex::new(Vec::new()),
+            focused_remote_pane_id: Mutex::new(None),
+            focus_delivery_pending: Arc::new(AtomicBool::new(false)),
+            focus_advisories: Mutex::new(FocusAdvisories::default()),
+            reliable_input_queue: ReliableInputQueue::new(),
+            resize_coordinator: ClientResizeCoordinator::new(),
+            fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
+            pending_window_titles: Mutex::new(HashMap::new()),
+            topology_session: Mutex::new(ClientTopologySessionState::Unbound),
+            layout_tab_owners: Mutex::new(HashMap::new()),
+            layout_snapshot: Mutex::new(None),
+            layout_failed: AtomicBool::new(false),
+            user_var_hydration: Mutex::new(UserVarHydrationState::default()),
+            detached: AtomicBool::new(false),
+        }
+    }
+
+    fn pin_topology_session(
+        &self,
+        incoming: ClientTopologySession,
+    ) -> Result<(), ClientTopologySessionError> {
+        self.pin_topology_session_with_lineage(incoming, None)
+            .map(|_| ())
+    }
+
+    /// Pin `incoming` as this attachment's topology session. A different
+    /// current session is accepted only when `lineage` names the bound
+    /// session as the one it restored; the attachment then rebinds to the
+    /// restored mux, and the lineage is returned so the caller retires every
+    /// mapping the restore did not carry over (ft-zy6g7).
+    fn pin_topology_session_with_lineage(
+        &self,
+        incoming: ClientTopologySession,
+        lineage: Option<mux::RestoredTopologyLineage>,
+    ) -> Result<Option<mux::RestoredTopologyLineage>, ClientTopologySessionError> {
+        if matches!(incoming, ClientTopologySession::Current(id) if id.as_bytes() == [0; 16]) {
+            return Err(ClientTopologySessionError::ReservedIdentity);
+        }
+        let mut pinned = lock_or_recover(&self.topology_session, "topology_session");
+        let error = match *pinned {
+            ClientTopologySessionState::Unbound => {
+                // Retain this identity even if subsequent application fails:
+                // a partially applied snapshot still owns its numeric ids.
+                *pinned = ClientTopologySessionState::Bound(incoming);
+                return Ok(None);
+            }
+            ClientTopologySessionState::Bound(current) if current == incoming => return Ok(None),
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(bound))
+                if matches!(incoming, ClientTopologySession::Current(_)) =>
+            {
+                if let Some(lineage) = lineage.filter(|lineage| lineage.predecessor == bound) {
+                    *pinned = ClientTopologySessionState::Bound(incoming);
+                    metrics::counter!("mux.client.topology_session_rebound.total").increment(1);
+                    return Ok(Some(lineage));
+                }
+                ClientTopologySessionError::Changed
+            }
+            ClientTopologySessionState::Bound(_) => ClientTopologySessionError::DialectChanged,
+            ClientTopologySessionState::Revoked(error) => return Err(error),
+        };
+        *pinned = ClientTopologySessionState::Revoked(error);
+        self.client.revoke_domain_reconnect();
+        metrics::counter!("mux.client.topology_session_revoked.total").increment(1);
+        Err(error)
+    }
+
+    pub(crate) fn begin_remote_metadata_application(
+        &self,
+    ) -> anyhow::Result<RemoteMetadataApplicationGuard<'_>> {
+        let inner_key = self as *const Self as usize;
+        REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| -> anyhow::Result<()> {
+                let mut depths = depths
+                    .try_borrow_mut()
+                    .map_err(|_| anyhow!("remote metadata suppression state is re-entered"))?;
+                if let Some(depth) = depths.get_mut(&inner_key) {
+                    *depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("remote metadata suppression depth exhausted"))?;
+                } else {
+                    depths.try_reserve(1).map_err(|error| {
+                        anyhow!("reserve remote metadata suppression attachment: {error}")
+                    })?;
+                    depths.insert(inner_key, 1);
+                }
+                Ok(())
+            })
+            .map_err(|_| anyhow!("remote metadata suppression thread-local is unavailable"))??;
+        Ok(RemoteMetadataApplicationGuard {
+            inner_key,
+            _attachment: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+
+    pub(crate) fn should_forward_local_metadata(&self) -> bool {
+        let inner_key = self as *const Self as usize;
+        REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| {
+                depths
+                    .try_borrow()
+                    .map(|depths| depths.get(&inner_key).copied().unwrap_or(0) == 0)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    }
+
+    fn queue_window_title(
+        self: &Arc<Self>,
+        window_id: WindowId,
+    ) -> Option<(WindowId, PendingWindowTitle)> {
+        // A mux notification reaches every attached domain. Reject unrelated
+        // windows before allocating a task or holding a scheduler permit.
+        let remote_window_id = self.local_to_remote_window(window_id)?;
+        // Resync can remap a local window within this attachment. Its new
+        // destination needs independent work while the old mapping retires.
+        let window_mapping = (window_id, remote_window_id);
+        let mut pending = lock_or_recover(&self.pending_window_titles, "pending_window_titles");
+        if let Some(dirty) = pending.get(&window_mapping) {
+            dirty.store(true, Ordering::Release);
+            metrics::counter!("mux.client.window_title.coalesced").increment(1);
+            return None;
+        }
+        let dirty = Arc::new(AtomicBool::new(true));
+        pending.insert(window_mapping, Arc::clone(&dirty));
+        Some((
+            remote_window_id,
+            PendingWindowTitle {
+                inner: Arc::clone(self),
+                window_mapping,
+                dirty,
+            },
+        ))
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_detached(&self) {
+        self.client.revoke_domain_reconnect();
+        self.reliable_input_queue.detach_domain(&self.detached);
+        self.resize_coordinator.detach(&self.detached);
+        self.fetch_retry_coordinator.detach();
+    }
+
+    pub(crate) fn start_resize_retry_driver(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.resize_coordinator.start(Arc::downgrade(self))
+    }
+
+    pub(crate) fn enqueue_unadmitted_resize(
+        &self,
+        intent: QueuedResizeIntent,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.resize_coordinator.is_started() && !self.is_detached(),
+            "client resize retry driver is not running or domain is detached"
+        );
+        self.resize_coordinator.enqueue(intent)
+    }
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        self.mark_detached();
+    }
+}
+
+pub struct ClientDomain {
+    config: ClientDomainConfig,
+    policy: parking_lot::RwLock<ClientDomainPolicy>,
+    durable_binding: Mutex<Option<DurableClientBinding>>,
+    label: String,
+    inner: Mutex<Option<Arc<ClientInner>>>,
+    background_attachment_ui: Mutex<Option<ConnectionUI>>,
+    initial_attachment_pending: AtomicBool,
+    retired: AtomicBool,
+    local_domain_id: DomainId,
+    mux_owner: Weak<Mux>,
+    mux_subscriber_id: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientDomainPolicy {
+    connect_automatically: bool,
+    local_echo_threshold_ms: Option<u64>,
+    overlay_lag_indicator: bool,
+}
+
+impl ClientDomainPolicy {
+    fn from_config(config: &ClientDomainConfig) -> Self {
+        Self {
+            connect_automatically: config.connect_automatically(),
+            local_echo_threshold_ms: config.local_echo_threshold_ms(),
+            overlay_lag_indicator: config.overlay_lag_indicator(),
+        }
+    }
+}
+
+struct InitialAttachmentClaim<'a> {
+    pending: &'a AtomicBool,
+}
+
+struct InitialAttachmentRequest {
+    owner_client_id: Option<Arc<ClientId>>,
+    primary_window_id: Option<WindowId>,
+}
+
+impl Drop for InitialAttachmentClaim<'_> {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+struct InitialAttachmentCleanup {
+    mux: Arc<Mux>,
+    domain_registration: DomainOperationGuard,
+    inner: Arc<ClientInner>,
+    rpc: RpcGenerationScope,
+    armed: AtomicBool,
+}
+
+impl InitialAttachmentCleanup {
+    fn arm(&self) {
+        let prior = self.armed.swap(true, Ordering::AcqRel);
+        debug_assert!(!prior, "initial attachment cleanup armed more than once");
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    fn cleanup_if_current(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        let mux = Arc::clone(&self.mux);
+        let domain_registration = &self.domain_registration;
+        let inner = Arc::clone(&self.inner);
+        let rpc = self.rpc.clone();
+        let _ = rpc.commit_sync(RpcConsumerKind::InitialAttachmentCleanup, || {
+            let _ = inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "initial attachment preparation failed or was cancelled",
+            );
+            inner.mark_detached();
+
+            let Some(domain) = domain_registration.downcast_ref::<ClientDomain>() else {
+                return;
+            };
+            if domain.perform_detach_if_current(&inner) {
+                return;
+            }
+            let attachment_slot_is_empty =
+                lock_or_recover(&domain.inner, "client_domain_inner").is_none();
+            if attachment_slot_is_empty {
+                domain.retired.store(true, Ordering::Release);
+                let _ = mux.domain_was_detached_if_guard(domain_registration);
+            }
+        });
+    }
+}
+
+impl Drop for InitialAttachmentCleanup {
+    fn drop(&mut self) {
+        self.cleanup_if_current();
+    }
+}
+
+impl Drop for ClientDomain {
+    fn drop(&mut self) {
+        if let Some(ui) = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        )
+        .take()
+        {
+            ui.close();
+        }
+        if let (Some(mux), Some(subscriber_id)) = (self.mux_owner.upgrade(), self.mux_subscriber_id)
+        {
+            mux.unsubscribe(subscriber_id);
+        }
+    }
+}
+
+async fn settle_remote_metadata_update<Update, UpdateOutput, Resync, ResyncFuture, Abort>(
+    operation: &'static str,
+    subject: &str,
+    update: Update,
+    resync: Resync,
+    abort: Abort,
+) -> anyhow::Result<()>
+where
+    Update: std::future::Future<Output = anyhow::Result<UpdateOutput>>,
+    Resync: FnOnce() -> ResyncFuture,
+    ResyncFuture: std::future::Future<Output = anyhow::Result<bool>>,
+    Abort: FnOnce() -> anyhow::Result<()>,
+{
+    match update.await {
+        Ok(_) => {
+            metrics::counter!(
+                "mux.client.remote_metadata_update",
+                "operation" => operation,
+                "outcome" => "success"
+            )
+            .increment(1);
+            Ok(())
+        }
+        Err(remote_error) => {
+            metrics::counter!(
+                "mux.client.remote_metadata_update",
+                "operation" => operation,
+                "outcome" => "remote_rejected"
+            )
+            .increment(1);
+            log::warn!(
+                "remote {operation} for {subject} failed: \
+                 {remote_error:#}; requesting an authoritative topology resync"
+            );
+            match resync().await {
+                Ok(true) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resynced"
+                    )
+                    .increment(1);
+                    Ok(())
+                }
+                Ok(false) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resync_retired"
+                    )
+                    .increment(1);
+                    Ok(())
+                }
+                Err(resync_error) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resync_failed"
+                    )
+                    .increment(1);
+                    let abort_error = abort().err();
+                    if let Some(abort_error) = abort_error.as_ref() {
+                        log::error!(
+                            "remote {operation} for {subject} was rejected and authoritative \
+                             resync failed; exact-generation abort also failed: \
+                             original={remote_error:#}; resync={resync_error:#}; \
+                             abort={abort_error:#}"
+                        );
+                    } else {
+                        log::error!(
+                            "remote {operation} for {subject} was rejected and authoritative \
+                             resync failed; aborted the exact RPC generation: \
+                             original={remote_error:#}; resync={resync_error:#}"
+                        );
+                    }
+                    let convergence_error = resync_error.context(format!(
+                        "authoritative resync after rejected remote {operation} for {subject}; \
+                         original error: {remote_error:#}"
+                    ));
+                    if let Some(abort_error) = abort_error {
+                        Err(convergence_error.context(format!(
+                            "aborting the divergent exact RPC generation also failed: \
+                             {abort_error:#}"
+                        )))
+                    } else {
+                        Err(convergence_error)
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn update_remote_workspace(
+    mux: Arc<Mux>,
+    domain: DomainOperationGuard,
+    inner: Arc<ClientInner>,
+    pdu: codec::SetWindowWorkspace,
+) -> anyhow::Result<()> {
+    if inner.is_detached() {
+        return Ok(());
+    }
+    let remote_window_id = pdu.window_id;
+    let subject = format!("window {remote_window_id}");
+    let rpc = inner.client.rpc_scope();
+    settle_remote_metadata_update(
+        "workspace update",
+        &subject,
+        rpc.set_window_workspace(pdu),
+        || async {
+            if !client_inner_is_current(&mux, &domain, &inner) {
+                return Ok(false);
+            }
+            let client_domain = domain
+                .downcast_ref::<ClientDomain>()
+                .ok_or_else(|| anyhow!("current remote workspace owner is not a ClientDomain"))?;
+            client_domain
+                .resync_if_current(Arc::clone(&mux), Arc::clone(&inner), &rpc)
+                .await
+        },
+        || {
+            inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "rejected workspace update could not be authoritatively resynchronized",
+            )
+        },
+    )
+    .await
+}
+
+fn reconcile_rejected_workspace_rename(
+    mux: &Mux,
+    inner: &ClientInner,
+    old_workspace: &str,
+    new_workspace: &str,
+) -> anyhow::Result<()> {
+    let Some(owner_client_id) = inner.owner_client_id.as_ref() else {
+        return Ok(());
+    };
+    let _remote_application = inner.begin_remote_metadata_application()?;
+    let _ = mux.compare_set_active_workspace_for_client_if_same(
+        owner_client_id,
+        new_workspace,
+        old_workspace,
+    )?;
+    Ok(())
+}
+
+async fn update_remote_workspace_rename(
+    mux: Arc<Mux>,
+    domain: DomainOperationGuard,
+    inner: Arc<ClientInner>,
+    old_workspace: String,
+    new_workspace: String,
+) -> anyhow::Result<()> {
+    if inner.is_detached() {
+        return Ok(());
+    }
+    let rpc = inner.client.rpc_scope();
+    let request = codec::RenameWorkspace {
+        old_workspace: old_workspace.clone(),
+        new_workspace: new_workspace.clone(),
+    };
+    let subject = format!("workspace {old_workspace:?} -> {new_workspace:?}");
+    settle_remote_metadata_update(
+        "workspace rename",
+        &subject,
+        rpc.rename_workspace(request),
+        || async {
+            if !client_inner_is_current(&mux, &domain, &inner) {
+                return Ok(false);
+            }
+            let client_domain = domain
+                .downcast_ref::<ClientDomain>()
+                .ok_or_else(|| anyhow!("current remote workspace owner is not a ClientDomain"))?;
+            let topology_current = client_domain
+                .resync_if_current(Arc::clone(&mux), Arc::clone(&inner), &rpc)
+                .await?;
+            if topology_current {
+                reconcile_rejected_workspace_rename(&mux, &inner, &old_workspace, &new_workspace)?;
+            }
+            Ok(topology_current)
+        },
+        || {
+            inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "rejected workspace rename could not be authoritatively resynchronized",
+            )
+        },
+    )
+    .await
+}
+
+fn active_workspace_sync_request(
+    owner_client_id: Option<&Arc<ClientId>>,
+    changed_client_id: &Arc<ClientId>,
+    mux: &Mux,
+) -> Option<codec::SetActiveWorkspace> {
+    let owner_client_id = owner_client_id?;
+    if !Arc::ptr_eq(owner_client_id, changed_client_id)
+        || !mux.client_registration_is_current(owner_client_id)
+    {
+        return None;
+    }
+
+    Some(codec::SetActiveWorkspace {
+        workspace: mux.active_workspace_for_client(changed_client_id),
+    })
+}
+
+fn current_active_workspace_sync(
+    inner: &ClientInner,
+    mux: &Mux,
+) -> Option<codec::SetActiveWorkspace> {
+    let owner_client_id = inner.owner_client_id.as_ref()?;
+    if !mux.client_registration_is_current(owner_client_id) {
+        return None;
+    }
+    Some(codec::SetActiveWorkspace {
+        workspace: mux.active_workspace_for_client(owner_client_id),
+    })
+}
+
+fn workspace_for_spawn_window(mux: &Mux, window_id: WindowId) -> String {
+    mux.get_window(window_id)
+        .map(|window| window.get_workspace().to_string())
+        .unwrap_or_else(|| mux.active_workspace())
+}
+
+/// Drop the local mirror of each tab the server has closed: every pane is a
+/// dead `ClientPane` of this attachment (the server sent `PaneRemoved`) and
+/// the snapshot lists none of their remote tabs. The `PaneRemoved` handler
+/// normally prunes such a tab, but that prune is skipped while any mux
+/// `Activity` is live. Requiring `is_dead` keeps a tab this client spawned
+/// after the snapshot was taken. No `KillPane` is sent: the server already
+/// closed these tabs.
+fn drop_local_tabs_closed_on_server(
+    mux: &Mux,
+    inner: &ClientInner,
+    listed_remote_tabs: &HashMap<TabId, WindowId>,
+) {
+    let mut closed = Vec::new();
+    for window_id in mux.iter_windows() {
+        // Collect under the window read guard and release it before removal,
+        // which takes the windows write lock.
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        for tab in window.iter() {
+            let panes = tab.iter_all_panes();
+            let server_closed = !panes.is_empty()
+                && panes.iter().all(|pane| {
+                    pane.downcast_ref::<ClientPane>()
+                        .is_some_and(|client_pane| {
+                            client_pane.belongs_to_client(inner)
+                                && !listed_remote_tabs.contains_key(&client_pane.remote_tab_id())
+                                && client_pane.is_dead()
+                        })
+                });
+            if server_closed {
+                closed.push(Arc::clone(tab));
+            }
+        }
+    }
+    for tab in closed {
+        log::debug!(
+            "domain {}: dropping local tab {} closed on the server",
+            inner.local_domain_id,
+            tab.tab_id()
+        );
+        mux.remove_tab_local_only_if_same(&tab);
+    }
+}
+
+/// Put the tab a spawn or move produced into the local window the operation
+/// named. The snapshot places a new tab through the window mapping, which can
+/// name another local window once one remote window's tabs are spread over
+/// several local windows. Each operation carries its own requested window, so
+/// overlapping operations cannot redirect each other.
+///
+/// Best effort: the server has already committed the spawn or move, so a
+/// local placement failure is logged and the tab stays where the snapshot put
+/// it rather than failing an operation that did happen.
+fn place_tab_in_requested_window(mux: &Mux, tab: &Arc<Tab>, requested_local_window: WindowId) {
+    if mux.get_window(requested_local_window).is_none() {
+        // The requested window closed while the request was in flight; keep
+        // the tab where the snapshot put it.
+        return;
+    }
+    let placed = match mux.window_containing_tab(tab.tab_id()) {
+        Some(current) if current == requested_local_window => Ok(()),
+        Some(_) => mux.move_tab_between_windows(tab.tab_id(), requested_local_window, None),
+        None => mux.add_tab_to_window(tab, requested_local_window),
+    };
+    if let Err(error) = placed {
+        log::warn!(
+            "keeping tab {} where the snapshot placed it; requested local window {}: {error:#}",
+            tab.tab_id(),
+            requested_local_window
+        );
+    }
+}
+
+/// Detach a live pane of this attachment from the local tab that mirrors its
+/// old remote tab and record its new remote tab, so a snapshot reporting a
+/// server-side move applies instead of retiring the transport. The pane stays
+/// registered (`Tab::remove_pane` is the move primitive) and the snapshot's
+/// tree walk installs it in the new tab's mirror. An emptied old tab is dropped
+/// locally without KillPane: the server has already retired it.
+fn rehome_client_pane_moved_on_server(
+    mux: &Mux,
+    inner: &ClientInner,
+    pane: &Arc<dyn Pane>,
+    new_remote_tab_id: TabId,
+) {
+    let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+        return;
+    };
+    let old_remote_tab_id = client_pane.remote_tab_id();
+    log::debug!(
+        "domain {}: remote pane {} moved from tab {} to tab {}",
+        inner.local_domain_id,
+        client_pane.remote_pane_id(),
+        old_remote_tab_id,
+        new_remote_tab_id
+    );
+    let old_tab = inner
+        .remote_to_local_tab_id(old_remote_tab_id)
+        .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+        .filter(|tab| {
+            tab.iter_all_panes()
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, pane))
+        });
+    if let Some(old_tab) = old_tab {
+        old_tab.remove_pane(pane.pane_id());
+        if old_tab.iter_all_panes().is_empty() {
+            mux.remove_tab_local_only_if_same(&old_tab);
+        }
+    }
+    client_pane.set_remote_tab_id(new_remote_tab_id);
+}
+
+fn client_inner_is_current(
+    mux: &Mux,
+    domain: &DomainOperationGuard,
+    inner: &Arc<ClientInner>,
+) -> bool {
+    !inner.is_detached()
+        && mux
+            .get_domain(domain.domain_id())
+            .is_some_and(|current| current.same_registration(domain))
+        && domain
+            .downcast_ref::<ClientDomain>()
+            .is_some_and(|client_domain| client_domain.inner_is_current(inner))
+}
+
+/// The notifications [`mux_notify_client_domain`] acts on: exactly the arms of
+/// its match, which must change together with this list.
+fn client_domain_handles(notif: &MuxNotification) -> bool {
+    matches!(
+        notif,
+        MuxNotification::ActiveWorkspaceChanged(_)
+            | MuxNotification::WorkspaceRenamed { .. }
+            | MuxNotification::WindowWorkspaceChanged { .. }
+            | MuxNotification::TabTitleChanged { .. }
+            | MuxNotification::WindowTitleChanged { .. }
+    )
+}
+
+fn mux_notify_client_domain(
+    owner: &Weak<Mux>,
+    local_domain_id: DomainId,
+    notif: MuxNotification,
+) -> bool {
+    let Some(mux) = owner.upgrade() else {
+        return false;
+    };
+    // Pane output and alerts, by far the most frequent notifications, concern
+    // no client domain; looking the domain up for them anyway took the mux's
+    // domain registration lock on every delivery (B20).
+    if !client_domain_handles(&notif) {
+        return true;
+    }
+    let domain = match mux.get_domain(local_domain_id) {
+        Some(domain) => domain,
+        // ClientDomain::new installs the subscriber before the caller can
+        // publish the domain. Keep that short pre-registration interval alive;
+        // the ClientDomain Drop guard unsubscribes if publication never occurs
+        // or after exact domain retirement.
+        None => return true,
+    };
+    let client_domain = match domain.downcast_ref::<ClientDomain>() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    match notif {
+        MuxNotification::ActiveWorkspaceChanged(client_id) => {
+            if let Some(inner) = client_domain.inner() {
+                if let Some(request) =
+                    active_workspace_sync_request(inner.owner_client_id.as_ref(), &client_id, &mux)
+                {
+                    let rpc = inner.client.rpc_scope();
+                    let mux = Arc::clone(&mux);
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    let _ = rpc.set_active_workspace(request).await;
+                                    anyhow::Result::<()>::Ok(())
+                                })
+                                .detach();
+                        }
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "active-workspace metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected active-workspace convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        MuxNotification::WorkspaceRenamed {
+            old_workspace,
+            new_workspace,
+        } => {
+            if let Some(inner) = client_domain.inner() {
+                if inner.should_forward_local_metadata() {
+                    let mux = Arc::clone(&mux);
+                    let rpc = inner.client.rpc_scope();
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    update_remote_workspace_rename(
+                                        mux,
+                                        domain,
+                                        inner,
+                                        old_workspace,
+                                        new_workspace,
+                                    )
+                                    .await
+                                })
+                                .detach();
+                        }
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "workspace-rename metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected workspace-rename convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        MuxNotification::WindowWorkspaceChanged {
+            window_id,
+            workspace,
+        } => {
+            let Some(observed_inner) = client_domain.inner() else {
+                return true;
+            };
+            if !observed_inner.should_forward_local_metadata() {
+                return true;
+            }
+            // Defer the RPC so the notification callback never performs
+            // domain lookup or transport work while the originating mux
+            // mutation is still unwinding.
+            let mux = Arc::clone(&mux);
+            let rpc = observed_inner.client.rpc_scope();
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4 * 1024,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation
+                        .spawn(async move {
+                            if !mux
+                                .get_domain(local_domain_id)
+                                .is_some_and(|current| current.same_registration(&domain))
+                            {
+                                return;
+                            }
+                            let client_domain = match domain.downcast_ref::<ClientDomain>() {
+                                Some(domain) => domain,
+                                None => return,
+                            };
+                            if let Some(remote_window_id) =
+                                client_domain.local_to_remote_window_id(window_id)
+                            {
+                                let Some(inner) = client_domain.inner() else {
+                                    return;
+                                };
+                                if !client_inner_is_current(&mux, &domain, &inner) {
+                                    return;
+                                }
+                                let request = codec::SetWindowWorkspace {
+                                    window_id: remote_window_id,
+                                    workspace,
+                                };
+                                if let Err(error) = update_remote_workspace(
+                                    Arc::clone(&mux),
+                                    domain,
+                                    inner,
+                                    request,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "failed to converge rejected remote workspace update for window \
+                                         {remote_window_id}: {error:#}"
+                                    );
+                                }
+                            } else {
+                                log::debug!(
+                                    "local window id {window_id} has no known remote window \
+                                    id while reconciling a local WindowWorkspaceChanged event"
+                                );
+                            }
+                        })
+                        .detach();
+                }
+                rejected => {
+                    metrics::counter!(
+                        "mux.client.metadata_scheduler_admission",
+                        "operation" => "window workspace",
+                        "outcome" => "generation_abort"
+                    )
+                    .increment(1);
+                    let abort = observed_inner.client.abort_rpc_transport_generation(
+                        &rpc,
+                        "workspace metadata scheduler admission failed",
+                    );
+                    log::error!(
+                        "main-thread scheduler rejected remote workspace convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                    );
+                }
+            }
+        }
+        MuxNotification::TabTitleChanged { tab_id, title } => {
+            if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
+                if let Some(inner) = client_domain.inner() {
+                    if !inner.should_forward_local_metadata() {
+                        return true;
+                    }
+                    let request = codec::TabTitleChanged {
+                        tab_id: remote_tab_id,
+                        title,
+                    };
+                    let rpc = inner.client.rpc_scope();
+                    let mux = Arc::clone(&mux);
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    rpc.set_tab_title(request).await?;
+                                    anyhow::Result::<()>::Ok(())
+                                })
+                                .detach();
+                        }
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "tab-title metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected tab-title convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        MuxNotification::WindowTitleChanged {
+            window_id,
+            title: _,
+        } => {
+            if let Some(inner) = client_domain.inner() {
+                if !inner.should_forward_local_metadata() {
+                    return true;
+                }
+                let Some((remote_window_id, pending_title)) = inner.queue_window_title(window_id)
+                else {
+                    return true;
+                };
+                let mux = Arc::clone(&mux);
+                let rpc = inner.client.rpc_scope();
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn(async move {
+                                loop {
+                                    promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
+                                    if !client_inner_is_current(&mux, &domain, &inner)
+                                        || inner.local_to_remote_window(window_id) != Some(remote_window_id)
+                                    {
+                                        return Ok(());
+                                    }
+                                    pending_title.begin_update();
+                                    let title = mux.get_window(window_id)
+                                        .map(|win| win.get_title().to_string());
+                                    let Some(title) = title else { return Ok(()); };
+                                    rpc.set_window_title(codec::WindowTitleChanged {
+                                        window_id: remote_window_id,
+                                        title,
+                                    }).await.map_err(|error| {
+                                        log::error!("window-title propagation failed for domain {} window {window_id}: {error:#}", inner.local_domain_id);
+                                        error
+                                    })?;
+                                    if pending_title.finish_if_clean() {
+                                        break;
+                                    }
+                                }
+                                anyhow::Result::<()>::Ok(())
+                            })
+                            .detach();
+                    }
+                    rejected => {
+                        metrics::counter!(
+                            "mux.client.metadata_scheduler_admission",
+                            "operation" => "window title",
+                            "outcome" => "generation_abort"
+                        )
+                        .increment(1);
+                        let abort = inner.client.abort_rpc_transport_generation(
+                            &rpc,
+                            "window title scheduler admission failed",
+                        );
+                        log::error!(
+                            "main-thread scheduler rejected remote title convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Filtered out by client_domain_handles before the domain lookup.
+        _ => {}
+    }
+    true
+}
+
+impl ClientDomain {
+    pub fn new(config: ClientDomainConfig, mux_owner: &Arc<Mux>) -> anyhow::Result<Self> {
+        let local_domain_id = alloc_domain_id();
+        let label = config.label();
+        let policy = ClientDomainPolicy::from_config(&config);
+        let owner = Arc::downgrade(mux_owner);
+        let mux_subscriber_id = mux_owner
+            .subscribe(move |notif| mux_notify_client_domain(&owner, local_domain_id, notif))
+            .context("allocate client-domain mux subscription")?;
+        Ok(Self {
+            config,
+            policy: parking_lot::RwLock::new(policy),
+            durable_binding: Mutex::new(None),
+            label,
+            inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id,
+            mux_owner: Arc::downgrade(mux_owner),
+            mux_subscriber_id: Some(mux_subscriber_id),
+        })
+    }
+
+    /// Register a domain already attached through `inner` with `mux`.
+    #[cfg(test)]
+    pub(crate) fn register_attached_for_test(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+    ) -> Arc<Self> {
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: format!("test-client-domain-{}", inner.local_domain_id),
+            ..UnixDomain::default()
+        });
+        let domain = Arc::new(ClientDomain {
+            label: config.label(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
+            config,
+            inner: Mutex::new(Some(Arc::clone(inner))),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: inner.local_domain_id,
+            mux_owner: Arc::downgrade(mux),
+            mux_subscriber_id: None,
+        });
+        let registered: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered)
+            .expect("test client domain should register with its exact mux");
+        domain
+    }
+
+    pub(crate) fn inner(&self) -> Option<Arc<ClientInner>> {
+        lock_or_recover(&self.inner, "client_domain_inner")
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    fn claim_initial_attachment(&self) -> anyhow::Result<InitialAttachmentClaim<'_>> {
+        self.initial_attachment_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                anyhow!(
+                    "client domain {} already has an attachment pending",
+                    self.local_domain_id
+                )
+            })?;
+        Ok(InitialAttachmentClaim {
+            pending: &self.initial_attachment_pending,
+        })
+    }
+
+    fn background_attachment_ui_is_reusable(ui: &ConnectionUI) -> bool {
+        ui.is_open() && ui.is_interactive()
+    }
+
+    fn initial_attachment_ui(
+        &self,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<(ConnectionUI, bool)> {
+        if let Some(window_id) = window_id {
+            let ui = ConnectionUI::with_params(ConnectionUIParams {
+                window_id: Some(window_id),
+                ..Default::default()
+            });
+            if !ui.is_interactive() {
+                ui.close();
+                bail!("interactive connection UI admission is temporarily unavailable");
+            }
+            return Ok((ui, false));
+        }
+
+        let mut retained = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        );
+        if retained
+            .as_ref()
+            .is_none_or(|ui| !Self::background_attachment_ui_is_reusable(ui))
+        {
+            if let Some(closed) = retained.take() {
+                closed.close();
+            }
+            // Background reconnect may still need host-key confirmation,
+            // passphrase, keyboard-interactive authentication, or MFA. Keep
+            // exactly one interactive prompt surface per domain across retry
+            // attempts, and disable the implicit 120-second linger because
+            // this exact sender slot owns its lifetime explicitly. Its window
+            // opens only for a prompt or once the connect has taken
+            // CONNECTION_UI_DELAY, so a connect that succeeds quickly (every
+            // reachable domain at GUI startup) flashes no window (ft-h38m4).
+            let candidate = ConnectionUI::with_params_deferred(
+                ConnectionUIParams {
+                    disable_close_delay: true,
+                    window_id: None,
+                    ..Default::default()
+                },
+                crate::client::CONNECTION_UI_DELAY,
+            );
+            if !candidate.is_interactive() {
+                candidate.close();
+                bail!(
+                    "background connection prompt admission is temporarily unavailable; retrying without starting transport authentication"
+                );
+            }
+            retained.replace(candidate);
+        }
+        Ok((
+            retained
+                .as_ref()
+                .expect("background connection UI was installed")
+                .clone(),
+            true,
+        ))
+    }
+
+    fn close_background_attachment_ui(&self) {
+        if let Some(ui) = lock_or_recover(
+            &self.background_attachment_ui,
+            "client_domain_background_attachment_ui",
+        )
+        .take()
+        {
+            ui.close();
+        }
+    }
+
+    fn ensure_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        let owner = self
+            .mux_owner
+            .upgrade()
+            .context("client domain's owning mux is not available")?;
+        if !Arc::ptr_eq(&owner, mux) {
+            bail!(
+                "client domain {} cannot operate on a different mux instance",
+                self.local_domain_id
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inner_is_current(&self, expected: &Arc<ClientInner>) -> bool {
+        !self.retired.load(Ordering::Acquire)
+            && lock_or_recover(&self.inner, "client_domain_inner")
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+    }
+
+    pub fn connect_automatically(&self) -> bool {
+        self.policy.read().connect_automatically
+    }
+
+    /// Durable namespace for this exact configured domain. This does not grant
+    /// any transport readiness or ordered-topology publication authority.
+    pub fn durable_layout_binding(&self) -> Option<DurableClientBinding> {
+        let binding = *lock_or_recover(&self.durable_binding, "durable_domain_binding");
+        (!self.retired.load(Ordering::Acquire))
+            .then_some(binding)
+            .flatten()
+    }
+
+    pub fn layout_snapshot(&self) -> Option<Arc<RemoteLayoutSnapshot>> {
+        let inner = self.inner()?;
+        let snapshot = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").clone();
+        snapshot
+    }
+
+    pub fn layout_restore_pending(&self) -> bool {
+        if self.durable_layout_binding().is_none() {
+            return false;
+        }
+        let Some(inner) = self.inner() else {
+            return true;
+        };
+        if inner.layout_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if matches!(
+            *lock_or_recover(&inner.topology_session, "topology_session"),
+            ClientTopologySessionState::Bound(ClientTopologySession::Legacy46)
+        ) {
+            return false;
+        }
+        let pending = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").is_none();
+        pending
+    }
+
+    fn publish_layout_snapshot(
+        &self,
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+    ) -> anyhow::Result<LayoutPublication> {
+        let Some(binding) = self.durable_layout_binding() else {
+            return Ok(LayoutPublication::NoDurableBinding);
+        };
+        let Some(session) = layout_session(
+            &lock_or_recover(&inner.topology_session, "topology_session"),
+            binding,
+        ) else {
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment has no current topology session",
+            ));
+        };
+        let rpc = inner.client.rpc_scope();
+        if !rpc.is_available() {
+            return Ok(LayoutPublication::Unavailable(
+                "the attachment's mux RPC is unavailable",
+            ));
+        }
+        rpc.commit_sync(
+            RpcConsumerKind::TopologySnapshot,
+            || -> anyhow::Result<()> {
+                ensure!(
+                    self.inner_is_current(inner) && !inner.is_detached(),
+                    "layout attachment retired before publication"
+                );
+                let owners = lock_or_recover(&inner.layout_tab_owners, "layout_tab_owners");
+                ensure!(owners.len() <= 65_536, "layout snapshot exceeds tab bound");
+                let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+                let mut tabs = Vec::new();
+                tabs.try_reserve_exact(owners.len())?;
+                for (&remote_tab_id, &remote_window_id) in owners.iter() {
+                    let local = mappings
+                        .get(&remote_tab_id)
+                        .context("layout tab mapping is missing")?;
+                    let tab = mux.get_tab(*local).context("layout tab was removed")?;
+                    tabs.push(RemoteLayoutTab {
+                        tab,
+                        remote_tab_id,
+                        remote_window_id,
+                    });
+                }
+                tabs.sort_unstable_by_key(|entry| entry.remote_tab_id);
+                drop(mappings);
+                drop(owners);
+                for entry in &tabs {
+                    entry.validate(mux, inner)?;
+                }
+                let snapshot = Arc::new(RemoteLayoutSnapshot {
+                    inner: Arc::downgrade(inner),
+                    rpc: rpc.clone(),
+                    binding,
+                    session,
+                    tabs,
+                });
+                *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = Some(snapshot);
+                Ok(())
+            },
+        )
+        .map_err(anyhow::Error::new)??;
+        Ok(LayoutPublication::Published)
+    }
+
+    /// Publish this attachment's layout receipt, or record that it cannot be
+    /// published. Either way the restore attempt is over, so typed input stops
+    /// being fenced on it (GitHub #132).
+    fn refresh_layout_snapshot(&self, mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
+        match self.publish_layout_snapshot(mux, inner) {
+            Ok(LayoutPublication::Published | LayoutPublication::NoDurableBinding) => {
+                inner.layout_failed.store(false, Ordering::Release);
+                self.notify_layout_ready();
+            }
+            // Nothing could be published now. A receipt published earlier
+            // stays usable; without one, no restore lands until a later
+            // refresh, so the fence must end here.
+            Ok(LayoutPublication::Unavailable(reason)) => {
+                self.end_layout_restore(inner, &reason, false);
+            }
+            Err(error) => self.end_layout_restore(inner, &format!("{error:#}"), true),
+        }
+    }
+
+    /// End this attachment's layout restore attempt without a new receipt,
+    /// withdrawing the current receipt when `withdraw_receipt` is set.
+    /// `layout_restore_pending` reports `false` until a later refresh
+    /// publishes a receipt.
+    fn end_layout_restore(
+        &self,
+        inner: &ClientInner,
+        reason: &dyn std::fmt::Display,
+        withdraw_receipt: bool,
+    ) {
+        if withdraw_receipt {
+            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+        }
+        inner.layout_failed.store(true, Ordering::Release);
+        log::warn!(
+            "remote layout publication unavailable for domain {}: {reason}",
+            self.local_domain_id
+        );
+        self.notify_layout_ready();
+    }
+
+    fn notify_layout_ready(&self) {
+        if let Some(observer) = LAYOUT_READY_OBSERVER.get() {
+            observer(self.local_domain_id);
+        }
+    }
+
+    async fn resolve_layout_binding_with(
+        &self,
+        resolver: DomainBindingResolver,
+    ) -> anyhow::Result<()> {
+        ensure!(!self.retired.load(Ordering::Acquire), "domain is retired");
+        if self.durable_layout_binding().is_some() {
+            return Ok(());
+        }
+        let fingerprint = self.config.endpoint_fingerprint();
+        let binding_id = resolver(fingerprint).await?;
+        ensure!(
+            binding_id.as_bytes() != [0; 16],
+            "durable domain binding is reserved"
+        );
+        let mut binding = lock_or_recover(&self.durable_binding, "durable_domain_binding");
+        ensure!(
+            !self.retired.load(Ordering::Acquire),
+            "domain retired while resolving layout binding"
+        );
+        let resolved = DurableClientBinding {
+            fingerprint,
+            binding_id,
+        };
+        ensure!(
+            binding.is_none_or(|current| current == resolved),
+            "durable domain binding changed while its registration remained live"
+        );
+        *binding = Some(resolved);
+        Ok(())
+    }
+
+    async fn prepare_layout_binding_for_attach(
+        &self,
+        mux: &Arc<Mux>,
+        resolver: Option<DomainBindingResolver>,
+        deadline: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        if let Some(resolver) = resolver {
+            let result = match futures::future::select(
+                Box::pin(self.resolve_layout_binding_with(resolver)),
+                Box::pin(deadline),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _deadline)) => result,
+                futures::future::Either::Right(((), pending_resolution)) => {
+                    // Drop the exact waiter before ordinary transport admission;
+                    // a late storage receipt must not publish onto this domain.
+                    drop(pending_resolution);
+                    Err(anyhow!("durable domain layout binding deadline elapsed"))
+                }
+            };
+            if let Err(error) = result {
+                metrics::counter!("mux.client.layout_binding_unavailable.total").increment(1);
+                log::warn!("durable domain layout binding unavailable: {error:#}");
+            }
+        }
+        ensure!(
+            !self.retired.load(Ordering::Acquire)
+                && mux.get_domain(self.local_domain_id).is_some_and(|current| {
+                    current
+                        .downcast_ref::<Self>()
+                        .is_some_and(|current| std::ptr::eq(current, self))
+                }),
+            "client domain retired while awaiting durable layout binding"
+        );
+        Ok(())
+    }
+
+    pub fn reconcile_configuration(&self, expected: &ClientDomainConfig) -> bool {
+        if !self.config.transport_configuration_matches(expected) {
+            return false;
+        }
+        *self.policy.write() = ClientDomainPolicy::from_config(expected);
+        true
+    }
+
+    pub fn perform_detach(&self) {
+        self.close_background_attachment_ui();
+        let expected = self.inner();
+        if let Some(expected) = expected {
+            let _ = self.perform_detach_if_current(&expected);
+        } else {
+            self.retired.store(true, Ordering::Release);
+            let _ = self.remove_exact_domain_registration();
+        }
+    }
+
+    /// Retire only the exact attachment observed by the caller.
+    ///
+    /// The compare-and-take happens under the attachment slot lock. Teardown
+    /// then passes the exact registered trait object back to the mux rather
+    /// than manufacturing a new trait-object view from `self`.
+    pub(crate) fn perform_detach_if_current(&self, expected: &Arc<ClientInner>) -> bool {
+        let retired = {
+            let mut inner = lock_or_recover(&self.inner, "client_domain_inner");
+            if !inner
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return false;
+            }
+            self.retired.store(true, Ordering::Release);
+            let retired = inner
+                .take()
+                .expect("exact client attachment disappeared while its lock was held");
+            retired.mark_detached();
+            retired
+        };
+        drop(retired);
+        self.close_background_attachment_ui();
+
+        log::info!(
+            "detached exact attachment for domain {}",
+            self.local_domain_id
+        );
+        let _ = self.remove_exact_domain_registration();
+        true
+    }
+
+    fn remove_exact_domain_registration(&self) -> bool {
+        let Some(mux) = self.mux_owner.upgrade() else {
+            return false;
+        };
+        let Some(registered) = mux.get_domain(self.local_domain_id) else {
+            return false;
+        };
+        if !registered
+            .downcast_ref::<Self>()
+            .is_some_and(|current| std::ptr::eq(current, self))
+        {
+            return false;
+        }
+        mux.domain_was_detached_if_guard(&registered)
+    }
+
+    pub(crate) fn remote_to_local_window_id(&self, remote_window_id: WindowId) -> Option<WindowId> {
+        let inner = self.inner()?;
+        inner.remote_to_local_window(remote_window_id)
+    }
+
+    pub(crate) fn local_to_remote_window_id(&self, local_window_id: WindowId) -> Option<WindowId> {
+        let inner = self.inner()?;
+        inner.local_to_remote_window(local_window_id)
+    }
+
+    pub(crate) fn local_to_remote_tab_id(&self, local_tab_id: TabId) -> Option<TabId> {
+        let inner = self.inner()?;
+        inner.local_to_remote_tab(local_tab_id)
+    }
+
+    /// The reader in the mux may have decided to give up on one or
+    /// more tabs at the time that a disconnect was detected, and
+    /// it's also possible that another client connected and adjusted
+    /// the set of tabs since we were connected, so we need to re-sync.
+    pub(crate) async fn reattach_if_current(
+        mux: Arc<Mux>,
+        domain: &DomainOperationGuard,
+        expected: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
+        let mut abort_guard =
+            rpc.abort_guard("successor mux RPC bootstrap failed, timed out, or was cancelled")?;
+        let result = with_mux_rpc_bootstrap_timeout(Self::reattach_if_current_inner(
+            mux,
+            domain,
+            expected,
+            rpc,
+            &abort_guard,
+            ui,
+        ))
+        .await;
+        if result.is_ok() {
+            abort_guard.disarm();
+        }
+        result
+    }
+
+    async fn reattach_if_current_inner(
+        mux: Arc<Mux>,
+        domain: &DomainOperationGuard,
+        expected: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        readiness_guard: &RpcGenerationAbortGuard,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
+        let domain_id = domain.domain_id();
+        let current = mux
+            .get_domain(domain_id)
+            .is_some_and(|candidate| candidate.same_registration(domain));
+        if !current {
+            let _ = expected
+                .client
+                .abort_rpc_transport_generation(&rpc, "reconnect target domain retired");
+            return Ok(());
+        }
+        let client_domain = domain
+            .downcast_ref::<Self>()
+            .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", domain_id))?;
+        if client_domain
+            .initial_attachment_pending
+            .load(Ordering::Acquire)
+        {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor arrived before initial attachment transaction retired",
+            );
+            bail!(
+                "client domain {domain_id} cannot publish a successor while its initial \
+                 attachment transaction is still pending"
+            );
+        }
+        if !client_domain.inner_is_current(&expected) {
+            let _ = expected
+                .client
+                .abort_rpc_transport_generation(&rpc, "reconnect client attachment retired");
+            return Ok(());
+        }
+
+        // Every physical server connection owns a fresh SessionHandler with no
+        // client identity. Re-establish codec compatibility and SetClientId on
+        // the exact successor generation before any topology or workspace RPC.
+        if let Err(error) = expected
+            .client
+            .verify_version_compat_with_scope(&ui, &rpc)
+            .await
+        {
+            let _ = expected
+                .client
+                .abort_rpc_transport_generation(&rpc, "successor mux RPC bootstrap failed");
+            return Err(error);
+        }
+
+        let topology_current = match Self::sync_remote_topology(
+            Arc::clone(&mux),
+            client_domain,
+            Arc::clone(&expected),
+            &rpc,
+            None,
+        )
+        .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                let _ = expected
+                    .client
+                    .abort_rpc_transport_generation(&rpc, "successor topology bootstrap failed");
+                return Err(error);
+            }
+        };
+        if !topology_current {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor topology bootstrap lost attachment authority",
+            );
+            return Ok(());
+        }
+
+        if !client_inner_is_current(&mux, domain, &expected) {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor topology bootstrap lost domain authority",
+            );
+            return Ok(());
+        }
+        if let Some(request) = current_active_workspace_sync(&expected, &mux) {
+            if let Err(error) = rpc.set_active_workspace(request).await {
+                let _ = expected
+                    .client
+                    .abort_rpc_transport_generation(&rpc, "successor workspace bootstrap failed");
+                return Err(error).context("synchronizing the successor active workspace");
+            }
+        }
+        if !client_inner_is_current(&mux, domain, &expected) {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor workspace bootstrap lost domain authority",
+            );
+            return Ok(());
+        }
+
+        expected
+            .client
+            .publish_rpc_transport_ready(&rpc, readiness_guard)
+            .await?;
+        Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
+        Self::start_pane_push_tracking(&expected, rpc.clone());
+        Self::flush_pending_palettes(&mux, &expected, rpc.clone());
+        Self::flush_pending_focus(&expected, rpc.clone());
+        Self::flush_bootstrap_resizes(&mux, &expected);
+        client_domain.refresh_layout_snapshot(&mux, &expected);
+        ui.close();
+        Ok(())
+    }
+
+    pub(crate) async fn resync_if_current(
+        &self,
+        mux: Arc<Mux>,
+        expected: Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<bool> {
+        if self.inner_is_current(&expected) {
+            return Self::sync_remote_topology(mux, self, expected, rpc, None).await;
+        }
+        Ok(false)
+    }
+
+    /// Start or coalesce a complete metadata census after pane mappings and
+    /// transport readiness have committed. Only four bounded pane replies can
+    /// be outstanding, regardless of server population. Metadata convergence
+    /// therefore continues beyond the fixed connection-bootstrap timeout.
+    fn request_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, None)
+    }
+
+    pub(crate) fn request_pane_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, Some(pane_id))?;
+        Ok(())
+    }
+
+    fn request_user_var_hydration_inner(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: Option<PaneId>,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        let (waiter, completion) = async_channel::bounded(1);
+        if !rpc
+            .agreed_codec_version()
+            .is_some_and(|version| version >= codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION)
+        {
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "legacy_unavailable")
+                .increment(1);
+            log::debug!(
+                "remote codec has no authoritative user-variable snapshot protocol; initial background values remain unavailable until updated"
+            );
+            let _ = waiter.try_send(Ok(()));
+            return Ok(completion);
+        }
+        let generation = rpc
+            .connection_generation()
+            .context("user-variable hydration has no live generation")?;
+        let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+        ensure!(
+            rpc.is_ready(),
+            "user-variable hydration requires committed RPC readiness"
+        );
+        if state.generation != Some(generation) {
+            *state = UserVarHydrationState {
+                generation: Some(generation),
+                ..UserVarHydrationState::default()
+            };
+        }
+        state.waiters.retain(|waiter| !waiter.is_closed());
+        ensure!(
+            state.waiters.len() < 64,
+            "user-variable hydration waiter limit reached"
+        );
+        let reservation = if state.running {
+            None
+        } else {
+            Some(reserve_client_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4096,
+                "user-variable hydration census",
+            )?)
+        };
+        state.waiters.push(waiter);
+        state.request(pane_id);
+        if let Some(reservation) = reservation {
+            state.running = true;
+            drop(state);
+            let mut guard = UserVarHydrationGuard {
+                inner: Arc::clone(&inner),
+                rpc: rpc.clone(),
+                armed: true,
+            };
+            reservation
+                .spawn(async move {
+                    let result = Self::hydrate_user_vars(&mux, &inner, &rpc, &mut guard).await;
+                    if let Err(error) = result {
+                        metrics::counter!("mux.client.user_vars.hydration", "outcome" => "failed")
+                            .increment(1);
+                        log::error!("remote user-variable hydration failed: {error:#}");
+                    }
+                })
+                .detach();
+        }
+        Ok(completion)
+    }
+
+    async fn hydrate_user_vars(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        guard: &mut UserVarHydrationGuard,
+    ) -> anyhow::Result<()> {
+        let current = || {
+            rpc.is_ready()
+                && !inner.is_detached()
+                && mux.get_domain(inner.local_domain_id).is_some_and(|domain| {
+                    domain
+                        .downcast_ref::<Self>()
+                        .is_some_and(|domain| domain.inner_is_current(inner))
+                })
+        };
+        loop {
+            ensure!(current(), "user-variable hydration attachment retired");
+            let (full_census, targets) = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed"
+                );
+                (
+                    std::mem::take(&mut state.census_requested),
+                    std::mem::take(&mut state.pending_panes),
+                )
+            };
+            let mut panes = {
+                let mappings = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+                if full_census {
+                    mappings
+                        .iter()
+                        .map(|(remote, local)| (*remote, *local))
+                        .collect::<Vec<_>>()
+                } else {
+                    targets
+                        .into_iter()
+                        .filter_map(|remote| mappings.get(&remote).map(|local| (remote, *local)))
+                        .collect()
+                }
+            };
+            panes.sort_unstable_by_key(|(remote, _)| *remote);
+            let mut requests = futures::stream::iter(panes.into_iter().map(|(remote, local)| {
+                Self::hydrate_one_pane_user_vars(mux, inner, rpc, remote, local)
+            }))
+            .buffer_unordered(4);
+            let mut busy = Vec::new();
+            while let Some(result) = requests.next().await {
+                busy.extend(result?);
+                ensure!(
+                    current(),
+                    "user-variable hydration attachment retired during reply application"
+                );
+            }
+            let waiters = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed before completion"
+                );
+                // A pane printing continuously can keep its snapshot busy
+                // through every attempt. Ask it again on the next pass; it
+                // used to fail the whole census, so no pane got its values
+                // (ft-ypblq).
+                for remote in busy {
+                    state.request(Some(remote));
+                }
+                if state.census_requested || !state.pending_panes.is_empty() {
+                    continue;
+                }
+                state.running = false;
+                guard.armed = false;
+                std::mem::take(&mut state.waiters)
+            };
+            for waiter in waiters {
+                let _ = waiter.try_send(Ok(()));
+            }
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "complete")
+                .increment(1);
+            return Ok(());
+        }
+    }
+
+    /// Returns `Some(remote)` when the pane's snapshot was still busy after
+    /// every attempt.
+    async fn hydrate_one_pane_user_vars(
+        mux: &Mux,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        remote: PaneId,
+        local: PaneId,
+    ) -> anyhow::Result<Option<PaneId>> {
+        // Scheduler and outbound quota pressure is temporary and explicitly
+        // retryable. Keep the same four census slots during backoff so a busy
+        // server cannot turn one census into an unbounded retry population.
+        for attempt in 0..8 {
+            ensure!(rpc.is_ready(), "user-variable hydration generation retired");
+            let belongs = mux.get_pane(local).is_some_and(|pane| {
+                pane.downcast_ref::<ClientPane>().is_some_and(|pane| {
+                    pane.belongs_to_client(inner) && pane.remote_pane_id() == remote
+                })
+            });
+            if !belongs {
+                return Ok(None);
+            }
+            match rpc
+                .get_pane_user_vars_v1(codec::GetPaneUserVarsV1 { pane_id: remote })
+                .await
+            {
+                Ok(response) => {
+                    ensure!(
+                        response.pane_id == remote,
+                        "user-variable reply changed its requested pane identity"
+                    );
+                    return Ok(None);
+                }
+                Err(error) if attempt == 7 && user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "deferred")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot still busy; asking again next pass: {error:#}");
+                    return Ok(Some(remote));
+                }
+                Err(error) if user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "backoff")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot temporarily rejected: {error:#}");
+                    promise::spawn::sleep(std::time::Duration::from_millis(
+                        (50_u64 << attempt).min(2000),
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("hydrating remote pane {remote} user variables"));
+                }
+            }
+        }
+        unreachable!("the final metadata attempt returns its response or error")
+    }
+
+    async fn sync_remote_topology(
+        mux: Arc<Mux>,
+        domain: &Self,
+        inner: Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<bool> {
+        let incarnation_is_current = || {
+            !inner.is_detached()
+                && domain.inner_is_current(&inner)
+                && mux
+                    .get_domain(domain.local_domain_id)
+                    .is_some_and(|current| {
+                        current
+                            .downcast_ref::<Self>()
+                            .is_some_and(|current| std::ptr::eq(current, domain))
+                    })
+        };
+        if !incarnation_is_current() {
+            return Ok(false);
+        }
+        // Applying the topology withdraws the layout receipt, which fences
+        // typed input until `refresh_layout_snapshot` below republishes it.
+        // Every earlier exit after the withdrawal ends the restore instead.
+        let layout_settlement = LayoutRestoreSettlement::new(domain, &inner);
+        let topology_current = rpc
+            .with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
+                if !incarnation_is_current() {
+                    bail!("client attachment retired before coherent topology application");
+                }
+                let _remote_application = inner.begin_remote_metadata_application()?;
+                layout_settlement.receipt_withdrawn();
+                Self::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    panes,
+                    primary_window_id,
+                )?;
+                if !incarnation_is_current() {
+                    bail!("client attachment retired during coherent topology application");
+                }
+                Ok(true)
+            })
+            .await?;
+        if !topology_current || !incarnation_is_current() {
+            return Ok(false);
+        }
+
+        let prepared = rpc
+            .commit_sync(RpcConsumerKind::RenderBootstrap, || {
+                if !incarnation_is_current() {
+                    bail!("client attachment retired before render bootstrap preparation");
+                }
+                Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), rpc)?;
+                if !incarnation_is_current() {
+                    bail!("client attachment retired during render bootstrap preparation");
+                }
+                Ok(true)
+            })
+            .map_err(anyhow::Error::new)??;
+        layout_settlement.disarm();
+        domain.refresh_layout_snapshot(&mux, &inner);
+        if prepared && rpc.is_ready() {
+            Self::request_user_var_hydration(mux, inner, rpc.clone())?;
+        }
+        Ok(prepared)
+    }
+
+    /// Ask the server about every pane of this attachment, once the connection
+    /// is ready, so that it pushes their later changes.
+    ///
+    /// A current-codec server pushes a pane's title, working directory and
+    /// output only to a session that has already asked about that pane. The
+    /// paint path asks for the panes it draws; without this pass a tab that is
+    /// attached or reconnected behind another tab keeps the title it had at
+    /// that moment until it is first shown (ft-pzu8b). Four requests are
+    /// outstanding at a time, whatever the population, and their replies are
+    /// not needed: the changes arrive as ordinary pushes.
+    pub(crate) fn start_pane_push_tracking(inner: &Arc<ClientInner>, rpc: RpcGenerationScope) {
+        let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        if panes.is_empty()
+            || !crate::pane::needs_push_tracking_request(rpc.agreed_codec_version(), panes.len())
+        {
+            return;
+        }
+        panes.sort_unstable();
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4096,
+            "pane push tracking",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // Not fatal: each pane still asks when it is first painted.
+                log::warn!("remote panes will be tracked as they are shown: {error:#}");
+                return;
+            }
+        };
+        reservation
+            .spawn(async move {
+                let mut requests = futures::stream::iter(panes.into_iter().map(|pane_id| {
+                    rpc.get_pane_render_changes(codec::GetPaneRenderChanges { pane_id })
+                }))
+                .buffer_unordered(4);
+                while requests.next().await.is_some() {
+                    if !rpc.is_ready() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// Send the configured palette of every pane of this attachment whose
+    /// palette has not reached the server, once the connection is ready:
+    /// panes that registered, or had their config applied, while the
+    /// connection was bootstrapping, and panes whose send failed. Four
+    /// requests are outstanding at a time. Each palette is read when its
+    /// request is sent, so it cannot overtake a newer one.
+    pub(crate) fn flush_pending_palettes(mux: &Mux, inner: &ClientInner, rpc: RpcGenerationScope) {
+        if !rpc.is_available() {
+            return;
+        }
+        let panes = mux
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .is_some_and(|client_pane| {
+                        client_pane.belongs_to_client(inner)
+                            && client_pane.palette_delivery_is_pending()
+                    })
+            })
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            return;
+        }
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4096,
+            "pane palette delivery",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // They stay pending for the next time the connection is ready.
+                log::warn!("configured palettes not sent after readiness: {error:#}");
+                return;
+            }
+        };
+        reservation
+            .spawn(async move {
+                let mut panes = panes.into_iter();
+                let mut requests = futures::stream::FuturesUnordered::new();
+                loop {
+                    while requests.len() < 4 {
+                        let Some(pane) = panes.next() else {
+                            break;
+                        };
+                        let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                            continue;
+                        };
+                        if let Some(delivery) = client_pane.take_pending_palette_delivery(&rpc) {
+                            requests.push(delivery);
+                        }
+                    }
+                    let Some(delivered) = requests.next().await else {
+                        break;
+                    };
+                    if let Err(error) = delivered {
+                        log::debug!(
+                            "configured palette not delivered; it stays pending: {error:#}"
+                        );
+                    }
+                    if !rpc.is_ready() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// Send the focused remote pane once the connection is ready, when the
+    /// GUI focused it before then or its send failed.
+    pub(crate) fn flush_pending_focus(inner: &ClientInner, rpc: RpcGenerationScope) {
+        if !rpc.is_available() || !inner.focus_delivery_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            1024,
+            "focused pane delivery",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // It stays pending for the next time the connection is ready.
+                log::warn!("focused pane not sent after readiness: {error:#}");
+                return;
+            }
+        };
+        let Some(request) = inner.take_pending_focus_delivery(&rpc) else {
+            return;
+        };
+        reservation
+            .spawn(async move {
+                if let Err(error) = request.await {
+                    log::debug!("focused pane not delivered; it stays pending: {error:#}");
+                }
+            })
+            .detach();
+    }
+
+    pub(crate) fn flush_bootstrap_resizes(mux: &Mux, inner: &ClientInner) {
+        for pane in mux.iter_panes() {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner)
+                && client_pane.flush_resize_after_ready().is_err()
+            {
+                log::warn!("initial remote pane geometry could not be admitted after readiness");
+            }
+        }
+    }
+
+    fn prepare_render_application_bootstrap(
+        mux: &Mux,
+        inner: &ClientInner,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<()> {
+        for pane in mux.iter_panes() {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner) {
+                client_pane.prepare_render_application_bootstrap(rpc)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_remote_spawn_entities(
+        mux: &Mux,
+        inner: &Arc<ClientInner>,
+        result: codec::SpawnResponse,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        if inner.is_detached() {
+            bail!("client attachment retired before remote spawn resolution");
+        }
+        let local_tab_id = inner
+            .remote_to_local_tab_id(result.tab_id)
+            .ok_or_else(|| anyhow!("remote tab {} didn't resolve after resync", result.tab_id))?;
+        let local_pane_id = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .get(&result.pane_id)
+            .copied()
+            .ok_or_else(|| anyhow!("remote pane {} didn't resolve after resync", result.pane_id))?;
+        let local_window_id = inner
+            .remote_to_local_window(result.window_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "remote window {} didn't resolve after resync",
+                    result.window_id
+                )
+            })?;
+
+        let tab = mux
+            .get_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
+        let pane = mux
+            .get_pane(local_pane_id)
+            .ok_or_else(|| anyhow!("local pane {local_pane_id} is invalid"))?;
+        let client_pane = pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("local pane {local_pane_id} is not a ClientPane"))?;
+        if !client_pane.belongs_to_client(inner) || client_pane.remote_pane_id() != result.pane_id {
+            bail!(
+                "local pane {local_pane_id} does not belong to the current client incarnation for \
+                 remote pane {}",
+                result.pane_id
+            );
+        }
+        if !tab
+            .iter_all_panes()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &pane))
+        {
+            bail!(
+                "local pane {local_pane_id} is not attached to resolved local tab {local_tab_id}"
+            );
+        }
+        if mux.window_containing_tab(local_tab_id) != Some(local_window_id) {
+            bail!(
+                "resolved local tab {local_tab_id} is not attached to local window \
+                 {local_window_id}"
+            );
+        }
+
+        Ok((tab, pane, local_window_id))
+    }
+
+    fn exact_remote_pane_id(
+        guard: &PaneOperationGuard,
+        inner: &Arc<ClientInner>,
+        role: &str,
+    ) -> anyhow::Result<PaneId> {
+        guard.with_pane(|pane| {
+            let pane = pane
+                .downcast_ref::<ClientPane>()
+                .ok_or_else(|| anyhow!("{role} pane_id {} is not a ClientPane", guard.pane_id()))?;
+            if !pane.belongs_to_client(inner) {
+                bail!(
+                    "{role} pane_id {} belongs to a different client attachment",
+                    guard.pane_id()
+                );
+            }
+            Ok(pane.remote_pane_id())
+        })
+    }
+
+    async fn split_exact(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        moved: Option<&PaneOperationGuard>,
+        split_request: SplitRequest,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "split target belongs to another mux registration"
+        );
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        self.ensure_mux_owner(mux)?;
+
+        let remote_target = Self::exact_remote_pane_id(target, &inner, "target")?;
+        let remote_move = moved
+            .map(|source| {
+                anyhow::ensure!(
+                    source.belongs_to(mux),
+                    "split source belongs to another mux registration"
+                );
+                anyhow::ensure!(
+                    !target.same_registration(source),
+                    "cannot move pane {} into a split of itself",
+                    target.pane_id()
+                );
+                Self::exact_remote_pane_id(source, &inner, "move source")
+            })
+            .transpose()?;
+        let target_config = target.with_pane(|pane| pane.get_config());
+
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .split_pane(SplitPane {
+                domain: SpawnTabDomain::CurrentPaneDomain,
+                pane_id: remote_target,
+                split_request,
+                command,
+                command_dir,
+                move_pane_id: remote_move,
+            })
+            .await?;
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
+            .await?
+        {
+            bail!("client attachment retired while resolving split pane");
+        }
+
+        let size = result.size;
+        rpc.commit_sync(RpcConsumerKind::SplitResolution, || {
+            let (tab, pane, window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            if let Some(source) = moved {
+                anyhow::ensure!(
+                    source.is_same_pane(&pane),
+                    "remote moved split resolved to a different local pane registration"
+                );
+            }
+            if let Some(config) = target_config {
+                pane.set_config(config);
+            }
+            target.capture_split_receipt(pane, tab, window_id, size)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
+    /// Apply the pane/tree portion of a validated ordered snapshot without
+    /// reconstructing recursive `PaneNode` transfer trees.
+    ///
+    /// IDs 86-90 remain rejected by the ordinary client transport. This seam
+    /// is deliberately non-dispatched until the ordered-window capability has
+    /// a complete connection-generation state machine and an atomic local
+    /// window-order mirror primitive.
+    #[allow(dead_code)]
+    pub(crate) fn process_pane_arena(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        panes: PaneArena,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        let preflight = preflight_pane_arena(&panes)?;
+        ensure_pane_arena_append_order_is_sound(
+            mux,
+            &inner,
+            &preflight.tabs,
+            &preflight.remote_pane_tabs,
+            &preflight.window_ids,
+        )?;
+        if primary_window_id.is_some()
+            && preflight.tabs.iter().any(|plan| {
+                inner
+                    .remote_to_local_window(plan.remote_window_id)
+                    .is_none_or(|local_window_id| mux.get_window(local_window_id).is_none())
+            })
+        {
+            bail!(
+                "ordered pane arena requires transactional primary-window reuse before it can \
+                 bootstrap an unmapped remote window"
+            );
+        }
+
+        let mut reserved_local_pane_ids =
+            inner
+                .reserve_local_pane_ids(preflight.remote_pane_ids)
+                .context("reserve local pane identifiers for ordered remote topology")?;
+        let live_panes = mux.iter_panes();
+        let mut local_pane_ids_by_remote = HashMap::new();
+        local_pane_ids_by_remote
+            .try_reserve(live_panes.len())
+            .context("reserve ordered pane live-pane index")?;
+        for pane in live_panes {
+            if pane.domain_id() != inner.local_domain_id {
+                continue;
+            }
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                if !client_pane.belongs_to_client(&inner) {
+                    continue;
+                }
+                index_live_client_pane(
+                    &mut local_pane_ids_by_remote,
+                    client_pane.remote_pane_id(),
+                    pane.pane_id(),
+                )?;
+            }
+        }
+        let mut remote_windows_to_forget = HashSet::new();
+        {
+            let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            remote_windows_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-window marks")?;
+            remote_windows_to_forget.extend(mappings.keys().copied());
+        }
+        let mut remote_tabs_to_forget = HashSet::new();
+        {
+            let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            remote_tabs_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-tab marks")?;
+            remote_tabs_to_forget.extend(mappings.keys().copied());
+        }
+        let mut remote_panes_to_forget = HashSet::new();
+        {
+            let mappings = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            remote_panes_to_forget
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane stale-pane marks")?;
+            remote_panes_to_forget.extend(mappings.keys().copied());
+        }
+
+        let (descriptors, mut nodes, window_titles) = panes.into_parts();
+        if descriptors.len() != preflight.tabs.len() {
+            bail!("ordered pane arena changed descriptor cardinality after preflight");
+        }
+        if window_titles.len() != preflight.window_ids.len() {
+            bail!("ordered pane arena changed window-title cardinality after preflight");
+        }
+        let mut prepared_tabs = Vec::new();
+        prepared_tabs
+            .try_reserve_exact(descriptors.len())
+            .context("reserve prepared ordered pane tabs")?;
+        let mut pending = PendingPaneArenaPublication::default();
+        pending
+            .new_panes
+            .try_reserve_exact(reserved_local_pane_ids.by_remote_pane.len())
+            .context("reserve pending ordered pane registrations")?;
+        pending
+            .existing_sync
+            .try_reserve_exact(local_pane_ids_by_remote.len())
+            .context("reserve pending ordered pane state updates")?;
+        let mut preparation_scratch = PaneArenaPreparationScratch::default();
+        for (descriptor, plan) in descriptors.into_iter().zip(preflight.tabs).rev() {
+            if usize::try_from(descriptor.node_count).ok() != Some(plan.node_count) {
+                bail!("ordered pane arena descriptor changed after preflight");
+            }
+            let mut workspace = None;
+            let tree = prepare_pane_tree_from_arena_with_scratch(
+                &mut nodes,
+                plan.node_count,
+                &mut preparation_scratch,
+                |mut entry| {
+                    if workspace.is_none() {
+                        workspace = Some(std::mem::take(&mut entry.workspace));
+                    }
+                    resolve_pane_arena_entry(
+                        mux,
+                        &inner,
+                        entry,
+                        &mut remote_panes_to_forget,
+                        &mut local_pane_ids_by_remote,
+                        &mut reserved_local_pane_ids,
+                        &mut pending,
+                    )
+                },
+            )?;
+            let workspace = workspace.ok_or_else(|| {
+                anyhow!(
+                    "ordered pane arena tab {} lost its preflighted workspace authority",
+                    plan.remote_tab_id
+                )
+            })?;
+            prepared_tabs.push(PreparedPaneArenaTab {
+                plan,
+                workspace,
+                tab_title: descriptor.tab_title,
+                tree,
+            });
+        }
+        if !nodes.is_empty() {
+            bail!(
+                "ordered pane arena retained {} nodes after direct preparation",
+                nodes.len()
+            );
+        }
+        drop(nodes);
+        drop(preparation_scratch);
+        prepared_tabs.reverse();
+
+        let mut publication = PaneArenaPublicationRollback::new(mux);
+        publication
+            .pane_registrations
+            .try_reserve_exact(pending.new_panes.len())
+            .context("reserve ordered pane registration rollback authority")?;
+        for (remote_pane_id, pane) in &pending.new_panes {
+            mux.add_pane(pane)
+                .with_context(|| format!("register remote pane {remote_pane_id} in mux"))?;
+            let registration = mux.capture_pane_registration(pane).ok_or_else(|| {
+                anyhow!(
+                    "remote pane {remote_pane_id} was published without exact rollback authority"
+                )
+            })?;
+            publication.pane_registrations.push(registration);
+        }
+
+        let mut local_tabs_by_remote = HashMap::new();
+        local_tabs_by_remote
+            .try_reserve(prepared_tabs.len())
+            .context("reserve ordered pane staged tab identities")?;
+        let mut staged_tabs = Vec::new();
+        staged_tabs
+            .try_reserve_exact(prepared_tabs.len())
+            .context("reserve ordered pane staged tabs")?;
+        let existing_tab_mappings = {
+            let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            let mut snapshot = HashMap::new();
+            snapshot
+                .try_reserve(mappings.len())
+                .context("reserve ordered pane existing tab mappings")?;
+            snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+            snapshot
+        };
+        publication
+            .new_tabs
+            .try_reserve_exact(prepared_tabs.len())
+            .context("reserve ordered pane tab rollback authority")?;
+        publication
+            .new_windows
+            .try_reserve_exact(preflight.window_ids.len())
+            .context("reserve ordered pane window rollback authority")?;
+        for prepared in prepared_tabs {
+            let remote_tab_id = prepared.plan.remote_tab_id;
+            let tab = existing_tab_mappings
+                .get(&remote_tab_id)
+                .copied()
+                .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+                .unwrap_or_else(|| Arc::new(Tab::new(&prepared.plan.root_size)));
+            if mux.get_tab(tab.tab_id()).is_none() {
+                mux.add_tab_no_panes(&tab)
+                    .with_context(|| format!("stage ordered remote tab {remote_tab_id} in mux"))?;
+                publication.new_tabs.push(Arc::clone(&tab));
+            }
+            local_tabs_by_remote.insert(remote_tab_id, Arc::clone(&tab));
+            staged_tabs.push(StagedPaneArenaTab { prepared, tab });
+        }
+
+        let mut local_windows_by_remote = HashMap::new();
+        local_windows_by_remote
+            .try_reserve(preflight.window_ids.len())
+            .context("reserve ordered pane staged window identities")?;
+        let existing_window_mappings = {
+            let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            let mut snapshot = Vec::new();
+            snapshot
+                .try_reserve_exact(mappings.len())
+                .context("reserve ordered pane existing window mappings")?;
+            snapshot.extend(mappings.iter().map(|(remote, local)| (*remote, *local)));
+            snapshot
+        };
+        for (remote_window_id, local_window_id) in existing_window_mappings {
+            if mux.get_window(local_window_id).is_some() {
+                local_windows_by_remote.insert(remote_window_id, local_window_id);
+            }
+        }
+        let mut attached_tabs = HashSet::new();
+        attached_tabs
+            .try_reserve(
+                existing_tab_mappings
+                    .len()
+                    .saturating_add(staged_tabs.len()),
+            )
+            .context("reserve ordered pane attachment index")?;
+        for &local_window_id in local_windows_by_remote.values() {
+            let window = mux.get_window(local_window_id).ok_or_else(|| {
+                anyhow!(
+                    "local window {local_window_id} disappeared while indexing ordered \
+                     attachments"
+                )
+            })?;
+            attached_tabs.extend(
+                window
+                    .iter()
+                    .map(|attached_tab| (local_window_id, attached_tab.tab_id())),
+            );
+        }
+
+        for staged in &mut staged_tabs {
+            let plan = &staged.prepared.plan;
+            remote_windows_to_forget.remove(&plan.remote_window_id);
+            remote_tabs_to_forget.remove(&plan.remote_tab_id);
+
+            if let Some(local_window_id) =
+                local_windows_by_remote.get(&plan.remote_window_id).copied()
+            {
+                if attached_tabs.insert((local_window_id, staged.tab.tab_id())) {
+                    mux.add_tab_to_window(&staged.tab, local_window_id)
+                        .with_context(|| {
+                            format!(
+                                "attach ordered remote tab {} to existing local window {}",
+                                plan.remote_tab_id, local_window_id
+                            )
+                        })?;
+                }
+                continue;
+            }
+
+            let window_builder =
+                mux.new_empty_window(Some(std::mem::take(&mut staged.prepared.workspace)), None);
+            let local_window_id = *window_builder;
+            publication.new_windows.push(window_builder);
+            local_windows_by_remote.insert(plan.remote_window_id, local_window_id);
+            mux.add_tab_to_window(&staged.tab, local_window_id)
+                .with_context(|| {
+                    format!(
+                        "attach ordered remote tab {} to staged local window {}",
+                        plan.remote_tab_id, local_window_id
+                    )
+                })?;
+            attached_tabs.insert((local_window_id, staged.tab.tab_id()));
+        }
+
+        for StagedPaneArenaTab { prepared, tab } in staged_tabs {
+            mux.set_tab_title(tab.tab_id(), &prepared.tab_title);
+            tab.sync_with_prepared_pane_tree(prepared.plan.root_size, prepared.tree)
+                .with_context(|| {
+                    format!(
+                        "install ordered remote pane tree in local tab {}",
+                        tab.tab_id()
+                    )
+                })?;
+        }
+
+        for (pane, alt_screen_active) in pending.existing_sync {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                client_pane.sync_remote_listing_state(alt_screen_active);
+            }
+        }
+        {
+            let mut pane_mappings =
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            pane_mappings.extend(
+                local_pane_ids_by_remote
+                    .iter()
+                    .map(|(remote, local)| (*remote, *local)),
+            );
+        }
+        {
+            let mut tab_mappings =
+                lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            tab_mappings.extend(
+                local_tabs_by_remote
+                    .iter()
+                    .map(|(remote, tab)| (*remote, tab.tab_id())),
+            );
+        }
+        {
+            let mut window_mappings =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            window_mappings.extend(
+                local_windows_by_remote
+                    .iter()
+                    .map(|(remote, local)| (*remote, *local)),
+            );
+        }
+        publication.commit();
+
+        for (window_title, remote_window_id) in window_titles.into_iter().zip(preflight.window_ids)
+        {
+            remote_windows_to_forget.remove(&remote_window_id);
+            if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
+                match mux.set_window_title(local_window_id, &window_title.title) {
+                    Ok(_) => {}
+                    Err(error) if error.is_not_found() => {
+                        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                            .remove(&remote_window_id);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        if !remote_windows_to_forget.is_empty() {
+            let mut windows =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            for remote_window_id in remote_windows_to_forget {
+                windows.remove(&remote_window_id);
+            }
+        }
+        if !remote_tabs_to_forget.is_empty() {
+            let mut tabs = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            for remote_tab_id in remote_tabs_to_forget {
+                tabs.remove(&remote_tab_id);
+            }
+        }
+        if !remote_panes_to_forget.is_empty() {
+            let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            for remote_pane_id in remote_panes_to_forget {
+                panes.remove(&remote_pane_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn process_pane_list(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        panes: ListPanesResponse,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        panes
+            .validate_floating_panes()
+            .context("validating bounded floating-pane snapshot")?;
+        let ListPanesResponse {
+            tabs,
+            tab_titles,
+            window_titles,
+            floating_panes,
+        } = panes;
+        Self::process_pane_snapshot(
+            mux,
+            inner,
+            tabs,
+            tab_titles,
+            window_titles,
+            Some(floating_panes),
+            primary_window_id,
+        )
+    }
+
+    /// After a rebind to a restored mux, forget everything above the
+    /// restored maximums (ft-zy6g7). The predecessor allocated those IDs after
+    /// its capture and the restored mux may hand them out again, so a kept
+    /// mapping would show a stranger's pane in an old tab. Each such pane is
+    /// marked dead before it is removed: a dead pane is pruned, never killed on
+    /// the server, which may already run a new pane under its remote ID.
+    fn retire_unrestored_topology(
+        mux: &Mux,
+        inner: &ClientInner,
+        lineage: &mux::RestoredTopologyLineage,
+    ) {
+        let unrestored = |id: usize, max: Option<usize>| max.is_none_or(|max| id > max);
+        let mut retired = Vec::new();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != inner.local_domain_id {
+                continue;
+            }
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner)
+                && unrestored(client_pane.remote_pane_id(), lineage.max_pane_id)
+            {
+                client_pane.renderable.lock().inner.borrow_mut().dead = true;
+                retired.push(pane.pane_id());
+            }
+        }
+        lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_pane_id));
+        lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_tab_id));
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_window_id));
+        log::info!(
+            "domain {}: rebound to the restored mux; retired {} pane(s) it did not restore",
+            inner.local_domain_id,
+            retired.len()
+        );
+        for local_pane_id in retired {
+            mux.remove_pane(local_pane_id);
+        }
+    }
+
+    fn process_topology_snapshot(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        snapshot: RpcTopologySnapshot,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        // A partially applied or rejected successor must not leave the old
+        // layout receipt usable while its numeric mappings are changing.
+        *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+        let mut previous_input_sources = Vec::new();
+        for pane in mux.iter_panes() {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                if client_pane.belongs_to_client(&inner) {
+                    if let Some(source) = client_pane.withdraw_conditional_input_source() {
+                        previous_input_sources.push((
+                            pane.pane_id(),
+                            client_pane.remote_pane_id(),
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
+        match snapshot {
+            RpcTopologySnapshot::Current {
+                session_incarnation,
+                lineage,
+                panes,
+                input_sources,
+            } => {
+                if let Some(lineage) = inner.pin_topology_session_with_lineage(
+                    ClientTopologySession::Current(session_incarnation),
+                    lineage,
+                )? {
+                    // Retire in the same step as the rebind: once the
+                    // successor is bound, no later snapshot of it would.
+                    Self::retire_unrestored_topology(mux, &inner, &lineage);
+                }
+                panes
+                    .validate_floating_panes()
+                    .context("validating bounded floating-pane snapshot")?;
+                if let Some(sources) = &input_sources {
+                    for (local_id, remote_id, previous) in previous_input_sources {
+                        if sources
+                            .get(&remote_id)
+                            .is_some_and(|source| *source != previous)
+                        {
+                            if let Some(pane) = mux.get_pane(local_id) {
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    // Prune the old mirror without asking the
+                                    // server to kill its numeric successor.
+                                    client_pane.renderable.lock().inner.borrow_mut().dead = true;
+                                }
+                            }
+                            mux.remove_pane(local_id);
+                        }
+                    }
+                }
+                let ListPanesResponse {
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    floating_panes,
+                } = panes;
+                Self::process_pane_snapshot(
+                    mux,
+                    Arc::clone(&inner),
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    Some(floating_panes),
+                    primary_window_id,
+                )?;
+                // Publish only after the whole display snapshot succeeds.
+                // Reentrant input during installation sees unavailable
+                // authority and cannot adopt a registration from a probe.
+                for pane in mux.iter_panes() {
+                    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                        if client_pane.belongs_to_client(&inner) {
+                            client_pane.publish_conditional_input_source(
+                                input_sources.as_ref().and_then(|sources| {
+                                    sources.get(&client_pane.remote_pane_id()).copied()
+                                }),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            RpcTopologySnapshot::Legacy46(panes) => {
+                inner.pin_topology_session(ClientTopologySession::Legacy46)?;
+                let (tabs, tab_titles, window_titles) = panes.into_parts();
+                Self::process_pane_snapshot(
+                    mux,
+                    inner,
+                    tabs,
+                    tab_titles,
+                    window_titles,
+                    None,
+                    primary_window_id,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_pane_snapshot(
+        mux: &Arc<Mux>,
+        inner: Arc<ClientInner>,
+        tabs: Vec<PaneNode>,
+        tab_titles: Vec<String>,
+        window_titles: HashMap<WindowId, String>,
+        floating_panes: Option<Vec<FloatingPaneSnapshotEntry>>,
+        mut primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        let floating_snapshot_authoritative = floating_panes.is_some();
+        let floating_panes = floating_panes.unwrap_or_default();
+        if !floating_snapshot_authoritative {
+            metrics::counter!(
+                "mux.client.legacy46_topology_snapshot.total",
+                "outcome" => "floating_state_unavailable"
+            )
+            .increment(1);
+            log::warn!(
+                "domain {}: codec-46 topology has no floating-pane authority; preserving unseen pane, tab, and window mappings",
+                inner.local_domain_id
+            );
+        }
+        if tabs.len() != tab_titles.len() {
+            bail!(
+                "malformed ListPanes response: {} tab tree(s) but {} tab title(s); refusing \
+                 identifier reservation or topology mutation",
+                tabs.len(),
+                tab_titles.len()
+            );
+        }
+        log::debug!(
+            "domain {}: ListPanes snapshot has {} tab trees and {} tab titles",
+            inner.local_domain_id,
+            tabs.len(),
+            tab_titles.len()
+        );
+
+        // Check out one fallback local identifier for every unique remote pane
+        // before publishing any tabs, panes, or windows. This remains safe if
+        // a pane from the live snapshot disappears during the tree walk. IDs
+        // that are not consumed are returned to the per-domain spare bank, so
+        // stable large-session resyncs do not burn through the process-wide
+        // PaneId namespace.
+        let mut remote_pane_ids = Vec::new();
+        let mut seen_remote_pane_ids = HashSet::new();
+        let mut remote_tab_owners = HashMap::new();
+        let mut remote_pane_tabs = HashMap::new();
+        for tabroot in &tabs {
+            let mut tree_identity = None;
+            collect_remote_pane_ids(
+                tabroot,
+                &mut tree_identity,
+                &mut seen_remote_pane_ids,
+                &mut remote_pane_ids,
+                &mut remote_pane_tabs,
+            )?;
+            if let Some((window_id, tab_id)) = tree_identity {
+                if remote_tab_owners.insert(tab_id, window_id).is_some() {
+                    bail!(
+                        "malformed ListPanes response: remote tab {tab_id} appears in more than \
+                         one tree"
+                    );
+                }
+            }
+        }
+        for floating in &floating_panes {
+            let entry = &floating.pane;
+            let Some(expected_window_id) = remote_tab_owners.get(&entry.tab_id).copied() else {
+                bail!(
+                    "malformed ListPanes response: floating pane {} names absent remote tab {}",
+                    entry.pane_id,
+                    entry.tab_id
+                );
+            };
+            if expected_window_id != entry.window_id {
+                bail!(
+                    "malformed ListPanes response: floating pane {} names window/tab {}/{}, but \
+                     the tab tree belongs to window {}",
+                    entry.pane_id,
+                    entry.window_id,
+                    entry.tab_id,
+                    expected_window_id
+                );
+            }
+            if !seen_remote_pane_ids.insert(entry.pane_id) {
+                bail!(
+                    "malformed ListPanes response: remote pane {} has more than one tiled/floating owner",
+                    entry.pane_id
+                );
+            }
+            if remote_pane_tabs
+                .insert(entry.pane_id, entry.tab_id)
+                .is_some()
+            {
+                bail!(
+                    "malformed ListPanes response: floating pane {} has conflicting tab owners",
+                    entry.pane_id
+                );
+            }
+            if entry.is_active_pane != floating.focused || entry.is_zoomed_pane {
+                bail!(
+                    "malformed ListPanes response: floating pane {} carries contradictory focus/zoom metadata",
+                    entry.pane_id
+                );
+            }
+            if entry.left_col != floating.rect.left
+                || entry.top_row != floating.rect.top
+                || entry.size.cols != floating.rect.width
+                || entry.size.rows != floating.rect.height
+            {
+                bail!(
+                    "malformed ListPanes response: floating pane {} geometry disagrees with its pane entry",
+                    entry.pane_id
+                );
+            }
+            remote_pane_ids.push(entry.pane_id);
+        }
+
+        // A numeric tab mapping is only a lookup hint. Validate every live
+        // target against this exact attachment before reserving IDs or changing
+        // any title/tree: a stale mapping must never replace another client's
+        // panes, even when both attachments use the same domain and remote IDs.
+        for remote_tab_id in remote_tab_owners.keys() {
+            let Some(tab) = inner
+                .remote_to_local_tab_id(*remote_tab_id)
+                .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+            else {
+                continue;
+            };
+            let panes = tab.iter_all_panes();
+            ensure!(
+                !panes.is_empty()
+                    && panes.iter().all(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| {
+                                client_pane.belongs_to_client(&inner)
+                                    && client_pane.remote_tab_id() == *remote_tab_id
+                            })
+                    }),
+                "remote tab {} mapping targets local tab {} outside this exact client attachment",
+                remote_tab_id,
+                tab.tab_id(),
+            );
+        }
+        let mut reserved_local_pane_ids = inner
+            .reserve_local_pane_ids(remote_pane_ids)
+            .context("reserve local pane identifiers for remote topology")?;
+        // Resolve the full live ClientPane set once. Calling
+        // `remote_to_local_pane_id` for each missing remote pane would scan the
+        // mux repeatedly and make a first large-session sync quadratic.
+        let live_panes = mux.iter_panes();
+        let mut local_pane_ids_by_remote = HashMap::with_capacity(live_panes.len());
+        let mut moved_panes = Vec::new();
+        for pane in live_panes {
+            if pane.domain_id() != inner.local_domain_id {
+                continue;
+            }
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                if !client_pane.belongs_to_client(&inner) {
+                    continue;
+                }
+                let remote_pane_id = client_pane.remote_pane_id();
+                if let Some(expected_remote_tab_id) = remote_pane_tabs.get(&remote_pane_id).copied()
+                {
+                    if client_pane.remote_tab_id() != expected_remote_tab_id {
+                        moved_panes.push((Arc::clone(&pane), expected_remote_tab_id));
+                    }
+                }
+                let local_pane_id = pane.pane_id();
+                index_live_client_pane(
+                    &mut local_pane_ids_by_remote,
+                    remote_pane_id,
+                    local_pane_id,
+                )?;
+            }
+        }
+        // The server moved these panes to another tab (MovePaneToNewTab).
+        // Keep each pane and its local identity; the tree walk below installs
+        // it in the new tab's mirror.
+        for (pane, new_remote_tab_id) in moved_panes {
+            rehome_client_pane_moved_on_server(mux, &inner, &pane, new_remote_tab_id);
+        }
+        {
+            let mut pane_map = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            pane_map.extend(
+                local_pane_ids_by_remote
+                    .iter()
+                    .map(|(remote, local)| (*remote, *local)),
+            );
+        }
+
+        // "Mark" the current set of known remote ids, so that we can "Sweep"
+        // any unreferenced ids at the bottom, garbage collection style
+        let mut remote_windows_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
+            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut remote_tabs_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
+            lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut remote_panes_to_forget: HashSet<WindowId> = if floating_snapshot_authoritative {
+            lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let mut local_tabs_by_remote = HashMap::new();
+        local_tabs_by_remote
+            .try_reserve(remote_tab_owners.len())
+            .context("reserve local tab identities for floating-pane reconciliation")?;
+        let mut authoritative_panes_by_remote = HashMap::new();
+        authoritative_panes_by_remote
+            .try_reserve(seen_remote_pane_ids.len())
+            .context("reserve authoritative pane identities for floating reconciliation")?;
+        let mut pending_tiled_sync = Vec::new();
+        pending_tiled_sync
+            .try_reserve_exact(seen_remote_pane_ids.len())
+            .context("reserve pending tiled-pane state updates")?;
+
+        for (tabroot, tab_title) in tabs.into_iter().zip(tab_titles.iter()) {
+            let root_size = match tabroot.root_size() {
+                Some(size) => size,
+                None => continue,
+            };
+
+            if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
+                let tab;
+
+                remote_windows_to_forget.remove(&remote_window_id);
+                remote_tabs_to_forget.remove(&remote_tab_id);
+
+                if let Some(tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
+                    match mux.get_tab(tab_id) {
+                        Some(t) => tab = t,
+                        None => {
+                            // We likely decided that we hit EOF on the tab and
+                            // removed it from the mux.  Let's add it back, but
+                            // with a new id.
+                            log::trace!(
+                                "we had remote_to_local_tab_id mapping of \
+                                 {remote_tab_id} -> {tab_id}, but the local \
+                                 tab is not in the mux, make a new tab"
+                            );
+                            inner.remove_old_tab_mapping(remote_tab_id);
+                            tab = Arc::new(Tab::new(&root_size));
+                            mux.add_tab_no_panes(&tab)?;
+                            inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
+                        }
+                    };
+                } else {
+                    tab = Arc::new(Tab::new(&root_size));
+                    mux.add_tab_no_panes(&tab)?;
+                    inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
+                }
+
+                if local_tabs_by_remote
+                    .insert(remote_tab_id, Arc::clone(&tab))
+                    .is_some()
+                {
+                    bail!(
+                        "malformed ListPanes response: remote tab {remote_tab_id} resolved more than once"
+                    );
+                }
+                mux.set_tab_title(tab.tab_id(), tab_title);
+
+                log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
+                let mut workspace = None;
+                let make_pane = |entry: PaneEntry| {
+                    workspace.replace(entry.workspace.clone());
+                    remote_panes_to_forget.remove(&entry.pane_id);
+                    let pane = if let Some(pane_id) =
+                        local_pane_ids_by_remote.get(&entry.pane_id).copied()
+                    {
+                        match mux.get_pane(pane_id) {
+                            Some(pane)
+                                if pane.downcast_ref::<ClientPane>().is_some_and(
+                                    |client_pane| {
+                                        client_pane.belongs_to_client(&inner)
+                                            && client_pane.remote_pane_id() == entry.pane_id
+                                    },
+                                ) =>
+                            {
+                                pane
+                            }
+                            Some(_) | None => {
+                                // We likely decided that we hit EOF on the tab and
+                                // removed it from the mux, or this mapping belongs
+                                // to an older client incarnation. Add the exact
+                                // current remote pane back with a fresh local id.
+                                inner.remove_old_pane_mapping(entry.pane_id);
+                                let local_pane_id = reserved_local_pane_ids
+                                    .take(entry.pane_id)
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "remote pane {} needs a local identifier, but no \
+                                             identifier was reserved",
+                                            entry.pane_id
+                                        )
+                                    })?;
+                                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                                    &inner,
+                                    local_pane_id,
+                                    entry.tab_id,
+                                    entry.pane_id,
+                                    entry.size,
+                                    &entry.title,
+                                    entry.alt_screen_active,
+                                )?);
+                                mux.add_pane(&pane).with_context(|| {
+                                    format!("register remote pane {} in mux", entry.pane_id)
+                                })?;
+                                inner.record_remote_to_local_pane_mapping(
+                                    entry.pane_id,
+                                    local_pane_id,
+                                );
+                                local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                                pane
+                            }
+                        }
+                    } else {
+                        let local_pane_id =
+                            reserved_local_pane_ids.take(entry.pane_id).ok_or_else(|| {
+                                anyhow!(
+                                    "remote pane {} needs a local identifier, but no identifier \
+                                     was reserved",
+                                    entry.pane_id
+                                )
+                            })?;
+                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                            &inner,
+                            local_pane_id,
+                            entry.tab_id,
+                            entry.pane_id,
+                            entry.size,
+                            &entry.title,
+                            entry.alt_screen_active,
+                        )?);
+                        log::debug!(
+                            "domain: {} attaching to remote pane {:?} -> local pane_id {}",
+                            inner.local_domain_id,
+                            entry,
+                            pane.pane_id()
+                        );
+                        mux.add_pane(&pane).with_context(|| {
+                            format!("register remote pane {} in mux", entry.pane_id)
+                        })?;
+                        inner.record_remote_to_local_pane_mapping(entry.pane_id, local_pane_id);
+                        local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                        pane
+                    };
+                    if pane.downcast_ref::<ClientPane>().is_some() {
+                        pending_tiled_sync.push((Arc::clone(&pane), entry.alt_screen_active));
+                    }
+                    if authoritative_panes_by_remote
+                        .insert(entry.pane_id, Arc::clone(&pane))
+                        .is_some()
+                    {
+                        bail!(
+                            "malformed ListPanes response: remote pane {} resolved more than once",
+                            entry.pane_id
+                        );
+                    }
+                    Ok(pane)
+                };
+                let installed = if floating_snapshot_authoritative {
+                    tab.sync_with_pane_tree(root_size, tabroot, make_pane)
+                } else {
+                    tab.sync_with_pane_tree_preserving_unmentioned_floating(
+                        root_size, tabroot, make_pane,
+                    )
+                };
+                // Retain the structural failure before rejecting the fence:
+                // rejection retires the transport and the detached unilateral
+                // consumer may otherwise lose the original error. This path
+                // can include configured workspace metadata, but not terminal
+                // text or the remote pane title/cwd payload.
+                installed.inspect_err(|error| {
+                    log::error!(
+                        "topology snapshot application rejected stage=tiled-tree domain={} remote_tab={} local_tab={}: {error:#}",
+                        inner.local_domain_id,
+                        remote_tab_id,
+                        tab.tab_id()
+                    );
+                })?;
+                // Snapshot application suppresses resize commands and preserves
+                // newer client-pane geometry. Rebuild the newly installed split
+                // tree from those panes so a stale remote listing cannot leave
+                // the tab bounds out of step with the visible terminal grids.
+                tab.rebuild_splits_sizes_from_contained_panes();
+
+                // Neither ordinary listing dialect carries authoritative UI
+                // order. Floating-pane authority does not grant authority to
+                // relocate tabs. Keep an already attached mirror's placement:
+                // a user may have reordered it or moved it to another GUI
+                // window since the remote-window mapping was recorded.
+                // Reattaching through that old mapping both discards user
+                // intent and fails the mux's exclusive-parent invariant.
+                if let Some(containing_window_id) = mux.window_containing_tab(tab.tab_id()) {
+                    // A restored layout attaches tabs before any snapshot maps
+                    // their remote window. Adopt the containing window when the
+                    // remote window has no live mapping and that window shows
+                    // no other remote window, so later spawns and title
+                    // updates resolve to it.
+                    let mapped_window_is_live = inner
+                        .remote_to_local_window(remote_window_id)
+                        .is_some_and(|local_window_id| mux.get_window(local_window_id).is_some());
+                    if !mapped_window_is_live
+                        && inner.local_to_remote_window(containing_window_id).is_none()
+                    {
+                        log::debug!(
+                            "domain {}: remote window {} adopts local window {} holding its tabs",
+                            inner.local_domain_id,
+                            remote_window_id,
+                            containing_window_id
+                        );
+                        inner.record_remote_to_local_window_mapping(
+                            remote_window_id,
+                            containing_window_id,
+                        );
+                    }
+                    continue;
+                }
+
+                if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
+                    let needs_attach = mux
+                        .get_window(local_window_id)
+                        .map(|window| window.iter().all(|candidate| !Arc::ptr_eq(candidate, &tab)));
+                    if let Some(needs_attach) = needs_attach {
+                        if needs_attach {
+                            log::debug!(
+                                "domain: {} adding tab to existing local window {}",
+                                inner.local_domain_id,
+                                local_window_id
+                            );
+                            mux.add_tab_to_window(&tab, local_window_id)
+                                .with_context(|| {
+                                    format!(
+                                        "attach remote tab {} to existing local window {}",
+                                        tab.tab_id(),
+                                        local_window_id
+                                    )
+                                })?;
+                        }
+                        continue;
+                    }
+                    log::debug!(
+                        "domain: {} dropping stale remote window mapping {} -> {}",
+                        inner.local_domain_id,
+                        remote_window_id,
+                        local_window_id
+                    );
+                    lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                        .remove(&remote_window_id);
+                }
+
+                if let Some(local_window_id) = primary_window_id {
+                    // Verify that the workspace is consistent between the local and remote
+                    // windows.
+                    //
+                    // NB: `Mux::get_window` hands back a read guard over the shared
+                    // `windows` RwLock, while `add_tab_to_window` acquires the *write*
+                    // lock on that same RwLock. Holding the read guard across that call
+                    // self-deadlocks parking_lot's (non-reentrant) RwLock — observed as a
+                    // hang on remote-domain attach (main thread parked acquiring the
+                    // exclusive window-registry lock). Decide what to do while the read
+                    // guard is alive, then drop it *before* mutating the mux.
+                    enum PrimaryWindow {
+                        Reuse,
+                        WorkspaceMismatch,
+                        Disappeared,
+                    }
+                    let decision = match mux.get_window(local_window_id) {
+                        Some(window) => {
+                            if Some(window.get_workspace()) == workspace.as_deref() {
+                                PrimaryWindow::Reuse
+                            } else {
+                                PrimaryWindow::WorkspaceMismatch
+                            }
+                        }
+                        None => PrimaryWindow::Disappeared,
+                    };
+                    // `window` read guard is dropped here, before any write lock.
+
+                    match decision {
+                        PrimaryWindow::Reuse => {
+                            // Yes! We can use this window
+                            log::debug!(
+                                "adding remote window {} as tab to local window {}",
+                                remote_window_id,
+                                local_window_id
+                            );
+                            inner.record_remote_to_local_window_mapping(
+                                remote_window_id,
+                                local_window_id,
+                            );
+                            mux.add_tab_to_window(&tab, local_window_id)?;
+                            primary_window_id.take();
+                            continue;
+                        }
+                        PrimaryWindow::WorkspaceMismatch => {}
+                        PrimaryWindow::Disappeared => {
+                            log::debug!(
+                                "primary local window {} disappeared during remote topology sync",
+                                local_window_id
+                            );
+                            primary_window_id.take();
+                        }
+                    }
+                }
+                log::debug!(
+                    "making new local window for remote {} in workspace {:?}",
+                    remote_window_id,
+                    workspace
+                );
+                let position = None;
+                let local_window_id = mux.new_empty_window(workspace.take(), position);
+                inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
+                mux.add_tab_to_window(&tab, *local_window_id)?;
+            }
+        }
+
+        let mut desired_floating = Vec::new();
+        desired_floating
+            .try_reserve_exact(floating_panes.len())
+            .context("reserve authoritative floating-pane states")?;
+        let mut pending_float_mappings =
+            PendingFloatingPaneMappings::new(&mut reserved_local_pane_ids, floating_panes.len())?;
+        let mut pending_float_sync = Vec::new();
+        pending_float_sync
+            .try_reserve_exact(floating_panes.len())
+            .context("reserve pending floating-pane state updates")?;
+
+        for floating in floating_panes {
+            let entry = floating.pane;
+            remote_panes_to_forget.remove(&entry.pane_id);
+            let tab = local_tabs_by_remote
+                .get(&entry.tab_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "floating pane {} lost its local tab mapping for remote tab {}",
+                        entry.pane_id,
+                        entry.tab_id
+                    )
+                })?;
+
+            let pane = if let Some(local_pane_id) =
+                local_pane_ids_by_remote.get(&entry.pane_id).copied()
+            {
+                match mux.get_pane(local_pane_id) {
+                    Some(pane)
+                        if pane
+                            .downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| {
+                                client_pane.belongs_to_client(&inner)
+                                    && client_pane.remote_pane_id() == entry.pane_id
+                                    && client_pane.remote_tab_id() == entry.tab_id
+                            }) =>
+                    {
+                        pending_float_sync.push((Arc::clone(&pane), entry.alt_screen_active));
+                        pane
+                    }
+                    Some(_) | None => {
+                        let local_pane_id =
+                            pending_float_mappings.take(entry.pane_id).ok_or_else(|| {
+                                anyhow!(
+                                    "remote floating pane {} needs a local identifier, but no \
+                                     identifier was reserved",
+                                    entry.pane_id
+                                )
+                            })?;
+                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                            &inner,
+                            local_pane_id,
+                            entry.tab_id,
+                            entry.pane_id,
+                            entry.size,
+                            &entry.title,
+                            entry.alt_screen_active,
+                        )?);
+                        local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                        pane
+                    }
+                }
+            } else {
+                let local_pane_id =
+                    pending_float_mappings.take(entry.pane_id).ok_or_else(|| {
+                        anyhow!(
+                            "remote floating pane {} needs a local identifier, but no identifier \
+                             was reserved",
+                            entry.pane_id
+                        )
+                    })?;
+                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                    &inner,
+                    local_pane_id,
+                    entry.tab_id,
+                    entry.pane_id,
+                    entry.size,
+                    &entry.title,
+                    entry.alt_screen_active,
+                )?);
+                local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                pane
+            };
+
+            if authoritative_panes_by_remote
+                .insert(entry.pane_id, Arc::clone(&pane))
+                .is_some()
+            {
+                bail!(
+                    "malformed ListPanes response: remote floating pane {} resolved more than once",
+                    entry.pane_id
+                );
+            }
+            desired_floating.push(DomainFloatingPaneState {
+                tab,
+                pane,
+                pane_id: local_pane_ids_by_remote[&entry.pane_id],
+                rect: floating.rect,
+                z_order: floating.z_order,
+                visible: floating.visible,
+                pinned: floating.pinned,
+                opacity: floating.opacity,
+                focused: floating.focused,
+            });
+        }
+
+        if authoritative_panes_by_remote.len() != seen_remote_pane_ids.len() {
+            log::error!(
+                "topology snapshot application rejected stage=pane-cardinality domain={} resolved={} expected={}",
+                inner.local_domain_id,
+                authoritative_panes_by_remote.len(),
+                seen_remote_pane_ids.len()
+            );
+            bail!(
+                "ListPanes resolved {} of {} authoritative panes",
+                authoritative_panes_by_remote.len(),
+                seen_remote_pane_ids.len()
+            );
+        }
+        if floating_snapshot_authoritative {
+            let mut authoritative_panes = Vec::new();
+            authoritative_panes
+                .try_reserve_exact(authoritative_panes_by_remote.len())
+                .context("reserve authoritative local pane set")?;
+            authoritative_panes.extend(authoritative_panes_by_remote.into_values());
+
+            // Reconciliation refuses a tiled pane of this domain that the
+            // snapshot does not name, which would retire the transport.
+            drop_local_tabs_closed_on_server(mux, &inner, &remote_tab_owners);
+
+            let reconcile_receipt = mux
+                .reconcile_domain_floating_panes(
+                    inner.local_domain_id,
+                    authoritative_panes,
+                    desired_floating,
+                )
+                .inspect_err(|error| {
+                    log::error!(
+                        "topology snapshot application rejected stage=floating-reconciliation domain={}: {error:#}",
+                        inner.local_domain_id
+                    );
+                })
+                .context("reconcile authoritative floating-pane topology")?;
+            let mut pending_float_mappings = pending_float_mappings.commit();
+            pending_float_mappings.sort_unstable_by_key(|(_, local_pane_id)| *local_pane_id);
+            debug_assert_eq!(
+                pending_float_mappings.len(),
+                reconcile_receipt.registered_pane_ids.len()
+            );
+            debug_assert!(pending_float_mappings
+                .iter()
+                .map(|(_, local_pane_id)| *local_pane_id)
+                .eq(reconcile_receipt.registered_pane_ids.iter().copied()));
+
+            for (pane, alt_screen_active) in pending_tiled_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+            for (pane, alt_screen_active) in pending_float_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+            {
+                let mut pane_mappings =
+                    lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+                for (remote_pane_id, local_pane_id) in &pending_float_mappings {
+                    pane_mappings.insert(*remote_pane_id, *local_pane_id);
+                }
+            }
+            log::debug!(
+                "domain {} floating reconciliation changed {} tab(s), registered {} pane(s), and \
+                 retired {} pane(s)",
+                inner.local_domain_id,
+                reconcile_receipt.changed_tab_ids.len(),
+                reconcile_receipt.registered_pane_ids.len(),
+                reconcile_receipt.retired_pane_ids.len(),
+            );
+        } else {
+            debug_assert!(desired_floating.is_empty());
+            debug_assert!(pending_float_sync.is_empty());
+            drop(pending_float_mappings);
+            for (pane, alt_screen_active) in pending_tiled_sync {
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.sync_remote_listing_state(alt_screen_active);
+                }
+            }
+        }
+
+        for (remote_window_id, window_title) in window_titles {
+            if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
+                match mux.set_window_title(local_window_id, &window_title) {
+                    Ok(_) => {}
+                    Err(error) if error.is_not_found() => {
+                        log::debug!(
+                            "dropping stale title mapping for remote window {} -> local {}",
+                            remote_window_id,
+                            local_window_id
+                        );
+                        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                            .remove(&remote_window_id);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        // "Sweep" away our mapping for ids that are no longer present in the
+        // latest sync
+        log::debug!(
+            "after sync, remote_windows_to_forget={remote_windows_to_forget:?}, \
+                    remote_tabs_to_forget={remote_tabs_to_forget:?}, \
+                    remote_panes_to_forget={remote_panes_to_forget:?}"
+        );
+        if !remote_windows_to_forget.is_empty() {
+            let mut windows =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            for w in remote_windows_to_forget {
+                windows.remove(&w);
+            }
+        }
+        if !remote_tabs_to_forget.is_empty() {
+            let mut tabs = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+            for t in remote_tabs_to_forget {
+                tabs.remove(&t);
+            }
+        }
+        if !remote_panes_to_forget.is_empty() {
+            let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            for p in remote_panes_to_forget {
+                panes.remove(&p);
+            }
+        }
+
+        *lock_or_recover(&inner.layout_tab_owners, "layout_tab_owners") = remote_tab_owners;
+
+        Ok(())
+    }
+
+    async fn finish_attach(
+        mux: &Arc<Mux>,
+        domain_id: DomainId,
+        client: Client,
+        rpc: RpcGenerationScope,
+        readiness_guard: &RpcGenerationAbortGuard,
+        request: InitialAttachmentRequest,
+    ) -> anyhow::Result<()> {
+        let InitialAttachmentRequest {
+            owner_client_id,
+            primary_window_id,
+        } = request;
+        let domain_registration = mux
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("invalid domain id {}", domain_id))?;
+        let domain = domain_registration
+            .downcast_ref::<Self>()
+            .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", domain_id))?;
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|owner| !mux.client_registration_is_current(owner))
+        {
+            bail!(
+                "client domain {domain_id} owner client registration is no longer current before \
+                 attachment preparation"
+            );
+        }
+        let policy = *domain.policy.read();
+        let threshold = policy.local_echo_threshold_ms;
+        let overlay_lag_indicator = policy.overlay_lag_indicator;
+        let inner = Arc::new(ClientInner::new(
+            domain_id,
+            client,
+            owner_client_id,
+            threshold,
+            overlay_lag_indicator,
+        ));
+        inner.start_resize_retry_driver()?;
+
+        // Move the non-cloneable exact-domain lease into the rollback guard
+        // before any attachment state can become visible.  The cleanup starts
+        // disarmed so an already-busy attachment cannot retire its incumbent;
+        // it is armed only after the empty-slot/current-generation preflight.
+        let cleanup = InitialAttachmentCleanup {
+            mux: Arc::clone(mux),
+            domain_registration,
+            inner: Arc::clone(&inner),
+            rpc: rpc.clone(),
+            armed: AtomicBool::new(false),
+        };
+        let domain = cleanup
+            .domain_registration
+            .downcast_ref::<Self>()
+            .expect("validated client-domain registration changed concrete type");
+
+        debug_assert!(
+            domain.initial_attachment_pending.load(Ordering::Acquire),
+            "initial attachment must be claimed before transport creation"
+        );
+        if domain.retired.load(Ordering::Acquire)
+            || !mux
+                .get_domain(domain_id)
+                .is_some_and(|current| current.same_registration(&cleanup.domain_registration))
+        {
+            inner.mark_detached();
+            bail!("client domain {domain_id} retired before attachment publication");
+        }
+        if lock_or_recover(&domain.inner, "client_domain_inner").is_some() {
+            inner.mark_detached();
+            bail!("client domain {domain_id} already has a published attachment");
+        }
+        cleanup.arm();
+
+        rpc.with_coherent_topology_snapshot(RpcConsumerKind::InitialAttachment, |panes| {
+            // Process the pane list BEFORE publishing inner to the domain.
+            // This prevents concurrent operations from seeing a partially
+            // attached domain with incomplete pane mappings. The pending claim
+            // rejects a second initial attachment without holding a callback-
+            // reentrant mutex across mux topology mutation.
+            let result = (|| {
+                let _remote_application = inner.begin_remote_metadata_application()?;
+                Self::process_topology_snapshot(mux, Arc::clone(&inner), panes, primary_window_id)?;
+
+                let mut published = lock_or_recover(&domain.inner, "client_domain_inner");
+                if domain.retired.load(Ordering::Acquire)
+                    || !mux.get_domain(domain_id).is_some_and(|current| {
+                        current.same_registration(&cleanup.domain_registration)
+                    })
+                {
+                    inner.mark_detached();
+                    bail!("client domain {domain_id} retired during attachment preparation");
+                }
+                if published.is_some() {
+                    inner.mark_detached();
+                    bail!("client domain {domain_id} gained an attachment during preparation");
+                }
+                if inner
+                    .owner_client_id
+                    .as_ref()
+                    .is_some_and(|owner| !mux.client_registration_is_current(owner))
+                {
+                    inner.mark_detached();
+                    bail!(
+                        "client domain {domain_id} owner client registration retired during \
+                         attachment preparation"
+                    );
+                }
+                *published = Some(Arc::clone(&inner));
+                anyhow::Result::<()>::Ok(())
+            })();
+            if result.is_err() {
+                // Run cleanup while the exact generation's consumer lease is
+                // still held. This prevents successor publication between a
+                // partial topology mutation and its rollback.
+                cleanup.cleanup_if_current();
+            }
+            result
+        })
+        .await?;
+
+        rpc.commit_sync(RpcConsumerKind::RenderBootstrap, || {
+            if inner.is_detached()
+                || domain.retired.load(Ordering::Acquire)
+                || !domain.inner_is_current(&inner)
+                || !mux
+                    .get_domain(domain_id)
+                    .is_some_and(|current| current.same_registration(&cleanup.domain_registration))
+            {
+                bail!("client domain {domain_id} retired before initial render bootstrap");
+            }
+            Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), &rpc)?;
+            if inner.is_detached()
+                || domain.retired.load(Ordering::Acquire)
+                || !domain.inner_is_current(&inner)
+                || !mux
+                    .get_domain(domain_id)
+                    .is_some_and(|current| current.same_registration(&cleanup.domain_registration))
+            {
+                bail!("client domain {domain_id} retired during initial render bootstrap");
+            }
+            Ok(())
+        })
+        .map_err(anyhow::Error::new)??;
+
+        let bootstrap_result: anyhow::Result<()> = async {
+            if let Some(request) = current_active_workspace_sync(&inner, mux) {
+                rpc.set_active_workspace(request)
+                    .await
+                    .context("synchronizing the initial active workspace")?;
+            }
+            inner
+                .client
+                .publish_rpc_transport_ready(&rpc, readiness_guard)
+                .await
+                .context("publishing initial mux RPC readiness")?;
+            // Only coherent topology plus committed readiness authorizes this
+            // client incarnation's internal reconnect loop. Before this cut,
+            // the GUI desired-state supervisor is the sole retry owner.
+            inner.client.authorize_domain_reconnect();
+            Ok(())
+        }
+        .await;
+        bootstrap_result?;
+        Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
+        Self::start_pane_push_tracking(&inner, rpc.clone());
+        Self::flush_pending_palettes(mux, &inner, rpc.clone());
+        Self::flush_pending_focus(&inner, rpc.clone());
+        Self::flush_bootstrap_resizes(mux, &inner);
+        domain.refresh_layout_snapshot(mux, &inner);
+        cleanup.disarm();
+
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl Domain for ClientDomain {
+    fn domain_id(&self) -> DomainId {
+        self.local_domain_id
+    }
+
+    fn domain_name(&self) -> &str {
+        self.config.name()
+    }
+
+    fn supports_floating_pane_spawn(&self) -> bool {
+        // A client-domain spawn is authoritative only on the remote mux. The
+        // current floating-pane PDUs move already-existing panes and do not
+        // combine spawn, source detachment, destination attachment, and tab
+        // retirement. Refuse before sending SpawnV2 until that transaction is
+        // represented by one remote operation.
+        false
+    }
+
+    async fn domain_label(&self) -> String {
+        self.label.to_string()
+    }
+
+    async fn spawn_pane(
+        &self,
+        mux: &Arc<Mux>,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+
+        self.ensure_mux_owner(mux)?;
+        let workspace = mux.active_workspace();
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .spawn_v2(SpawnV2 {
+                domain: SpawnTabDomain::DefaultDomain,
+                window_id: None,
+                size,
+                command,
+                command_dir,
+                workspace,
+            })
+            .await?;
+
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
+            .await?
+        {
+            bail!("client attachment retired while resolving spawned pane");
+        }
+        rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
+            let (_tab, pane, _window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            Ok(pane)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
+    /// Forward the request to the remote; we need to translate the local ids
+    /// to those that match the remote for the request, resync the changed
+    /// structure, and then translate the results back to local
+    async fn move_pane_to_new_tab(
+        &self,
+        mux: &Arc<Mux>,
+        pane_guard: &PaneOperationGuard,
+        window_id: Option<WindowId>,
+        workspace_for_new_window: Option<String>,
+    ) -> anyhow::Result<Option<MoveCommitReceipt>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+
+        self.ensure_mux_owner(mux)?;
+        anyhow::ensure!(
+            pane_guard.belongs_to(mux),
+            "move target belongs to another mux registration"
+        );
+        let remote_pane_id = Self::exact_remote_pane_id(pane_guard, &inner, "move target")?;
+
+        let remote_window_id = window_id
+            .and_then(|local_window| inner.remote_window_for_local_window(mux, local_window));
+        // Asking the server for a new window when the caller named an existing
+        // local window would silently open one; refuse instead.
+        if let (Some(local_window), None) = (window_id, remote_window_id) {
+            bail!("local window {local_window} shows no remote window of this domain");
+        }
+
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .move_pane_to_new_tab(codec::MovePaneToNewTab {
+                pane_id: remote_pane_id,
+                window_id: remote_window_id,
+                workspace_for_new_window,
+            })
+            .await?;
+
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
+            .await?
+        {
+            bail!("client attachment retired while moving pane");
+        }
+
+        rpc.commit_sync(RpcConsumerKind::MoveResolution, || {
+            let local_tab_id = inner.remote_to_local_tab_id(result.tab_id).ok_or_else(|| {
+                anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
+            })?;
+
+            let local_win_id = inner
+                .remote_to_local_window(result.window_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote window {} didn't resolve after resync",
+                        result.window_id
+                    )
+                })?;
+
+            let tab = mux
+                .get_tab(local_tab_id)
+                .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
+            let local_win_id = match window_id {
+                Some(requested) => {
+                    place_tab_in_requested_window(mux, &tab, requested);
+                    mux.window_containing_tab(local_tab_id)
+                        .unwrap_or(local_win_id)
+                }
+                None => local_win_id,
+            };
+
+            pane_guard.capture_move_receipt(tab, local_win_id).map(Some)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
+    async fn spawn(
+        &self,
+        mux: &Arc<Mux>,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        window: WindowId,
+    ) -> anyhow::Result<Arc<Tab>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+
+        self.ensure_mux_owner(mux)?;
+        let workspace = workspace_for_spawn_window(mux, window);
+
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .spawn_v2(SpawnV2 {
+                domain: SpawnTabDomain::DefaultDomain,
+                window_id: inner.remote_window_for_local_window(mux, window),
+                size,
+                command,
+                command_dir,
+                workspace,
+            })
+            .await?;
+        if !Self::sync_remote_topology(
+            Arc::clone(mux),
+            self,
+            Arc::clone(&inner),
+            &rpc,
+            Some(window),
+        )
+        .await?
+        {
+            bail!("client attachment retired while resolving spawned tab");
+        }
+        rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
+            let (tab, _pane, _window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            place_tab_in_requested_window(mux, &tab, window);
+            Ok(tab)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
+    async fn split_pane_spawned(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        split_request: SplitRequest,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        self.split_exact(mux, target, None, split_request, command, command_dir)
+            .await
+    }
+
+    async fn split_pane_moved(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        source: &PaneOperationGuard,
+        split_request: SplitRequest,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        self.split_exact(mux, target, Some(source), split_request, None, None)
+            .await
+    }
+
+    async fn attach(
+        &self,
+        mux: &Arc<Mux>,
+        owner_client_id: Option<Arc<ClientId>>,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        self.ensure_mux_owner(mux)?;
+        if self.state() == DomainState::Attached {
+            let inner = self.inner().ok_or_else(|| {
+                anyhow!("client attachment retired while coalescing an attach request")
+            })?;
+            let rpc = inner.client.rpc_scope();
+            ensure!(
+                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id).await?,
+                "client attachment retired while coalescing an attach request"
+            );
+            return Ok(());
+        }
+        // Claim after the attached topology-sync fast path, but before creating
+        // a transport. The Lua startup retry and reconnect watchdog can
+        // otherwise both observe Detached and each launch a proxy command while
+        // the first handshake is still in flight. A late claim in
+        // `finish_attach` fenced topology publication but leaked the losing SSH
+        // child and left two live connections to the same remote mux.
+        let _claim = self.claim_initial_attachment()?;
+
+        let domain_id = self.local_domain_id;
+        let config = self.config.clone();
+
+        let activity = mux::activity::Activity::new_for_mux(mux);
+        // A missing target window denotes a background attach (automatic
+        // supervisor or Lua startup/watchdog). It reuses one domain-owned
+        // prompt surface across retries rather than allocating an unbounded
+        // stream of delayed-close windows. Direct user opens carry a concrete
+        // window and retain a one-shot connection surface.
+        let (ui, background_ui) = self.initial_attachment_ui(window_id)?;
+        ui.title("FrankenTerm: Connecting...");
+
+        let attach_result = ui
+            .async_run_and_log_error({
+                let ui = ui.clone();
+                let mux = Arc::clone(mux);
+                async move {
+                    // Optional persistence has its own short budget. A stalled
+                    // store must not consume the transport/version/topology
+                    // bootstrap timeout or prevent ordinary attachment.
+                    self.prepare_layout_binding_for_attach(
+                        &mux,
+                        DOMAIN_BINDING_RESOLVER.get().copied(),
+                        promise::spawn::sleep(LAYOUT_BINDING_RESOLUTION_TIMEOUT),
+                    )
+                    .await?;
+                    let result = with_mux_rpc_bootstrap_timeout(async {
+                        let mut cloned_ui = ui.clone();
+                        let mux_owner = Arc::downgrade(&mux);
+                        let client = spawn_into_new_thread(move || match &config {
+                            ClientDomainConfig::Unix(unix) => {
+                                let initial = true;
+                                let no_auto_start = false;
+                                Client::new_unix_domain(
+                                    Some(domain_id),
+                                    unix,
+                                    initial,
+                                    &mut cloned_ui,
+                                    no_auto_start,
+                                    mux_owner,
+                                )
+                            }
+                            ClientDomainConfig::Tls(tls) => {
+                                Client::new_tls(domain_id, tls, &mut cloned_ui, mux_owner)
+                            }
+                            ClientDomainConfig::Ssh(ssh) => {
+                                Client::new_ssh(domain_id, ssh, &mut cloned_ui, mux_owner)
+                            }
+                        })
+                        .await?;
+
+                        ui.output_str("Checking server version\n");
+                        let rpc = client.bootstrap_rpc_scope();
+                        let mut abort_guard = rpc.abort_guard(
+                            "initial mux RPC bootstrap failed, timed out, or was cancelled",
+                        )?;
+                        let attach_result = async {
+                            client.verify_version_compat_with_scope(&ui, &rpc).await?;
+
+                            ui.output_str("Version check OK!  Requesting topology snapshot...\n");
+                            ClientDomain::finish_attach(
+                                &mux,
+                                domain_id,
+                                client,
+                                rpc,
+                                &abort_guard,
+                                InitialAttachmentRequest {
+                                    owner_client_id,
+                                    primary_window_id: window_id,
+                                },
+                            )
+                            .await
+                        }
+                        .await;
+                        if attach_result.is_ok() {
+                            abort_guard.disarm();
+                        }
+                        attach_result
+                    })
+                    .await;
+                    result
+                }
+            })
+            .await
+            .map_err(|e| {
+                log::error!("initial attachment failed for domain {domain_id}: {e:#}");
+                ui.output_str(&format!("Error during attach: {:#}\n", e));
+                e
+            });
+        if attach_result.is_ok() {
+            ui.output_str("Attached!\n");
+        }
+        drop(activity);
+        if background_ui {
+            if attach_result.is_ok() {
+                self.close_background_attachment_ui();
+            }
+        } else {
+            ui.close();
+        }
+        attach_result
+    }
+
+    fn detachable(&self) -> bool {
+        true
+    }
+
+    fn detach(&self) -> anyhow::Result<()> {
+        self.perform_detach();
+        Ok(())
+    }
+
+    fn state(&self) -> DomainState {
+        if lock_or_recover(&self.inner, "client_domain_inner").is_some() {
+            DomainState::Attached
+        } else {
+            DomainState::Detached
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MuxTestScope;
+    use asupersync::runtime::RuntimeBuilder;
+    use mux::tab::{PaneEntry, PaneNode};
+
+    fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build client-domain test runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn own_focus_echoes_never_move_local_focus() {
+        // The ft-ox00h sequence against a legacy server: attach focuses the
+        // server's active pane 0, layout restore then selects the saved pane 2,
+        // and the server echoes both, in order.
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(0, t0);
+        focus.advised(2, t0);
+        assert!(!focus.is_remote_change(0, t0), "stale echo of pane 0");
+        assert!(!focus.is_remote_change(2, t0), "echo of the restored pane");
+        // Another client focusing a pane is still applied.
+        assert!(focus.is_remote_change(5, t0));
+        // A later echo of a settled advisory is a genuine change again.
+        assert!(focus.is_remote_change(0, t0));
+    }
+
+    #[test]
+    fn a_newer_echo_settles_older_unechoed_advisories() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        // The server does not echo a focus it already had, so 1 never returns.
+        focus.advised(1, t0);
+        focus.advised(3, t0);
+        assert!(!focus.is_remote_change(3, t0));
+        assert!(
+            focus.is_remote_change(1, t0),
+            "pane 1's advisory was superseded, so a later focus there is remote"
+        );
+    }
+
+    #[test]
+    fn unechoed_focus_advisories_expire() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(4, t0);
+        let later = t0 + FocusAdvisories::ECHO_WINDOW;
+        assert!(focus.is_remote_change(4, later));
+        for pane in 0..(FocusAdvisories::MAX_IN_FLIGHT + 8) {
+            focus.advised(pane, t0);
+        }
+        assert_eq!(focus.in_flight.len(), FocusAdvisories::MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_v1_encoding_is_stable_across_process_and_compiler_restarts() {
+        let config = ClientDomainConfig::Ssh(SshDomain {
+            remote_address: "host:22".into(),
+            timeout: std::time::Duration::new(7, 9),
+            remote_wezterm_path: Some("/usr/bin/ft".into()),
+            ssh_backend: Some(config::SshBackend::LibSsh),
+            assume_shell: config::Shell::Posix,
+            ..SshDomain::default()
+        });
+        // Independently encoded little-endian lengths/integers and SHA-256.
+        // Rust's Hash/Debug/serde representations are not disk identity formats.
+        assert_eq!(
+            config.endpoint_fingerprint().as_bytes(),
+            [
+                0x78, 0xac, 0x1b, 0xd5, 0x1e, 0xef, 0x7a, 0x71, 0x9e, 0x57, 0xdc, 0xab, 0x97, 0xed,
+                0x61, 0x70, 0xc3, 0xa0, 0xa7, 0x19, 0xd8, 0xa5, 0x61, 0x67, 0x5d, 0xab, 0xbd, 0x20,
+                0xfd, 0x39, 0x3c, 0xc1,
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_fingerprint_preserves_ssh_identity_across_label_policy_and_map_order() {
+        let mut first = SshDomain {
+            name: "work".to_string(),
+            remote_address: "user@host:22".to_string(),
+            ..SshDomain::default()
+        };
+        first
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-a".into());
+        first
+            .ssh_option
+            .insert("StrictHostKeyChecking".into(), "yes".into());
+        let expected = ClientDomainConfig::Ssh(first.clone()).endpoint_fingerprint();
+        let mut renamed = first.clone();
+        renamed.name = "renamed work".to_string();
+        renamed.connect_automatically = true;
+        renamed.local_echo_threshold_ms = Some(10);
+        renamed.overlay_lag_indicator = true;
+        renamed.ssh_option.clear();
+        renamed
+            .ssh_option
+            .insert("StrictHostKeyChecking".into(), "yes".into());
+        renamed
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-a".into());
+        assert_eq!(
+            ClientDomainConfig::Ssh(renamed).endpoint_fingerprint(),
+            expected
+        );
+
+        for changed in [
+            SshDomain {
+                remote_address: "user@other:22".into(),
+                ..first.clone()
+            },
+            SshDomain {
+                username: Some("other-user".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                no_agent_auth: true,
+                ..first.clone()
+            },
+            SshDomain {
+                override_proxy_command: Some("different proxy".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                ssh_backend: Some(config::SshBackend::Ssh2),
+                ..first.clone()
+            },
+            SshDomain {
+                ssh_config_file: Some("/private/other-config".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                default_prog: Some(vec!["different".into()]),
+                ..first.clone()
+            },
+        ] {
+            assert_ne!(
+                ClientDomainConfig::Ssh(changed).endpoint_fingerprint(),
+                expected
+            );
+        }
+        first
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-b".into());
+        assert_ne!(
+            ClientDomainConfig::Ssh(first).endpoint_fingerprint(),
+            expected
+        );
+        assert!(!format!("{expected:?}").contains("private"));
+    }
+
+    #[test]
+    fn endpoint_fingerprint_frames_fields_and_preserves_exact_os_paths_and_timeouts() {
+        let base = UnixDomain {
+            socket_path: Some("/tmp/binding.sock".into()),
+            proxy_command: Some(vec!["a".into(), "bc".into()]),
+            read_timeout: std::time::Duration::new(1 << 54, 1),
+            ..UnixDomain::default()
+        };
+        let expected = ClientDomainConfig::Unix(base.clone()).endpoint_fingerprint();
+        let mut changed = base.clone();
+        changed.proxy_command = Some(vec!["ab".into(), "c".into()]);
+        assert_ne!(
+            ClientDomainConfig::Unix(changed).endpoint_fingerprint(),
+            expected
+        );
+        let mut changed = base;
+        changed.read_timeout = std::time::Duration::new(1 << 54, 2);
+        assert_ne!(
+            ClientDomainConfig::Unix(changed).endpoint_fingerprint(),
+            expected
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let path_a = std::ffi::OsString::from_vec(b"/tmp/\xff".to_vec());
+            let path_b = std::ffi::OsString::from_vec(b"/tmp/\xfe".to_vec());
+            assert_eq!(path_a.to_string_lossy(), path_b.to_string_lossy());
+            let a = ClientDomainConfig::Unix(UnixDomain {
+                socket_path: Some(path_a.into()),
+                ..UnixDomain::default()
+            });
+            let b = ClientDomainConfig::Unix(UnixDomain {
+                socket_path: Some(path_b.into()),
+                ..UnixDomain::default()
+            });
+            assert_ne!(a.endpoint_fingerprint(), b.endpoint_fingerprint());
+        }
+        let tls = TlsDomainClient {
+            remote_address: "host:1234".into(),
+            ..TlsDomainClient::default()
+        };
+        let expected = ClientDomainConfig::Tls(tls.clone()).endpoint_fingerprint();
+        let mut changed = tls.clone();
+        changed.accept_invalid_hostnames = true;
+        assert_ne!(
+            ClientDomainConfig::Tls(changed).endpoint_fingerprint(),
+            expected
+        );
+        let mut changed = tls;
+        changed.name = "another-credential-cache".into();
+        assert_ne!(
+            ClientDomainConfig::Tls(changed).endpoint_fingerprint(),
+            expected
+        );
+    }
+
+    #[test]
+    fn durable_layout_binding_requires_receipt_and_cancellation_or_retirement_cannot_publish() {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x42; 16])) })
+        }
+        fn reserved(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0; 16])) })
+        }
+        fn pending(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(std::future::pending())
+        }
+        fn delayed(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            let mut polled = false;
+            Box::pin(std::future::poll_fn(move |context| {
+                if std::mem::replace(&mut polled, true) {
+                    std::task::Poll::Ready(Ok(codec::DomainBindingId::from_bytes([0x43; 16])))
+                } else {
+                    context.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create domain");
+        let mut waiting = Box::pin(domain.resolve_layout_binding_with(pending));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(domain.durable_layout_binding(), None);
+        drop(waiting);
+        assert_eq!(domain.durable_layout_binding(), None);
+        let retiring = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create concurrently retired domain");
+        let mut late_receipt = Box::pin(retiring.resolve_layout_binding_with(delayed));
+        assert!(late_receipt.as_mut().poll(&mut context).is_pending());
+        retiring.retired.store(true, Ordering::Release);
+        assert!(matches!(
+            late_receipt.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(retiring.durable_layout_binding(), None);
+        let concurrent = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create concurrent receipt domain");
+        let mut conflicting = Box::pin(concurrent.resolve_layout_binding_with(delayed));
+        assert!(conflicting.as_mut().poll(&mut context).is_pending());
+        asupersync_block_on(concurrent.resolve_layout_binding_with(ready))
+            .expect("first committed receipt wins");
+        assert!(matches!(
+            conflicting.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(
+            concurrent
+                .durable_layout_binding()
+                .expect("preserve winner")
+                .binding_id
+                .as_bytes(),
+            [0x42; 16]
+        );
+        asupersync_block_on(async {
+            assert!(domain.resolve_layout_binding_with(reserved).await.is_err());
+            assert_eq!(domain.durable_layout_binding(), None);
+            domain
+                .resolve_layout_binding_with(ready)
+                .await
+                .expect("durable receipt");
+            let committed = domain.durable_layout_binding().expect("binding available");
+            assert_eq!(committed.binding_id.as_bytes(), [0x42; 16]);
+            domain
+                .resolve_layout_binding_with(reserved)
+                .await
+                .expect("reuse committed binding");
+            assert_eq!(domain.durable_layout_binding(), Some(committed));
+            domain.retired.store(true, Ordering::Release);
+            assert_eq!(domain.durable_layout_binding(), None);
+            assert!(domain.resolve_layout_binding_with(ready).await.is_err());
+        });
+    }
+
+    #[test]
+    fn pending_layout_binding_deadline_admits_transport_without_granting_durable_authority() {
+        fn pending(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(std::future::pending())
+        }
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x44; 16])) })
+        }
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain = Arc::new(
+            ClientDomain::new(
+                ClientDomainConfig::Unix(UnixDomain {
+                    name: "binding-deadline".into(),
+                    ..UnixDomain::default()
+                }),
+                &mux,
+            )
+            .expect("create exact domain"),
+        );
+        let registration: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registration)
+            .expect("register exact domain");
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let (expire, expiry) = futures::channel::oneshot::channel();
+        let transport_admitted = AtomicBool::new(false);
+        let mut preparation = Box::pin(async {
+            domain
+                .prepare_layout_binding_for_attach(&mux, Some(pending), async {
+                    expiry.await.expect("controlled storage deadline");
+                })
+                .await?;
+            transport_admitted.store(true, Ordering::Release);
+            anyhow::Result::<()>::Ok(())
+        });
+        assert!(preparation.as_mut().poll(&mut context).is_pending());
+        assert!(!transport_admitted.load(Ordering::Acquire));
+        expire.send(()).expect("expire optional storage only");
+        assert!(matches!(
+            preparation.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(preparation);
+        assert!(transport_admitted.load(Ordering::Acquire));
+        assert_eq!(domain.durable_layout_binding(), None);
+
+        // Always falling back would pass the pending case. A real receipt wins
+        // before its deadline and establishes a durable identity.
+        asupersync_block_on(domain.prepare_layout_binding_for_attach(
+            &mux,
+            Some(ready),
+            std::future::pending(),
+        ))
+        .expect("ready store permits normal admission");
+        assert_eq!(
+            domain
+                .durable_layout_binding()
+                .expect("durable receipt")
+                .binding_id
+                .as_bytes(),
+            [0x44; 16]
+        );
+        domain.retired.store(true, Ordering::Release);
+        assert!(
+            asupersync_block_on(domain.prepare_layout_binding_for_attach(
+                &mux,
+                Some(pending),
+                std::future::ready(()),
+            ))
+            .is_err(),
+            "fallback must not revive a retired registration"
+        );
+    }
+
+    #[test]
+    fn initial_attachment_claim_is_single_flight_before_transport_creation() {
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "single-flight-attach-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let domain = ClientDomain {
+            label: config.label(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
+            config,
+            inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: 91_020,
+            mux_owner: Weak::new(),
+            mux_subscriber_id: None,
+        };
+
+        let first = domain
+            .claim_initial_attachment()
+            .expect("first attach must reserve the transport-launch authority");
+        let second = match domain.claim_initial_attachment() {
+            Ok(_) => panic!("a concurrent attach must fail before launching a transport"),
+            Err(error) => error,
+        };
+        assert!(second
+            .to_string()
+            .contains("already has an attachment pending"));
+
+        drop(first);
+        domain
+            .claim_initial_attachment()
+            .expect("dropping the first transaction must release retry admission");
+    }
+
+    #[test]
+    fn headless_fallback_cannot_poison_background_prompt_reuse() {
+        let headless = ConnectionUI::new_headless();
+        assert!(headless.is_open());
+        assert!(!headless.is_interactive());
+        assert!(!ClientDomain::background_attachment_ui_is_reusable(
+            &headless
+        ));
+        headless.close();
+    }
+
+    #[test]
+    fn policy_reconciliation_updates_the_live_attachment_policy_in_place() {
+        let domain_id = 91_021;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "live-policy-reload-test".to_string(),
+            connect_automatically: false,
+            ..UnixDomain::default()
+        });
+        let domain = ClientDomain {
+            label: config.label(),
+            config: config.clone(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
+            inner: Mutex::new(None),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: domain_id,
+            mux_owner: Weak::new(),
+            mux_subscriber_id: None,
+        };
+
+        let mut enabled = config.clone();
+        let ClientDomainConfig::Unix(enabled) = &mut enabled else {
+            unreachable!("test config is unix")
+        };
+        enabled.connect_automatically = true;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled.clone(),)));
+        assert!(domain.connect_automatically());
+
+        enabled.connect_automatically = false;
+        assert!(domain.reconcile_configuration(&ClientDomainConfig::Unix(enabled.clone())));
+        assert!(!domain.connect_automatically());
+    }
+    #[test]
+    fn rejected_remote_workspace_update_deterministically_resyncs() {
+        let resyncs = Arc::new(AtomicUsize::new(0));
+        let resyncs_for_call = Arc::clone(&resyncs);
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let aborts_for_call = Arc::clone(&aborts);
+        asupersync_block_on(settle_remote_metadata_update(
+            "workspace update",
+            "window 77",
+            async { Err::<(), _>(anyhow!("planted remote rejection")) },
+            move || async move {
+                resyncs_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            move || {
+                aborts_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
+        .expect("a successful authoritative resync must converge the rejection");
+        assert_eq!(resyncs.load(Ordering::SeqCst), 1);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_remote_workspace_update_aborts_once_when_resync_fails() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let aborts_for_call = Arc::clone(&aborts);
+        let error = asupersync_block_on(settle_remote_metadata_update(
+            "workspace update",
+            "window 78",
+            async { Err::<(), _>(anyhow!("planted remote rejection")) },
+            || async { Err(anyhow!("planted resync failure")) },
+            move || {
+                aborts_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
+        .expect_err("failed authoritative convergence must abort its exact generation");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("planted remote rejection"));
+        assert!(rendered.contains("planted resync failure"));
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn remote_metadata_suppression_is_exact_and_nested() {
+        let inner = test_client_inner(91_001);
+        assert!(inner.should_forward_local_metadata());
+        let outer = inner
+            .begin_remote_metadata_application()
+            .expect("enter outer remote metadata application");
+        assert!(!inner.should_forward_local_metadata());
+        let nested = inner
+            .begin_remote_metadata_application()
+            .expect("enter nested remote metadata application");
+        assert!(!inner.should_forward_local_metadata());
+        drop(nested);
+        assert!(!inner.should_forward_local_metadata());
+        drop(outer);
+        assert!(inner.should_forward_local_metadata());
+    }
+
+    #[test]
+    fn remote_metadata_suppression_does_not_hide_another_threads_local_change() {
+        let inner = test_client_inner(91_002);
+        let guard = inner
+            .begin_remote_metadata_application()
+            .expect("enter remote metadata application");
+        let inner_for_thread = Arc::clone(&inner);
+        let visible_elsewhere =
+            std::thread::spawn(move || inner_for_thread.should_forward_local_metadata())
+                .join()
+                .expect("metadata visibility probe thread");
+        assert!(visible_elsewhere);
+        drop(guard);
+    }
+
+    fn test_client_id(name: &str, pid: u32) -> Arc<ClientId> {
+        Arc::new(ClientId {
+            hostname: format!("{name}.local"),
+            username: "testuser".to_string(),
+            pid,
+            epoch: 1000,
+            id: 0,
+            ssh_auth_sock: None,
+        })
+    }
+
+    #[test]
+    fn active_workspace_sync_request_only_targets_attached_owner_client() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let owner = test_client_id("owner", 41_001);
+        let other = test_client_id("other", 41_002);
+        mux.register_client(Arc::clone(&owner));
+        mux.register_client(Arc::clone(&other));
+        mux.set_active_workspace_for_client(&owner, "owner-workspace");
+        mux.set_active_workspace_for_client(&other, "other-workspace");
+
+        assert_eq!(
+            active_workspace_sync_request(Some(&owner), &owner, &mux),
+            Some(codec::SetActiveWorkspace {
+                workspace: "owner-workspace".to_string(),
+            })
+        );
+        assert_eq!(
+            active_workspace_sync_request(Some(&owner), &other, &mux),
+            None
+        );
+        let same_value_stale_owner = Arc::new((*owner).clone());
+        assert_eq!(
+            active_workspace_sync_request(Some(&same_value_stale_owner), &owner, &mux),
+            None,
+            "an equal-valued stale client Arc must not inherit replacement authority"
+        );
+        assert_eq!(active_workspace_sync_request(None, &owner, &mux), None);
+    }
+
+    #[test]
+    fn client_domain_subscriber_looks_up_its_domain_only_for_what_it_handles() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        // A domain id that resolves to something other than a ClientDomain
+        // makes the lookup observable: a subscriber that looks finds no
+        // ClientDomain there and asks to be dropped (false).
+        let local: Arc<dyn Domain> =
+            Arc::new(mux::domain::LocalDomain::new("not-a-client").expect("local domain"));
+        mux.add_domain(&local).expect("register local domain");
+        let owner = Arc::downgrade(&mux);
+        let id = local.domain_id();
+
+        let handled = vec![
+            MuxNotification::ActiveWorkspaceChanged(test_client_id("handled", 41_101)),
+            MuxNotification::WorkspaceRenamed {
+                old_workspace: "old".to_string(),
+                new_workspace: "new".to_string(),
+            },
+            MuxNotification::WindowWorkspaceChanged {
+                window_id: 1,
+                workspace: "w".to_string(),
+            },
+            MuxNotification::TabTitleChanged {
+                tab_id: 1,
+                title: "t".to_string(),
+            },
+            MuxNotification::WindowTitleChanged {
+                window_id: 1,
+                title: "t".to_string(),
+            },
+        ];
+        for notif in handled {
+            let name = format!("{:?}", notif);
+            assert!(client_domain_handles(&notif), "{}", name);
+            assert!(!mux_notify_client_domain(&owner, id, notif), "{}", name);
+        }
+
+        let ignored = vec![
+            MuxNotification::PaneOutput(1),
+            MuxNotification::Alert {
+                pane_id: 1,
+                alert: wezterm_term::Alert::Bell,
+            },
+            MuxNotification::PaneFocused(1),
+            MuxNotification::TabResized(1),
+            MuxNotification::Empty,
+        ];
+        for notif in ignored {
+            let name = format!("{:?}", notif);
+            assert!(!client_domain_handles(&notif), "{}", name);
+            assert!(mux_notify_client_domain(&owner, id, notif), "{}", name);
+        }
+
+        // An id not yet published keeps the subscriber either way.
+        let unpublished = alloc_domain_id();
+        assert!(mux_notify_client_domain(
+            &owner,
+            unpublished,
+            MuxNotification::TabResized(1)
+        ));
+        assert!(mux_notify_client_domain(
+            &owner,
+            unpublished,
+            MuxNotification::TabTitleChanged {
+                tab_id: 1,
+                title: "t".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn active_workspace_sync_request_tracks_renamed_owner_workspace() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let owner = test_client_id("owner", 41_003);
+        mux.register_client(Arc::clone(&owner));
+        mux.set_active_workspace_for_client(&owner, "old-workspace");
+        mux.rename_workspace("old-workspace", "renamed-workspace")
+            .expect("rename active workspace");
+
+        assert_eq!(
+            active_workspace_sync_request(Some(&owner), &owner, &mux),
+            Some(codec::SetActiveWorkspace {
+                workspace: "renamed-workspace".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn spawn_workspace_prefers_target_window_over_active_workspace() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let owner = test_client_id("owner", 41_004);
+        mux.register_client(Arc::clone(&owner));
+        mux.replace_identity(Some(owner));
+        mux.set_active_workspace("active-workspace");
+
+        let target_window_id = *mux.new_empty_window(Some("target-workspace".to_string()), None);
+
+        assert_eq!(
+            workspace_for_spawn_window(&mux, target_window_id),
+            "target-workspace"
+        );
+        assert_eq!(
+            workspace_for_spawn_window(&mux, usize::MAX),
+            "active-workspace"
+        );
+    }
+
+    fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
+        let unix = UnixDomain {
+            name: "test-client-domain".to_string(),
+            ..UnixDomain::default()
+        };
+        Arc::new(ClientInner::new(
+            local_domain_id,
+            Client::new_test_client(Some(local_domain_id), ClientDomainConfig::Unix(unix)),
+            None,
+            None,
+            false,
+        ))
+    }
+
+    #[test]
+    fn window_title_burst_is_single_flight_and_preserves_inflight_updates() {
+        let inner = test_client_inner(91_020);
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+        assert!(inner.queue_window_title(99).is_none());
+        let (remote, pending) = inner.queue_window_title(17).expect("first title update");
+        assert_eq!(remote, 70);
+        for _ in 0..40_000 {
+            assert!(inner.queue_window_title(17).is_none());
+        }
+        assert_eq!(
+            lock_or_recover(&inner.pending_window_titles, "test pending titles").len(),
+            1
+        );
+
+        pending.begin_update();
+        let writer = Arc::clone(&inner);
+        std::thread::spawn(move || assert!(writer.queue_window_title(17).is_none()))
+            .join()
+            .expect("inflight title writer");
+        assert!(
+            !pending.finish_if_clean(),
+            "an update during the RPC requires another pass"
+        );
+        pending.begin_update();
+        assert!(pending.finish_if_clean());
+
+        let (_, successor) = inner
+            .queue_window_title(17)
+            .expect("update after completion");
+        drop(pending);
+        assert!(
+            inner.queue_window_title(17).is_none(),
+            "old completion must not erase its successor"
+        );
+        drop(successor);
+        assert!(lock_or_recover(&inner.pending_window_titles, "test pending titles").is_empty());
+        assert!(
+            inner.queue_window_title(17).is_some(),
+            "cancelled work must release admission"
+        );
+    }
+
+    #[test]
+    fn window_title_remap_does_not_coalesce_into_work_for_the_previous_destination() {
+        let inner = test_client_inner(91_022);
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+        let (_, obsolete) = inner.queue_window_title(17).unwrap();
+        lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(80, 17);
+        let (remote, current) = inner
+            .queue_window_title(17)
+            .expect("remapped window requires its own title propagation");
+        assert_eq!(remote, 80);
+        drop(obsolete);
+        assert!(inner.queue_window_title(17).is_none());
+        current.begin_update();
+        assert!(current.finish_if_clean());
+        assert!(lock_or_recover(&inner.pending_window_titles, "test pending titles").is_empty());
+    }
+
+    #[test]
+    fn window_title_coalescing_is_scoped_to_the_exact_attachment_and_window() {
+        let old = test_client_inner(91_021);
+        let replacement = test_client_inner(91_021);
+        for inner in [&old, &replacement] {
+            lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(70, 17);
+            lock_or_recover(&inner.remote_to_local_window, "test window mapping").insert(80, 18);
+        }
+        let (_, old_ticket) = old.queue_window_title(17).unwrap();
+        let (_, current_ticket) = replacement.queue_window_title(17).unwrap();
+        let (remote, other_window) = replacement.queue_window_title(18).unwrap();
+        assert_eq!(remote, 80);
+        drop(old_ticket);
+        assert!(replacement.queue_window_title(17).is_none());
+        drop(current_ticket);
+        assert!(replacement.queue_window_title(17).is_some());
+        assert!(replacement.queue_window_title(18).is_none());
+        drop(other_window);
+    }
+
+    #[test]
+    fn rejected_workspace_rename_restores_only_unchanged_owner_workspace() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let owner = test_client_id("rename-owner", 41_005);
+        mux.register_client(Arc::clone(&owner));
+        mux.set_active_workspace_for_client(&owner, "renamed-workspace");
+
+        let unix = UnixDomain {
+            name: "rename-client-domain".to_string(),
+            ..UnixDomain::default()
+        };
+        let inner = Arc::new(ClientInner::new(
+            91_003,
+            Client::new_test_client(Some(91_003), ClientDomainConfig::Unix(unix)),
+            Some(Arc::clone(&owner)),
+            None,
+            false,
+        ));
+        let forwarding_states = Arc::new(Mutex::new(Vec::new()));
+        let forwarding_states_for_subscriber = Arc::clone(&forwarding_states);
+        let inner_for_subscriber = Arc::clone(&inner);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::ActiveWorkspaceChanged(_)) {
+                forwarding_states_for_subscriber
+                    .lock()
+                    .expect("forwarding-state observation lock")
+                    .push(inner_for_subscriber.should_forward_local_metadata());
+            }
+            true
+        })
+        .expect("subscribe to rejected rename reconciliation");
+
+        reconcile_rejected_workspace_rename(&mux, &inner, "old-workspace", "renamed-workspace")
+            .expect("restore rejected owner workspace");
+        assert_eq!(mux.active_workspace_for_client(&owner), "old-workspace");
+        assert_eq!(
+            forwarding_states
+                .lock()
+                .expect("forwarding states after rollback")
+                .as_slice(),
+            &[false],
+            "authoritative rollback notification must not echo to the rejecting server"
+        );
+
+        mux.set_active_workspace_for_client(&owner, "intervening-local-workspace");
+        reconcile_rejected_workspace_rename(&mux, &inner, "old-workspace", "renamed-workspace")
+            .expect("intervening selection is a successful no-op");
+        assert_eq!(
+            mux.active_workspace_for_client(&owner),
+            "intervening-local-workspace"
+        );
+        assert_eq!(
+            forwarding_states
+                .lock()
+                .expect("forwarding states after intervening selection")
+                .as_slice(),
+            &[false, true],
+            "compare-and-set reconciliation must not overwrite or re-notify an intervening choice"
+        );
+    }
+
+    #[test]
+    fn exact_id_reverse_lookup_work_is_q_linear_at_large_tab_counts() {
+        for count in [1_024usize, 4_096, 16_384] {
+            let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+            for remote in 0..count {
+                assert_eq!(mappings.insert(remote, count + remote), None);
+            }
+            for local in count..count.saturating_mul(2) {
+                assert_eq!(mappings.get_remote(&local), Some(&(local - count)));
+            }
+            assert_eq!(
+                mappings.reverse_lookup_probes(),
+                count,
+                "one reverse lookup must perform one indexed probe regardless of map size",
+            );
+            eprintln!(
+                "client_reverse_mapping_work tab_count={count} lookups={count} hash_probes={}",
+                mappings.reverse_lookup_probes(),
+            );
+        }
+    }
+
+    #[test]
+    fn exact_id_mapping_reassignment_preserves_one_to_one_reverse_authority() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.extend([(1, 101), (2, 102)]);
+
+        assert_eq!(mappings.insert(1, 103), Some(101));
+        assert_eq!(mappings.get(&1), Some(&103));
+        assert_eq!(mappings.get_remote(&101), None);
+        assert_eq!(mappings.get_remote(&103), Some(&1));
+
+        assert_eq!(mappings.insert(3, 102), None);
+        assert_eq!(mappings.get(&2), None);
+        assert_eq!(mappings.get(&3), Some(&102));
+        assert_eq!(mappings.get_remote(&102), Some(&3));
+
+        mappings.retain(|remote, _local| *remote != 1);
+        assert_eq!(mappings.get(&1), None);
+        assert_eq!(mappings.get_remote(&103), None);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings.remove(&3), Some(102));
+        assert_eq!(mappings.get_remote(&102), None);
+        assert!(mappings.is_empty());
+    }
+
+    #[test]
+    fn exact_id_idempotent_insert_repairs_a_torn_forward_alias() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.insert(1, 101);
+        mappings.insert_forward_alias_for_test(2, 101);
+
+        assert_eq!(mappings.insert(2, 101), Some(101));
+        assert_eq!(mappings.get(&1), None);
+        assert_eq!(mappings.get(&2), Some(&101));
+        assert_eq!(mappings.get_remote(&101), Some(&2));
+        assert_eq!(mappings.len(), 1);
+    }
+
+    #[test]
+    fn exact_id_retain_predicate_panic_leaves_bijection_unchanged() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.extend([(1, 101), (2, 102), (3, 103)]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mappings.retain(|remote, _local| {
+                assert_ne!(*remote, 2, "injected retain predicate panic");
+                *remote != 1
+            });
+        }));
+        assert!(result.is_err());
+        for remote in 1..=3 {
+            let local = 100 + remote;
+            assert_eq!(mappings.get(&remote), Some(&local));
+            assert_eq!(mappings.get_remote(&local), Some(&remote));
+        }
+        assert_eq!(mappings.len(), 3);
+    }
+
+    #[test]
+    fn ready_connection_asks_about_every_pane_four_at_a_time() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_041), config);
+        let inner = Arc::new(ClientInner::new(91_041, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        // The pass asks by remote pane id. None of these panes is ever painted.
+        for index in 0..50 {
+            lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+                .insert(10_000 + index, 20_000 + index);
+        }
+
+        peer.replace_ready_generation(&inner.client, codec::LEGACY46_CODEC_VERSION)
+            .unwrap();
+        ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+        pump();
+        assert!(
+            peer.is_empty(),
+            "a codec 46 attachment of 50 panes is not asked about panes that are not painted"
+        );
+
+        // The initial attachment, then a reconnect: the new server session
+        // tracks nothing until it is asked again.
+        for _ in 0..2 {
+            peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                .unwrap();
+            ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+            assert!(
+                peer.is_empty(),
+                "starting the pass must enqueue one worker, not one task per pane"
+            );
+            pump();
+            let mut asked = HashSet::new();
+            for _ in 0..50 {
+                assert!(
+                    (1..=4).contains(&peer.queued_len()),
+                    "at most four requests may be outstanding: {}",
+                    peer.queued_len()
+                );
+                let request =
+                    promise::spawn::block_on(peer.respond_next_registration_request()).unwrap();
+                let codec::Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }) =
+                    request
+                else {
+                    panic!("the pass sends only pane polls, got {:?}", request);
+                };
+                assert!(
+                    asked.insert(pane_id),
+                    "pane {} was asked about twice",
+                    pane_id
+                );
+                pump();
+            }
+            assert_eq!(asked, (10_000..10_050).collect());
+            assert!(peer.is_empty());
+        }
+    }
+
+    /// ft-zxm86: the operator's codec 46 hosts hold 2 to 10 panes. A tab never
+    /// shown after a GUI relaunch kept its attach-time title because a codec
+    /// 46 server was never asked about its panes. A small codec 46 attachment
+    /// is now asked about every pane, four at a time, as a current one is.
+    #[test]
+    fn a_small_codec_46_attachment_asks_about_every_pane() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_042), config);
+        let inner = Arc::new(ClientInner::new(91_042, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        for index in 0..10 {
+            lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+                .insert(30_000 + index, 40_000 + index);
+        }
+        assert_eq!(inner.attached_pane_count(), 10);
+
+        peer.replace_ready_generation(&inner.client, codec::LEGACY46_CODEC_VERSION)
+            .unwrap();
+        ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+        pump();
+        let mut asked = HashSet::new();
+        for _ in 0..10 {
+            assert!(
+                (1..=4).contains(&peer.queued_len()),
+                "at most four requests may be outstanding: {}",
+                peer.queued_len()
+            );
+            let request =
+                promise::spawn::block_on(peer.respond_next_registration_request()).unwrap();
+            let codec::Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }) = request
+            else {
+                panic!("the pass sends only pane polls, got {:?}", request);
+            };
+            assert!(
+                asked.insert(pane_id),
+                "pane {} was asked about twice",
+                pane_id
+            );
+            pump();
+        }
+        assert_eq!(asked, (30_000..30_010).collect());
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn background_user_variable_hydration_covers_large_population_and_reconnection_with_four_slots()
+    {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_038), config);
+        let inner = Arc::new(ClientInner::new(91_038, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        for index in 0..600 {
+            let remote = 10_000 + index;
+            let local = 20_000 + index;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            // Pane registration independently sends the initial palette and
+            // the pane's bootstrap poll. Drain that setup one pane at a time
+            // before measuring census traffic.
+            let requests = peer.answer_pane_registration(&pump);
+            assert!(requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))));
+        }
+        assert!(peer.is_empty());
+        for reconnect in [false, true] {
+            if reconnect {
+                peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                    .unwrap();
+            }
+            let rpc = inner.client.rpc_scope();
+            let first = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            let coalesced = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            assert!(
+                rpc.is_ready(),
+                "background hydration must not revoke attachment readiness"
+            );
+            assert!(
+                first.try_recv().is_err(),
+                "the completion receipt must await the census"
+            );
+            assert!(
+                peer.is_empty(),
+                "starting a census must enqueue one worker, not one task per pane"
+            );
+            pump();
+            assert_eq!(peer.queued_len(), 4);
+            let mut observed = HashSet::new();
+            for _ in 0..600 {
+                assert!(
+                    peer.queued_len() <= 4,
+                    "census RPC concurrency must stay bounded as population grows"
+                );
+                let pane_id = promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new(),
+                    },
+                ))
+                .unwrap();
+                assert!(
+                    observed.insert(pane_id),
+                    "coalescing before worker start must not repeat initial snapshots"
+                );
+                pump();
+            }
+            assert_eq!(observed, (10_000..10_600).collect());
+            first.try_recv().unwrap().unwrap();
+            coalesced.try_recv().unwrap().unwrap();
+            assert!(peer.is_empty());
+            assert!(!lock_or_recover(&inner.user_var_hydration, "test metadata worker").running);
+            for _ in 0..1000 {
+                ClientDomain::request_pane_user_var_hydration(
+                    Arc::clone(&mux),
+                    Arc::clone(&inner),
+                    rpc.clone(),
+                    10_023,
+                )
+                .unwrap();
+            }
+            pump();
+            assert_eq!(
+                peer.queued_len(),
+                1,
+                "a burst of new keys in one pane must not rescan the other 599 panes"
+            );
+            assert_eq!(
+                promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new()
+                    },
+                ))
+                .unwrap(),
+                10_023
+            );
+            pump();
+            assert!(peer.is_empty());
+        }
+    }
+
+    /// ft-ypblq: a pane printing continuously can keep its user-variable
+    /// snapshot busy through every attempt. It is asked again on the next
+    /// pass; the other panes are not failed with it, nor asked again.
+    #[test]
+    fn busy_user_variable_snapshot_is_asked_again_without_failing_the_census() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_040), config);
+        let inner = Arc::new(ClientInner::new(91_040, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        let (flooding, quiet) = (10_000, 10_001);
+        for remote in [flooding, quiet] {
+            let local = remote + 10_000;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            peer.answer_pane_registration(&pump);
+        }
+        assert!(peer.is_empty());
+        let rpc = inner.client.rpc_scope();
+        let census =
+            ClientDomain::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&inner), rpc)
+                .unwrap();
+        // The backoff sleeps are real: one pass of 8 attempts takes ~5 s.
+        let next_request = || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while peer.is_empty() {
+                assert!(Instant::now() < deadline, "no user-variable request");
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The flooding pane is refused for one full pass of 8 attempts, then
+        // answered on the next pass.
+        let mut flooding_asks = 0;
+        let mut quiet_asks = 0;
+        while flooding_asks < 9 {
+            next_request();
+            let refuse = flooding_asks < 8;
+            let (pane, _) = promise::spawn::block_on(
+                peer.answer_next_user_vars(move |pane| refuse && pane == flooding),
+            )
+            .unwrap();
+            if pane == flooding {
+                flooding_asks += 1;
+            } else {
+                assert_eq!(pane, quiet);
+                quiet_asks += 1;
+            }
+            pump();
+            if flooding_asks < 9 {
+                assert!(
+                    census.try_recv().is_err(),
+                    "the census waits for every pane, and a busy one does not fail it"
+                );
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_or_recover(&inner.user_var_hydration, "test metadata worker").running {
+            assert!(Instant::now() < deadline, "census did not complete");
+            pump();
+        }
+        assert_eq!(quiet_asks, 1, "the quiet pane is not asked again");
+        census.try_recv().unwrap().unwrap();
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn user_variable_refresh_targets_coalesce_and_overflow_to_one_complete_census() {
+        let mut state = UserVarHydrationState::default();
+        for pane in 0..4096 {
+            state.request(Some(pane));
+        }
+        state.request(Some(0));
+        assert_eq!(state.pending_panes.len(), 4096);
+        assert!(!state.census_requested);
+        state.request(Some(4096));
+        assert!(state.census_requested);
+        assert!(
+            state.pending_panes.is_empty(),
+            "overflow must retain a full census obligation without an unbounded ID set"
+        );
+        state.request(Some(4097));
+        assert!(
+            state.pending_panes.is_empty(),
+            "a pending census subsumes later targeted requests"
+        );
+        state.census_requested = false;
+        state.request(Some(3));
+        state.request(None);
+        assert!(state.census_requested);
+        assert!(state.pending_panes.is_empty());
+    }
+
+    #[test]
+    fn user_variable_hydration_skips_old_codecs_and_only_retries_typed_safe_rejections() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(91_039),
+            ClientDomainConfig::Unix(UnixDomain::default()),
+        );
+        peer.replace_ready_generation(&client, codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION - 1)
+            .unwrap();
+        let inner = Arc::new(ClientInner::new(91_039, client, None, None, false));
+        ClientDomain::request_user_var_hydration(
+            Arc::clone(&mux),
+            Arc::clone(&inner),
+            inner.client.rpc_scope(),
+        )
+        .unwrap()
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        assert!(
+            peer.is_empty(),
+            "older codecs must never receive the additive metadata PDU"
+        );
+        let rejection = |response: codec::ErrorResponse| {
+            crate::client::remote_rejection_error(
+                "get_pane_user_vars_v1",
+                codec::GetPaneUserVarsV1::IDENT,
+                &response,
+            )
+        };
+        assert!(user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::invalid_request(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::ListPanes::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&anyhow!(
+            "unclassified transport failure"
+        )));
+    }
+
+    /// A registered domain with a durable layout binding whose attachment has
+    /// published no layout receipt, so typed input is fenced on its restore.
+    fn layout_fenced_test_domain(
+        mux: &Arc<Mux>,
+        local_domain_id: DomainId,
+    ) -> (Arc<ClientInner>, Arc<ClientDomain>) {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x45; 16])) })
+        }
+        let inner = test_client_inner(local_domain_id);
+        let domain = register_test_client_domain(mux, &inner);
+        asupersync_block_on(domain.resolve_layout_binding_with(ready))
+            .expect("durable layout binding");
+        assert!(
+            domain.layout_restore_pending(),
+            "an unpublished restore fences typed input"
+        );
+        (inner, domain)
+    }
+
+    /// GitHub #132: a refresh that could not publish a layout receipt (here the
+    /// attachment has no topology session) left the restore pending for good,
+    /// so the GUI dropped every key typed into the domain's panes.
+    #[test]
+    fn layout_refresh_that_cannot_publish_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_101);
+
+        assert!(matches!(
+            domain.publish_layout_snapshot(&mux, &inner),
+            Ok(LayoutPublication::Unavailable(_))
+        ));
+        assert!(domain.layout_restore_pending());
+        domain.refresh_layout_snapshot(&mux, &inner);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
+    }
+
+    /// GitHub #132: a topology resync withdraws the layout receipt before it
+    /// applies the topology, and used to republish it only on full success. Any
+    /// exit in between must end the restore instead of fencing input forever.
+    #[test]
+    fn topology_resync_that_exits_before_republishing_ends_the_input_fence() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = layout_fenced_test_domain(&mux, 91_102);
+
+        // An exit before the withdrawal, or after the caller republished,
+        // leaves the restore state alone.
+        drop(LayoutRestoreSettlement::new(&domain, &inner));
+        let republished = LayoutRestoreSettlement::new(&domain, &inner);
+        republished.receipt_withdrawn();
+        republished.disarm();
+        assert!(!inner.layout_failed.load(Ordering::Acquire));
+        assert!(domain.layout_restore_pending());
+
+        let interrupted = LayoutRestoreSettlement::new(&domain, &inner);
+        interrupted.receipt_withdrawn();
+        drop(interrupted);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
+    }
+
+    fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
+        ClientDomain::register_attached_for_test(mux, inner)
+    }
+
+    #[test]
+    fn cancelled_reconnect_holds_exact_domain_guard_until_future_drop() {
+        asupersync_block_on(async {
+            let scope = MuxTestScope::enter();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let domain_id = 91_019;
+            let config = ClientDomainConfig::Unix(UnixDomain {
+                name: "cancelled-reconnect-guard".to_string(),
+                ..UnixDomain::default()
+            });
+            let (client, peer) =
+                Client::new_test_client_with_rpc_peer(Some(domain_id), config.clone());
+            peer.activate_reconnect_generation(&client)
+                .expect("test reconnect must own a fresh negotiating RPC generation");
+            let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+            let domain = Arc::new(ClientDomain {
+                label: config.label(),
+                policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+                durable_binding: Mutex::new(None),
+                config,
+                inner: Mutex::new(Some(Arc::clone(&inner))),
+                background_attachment_ui: Mutex::new(None),
+                initial_attachment_pending: AtomicBool::new(false),
+                retired: AtomicBool::new(false),
+                local_domain_id: domain_id,
+                mux_owner: Arc::downgrade(&mux),
+                mux_subscriber_id: None,
+            });
+            let registered: Arc<dyn Domain> = domain.clone();
+            mux.add_domain(&registered)
+                .expect("reconnect domain should register");
+            let domain_guard = mux
+                .get_domain(domain_id)
+                .expect("reconnect should acquire the exact domain generation");
+            let rpc = inner.client.bootstrap_rpc_scope();
+            let weak_domain = Arc::downgrade(&domain);
+            let mux_for_reconnect = Arc::clone(&mux);
+            let mut reconnect = Box::pin(async move {
+                ClientDomain::reattach_if_current(
+                    mux_for_reconnect,
+                    &domain_guard,
+                    inner,
+                    rpc,
+                    ConnectionUI::new_headless(),
+                )
+                .await
+            });
+
+            use std::future::Future as _;
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(reconnect.as_mut().poll(context))
+            })
+            .await;
+            assert!(
+                matches!(&first_poll, std::task::Poll::Pending),
+                "the reconnect must park with its exact guard around an in-flight bootstrap RPC; \
+                 first poll returned {:?}",
+                first_poll
+            );
+            assert!(
+                !peer.is_empty(),
+                "the reconnect barrier must be a real queued bootstrap RPC"
+            );
+
+            assert!(mux.domain_was_detached_if_same(&registered));
+            drop(registered);
+            drop(domain);
+            assert!(
+                weak_domain.upgrade().is_some(),
+                "retirement must not run the domain destructor while reconnect holds its guard"
+            );
+
+            let successor_inner = test_client_inner(domain_id);
+            let successor_config = ClientDomainConfig::Unix(UnixDomain {
+                name: "cancelled-reconnect-successor".to_string(),
+                ..UnixDomain::default()
+            });
+            let successor: Arc<dyn Domain> = Arc::new(ClientDomain {
+                label: successor_config.label(),
+                policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(
+                    &successor_config,
+                )),
+                durable_binding: Mutex::new(None),
+                config: successor_config,
+                inner: Mutex::new(Some(successor_inner)),
+                background_attachment_ui: Mutex::new(None),
+                initial_attachment_pending: AtomicBool::new(false),
+                retired: AtomicBool::new(false),
+                local_domain_id: domain_id,
+                mux_owner: Arc::downgrade(&mux),
+                mux_subscriber_id: None,
+            });
+            assert!(
+                matches!(
+                    mux.add_domain(&successor),
+                    Err(mux::DomainRegistrationError::RetiredIdentifier { .. })
+                ),
+                "same-ID replacement must stay fenced while reconnect is pending"
+            );
+
+            drop(reconnect);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match mux.add_domain(&successor) {
+                    Ok(()) => break,
+                    Err(mux::DomainRegistrationError::RetiredIdentifier { .. }) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "cancelled reconnect did not release its exact retirement fence"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("unexpected successor registration failure: {}", error),
+                }
+            }
+            assert!(
+                weak_domain.upgrade().is_none(),
+                "cancelling reconnect must let the retirement worker dispose the old domain"
+            );
+            assert!(
+                mux.get_domain(domain_id)
+                    .is_some_and(|current| current.is_same_domain(&successor)),
+                "the successor must become the exact current registration after cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_attachment_cannot_detach_a_same_domain_replacement() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "exact-detach-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let domain = Arc::new(
+            ClientDomain::new(config, &mux).expect("client domain should allocate its subscriber"),
+        );
+        let registered: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered)
+            .expect("client domain should register");
+
+        let stale = test_client_inner(domain.local_domain_id);
+        let replacement = test_client_inner(domain.local_domain_id);
+        *lock_or_recover(&domain.inner, "client_domain_inner") = Some(Arc::clone(&replacement));
+
+        assert!(
+            !domain.perform_detach_if_current(&stale),
+            "an old reader must not detach a replacement ClientInner",
+        );
+        assert!(domain.inner_is_current(&replacement));
+        assert!(!replacement.is_detached());
+        assert!(
+            mux.get_domain(domain.local_domain_id)
+                .is_some_and(|current| current.is_same_domain(&registered)),
+            "rejected stale teardown must preserve the exact domain registration",
+        );
+
+        assert!(
+            domain.perform_detach_if_current(&replacement),
+            "the exact current attachment must remain detachable",
+        );
+        assert!(domain.inner().is_none());
+        assert_eq!(
+            domain.state(),
+            DomainState::Detached,
+            "exact transport retirement must make desired-state health truthful"
+        );
+        assert!(replacement.is_detached());
+        assert!(mux.get_domain(domain.local_domain_id).is_none());
+    }
+
+    fn sample_remote_tab_listing() -> ListPanesResponse {
+        ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(PaneEntry {
+                window_id: 41,
+                tab_id: 51,
+                pane_id: 61,
+                title: "remote shell".to_string(),
+                size: TerminalSize {
+                    cols: 120,
+                    rows: 40,
+                    pixel_width: 1200,
+                    pixel_height: 800,
+                    dpi: 96,
+                },
+                working_dir: None,
+                alt_screen_active: true,
+                is_active_pane: true,
+                is_zoomed_pane: false,
+                workspace: "ops".to_string(),
+                cursor_pos: mux::renderable::StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: None,
+            })],
+            tab_titles: vec!["remote tab".to_string()],
+            window_titles: HashMap::from([(41, "ops window".to_string())]),
+            floating_panes: Vec::new(),
+        }
+    }
+
+    fn sample_remote_tab_listing_with_float() -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        let mut pane = template;
+        pane.pane_id = 62;
+        pane.title = "remote floating shell".to_string();
+        pane.size = TerminalSize {
+            cols: 20,
+            rows: 8,
+            pixel_width: 200,
+            pixel_height: 160,
+            dpi: 96,
+        };
+        pane.alt_screen_active = false;
+        pane.is_active_pane = false;
+        pane.is_zoomed_pane = false;
+        pane.left_col = 4;
+        pane.top_row = 3;
+        listing
+            .floating_panes
+            .push(codec::FloatingPaneSnapshotEntry {
+                pane,
+                rect: mux::tab::FloatingPaneRect {
+                    left: 4,
+                    top: 3,
+                    width: 20,
+                    height: 8,
+                },
+                z_order: 7,
+                visible: true,
+                pinned: true,
+                opacity: 0.75,
+                focused: false,
+            });
+        listing
+    }
+
+    fn sample_remote_pane_arena(tab_and_pane_ids: &[(TabId, PaneId)]) -> PaneArena {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing
+            .tabs
+            .pop()
+            .expect("sample listing must contain one leaf")
+        else {
+            panic!("sample listing root must be a leaf");
+        };
+        listing.tab_titles.clear();
+        for &(tab_id, pane_id) in tab_and_pane_ids {
+            let mut entry = template.clone();
+            entry.tab_id = tab_id;
+            entry.pane_id = pane_id;
+            entry.title = format!("remote shell {pane_id}");
+            listing.tabs.push(PaneNode::Leaf(entry));
+            listing.tab_titles.push(format!("remote tab {tab_id}"));
+        }
+        codec::ordered_pane_arena_from_list_panes(listing)
+            .expect("sample listing must flatten into a canonical pane arena")
+    }
+
+    fn remote_tab_order(mux: &Mux, inner: &ClientInner, local_window_id: WindowId) -> Vec<TabId> {
+        mux.window_order_snapshot(local_window_id)
+            .expect("local window order must be valid")
+            .expect("local window must exist")
+            .ordered_tab_ids()
+            .map(|local_tab_id| {
+                inner
+                    .local_to_remote_tab(local_tab_id)
+                    .expect("every ordered test tab must have a remote identity")
+            })
+            .collect()
+    }
+
+    fn client_remote_pane_id(pane: &Arc<dyn Pane>) -> PaneId {
+        pane.downcast_ref::<ClientPane>()
+            .expect("ordered test pane must be a ClientPane")
+            .remote_pane_id()
+    }
+
+    #[test]
+    fn pane_arena_publication_rollback_removes_emptied_published_windows() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("rollback fixture tab must register");
+        let inner = test_client_inner(70_001);
+        let pane: Arc<dyn Pane> = Arc::new(
+            ClientPane::new(
+                &inner,
+                70_002,
+                51,
+                61,
+                TerminalSize::default(),
+                "rollback pane",
+                false,
+            )
+            .unwrap(),
+        );
+        mux.add_pane(&pane)
+            .expect("rollback fixture pane must register");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("rollback fixture must retain exact pane registration authority");
+        tab.assign_pane(&pane);
+        let window_builder = mux.new_empty_window(Some("rollback".to_string()), None);
+        let window_id = *window_builder;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("rollback fixture tab must attach to provisional window");
+
+        let mut publication = PaneArenaPublicationRollback::new(&mux);
+        publication.pane_registrations.push(registration);
+        publication.new_tabs.push(Arc::clone(&tab));
+        publication.new_windows.push(window_builder);
+        drop(publication);
+
+        assert!(
+            mux.get_window(window_id).is_none(),
+            "compensating rollback must remove the already-published window it emptied"
+        );
+        assert!(
+            mux.get_tab(tab.tab_id()).is_none(),
+            "rollback must remove the exact staged tab registration"
+        );
+        assert!(
+            mux.get_pane(pane.pane_id()).is_none(),
+            "rollback must detach the populated local pane mirror"
+        );
+        assert!(mux.iter_windows().is_empty());
+    }
+
+    #[test]
+    fn direct_pane_arena_application_preserves_forward_tab_order() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_005);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61), (52, 62), (53, 63)]),
+            None,
+        )
+        .expect("direct flat arena application should attach in descriptor order");
+
+        let local_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        assert_eq!(
+            remote_tab_order(&mux, &inner, local_window_id),
+            vec![51, 52, 53]
+        );
+        assert_eq!(mux.iter_panes().len(), 3);
+        assert_eq!(mux.iter_windows().len(), 1);
+        assert_eq!(
+            mux.get_window(local_window_id)
+                .expect("ordered local window must exist")
+                .get_title(),
+            "ops window"
+        );
+        for remote_tab_id in [51, 52, 53] {
+            let local_tab_id = inner
+                .remote_to_local_tab_id(remote_tab_id)
+                .expect("remote tab should map locally");
+            assert_eq!(
+                mux.get_tab(local_tab_id)
+                    .expect("mapped tab must exist")
+                    .get_title(),
+                format!("remote tab {remote_tab_id}")
+            );
+        }
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61), (52, 62), (53, 63)]),
+            None,
+        )
+        .expect("stable direct flat arena resync should reuse its mirrors");
+        assert_eq!(
+            remote_tab_order(&mux, &inner, local_window_id),
+            vec![51, 52, 53]
+        );
+        assert_eq!(mux.iter_panes().len(), 3);
+    }
+
+    #[test]
+    fn direct_pane_arena_application_preserves_split_shape_and_focus() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_008);
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut left) = listing
+            .tabs
+            .pop()
+            .expect("sample listing must contain one leaf")
+        else {
+            panic!("sample listing root must be a leaf");
+        };
+        let mut right = left.clone();
+        left.pane_id = 61;
+        left.is_active_pane = true;
+        left.is_zoomed_pane = false;
+        right.pane_id = 62;
+        right.title = "remote shell 62".to_string();
+        right.is_active_pane = false;
+        right.is_zoomed_pane = true;
+        let split = mux::tab::SplitDirectionAndSize {
+            direction: mux::tab::SplitDirection::Horizontal,
+            first: left.size,
+            second: right.size,
+        };
+        listing.tabs.push(PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(left)),
+            right: Box::new(PaneNode::Leaf(right)),
+            node: split,
+        });
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            codec::ordered_pane_arena_from_list_panes(listing)
+                .expect("split listing must flatten into a canonical pane arena"),
+            None,
+        )
+        .expect("direct flat arena application should preserve a split tree");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote split tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("mapped split tab must exist");
+        let panes = tab.iter_panes_ignoring_zoom();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].top, panes[1].top);
+        assert!(
+            panes[1].left > panes[0].left,
+            "a horizontal split must place the second pane to the right"
+        );
+        assert_eq!(
+            tab.get_active_idx(),
+            0,
+            "left pane remains the base active pane"
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| client_remote_pane_id(&pane.pane))
+                .collect::<Vec<_>>(),
+            vec![61, 62]
+        );
+        assert_eq!(
+            client_remote_pane_id(
+                &tab.get_active_pane()
+                    .expect("zoomed split pane must be publicly active")
+            ),
+            62,
+            "the zoomed pane must retain public focus semantics"
+        );
+        assert_eq!(
+            client_remote_pane_id(
+                &tab.get_zoomed_pane()
+                    .expect("split pane must retain zoom authority")
+            ),
+            62
+        );
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_reorder_before_tree_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_006);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61), (52, 62)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let local_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let local_first_tab = inner
+            .remote_to_local_tab_id(51)
+            .and_then(|tab_id| mux.get_tab(tab_id))
+            .expect("first remote tab should map locally");
+        let first_pane_before = local_first_tab
+            .get_active_pane()
+            .expect("first remote tab should have an active pane");
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(52, 62), (51, 61)]),
+            None,
+        )
+        .expect_err("existing-window reorder must fail before pane preparation");
+        assert!(
+            format!("{error:#}").contains("requires an atomic existing-window reorder"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert_eq!(
+            remote_tab_order(&mux, &inner, local_window_id),
+            vec![51, 52]
+        );
+        assert!(Arc::ptr_eq(
+            &first_pane_before,
+            &local_first_tab
+                .get_active_pane()
+                .expect("rejected reorder must retain the prior pane tree")
+        ));
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_remote_pane_migration_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_009);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("initial remote tab should map locally");
+        let local_pane_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("initial remote pane should map locally");
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(52, 61)]),
+            None,
+        )
+        .expect_err("moving a live remote pane between tabs must fail before mutation");
+        assert!(
+            format!("{error:#}").contains("atomic pane migration is required"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert_eq!(inner.remote_to_local_tab_id(51), Some(local_tab_id));
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 61), Some(local_pane_id));
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_aliased_tab_mappings_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_010);
+        let snapshot = sample_remote_pane_arena(&[(51, 61), (52, 62)]);
+
+        ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), snapshot.clone(), None)
+            .expect("initial direct flat arena application should attach");
+        let first_local_tab = inner
+            .remote_to_local_tab_id(51)
+            .expect("first remote tab should map locally");
+        lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .insert_forward_alias_for_test(52, first_local_tab);
+
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), snapshot, None)
+            .expect_err("aliased remote tab mappings must fail before mutation");
+        assert!(
+            format!("{error:#}").contains("mappings alias remote tabs"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert_eq!(mux.iter_panes().len(), 2);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_foreign_tab_and_window_mappings() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let owner = test_client_inner(91_012);
+        let foreign = test_client_inner(91_013);
+        let snapshot = sample_remote_pane_arena(&[(51, 61)]);
+
+        ClientDomain::process_pane_arena(&mux, Arc::clone(&owner), snapshot.clone(), None)
+            .expect("owner should establish the initial direct mirror");
+        let owner_tab = owner
+            .remote_to_local_tab_id(51)
+            .expect("owner tab should map locally");
+        let owner_window = owner
+            .remote_to_local_window(41)
+            .expect("owner window should map locally");
+        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab")
+            .insert_forward_alias_for_test(51, owner_tab);
+        lock_or_recover(&foreign.remote_to_local_window, "remote_to_local_window")
+            .insert_forward_alias_for_test(41, owner_window);
+
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&foreign), snapshot, None)
+            .expect_err("foreign live topology mappings must fail before mutation");
+        assert!(
+            format!("{error:#}").contains("does not belong exactly to this client"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert_eq!(owner.remote_to_local_tab_id(51), Some(owner_tab));
+        assert_eq!(owner.remote_to_local_window(41), Some(owner_window));
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_stale_topology_removal_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_014);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61), (52, 62)]),
+            None,
+        )
+        .expect("initial direct flat arena application should attach");
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect_err("removing live stale topology requires an atomic reconciliation path");
+        assert!(
+            format!("{error:#}").contains("atomic stale-pane removal is required"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert!(inner.remote_to_local_tab_id(51).is_some());
+        assert!(inner.remote_to_local_tab_id(52).is_some());
+        assert_eq!(mux.iter_panes().len(), 2);
+        assert_eq!(mux.iter_windows().len(), 1);
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_reserved_window_title_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_011);
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        window_titles[0].window_id = u64::MAX;
+
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&inner),
+            PaneArena::from_unvalidated_parts(trees, nodes, window_titles),
+            None,
+        )
+        .expect_err("reserved terminal identities must fail before mutation");
+        assert!(
+            format!("{error:#}").contains("reserved value"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_new_empty_window_before_tree_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_007);
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        window_titles.push(mux::tab::PaneArenaWindowTitle {
+            window_id: 42,
+            title: "empty remote window".to_string(),
+        });
+        let panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), panes, None)
+            .expect_err("a new empty window without workspace authority must fail closed");
+        assert!(
+            format!("{error:#}")
+                .contains("requires exact ordered workspace and client ownership authority"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert!(
+            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").is_empty()
+        );
+        assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
+    fn direct_pane_arena_rejects_title_only_foreign_window_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let owner = test_client_inner(91_015);
+        let foreign = test_client_inner(91_016);
+
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&owner),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("owner direct flat arena application should attach");
+        ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&foreign),
+            sample_remote_pane_arena(&[(51, 61)]),
+            None,
+        )
+        .expect("foreign direct flat arena application should attach separately");
+        let owner_window_id = owner
+            .remote_to_local_window(41)
+            .expect("owner remote window should map locally");
+        let foreign_window_id = foreign
+            .remote_to_local_window(41)
+            .expect("foreign remote window should map locally");
+        assert_ne!(owner_window_id, foreign_window_id);
+        lock_or_recover(&owner.remote_to_local_window, "remote_to_local_window")
+            .insert_forward_alias_for_test(42, foreign_window_id);
+
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        window_titles.push(mux::tab::PaneArenaWindowTitle {
+            window_id: 42,
+            title: "must not replace owned title".to_string(),
+        });
+        let error = ClientDomain::process_pane_arena(
+            &mux,
+            Arc::clone(&owner),
+            PaneArena::from_unvalidated_parts(trees, nodes, window_titles),
+            None,
+        )
+        .expect_err("title-only mappings must not confer window ownership");
+        assert!(
+            format!("{error:#}")
+                .contains("requires exact ordered workspace and client ownership authority"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert_eq!(
+            mux.get_window(foreign_window_id)
+                .expect("foreign window must survive rejection")
+                .get_title(),
+            "ops window"
+        );
+        assert_eq!(mux.iter_windows().len(), 2);
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn layout_session_scopes_legacy_tabs_to_their_binding() {
+        let binding = |byte| DurableClientBinding {
+            fingerprint: ClientEndpointFingerprint([byte; 32]),
+            binding_id: codec::DomainBindingId::from_bytes([byte; 16]),
+        };
+        let legacy = ClientTopologySessionState::Bound(ClientTopologySession::Legacy46);
+        let first = layout_session(&legacy, binding(0x21)).expect("legacy tabs get a session");
+        // Stable across GUI restarts: the same binding derives the same session.
+        assert_eq!(layout_session(&legacy, binding(0x21)), Some(first));
+        // Two legacy hosts never alias each other's numeric tab IDs.
+        assert_ne!(layout_session(&legacy, binding(0x22)), Some(first));
+        assert_ne!(first.as_bytes(), [0; 16]);
+
+        let incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
+        let current =
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(incarnation));
+        assert_eq!(layout_session(&current, binding(0x21)), Some(incarnation));
+        assert_eq!(
+            layout_session(&ClientTopologySessionState::Unbound, binding(0x21)),
+            None
+        );
+        assert_eq!(
+            layout_session(
+                &ClientTopologySessionState::Revoked(ClientTopologySessionError::Changed),
+                binding(0x21)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_snapshot_rejects_changed_remote_pane_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_030);
+        let _domain = register_test_client_domain(&mux, &inner);
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .unwrap();
+        let pane = mux.iter_panes().into_iter().next().unwrap();
+        let (_, _, tab_id) = mux.resolve_pane_id(pane.pane_id()).unwrap();
+        let receipt = RemoteLayoutTab {
+            tab: mux.get_tab(tab_id).unwrap(),
+            remote_tab_id: 51,
+            remote_window_id: 41,
+        };
+        receipt.validate(&mux, &inner).unwrap();
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping").insert(61, usize::MAX);
+        assert!(receipt
+            .validate(&mux, &inner)
+            .unwrap_err()
+            .to_string()
+            .contains("mapping changed"));
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+            .insert(61, pane.pane_id());
+        receipt.validate(&mux, &inner).unwrap();
+        let replacement = test_client_inner(inner.local_domain_id);
+        assert!(receipt.validate(&mux, &replacement).is_err());
+    }
+
+    #[test]
+    fn malformed_remote_tab_title_cardinality_is_rejected_before_topology_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_001);
+        let mut listing = sample_remote_tab_listing();
+        listing.tab_titles.clear();
+
+        let err = ClientDomain::process_pane_list(&mux, Arc::clone(&inner), listing, None)
+            .expect_err("mismatched tab/title cardinality must fail closed");
+
+        assert!(
+            err.to_string().contains("malformed ListPanes response"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert!(
+            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").is_empty()
+        );
+        assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
+    fn duplicate_remote_pane_identity_is_rejected_before_topology_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_003);
+        let mut listing = sample_remote_tab_listing();
+        listing.tabs.push(listing.tabs[0].clone());
+        listing.tab_titles.push("duplicate remote tab".to_string());
+
+        let err = ClientDomain::process_pane_list(&mux, Arc::clone(&inner), listing, None)
+            .expect_err("duplicate remote pane identity must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("remote pane 61 appears more than once"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert!(
+            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").is_empty()
+        );
+        assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
+    fn tiled_and_floating_remote_pane_alias_is_rejected_before_topology_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_017);
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(entry) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        listing
+            .floating_panes
+            .push(codec::FloatingPaneSnapshotEntry {
+                pane: entry,
+                rect: mux::tab::FloatingPaneRect {
+                    left: 0,
+                    top: 0,
+                    width: 120,
+                    height: 40,
+                },
+                z_order: 0,
+                visible: true,
+                pinned: false,
+                opacity: 1.0,
+                focused: true,
+            });
+
+        let error = ClientDomain::process_pane_list(&mux, Arc::clone(&inner), listing, None)
+            .expect_err("one remote pane cannot be both tiled and floating");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote pane 61 has more than one tiled/floating owner"),
+            "unexpected error: {error:#}",
+            error = error,
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
+    fn process_pane_list_uses_its_explicit_mux_when_the_global_mux_differs() {
+        let scope = MuxTestScope::enter();
+        let ambient_mux = Arc::new(Mux::new(None));
+        scope.set_mux(&ambient_mux);
+        let target_mux = Arc::new(Mux::new(None));
+        let inner = test_client_inner(91_004);
+        let _domain = register_test_client_domain(&target_mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &target_mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("explicit target mux should receive the remote topology");
+
+        assert_eq!(target_mux.iter_panes().len(), 1);
+        assert_eq!(target_mux.iter_windows().len(), 1);
+        assert!(ambient_mux.iter_panes().is_empty());
+        assert!(ambient_mux.iter_windows().is_empty());
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map into the explicit mux");
+        assert_eq!(
+            target_mux
+                .get_tab(local_tab_id)
+                .expect("mapped tab should exist in the explicit mux")
+                .get_title(),
+            "remote tab"
+        );
+    }
+
+    #[test]
+    fn duplicate_live_client_pane_mirrors_are_rejected_without_overwriting_index() {
+        let mut by_remote_pane = HashMap::new();
+        index_live_client_pane(&mut by_remote_pane, 61, 101)
+            .expect("first live mirror should establish the identity");
+        index_live_client_pane(&mut by_remote_pane, 61, 101)
+            .expect("revisiting the exact same local pane is idempotent");
+
+        let err = index_live_client_pane(&mut by_remote_pane, 61, 102)
+            .expect_err("a second local mirror must fail closed");
+        assert!(
+            err.to_string()
+                .contains("remote pane 61 is mirrored by local panes 101 and 102"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert_eq!(by_remote_pane.get(&61), Some(&101));
+    }
+
+    #[test]
+    fn stable_topology_resync_reuses_unconsumed_fallback_pane_id() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_002);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("initial remote topology should attach");
+        assert!(
+            lock_or_recover(&inner.spare_local_pane_ids, "spare_local_pane_ids").is_empty(),
+            "the initial sync should consume its one reservation"
+        );
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("stable remote topology should resync");
+        let spare_after_second_sync =
+            lock_or_recover(&inner.spare_local_pane_ids, "spare_local_pane_ids").clone();
+        assert_eq!(spare_after_second_sync.len(), 1);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("another stable remote topology should resync");
+        assert_eq!(
+            *lock_or_recover(&inner.spare_local_pane_ids, "spare_local_pane_ids"),
+            spare_after_second_sync,
+            "steady-state resync must return and reuse the same unconsumed fallback"
+        );
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn floating_snapshot_publish_replay_and_retire_preserve_exact_ownership() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_018);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("initial floating snapshot should attach atomically");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote floating owner tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("remote floating owner tab should be registered");
+        let local_float_id = inner
+            .remote_to_local_pane_id(&mux, 62)
+            .expect("remote floating pane should map locally");
+        let floating_pane = mux
+            .get_pane(local_float_id)
+            .expect("remote floating pane should publish with its owner");
+        let positioned = tab.iter_floating_panes();
+        assert_eq!(positioned.len(), 1);
+        assert_eq!(positioned[0].pane_id, local_float_id);
+        assert!(Arc::ptr_eq(&positioned[0].pane, &floating_pane));
+        assert_eq!(
+            (
+                positioned[0].left,
+                positioned[0].top,
+                positioned[0].width,
+                positioned[0].height,
+            ),
+            (4, 3, 20, 8),
+        );
+        assert_eq!(positioned[0].z_order, 7);
+        assert!(positioned[0].visible);
+        assert!(positioned[0].pinned);
+        assert_eq!(positioned[0].opacity.to_bits(), 0.75_f32.to_bits());
+        assert!(!positioned[0].is_focused);
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("identical floating snapshot should be a no-op replay");
+        let replayed = mux
+            .get_pane(local_float_id)
+            .expect("no-op replay should preserve the floating registration");
+        assert!(Arc::ptr_eq(&replayed, &floating_pane));
+        let replayed_positioned = tab.iter_floating_panes();
+        assert_eq!(replayed_positioned.len(), 1);
+        assert!(Arc::ptr_eq(&replayed_positioned[0].pane, &floating_pane));
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("snapshot removal should retire the stale floating mirror");
+        assert!(tab.iter_floating_panes().is_empty());
+        assert!(mux.get_pane(local_float_id).is_none());
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    /// Attach remote tabs 51 (pane 61) and 52 (pane 62) in remote window 41.
+    fn attach_two_remote_tabs(mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
+        let mut two_tabs = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut second) = two_tabs.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        second.tab_id = 52;
+        second.pane_id = 62;
+        two_tabs.tabs.push(PaneNode::Leaf(second));
+        two_tabs.tab_titles.push("second tab".to_string());
+        ClientDomain::process_pane_list(mux, Arc::clone(inner), two_tabs, None)
+            .expect("two-tab topology should attach");
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_drops_a_tab_the_server_closed_and_keeps_the_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_031);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let closed_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+
+        // PaneRemoved marked the pane dead, but its prune was skipped because
+        // a mux Activity was live, so the tab is still attached locally.
+        let closed_pane = mux
+            .get_pane(
+                inner
+                    .remote_to_local_pane_id(&mux, 62)
+                    .expect("remote pane 62 should map locally"),
+            )
+            .expect("closed pane is still registered");
+        closed_pane
+            .downcast_ref::<ClientPane>()
+            .expect("client pane")
+            .renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .dead = true;
+        drop(closed_pane);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("a snapshot without a server-closed tab must apply, not retire the attachment");
+
+        assert!(mux.get_tab(closed_tab_id).is_none());
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        let surviving_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("surviving remote tab should stay mapped");
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("window should survive")
+                .iter()
+                .map(|tab| tab.tab_id())
+                .collect::<Vec<_>>(),
+            vec![surviving_tab_id]
+        );
+    }
+
+    /// Remote tabs 51 (pane 61) and 52 (pane 62) after the server moved pane 62
+    /// into new tab 53 of `remote_window_id`.
+    fn listing_after_server_moved_pane_62(remote_window_id: WindowId) -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut moved) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        moved.window_id = remote_window_id;
+        moved.tab_id = 53;
+        moved.pane_id = 62;
+        listing.tabs.push(PaneNode::Leaf(moved));
+        listing.tab_titles.push("moved tab".to_string());
+        listing
+            .window_titles
+            .insert(remote_window_id, "moved window".to_string());
+        listing
+    }
+
+    fn assert_pane_62_rehomed_into_tab_53(mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
+        let local_pane_id = inner
+            .remote_to_local_pane_id(mux, 62)
+            .expect("moved pane keeps its mapping");
+        let pane_before = mux.get_pane(local_pane_id).expect("moved pane is live");
+        let old_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab maps locally");
+
+        ClientDomain::process_pane_list(
+            mux,
+            Arc::clone(inner),
+            listing_after_server_moved_pane_62(41),
+            None,
+        )
+        .expect("a server-side pane move must apply, not retire the attachment");
+
+        let pane_after = mux
+            .get_pane(local_pane_id)
+            .expect("the moved pane keeps its local identity");
+        assert!(Arc::ptr_eq(&pane_before, &pane_after));
+        assert_eq!(
+            pane_after
+                .downcast_ref::<ClientPane>()
+                .expect("client pane")
+                .remote_tab_id(),
+            53
+        );
+        let new_tab = inner
+            .remote_to_local_tab_id(53)
+            .and_then(|tab_id| mux.get_tab(tab_id))
+            .expect("new remote tab mirrors locally");
+        assert!(new_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &pane_after)));
+        assert!(
+            mux.get_tab(old_tab_id).is_none(),
+            "emptied old tab is dropped"
+        );
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_rehomes_a_pane_the_server_moved_to_a_new_tab() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_033);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        assert_pane_62_rehomed_into_tab_53(&mux, &inner);
+    }
+
+    #[test]
+    fn snapshot_rehomes_a_pane_the_server_moved_to_a_new_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_034);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let local_pane_id = inner.remote_to_local_pane_id(&mux, 62).expect("pane 62");
+        let pane_before = mux.get_pane(local_pane_id).expect("pane 62 is live");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_after_server_moved_pane_62(42),
+            None,
+        )
+        .expect("a move into a new remote window must apply");
+
+        let pane_after = mux.get_pane(local_pane_id).expect("same local pane");
+        assert!(Arc::ptr_eq(&pane_before, &pane_after));
+        let new_window = inner
+            .remote_to_local_window(42)
+            .expect("new remote window maps locally");
+        let new_tab_id = inner
+            .remote_to_local_tab_id(53)
+            .expect("new remote tab maps locally");
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(new_window));
+    }
+
+    /// Attach remote tab 51 of remote window 41, then move its local mirror to
+    /// a second local window, as a restored layout does at startup.
+    fn attach_and_move_tab_51_to_new_local_window(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+    ) -> (WindowId, WindowId, TabId) {
+        ClientDomain::process_pane_list(mux, Arc::clone(inner), sample_remote_tab_listing(), None)
+            .expect("remote topology should attach");
+        let mapped_window = inner
+            .remote_to_local_window(41)
+            .expect("remote window maps locally");
+        let local_tab_id = inner.remote_to_local_tab_id(51).expect("tab 51 maps");
+        let other_window = *mux.new_empty_window(Some("ops".to_string()), None);
+        mux.move_tab_between_windows(local_tab_id, other_window, None)
+            .expect("move the tab to the other local window");
+        (mapped_window, other_window, local_tab_id)
+    }
+
+    #[test]
+    fn spawn_target_follows_the_remote_tabs_a_local_window_holds() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_035);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let (mapped_window, other_window, _) =
+            attach_and_move_tab_51_to_new_local_window(&mux, &inner);
+        let empty_window = *mux.new_empty_window(Some("ops".to_string()), None);
+
+        // The window that now holds remote tab 51 targets its remote window
+        // even though the mapping still names the original local window.
+        assert_eq!(
+            inner.remote_window_for_local_window(&mux, other_window),
+            Some(41)
+        );
+        assert_eq!(inner.local_to_remote_window(other_window), None);
+        // Resolution never repoints the shared mapping.
+        assert_eq!(inner.remote_to_local_window(41), Some(mapped_window));
+        assert_eq!(
+            inner.remote_window_for_local_window(&mux, empty_window),
+            None
+        );
+    }
+
+    #[test]
+    fn a_resolved_tab_is_placed_in_the_requested_local_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_036);
+        let _domain = register_test_client_domain(&mux, &inner);
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("remote topology should attach");
+        let mapped_window = inner.remote_to_local_window(41).expect("window maps");
+        let tab = inner
+            .remote_to_local_tab_id(51)
+            .and_then(|tab_id| mux.get_tab(tab_id))
+            .expect("tab 51 maps");
+        let requested = *mux.new_empty_window(Some("ops".to_string()), None);
+
+        place_tab_in_requested_window(&mux, &tab, requested);
+        assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(requested));
+        assert_eq!(inner.remote_to_local_window(41), Some(mapped_window));
+
+        // A requested window that closed in flight leaves the tab in place.
+        place_tab_in_requested_window(&mux, &tab, usize::MAX);
+        assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(requested));
+    }
+
+    #[test]
+    fn snapshot_maps_an_unmapped_remote_window_to_the_local_window_holding_its_tabs() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_037);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let (_, other_window, _) = attach_and_move_tab_51_to_new_local_window(&mux, &inner);
+        // A restored window: its tabs are attached but the remote window has
+        // no mapping.
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window").remove(&41);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("resync should apply");
+        assert_eq!(inner.remote_to_local_window(41), Some(other_window));
+        assert_eq!(inner.local_to_remote_window(other_window), Some(41));
+    }
+
+    #[test]
+    fn snapshot_missing_a_live_tab_still_rejects_without_dropping_it() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_032);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let live_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+
+        // A snapshot that predates a tab is not evidence the server closed it.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect_err("an unlisted live tab must not be silently dropped");
+        assert!(mux.get_tab(live_tab_id).is_some());
+    }
+
+    #[test]
+    fn topology_resync_rejects_previous_attachment_tab_order_before_mutation() {
+        for current in [false, true] {
+            let scope = MuxTestScope::enter();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let owner = test_client_inner(91_024);
+            let _domain = register_test_client_domain(&mux, &owner);
+            ClientDomain::process_pane_list(
+                &mux,
+                Arc::clone(&owner),
+                sample_remote_tab_listing(),
+                None,
+            )
+            .expect("attach original client");
+            let window_id = owner.remote_to_local_window(41).expect("original window");
+            let tab_id = owner.remote_to_local_tab_id(51).expect("original tab");
+            let tab = mux.get_tab(tab_id).expect("original tab allocation");
+            let pane = tab
+                .iter_all_panes()
+                .into_iter()
+                .next()
+                .expect("original pane");
+            let title = tab.get_title();
+            let order = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            let topology = mux.topology_snapshot_authority().unwrap();
+
+            // Same numeric domain, remote tab and remote pane IDs; a distinct
+            // attachment must still have no authority over the original Arcs.
+            let successor = test_client_inner(owner.local_domain_id);
+            successor.record_remote_to_local_tab_mapping(51, tab_id);
+            successor.record_remote_to_local_window_mapping(41, window_id);
+            let mut listing = sample_remote_tab_listing();
+            listing.tab_titles[0] = "must not overwrite the original".to_string();
+            let error = ClientDomain::process_pane_snapshot(
+                &mux,
+                Arc::clone(&successor),
+                listing.tabs,
+                listing.tab_titles,
+                listing.window_titles,
+                current.then_some(listing.floating_panes),
+                None,
+            )
+            .expect_err("a stale tab mapping must reject the complete snapshot");
+            assert!(format!("{error:#}").contains("outside this exact client attachment"));
+            assert_eq!(mux.topology_snapshot_authority().unwrap(), topology);
+            assert_eq!(tab.get_title(), title);
+            assert_eq!(mux.iter_windows().len(), 1);
+            assert_eq!(mux.iter_panes().len(), 1);
+            assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &pane));
+            assert!(Arc::ptr_eq(&mux.get_tab(tab_id).unwrap(), &tab));
+            let after = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            assert_eq!(after.ordered_tab_ids().collect::<Vec<_>>(), vec![tab_id]);
+            assert_eq!(after.order_revision(), order.order_revision());
+            assert_eq!(after.active_tab_id(), order.active_tab_id());
+            assert_eq!(mux.window_containing_tab(tab_id), Some(window_id));
+            assert!(lock_or_recover(&successor.spare_local_pane_ids, "spares").is_empty());
+            assert!(lock_or_recover(&successor.remote_to_local_pane, "pane map").is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_topology_resync_preserves_user_tab_order_and_window_moves() {
+        assert_topology_resync_preserves_user_tab_order_and_window_moves(false);
+    }
+
+    #[test]
+    fn current_topology_resync_preserves_user_tab_order_and_window_moves() {
+        assert_topology_resync_preserves_user_tab_order_and_window_moves(true);
+    }
+
+    #[test]
+    fn current_topology_replaces_reused_pane_mirror_even_after_an_unavailable_join() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_024);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa4; 16]);
+        let original = crate::client::ConditionalPaneInputSource {
+            session_incarnation,
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xb1; 16]),
+        };
+        let replacement = crate::client::ConditionalPaneInputSource {
+            session_incarnation,
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xb2; 16]),
+        };
+        let apply = |source: Option<crate::client::ConditionalPaneInputSource>| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation,
+                    lineage: None,
+                    panes: sample_remote_tab_listing(),
+                    input_sources: source.map(|source| HashMap::from([(61, source)])),
+                },
+                None,
+            )
+        };
+        apply(Some(original)).expect("initial exact pane snapshot installs");
+        let old_id = inner.remote_to_local_pane_id(&mux, 61).unwrap();
+        let old = mux.get_pane(old_id).unwrap();
+        let old_registration = mux.capture_pane_registration(&old).unwrap();
+        let old_client = old.downcast_ref::<ClientPane>().unwrap();
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
+        old_client.publish_conditional_input_source(Some(original));
+
+        apply(None).expect("missing input authority must preserve viewing");
+        assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
+        apply(Some(original)).expect("same-source refresh preserves the local mirror");
+        assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
+        apply(None).unwrap();
+
+        apply(Some(replacement)).expect("a changed registration must create a new mirror");
+        let new_id = inner.remote_to_local_pane_id(&mux, 61).unwrap();
+        let new = mux.get_pane(new_id).unwrap();
+        assert!(
+            !Arc::ptr_eq(&new, &old),
+            "a reused numeric id must not rebind the old display"
+        );
+        assert!(
+            old_client.is_dead(),
+            "pruning the old mirror must not kill its numeric successor"
+        );
+        assert!(old_registration.try_with_current(|_| ()).is_none());
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
+        let new_client = new.downcast_ref::<ClientPane>().unwrap();
+        assert_eq!(
+            new_client.withdraw_conditional_input_source(),
+            Some(replacement)
+        );
+        new_client.publish_conditional_input_source(Some(replacement));
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn current_topology_rejects_reused_ids_from_another_session_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_022);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let original_session = MuxSessionIncarnation::from_bytes([0xa1; 16]);
+        let replacement_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        let listing = || {
+            let mut panes = sample_remote_tab_listing();
+            let PaneNode::Leaf(mut second) = panes.tabs[0].clone() else {
+                panic!("sample must contain one leaf");
+            };
+            second.tab_id = 52;
+            second.pane_id = 62;
+            panes.tabs.push(PaneNode::Leaf(second));
+            panes.tab_titles.push("second tab".to_string());
+            panes
+        };
+        let apply = |session_incarnation, panes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    input_sources: None,
+                    session_incarnation,
+                    lineage: None,
+                    panes,
+                },
+                None,
+            )
+        };
+        apply(original_session, listing()).expect("initial session attaches");
+        let window_id = inner.remote_to_local_window(41).unwrap();
+        let second_id = inner.remote_to_local_tab_id(52).unwrap();
+        mux.move_tab_between_windows(second_id, window_id, Some(0))
+            .expect("user reorders the two live tabs");
+        apply(original_session, listing()).expect("same-session resync preserves user order");
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+        let before = mux.window_order_snapshot(window_id).unwrap().unwrap();
+        let topology = mux.topology_snapshot_authority().unwrap();
+        let panes_before = mux.iter_panes();
+        let titles_before: Vec<_> = before
+            .ordered_tabs()
+            .iter()
+            .map(|tab| tab.get_title())
+            .collect();
+
+        // The replacement uses exactly the same numeric ids but different
+        // metadata. Neither it nor a delayed old-session response may mutate
+        // this attachment after the identity mismatch revokes it.
+        for session in [replacement_session, original_session] {
+            let mut reused = listing();
+            reused
+                .tab_titles
+                .fill("replacement must not overwrite old tab".to_string());
+            reused
+                .window_titles
+                .insert(41, "replacement window".to_string());
+            let error = apply(session, reused).expect_err("different session must not alias ids");
+            assert_eq!(
+                error.downcast_ref::<ClientTopologySessionError>(),
+                Some(&ClientTopologySessionError::Changed)
+            );
+            assert_eq!(mux.topology_snapshot_authority().unwrap(), topology);
+            assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+            assert_eq!(mux.iter_windows().len(), 1);
+            assert_eq!(mux.iter_panes().len(), panes_before.len());
+            let after = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            assert_eq!(after.order_revision(), before.order_revision());
+            assert_eq!(after.active_tab_id(), before.active_tab_id());
+            for ((prior, current), title) in before
+                .ordered_tabs()
+                .iter()
+                .zip(after.ordered_tabs())
+                .zip(&titles_before)
+            {
+                assert!(Arc::ptr_eq(prior, current));
+                assert_eq!(&current.get_title(), title);
+                assert_eq!(mux.window_containing_tab(current.tab_id()), Some(window_id));
+            }
+            for pane in &panes_before {
+                assert!(Arc::ptr_eq(&mux.get_pane(pane.pane_id()).unwrap(), pane));
+            }
+        }
+
+        // A fresh attachment has its own identity namespace and can attach
+        // the new session without inheriting or destroying the old objects.
+        let fresh = test_client_inner(91_023);
+        let _fresh_domain = register_test_client_domain(&mux, &fresh);
+        ClientDomain::process_topology_snapshot(
+            &mux,
+            Arc::clone(&fresh),
+            RpcTopologySnapshot::Current {
+                input_sources: None,
+                session_incarnation: replacement_session,
+                lineage: None,
+                panes: listing(),
+            },
+            None,
+        )
+        .expect("fresh attachment accepts the replacement session");
+        assert_ne!(fresh.remote_to_local_tab_id(52), Some(second_id));
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+        assert_eq!(mux.iter_panes().len(), panes_before.len() * 2);
+    }
+
+    #[test]
+    fn restored_successor_rebinds_and_retires_only_what_it_did_not_restore() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_025);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let original_session = MuxSessionIncarnation::from_bytes([0xa1; 16]);
+        let restored_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        // Tab 52 and pane 62 opened after the last checkpoint: the restored
+        // mux never saw them and hands their ids to whatever it opens next.
+        let listing = |second_title: &str| {
+            let mut panes = sample_remote_tab_listing();
+            let PaneNode::Leaf(mut second) = panes.tabs[0].clone() else {
+                panic!("sample must contain one leaf");
+            };
+            second.tab_id = 52;
+            second.pane_id = 62;
+            second.title = second_title.to_string();
+            panes.tabs.push(PaneNode::Leaf(second));
+            panes.tab_titles.push(second_title.to_string());
+            panes
+        };
+        let apply = |session_incarnation, lineage, panes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    input_sources: None,
+                    session_incarnation,
+                    lineage,
+                    panes,
+                },
+                None,
+            )
+        };
+        let checkpointed = mux::RestoredTopologyLineage {
+            predecessor: original_session,
+            max_pane_id: Some(61),
+            max_tab_id: Some(51),
+            max_window_id: Some(41),
+        };
+        apply(original_session, None, listing("opened before the outage"))
+            .expect("initial session attaches");
+        let window_id = inner.remote_to_local_window(41).unwrap();
+        let kept_tab = mux
+            .get_tab(inner.remote_to_local_tab_id(51).unwrap())
+            .unwrap();
+        let kept_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 61).unwrap())
+            .unwrap();
+        let stale_tab_id = inner.remote_to_local_tab_id(52).unwrap();
+        let stale_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 62).unwrap())
+            .unwrap();
+
+        apply(
+            restored_session,
+            Some(checkpointed),
+            listing("opened after the restore"),
+        )
+        .expect("the restored successor of the bound session rebinds");
+
+        // What the restore carried over is the very same window, tab and pane.
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+        assert_eq!(mux.iter_windows().len(), 1);
+        assert!(Arc::ptr_eq(
+            &mux.get_tab(inner.remote_to_local_tab_id(51).unwrap())
+                .unwrap(),
+            &kept_tab
+        ));
+        assert!(Arc::ptr_eq(
+            &mux.get_pane(inner.remote_to_local_pane_id(&mux, 61).unwrap())
+                .unwrap(),
+            &kept_pane
+        ));
+        assert!(!kept_pane.is_dead());
+        // What it did not is retired as dead (so never killed remotely), and
+        // the reused ids name new local objects for the new remote ones.
+        assert!(stale_pane.is_dead());
+        assert!(mux.get_pane(stale_pane.pane_id()).is_none());
+        assert!(mux.get_tab(stale_tab_id).is_none());
+        let reused_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 62).unwrap())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&reused_pane, &stale_pane));
+        assert_eq!(reused_pane.get_title(), "opened after the restore");
+        assert_ne!(inner.remote_to_local_tab_id(52), Some(stale_tab_id));
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![51, 52]);
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        // The attachment now belongs to the restored session alone.
+        apply(restored_session, None, listing("opened after the restore"))
+            .expect("same-session resync after the rebind");
+        assert_eq!(mux.iter_panes().len(), 2);
+        let error = apply(
+            MuxSessionIncarnation::from_bytes([0xa3; 16]),
+            Some(checkpointed),
+            listing("opened after the restore"),
+        )
+        .expect_err("a lineage naming a session this attachment left must not rebind");
+        assert_eq!(
+            error.downcast_ref::<ClientTopologySessionError>(),
+            Some(&ClientTopologySessionError::Changed)
+        );
+        assert!(Arc::ptr_eq(
+            &mux.get_pane(reused_pane.pane_id()).unwrap(),
+            &reused_pane
+        ));
+        assert!(!reused_pane.is_dead());
+    }
+
+    #[test]
+    fn a_lineage_on_a_first_attachment_only_binds() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_026);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let restored_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        let lineage = mux::RestoredTopologyLineage {
+            predecessor: MuxSessionIncarnation::from_bytes([0xa1; 16]),
+            max_pane_id: Some(1),
+            max_tab_id: Some(1),
+            max_window_id: Some(1),
+        };
+        ClientDomain::process_topology_snapshot(
+            &mux,
+            Arc::clone(&inner),
+            RpcTopologySnapshot::Current {
+                input_sources: None,
+                session_incarnation: restored_session,
+                lineage: Some(lineage),
+                panes: sample_remote_tab_listing(),
+            },
+            None,
+        )
+        .expect("a first attachment binds whatever lineage the mux names");
+        // Remote ids above the lineage's marks are this session's own.
+        assert!(inner.remote_to_local_pane_id(&mux, 61).is_some());
+        assert!(inner.remote_to_local_tab_id(51).is_some());
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert!(!mux.iter_panes()[0].is_dead());
+    }
+
+    #[test]
+    fn current_topology_reserved_session_does_not_pin_or_mutate_initial_attachment() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_024);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let apply = |bytes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    input_sources: None,
+                    session_incarnation: MuxSessionIncarnation::from_bytes(bytes),
+                    lineage: None,
+                    panes: sample_remote_tab_listing(),
+                },
+                None,
+            )
+        };
+        let error = apply([0; 16]).expect_err("zero session is never authority");
+        assert_eq!(
+            error.downcast_ref::<ClientTopologySessionError>(),
+            Some(&ClientTopologySessionError::ReservedIdentity)
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert_eq!(inner.remote_to_local_tab_id(51), None);
+        apply([0xa3; 16]).expect("valid first session still attaches after invalid input");
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn only_a_different_server_session_needs_a_fresh_attachment() {
+        // As the reconnect loop sees it: the typed error under the snapshot
+        // application context.
+        for fresh in [
+            ClientTopologySessionError::Changed,
+            ClientTopologySessionError::DialectChanged,
+        ] {
+            let error = anyhow::Error::new(fresh).context("applying coherent topology snapshot");
+            assert!(reattach_needs_fresh_attachment(&error), "{:#}", error);
+        }
+        let reserved = anyhow::Error::new(ClientTopologySessionError::ReservedIdentity)
+            .context("applying coherent topology snapshot");
+        assert!(!reattach_needs_fresh_attachment(&reserved));
+        assert!(!reattach_needs_fresh_attachment(&anyhow!(
+            "remote mux session identity changed; a fresh domain attachment is required"
+        )));
+    }
+
+    #[test]
+    fn topology_session_dialect_change_cannot_promote_legacy_numeric_ids() {
+        let current = ClientTopologySession::Current(MuxSessionIncarnation::from_bytes([0xa4; 16]));
+        for (first, next) in [
+            (ClientTopologySession::Legacy46, current),
+            (current, ClientTopologySession::Legacy46),
+        ] {
+            let inner = test_client_inner(91_025);
+            inner.pin_topology_session(first).expect("initial dialect");
+            inner
+                .pin_topology_session(first)
+                .expect("same dialect retains continuity");
+            assert_eq!(
+                inner.pin_topology_session(next),
+                Err(ClientTopologySessionError::DialectChanged)
+            );
+            assert_eq!(
+                inner.pin_topology_session(first),
+                Err(ClientTopologySessionError::DialectChanged)
+            );
+        }
+    }
+
+    fn assert_stale_topology_snapshot_preserves_geometry(current: bool, tab_count: usize) {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_026;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "snapshot-resize-echo-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let apply = |panes: ListPanesResponse| {
+            // Use the same exact-attachment, synchronous suppression scope as
+            // the live initial-attachment and resync consumers.
+            let _remote_application = inner.begin_remote_metadata_application().unwrap();
+            if current {
+                ClientDomain::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    RpcTopologySnapshot::Current {
+                        input_sources: None,
+                        session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
+                        lineage: None,
+                        panes,
+                    },
+                    None,
+                )
+            } else {
+                // Match the legacy decoder consumer: floating-pane authority
+                // is absent, rather than an authoritative empty collection.
+                inner
+                    .pin_topology_session(ClientTopologySession::Legacy46)
+                    .unwrap();
+                ClientDomain::process_pane_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    panes.tabs,
+                    panes.tab_titles,
+                    panes.window_titles,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+        };
+        let mut old_listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = old_listing.tabs[0].clone() else {
+            panic!("fixture must contain one leaf");
+        };
+        for offset in 1..tab_count {
+            let mut entry = template.clone();
+            entry.tab_id += offset;
+            entry.pane_id += offset;
+            old_listing.tabs.push(PaneNode::Leaf(entry));
+            old_listing.tab_titles.push(format!("remote tab {offset}"));
+        }
+        apply(old_listing.clone());
+        assert!(peer.is_empty(), "initial snapshot must not issue commands");
+        // Registration separately schedules the initial palette update. Drain
+        // and identify that request before measuring resize traffic; otherwise
+        // a later executor tick can mistake palette setup for a resize echo.
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            tab_count
+        );
+        // Each pane the snapshot created polls without being painted: only
+        // then does the server push its later title and output changes.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::GetPaneRenderChanges(_)))
+                .count(),
+            tab_count
+        );
+        assert!(peer.is_empty(), "pane registration setup must be settled");
+        let tab = mux
+            .get_tab(inner.remote_to_local_tab_id(51).unwrap())
+            .unwrap();
+        let stale_size = tab.get_size();
+        let pane = tab.get_active_pane().unwrap();
+        let desired = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        // A font/window command commits before an older ListPanes response is
+        // consumed. The response must not turn observation into a new command.
+        tab.resize(desired);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == desired));
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty(), "explicit resize response must be settled");
+        apply(old_listing.clone());
+        assert!(
+            peer.is_empty(),
+            "stale remote geometry was echoed as a resize command"
+        );
+        assert_eq!(pane.get_dimensions().cols, desired.cols);
+        assert_eq!(pane.get_dimensions().viewport_rows, desired.rows);
+        assert_eq!(tab.get_size(), desired);
+
+        // Returning to the older geometry is still an explicit user command,
+        // whereas replaying the older listing above must remain observational.
+        assert_ne!(stale_size, desired);
+        tab.resize(stale_size);
+        assert!(
+            !peer.is_empty(),
+            "returning to stale tab geometry must resize the divergent pane"
+        );
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == stale_size));
+        while executor.try_tick().unwrap() {}
+        assert_eq!(pane.get_dimensions().cols, stale_size.cols);
+        assert_eq!(pane.get_dimensions().viewport_rows, stale_size.rows);
+        tab.resize(desired);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == desired));
+        while executor.try_tick().unwrap() {}
+
+        let mut current_listing = old_listing;
+        let PaneNode::Leaf(entry) = &mut current_listing.tabs[0] else {
+            panic!("fixture must contain one pane");
+        };
+        entry.size = desired;
+        apply(current_listing);
+        assert_eq!(tab.get_size(), desired);
+        assert!(
+            peer.is_empty(),
+            "current snapshot must remain observational"
+        );
+
+        let next = TerminalSize {
+            cols: 90,
+            pixel_width: 900,
+            ..desired
+        };
+        tab.resize(next);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == next));
+        executor.try_tick().unwrap();
+    }
+
+    #[test]
+    fn stale_topology_snapshot_does_not_echo_resize_over_newer_local_geometry() {
+        assert_stale_topology_snapshot_preserves_geometry(true, 1);
+    }
+
+    #[test]
+    fn three_tab_topology_snapshot_survives_resize_and_repeated_application() {
+        assert_stale_topology_snapshot_preserves_geometry(true, 3);
+    }
+
+    #[test]
+    fn three_tab_snapshot_preserves_precreated_window_across_mixed_dpi_normalization() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_027;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "mixed-dpi-snapshot-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let window = mux.new_empty_window(Some("default".to_string()), None);
+        let window_id = *window;
+        let high_dpi = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 960,
+            pixel_height: 648,
+            dpi: 144,
+        };
+        let low_dpi = TerminalSize {
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 0,
+            ..high_dpi
+        };
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("fixture must contain one leaf");
+        };
+        listing.tabs.clear();
+        listing.tab_titles.clear();
+        for offset in 0..3 {
+            let mut entry = template.clone();
+            entry.tab_id += offset;
+            entry.pane_id += offset;
+            entry.size = if offset == 1 { low_dpi } else { high_dpi };
+            entry.workspace = "default".to_string();
+            listing.tabs.push(PaneNode::Leaf(entry));
+            listing.tab_titles.push(format!("remote tab {offset}"));
+        }
+        let apply = |panes, preferred_window| {
+            let _application = inner.begin_remote_metadata_application().unwrap();
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    input_sources: None,
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x93; 16]),
+                    lineage: None,
+                    panes,
+                },
+                preferred_window,
+            )
+            .expect("mixed-DPI snapshot must retain exact attachment authority");
+        };
+        apply(listing.clone(), Some(window_id));
+        let tabs = (0..3)
+            .map(|offset| {
+                mux.get_tab(
+                    inner
+                        .remote_to_local_tab_id(template.tab_id + offset)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let panes = (0..3)
+            .map(|offset| {
+                mux.get_pane(
+                    inner
+                        .remote_to_local_pane_id(&mux, template.pane_id + offset)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (offset, tab) in tabs.iter().enumerate() {
+            assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(window_id));
+            assert_eq!(tab.get_size(), if offset == 1 { low_dpi } else { high_dpi });
+        }
+        mux.activate_tab_exact_in_window(window_id, &tabs[2], false)
+            .expect("activate third attached tab");
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            3
+        );
+        assert!(peer.is_empty());
+
+        // The observed bridge changed B's pixels and DPI, keeping 80x24 cells.
+        tabs[1].resize(high_dpi);
+        assert!(matches!(
+            promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
+            codec::Pdu::Resize(resize) if resize.size == high_dpi
+        ));
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty());
+        let PaneNode::Leaf(second) = &mut listing.tabs[1] else {
+            panic!("second tab must remain a leaf");
+        };
+        second.size = high_dpi;
+        for _ in 0..2 {
+            apply(listing.clone(), None);
+            while executor.try_tick().unwrap() {}
+            assert!(peer.is_empty(), "snapshot must not echo a resize command");
+            for offset in 0..3 {
+                let tab = mux
+                    .get_tab(
+                        inner
+                            .remote_to_local_tab_id(template.tab_id + offset)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let pane = mux
+                    .get_pane(
+                        inner
+                            .remote_to_local_pane_id(&mux, template.pane_id + offset)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert!(Arc::ptr_eq(&tab, &tabs[offset]));
+                assert!(Arc::ptr_eq(&pane, &panes[offset]));
+                assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(window_id));
+                assert_eq!(tab.get_size(), high_dpi);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_legacy_topology_snapshot_preserves_newer_local_geometry() {
+        assert_stale_topology_snapshot_preserves_geometry(false, 1);
+    }
+
+    fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_021);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let listing = || {
+            let mut listing = if current {
+                sample_remote_tab_listing_with_float()
+            } else {
+                sample_remote_tab_listing()
+            };
+            let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+                panic!("sample listing must have one leaf");
+            };
+            for (tab_id, pane_id) in [(52, 72), (53, 73)] {
+                let mut entry = template.clone();
+                entry.tab_id = tab_id;
+                entry.pane_id = pane_id;
+                listing.tabs.push(PaneNode::Leaf(entry));
+                listing.tab_titles.push(format!("remote tab {tab_id}"));
+            }
+            listing
+        };
+        let apply = |panes: ListPanesResponse| {
+            if current {
+                return ClientDomain::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    RpcTopologySnapshot::Current {
+                        input_sources: None,
+                        session_incarnation: MuxSessionIncarnation::from_bytes([0x91; 16]),
+                        lineage: None,
+                        panes,
+                    },
+                    None,
+                );
+            }
+            ClientDomain::process_pane_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                panes.tabs,
+                panes.tab_titles,
+                panes.window_titles,
+                None,
+                None,
+            )
+        };
+        apply(listing()).expect("initial attachment");
+        let original = inner.remote_to_local_window(41).expect("local window");
+        let first = mux
+            .get_tab(inner.remote_to_local_tab_id(51).expect("tab mapping"))
+            .expect("first tab");
+        let last = mux
+            .get_tab(inner.remote_to_local_tab_id(53).expect("tab mapping"))
+            .expect("last tab");
+        let panes_before = mux.iter_panes();
+        mux.move_tab_between_windows(last.tab_id(), original, Some(0))
+            .expect("user reorders tabs");
+        let destination = mux.new_empty_window(Some("ops".to_string()), None);
+        mux.move_tab_between_windows(first.tab_id(), *destination, Some(0))
+            .expect("user moves one tab to another native window");
+        let before = [original, *destination].map(|id| {
+            mux.window_order_snapshot(id)
+                .expect("valid order")
+                .expect("live window")
+        });
+        assert_eq!(remote_tab_order(&mux, &inner, original), vec![53, 52]);
+        assert_eq!(remote_tab_order(&mux, &inner, *destination), vec![51]);
+        assert!(
+            mux.add_tab_to_window(&first, original).is_err(),
+            "the old resync operation attempts a forbidden second parent"
+        );
+
+        // The server still lists 51,52,53 under its original remote window.
+        // Repeating a resync must neither reinsert 51 nor reset the local order.
+        for _ in 0..2 {
+            apply(listing()).expect("resync after a local window move must succeed");
+            assert_eq!(mux.iter_windows().len(), 2);
+            for expected in &before {
+                let current = mux
+                    .window_order_snapshot(expected.window_id())
+                    .expect("valid restored order")
+                    .expect("same window");
+                assert_eq!(current.order_revision(), expected.order_revision());
+                assert_eq!(
+                    current
+                        .ordered_tabs()
+                        .iter()
+                        .map(Arc::as_ptr)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .ordered_tabs()
+                        .iter()
+                        .map(Arc::as_ptr)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(current.active_tab_id(), expected.active_tab_id());
+                for tab in current.ordered_tabs() {
+                    assert_eq!(
+                        mux.window_containing_tab(tab.tab_id()),
+                        Some(expected.window_id())
+                    );
+                }
+            }
+            for pane in &panes_before {
+                assert!(mux
+                    .get_pane(pane.pane_id())
+                    .is_some_and(|live| Arc::ptr_eq(&live, pane)));
+            }
+        }
+        if current {
+            // Preserving a local window placement must not skip current
+            // floating-pane reconciliation, including exact stale retirement.
+            let floating_id = inner
+                .remote_to_local_pane_id(&mux, 62)
+                .expect("floating pane survived moved-tab resync");
+            let floating = first.iter_floating_panes();
+            assert_eq!(floating.len(), 1);
+            assert_eq!(floating[0].pane_id, floating_id);
+            assert_eq!((floating[0].left, floating[0].top), (4, 3));
+            let mut without_float = listing();
+            without_float.floating_panes.clear();
+            apply(without_float).expect("retire floating pane in a user-moved tab");
+            assert!(first.iter_floating_panes().is_empty());
+            assert!(mux.get_pane(floating_id).is_none());
+            assert_eq!(remote_tab_order(&mux, &inner, original), vec![53, 52]);
+            assert_eq!(remote_tab_order(&mux, &inner, *destination), vec![51]);
+        }
+        drop(destination);
+    }
+
+    #[test]
+    fn legacy_topology_snapshot_preserves_unrepresented_floating_state() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_020);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("authoritative floating snapshot should attach");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote owner tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("remote owner tab should remain registered");
+        let local_tiled_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("remote tiled pane should map locally");
+        let local_float_id = inner
+            .remote_to_local_pane_id(&mux, 62)
+            .expect("remote floating pane should map locally");
+        let tiled_pane = mux
+            .get_pane(local_tiled_id)
+            .expect("remote tiled pane should be live");
+        let floating_pane = mux
+            .get_pane(local_float_id)
+            .expect("remote floating pane should be live");
+        let before = tab.iter_floating_panes();
+        assert_eq!(before.len(), 1);
+        assert!(Arc::ptr_eq(&before[0].pane, &floating_pane));
+
+        let ListPanesResponse {
+            tabs,
+            tab_titles,
+            window_titles,
+            floating_panes: _,
+        } = sample_remote_tab_listing();
+        ClientDomain::process_pane_snapshot(
+            &mux,
+            Arc::clone(&inner),
+            tabs,
+            tab_titles,
+            window_titles,
+            None,
+            None,
+        )
+        .expect("codec-46 tiled snapshot must preserve unrepresented floating state");
+
+        assert_eq!(
+            inner.remote_to_local_pane_id(&mux, 62),
+            Some(local_float_id),
+            "a dialect without floating authority must not sweep its mapping"
+        );
+        assert!(mux
+            .get_pane(local_tiled_id)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &tiled_pane)));
+        assert!(mux
+            .get_pane(local_float_id)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &floating_pane)));
+        let after = tab.iter_floating_panes();
+        assert_eq!(after.len(), 1);
+        assert!(Arc::ptr_eq(&after[0].pane, &floating_pane));
+        assert_eq!(
+            (
+                after[0].left,
+                after[0].top,
+                after[0].width,
+                after[0].height,
+                after[0].z_order,
+                after[0].visible,
+                after[0].pinned,
+                after[0].opacity.to_bits(),
+                after[0].is_focused,
+            ),
+            (4, 3, 20, 8, 7, true, true, 0.75_f32.to_bits(), false),
+        );
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    /// Spawn a watchdog that aborts the test process if the body does not
+    /// finish within `secs`. Used to turn a *deadlock* regression into a fast,
+    /// obvious failure instead of a hung test binary (CI would otherwise just
+    /// time out the whole suite with no signal).
+    /// Cancellable watchdog. Returns a guard; when the guard drops (test
+    /// finished, including on panic/unwind) the watchdog thread observes the
+    /// flag and exits cleanly. This is critical: a fire-and-forget watchdog that
+    /// outlives its test would `process::exit` during a *later* test if the whole
+    /// suite runs slower than the timeout (e.g. on a busy CI/swarm host), killing
+    /// the run spuriously. The watchdog only aborts if the guard is still alive
+    /// at the deadline (i.e. the test really hung).
+    #[must_use = "hold the guard for the duration of the test"]
+    fn deadlock_watchdog(secs: u64, label: &'static str) -> WatchdogGuard {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            for _ in 0..secs.saturating_mul(20) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            if !flag.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "WATCHDOG: `{label}` did not complete within {secs}s — likely a \
+                     mux-lock deadlock regression (read guard held across a write lock)."
+                );
+                std::process::exit(97);
+            }
+        });
+        WatchdogGuard {
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    struct WatchdogGuard {
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Regression guard for the remote-attach deadlock: `process_pane_list`
+    /// takes the "reuse existing primary window with matching workspace" branch
+    /// here (local window workspace "ops" == the listing's "ops"), which used to
+    /// hold `Mux::get_window`'s read guard across `add_tab_to_window`'s write
+    /// lock and self-deadlock parking_lot's RwLock. The watchdog makes a
+    /// regression fail fast instead of hanging.
+    #[test]
+    fn process_pane_list_seeds_spawned_client_pane_alt_screen_state() {
+        let scope = MuxTestScope::enter();
+        let _wd = deadlock_watchdog(
+            30,
+            "process_pane_list_seeds_spawned_client_pane_alt_screen_state",
+        );
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            Some(local_window_id),
+        )
+        .expect("process_pane_list should seed remote pane state");
+
+        let local_pane_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("remote pane should map locally");
+        let pane = mux
+            .get_pane(local_pane_id)
+            .expect("local pane should exist after sync");
+        let client_pane = pane
+            .downcast_ref::<ClientPane>()
+            .expect("pane should be a ClientPane");
+
+        assert!(client_pane.is_alt_screen_active());
+        assert_eq!(inner.remote_to_local_window(41), Some(local_window_id));
+        assert!(mux.window_has_panes_in_domain(local_window_id, local_domain_id));
+
+        let other_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+        assert!(!mux.window_has_panes_in_domain(other_window_id, local_domain_id));
+    }
+
+    #[test]
+    fn existing_remote_window_mapping_attaches_through_mux_authority_once() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+        inner.record_remote_to_local_window_mapping(41, local_window_id);
+        let observed_additions = Arc::new(Mutex::new(Vec::new()));
+        let observed_additions_for_subscriber = Arc::clone(&observed_additions);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowTopologyChanged(change) = notification {
+                for &(tab_id, window_id) in change.attached_tabs() {
+                    if window_id != local_window_id {
+                        continue;
+                    }
+                    lock_or_recover(&observed_additions_for_subscriber, "observed_tab_additions")
+                        .push(tab_id);
+                }
+            }
+            true
+        })
+        .expect("subscribe to canonical tab attachment events");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("existing remote window mapping should attach through mux authority");
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map locally");
+        assert_eq!(
+            *lock_or_recover(&observed_additions, "observed_tab_additions"),
+            vec![local_tab_id],
+        );
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("stable remote topology should not reattach its exact tab");
+        assert_eq!(
+            *lock_or_recover(&observed_additions, "observed_tab_additions"),
+            vec![local_tab_id],
+            "stable resync must not publish a duplicate tab attachment",
+        );
+        let local_tab = mux
+            .get_tab(local_tab_id)
+            .expect("mapped tab should remain registered");
+        let attached_exactly_once = mux
+            .get_window(local_window_id)
+            .expect("mapped window should remain registered")
+            .iter()
+            .filter(|candidate| Arc::ptr_eq(candidate, &local_tab))
+            .count();
+        assert_eq!(attached_exactly_once, 1);
+    }
+
+    #[test]
+    fn process_pane_list_keeps_workspace_mismatch_out_of_primary_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let requested_window_id = *mux.new_empty_window(Some("local-workspace".to_string()), None);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            Some(requested_window_id),
+        )
+        .expect("process_pane_list should attach remote topology");
+
+        let mapped_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+
+        assert_ne!(mapped_window_id, requested_window_id);
+        assert!(!mux.window_has_panes_in_domain(requested_window_id, local_domain_id));
+        assert!(mux.window_has_panes_in_domain(mapped_window_id, local_domain_id));
+    }
+
+    #[test]
+    fn resolve_remote_spawn_entities_returns_local_ids_after_sync() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            Some(local_window_id),
+        )
+        .expect("process_pane_list should seed remote pane state");
+
+        let (tab, pane, resolved_window_id) = ClientDomain::resolve_remote_spawn_entities(
+            &mux,
+            &inner,
+            codec::SpawnResponse {
+                pane_id: 61,
+                tab_id: 51,
+                window_id: 41,
+                size: TerminalSize {
+                    cols: 120,
+                    rows: 40,
+                    pixel_width: 1200,
+                    pixel_height: 800,
+                    dpi: 96,
+                },
+            },
+        )
+        .expect("spawn response should resolve through the synced remote topology");
+
+        assert_eq!(resolved_window_id, local_window_id);
+        assert_eq!(inner.remote_to_local_tab_id(51), Some(tab.tab_id()));
+        assert_eq!(
+            inner.remote_to_local_pane_id(&mux, 61),
+            Some(pane.pane_id())
+        );
+        assert!(pane
+            .downcast_ref::<ClientPane>()
+            .expect("resolved pane should be a client pane")
+            .is_alt_screen_active());
+    }
+
+    #[test]
+    fn resolve_remote_spawn_entities_errors_when_remote_ids_do_not_resolve() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(alloc_domain_id());
+
+        let error = match ClientDomain::resolve_remote_spawn_entities(
+            &mux,
+            &inner,
+            codec::SpawnResponse {
+                pane_id: 61,
+                tab_id: 51,
+                window_id: 41,
+                size: TerminalSize {
+                    cols: 120,
+                    rows: 40,
+                    pixel_width: 1200,
+                    pixel_height: 800,
+                    dpi: 96,
+                },
+            },
+        ) {
+            Ok(_) => {
+                panic!("missing remote mappings should surface an explicit spawn resolution error")
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("remote tab 51 didn't resolve after resync"),
+            "unexpected error: {error:#}",
+            error = error
+        );
+    }
+}

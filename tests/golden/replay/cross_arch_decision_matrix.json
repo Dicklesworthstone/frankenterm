@@ -1,0 +1,100 @@
+{
+  "schema": "ft.replay.golden_matrix.v1",
+  "matrix_targets": [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+  ],
+  "canonical_output_sha256": "6d1485522bd7d15955efbffe3d0c71f8b7e83a06de1a6e92ff7599920b3ea909",
+  "canonical_output": {
+    "schema": "ft.replay.canonical_output.v1",
+    "graph": {
+      "node_count": 5,
+      "edge_count": 6,
+      "dag": true
+    },
+    "events": [
+      {
+        "node_id": 0,
+        "decision_type": "PatternMatch",
+        "pane_id": 7,
+        "rule_id": "codex.usage.reached",
+        "definition_hash": "a3efd08e6ffca6a1450fd0f5527f66de63f56bb73feff9a9109eac92ea86516f",
+        "input_hash": "0ea75163767fcfa13138eef315235c8f61cb2958f961975867cbd186597202b5",
+        "output_hash": "3023fea2ccafe28e0ba6e9687d5094e2994fc5283a1868f57bcfa7f2050e6578",
+        "timestamp_ms": 10000,
+        "causal_chain": [],
+        "effects": [
+          1,
+          2,
+          4
+        ]
+      },
+      {
+        "node_id": 1,
+        "decision_type": "WorkflowStep",
+        "pane_id": 7,
+        "rule_id": "workflow.cooldown.annotate",
+        "definition_hash": "ac4308a9d3bd69849cb0d177ad1ae69a8073443545d13876c7c8d9f349aaaa9f",
+        "input_hash": "1342495b10f88ab8dfc0478c747353a865ae2defc4bc5c643b6748251e132216",
+        "output_hash": "1a16dc8d60103adc95657061c30f6790f26cb8682b7cd7d3cd36df070d334617",
+        "timestamp_ms": 10050,
+        "causal_chain": [
+          0
+        ],
+        "effects": [
+          2,
+          4
+        ]
+      },
+      {
+        "node_id": 2,
+        "decision_type": "PolicyDecision",
+        "pane_id": 7,
+        "rule_id": "policy.wait.allowed",
+        "definition_hash": "dabc7b2983db7e73c0a9e54d185e8351f0907ebcb9c6cec66bc55bea0eaf5804",
+        "input_hash": "dad0c9722b1a786596332be1ccba08732d68e27174bb865738a1656752bbb103",
+        "output_hash": "547721048fbe07a06162b4bd3a0519e852240992dc5b78972f8ae806bced97ef",
+        "timestamp_ms": 10060,
+        "causal_chain": [
+          0,
+          1
+        ],
+        "effects": [
+          4
+        ]
+      },
+      {
+        "node_id": 3,
+        "decision_type": "AlertFired",
+        "pane_id": 12,
+        "rule_id": "fleet.rate_limit.aggregate",
+        "definition_hash": "3779e19c6d134c041459b67e624d35ead9d2ec0df1211bdc603b8919cce8d0d6",
+        "input_hash": "378ef37f9813b3f571c65256e8a58d6f1f4f1abaadb1c4c62f3e2493e54b1599",
+        "output_hash": "e2a3aae5d24ef76bc5d4949095a3d40d0e6f86fef12e2f3eda33e8c3c5a55fa4",
+        "timestamp_ms": 10070,
+        "causal_chain": [],
+        "effects": []
+      },
+      {
+        "node_id": 4,
+        "decision_type": "OverrideApplied",
+        "pane_id": 7,
+        "rule_id": "operator.override.resume",
+        "definition_hash": "5d24f2a7e914cf2c8ff1841a709f1f5687b2f932f0dc29fe49156157aae1f2c1",
+        "input_hash": "29f813eab11675daf63f6ee848b7929d549d2a70db50b7f84d8676c100436488",
+        "output_hash": "0f89a364e3591863aeda169d21300a7195c8bc537bda5c027a47a2737d355901",
+        "timestamp_ms": 10100,
+        "causal_chain": [
+          0,
+          1,
+          2
+        ],
+        "effects": []
+      }
+    ],
+    "roots": [
+      0,
+      3
+    ]
+  }
+}

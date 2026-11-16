@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9001",
+    "description": "An unexpected internal error occurred. This is likely a bug in ft.",
+    "error": "Watchdog warnings read failed for backend 'wezterm': transport unavailable",
+    "hint": "Watchdog warning telemetry could not be read from backend 'wezterm'.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Treat missing watchdog data as backend-health uncertainty until the probe recovers."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Watchdog warning telemetry could not be read from backend 'wezterm'."
+    },
+    "title": "Internal error"
+  },
+  "plain_lines": [
+    "Error: Internal error",
+    "",
+    "Watchdog warnings read failed for backend 'wezterm': transport unavailable",
+    "",
+    "An unexpected internal error occurred. This is likely a bug in ft.",
+    "",
+    "Suggestions:",
+    "  • Watchdog warning telemetry could not be read from backend 'wezterm'.",
+    "  → Status: `ft status`",
+    "  → Diagnostics: `ft doctor`",
+    "  • Treat missing watchdog data as backend-health uncertainty until the probe recovers.",
+    "",
+    "Error code: FT-9001",
+    "Run `ft why FT-9001` for more details."
+  ]
+}

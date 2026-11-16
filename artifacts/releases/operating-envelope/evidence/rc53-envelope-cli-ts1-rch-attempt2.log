@@ -1,0 +1,652 @@
+  [2m2026-09-21T07:13:31.832482Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2062 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:13:32.105943Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts1 at ubuntu@100.74.254.33 (2 slots remaining after reservation, speed 76.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2977 [2;3mon[0m ThreadId(1)
+
+[*] Job j-30023644042233671 submitted to ts1 (2 slots remaining, speed 76.4)
+  [2m2026-09-21T07:13:45.937209Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankenterm (hash: paired-d825db70fe16125e329091ef90783dc9)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:13:45.937380Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:744 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:13:46.599547Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker ts1...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:892 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:13:46.599602Z[0m [33m WARN[0m [1;33mrch::transfer[0m[33m: [33mProject hash contains non-hex characters, sanitizing: "paired-d825db70fe16125e329091ef90783dc9"[0m
+    [2;3mat[0m rch/src/transfer.rs:1378 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:14:13.213516Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 362567680 bytes in 23198ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1232 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:14:13.239918Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: env 'TMPDIR=/var/tmp' 'CARGO_HOME=/home/ubuntu/.cargo' 'RUSTUP_TOOLCHAIN=nightly-2026-08-31' 'CARGO_INCREMENTAL=0' cargo test --locked --profile test-recovery --target x86_64-unknown-linux-gnu -j 2 -p frankenterm --bin ft robot_swarm_envelope --config 'build.build-dir="/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-4157331073ec1f2a4a959f4d6ba46d47"' -- --nocapture '--test-threads=1'[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1309 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:14:13.240573Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/ft-rc53-envelope-cli -> /var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-4157331073ec1f2a4a959f4d6ba46d47[0m
+    [2;3mat[0m rch/src/transfer.rs:1992 [2;3mon[0m ThreadId(1)
+
+   Compiling libc v0.2.189
+   Compiling typenum v1.20.1
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling jobserver v0.1.35
+   Compiling smallvec v1.15.2
+   Compiling cc v1.4.5
+   Compiling fastrand v2.5.0
+   Compiling log v0.4.34
+   Compiling serde_core v1.0.229
+   Compiling displaydoc v0.2.7
+   Compiling aho-corasick v1.1.5
+   Compiling thiserror v2.0.20
+   Compiling regex-syntax v0.8.11
+   Compiling indexmap v2.14.0
+   Compiling regex-automata v0.4.18
+   Compiling crypto-common v0.2.2
+   Compiling bitflags v2.13.2
+   Compiling semver v1.0.28
+   Compiling futures-core v0.3.34
+   Compiling tinyvec_macros v0.1.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling serde_json v1.0.151
+   Compiling tinyvec v1.12.0
+   Compiling rustc_version v0.4.1
+   Compiling itoa v1.0.18
+   Compiling scopeguard v1.2.0
+   Compiling unicode-normalization v0.1.25
+   Compiling parking_lot_core v0.9.12
+   Compiling lock_api v0.4.14
+   Compiling bstr v1.13.1
+   Compiling generic-array v0.14.7
+   Compiling tracing-core v0.1.36
+   Compiling once_cell v1.21.4
+   Compiling parking_lot v0.12.5
+   Compiling crc32fast v1.5.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling tracing v0.1.44
+   Compiling digest v0.10.7
+   Compiling num-bigint v0.4.8
+   Compiling rustix v1.1.4
+   Compiling bytes v1.12.1
+   Compiling gix-trace v0.1.21
+   Compiling digest v0.11.3
+   Compiling gix-validate v0.10.1
+   Compiling gix-utils v0.3.6
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+   Compiling gix-path v0.10.22
+   Compiling byteorder v1.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling prodash v30.0.1
+   Compiling zlib-rs v0.5.5
+   Compiling sha2 v0.11.0
+   Compiling gix-features v0.45.2
+   Compiling curve25519-dalek v4.1.3
+   Compiling zeroize v1.9.0
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.2.0
+   Compiling equivalent v1.0.2
+   Compiling nom v7.1.3
+   Compiling base64 v0.23.1
+   Compiling subtle v2.6.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling time-macros v0.2.32
+   Compiling ring v0.17.14
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling num_threads v0.1.7
+   Compiling time v0.3.55
+   Compiling linux-raw-sys v0.12.1
+   Compiling heapless v0.8.0
+   Compiling hash32 v0.3.1
+   Compiling untrusted v0.9.0
+   Compiling cipher v0.5.2
+   Compiling faster-hex v0.10.0
+   Compiling tinystr v0.8.4
+   Compiling universal-hash v0.6.1
+   Compiling hybrid-array v0.4.14
+   Compiling futures-sink v0.3.34
+   Compiling rustls v0.23.44
+   Compiling icu_locale_core v2.3.0
+   Compiling rustls-webpki v0.103.15
+   Compiling rusticata-macros v4.1.0
+   Compiling zerotrie v0.2.5
+   Compiling sha1 v0.10.7
+   Compiling mio v1.2.3
+   Compiling asn1-rs-derive v0.6.0
+   Compiling asn1-rs-impl v0.2.0
+   Compiling getrandom v0.3.4
+   Compiling icu_provider v2.3.1
+   Compiling asn1-rs v0.7.2
+   Compiling sha1-checked v0.10.0
+   Compiling webpki-roots v1.0.9
+   Compiling openssl-src v300.6.1+3.6.3
+   Compiling errno v0.3.14
+   Compiling crossbeam-utils v0.8.23
+   Compiling oid-registry v0.8.1
+   Compiling icu_collections v2.3.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling openssl-sys v0.9.117
+   Compiling gix-hash v0.21.2
+   Compiling polyval v0.7.3
+   Compiling futures-lite v2.6.1
+   Compiling sharded-slab v0.1.7
+   Compiling chacha20 v0.10.1
+   Compiling tempfile v3.27.0
+   Compiling aead v0.6.1
+   Compiling matchers v0.2.0
+   Compiling num-rational v0.4.2
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling jiff-core v0.1.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling jiff v0.2.35
+   Compiling ed25519-dalek v2.2.0
+   Compiling ghash v0.6.0
+   Compiling der-parser v10.0.0
+   Compiling aes v0.9.2
+   Compiling poly1305 v0.9.1
+   Compiling ctr v0.10.1
+   Compiling hashbrown v0.16.1
+   Compiling polling v3.11.0
+   Compiling xattr v1.6.1
+   Compiling franken-evidence v0.5.0
+   Compiling signal-hook v0.4.4
+   Compiling zerocopy v0.8.56
+   Compiling asupersync v0.5.0
+   Compiling franken-decision v0.5.0
+   Compiling aes-gcm v0.11.1
+   Compiling chacha20poly1305 v0.11.0
+   Compiling x509-parser v0.18.1
+   Compiling gix-date v0.12.1
+   Compiling nkeys v0.4.5
+   Compiling futures-channel v0.3.34
+   Compiling prost v0.14.4
+   Compiling hmac v0.13.0
+   Compiling sha1 v0.11.0
+   Compiling getrandom v0.2.17
+   Compiling winnow v0.7.15
+   Compiling visibility v0.1.1
+   Compiling gix-actor v0.37.1
+   Compiling rand_core v0.6.4
+   Compiling gix-hashtable v0.11.0
+   Compiling futures-util v0.3.34
+   Compiling gix-object v0.54.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling regex v1.13.1
+   Compiling memmap2 v0.9.11
+   Compiling cmov v0.5.4
+   Compiling percent-encoding v2.3.2
+   Compiling ctutils v0.4.2
+   Compiling idna_adapter v1.2.2
+   Compiling rand_chacha v0.3.1
+   Compiling form_urlencoded v1.2.2
+   Compiling block-buffer v0.12.1
+   Compiling fnv v1.0.7
+   Compiling rand v0.8.7
+   Compiling idna v1.1.0
+   Compiling zmij v1.0.23
+   Compiling base64ct v1.8.3
+   Compiling cpufeatures v0.3.0
+   Compiling url v2.5.8
+   Compiling gix-fs v0.18.2
+   Compiling bit-vec v0.8.0
+   Compiling hashbrown v0.14.5
+   Compiling serde v1.0.229
+   Compiling dashmap v6.2.1
+   Compiling bit-set v0.8.0
+   Compiling phf_generator v0.13.1
+   Compiling zerofrom v0.1.8
+   Compiling gix-chunk v0.4.12
+   Compiling yoke v0.8.3
+   Compiling phf_macros v0.13.1
+   Compiling gix-tempfile v20.0.1
+   Compiling gix-quote v0.6.2
+   Compiling frankenterm-dynamic-derive v0.1.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/dynamic/derive)
+   Compiling frankenterm-dynamic v0.2.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/dynamic)
+   Compiling gix-lock v20.0.1
+   Compiling phf v0.13.1
+   Compiling gix-glob v0.23.0
+   Compiling half v2.7.1
+   Compiling av-scenechange v0.14.1
+   Compiling av1-grain v0.2.5
+   Compiling zerovec v0.11.8
+   Compiling gix-commitgraph v0.31.0
+   Compiling libz-sys v1.1.29
+   Compiling encoding_rs v0.8.41
+   Compiling multiversion-macros v0.9.0
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling const-oid v0.10.2
+   Compiling unicode-bom v2.0.3
+   Compiling rav1e v0.8.1
+   Compiling darling_core v0.20.11
+   Compiling gix-revwalk v0.25.0
+   Compiling ahash v0.8.12
+   Compiling winnow v1.0.4
+   Compiling static_assertions v1.1.0
+   Compiling tiff v0.11.3
+   Compiling openssl v0.10.81
+   Compiling kstring v2.0.4
+   Compiling ravif v0.13.0
+   Compiling exr v1.74.2
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling darling_macro v0.20.11
+   Compiling csscolorparser v0.8.4
+   Compiling inout v0.2.2
+   Compiling filetime v0.2.29
+   Compiling which v8.0.5
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling multiversion_no_op v1.0.0
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling luajit-src v210.7.3+1ee778a
+   Compiling image v0.25.10
+   Compiling phf_generator v0.11.3
+   Compiling darling v0.20.11
+   Compiling gix-attributes v0.29.0
+   Compiling http v1.5.0
+   Compiling gix-sec v0.12.2
+   Compiling uuid v1.26.1
+   Compiling lua-src v551.0.2
+   Compiling writeable v0.6.4
+   Compiling web-time v1.1.0
+   Compiling litemap v0.8.3
+   Compiling frankenterm-color-types v0.3.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/color-types)
+   Compiling toml v1.1.6+spec-1.1.0
+   Compiling frankenterm-input-types v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/input-types)
+   Compiling mlua-sys v0.12.0
+   Compiling frankenterm-blob-leases v0.1.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/blob-leases)
+   Compiling derive_builder_core v0.20.2
+   Compiling phf_codegen v0.11.3
+   Compiling potential_utf v0.1.6
+   Compiling gix-ref v0.57.0
+   Compiling vtparse v0.7.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/vtparse)
+   Compiling pem-rfc7468 v0.7.0
+   Compiling tokio v1.53.1
+   Compiling gix-config-value v0.16.0
+   Compiling utf8_iter v1.0.4
+   Compiling signal-hook v0.3.18
+   Compiling shell-words v1.1.1
+   Compiling ipnet v2.12.1
+   Compiling const-oid v0.9.6
+   Compiling unicode-segmentation v1.13.3
+   Compiling convert_case v0.10.0
+   Compiling der v0.7.10
+   Compiling chrono v0.4.45
+   Compiling gix-command v0.6.5
+   Compiling frankenterm-escape-parser v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/escape-parser)
+   Compiling derive_builder_macro v0.20.2
+   Compiling terminfo v0.9.0
+   Compiling frankenterm-char-props v0.1.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/char-props)
+   Compiling gix-traverse v0.51.1
+   Compiling futures-executor v0.3.34
+   Compiling gix-packetline v0.20.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_properties_data v2.3.0
+   Compiling filedescriptor v0.8.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/filedescriptor)
+   Compiling signature v2.2.0
+   Compiling gix-bitmap v0.2.16
+   Compiling libssh2-sys v0.3.2
+   Compiling libssh-rs-sys v0.2.8 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/vendor/libssh-rs-sys)
+   Compiling arc-swap v1.9.2
+   Compiling num-traits v0.2.19
+   Compiling cpubits v0.1.1
+   Compiling httparse v1.10.1
+   Compiling frankenterm-cell v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/cell)
+   Compiling gix-index v0.45.1
+   Compiling futures v0.3.34
+   Compiling spki v0.7.3
+   Compiling derive_more-impl v2.1.1
+   Compiling gix-pathspec v0.14.0
+   Compiling gix-ignore v0.18.0
+   Compiling multiversion v0.9.0
+   Compiling frankenterm-bidi v0.2.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/bidi)
+   Compiling fancy-regex v0.19.1
+   Compiling unicode-display-width v0.3.0
+   Compiling hashbrown v0.17.1
+   Compiling io-lifetimes v3.0.1
+   Compiling simdutf8 v0.1.5
+   Compiling litrs v1.0.0
+   Compiling portable-atomic v1.15.0
+   Compiling foreign-types-shared v0.1.1
+   Compiling core_detect v1.0.0
+   Compiling option-ext v0.2.0
+   Compiling foldhash v0.1.5
+   Compiling io-lifetimes v2.0.4
+   Compiling hashbrown v0.15.5
+   Compiling dirs-sys v0.5.0
+   Compiling document-features v0.2.12
+   Compiling foreign-types v0.3.2
+   Compiling frankenterm-surface v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/surface)
+   Compiling ftui-core v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling gix-worktree v0.46.0
+   Compiling derive_more v2.1.1
+   Compiling pkcs8 v0.10.2
+   Compiling signal-hook-mio v0.2.5
+   Compiling mlua v0.12.1
+   Compiling ed25519 v2.2.3
+   Compiling http-body v1.1.0
+   Compiling gix-url v0.34.0
+   Compiling sha2 v0.10.9
+   Compiling nix v0.31.3
+   Compiling memoffset v0.9.1
+   Compiling io-extras v0.19.0
+   Compiling native-tls v0.2.18
+   Compiling hex v0.4.3
+   Compiling camino v1.2.5
+   Compiling async-executor v1.14.0
+   Compiling libssh-rs v0.3.8
+   Compiling portable-pty v0.9.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/pty)
+   Compiling termwiz v0.24.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/termwiz)
+   Compiling flume v0.12.0
+   Compiling frankenterm-uds v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/uds)
+   Compiling rmp v0.8.15
+   Compiling ssh2 v0.9.6
+   Compiling luahelper v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/luahelper)
+   Compiling crossterm v0.29.0
+   Compiling signatory v0.27.1
+   Compiling async-channel v2.5.0
+   Compiling async-io v2.6.0
+   Compiling gix-filter v0.24.1
+   Compiling imara-diff v0.1.8
+   Compiling filenamegen v0.2.7
+   Compiling async_ossl v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/async_ossl)
+   Compiling tokio-util v0.7.19
+   Compiling gix-discover v0.45.0
+   Compiling gix-revision v0.39.0
+   Compiling franken-kernel v0.5.0
+   Compiling fancy-regex v0.18.0
+   Compiling fastmcp-core v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling pem-rfc7468 v1.0.0
+   Compiling clru v0.6.3
+   Compiling bincode-next v3.1.1
+   Compiling gethostname v1.1.0
+   Compiling curve25519-dalek v5.0.0
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling rapidhash v4.5.1
+   Compiling vergen-lib v9.1.0
+   Compiling os_pipe v1.2.3
+   Compiling stdio-override v0.2.0
+   Compiling openssl-probe v0.2.1
+   Compiling atomic-waker v1.1.2
+   Compiling unty-next v0.1.2
+   Compiling cap-primitives v4.0.3
+   Compiling pin-project-lite v0.2.17
+   Compiling data-encoding v2.11.1
+   Compiling parking v2.2.1
+   Compiling ryu v1.0.23
+   Compiling futures-io v0.3.34
+   Compiling tower-service v0.3.3
+   Compiling frankenterm-sigpipe v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-sigpipe)
+   Compiling try-lock v0.2.5
+   Compiling bumpalo v3.20.3
+   Compiling promise v0.2.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/promise)
+   Compiling ftui-render v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling want v0.3.1
+   Compiling h2 v0.4.19
+   Compiling rich_rust v0.2.3 (https://github.com/Dicklesworthstone/rich_rust?rev=60ca9a06697b79378b6569b678405d3121194114#60ca9a06)
+   Compiling frankenterm-ssh v0.4.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/ssh)
+   Compiling frankenterm-term v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/term)
+   Compiling notify v8.2.0
+   Compiling webpki-root-certs v1.0.9
+   Compiling gix-pack v0.64.1
+   Compiling fastmcp-protocol v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling der v0.8.1
+   Compiling ureq-proto v0.6.1
+   Compiling gix-refspec v0.35.0
+   Compiling gix-dir v0.19.0
+   Compiling fs-set-times v0.20.3
+   Compiling gix-diff v0.57.1
+   Compiling icu_locale_fallback v2.3.0
+   Compiling rmp-serde v1.3.1
+   Compiling gix-transport v0.52.1
+   Compiling dirs v6.0.0
+   Compiling derive_builder v0.20.2
+   Compiling gix-config v0.50.0
+   Compiling colorgrad v0.8.0
+   Compiling gix-shallow v0.7.0
+   Compiling anstyle-parse v1.0.0
+   Compiling crossbeam-queue v0.3.14
+   Compiling umask v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/umask)
+   Compiling pin-project v1.1.13
+   Compiling rustix-linux-procfs v0.1.1
+   Compiling socks v0.3.4
+   Compiling cargo-platform v0.3.3
+   Compiling sysinfo v0.39.6
+   Compiling socket2 v0.6.5
+   Compiling castaway v0.2.4
+   Compiling vergen v9.1.0
+   Compiling frankenterm-config-derive v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/config/derive)
+   Compiling maybe-async v0.2.11
+   Compiling ambient-authority v0.0.2
+   Compiling slab v0.4.12
+   Compiling signature v3.0.0
+   Compiling colorchoice v1.0.5
+   Compiling utf8-zero v0.8.1
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling maybe-owned v0.3.4
+   Compiling cap-std v4.0.3
+   Compiling anstream v1.0.0
+   Compiling ureq v3.4.0
+   Compiling ed25519 v3.0.0
+   Compiling gix-protocol v0.55.0
+   Compiling config v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/config)
+   Compiling gix-odb v0.74.0
+   Compiling cargo_metadata v0.23.1
+   Compiling num v0.4.3
+   Compiling gix-submodule v0.24.0
+   Compiling icu_segmenter v2.3.0
+   Compiling gix-status v0.24.0
+   Compiling hyper v1.11.0
+   Compiling sync_wrapper v1.0.2
+   Compiling onig_sys v69.9.3
+   Compiling tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8
+   Compiling vergen-gix v9.1.0
+   Compiling vte v0.14.1
+   Compiling matrixmultiply v0.3.11
+   Compiling cap-fs-ext v4.0.3
+   Compiling zstd-safe v8.0.0
+   Compiling frankenterm-build-identity v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-build-identity)
+   Compiling heck v0.5.0
+   Compiling str_indices v0.4.4
+   Compiling lzma-rust2 v0.15.8
+   Compiling tower-layer v0.3.3
+   Compiling hmac-sha256 v1.1.14
+   Compiling fastapi-types v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling base64 v0.22.1
+   Compiling hyper-util v0.1.20
+   Compiling fastapi-router v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling toml_edit v0.25.15+spec-1.1.0
+   Compiling ort-sys v2.0.0-rc.13
+   Compiling tower v0.5.3
+   Compiling textwrap v0.16.4
+   Compiling clap_builder v4.6.6
+   Compiling ropey v1.6.1
+   Compiling clap_derive v4.6.4
+   Compiling strip-ansi-escapes v0.2.1
+   Compiling rand_chacha v0.9.0
+   Compiling gix v0.77.0
+   Compiling ed25519-dalek v3.0.0
+   Compiling rangeset v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/rangeset)
+   Compiling fastmcp-transport v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling tokio-native-tls v0.3.1
+   Compiling ftui-style v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling procinfo v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/procinfo)
+   Compiling http-body-util v0.1.5
+   Compiling ftui-layout v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling lru v0.16.4
+   Compiling console v0.16.6
+   Compiling frankenterm-core-replay-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-replay-types)
+   Compiling esaxx-rs v0.1.10
+   Compiling unit-prefix v0.5.2
+   Compiling rawpointer v0.2.1
+   Compiling bintree v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/bintree)
+   Compiling mux v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/mux)
+   Compiling indicatif v0.18.6
+   Compiling frankenterm-core-audit-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-audit-types)
+   Compiling ftui-text v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling hyper-tls v0.6.0
+   Compiling rand v0.9.5
+   Compiling fastmcp-console v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling clap v4.6.6
+   Compiling tower-http v0.6.11
+   Compiling proc-macro-crate v3.5.0
+   Compiling fastapi-openapi v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling serde_urlencoded v0.7.1
+   Compiling libsqlite3-sys v0.38.2
+   Compiling monostate-impl v0.1.18
+   Compiling macro_rules_attribute-proc_macro v0.2.3
+   Compiling leb128 v0.2.7
+   Compiling base64 v0.13.1
+   Compiling mime v0.3.17
+   Compiling reqwest v0.12.28
+   Compiling spm_precompiled v0.1.4
+   Compiling varbincode v0.1.0
+   Compiling macro_rules_attribute v0.2.3
+   Compiling fastmcp-derive v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling monostate v0.1.18
+   Compiling fastapi-core v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling fastmcp-server v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling onig v6.5.3
+   Compiling tru v0.2.0 (https://github.com/Dicklesworthstone/toon_rust?rev=d48c5b55caeedc99368a1461535b7e0c143afe06#d48c5b55)
+   Compiling zstd v0.14.0
+   Compiling ndarray v0.17.2
+   Compiling fastmcp-client v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling frankenterm-pty-guardian v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-pty-guardian)
+   Compiling compact_str v0.9.1
+   Compiling ftui-backend v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling rayon-cond v0.4.0
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling dary_heap v0.3.9
+   Compiling ftui-i18n v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling daachorse v3.0.3
+   Compiling unicode_categories v0.1.1
+   Compiling ftui-runtime v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling tokenizers v0.23.2
+   Compiling fastmcp-rust v0.9.0 (https://github.com/Dicklesworthstone/fastmcp_rust?rev=180a7c88890705217bb8e202d19555adabf24187#180a7c88)
+   Compiling ort v2.0.0-rc.13
+   Compiling codec v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/codec)
+   Compiling fastapi-http v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling hf-hub v0.5.0
+   Compiling clap_complete v4.6.9
+   Compiling tikv-jemalloc-ctl v0.7.0
+   Compiling tikv-jemallocator v0.7.0
+   Compiling ftui-widgets v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling fastapi-output v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling safetensors v0.8.0
+   Compiling fastapi-macros v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling spinning_top v0.3.0
+   Compiling hashlink v0.12.1
+   Compiling fr-expire v0.1.0 (https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d)
+   Compiling frankenterm-core v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core)
+   Compiling futures-timer v3.0.4
+   Compiling fr-protocol v0.1.0 (https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d)
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fallible-iterator v0.3.0
+   Compiling nonzero_ext v0.3.0
+   Compiling unsafe-libyaml v0.2.11
+   Compiling governor v0.10.4
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling rusqlite v0.40.2
+   Compiling fr-persist v0.1.0 (https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d)
+   Compiling fr-store v0.1.0 (https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d)
+   Compiling fastapi-rust v0.4.4 (https://github.com/Dicklesworthstone/fastapi_rust?rev=fb15fa5025cfdc23ab99344db5e2a4939dbcf38e#fb15fa50)
+   Compiling fastembed v6.0.3
+   Compiling ftui v0.2.1 (https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f)
+   Compiling frankenterm-alloc v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-alloc)
+   Compiling frankenterm-core-mcp v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-mcp)
+   Compiling franken-agent-detection v0.2.4
+   Compiling roaring v0.11.5
+   Compiling dirs v7.0.0
+   Compiling frankenterm-core-cass-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-cass-types)
+   Compiling emojis v0.9.0
+   Compiling bloomfilter v3.0.1
+   Compiling rand v0.10.2
+   Compiling frankenterm-core-policy-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-policy-types)
+   Compiling rustls-pemfile v2.2.0
+   Compiling frankenterm-core-telemetry-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-telemetry-types)
+   Compiling frankenterm-core-resource-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-resource-types)
+   Compiling frankenterm-core-error-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-error-types)
+   Compiling ft-perf-gate v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/ft-perf-gate)
+   Compiling frankenterm-core-caut-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-caut-types)
+   Compiling frankenterm-core-connector-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-connector-types)
+   Compiling frankenterm-core-config-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-config-types)
+   Compiling fr-config v0.1.0 (https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d)
+   Compiling frankenterm-core-x11-resize-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-x11-resize-types)
+   Compiling predicates-core v1.0.10
+   Compiling frankenterm-core-atlas-pack-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-atlas-pack-types)
+   Compiling ratelim v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/ratelim)
+   Compiling compact_str v0.10.0
+   Compiling tar v0.4.46
+   Compiling frankensearch-index v0.3.0
+   Compiling safe_arch v1.2.0
+   Compiling yasna v0.6.0
+   Compiling pem v4.0.0
+   Compiling float-cmp v0.10.0
+   Compiling assert_cmd v2.2.2
+   Compiling difflib v0.4.0
+   Compiling termtree v0.5.1
+   Compiling normalize-line-endings v0.3.0
+   Compiling predicates v3.1.4
+   Compiling predicates-tree v1.0.13
+   Compiling rcgen v0.14.10
+   Compiling wide v1.7.0
+   Compiling frankenterm v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm)
+   Compiling frankensearch-core v0.3.0
+   Compiling frankenterm-client v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/frankenterm/client)
+   Compiling frankenterm-flight-recorder v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-flight-recorder)
+   Compiling dns-lookup v4.0.1
+   Compiling frankenterm-core-replay v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-core-replay)
+   Compiling frankenterm-mux-server-impl v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9/crates/frankenterm-mux-server-impl)
+    Finished `test-recovery` profile [unoptimized] target(s) in 11m 50s
+     Running unittests src/main.rs (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-4157331073ec1f2a4a959f4d6ba46d47/x86_64-unknown-linux-gnu/test-recovery/build/frankenterm/f5d73d4f13d31a00/out/ft-f5d73d4f13d31a00)
+
+running 3 tests
+test tests::cli_swarm_envelope_and_robot_swarm_envelope_parse ... ok
+test tests::robot_swarm_envelope_golden_scenarios_cover_json_and_toon_outputs ... ok
+test tests::robot_swarm_envelope_surfaces_are_dry_run_redacted_and_toon_safe ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 972 filtered out; finished in 0.05s
+
+  [2m2026-09-21T07:26:04.680612Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 711442ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1482 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:26:04.693079Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1573 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:26:04.693163Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-d825db70fe16125e329091ef90783dc9 on ts1[0m
+    [2;3mat[0m rch/src/transfer.rs:4648 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:26:04.914790Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifact retrieval budget from selected remote files, [1;32mselected_bytes[0m[32m: 0, [1;32mtotal_timeout_ms[0m[32m: 30000[0m
+    [2;3mat[0m rch/src/transfer.rs:1717 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:26:05.144088Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 450ms (0 files, 44 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:4705 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T07:26:05.144152Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 0 files, 44 bytes in 450ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1605 [2;3mon[0m ThreadId(1)
+
+[W] Worker: ts1 | Job: j-30023644042233671
+[T] Total: 735.1s (sync 23.2s, build 711.4s, artifacts 450ms)
+^ Sync: 345.8 MB in 23.2s (14.9 MB/s)
+[C] Compile: 711.4s
+v Artifacts: 44 B in 450ms (98 B/s)
+[T] Cache: MISS
++------------- [OK] Build Successful --------------+
+| Target: test-recovery                            |
+| Duration: 11.9m (^ 104% slower vs previous 5.8m) |
+| Artifacts: 0 files (44 B)                        |
+| Worker: ts1                                      |
+| Cache: MISS (warming cache)                      |
+| Time: 2026-09-21 07:26:05                        |
++--------------------------------------------------+
+[RCH] remote ts1 (753.7s)
+[RCH] clean-overlay receipt: base=773f5898277ebb612717065386835359d163e9df overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195 tree=3541bbfad9109fa6a38e296f334fe5f143128715

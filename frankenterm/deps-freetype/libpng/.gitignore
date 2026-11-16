@@ -1,0 +1,3 @@
+# Only track source files and scripts (needed for build)
+/contrib/
+/projects/

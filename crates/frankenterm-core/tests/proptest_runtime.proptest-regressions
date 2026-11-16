@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cdd77af6ada640ed99a630c2525e703591098dedc4b7362ca5a5f82855682f4e # shrinks to snap = RuntimeLockMemoryTelemetrySnapshot { timestamp_ms: 0, avg_storage_lock_wait_ms: 0.0, p50_storage_lock_wait_ms: 0.0, p95_storage_lock_wait_ms: 0.0, max_storage_lock_wait_ms: 10.236631110953935, storage_lock_contention_events: 0, avg_storage_lock_hold_ms: 0.0, p50_storage_lock_hold_ms: 0.0, p95_storage_lock_hold_ms: 0.0, max_storage_lock_hold_ms: 0.0, cursor_snapshot_bytes_last: 0, p50_cursor_snapshot_bytes: 0, p95_cursor_snapshot_bytes: 0, cursor_snapshot_bytes_max: 0, avg_cursor_snapshot_bytes: 0.0 }
+cc 7dad310447c3825be99d7a17c37306a69444340b029fb8423d468fdd54a58d4a # shrinks to snap = RuntimeLockMemoryTelemetrySnapshot { timestamp_ms: 0, avg_storage_lock_wait_ms: 922.4305788741601, p50_storage_lock_wait_ms: 0.0, p95_storage_lock_wait_ms: 0.0, max_storage_lock_wait_ms: 0.0, storage_lock_contention_events: 0, avg_storage_lock_hold_ms: 0.0, p50_storage_lock_hold_ms: 0.0, p95_storage_lock_hold_ms: 0.0, max_storage_lock_hold_ms: 0.0, cursor_snapshot_bytes_last: 0, p50_cursor_snapshot_bytes: 0, p95_cursor_snapshot_bytes: 0, cursor_snapshot_bytes_max: 0, avg_cursor_snapshot_bytes: 0.0 }

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-release.json",
+  "title": "WA Robot Release Response",
+  "description": "Schema for the data field when calling 'wa robot reservations release <reservation_id>'. Releases a pane reservation.",
+  "type": "object",
+  "required": ["reservation_id", "released"],
+  "properties": {
+    "reservation_id": {
+      "type": "integer",
+      "description": "ID of the reservation that was released"
+    },
+    "released": {
+      "type": "boolean",
+      "description": "True if a reservation was released, false if no matching reservation existed"
+    }
+  },
+  "additionalProperties": false
+}

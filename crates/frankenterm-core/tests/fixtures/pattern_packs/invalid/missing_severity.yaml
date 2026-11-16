@@ -1,0 +1,9 @@
+# Rule missing the required `severity` field — must fail serde parse.
+name: example.com:bad
+version: "1.0.0"
+rules:
+  - id: example.bad.no_severity
+    agent_type: codex
+    event_type: oops
+    anchors: ["something"]
+    description: This rule omits the severity field.

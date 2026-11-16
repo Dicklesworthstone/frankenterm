@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Fake frankenterm-term ingest_throughput for scripts/test_ghostty_headless_h2h.sh.
+
+* --gen-only: writes deterministic corpora and prints one
+  ft.bench.ingest-corpus.v1 line each ($FAKE_FT_BAD_SHA=1 misreports the hash).
+* --lane term --from-file F ...: sleeps $FAKE_FT_SLEEP (default 0.03), prints one
+  ft.bench.ingest-throughput.v1 line whose grid matches fake-probe's (shifted by
+  $FAKE_FT_ROW_SKEW rows, capped by --scrollback), reports its profile from its
+  own path like the real bench, and exits 1 unless $FAKE_FT_SANITY is unset or ok.
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+
+ALL = ("color_emoji_random", "color_random", "seq_lines")
+
+
+def parse_size(text: str) -> int:
+    for suffix, scale in (("KiB", 1024), ("MiB", 1 << 20), ("K", 1024), ("M", 1 << 20)):
+        if text.endswith(suffix):
+            return int(text[: -len(suffix)]) * scale
+    return int(text)
+
+
+def options(argv):
+    flags = {"--gen-only": False}
+    values = {}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--gen-only":
+            flags[arg] = True
+            index += 1
+        else:
+            values[arg] = argv[index + 1]
+            index += 2
+    return flags, values
+
+
+def gen(values) -> int:
+    names = ALL if values["--corpus"] == "all" else values["--corpus"].split(",")
+    size = parse_size(values.get("--size", "64MiB"))
+    directory = values["--corpus-dir"]
+    os.makedirs(directory, exist_ok=True)
+    for name in names:
+        unit = f"{name}:".encode()
+        content = (unit * (size // len(unit) + 1))[:size]
+        path = os.path.join(directory, f"{name}-{size}.bin")
+        with open(path, "wb") as handle:
+            handle.write(content)
+        sha = hashlib.sha256(content).hexdigest()
+        if os.environ.get("FAKE_FT_BAD_SHA"):
+            sha = "0" * 64
+        print(json.dumps({
+            "schema": "ft.bench.ingest-corpus.v1", "corpus": name, "corpus_source": "generated",
+            "corpus_path": path, "corpus_sha256": sha, "seed": int(values.get("--seed", 20261005)),
+            "bytes": size,
+        }))
+    return 0
+
+
+def lane(values) -> int:
+    path = values["--from-file"]
+    rows, cols = int(values["--rows"]), int(values["--cols"])
+    scrollback = int(values["--scrollback"])
+    size = os.path.getsize(path)
+    started = time.perf_counter()
+    time.sleep(float(os.environ.get("FAKE_FT_SLEEP", "0.03")))
+    secs = time.perf_counter() - started
+    retained = min(rows + size // 100 + int(os.environ.get("FAKE_FT_ROW_SKEW", "0")), rows + scrollback)
+    sanity = os.environ.get("FAKE_FT_SANITY", "ok")
+    exe = os.path.abspath(sys.argv[0])
+    profile = os.path.basename(os.path.dirname(os.path.dirname(exe)))
+    fingerprint = hashlib.sha256(f"{size}:{rows}:{cols}".encode()).hexdigest()[:16]
+    print(json.dumps({
+        "schema": "ft.bench.ingest-throughput.v1", "lane": values["--lane"], "corpus": "file:x",
+        "corpus_path": path, "bytes": size, "secs": secs, "rows": rows, "cols": cols,
+        "scrollback": scrollback, "chunk": int(values["--chunk"]), "cursor_x": size % cols,
+        "cursor_y": rows - 1, "retained_rows": retained, "state_fingerprint": fingerprint,
+        "sanity": sanity, "profile": profile, "debug_assertions": False,
+    }))
+    return 0 if sanity == "ok" else 1
+
+
+def main() -> int:
+    flags, values = options(sys.argv[1:])
+    return gen(values) if flags["--gen-only"] else lane(values)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

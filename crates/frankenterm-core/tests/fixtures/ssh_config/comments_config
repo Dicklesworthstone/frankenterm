@@ -1,0 +1,10 @@
+# Comment-only line
+
+# Global options should be ignored (appear before any Host blocks)
+User ignored
+
+Host   test   # inline comment
+  HostName test.example.com   # trailing comment
+  User   alice
+  Port  2200
+  IdentityFile "~/.ssh/id_rsa"  # quoted path

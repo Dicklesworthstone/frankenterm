@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc be3cb135255efe6791aa1bfaefe70b61279b2c66b18f81600fb07c8985098fe0 # shrinks to kind = FrankenSqlite

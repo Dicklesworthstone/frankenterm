@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4403de0f516ca9cdf814f00aef7512c81e86c05481b433615470f56806fddabb # shrinks to thresholds = StorageHealthThresholds { writer_queue: WriterQueueThresholds { yellow_ratio: 0.01, red_ratio: 0.02 }, wal: WalThresholds { yellow_frames: 36, red_frames: 276 }, fts_consistency: FtsConsistencyThresholds { yellow_ratio: 0.9216281873347589, red_ratio: 0.8560417185786356 }, indexing_lag: IndexingLagThresholds { yellow: 4.102s, red: 7.473s } }

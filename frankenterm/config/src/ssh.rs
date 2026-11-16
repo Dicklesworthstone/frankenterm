@@ -1,0 +1,297 @@
+use crate::config::validate_domain_name;
+use crate::*;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "lua")]
+use luahelper::impl_lua_conversion_dynamic;
+use std::fmt::Display;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SshBackend {
+    Ssh2,
+    LibSsh,
+}
+
+impl Default for SshBackend {
+    fn default() -> Self {
+        Self::LibSsh
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum SshMultiplexing {
+    WezTerm,
+    None,
+    // TODO: Tmux-cc in the future?
+}
+
+impl Default for SshMultiplexing {
+    fn default() -> Self {
+        Self::WezTerm
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum Shell {
+    /// Unknown command shell: no assumptions can be made
+    Unknown,
+
+    /// Posix shell compliant, such that `cd DIR ; exec CMD` behaves
+    /// as it does in the bourne shell family of shells
+    Posix,
+    // TODO: Cmd, PowerShell in the future?
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Default, Debug, Clone, Eq, PartialEq, FromDynamic, ToDynamic)]
+pub struct SshDomain {
+    /// The name of this specific domain.  Must be unique amongst
+    /// all types of domain in the configuration file.
+    #[dynamic(validate = "validate_domain_name")]
+    pub name: String,
+
+    /// identifies the host:port pair of the remote server.
+    pub remote_address: String,
+
+    /// Whether agent auth should be disabled
+    #[dynamic(default)]
+    pub no_agent_auth: bool,
+
+    /// The username to use for authenticating with the remote host
+    pub username: Option<String>,
+
+    /// If true, connect to this domain automatically at startup
+    #[dynamic(default)]
+    pub connect_automatically: bool,
+
+    #[dynamic(default = "default_read_timeout")]
+    pub timeout: Duration,
+
+    #[dynamic(default = "default_local_echo_threshold_ms")]
+    pub local_echo_threshold_ms: Option<u64>,
+
+    /// Show time since last response when waiting for a response.
+    /// It is recommended to use
+    /// <https://wezterm.org/config/lua/pane/get_metadata.html#since_last_response_ms>
+    /// instead.
+    #[dynamic(default)]
+    pub overlay_lag_indicator: bool,
+
+    /// The path to the wezterm binary on the remote host
+    pub remote_wezterm_path: Option<String>,
+    /// Override the entire `wezterm cli proxy` invocation that would otherwise
+    /// be computed from remote_wezterm_path and other information.
+    pub override_proxy_command: Option<String>,
+
+    pub ssh_backend: Option<SshBackend>,
+
+    /// If false, then don't use a multiplexer connection,
+    /// just connect directly using ssh. This doesn't require
+    /// that the remote host have wezterm installed, and is equivalent
+    /// to using `wezterm ssh` to connect.
+    #[dynamic(default)]
+    pub multiplexing: SshMultiplexing,
+
+    /// ssh_config option values
+    #[dynamic(default)]
+    pub ssh_option: HashMap<String, String>,
+
+    /// Optional override path for the ssh_config file used for this domain.
+    ///
+    /// When set, ft resolves host defaults from this file instead of the
+    /// standard ssh config search path and passes the same override to the
+    /// libssh session initialization path.
+    pub ssh_config_file: Option<String>,
+
+    pub default_prog: Option<Vec<String>>,
+
+    #[dynamic(default)]
+    pub assume_shell: Shell,
+}
+#[cfg(feature = "lua")]
+impl_lua_conversion_dynamic!(SshDomain);
+
+impl SshDomain {
+    pub fn default_domains() -> Vec<Self> {
+        let mut config = frankenterm_ssh::Config::new();
+        config.add_default_config_files();
+
+        let mut plain_ssh = vec![];
+        let mut mux_ssh = vec![];
+        for host in config.enumerate_hosts() {
+            plain_ssh.push(Self {
+                name: format!("SSH:{host}"),
+                remote_address: host.to_string(),
+                multiplexing: SshMultiplexing::None,
+                local_echo_threshold_ms: default_local_echo_threshold_ms(),
+                ..SshDomain::default()
+            });
+
+            mux_ssh.push(Self {
+                name: format!("SSHMUX:{host}"),
+                remote_address: host.to_string(),
+                multiplexing: SshMultiplexing::WezTerm,
+                local_echo_threshold_ms: default_local_echo_threshold_ms(),
+                ..SshDomain::default()
+            });
+        }
+
+        plain_ssh.append(&mut mux_ssh);
+        plain_ssh
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SshParameters {
+    pub username: Option<String>,
+    pub host_and_port: String,
+}
+
+impl Display for SshParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(user) = &self.username {
+            write!(f, "{}@{}", user, self.host_and_port)
+        } else {
+            write!(f, "{}", self.host_and_port)
+        }
+    }
+}
+
+pub fn username_from_env() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    const USER: &str = "USER";
+    #[cfg(windows)]
+    const USER: &str = "USERNAME";
+
+    std::env::var(USER).with_context(|| format!("while resolving {} env var", USER))
+}
+
+impl FromStr for SshParameters {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('@').collect();
+
+        if parts.len() == 2 {
+            Ok(Self {
+                username: Some(parts[0].to_string()),
+                host_and_port: parts[1].to_string(),
+            })
+        } else if parts.len() == 1 {
+            Ok(Self {
+                username: None,
+                host_and_port: parts[0].to_string(),
+            })
+        } else {
+            bail!("failed to parse ssh parameters from `{}`", s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_stable() {
+        assert!(matches!(SshBackend::default(), SshBackend::LibSsh));
+        assert!(matches!(
+            SshMultiplexing::default(),
+            SshMultiplexing::WezTerm
+        ));
+        assert!(matches!(Shell::default(), Shell::Unknown));
+    }
+
+    #[test]
+    fn ssh_parameters_parse_with_username() {
+        let params: SshParameters = "alice@example.com:2222".parse().expect("parse");
+        assert_eq!(params.username.as_deref(), Some("alice"));
+        assert_eq!(params.host_and_port, "example.com:2222");
+        assert_eq!(params.to_string(), "alice@example.com:2222");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_without_username() {
+        let params: SshParameters = "example.com".parse().expect("parse");
+        assert_eq!(params.username, None);
+        assert_eq!(params.host_and_port, "example.com");
+        assert_eq!(params.to_string(), "example.com");
+    }
+
+    #[test]
+    fn ssh_parameters_reject_invalid_format() {
+        let err = "a@b@c".parse::<SshParameters>().expect_err("should fail");
+        assert!(
+            err.to_string().contains("failed to parse ssh parameters"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn ssh_parameters_display_with_username() {
+        let params = SshParameters {
+            username: Some("admin".to_string()),
+            host_and_port: "server.local:22".to_string(),
+        };
+        assert_eq!(params.to_string(), "admin@server.local:22");
+    }
+
+    #[test]
+    fn ssh_parameters_display_without_username() {
+        let params = SshParameters {
+            username: None,
+            host_and_port: "server.local".to_string(),
+        };
+        assert_eq!(params.to_string(), "server.local");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_host_only() {
+        let params: SshParameters = "192.168.1.1".parse().unwrap();
+        assert_eq!(params.username, None);
+        assert_eq!(params.host_and_port, "192.168.1.1");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_with_port() {
+        let params: SshParameters = "root@10.0.0.1:2222".parse().unwrap();
+        assert_eq!(params.username.as_deref(), Some("root"));
+        assert_eq!(params.host_and_port, "10.0.0.1:2222");
+    }
+
+    #[test]
+    fn ssh_domain_default_values() {
+        let domain = SshDomain::default();
+        assert_eq!(domain.name, "");
+        assert_eq!(domain.remote_address, "");
+        assert!(!domain.no_agent_auth);
+        assert!(domain.username.is_none());
+        assert!(domain.ssh_config_file.is_none());
+        assert!(!domain.connect_automatically);
+        assert!(matches!(domain.multiplexing, SshMultiplexing::WezTerm));
+        assert!(matches!(domain.assume_shell, Shell::Unknown));
+    }
+
+    #[test]
+    fn ssh_multiplexing_equality() {
+        assert_eq!(SshMultiplexing::WezTerm, SshMultiplexing::WezTerm);
+        assert_ne!(SshMultiplexing::WezTerm, SshMultiplexing::None);
+    }
+
+    #[test]
+    fn ssh_parameters_clone() {
+        let params = SshParameters {
+            username: Some("user".to_string()),
+            host_and_port: "host:22".to_string(),
+        };
+        let cloned = params.clone();
+        assert_eq!(cloned.username, params.username);
+        assert_eq!(cloned.host_and_port, params.host_and_port);
+    }
+}

@@ -1,0 +1,3 @@
+{"ts_ms":0,"op":"upload","version_before":0,"version_after":1,"bytes":1024}
+{"ts_ms":50,"op":"grow","version_before":1,"version_after":2,"bytes":16777216}
+{"ts_ms":60,"op":"upload","version_before":2,"version_after":3,"bytes":1024}

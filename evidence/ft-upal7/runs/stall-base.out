@@ -1,0 +1,28 @@
+[multi 13:52:51] app /Users/jemanuel/ft-build/upal7/fam-base/FrankenTerm.app retention 100000, 50 panes of 40000 rows
+[2026-11-06 13:52:51] published family 0.15.21-b4218ab
+[2026-11-06 13:52:51] recovery identities created
+[2026-11-06 13:52:51] recovery wrapping key created
+[2026-11-06 13:52:52] recovery store prepared
+[2026-11-06 13:52:52] recovery key enrolled
+[2026-11-06 13:52:56] install complete: mux /private/tmp/ftrt-49056/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, guardian /private/tmp/ftrt-49056/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, panes [0 1 2 3]
+[multi 13:53:16] panes before the stall: 50
+[multi 13:53:16] guardian 49424 stalled: 0.2 s running, then 3.8 s stopped, over and over
+[multi 14:08:36] no root yet
+[multi 14:08:36] before the kill (no reads):
+   4 ERROR frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery outcome=capture_rejected disabled=false
+   2 WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 19
+   2 WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 18
+[multi 14:08:39] guardian 49424 running again
+[multi 14:08:39] reuse lines: 0; capture deadlines: 0
+[multi 14:08:39] mux 49551 killed
+[2026-11-06 14:08:39] family 0.15.21-b4218ab already published
+[2026-11-06 14:13:52] ERROR: mux did not come up with a pane; see /private/tmp/ftrt-49056/h/.local/state/frankenterm-guardian-e2e/logs or the service journal
+[multi 14:13:52] the host script gave up after 313 s; watching the mux itself
+[multi 14:19:03] the mux itself, 624 s after the restart: still restoring
+[2026-11-06T19:07:54Z WARN  mux::pane_registration_handle] guardian checkpoint of pane 25 took 3993 ms: parser 247 ms, publication 3745 ms, 5386615 payload bytes
+[2026-11-06T19:07:58Z WARN  mux::pane_registration_handle] guardian checkpoint of pane 26 took 3998 ms: parser 219 ms, publication 3778 ms, 5386613 payload bytes
+[2026-11-06T19:08:02Z WARN  mux::pane_registration_handle] guardian checkpoint of pane 27 took 4044 ms: parser 210 ms, publication 3833 ms, 5386610 payload bytes
+[2026-11-06T19:08:22Z WARN  frankenterm_mux_server_impl::guardian_proxy] guardian checkpoint publication took 19747 ms: stage 11756 ms, adoption 4016 ms, ack 3974 ms
+[2026-11-06T19:08:22Z WARN  mux::pane_registration_handle] guardian checkpoint of pane 28 took 20076 ms: parser 222 ms, publication 19854 ms, 5386607 payload bytes
+[2026-11-06 14:08:40] ERROR: guardian holds 50 live pane(s), but no committed recovery snapshot exists; refusing a fresh mux start
+[multi 14:19:03] sandbox /private/tmp/ftrt-49056, 990M

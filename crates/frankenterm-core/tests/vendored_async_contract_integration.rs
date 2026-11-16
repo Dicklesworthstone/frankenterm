@@ -1,0 +1,538 @@
+// ft-yqd3w: this entire file is migration-era scaffolding that
+// references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
+// (deleted) or the SurfaceGuardReport object model in
+// runtime_async_surface_guard (rewritten to a tighter form). The Tokio→
+// asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
+// suites have nothing left to anchor on. Disabled wholesale via cfg(any())
+// rather than deleted (AGENTS.md RULE 1) — the file content is preserved
+// for audit but never compiled. ft-3hi74 (folded into ft-yqd3w) covers the
+// architectural follow-up.
+#![cfg(any())]
+
+//! Integration tests for Core↔Vendored async contracts (ft-e34d9.10.5.4 AC#4).
+//!
+//! Validates cross-layer workflows and degraded behavior using the contract
+//! definitions from `vendored_async_contracts.rs`. These tests exercise the
+//! compliance and audit infrastructure to prove that contract invariants
+//! hold at the integration level — not just in isolation.
+
+use std::collections::BTreeSet;
+
+use frankenterm_core::{
+    runtime_async::{SURFACE_CONTRACT_V1, SurfaceDisposition},
+    vendored_async_contracts::*,
+};
+
+// =============================================================================
+// Contract Infrastructure Integration
+// =============================================================================
+
+#[test]
+fn standard_contracts_cover_all_categories() {
+    let contracts = standard_contracts();
+    let categories: std::collections::HashSet<_> = contracts.iter().map(|c| c.category).collect();
+
+    assert!(categories.contains(&ContractCategory::Ownership));
+    assert!(categories.contains(&ContractCategory::Cancellation));
+    assert!(categories.contains(&ContractCategory::Channeling));
+    assert!(categories.contains(&ContractCategory::ErrorMapping));
+    assert!(categories.contains(&ContractCategory::Backpressure));
+    assert!(categories.contains(&ContractCategory::Timeout));
+    assert!(categories.contains(&ContractCategory::TaskLifecycle));
+    assert_eq!(categories.len(), 7, "exactly 7 contract categories");
+}
+
+#[test]
+fn standard_contracts_have_exactly_12_entries() {
+    assert_eq!(standard_contracts().len(), 12);
+}
+
+#[test]
+fn contract_ids_are_unique() {
+    let contracts = standard_contracts();
+    let ids: std::collections::HashSet<_> = contracts.iter().map(|c| &c.contract_id).collect();
+    assert_eq!(ids.len(), contracts.len());
+}
+
+#[test]
+fn contract_ids_follow_naming_convention() {
+    for contract in &standard_contracts() {
+        assert!(
+            contract.contract_id.starts_with("ABC-"),
+            "Contract ID '{}' must start with 'ABC-'",
+            contract.contract_id
+        );
+        assert_eq!(
+            contract.contract_id.split('-').count(),
+            3,
+            "Contract ID format: ABC-CAT-NNN"
+        );
+    }
+}
+
+#[test]
+fn only_err_002_is_non_verifiable() {
+    let contracts = standard_contracts();
+    let non_verifiable: Vec<_> = contracts.iter().filter(|c| !c.verifiable).collect();
+    assert_eq!(non_verifiable.len(), 1);
+    assert_eq!(non_verifiable[0].contract_id, "ABC-ERR-002");
+}
+
+// =============================================================================
+// Compliance Evidence Assembly
+// =============================================================================
+
+fn make_evidence(contract: &AsyncBoundaryContract, passed: bool) -> ContractEvidence {
+    ContractEvidence {
+        contract_id: contract.contract_id.clone(),
+        test_name: format!("integration_{}", contract.contract_id),
+        passed,
+        evidence_type: EvidenceType::IntegrationTest,
+        detail: if passed { "OK" } else { "FAIL" }.into(),
+    }
+}
+
+#[test]
+fn compliance_with_all_passing_evidence() {
+    for contract in standard_contracts() {
+        let evidence = vec![make_evidence(&contract, true)];
+        let compliance = ContractCompliance::from_evidence(contract.clone(), evidence);
+        assert!(
+            compliance.compliant,
+            "Contract {} should be compliant with passing evidence",
+            contract.contract_id
+        );
+        assert!((compliance.coverage - 1.0).abs() < f64::EPSILON);
+    }
+}
+
+#[test]
+fn compliance_with_failing_evidence() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let evidence = vec![make_evidence(&contract, false)];
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(!compliance.compliant);
+    assert!((compliance.coverage - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn compliance_with_mixed_evidence_computes_coverage() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let evidence = vec![
+        ContractEvidence {
+            contract_id: contract.contract_id.clone(),
+            test_name: "test_a".into(),
+            passed: true,
+            evidence_type: EvidenceType::UnitTest,
+            detail: "OK".into(),
+        },
+        ContractEvidence {
+            contract_id: contract.contract_id.clone(),
+            test_name: "test_b".into(),
+            passed: false,
+            evidence_type: EvidenceType::StaticAnalysis,
+            detail: "Found violation".into(),
+        },
+    ];
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(!compliance.compliant, "mixed evidence → non-compliant");
+    assert!(
+        (compliance.coverage - 0.5).abs() < f64::EPSILON,
+        "50% coverage"
+    );
+}
+
+#[test]
+fn compliance_with_no_evidence_is_non_compliant() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let compliance = ContractCompliance::from_evidence(contract, Vec::new());
+    assert!(!compliance.compliant);
+    assert!((compliance.coverage - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn compliance_with_mismatched_contract_id_is_non_compliant() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let evidence = vec![
+        make_evidence(&contract, true),
+        ContractEvidence {
+            contract_id: "ABC-CAN-001".into(),
+            test_name: "wrong_contract".into(),
+            passed: true,
+            evidence_type: EvidenceType::StaticAnalysis,
+            detail: "mismatch".into(),
+        },
+    ];
+
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(!compliance.compliant);
+    assert!(
+        (compliance.coverage - 1.0).abs() < f64::EPSILON,
+        "coverage should only consider matching evidence entries"
+    );
+}
+
+#[test]
+fn audit_report_mismatched_only_evidence_is_uncovered() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let contract_id = contract.contract_id.clone();
+    let mut report = ContractAuditReport::new("mismatched-only", 4000);
+    let evidence = vec![ContractEvidence {
+        contract_id: "ABC-CAN-001".into(),
+        test_name: "wrong_contract".into(),
+        passed: true,
+        evidence_type: EvidenceType::StaticAnalysis,
+        detail: "mismatch".into(),
+    }];
+
+    report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
+    report.finalize();
+
+    assert_eq!(report.uncovered_contracts, vec![contract_id]);
+    assert!(!report.overall_compliant);
+    assert_eq!(report.failing_contracts().len(), 1);
+    assert_eq!(report.failing_contracts()[0].matching_evidence_count(), 0);
+}
+
+// =============================================================================
+// Audit Report Assembly
+// =============================================================================
+
+fn build_report(all_passing: bool) -> ContractAuditReport {
+    let mut report = ContractAuditReport::new("integration-test", 1000);
+    for contract in standard_contracts() {
+        let evidence = vec![make_evidence(&contract, all_passing)];
+        report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
+    }
+    report.finalize();
+    report
+}
+
+#[test]
+fn audit_report_all_passing() {
+    let report = build_report(true);
+    assert!(report.overall_compliant);
+    assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
+    assert!(report.uncovered_contracts.is_empty());
+    assert!(report.failing_contracts().is_empty());
+}
+
+#[test]
+fn audit_report_all_failing() {
+    let report = build_report(false);
+    assert!(!report.overall_compliant);
+    assert!((report.compliance_rate - 0.0).abs() < f64::EPSILON);
+    assert_eq!(report.failing_contracts().len(), 12);
+}
+
+#[test]
+fn audit_report_with_one_failure() {
+    let mut report = ContractAuditReport::new("partial-test", 2000);
+    for (i, contract) in standard_contracts().into_iter().enumerate() {
+        let evidence = vec![make_evidence(&contract, i != 0)];
+        report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
+    }
+    report.finalize();
+
+    assert!(!report.overall_compliant);
+    assert!(report.compliance_rate > 0.9); // 11/12 = 0.917
+    assert_eq!(report.failing_contracts().len(), 1);
+    assert_eq!(
+        report.failing_contracts()[0].contract.contract_id,
+        "ABC-OWN-001"
+    );
+}
+
+#[test]
+fn audit_report_empty_is_non_compliant() {
+    let mut report = ContractAuditReport::new("empty-test", 3000);
+    report.finalize();
+    assert!(!report.overall_compliant);
+    assert!((report.compliance_rate - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn audit_report_by_category_covers_all_7() {
+    let report = build_report(true);
+    let by_cat = report.by_category();
+    assert_eq!(by_cat.len(), 7, "must cover all 7 categories");
+}
+
+#[test]
+fn audit_report_summary_is_non_empty() {
+    let report = build_report(true);
+    let summary = report.summary();
+    assert!(!summary.is_empty());
+    assert!(summary.contains("COMPLIANT"));
+}
+
+// =============================================================================
+// Compatibility Mapping Integration
+// =============================================================================
+
+#[test]
+fn compatibility_mappings_cover_runtime_surface_contract_exactly() {
+    let mappings = standard_compatibility_mappings();
+    let mapping_apis: std::collections::BTreeSet<_> = mappings
+        .iter()
+        .map(|mapping| mapping.compat_api.as_str())
+        .collect();
+    let contract_apis: std::collections::BTreeSet<_> =
+        SURFACE_CONTRACT_V1.iter().map(|entry| entry.api).collect();
+    let missing: Vec<_> = contract_apis.difference(&mapping_apis).copied().collect();
+    let extra: Vec<_> = mapping_apis.difference(&contract_apis).copied().collect();
+
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "compatibility mappings drifted from SURFACE_CONTRACT_V1; missing={missing:?} extra={extra:?}"
+    );
+    assert_eq!(
+        mappings.len(),
+        SURFACE_CONTRACT_V1.len(),
+        "compatibility mappings should remain one-to-one with SURFACE_CONTRACT_V1"
+    );
+}
+
+#[test]
+fn compatibility_mapping_apis_are_unique() {
+    let mappings = standard_compatibility_mappings();
+    let apis: std::collections::HashSet<_> = mappings.iter().map(|m| &m.compat_api).collect();
+    assert_eq!(apis.len(), mappings.len());
+}
+
+#[test]
+fn compatibility_mapping_contract_ids_reference_valid_contracts() {
+    let contract_ids: std::collections::HashSet<_> = standard_contracts()
+        .iter()
+        .map(|c| c.contract_id.clone())
+        .collect();
+    for mapping in &standard_compatibility_mappings() {
+        for cid in &mapping.satisfies_contracts {
+            assert!(
+                contract_ids.contains(cid),
+                "Mapping '{}' references unknown contract '{}'",
+                mapping.compat_api,
+                cid
+            );
+        }
+    }
+}
+
+#[test]
+fn misaligned_mappings_have_reasons() {
+    // spawn_detached, process::Command, and signal should be misaligned
+    let mappings = standard_compatibility_mappings();
+    assert!(
+        mappings.iter().filter(|m| !m.disposition_aligned).count() >= 3,
+        "at least 3 misaligned mappings expected"
+    );
+}
+
+#[test]
+fn misaligned_mappings_match_non_keep_surface_contracts_exactly() {
+    let mappings = standard_compatibility_mappings();
+    let misaligned: BTreeSet<_> = mappings
+        .iter()
+        .filter(|mapping| !mapping.disposition_aligned)
+        .map(|mapping| mapping.compat_api.as_str())
+        .collect();
+    let non_keep_surfaces: BTreeSet<_> = SURFACE_CONTRACT_V1
+        .iter()
+        .filter(|entry| entry.disposition != SurfaceDisposition::Keep)
+        .map(|entry| entry.api)
+        .collect();
+
+    assert_eq!(
+        misaligned, non_keep_surfaces,
+        "non-aligned compatibility mappings must stay in exact lockstep with non-Keep runtime surfaces"
+    );
+}
+
+#[test]
+fn zero_contract_mappings_are_exactly_detached_or_retired_surfaces() {
+    let zero_contract_mappings: BTreeSet<_> = standard_compatibility_mappings()
+        .into_iter()
+        .filter(|mapping| mapping.satisfies_contracts.is_empty())
+        .map(|mapping| mapping.compat_api)
+        .collect();
+    let expected: BTreeSet<String> = [
+        "CompatRuntime::spawn_detached",
+        "process::Command",
+        "signal",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    assert_eq!(
+        zero_contract_mappings, expected,
+        "only detached-task and retired tokio-only surfaces should be contractless"
+    );
+}
+
+#[test]
+fn canonical_channel_bridge_mappings_are_present_and_aligned() {
+    let mappings = standard_compatibility_mappings();
+    for api in ["broadcast", "oneshot", "notify"] {
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.compat_api == api)
+            .unwrap_or_else(|| panic!("missing mapping for {api}"));
+        assert!(
+            mapping
+                .satisfies_contracts
+                .iter()
+                .any(|id| id == "ABC-CHN-001"),
+            "{api} should satisfy the canonical channel contract"
+        );
+        assert!(
+            mapping.disposition_aligned,
+            "{api} should remain aligned because it is a Keep surface"
+        );
+    }
+}
+
+#[test]
+fn compatibility_mappings_cover_all_verifiable_contracts() {
+    let unmapped = compatibility_unmapped_verifiable_contract_ids();
+    assert!(
+        unmapped.is_empty(),
+        "verifiable contracts missing from compatibility mappings: {unmapped:?}"
+    );
+}
+
+#[test]
+fn compatibility_mappings_cover_all_verifiable_categories() {
+    let mapped_ids = compatibility_mapped_contract_ids();
+    let mapped_categories: std::collections::HashSet<_> = standard_contracts()
+        .into_iter()
+        .filter(|contract| contract.verifiable)
+        .filter(|contract| mapped_ids.contains(contract.contract_id.as_str()))
+        .map(|contract| contract.category)
+        .collect();
+
+    for expected in [
+        ContractCategory::Ownership,
+        ContractCategory::Cancellation,
+        ContractCategory::Channeling,
+        ContractCategory::ErrorMapping,
+        ContractCategory::Backpressure,
+        ContractCategory::Timeout,
+        ContractCategory::TaskLifecycle,
+    ] {
+        assert!(
+            mapped_categories.contains(&expected),
+            "compatibility mappings should cover {expected:?}"
+        );
+    }
+}
+
+// =============================================================================
+// Cross-Category Invariant Tests
+// =============================================================================
+
+#[test]
+fn ownership_contracts_are_bidirectional() {
+    let ownership: Vec<_> = standard_contracts()
+        .into_iter()
+        .filter(|c| c.category == ContractCategory::Ownership)
+        .collect();
+    assert_eq!(ownership.len(), 2);
+    for c in &ownership {
+        assert_eq!(c.direction, BoundaryDirection::Bidirectional);
+    }
+}
+
+#[test]
+fn error_mapping_includes_vendored_to_core() {
+    let err: Vec<_> = standard_contracts()
+        .into_iter()
+        .filter(|c| c.category == ContractCategory::ErrorMapping)
+        .collect();
+    assert_eq!(err.len(), 2);
+    assert!(
+        err.iter()
+            .any(|c| c.direction == BoundaryDirection::VendoredToCore)
+    );
+}
+
+#[test]
+fn backpressure_is_vendored_to_core() {
+    let bp: Vec<_> = standard_contracts()
+        .into_iter()
+        .filter(|c| c.category == ContractCategory::Backpressure)
+        .collect();
+    assert_eq!(bp.len(), 1);
+    assert_eq!(bp[0].direction, BoundaryDirection::VendoredToCore);
+}
+
+#[test]
+fn timeout_is_core_to_vendored() {
+    let to: Vec<_> = standard_contracts()
+        .into_iter()
+        .filter(|c| c.category == ContractCategory::Timeout)
+        .collect();
+    assert_eq!(to.len(), 1);
+    assert_eq!(to[0].direction, BoundaryDirection::CoreToVendored);
+}
+
+// =============================================================================
+// Serde Stability
+// =============================================================================
+
+#[test]
+fn all_contracts_serde_roundtrip() {
+    let contracts = standard_contracts();
+    let json = serde_json::to_string_pretty(&contracts).unwrap();
+    let back: Vec<AsyncBoundaryContract> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.len(), contracts.len());
+    for (a, b) in contracts.iter().zip(back.iter()) {
+        assert_eq!(a.contract_id, b.contract_id);
+        assert_eq!(a.category, b.category);
+        assert_eq!(a.direction, b.direction);
+    }
+}
+
+#[test]
+fn audit_report_serde_roundtrip() {
+    let report = build_report(true);
+    let json = serde_json::to_string(&report).unwrap();
+    let back: ContractAuditReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.overall_compliant, report.overall_compliant);
+    assert!((back.compliance_rate - report.compliance_rate).abs() < f64::EPSILON);
+    assert_eq!(back.contracts.len(), report.contracts.len());
+}
+
+// =============================================================================
+// Regression Anchors
+// =============================================================================
+
+#[test]
+fn contract_category_distribution_is_stable() {
+    let contracts = standard_contracts();
+    let mut counts: std::collections::HashMap<ContractCategory, usize> =
+        std::collections::HashMap::new();
+    for c in &contracts {
+        *counts.entry(c.category).or_default() += 1;
+    }
+    assert_eq!(counts[&ContractCategory::Ownership], 2);
+    assert_eq!(counts[&ContractCategory::Cancellation], 2);
+    assert_eq!(counts[&ContractCategory::Channeling], 2);
+    assert_eq!(counts[&ContractCategory::ErrorMapping], 2);
+    assert_eq!(counts[&ContractCategory::Backpressure], 1);
+    assert_eq!(counts[&ContractCategory::Timeout], 1);
+    assert_eq!(counts[&ContractCategory::TaskLifecycle], 2);
+}
+
+#[test]
+fn all_invariant_fields_non_empty() {
+    for c in &standard_contracts() {
+        assert!(!c.invariant.is_empty(), "{} invariant empty", c.contract_id);
+        assert!(
+            !c.violation_impact.is_empty(),
+            "{} impact empty",
+            c.contract_id
+        );
+        assert!(!c.description.is_empty(), "{} desc empty", c.contract_id);
+    }
+}

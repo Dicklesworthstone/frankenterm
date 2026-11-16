@@ -1,0 +1,92 @@
+//! Testing C0 control characters
+
+use super::*;
+
+#[test]
+fn test_bs() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.assert_cursor_pos(0, 0, None, Some(0));
+    term.print("\x08");
+    term.assert_cursor_pos(0, 0, Some("cannot move left of the margin"), Some(0));
+    term.print("ab\x08");
+    term.assert_cursor_pos(1, 0, None, None);
+    // TODO: when we can set the left margin, we should test that here
+}
+
+#[test]
+fn test_lf() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("hello\n");
+    term.assert_cursor_pos(5, 1, Some("LF moves vertically only"), None);
+}
+
+#[test]
+fn lf_under_origin_mode_moves_down_one_row_in_the_same_column() {
+    let mut term = TestTerm::new(10, 10, 0);
+    term.set_scroll_region(3, 7);
+    term.set_mode("?6", true);
+    term.assert_cursor_pos(0, 3, Some("DECOM homes the cursor to the region"), None);
+    term.print("a\n");
+    term.assert_cursor_pos(1, 4, Some("LF moves down one row"), None);
+    term.print("\n\n\n");
+    term.assert_cursor_pos(1, 7, Some("LF reaches the bottom margin"), None);
+    term.print("\n");
+    term.assert_cursor_pos(1, 7, Some("LF at the bottom margin scrolls"), None);
+
+    let mut term = TestTerm::new(10, 10, 0);
+    term.set_mode("?69", true);
+    term.set_left_and_right_margins(2, 6);
+    term.set_scroll_region(3, 7);
+    term.set_mode("?6", true);
+    term.assert_cursor_pos(2, 3, Some("DECOM homes the cursor to the margins"), None);
+    term.print("ab\n");
+    term.assert_cursor_pos(4, 4, Some("LF keeps the column"), None);
+}
+
+#[test]
+fn test_cr() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("hello\r");
+    term.assert_cursor_pos(
+        0,
+        0,
+        Some(
+            "CR moves to left margin on current line, \
+             but is unchanged relative to the initial state",
+        ),
+        Some(0),
+    );
+    // TODO: when we can set the left margin, we should test that here
+}
+
+#[test]
+fn test_tab() {
+    let mut term = TestTerm::new(3, 25, 0);
+    term.print("\t");
+    term.assert_cursor_pos(8, 0, None, None);
+    term.print("\t");
+    term.assert_cursor_pos(16, 0, None, None);
+    term.print("\t");
+    term.assert_cursor_pos(24, 0, None, None);
+    term.print("\t");
+    term.assert_cursor_pos(24, 0, None, None);
+}
+
+#[test]
+fn saturating_tab_stops_respect_clamped_left_right_margins() {
+    let mut term = TestTerm::new(3, 6, 0);
+    term.set_mode("?69", true);
+    term.set_left_and_right_margins(1, 4);
+    term.cup(1, 0);
+
+    term.print("\t");
+    term.assert_cursor_pos(
+        4,
+        0,
+        Some("HT clamps to the right margin when the next tab stop is outside"),
+        None,
+    );
+
+    term.print("\t");
+    term.assert_cursor_pos(4, 0, Some("HT remains pinned at the right margin"), None);
+}

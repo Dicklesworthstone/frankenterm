@@ -1,0 +1,38 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 1,
+  "pane_filter": null,
+  "query": "error",
+  "reasons": [
+    {
+      "code": "CAPTURE_GAPS",
+      "confidence": 0.6,
+      "evidence": [
+        {
+          "key": "total_gaps",
+          "value": "2"
+        },
+        {
+          "key": "affected_panes",
+          "value": "1"
+        },
+        {
+          "key": "estimated_missing_segments",
+          "value": "80"
+        },
+        {
+          "key": "gap_reasons",
+          "value": "connection reset, shell crashed"
+        }
+      ],
+      "suggestions": [
+        "Gaps occur during daemon restarts or high load.",
+        "Reduce poll interval: ft watch --poll-interval 2000",
+        "Check gap details: ft events --rule-id gap"
+      ],
+      "summary": "2 capture gap(s) detected across 1 pane(s). ~80 segments may be missing."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 80
+}

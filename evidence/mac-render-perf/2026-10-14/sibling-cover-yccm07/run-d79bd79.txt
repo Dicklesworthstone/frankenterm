@@ -1,0 +1,6 @@
+d79bd79-front: pid 63568, run dir /tmp/ftcv.yc4spdh1
+d79bd79-front: three stacked (12-21 s): 183.0 frames/s presented, drawables 9 (3.6 MiB)
+d79bd79-front: front moved aside (32-41 s): 172.8 frames/s presented, drawables 9 (3.6 MiB)
+d79bd79-front: middle turned glass (52-61 s): 182.7 frames/s presented, drawables 9 (3.6 MiB)
+d79bd79-front: cover transitions: []
+run directory kept: /tmp/ftcv.yc4spdh1

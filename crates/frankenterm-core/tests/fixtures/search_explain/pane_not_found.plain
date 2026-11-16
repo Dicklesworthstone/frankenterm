@@ -1,0 +1,12 @@
+Search explain for query: "checkpoint"
+  Pane filter: 999
+  Panes: 1 total (1 observed, 0 ignored)
+  Indexed segments: 50
+
+1 potential issue(s):
+
+  1. [PANE_NOT_FOUND] Pane 999 is not known to the watcher.
+     pane_id: 999
+     Suggestions:
+       - Verify the pane ID: ft list
+       - The pane may have been closed or never discovered.

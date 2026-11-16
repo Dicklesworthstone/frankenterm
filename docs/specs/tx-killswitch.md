@@ -1,0 +1,201 @@
+# Mission/TX Kill-Switch State-Space Proof
+
+**Bead:** [BR-RC-SAFETY-PROOFS.G13] / `ft-x0666.4`
+**Status:** Proof artifact shipped. Headline correctness rules
+verified by exhaustive BFS at step_count ∈ {2, 3} + 1000-case
+proptest fuzz.
+
+## Why this matters
+
+Mission/TX is the most dangerous code in ft — multi-pane
+mutations with prepare/commit/compensate. A bug here is
+user-visible damage to other AI agents being orchestrated. The
+README describes kill switches and pause controls as emergency intervention.
+This bead proves bounded model properties; production intervention requires
+separate live dispatch, cancellation, persistence, and no-further-effect proof.
+
+## Proof artifacts
+
+| Artifact | Location |
+|---|---|
+| Pure-Rust state-space model | `crates/frankenterm-core/src/tx_killswitch_model.rs` |
+| Exhaustive BFS + proptest harness | `crates/frankenterm-core/tests/tx_killswitch_model.rs` |
+| TLA+ formal specification | `docs/specs/tx-killswitch.tla` |
+| This audit doc | `docs/specs/tx-killswitch.md` |
+
+## State machine
+
+The model mirrors the production
+[`MissionTxState`](../../crates/frankenterm-core/src/plan.rs)
+enum and `MissionKillSwitchLevel` (Off / SafeMode / HardStop).
+Reachable transitions:
+
+```text
+   Draft ─Plan─▶ Planned ─Prepare─▶ Prepared ─BeginCommit─▶ Committing
+                                                              │
+            ┌─CommitStep(s) ◀───────────────────────────────┘
+            │     (loops until all steps committed)
+            ▼
+       Committing ─FinishCommit─▶ Committed
+            │
+            └─FailCommit─▶ Failed ─BeginCompensate─▶ Compensating
+                                                          │
+                          ┌─CompensateStep(s) ◀──────────┘
+                          │   (loops until compensated == committed)
+                          ▼
+                   Compensating ─FinishCompensate─▶ Compensated
+                                                          │
+                                                          ▼
+                                                      RolledBack
+```
+
+`FlipKillSwitch(to)` can fire from any state. When
+`kill_switch == HardStop`, all forward-progress actions
+(`Plan`, `Prepare`, `BeginCommit`, `CommitStep`) are disabled;
+recovery actions (`BeginCompensate`, `CompensateStep`,
+`FinishCompensate`, `RollBack`) remain enabled where their state preconditions
+hold. That alone does not prove every state drains with HardStop held fixed.
+
+## Safety invariants (proven)
+
+The Rust harness runs exhaustive BFS at `step_count ∈ {2, 3}`
+and asserts these on every reachable state. The TLA+ spec
+encodes the same set as `SafetyInvariants`.
+
+### NoSilentPartialCommit
+
+`tx_state = Committed ⇒ committed_steps = {0, …, step_count-1}`
+
+A `Committed` state always has every step recorded as
+committed. The exhaustive BFS proves no reachable
+`MissionTxState::Committed` violates this.
+
+### NoOrphanCompensation
+
+`compensated_steps ⊆ committed_steps`
+
+The compensation path may only undo what was actually
+committed. Vacuously true when both sets are empty (legitimate
+case: commit fails before any step commits).
+
+### StepIdsInBound
+
+Every step id in `committed_steps ∪ compensated_steps` is
+in `0..step_count`.
+
+## Model reachability and liveness limits
+
+### HardStopAdmitsProgress
+
+> From every reachable state with `kill_switch = HardStop`,
+> the harness admits recovery progress, including a path that disarms the switch.
+
+Drained = `tx_state ∈ {Committed, Failed, Compensated, RolledBack}`.
+
+Verified by the harness's
+`every_reachable_hard_stop_state_admits_progress_to_drained`
+test: walks every reachable state, asserts every one with
+`HardStop` either is drained, or has at least one enabled
+non-flip action that progresses, or admits a flip-back-to-Off.
+Because the test permits flipping back to Off, it is not a proof of drainage
+while HardStop remains armed. Production acceptance must hold the tier fixed,
+stop further forward effects, and observe cancellation/recovery completion.
+The startup-restored operator switch has a separate live refresh/fencing gap
+tracked in `ft-xxfwy.42`.
+
+### tx-state acyclicity (in projection)
+
+Projected onto `MissionTxState` alone (ignoring kill-switch
+flips, which are intentionally cyclic), the reachable graph is
+acyclic. Verified by
+`tx_state_projection_is_acyclic`: terminal states have no
+outgoing tx_state edges, and `Compensated` has only one
+outgoing edge (`→ RolledBack`).
+
+## Real bug the proof harness caught
+
+During development, an over-strict invariant
+`CompensatingImpliesCommittedNonEmpty` failed against
+`step_count=1` with action sequence `[3, 3, 9, 1, 15]`. The
+fuzz harness produced the deterministic minimal counterexample:
+
+```text
+Draft → Planned → Prepared → Committing → Failed → Compensating
+        with committed_steps = {} and compensated_steps = {}
+```
+
+This is **a legitimate production state** — when the very first
+commit step fails before committing anything, the engine enters
+Compensating with no steps to compensate, then immediately
+`FinishCompensates` (vacuously, both sets empty). The
+over-strict invariant was wrong; weakening it fixed the proof
+without changing any production semantics.
+
+This is exactly the kind of value formal-method-style
+state-space exploration provides — catches invariants that
+look reasonable but aren't grounded in the actual reachable
+state set.
+
+## Coverage
+
+| Run | Step count | Reachable states | Time | Verdict |
+|---|---|---|---|---|
+| BFS exhaustive | 2 | ~hundreds | <10ms | All safety + liveness pass |
+| BFS exhaustive | 3 | ~thousands | <100ms | All safety + liveness pass |
+| Proptest fuzz | 1..3 | up to 32 actions/case × 1000 cases | <100ms | All safety + liveness pass on every visited state |
+| CI random corpus | 1..3 | 1,000,000 deterministic pseudo-random schedules × up to 32 actions | CI lane | All safety + liveness pass on every visited state |
+| TLC model check | 2 | 258 states / 87 distinct states | <120s budget | 0 invariant violations, 0 deadlocks |
+| Adversarial recovery | 2 | random + flip-Off + greedy | <100ms | Always reaches drained within 100 steps |
+
+The default deterministic random corpus contains 1000 schedules. The larger
+lane requires an explicit `FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000` run
+through RCH, retained with its source identity and executed schedule count.
+DSR owns release orchestration. The historical run table above is not evidence
+that the million-schedule lane ran for a current release.
+
+## Bead acceptance status
+
+| Item | Status |
+|---|---|
+| TLA+ spec at docs/specs/tx-killswitch.tla | ✓ |
+| Stateright-shape harness at crates/frankenterm-core/tests/tx_killswitch_model.rs | ✓ (hand-rolled BFS — same shape Stateright would produce) |
+| Property test ≥1M random schedules per release proof | Requires retained current-source RCH execution and DSR bundle receipt; historical workflow wiring is insufficient. |
+| Attestation entry shipped | ✓ `docs/attestations/proofs/tx-killswitch.json` under required `proofs/tx-killswitch` |
+| TLC checks safety + liveness | ✓ `scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla` |
+| Stateright-in-Rust drives actual tx_execution.rs | ⏳ requires the production engine to be exercised; this bead's Stateright-shape harness drives the model. The integration bead links the harness to the real engine. |
+
+## Cross-references
+
+- **Sibling fixtures** (same session pattern):
+  `a11y_tree`, `color_management`, `ime_caret`,
+  `atlas_stability`, `triple_buffer`, `live_resize`,
+  `grid_reflow`, `render_quality`, `snap_back_fuzz`,
+  `wayland_frame_pacing`, `bidi_correctness`.
+- **Production engine:** `crates/frankenterm-core/src/tx_execution.rs`
+  (3.8k LOC). The model abstracts its `MissionKillSwitchLevel`
+  + `MissionTxState` types; the integration bead drives the
+  production engine through the same harness.
+- **Trauma-guard cross-link:** failures observed during
+  proptest fuzz feed the trauma-guard catalog (the bead's
+  action #4).
+- **Attestation cross-link:**
+  `docs/attestations/proofs/tx-killswitch.json` is wired into
+  the required `proofs/tx-killswitch` manifest category. Strict
+  release builds hash it into the signed bundle.
+
+## Re-running
+
+```bash
+# Exhaustive BFS + proptest fuzz.
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  cargo test -p frankenterm-core --test tx_killswitch_model --locked
+
+# CI-grade deterministic random corpus.
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000 \
+  cargo test -p frankenterm-core --test tx_killswitch_model --locked \
+    random_schedule_never_violates_safety_invariants -- --nocapture
+
+# TLA+ TLC.
+scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla
+```

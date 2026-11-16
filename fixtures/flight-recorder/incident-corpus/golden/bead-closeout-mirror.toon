@@ -1,0 +1,8 @@
+schema_version: ft.flight_recorder.incident_golden.v1
+scenario_id: bead_closeout_mirror
+incident_id: ft-ogr3n6-bead-closeout-mirror
+outcome: source_pass
+proof_admissible: true
+frame_count: 3
+closeout: dep_cycles=0,main_pushed=true,legacy_branch_mirror=main_synced_to_master
+local_cargo_counted: false

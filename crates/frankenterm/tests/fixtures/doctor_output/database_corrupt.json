@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "schema mismatch (found v0, expected v50)",
+      "name": "database",
+      "recommendation": "Preserve .ft/ft.db, run ft session doctor, and recover from a verified backup or migration receipt",
+      "status": "error"
+    }
+  ],
+  "ok": false,
+  "status": "error",
+  "version": "<scrubbed>"
+}

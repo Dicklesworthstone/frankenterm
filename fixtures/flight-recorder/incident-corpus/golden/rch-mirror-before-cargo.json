@@ -1,0 +1,48 @@
+{
+  "schema_version": "ft.flight_recorder.incident_golden.v1",
+  "contract_id": "ft.flight_recorder.incident_golden.v1",
+  "bead_id": "ft-ogr3n.6",
+  "scenario_id": "rch_mirror_before_cargo",
+  "source_set_path": "fixtures/flight-recorder/incident-corpus/source-sets/rch-mirror-before-cargo.json",
+  "surface_contract_id": "ft.swarm.incident_surfaces.v1",
+  "expected": {
+    "incident_id": "ft-ogr3n6-rch-mirror-before-cargo",
+    "outcome": "infrastructure_block",
+    "proof_admissible": false,
+    "frame_count": 2,
+    "required_sources": [
+      "beads",
+      "rch"
+    ],
+    "required_causal_classes": [
+      "infrastructure_failure",
+      "source_pass"
+    ],
+    "required_inadmissible_reason_codes": [
+      "proof.no_remote_rch_pass",
+      "proof.rch_blocking_event"
+    ],
+    "required_error_codes": [],
+    "required_frame_reason_codes": [
+      "rch.cargo_not_reached",
+      "proof.source_verdict_unavailable"
+    ],
+    "required_artifact_uris": [
+      ".beads/issues.jsonl",
+      "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+    ],
+    "required_rch_build_ids": [
+      "j-29871232832766560"
+    ],
+    "required_rch_worker_ids": [],
+    "required_source_set_substrings": [
+      "\"source_verdict\": \"unavailable_no_cargo\""
+    ],
+    "forbidden_substrings": [
+      "ghp_",
+      "API_TOKEN",
+      "sk-live-",
+      "password="
+    ]
+  }
+}

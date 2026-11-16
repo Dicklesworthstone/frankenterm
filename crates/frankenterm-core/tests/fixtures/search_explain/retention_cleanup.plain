@@ -1,0 +1,12 @@
+Search explain for query: "old session"
+  Panes: 1 total (1 observed, 0 ignored)
+  Indexed segments: 30
+
+1 potential issue(s):
+
+  1. [RETENTION_CLEANUP] Retention cleanup has run 7 time(s). Older content may have been purged.
+     cleanup_count: 7
+     earliest_segment_at: 1699395200000
+     Suggestions:
+       - Check retention settings: ft config show --effective
+       - Increase retention window if needed.

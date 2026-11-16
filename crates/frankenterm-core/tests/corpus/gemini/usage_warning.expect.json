@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "gemini.usage.warning",
+    "agent_type": "gemini",
+    "event_type": "usage.warning",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "remaining": "10"
+    },
+    "matched_text": "Usage limit warning: 10% of your Pro models quota remaining"
+  }
+]

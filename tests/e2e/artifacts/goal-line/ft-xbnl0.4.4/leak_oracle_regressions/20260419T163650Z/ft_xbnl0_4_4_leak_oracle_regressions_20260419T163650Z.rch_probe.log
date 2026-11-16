@@ -1,0 +1,104 @@
+  [2m2026-04-19T16:36:51.602314Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1149989 (212.90.121.76)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:51.912938Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1149989[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:52.885144Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1152480 (109.205.181.92)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:53.195184Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1152480[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:54.197872Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1153651 (38.242.134.66)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:54.633088Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1153651[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:55.582630Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1156319 (178.18.254.243)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:56.002740Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1156319[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:56.206710Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1167313 (154.12.232.219)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:56.494382Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1167313[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:57.440804Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1227854 (109.123.245.77)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:57.741974Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1227854[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:58.691549Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1264463 (38.242.209.154)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:36:59.129154Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1264463[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:00.040483Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mConnected to vmi1293453 (149.102.137.103)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:185 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:00.366246Z[0m [32m INFO[0m [1;32mrch_common::ssh[0m[32m: [32mDisconnected from vmi1293453[0m
+    [2;3mat[0m rch-common/src/ssh.rs:307 [2;3mon[0m ThreadId(1)
+
+{
+  "api_version": "1.0",
+  "timestamp": 1776616620,
+  "command": "workers probe",
+  "success": true,
+  "data": [
+    {
+      "id": "vmi1149989",
+      "host": "212.90.121.76",
+      "status": "ok",
+      "latency_ms": 303
+    },
+    {
+      "id": "vmi1152480",
+      "host": "109.205.181.92",
+      "status": "ok",
+      "latency_ms": 302
+    },
+    {
+      "id": "vmi1153651",
+      "host": "38.242.134.66",
+      "status": "ok",
+      "latency_ms": 428
+    },
+    {
+      "id": "vmi1156319",
+      "host": "178.18.254.243",
+      "status": "ok",
+      "latency_ms": 413
+    },
+    {
+      "id": "vmi1167313",
+      "host": "154.12.232.219",
+      "status": "ok",
+      "latency_ms": 279
+    },
+    {
+      "id": "vmi1227854",
+      "host": "109.123.245.77",
+      "status": "ok",
+      "latency_ms": 293
+    },
+    {
+      "id": "vmi1264463",
+      "host": "38.242.209.154",
+      "status": "ok",
+      "latency_ms": 430
+    },
+    {
+      "id": "vmi1293453",
+      "host": "149.102.137.103",
+      "status": "ok",
+      "latency_ms": 318
+    }
+  ]
+}

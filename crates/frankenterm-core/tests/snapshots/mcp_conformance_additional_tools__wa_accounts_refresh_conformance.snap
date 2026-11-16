@@ -1,0 +1,26 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "accounts": [
+      {
+        "account_id": "acc-refresh",
+        "last_refreshed_at": 0,
+        "name": "Refresh Org",
+        "percent_remaining": 50.0,
+        "reset_at": "2026-03-01T00:00:00Z",
+        "service": "openai",
+        "tokens_limit": 10000,
+        "tokens_remaining": 5000,
+        "tokens_used": 5000
+      }
+    ],
+    "refreshed_at": "2026-02-27T21:05:00Z",
+    "refreshed_count": 1,
+    "service": "openai"
+  },
+  "ok": true,
+  "tool": "wa.accounts_refresh"
+}

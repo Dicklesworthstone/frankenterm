@@ -1,0 +1,56 @@
+{
+  "ts": "<scrubbed>",
+  "session": "frankenterm",
+  "git": {
+    "commits_1h": 8,
+    "commits_since_last_tick": 2
+  },
+  "beads": {
+    "open": 12,
+    "in_progress": 3,
+    "blocked": 1,
+    "ready": 4
+  },
+  "disk": {
+    "data_avail": "200Gi",
+    "data_used_pct": "91%",
+    "stale_targets_12h": 1,
+    "total_targets": 6,
+    "targets_size_mb": 15872
+  },
+  "swarm": {
+    "panes_count": 7,
+    "agents": [
+      { "idx": 0, "type": "user", "pane": "%41" },
+      { "idx": 1, "type": "claude", "pane": "%42" },
+      { "idx": 2, "type": "claude", "pane": "%43" },
+      { "idx": 3, "type": "codex", "pane": "%44" },
+      { "idx": 4, "type": "codex", "pane": "%45" },
+      { "idx": 5, "type": "codex", "pane": "%46" },
+      { "idx": 6, "type": "codex", "pane": "%47" }
+    ]
+  },
+  "coordinator": {
+    "mode": "ntm_robot_equivalents",
+    "native_coordinator_available": false,
+    "status": {
+      "total_agents": 6,
+      "healthy": 5,
+      "degraded": 1,
+      "unhealthy": 0,
+      "rate_limited": 0
+    },
+    "digest": {
+      "active_alerts": 1,
+      "critical_or_error_alerts": 1
+    },
+    "conflicts": {
+      "count": 0
+    },
+    "auto_assign": {
+      "idle_agents": 1,
+      "recommendations": 0,
+      "blocked_beads": 0
+    }
+  }
+}

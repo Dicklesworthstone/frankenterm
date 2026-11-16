@@ -1,0 +1,9 @@
+name = "bad-range"
+seed = 1
+
+[[faults]]
+type = "delay"
+duration_ms = 100
+[faults.filter]
+time_range_start_ms = 200
+time_range_end_ms = 100

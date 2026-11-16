@@ -1,0 +1,48 @@
+== probe run 1
+macOS Version 26.5 (Build 25F71), frame (40.0, 119.0, 260.0, 170.0)
+control: nothing above: probe VISIBLE [covers bottom->top: ]
+window opaque + layer opaque, alpha 1: probe VISIBLE [covers bottom->top: VISIBLE]
+window opaque + layer NOT opaque, alpha 0.92 (operator's back window today): probe VISIBLE [covers bottom->top: VISIBLE]
+window opaque + layer NOT opaque, alpha 1: probe VISIBLE [covers bottom->top: VISIBLE]
+window NOT opaque + layer opaque, alpha 1: probe VISIBLE [covers bottom->top: VISIBLE]
+glass: window NOT opaque + layer NOT opaque, alpha 0.87: probe VISIBLE [covers bottom->top: VISIBLE]
+stack: glass over (window opaque + layer NOT opaque, 0.92): probe VISIBLE [covers bottom->top: VISIBLE,VISIBLE]
+stack: glass over (window opaque + layer opaque, 0.92): probe VISIBLE [covers bottom->top: VISIBLE,VISIBLE]
+== probe run 2
+macOS Version 26.5 (Build 25F71), frame (40.0, 119.0, 260.0, 170.0)
+control: nothing above: probe VISIBLE [covers bottom->top: ]
+same frame: window+layer opaque: probe VISIBLE [covers bottom->top: VISIBLE]
+cover 20pt larger: window+layer opaque: probe VISIBLE [covers bottom->top: VISIBLE]
+cover 20pt larger: window opaque, layer NOT, 0.92: probe VISIBLE [covers bottom->top: VISIBLE]
+cover 20pt larger: window NOT, layer opaque: probe VISIBLE [covers bottom->top: VISIBLE]
+cover 20pt larger: glass: probe VISIBLE [covers bottom->top: VISIBLE]
+same frame, square cover: window+layer opaque: probe occluded [covers bottom->top: VISIBLE]
+same frame, square cover: window opaque, layer NOT, 0.92: probe VISIBLE [covers bottom->top: VISIBLE]
+== probe run 3
+macOS Version 26.5 (Build 25F71), frame (40.0, 121.0, 260.0, 170.0)
+control: nothing above: probe VISIBLE [covers bottom->top: ]
+titled, transparent titlebar, cover extends 60pt above probe (+20 sides): probe VISIBLE [covers bottom->top: VISIBLE]
+titled, solid titlebar, same frame: probe VISIBLE [covers bottom->top: VISIBLE]
+titled, solid titlebar, +20 all sides: probe VISIBLE [covers bottom->top: VISIBLE]
+titled, transparent titlebar, black window bg, +20: probe VISIBLE [covers bottom->top: VISIBLE]
+square: window+layer opaque, alpha 0.92: probe occluded [covers bottom->top: VISIBLE]
+square: window NOT, layer opaque: probe occluded [covers bottom->top: VISIBLE]
+square stack: glass over (window+layer opaque): probe occluded [covers bottom->top: VISIBLE,VISIBLE]
+== probe run 4
+macOS Version 26.5 (Build 25F71), frame (40.0, 121.0, 260.0, 170.0)
+control: nothing above: probe VISIBLE [covers bottom->top: ]
+titled PLAIN default window (no metal), +20: probe VISIBLE [covers bottom->top: VISIBLE]
+titled PLAIN default window, not full-size content, +20: probe VISIBLE [covers bottom->top: VISIBLE]
+titled metal, solid titlebar, black bg, not full-size, +20: probe VISIBLE [covers bottom->top: VISIBLE]
+titled metal, solid titlebar, black bg, full-size, +20: probe VISIBLE [covers bottom->top: VISIBLE]
+square PLAIN default window, same frame: probe occluded [covers bottom->top: VISIBLE]
+square metal opaque, same frame (repeat): probe occluded [covers bottom->top: VISIBLE]
+== probe run 5
+macOS Version 26.5 (Build 25F71), frame (40.0, 121.0, 260.0, 170.0)
+control: nothing above: probe VISIBLE [covers bottom->top: ] z front->back: probe@L0(260x170)
+titled PLAIN default window (no metal), +20: probe VISIBLE [covers bottom->top: VISIBLE] z front->back: cover0@L0(300x210) > probe@L0(260x170)
+titled PLAIN default window, not full-size content, +20: probe VISIBLE [covers bottom->top: VISIBLE] z front->back: cover0@L0(300x242) > probe@L0(260x170)
+titled metal, solid titlebar, black bg, not full-size, +20: probe VISIBLE [covers bottom->top: VISIBLE] z front->back: cover0@L0(300x242) > probe@L0(260x170)
+titled metal, solid titlebar, black bg, full-size, +20: probe VISIBLE [covers bottom->top: VISIBLE] z front->back: cover0@L0(300x210) > probe@L0(260x170)
+square PLAIN default window, same frame: probe occluded [covers bottom->top: VISIBLE] z front->back: cover0@L0(260x170) > probe@L0(260x170)
+square metal opaque, same frame (repeat): probe occluded [covers bottom->top: VISIBLE] z front->back: cover0@L0(260x170) > probe@L0(260x170)

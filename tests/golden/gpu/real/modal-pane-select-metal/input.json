@@ -1,0 +1,17 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "first pane\nits label is drawn over it\u001b[?25l",
+    "config": {
+      "front_end": "Metal"
+    },
+    "snapshot": {
+      "split": {
+        "direction": "right",
+        "text": "second pane\nactive\u001b[?25l"
+      },
+      "modal": "pane_select"
+    }
+  },
+  "parity_golden": "real/modal-pane-select"
+}

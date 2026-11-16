@@ -1,0 +1,398 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::mut_from_ref)]
+// let () = msg_send! is a common pattern for objc
+#![allow(clippy::let_unit_value)]
+
+use super::nsstring_to_str;
+use super::window::WindowInner;
+use crate::connection::{
+    fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
+};
+use crate::os::macos::app::create_app_delegate;
+use crate::screen::{ScreenInfo, Screens};
+use crate::spawn::*;
+use crate::Appearance;
+use cocoa::appkit::{
+    NSApp, NSApplication, NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyRegular, NSScreen,
+};
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSArray, NSInteger};
+use objc::runtime::{Object, BOOL, YES};
+use objc::*;
+use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
+
+pub struct Connection {
+    ns_app: id,
+    pub(crate) windows: RefCell<HashMap<usize, Rc<RefCell<WindowInner>>>>,
+    pub(crate) next_window_id: AtomicUsize,
+    pub(crate) gl_connection: RefCell<Option<Rc<crate::egl::GlConnection>>>,
+}
+
+const NONACTIVATING_NATIVE_E2E_ENV: &str = "FRANKENTERM_NATIVE_E2E_NONACTIVATING";
+
+/// Return whether the process is running the native bridge's non-activating
+/// GUI smoke lane.
+///
+/// This is deliberately an exact, opt-in test seam rather than a general GUI
+/// preference. The normal application keeps its regular activation policy;
+/// the hermetic native-event harness uses the accessory policy and presents
+/// its window behind existing windows so it can exercise AppKit without
+/// stealing keyboard focus from the operator.
+pub(super) fn nonactivating_native_e2e_enabled() -> bool {
+    std::env::var_os(NONACTIVATING_NATIVE_E2E_ENV).is_some_and(|value| value == "1")
+}
+
+impl Connection {
+    pub(crate) fn create_new() -> anyhow::Result<Self> {
+        // Ensure that the SPAWN_QUEUE is created; it will have nothing
+        // to run right now.
+        SPAWN_QUEUE.run();
+
+        unsafe {
+            let ns_app = NSApp();
+            ns_app.setActivationPolicy_(if nonactivating_native_e2e_enabled() {
+                NSApplicationActivationPolicyAccessory
+            } else {
+                NSApplicationActivationPolicyRegular
+            });
+
+            let delegate = create_app_delegate();
+            let () = msg_send![ns_app, setDelegate: delegate];
+
+            let conn = Self {
+                ns_app,
+                windows: RefCell::new(HashMap::new()),
+                next_window_id: AtomicUsize::new(1),
+                gl_connection: RefCell::new(None),
+            };
+            Ok(conn)
+        }
+    }
+
+    pub(crate) fn next_window_id(&self) -> anyhow::Result<usize> {
+        crate::connection::next_unique_window_id(&self.next_window_id)
+    }
+
+    pub(crate) fn window_by_id(&self, window_id: usize) -> Option<Rc<RefCell<WindowInner>>> {
+        self.windows.borrow().get(&window_id).map(Rc::clone)
+    }
+
+    pub(crate) fn with_window_inner<
+        R,
+        F: FnOnce(&mut WindowInner) -> anyhow::Result<R> + Send + 'static,
+    >(
+        window_id: usize,
+        f: F,
+    ) -> promise::Future<R>
+    where
+        R: Send + 'static,
+    {
+        let (mut prom, future) = new_window_op_promise();
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "macOS window operation",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let Some(conn) = Connection::get() else {
+                        fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
+                        return;
+                    };
+                    if let Some(handle) = conn.window_by_id(window_id) {
+                        let mut inner = handle.borrow_mut();
+                        prom.result(f(&mut inner));
+                    } else {
+                        fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
+                    }
+                })
+                .detach(),
+            Err(rejected) => {
+                prom.err(anyhow::anyhow!(
+                    "macOS window operation rejected by main-thread scheduler: {rejected:?}"
+                ));
+            }
+        }
+
+        future
+    }
+
+    pub(crate) fn with_window_inner_reserved<F>(
+        window_id: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut WindowInner) + Send + 'static,
+    {
+        reservation.spawn(async move {
+            let Some(conn) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = conn.window_by_id(window_id) {
+                f(&mut handle.borrow_mut());
+            }
+        })
+    }
+
+    pub(crate) fn with_window_inner_reserved_handoff<F>(
+        window_id: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut WindowInner, promise::spawn::MainThreadSpawnReservation) + Send + 'static,
+    {
+        reservation.handoff_to_main_thread_local(move |reservation| {
+            let Some(conn) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = conn.window_by_id(window_id) {
+                f(&mut handle.borrow_mut(), reservation);
+            }
+        })
+    }
+}
+
+/// `/System/Library/CoreServices/SystemVersion.plist`
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct SoftwareVersion {
+    product_build_version: String,
+    product_user_visible_version: String,
+    product_name: String,
+}
+
+impl SoftwareVersion {
+    fn load() -> anyhow::Result<Self> {
+        let vers: Self = plist::from_file("/System/Library/CoreServices/SystemVersion.plist")?;
+        Ok(vers)
+    }
+}
+
+fn stop_app_message_loop() {
+    unsafe {
+        let () = msg_send![NSApp(), stop: nil];
+        // Generate a UI event so that the run loop breaks out after receiving
+        // the stop request. This also unwinds an active modal confirmation.
+        let () = msg_send![NSApp(), abortModal];
+    }
+}
+
+impl ConnectionOps for Connection {
+    fn name(&self) -> String {
+        if let Ok(vers) = SoftwareVersion::load() {
+            format!(
+                "{} {} ({})",
+                vers.product_name, vers.product_user_visible_version, vers.product_build_version
+            )
+        } else {
+            "macOS".to_string()
+        }
+    }
+
+    fn default_dpi(&self) -> f64 {
+        if let Ok(screens) = self.screens() {
+            screens.active.effective_dpi.unwrap_or(crate::DEFAULT_DPI)
+        } else {
+            crate::DEFAULT_DPI
+        }
+    }
+
+    fn terminate_message_loop(&self) {
+        unsafe {
+            let is_main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
+            if is_main_thread == YES {
+                stop_app_message_loop();
+            } else {
+                // Bounce through the AppKit thread so stop applies to the
+                // active NSApplication run loop level.
+                match crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                    "terminate macOS message loop",
+                ) {
+                    Ok(reservation) => reservation
+                        .spawn(async move {
+                            stop_app_message_loop();
+                        })
+                        .detach(),
+                    Err(rejected) => log::error!(
+                        "cannot terminate macOS message loop after scheduler rejection: {rejected:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    fn get_appearance(&self) -> Appearance {
+        let name = unsafe {
+            let appearance: id = msg_send![self.ns_app, effectiveAppearance];
+            nsstring_to_str(msg_send![appearance, name])
+        };
+        log::debug!("NSAppearanceName is {name}");
+        match name {
+            "NSAppearanceNameVibrantDark" | "NSAppearanceNameDarkAqua" => Appearance::Dark,
+            "NSAppearanceNameVibrantLight" | "NSAppearanceNameAqua" => Appearance::Light,
+            "NSAppearanceNameAccessibilityHighContrastVibrantLight"
+            | "NSAppearanceNameAccessibilityHighContrastAqua" => Appearance::LightHighContrast,
+            "NSAppearanceNameAccessibilityHighContrastVibrantDark"
+            | "NSAppearanceNameAccessibilityHighContrastDarkAqua" => Appearance::DarkHighContrast,
+            _ => {
+                log::warn!("Unknown NSAppearanceName {name}, assume Light");
+                Appearance::Light
+            }
+        }
+    }
+
+    fn run_message_loop(&self) -> anyhow::Result<()> {
+        unsafe {
+            self.ns_app.run();
+        }
+        self.windows.borrow_mut().clear();
+        Ok(())
+    }
+
+    fn hide_application(&self) {
+        unsafe {
+            let () = msg_send![self.ns_app, hide: self.ns_app];
+        }
+    }
+
+    fn beep(&self) {
+        unsafe {
+            NSBeep();
+        }
+    }
+
+    fn screens(&self) -> anyhow::Result<Screens> {
+        let mut by_name = HashMap::new();
+        let mut virtual_rect = euclid::rect(0, 0, 0, 0);
+
+        let screens = unsafe { NSScreen::screens(nil) };
+        for idx in 0..unsafe { screens.count() } {
+            let screen = unsafe { screens.objectAtIndex(idx) };
+            let screen = nsscreen_to_screen_info(screen);
+            virtual_rect = virtual_rect.union(&screen.rect);
+            by_name.insert(screen.name.clone(), screen);
+        }
+
+        // The screen with the menu bar is always index 0
+        let main = nsscreen_to_screen_info(unsafe { screens.objectAtIndex(0) });
+
+        // The active screen is known as the "main" screen in macOS
+        let active = nsscreen_to_screen_info(unsafe { NSScreen::mainScreen(nil) });
+
+        Ok(Screens {
+            by_name,
+            active,
+            main,
+            virtual_rect,
+        })
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn nsscreen_to_screen_info(screen: *mut Object) -> ScreenInfo {
+    let frame = unsafe { NSScreen::frame(screen) };
+    let backing_frame = unsafe { NSScreen::convertRectToBacking_(screen, frame) };
+    let rect = euclid::rect(
+        backing_frame.origin.x as isize,
+        backing_frame.origin.y as isize,
+        backing_frame.size.width as isize,
+        backing_frame.size.height as isize,
+    );
+    let has_name: BOOL = unsafe { msg_send!(screen, respondsToSelector: sel!(localizedName)) };
+    let name = if has_name == YES {
+        unsafe { nsstring_to_str(msg_send!(screen, localizedName)) }.to_string()
+    } else {
+        format!(
+            "{}x{}@{},{}",
+            backing_frame.size.width,
+            backing_frame.size.height,
+            backing_frame.origin.x,
+            backing_frame.origin.y
+        )
+    };
+
+    let has_max_fps: BOOL =
+        unsafe { msg_send!(screen, respondsToSelector: sel!(maximumFramesPerSecond)) };
+    let max_fps = if has_max_fps == YES {
+        let max_fps: NSInteger = unsafe { msg_send!(screen, maximumFramesPerSecond) };
+        Some(max_fps as usize)
+    } else {
+        None
+    };
+
+    let scale = backing_frame.size.width / frame.size.width;
+
+    let config = config::configuration();
+    let effective_dpi = if let Some(dpi) = config.dpi_by_screen.get(&name).copied() {
+        Some(dpi)
+    } else if let Some(dpi) = config.dpi {
+        Some(dpi)
+    } else {
+        Some(crate::DEFAULT_DPI * scale)
+    };
+
+    ScreenInfo {
+        name,
+        rect,
+        scale,
+        max_fps,
+        effective_dpi,
+    }
+}
+
+extern "C" {
+    fn NSBeep();
+}
+
+#[cfg(test)]
+mod software_version_tests {
+    use super::SoftwareVersion;
+
+    #[test]
+    fn software_version_plist_roundtrip_decodes_pascal_case_keys() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProductBuildVersion</key>
+    <string>23A344</string>
+    <key>ProductName</key>
+    <string>macOS</string>
+    <key>ProductUserVisibleVersion</key>
+    <string>14.0</string>
+</dict>
+</plist>
+"#;
+
+        let version: SoftwareVersion = plist::from_bytes(plist.as_bytes()).unwrap();
+        assert_eq!(version.product_build_version, "23A344");
+        assert_eq!(version.product_name, "macOS");
+        assert_eq!(version.product_user_visible_version, "14.0");
+    }
+
+    #[test]
+    fn software_version_fields_format_expected_connection_name() {
+        let version = SoftwareVersion {
+            product_build_version: "23A344".to_string(),
+            product_user_visible_version: "14.0".to_string(),
+            product_name: "macOS".to_string(),
+        };
+
+        let name = format!(
+            "{} {} ({})",
+            version.product_name,
+            version.product_user_visible_version,
+            version.product_build_version
+        );
+        assert_eq!(name, "macOS 14.0 (23A344)");
+    }
+}

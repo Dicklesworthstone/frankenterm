@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dde87cbbec66af54ddcf42a45210b3ec6447176ce209317b3cbdf8f44fc01c38 # shrinks to timing = StageTimingMetrics { queue_wait_ms: None, reflow_ms: None, render_ms: None, present_ms: None, p50_ms: Some(0.0), p95_ms: Some(0.0), p99_ms: Some(26.603934923706106) }

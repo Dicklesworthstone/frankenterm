@@ -1,0 +1,21 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Selection line fixture: row zero is context only.",
+    "this entire logical row is selected from first to last cell",
+    "row two verifies the highlight does not bleed vertically."
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 63,
+    "shape": "underline"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 0,
+    "end_row": 1,
+    "end_col": 63
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

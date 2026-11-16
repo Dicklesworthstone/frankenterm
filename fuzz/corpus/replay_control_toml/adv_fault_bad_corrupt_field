@@ -1,0 +1,8 @@
+name = "bad-corrupt"
+seed = 1
+
+[[faults]]
+type = "corrupt"
+field = "payload_checksum"
+mutation = "flip"
+[faults.filter]

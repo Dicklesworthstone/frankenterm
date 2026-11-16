@@ -1,0 +1,948 @@
+//! Allocator and per-pane arena helpers for FrankenTerm.
+//!
+//! This crate keeps allocator wiring out of `frankenterm-core`, which forbids
+//! unsafe code and should remain business-logic only.
+
+#![forbid(unsafe_code)]
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub mod resource_ledger;
+
+/// Recover from `std::sync::Mutex` poisoning by taking the inner guard.
+///
+/// The pane-arena registry stores a `HashMap<u64, PaneArenaState>` where
+/// every value is `Copy` (plain u64 counters) and all mutations go through
+/// atomic `HashMap::insert` / `HashMap::remove` calls. A panic inside any
+/// of those mutations cannot leave the map structurally corrupted in safe
+/// Rust, so the correct response to lock poisoning is to proceed with the
+/// recovered guard rather than panic-cascade every subsequent caller of
+/// `reserve` / `release` / `stats` / `snapshot` (8 sites below). This
+/// mirrors the `unwrap_or_else(PoisonError::into_inner)` idiom used
+/// throughout the workspace (runtime.rs, events.rs).
+fn recover_poisoned<'a, T>(
+    result: Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>,
+) -> MutexGuard<'a, T> {
+    result.unwrap_or_else(PoisonError::into_inner)
+}
+
+// ft-p9hok: jemalloc is gated to non-Windows targets. Its C sys-crate
+// (tikv-jemalloc-sys) cannot build on windows-msvc, and the `tikv-*` deps are
+// absent there (see Cargo.toml's `[target.'cfg(not(windows))'.dependencies]`),
+// so every jemalloc-touching item below is `not(windows)`-gated. On Windows the
+// `jemalloc` feature is a no-op and the build uses the system allocator.
+// Mac/Linux behaviour is unchanged: with the `jemalloc` feature on, this
+// `#[global_allocator]` is installed exactly as before.
+#[cfg(all(feature = "jemalloc", not(windows)))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Active allocator backend selected at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorBackend {
+    /// Default Rust/system allocator.
+    System,
+    /// Jemalloc via `tikv-jemallocator`.
+    Jemalloc,
+}
+
+impl AllocatorBackend {
+    /// Stable string identifier for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Jemalloc => "jemalloc",
+        }
+    }
+}
+
+/// Compile-time allocator backend.
+#[must_use]
+pub const fn allocator_backend() -> AllocatorBackend {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        AllocatorBackend::Jemalloc
+    }
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    {
+        AllocatorBackend::System
+    }
+}
+
+/// Whether jemalloc is active in this build.
+#[must_use]
+pub const fn jemalloc_enabled() -> bool {
+    matches!(allocator_backend(), AllocatorBackend::Jemalloc)
+}
+
+/// Snapshot of allocator-level memory statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllocatorStats {
+    /// Bytes currently allocated to application objects.
+    pub allocated: usize,
+    /// Bytes in active pages.
+    pub active: usize,
+    /// Bytes resident in physical memory.
+    pub resident: usize,
+    /// Bytes mapped from the OS.
+    pub mapped: usize,
+    /// Bytes retained by the allocator.
+    pub retained: usize,
+}
+
+/// Logical per-pane arena accounting snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneArenaStats {
+    /// Current logical bytes tracked against the pane arena.
+    pub tracked_bytes: usize,
+    /// Peak logical bytes observed for the pane arena.
+    pub peak_tracked_bytes: usize,
+    /// Number of accounting updates applied to the pane arena.
+    pub updates: u64,
+}
+
+/// Errors returned by allocator stats reads.
+#[derive(Debug, thiserror::Error)]
+pub enum AllocatorStatsError {
+    /// Jemalloc stats access failed.
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    #[error("jemalloc stats read failed: {0:?}")]
+    Jemalloc(tikv_jemalloc_ctl::Error),
+    /// Stats are unavailable because jemalloc support is not compiled in.
+    #[error("jemalloc support is disabled (enable feature `jemalloc`)")]
+    JemallocNotEnabled,
+    /// jemalloc's stats report could not be produced.
+    #[error("jemalloc stats report failed: {0}")]
+    StatsReport(std::io::Error),
+    /// jemalloc's stats report lacked an expected run-time option.
+    #[error("jemalloc stats report has no usable opt.{0}")]
+    MissingOption(&'static str),
+}
+
+/// Whether this target's jemalloc can run background purge threads. jemalloc's
+/// configure leaves them out of every Mach-O (Apple) build. There,
+/// `background_thread:true` is not merely ignored: jemalloc prints "option
+/// background_thread currently supports pthread only" and its initialization
+/// stops partway, leaving one arena for every thread and `opt.narenas` at 0.
+pub const JEMALLOC_HAS_BACKGROUND_THREADS: bool = !cfg!(target_vendor = "apple");
+
+/// The jemalloc configuration the GUI binary installs through its
+/// `malloc_conf` export (ft-yccm0.2.8), NUL-terminated as jemalloc reads it.
+///
+/// - `background_thread:true`, only where jemalloc supports it (see
+///   [`JEMALLOC_HAS_BACKGROUND_THREADS`]; never on macOS): purging runs on
+///   jemalloc's own threads. Without them jemalloc decays an arena's dirty
+///   pages only while some thread allocates in that arena, so a GUI that goes
+///   idle after a flood can keep its freed pages resident until the OS
+///   compresses or swaps them (the 0.15.2 incident on macOS: ~4.2 GB of
+///   jemalloc heap in 31,947 mappings, mostly swapped).
+/// - `dirty_decay_ms:5000`: half the 10 s default, so a freed burst returns to
+///   the OS within seconds once its arena sees activity again, while a paint
+///   loop that frees and reallocates every frame keeps reusing its dirty pages.
+/// - `muzzy_decay_ms:0`: jemalloc 5.3's default, stated so the whole policy is
+///   in one place.
+///
+/// Provisional until the M.6 bundles and the T1 ABBA run measure it; on macOS
+/// the soak decides whether activity-driven decay alone returns idle memory.
+/// A run can override it without a rebuild through `_RJEM_MALLOC_CONF`, which
+/// jemalloc applies after this compiled-in string (never pass
+/// `background_thread:true` there on macOS).
+#[cfg(not(target_vendor = "apple"))]
+pub const GUI_JEMALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0";
+/// See the non-Apple definition; Apple targets leave out `background_thread`.
+#[cfg(target_vendor = "apple")]
+pub const GUI_JEMALLOC_CONF: &[u8] = b"dirty_decay_ms:5000,muzzy_decay_ms:0\0";
+
+/// jemalloc run-time options in effect, read back from jemalloc itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JemallocOptions {
+    /// `opt.background_thread`; `None` where jemalloc has no background-thread
+    /// support (Apple targets), whose stats report omits the option.
+    pub background_thread: Option<bool>,
+    /// `opt.dirty_decay_ms` (-1 disables decay).
+    pub dirty_decay_ms: i64,
+    /// `opt.muzzy_decay_ms` (-1 disables decay).
+    pub muzzy_decay_ms: i64,
+    /// `opt.narenas`; 0 when jemalloc's initialization stopped partway.
+    pub narenas: u64,
+}
+
+/// The jemalloc options this process is running with, taken from jemalloc's
+/// own JSON stats report (the decay options have no typed accessor).
+pub fn jemalloc_options() -> Result<JemallocOptions, AllocatorStatsError> {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        use tikv_jemalloc_ctl::stats_print::{Options, stats_print};
+
+        let mut options = Options::default();
+        options.json_format = true;
+        // "opt" is part of the constant section, so constants stay in.
+        options.skip_merged_arenas = true;
+        options.skip_per_arena = true;
+        options.skip_bin_size_classes = true;
+        options.skip_large_size_classes = true;
+        options.skip_mutex_statistics = true;
+        let mut report = Vec::new();
+        stats_print(&mut report, options).map_err(AllocatorStatsError::StatsReport)?;
+        parse_jemalloc_options(&report)
+    }
+
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    {
+        Err(AllocatorStatsError::JemallocNotEnabled)
+    }
+}
+
+/// Extract [`JemallocOptions`] from a jemalloc JSON stats report.
+#[cfg(any(test, all(feature = "jemalloc", not(windows))))]
+fn parse_jemalloc_options(report: &[u8]) -> Result<JemallocOptions, AllocatorStatsError> {
+    let value: serde_json::Value = serde_json::from_slice(report).map_err(|error| {
+        AllocatorStatsError::StatsReport(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        ))
+    })?;
+    let opt = &value["jemalloc"]["opt"];
+    Ok(JemallocOptions {
+        // jemalloc reports the option only where its runtime control exists.
+        background_thread: match opt.get("background_thread") {
+            None => None,
+            Some(flag) => Some(
+                flag.as_bool()
+                    .ok_or(AllocatorStatsError::MissingOption("background_thread"))?,
+            ),
+        },
+        dirty_decay_ms: opt["dirty_decay_ms"]
+            .as_i64()
+            .ok_or(AllocatorStatsError::MissingOption("dirty_decay_ms"))?,
+        muzzy_decay_ms: opt["muzzy_decay_ms"]
+            .as_i64()
+            .ok_or(AllocatorStatsError::MissingOption("muzzy_decay_ms"))?,
+        narenas: opt["narenas"]
+            .as_u64()
+            .ok_or(AllocatorStatsError::MissingOption("narenas"))?,
+    })
+}
+
+/// Read allocator statistics.
+pub fn read_allocator_stats() -> Result<AllocatorStats, AllocatorStatsError> {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        use tikv_jemalloc_ctl::{epoch, stats};
+
+        epoch::advance().map_err(AllocatorStatsError::Jemalloc)?;
+        Ok(AllocatorStats {
+            allocated: stats::allocated::read().map_err(AllocatorStatsError::Jemalloc)?,
+            active: stats::active::read().map_err(AllocatorStatsError::Jemalloc)?,
+            resident: stats::resident::read().map_err(AllocatorStatsError::Jemalloc)?,
+            mapped: stats::mapped::read().map_err(AllocatorStatsError::Jemalloc)?,
+            retained: stats::retained::read().map_err(AllocatorStatsError::Jemalloc)?,
+        })
+    }
+
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    {
+        Err(AllocatorStatsError::JemallocNotEnabled)
+    }
+}
+
+/// Opaque logical arena identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ArenaId(u32);
+
+impl ArenaId {
+    /// Raw numeric identifier.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Logical pane arena handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PaneArena {
+    pane_id: u64,
+    arena_id: ArenaId,
+}
+
+impl PaneArena {
+    /// Construct a logical pane arena.
+    #[must_use]
+    pub const fn new(pane_id: u64, arena_id: ArenaId) -> Self {
+        Self { pane_id, arena_id }
+    }
+
+    /// Pane owner.
+    #[must_use]
+    pub const fn pane_id(&self) -> u64 {
+        self.pane_id
+    }
+
+    /// Logical arena id.
+    #[must_use]
+    pub const fn arena_id(&self) -> ArenaId {
+        self.arena_id
+    }
+}
+
+/// Snapshot of a logical pane arena plus its accounting state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneArenaSnapshot {
+    /// Logical pane arena identity.
+    pub arena: PaneArena,
+    /// Current tracked accounting state.
+    pub stats: PaneArenaStats,
+}
+
+/// Safe typed ownership wrapper for per-pane arena allocations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arena<T> {
+    owner: PaneArena,
+    value: T,
+}
+
+impl<T> Arena<T> {
+    /// Wrap a value with pane arena ownership metadata.
+    #[must_use]
+    pub const fn new(owner: PaneArena, value: T) -> Self {
+        Self { owner, value }
+    }
+
+    /// Owning pane arena metadata.
+    #[must_use]
+    pub const fn owner(&self) -> PaneArena {
+        self.owner
+    }
+
+    /// Borrow the wrapped value.
+    #[must_use]
+    pub const fn as_ref(&self) -> &T {
+        &self.value
+    }
+
+    /// Mutably borrow the wrapped value.
+    #[must_use]
+    pub const fn as_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    /// Consume wrapper and return inner value.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    /// Map to another value while preserving ownership metadata.
+    #[must_use]
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Arena<U> {
+        Arena {
+            owner: self.owner,
+            value: f(self.value),
+        }
+    }
+}
+
+/// Outcome when reserving a pane arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// Brand new logical arena created.
+    Created(PaneArena),
+    /// Existing reservation reused.
+    Existing(PaneArena),
+}
+
+impl ReserveOutcome {
+    /// Access the resolved pane arena.
+    #[must_use]
+    pub const fn arena(self) -> PaneArena {
+        match self {
+            Self::Created(arena) | Self::Existing(arena) => arena,
+        }
+    }
+
+    /// Whether this call created a fresh reservation.
+    #[must_use]
+    pub const fn is_created(self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+/// Concurrent registry of logical per-pane arena reservations.
+#[derive(Debug, Default)]
+pub struct PaneArenaRegistry {
+    next_arena_id: AtomicU32,
+    arenas_by_pane: Mutex<HashMap<u64, PaneArenaState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneArenaState {
+    arena: PaneArena,
+    stats: PaneArenaStats,
+}
+
+impl PaneArenaState {
+    fn new(arena: PaneArena) -> Self {
+        Self {
+            arena,
+            stats: PaneArenaStats::default(),
+        }
+    }
+
+    fn update_tracked_bytes(&mut self, tracked_bytes: usize) -> PaneArenaStats {
+        self.stats.tracked_bytes = tracked_bytes;
+        self.stats.peak_tracked_bytes = self.stats.peak_tracked_bytes.max(tracked_bytes);
+        self.stats.updates = self.stats.updates.saturating_add(1);
+        self.stats
+    }
+}
+
+#[track_caller]
+fn next_unique_arena_id(counter: &AtomicU32) -> ArenaId {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            panic!("pane arena id space exhausted; refusing to reuse an arena identity");
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return ArenaId(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+impl PaneArenaRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next_arena_id: AtomicU32::new(1),
+            arenas_by_pane: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reserve (or reuse) a logical arena for the given pane.
+    pub fn reserve(&self, pane_id: u64) -> ReserveOutcome {
+        let mut guard = recover_poisoned(self.arenas_by_pane.lock());
+
+        if let Some(existing) = guard.get(&pane_id).copied() {
+            return ReserveOutcome::Existing(existing.arena);
+        }
+
+        let arena = PaneArena::new(pane_id, self.allocate_arena_id());
+        guard.insert(pane_id, PaneArenaState::new(arena));
+        ReserveOutcome::Created(arena)
+    }
+
+    /// Release a pane reservation.
+    pub fn release(&self, pane_id: u64) -> Option<PaneArena> {
+        recover_poisoned(self.arenas_by_pane.lock())
+            .remove(&pane_id)
+            .map(|state| state.arena)
+    }
+
+    /// Update the logical tracked byte count for a pane arena.
+    ///
+    /// Returns `Some(stats)` when the pane is currently reserved and the
+    /// accounting was updated, or `None` when the pane is not reserved
+    /// (released or never allocated). Callers that update accounting in
+    /// response to upstream events typically swallow the `None` case
+    /// silently — best-effort updates against a possibly-stale `pane_id`
+    /// are reconciled by the next discovery tick.
+    pub fn set_tracked_bytes(&self, pane_id: u64, tracked_bytes: usize) -> Option<PaneArenaStats> {
+        recover_poisoned(self.arenas_by_pane.lock())
+            .get_mut(&pane_id)
+            .map(|state| state.update_tracked_bytes(tracked_bytes))
+    }
+
+    /// Lookup the accounting state for a pane reservation.
+    pub fn stats(&self, pane_id: u64) -> Option<PaneArenaStats> {
+        recover_poisoned(self.arenas_by_pane.lock())
+            .get(&pane_id)
+            .map(|state| state.stats)
+    }
+
+    /// Lookup an existing pane reservation.
+    pub fn get(&self, pane_id: u64) -> Option<PaneArena> {
+        recover_poisoned(self.arenas_by_pane.lock())
+            .get(&pane_id)
+            .map(|state| state.arena)
+    }
+
+    /// Number of tracked pane reservations.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        recover_poisoned(self.arenas_by_pane.lock()).len()
+    }
+
+    /// Whether the registry is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Sorted snapshot of all pane reservations.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<PaneArena> {
+        let mut values: Vec<_> = recover_poisoned(self.arenas_by_pane.lock())
+            .values()
+            .map(|state| state.arena)
+            .collect();
+        values.sort_by_key(PaneArena::pane_id);
+        values
+    }
+
+    /// Sorted snapshot of all pane reservations with accounting state.
+    #[must_use]
+    pub fn stats_snapshot(&self) -> Vec<PaneArenaSnapshot> {
+        let mut values: Vec<_> = recover_poisoned(self.arenas_by_pane.lock())
+            .values()
+            .map(|state| PaneArenaSnapshot {
+                arena: state.arena,
+                stats: state.stats,
+            })
+            .collect();
+        values.sort_by_key(|snapshot| snapshot.arena.pane_id());
+        values
+    }
+
+    fn allocate_arena_id(&self) -> ArenaId {
+        next_unique_arena_id(&self.next_arena_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocator_backend_matches_feature_gate() {
+        #[cfg(all(feature = "jemalloc", not(windows)))]
+        assert_eq!(allocator_backend(), AllocatorBackend::Jemalloc);
+
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
+        assert_eq!(allocator_backend(), AllocatorBackend::System);
+    }
+
+    /// ft-yccm0.2.8 config presence: the GUI's jemalloc string is one
+    /// NUL-terminated ASCII list that sets exactly the tuned options, and asks
+    /// for background threads only where jemalloc has them (on macOS the
+    /// request would stop jemalloc's initialization partway).
+    #[test]
+    fn gui_jemalloc_conf_sets_background_thread_and_decay() {
+        let (last, body) = GUI_JEMALLOC_CONF.split_last().unwrap();
+        assert_eq!(*last, 0, "jemalloc reads malloc_conf as a C string");
+        assert!(!body.contains(&0), "no interior NUL may truncate the list");
+        let text = std::str::from_utf8(body).unwrap();
+        assert!(text.is_ascii());
+        let pairs: std::collections::BTreeMap<&str, &str> = text
+            .split(',')
+            .map(|pair| pair.split_once(':').expect("key:value"))
+            .collect();
+        if JEMALLOC_HAS_BACKGROUND_THREADS {
+            assert_eq!(pairs.len(), 3, "{text}");
+            assert_eq!(pairs["background_thread"], "true");
+        } else {
+            assert_eq!(pairs.len(), 2, "{text}");
+            assert!(!pairs.contains_key("background_thread"), "{text}");
+        }
+        assert_eq!(
+            JEMALLOC_HAS_BACKGROUND_THREADS,
+            !cfg!(target_os = "macos") && !cfg!(target_os = "ios"),
+            "jemalloc builds background threads everywhere but Mach-O"
+        );
+        let dirty: i64 = pairs["dirty_decay_ms"].parse().unwrap();
+        assert!(
+            (0..10_000).contains(&dirty),
+            "tuned below jemalloc's 10 s default"
+        );
+        assert_eq!(pairs["muzzy_decay_ms"], "0");
+    }
+
+    #[test]
+    fn jemalloc_options_parse_from_the_stats_report_shape() {
+        let report = br#"{"jemalloc": {"version": "5.3.1", "opt": {"abort": false,
+            "background_thread": true, "dirty_decay_ms": 5000, "muzzy_decay_ms": 0,
+            "narenas": 56, "retain": true}}}"#;
+        assert_eq!(
+            parse_jemalloc_options(report).unwrap(),
+            JemallocOptions {
+                background_thread: Some(true),
+                dirty_decay_ms: 5000,
+                muzzy_decay_ms: 0,
+                narenas: 56,
+            }
+        );
+        let disabled = br#"{"jemalloc": {"opt": {"background_thread": false,
+            "dirty_decay_ms": -1, "muzzy_decay_ms": -1, "narenas": 4}}}"#;
+        assert_eq!(parse_jemalloc_options(disabled).unwrap().dirty_decay_ms, -1);
+        // A macOS report: no background-thread support, so no such option.
+        let apple = br#"{"jemalloc": {"opt": {"dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0, "narenas": 56}}}"#;
+        assert_eq!(
+            parse_jemalloc_options(apple).unwrap().background_thread,
+            None
+        );
+        let missing = br#"{"jemalloc": {"opt": {"background_thread": true}}}"#;
+        assert!(matches!(
+            parse_jemalloc_options(missing),
+            Err(AllocatorStatsError::MissingOption("dirty_decay_ms"))
+        ));
+        let malformed = br#"{"jemalloc": {"opt": {"background_thread": "yes",
+            "dirty_decay_ms": 5000, "muzzy_decay_ms": 0, "narenas": 56}}}"#;
+        assert!(matches!(
+            parse_jemalloc_options(malformed),
+            Err(AllocatorStatsError::MissingOption("background_thread"))
+        ));
+        assert!(matches!(
+            parse_jemalloc_options(b"not json"),
+            Err(AllocatorStatsError::StatsReport(_))
+        ));
+    }
+
+    #[test]
+    fn jemalloc_options_read_back_from_the_running_allocator() {
+        let options = jemalloc_options();
+        #[cfg(all(feature = "jemalloc", not(windows)))]
+        {
+            let options = options.expect("jemalloc reports its options");
+            assert!(
+                options.narenas > 0,
+                "jemalloc finished initializing: {options:?}"
+            );
+            assert!(options.dirty_decay_ms >= -1 && options.muzzy_decay_ms >= -1);
+            // The option is reported exactly where jemalloc supports it.
+            assert_eq!(
+                options.background_thread.is_some(),
+                JEMALLOC_HAS_BACKGROUND_THREADS,
+                "{options:?}"
+            );
+        }
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
+        assert!(matches!(
+            options,
+            Err(AllocatorStatsError::JemallocNotEnabled)
+        ));
+    }
+
+    #[test]
+    fn arena_wrapper_preserves_owner_metadata() {
+        let owner = PaneArena::new(7, ArenaId(42));
+        let arena = Arena::new(owner, String::from("value"));
+        assert_eq!(arena.owner(), owner);
+        assert_eq!(arena.as_ref(), "value");
+
+        let mapped = arena.map(|value| value.len());
+        assert_eq!(mapped.owner(), owner);
+        assert_eq!(mapped.into_inner(), 5);
+    }
+
+    #[test]
+    fn registry_reserve_reuse_release_cycle() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.is_empty());
+
+        let first = registry.reserve(11);
+        assert!(first.is_created());
+        assert_eq!(registry.count(), 1);
+
+        let second = registry.reserve(11);
+        assert!(!second.is_created());
+        assert_eq!(first.arena(), second.arena());
+
+        let released = registry.release(11).expect("reservation should exist");
+        assert_eq!(released, first.arena());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_snapshot_is_sorted_and_stable() {
+        let registry = PaneArenaRegistry::new();
+        let _ = registry.reserve(30);
+        let _ = registry.reserve(10);
+        let _ = registry.reserve(20);
+
+        let panes: Vec<_> = registry
+            .snapshot()
+            .into_iter()
+            .map(|arena| arena.pane_id())
+            .collect();
+        assert_eq!(panes, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn registry_tracks_logical_bytes_and_peak_usage() {
+        let registry = PaneArenaRegistry::new();
+        let arena = registry.reserve(17).arena();
+
+        let first = registry
+            .set_tracked_bytes(17, 64)
+            .expect("pane arena stats should exist");
+        assert_eq!(first.tracked_bytes, 64);
+        assert_eq!(first.peak_tracked_bytes, 64);
+        assert_eq!(first.updates, 1);
+
+        let second = registry
+            .set_tracked_bytes(17, 32)
+            .expect("pane arena stats should exist");
+        assert_eq!(second.tracked_bytes, 32);
+        assert_eq!(second.peak_tracked_bytes, 64);
+        assert_eq!(second.updates, 2);
+
+        let snapshot = registry.stats_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].arena, arena);
+        assert_eq!(snapshot[0].stats, second);
+
+        let released = registry.release(17).expect("pane arena should exist");
+        assert_eq!(released, arena);
+        assert!(registry.stats(17).is_none());
+        assert_eq!(registry.stats_snapshot(), [] as [PaneArenaSnapshot; 0]);
+    }
+
+    #[test]
+    fn allocator_stats_api_matches_feature_mode() {
+        #[cfg(all(feature = "jemalloc", not(windows)))]
+        {
+            let stats = read_allocator_stats().expect("jemalloc stats should be readable");
+            assert!(stats.resident >= stats.allocated);
+            assert!(stats.mapped >= stats.resident);
+        }
+
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
+        {
+            let err = read_allocator_stats().expect_err("stats should be unavailable");
+            assert!(matches!(err, AllocatorStatsError::JemallocNotEnabled));
+        }
+    }
+
+    // ========================================================================
+    // AllocatorBackend
+    // ========================================================================
+
+    #[test]
+    fn allocator_backend_as_str() {
+        assert_eq!(AllocatorBackend::System.as_str(), "system");
+        assert_eq!(AllocatorBackend::Jemalloc.as_str(), "jemalloc");
+    }
+
+    #[test]
+    fn jemalloc_enabled_matches_backend() {
+        assert_eq!(
+            jemalloc_enabled(),
+            allocator_backend() == AllocatorBackend::Jemalloc
+        );
+    }
+
+    // ========================================================================
+    // AllocatorStats default
+    // ========================================================================
+
+    #[test]
+    fn allocator_stats_default_is_zeroed() {
+        let stats = AllocatorStats::default();
+        assert_eq!(stats.allocated, 0);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.resident, 0);
+        assert_eq!(stats.mapped, 0);
+        assert_eq!(stats.retained, 0);
+    }
+
+    // ========================================================================
+    // ArenaId and PaneArena
+    // ========================================================================
+
+    #[test]
+    fn arena_id_raw_returns_inner_value() {
+        let id = ArenaId(42);
+        assert_eq!(id.raw(), 42);
+    }
+
+    #[test]
+    fn arena_id_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+
+        assert_eq!(next_unique_arena_id(&counter), ArenaId(u32::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "pane arena id space exhausted; refusing to reuse an arena identity")]
+    fn arena_id_allocator_fails_closed_at_exhaustion() {
+        let counter = AtomicU32::new(u32::MAX);
+        let _ = next_unique_arena_id(&counter);
+    }
+
+    #[test]
+    fn pane_arena_accessors() {
+        let arena = PaneArena::new(7, ArenaId(3));
+        assert_eq!(arena.pane_id(), 7);
+        assert_eq!(arena.arena_id(), ArenaId(3));
+    }
+
+    #[test]
+    fn pane_arena_equality() {
+        let a = PaneArena::new(1, ArenaId(10));
+        let b = PaneArena::new(1, ArenaId(10));
+        let c = PaneArena::new(1, ArenaId(11));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ========================================================================
+    // Arena<T> wrapper
+    // ========================================================================
+
+    #[test]
+    fn arena_as_mut_allows_modification() {
+        let owner = PaneArena::new(1, ArenaId(1));
+        let mut arena = Arena::new(owner, vec![1, 2, 3]);
+        arena.as_mut().push(4);
+        assert_eq!(arena.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(arena.owner(), owner);
+    }
+
+    #[test]
+    fn arena_into_inner_returns_value() {
+        let owner = PaneArena::new(5, ArenaId(5));
+        let arena = Arena::new(owner, "hello".to_string());
+        let inner = arena.into_inner();
+        assert_eq!(inner, "hello");
+    }
+
+    // ========================================================================
+    // ReserveOutcome
+    // ========================================================================
+
+    #[test]
+    fn reserve_outcome_created_accessors() {
+        let arena = PaneArena::new(1, ArenaId(1));
+        let outcome = ReserveOutcome::Created(arena);
+        assert!(outcome.is_created());
+        assert_eq!(outcome.arena(), arena);
+    }
+
+    #[test]
+    fn reserve_outcome_existing_accessors() {
+        let arena = PaneArena::new(2, ArenaId(2));
+        let outcome = ReserveOutcome::Existing(arena);
+        assert!(!outcome.is_created());
+        assert_eq!(outcome.arena(), arena);
+    }
+
+    // ========================================================================
+    // PaneArenaRegistry edge cases
+    // ========================================================================
+
+    #[test]
+    fn registry_get_returns_none_for_unknown_pane() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.get(999).is_none());
+    }
+
+    #[test]
+    fn registry_get_returns_some_for_reserved_pane() {
+        let registry = PaneArenaRegistry::new();
+        let outcome = registry.reserve(42);
+        let got = registry.get(42).expect("should find reserved pane");
+        assert_eq!(got, outcome.arena());
+    }
+
+    #[test]
+    fn registry_release_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.release(999).is_none());
+    }
+
+    #[test]
+    fn registry_set_tracked_bytes_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.set_tracked_bytes(999, 100).is_none());
+    }
+
+    #[test]
+    fn registry_stats_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.stats(999).is_none());
+    }
+
+    #[test]
+    fn registry_multiple_panes_independent_arenas() {
+        let registry = PaneArenaRegistry::new();
+        let a = registry.reserve(1).arena();
+        let b = registry.reserve(2).arena();
+        let c = registry.reserve(3).arena();
+
+        assert_ne!(a.arena_id(), b.arena_id());
+        assert_ne!(b.arena_id(), c.arena_id());
+        assert_eq!(registry.count(), 3);
+
+        // Track bytes independently
+        registry.set_tracked_bytes(1, 100);
+        registry.set_tracked_bytes(2, 200);
+        registry.set_tracked_bytes(3, 300);
+
+        assert_eq!(registry.stats(1).unwrap().tracked_bytes, 100);
+        assert_eq!(registry.stats(2).unwrap().tracked_bytes, 200);
+        assert_eq!(registry.stats(3).unwrap().tracked_bytes, 300);
+    }
+
+    #[test]
+    fn registry_peak_tracked_bytes_is_watermark() {
+        let registry = PaneArenaRegistry::new();
+        registry.reserve(1);
+
+        registry.set_tracked_bytes(1, 100);
+        registry.set_tracked_bytes(1, 500);
+        registry.set_tracked_bytes(1, 200);
+        registry.set_tracked_bytes(1, 400);
+
+        let stats = registry.stats(1).unwrap();
+        assert_eq!(stats.tracked_bytes, 400);
+        assert_eq!(stats.peak_tracked_bytes, 500);
+        assert_eq!(stats.updates, 4);
+    }
+
+    #[test]
+    fn registry_arena_ids_are_monotonically_increasing() {
+        let registry = PaneArenaRegistry::new();
+        let a = registry.reserve(10).arena().arena_id().raw();
+        let b = registry.reserve(20).arena().arena_id().raw();
+        let c = registry.reserve(30).arena().arena_id().raw();
+        assert!(a < b);
+        assert!(b < c);
+    }
+
+    #[test]
+    fn registry_stats_snapshot_includes_all_panes() {
+        let registry = PaneArenaRegistry::new();
+        registry.reserve(5);
+        registry.reserve(3);
+        registry.reserve(7);
+
+        registry.set_tracked_bytes(5, 50);
+        registry.set_tracked_bytes(7, 70);
+
+        let snapshot = registry.stats_snapshot();
+        assert_eq!(snapshot.len(), 3);
+        // Sorted by pane_id
+        assert_eq!(snapshot[0].arena.pane_id(), 3);
+        assert_eq!(snapshot[1].arena.pane_id(), 5);
+        assert_eq!(snapshot[2].arena.pane_id(), 7);
+        // Stats reflect tracked bytes
+        assert_eq!(snapshot[0].stats.tracked_bytes, 0); // no set_tracked_bytes for pane 3
+        assert_eq!(snapshot[1].stats.tracked_bytes, 50);
+        assert_eq!(snapshot[2].stats.tracked_bytes, 70);
+    }
+
+    #[test]
+    fn pane_arena_stats_default_is_zeroed() {
+        let stats = PaneArenaStats::default();
+        assert_eq!(stats.tracked_bytes, 0);
+        assert_eq!(stats.peak_tracked_bytes, 0);
+        assert_eq!(stats.updates, 0);
+    }
+}

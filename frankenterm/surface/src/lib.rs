@@ -1,0 +1,3456 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+#![allow(
+    clippy::cast_abs_to_unsigned,
+    clippy::derivable_impls,
+    clippy::from_over_into,
+    clippy::len_without_is_empty,
+    clippy::manual_flatten,
+    clippy::module_inception,
+    clippy::needless_borrow,
+    clippy::needless_borrowed_reference,
+    clippy::needless_lifetimes,
+    clippy::needless_return,
+    clippy::redundant_closure,
+    clippy::result_large_err,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_sort_by
+)]
+use crate::line::CellRef;
+use alloc::borrow::Cow;
+use alloc::collections::BTreeSet;
+use core::cmp::min;
+use finl_unicode::grapheme_clusters::Graphemes;
+use frankenterm_cell::color::ColorAttribute;
+#[cfg(feature = "use_image")]
+use frankenterm_cell::image::ImageCell;
+use frankenterm_cell::{Cell, CellAttributes};
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "use_serde")]
+use serde::{Deserialize, Serialize};
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+use crate::alloc::borrow::ToOwned;
+use crate::alloc::string::ToString;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
+pub mod cellcluster;
+pub mod change;
+pub mod hyperlink;
+pub mod line;
+
+pub use self::change::{Change, LineAttribute};
+#[cfg(feature = "use_image")]
+pub use self::change::{Image, TextureCoordinate};
+pub use self::line::Line;
+
+/// Position holds 0-based positioning information, where
+/// Absolute(0) is the start of the line or column,
+/// Relative(0) is the current position in the line or
+/// column and EndRelative(0) is the end position in the
+/// line or column.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Position {
+    /// Negative values move up, positive values down, 0 means no change
+    Relative(isize),
+    /// Relative to the start of the line or top of the screen
+    Absolute(usize),
+    /// Relative to the end of line or bottom of screen
+    EndRelative(usize),
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Hash, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum CursorVisibility {
+    Hidden,
+    Visible,
+}
+
+impl Default for CursorVisibility {
+    fn default() -> CursorVisibility {
+        CursorVisibility::Visible
+    }
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum CursorShape {
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
+impl Default for CursorShape {
+    fn default() -> CursorShape {
+        CursorShape::Default
+    }
+}
+
+impl CursorShape {
+    pub fn is_blinking(self) -> bool {
+        matches!(
+            self,
+            Self::BlinkingBlock | Self::BlinkingUnderline | Self::BlinkingBar
+        )
+    }
+}
+
+/// SequenceNo indicates a logical position within a stream of changes.
+/// The sequence is only meaningful within a given `Surface` instance.
+pub type SequenceNo = usize;
+pub const SEQ_ZERO: SequenceNo = 0;
+
+/// A rectangular dirty region in surface cell coordinates.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct DirtyRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl DirtyRect {
+    #[inline]
+    fn can_vertical_merge(&self, row: usize, span: &core::ops::Range<usize>) -> bool {
+        self.x == span.start
+            && self.width == span.end.saturating_sub(span.start)
+            && self.y.saturating_add(self.height) == row
+    }
+}
+
+/// The `Surface` type represents the contents of a terminal screen.
+/// It is not directly connected to a terminal device.
+/// It consists of a buffer and a log of changes.  You can accumulate
+/// updates to the screen by adding instances of the `Change` enum
+/// that describe the updates.
+///
+/// When ready to render the `Surface` to a `Terminal`, you can use
+/// the `get_changes` method to return an optimized stream of `Change`s
+/// since the last render and then pass it to an instance of `Renderer`.
+///
+/// `Surface`s can also be composited together; this is useful when
+/// building up a UI with layers or widgets: each widget can be its
+/// own `Surface` instance and have its content maintained independently
+/// from the other widgets on the screen and can then be copied into
+/// the target `Surface` buffer for rendering.
+///
+/// To support more efficient updates in the composite use case, a
+/// `draw_from_screen` method is available; the intent is to have one
+/// `Surface` be hold the data that was last rendered, and a second `Surface`
+/// of the same size that is repeatedly redrawn from the composite
+/// of the widgets.  `draw_from_screen` is used to extract the smallest
+/// difference between the updated screen and apply those changes to
+/// the render target, and then use `get_changes` to render those without
+/// repainting the world on each update.
+#[derive(Default, Clone)]
+pub struct Surface {
+    width: usize,
+    height: usize,
+    lines: Vec<Line>,
+    attributes: CellAttributes,
+    xpos: usize,
+    ypos: usize,
+    seqno: SequenceNo,
+    changes: Vec<Change>,
+    cursor_shape: Option<CursorShape>,
+    cursor_visibility: CursorVisibility,
+    cursor_color: ColorAttribute,
+    title: String,
+}
+
+#[derive(Default)]
+struct DiffState {
+    changes: Vec<Change>,
+    /// Keep track of the cursor position that the change stream
+    /// selects for updates so that we can avoid emitting redundant
+    /// position changes.
+    cursor: Option<(usize, usize)>,
+    /// Similarly, we keep track of the cell attributes that we have
+    /// activated for change stream to avoid over-emitting.
+    /// Tracking the cursor and attributes in this way helps to coalesce
+    /// lines of text into simpler strings.
+    attr: Option<CellAttributes>,
+}
+
+impl DiffState {
+    #[inline]
+    fn diff_cells(&mut self, col_num: usize, row_num: usize, cell: CellRef, other_cell: CellRef) {
+        if cell.same_contents(&other_cell) {
+            return;
+        }
+
+        self.set_cell(col_num, row_num, other_cell);
+    }
+
+    #[inline]
+    fn set_cell(&mut self, col_num: usize, row_num: usize, other_cell: CellRef) {
+        self.cursor = match self.cursor.take() {
+            Some((cursor_row, cursor_col)) if cursor_row == row_num && cursor_col == col_num => {
+                // It is on the current column, so we don't need
+                // to explicitly move it.  Move the cursor by the
+                // width of the text we're about to add.
+                Some((row_num, col_num + other_cell.width()))
+            }
+            _ => {
+                // Need to explicitly move the cursor
+                self.changes.push(Change::CursorPosition {
+                    y: Position::Absolute(row_num),
+                    x: Position::Absolute(col_num),
+                });
+                // and update the position for next time
+                Some((row_num, col_num + other_cell.width()))
+            }
+        };
+
+        // we could get fancy and try to minimize the update traffic
+        // by computing a series of AttributeChange values here.
+        // For now, let's just record the new value
+        self.attr = match self.attr.take() {
+            Some(ref attr) if attr == other_cell.attrs() => {
+                // Active attributes match, so we don't need
+                // to emit a change for them
+                Some(attr.clone())
+            }
+            _ => {
+                // Attributes are different
+                self.changes
+                    .push(Change::AllAttributes(other_cell.attrs().clone()));
+                Some(other_cell.attrs().clone())
+            }
+        };
+        // A little bit of bloat in the code to avoid runs of single
+        // character Text entries; just append to the string.
+        let result_len = self.changes.len();
+        if result_len > 0 && self.changes[result_len - 1].is_text() {
+            if let Some(Change::Text(ref mut prefix)) = self.changes.get_mut(result_len - 1) {
+                prefix.push_str(other_cell.str());
+            }
+        } else {
+            self.changes
+                .push(Change::Text(other_cell.str().to_string()));
+        }
+    }
+}
+
+impl Surface {
+    /// Create a new Surface with the specified width and height.
+    pub fn new(width: usize, height: usize) -> Self {
+        let mut lines = Vec::new();
+        lines.resize_with(height, || Line::with_width(width, SEQ_ZERO));
+        Surface {
+            width,
+            height,
+            lines,
+            ..Default::default()
+        }
+    }
+
+    /// Returns the (width, height) of the surface
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.xpos, self.ypos)
+    }
+
+    pub fn cursor_shape(&self) -> Option<CursorShape> {
+        self.cursor_shape
+    }
+
+    pub fn cursor_visibility(&self) -> CursorVisibility {
+        self.cursor_visibility
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Resize the Surface to the specified width and height.
+    /// If the width and/or height are smaller than previously, the rows and/or
+    /// columns are truncated.  If the width and/or height are larger than
+    /// previously then an appropriate number of cells are added to the
+    /// buffer and filled with default attributes.
+    /// An actual dimension change invalidates the change stream, discarding it
+    /// and causing a subsequent `get_changes` call to yield a full repaint.
+    /// Requesting the current dimensions is a no-op.
+    /// If the cursor position would be outside the bounds of the newly resized
+    /// screen, it will be moved to be within the new bounds.
+    pub fn resize(&mut self, width: usize, height: usize) {
+        if self.width == width && self.height == height {
+            return;
+        }
+
+        // Invalidate the change stream before an actual dimension change.
+        // Rendering a resize as a Change doesn't make sense, so advance the
+        // sequence without recording an entry and flush the journal. This is
+        // required even when the journal is already empty: a consumer holding
+        // the current token must still observe the resize and request a full
+        // repaint. A same-dimension resize is a genuine no-op.
+        let next_seqno = self
+            .seqno
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("surface change sequence exhausted during resize"));
+        self.seqno = next_seqno;
+        self.changes.clear();
+
+        // Drop discarded rows before resizing retained rows, then construct
+        // only genuinely new rows at their final width. `Vec::resize` would
+        // eagerly allocate a full-width template even when height is unchanged
+        // or shrinking, and growing first would resize each new row twice.
+        self.lines.truncate(height);
+        for line in &mut self.lines {
+            line.resize(width, self.seqno);
+        }
+        let seqno = self.seqno;
+        self.lines
+            .resize_with(height, || Line::with_width(width, seqno));
+        self.width = width;
+        self.height = height;
+
+        // Ensure that the cursor position is well-defined
+        self.xpos = compute_position_change(self.xpos, &Position::Relative(0), self.width);
+        self.ypos = compute_position_change(self.ypos, &Position::Relative(0), self.height);
+    }
+
+    /// Efficiently apply a series of changes
+    /// Returns the sequence number at the end of the change.
+    pub fn add_changes(&mut self, mut changes: Vec<Change>) -> SequenceNo {
+        // Preflight the complete batch before changing either the modeled
+        // screen or its journal. Reusing a saturated sequence number would
+        // make later mutations invisible to a consumer holding that token.
+        let next_seqno = self
+            .seqno
+            .checked_add(changes.len())
+            .unwrap_or_else(|| panic!("surface change sequence exhausted while applying a batch"));
+        let seq = self.seqno.saturating_sub(1).saturating_add(changes.len());
+        // Stamp every affected Line with the committed batch frontier. Keeping
+        // the old frontier during apply would make `changed_since(old)` miss
+        // rows that this batch actually mutated.
+        self.seqno = next_seqno;
+
+        for change in &mut changes {
+            let original = core::mem::replace(change, Change::Text(String::new()));
+            *change = self.canonicalize_change(original);
+            self.apply_change(change);
+        }
+
+        self.changes.append(&mut changes);
+
+        seq
+    }
+
+    /// Apply a change and return the sequence number at the end of the change.
+    pub fn add_change<C: Into<Change>>(&mut self, change: C) -> SequenceNo {
+        let seq = self.seqno;
+        let next_seqno = self
+            .seqno
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("surface change sequence exhausted"));
+        self.seqno = next_seqno;
+        let change = self.canonicalize_change(change.into());
+        self.apply_change(&change);
+        self.changes.push(change);
+        seq
+    }
+
+    fn canonicalize_change(&self, change: Change) -> Change {
+        #[cfg(feature = "use_image")]
+        {
+            return match change {
+                Change::Image(image) => {
+                    let available_width = self.width.saturating_sub(self.xpos.min(self.width));
+                    image
+                        .clipped_to_cell_bounds(available_width, self.height)
+                        .map(Change::Image)
+                        // Preserve sequence-number continuity while ensuring
+                        // that a rejected image cannot escape through the
+                        // incremental journal to a direct renderer.
+                        .unwrap_or_else(|| Change::Text(String::new()))
+                }
+                change => change,
+            };
+        }
+
+        #[cfg(not(feature = "use_image"))]
+        change
+    }
+
+    fn apply_change(&mut self, change: &Change) {
+        match change {
+            Change::AllAttributes(attr) => self.attributes = attr.clone(),
+            Change::Text(text) => self.print_text(text),
+            Change::Attribute(change) => self.attributes.apply_change(change),
+            Change::CursorPosition { x, y } => self.set_cursor_pos(x, y),
+            Change::ClearScreen(color) => self.clear_screen(*color),
+            Change::ClearToEndOfLine(color) => self.clear_eol(*color),
+            Change::ClearToEndOfScreen(color) => self.clear_eos(*color),
+            Change::CursorColor(color) => self.cursor_color = *color,
+            Change::CursorShape(shape) => self.cursor_shape = Some(*shape),
+            Change::CursorVisibility(visibility) => self.cursor_visibility = *visibility,
+            #[cfg(feature = "use_image")]
+            Change::Image(image) => self.add_image(image),
+            Change::Title(text) => self.title = text.to_owned(),
+            Change::ScrollRegionUp {
+                first_row,
+                region_size,
+                scroll_count,
+            } => self.scroll_region_up(*first_row, *region_size, *scroll_count),
+            Change::ScrollRegionDown {
+                first_row,
+                region_size,
+                scroll_count,
+            } => self.scroll_region_down(*first_row, *region_size, *scroll_count),
+            Change::LineAttribute(attr) => self.line_attribute(attr),
+        }
+    }
+
+    #[cfg(feature = "use_image")]
+    fn add_image(&mut self, image: &Image) {
+        if image.width == 0 || image.height == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let top_left_x = image.top_left.x.into_inner();
+        let top_left_y = image.top_left.y.into_inner();
+        let bottom_right_x = image.bottom_right.x.into_inner();
+        let bottom_right_y = image.bottom_right.y.into_inner();
+        let xspan = f64::from(bottom_right_x) - f64::from(top_left_x);
+        let yspan = f64::from(bottom_right_y) - f64::from(top_left_y);
+
+        let original_ypos = self.ypos.min(self.height - 1);
+        let available_rows = self.height.saturating_sub(original_ypos);
+        let scroll = image.height.saturating_sub(available_rows);
+        if scroll > 0 {
+            // One region rotation is O(viewport rows). Repeatedly removing row
+            // zero made a tall image O(rows squared), and an image taller than
+            // the viewport could underflow `ypos` before rendering began.
+            self.scroll_region_up(0, self.height, scroll);
+        }
+        self.ypos = original_ypos.saturating_sub(scroll);
+        let source_row_start = image.height.saturating_sub(self.height);
+        let visible_height = image
+            .height
+            .saturating_sub(source_row_start)
+            .min(self.height.saturating_sub(self.ypos));
+        let visible_width = image.width.min(self.width.saturating_sub(self.xpos));
+
+        for visible_y in 0..visible_height {
+            let source_y = source_row_start.saturating_add(visible_y);
+            let texture_top = if source_y == 0 {
+                top_left_y
+            } else {
+                (f64::from(top_left_y) + yspan * source_y as f64 / image.height as f64) as f32
+            };
+            let texture_bottom = if source_y.saturating_add(1) == image.height {
+                bottom_right_y
+            } else {
+                (f64::from(top_left_y)
+                    + yspan * source_y.saturating_add(1) as f64 / image.height as f64)
+                    as f32
+            };
+            if texture_top >= texture_bottom {
+                continue;
+            }
+            for x in 0..visible_width {
+                let texture_left = if x == 0 {
+                    top_left_x
+                } else {
+                    (f64::from(top_left_x) + xspan * x as f64 / image.width as f64) as f32
+                };
+                let texture_right = if x + 1 == image.width {
+                    bottom_right_x
+                } else {
+                    (f64::from(top_left_x) + xspan * (x + 1) as f64 / image.width as f64) as f32
+                };
+                if texture_left >= texture_right {
+                    continue;
+                }
+                self.lines[self.ypos + visible_y].set_cell(
+                    self.xpos + x,
+                    Cell::new(
+                        ' ',
+                        self.attributes
+                            .clone()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(texture_left, texture_top),
+                                TextureCoordinate::new_f32(texture_right, texture_bottom),
+                                image.image.clone(),
+                            )))
+                            .clone(),
+                    ),
+                    self.seqno,
+                );
+            }
+        }
+
+        self.xpos = self.xpos.saturating_add(image.width);
+    }
+
+    fn clear_screen(&mut self, color: ColorAttribute) {
+        self.attributes = CellAttributes::default().set_background(color).clone();
+        let cleared = Cell::new(' ', self.attributes.clone());
+        for line in &mut self.lines {
+            line.fill_range(0..self.width, &cleared, self.seqno);
+        }
+        self.xpos = 0;
+        self.ypos = 0;
+    }
+
+    fn clear_eos(&mut self, color: ColorAttribute) {
+        self.attributes = CellAttributes::default().set_background(color).clone();
+        let cleared = Cell::new(' ', self.attributes.clone());
+        let Some(line) = self.lines.get_mut(self.ypos) else {
+            return;
+        };
+        line.fill_range(self.xpos..self.width, &cleared, self.seqno);
+        for line in &mut self.lines.iter_mut().skip(self.ypos.saturating_add(1)) {
+            line.fill_range(0..self.width, &cleared, self.seqno);
+        }
+    }
+
+    fn clear_eol(&mut self, color: ColorAttribute) {
+        self.attributes = CellAttributes::default().set_background(color).clone();
+        let cleared = Cell::new(' ', self.attributes.clone());
+        if let Some(line) = self.lines.get_mut(self.ypos) {
+            line.fill_range(self.xpos..self.width, &cleared, self.seqno);
+        }
+    }
+
+    fn scroll_screen_up(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.lines.remove(0);
+        self.lines.push(Line::with_width(self.width, self.seqno));
+    }
+
+    fn scroll_region_up(&mut self, start: usize, size: usize, count: usize) {
+        let end = start.saturating_add(size).min(self.height);
+        if start >= end {
+            return;
+        }
+        let size = end - start;
+        let count = min(count, size);
+
+        // Replace the first lines with empty lines
+        for index in start..start + min(count, size) {
+            self.lines[index] = Line::with_width(self.width, self.seqno);
+        }
+        // Rotate the remaining lines up the surface.
+        if 0 < count && count < size {
+            self.lines[start..start + size].rotate_left(count);
+        }
+    }
+
+    fn scroll_region_down(&mut self, start: usize, size: usize, count: usize) {
+        let end = start.saturating_add(size).min(self.height);
+        if start >= end {
+            return;
+        }
+        let size = end - start;
+        let count = min(count, size);
+
+        // Replace the last lines with empty lines
+        for index in start + size - min(count, size)..start + size {
+            self.lines[index] = Line::with_width(self.width, self.seqno);
+        }
+        // Rotate the remaining lines down the surface.
+        if 0 < count && count < size {
+            self.lines[start..start + size].rotate_right(count);
+        }
+    }
+
+    fn line_attribute(&mut self, attr: &LineAttribute) {
+        if let Some(line) = self.lines.get_mut(self.ypos) {
+            match attr {
+                LineAttribute::DoubleHeightTopHalfLine => line.set_double_height_top(self.seqno),
+                LineAttribute::DoubleHeightBottomHalfLine => {
+                    line.set_double_height_bottom(self.seqno);
+                }
+                LineAttribute::DoubleWidthLine => line.set_double_width(self.seqno),
+                LineAttribute::SingleWidthLine => line.set_single_width(self.seqno),
+            }
+        }
+    }
+
+    fn print_text(&mut self, text: &str) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+
+        for g in Graphemes::new(text) {
+            if g == "\r\n" {
+                self.xpos = 0;
+                let new_y = self.ypos.saturating_add(1);
+                if new_y >= self.height {
+                    self.scroll_screen_up();
+                } else {
+                    self.ypos = new_y;
+                }
+                continue;
+            }
+
+            if g == "\r" {
+                self.xpos = 0;
+                continue;
+            }
+
+            if g == "\n" {
+                let new_y = self.ypos.saturating_add(1);
+                if new_y >= self.height {
+                    self.scroll_screen_up();
+                } else {
+                    self.ypos = new_y;
+                }
+                continue;
+            }
+
+            if self.xpos >= self.width {
+                let new_y = self.ypos.saturating_add(1);
+                if new_y >= self.height {
+                    self.scroll_screen_up();
+                } else {
+                    self.ypos = new_y;
+                }
+                self.xpos = 0;
+            }
+
+            let cell = Cell::new_grapheme(g, self.attributes.clone(), None);
+            // the max(1) here is to ensure that we advance to the next cell
+            // position for zero-width graphemes.  We want to make sure that
+            // they occupy a cell so that we can re-emit them when we output them.
+            // If we didn't do this, then we'd effectively filter them out from
+            // the model, which seems like a lossy design choice.
+            let width = cell.width().max(1);
+
+            self.lines[self.ypos].set_cell(self.xpos, cell, self.seqno);
+
+            // Increment the position now; we'll defer processing
+            // wrapping until the next printed character, otherwise
+            // we'll eagerly scroll when we reach the right margin.
+            self.xpos = self.xpos.saturating_add(width);
+        }
+    }
+
+    fn set_cursor_pos(&mut self, x: &Position, y: &Position) {
+        self.xpos = compute_position_change(self.xpos, x, self.width);
+        self.ypos = compute_position_change(self.ypos, y, self.height);
+    }
+
+    /// Returns the entire contents of the screen as a string.
+    /// Only the character data is returned.  The end of each line is
+    /// returned as a \n character.
+    /// This function exists primarily for testing purposes.
+    pub fn screen_chars_to_string(&self) -> String {
+        let mut s = String::new();
+
+        for line in &self.lines {
+            let mut col = 0usize;
+            for cell in line.visible_cells() {
+                let cell_idx = cell.cell_index();
+                while col < cell_idx.min(self.width) {
+                    s.push(' ');
+                    col += 1;
+                }
+                if col >= self.width {
+                    break;
+                }
+                s.push_str(cell.str());
+                col = col.saturating_add(cell.width().max(1));
+            }
+            while col < self.width {
+                s.push(' ');
+                col += 1;
+            }
+            s.push('\n');
+        }
+
+        s
+    }
+
+    /// Returns the cell data for the screen.
+    /// This is intended to be used for testing purposes.
+    pub fn screen_cells(&mut self) -> Vec<&mut [Cell]> {
+        let mut lines = Vec::new();
+        for line in &mut self.lines {
+            lines.push(line.cells_mut());
+        }
+        lines
+    }
+
+    pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+        self.lines.iter().map(|line| Cow::Borrowed(line)).collect()
+    }
+
+    /// Returns a stream of changes suitable to update the screen
+    /// to match the model.  The input `seq` argument should be 0
+    /// on the first call, or in any situation where the screen
+    /// contents may have been invalidated, otherwise it should
+    /// be set to the `SequenceNo` returned by the most recent call
+    /// to `get_changes`.
+    /// `get_changes` will use a heuristic to decide on the lower
+    /// cost approach to updating the screen and return some sequence
+    /// of `Change` entries that will update the display accordingly.
+    /// The worst case is that this function will fabricate a sequence
+    /// of Change entries to paint the screen from scratch.
+    pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+        // Do we have continuity in the sequence numbering?
+        let first = self.seqno.saturating_sub(self.changes.len());
+        if seq == 0 || first > seq || self.seqno == 0 {
+            // No, we have folded away some data, we'll need a full paint
+            return (self.seqno, Cow::Owned(self.repaint_all()));
+        }
+
+        // Approximate cost to render the change screen
+        let delta_cost = self.seqno - seq;
+        // Approximate cost to repaint from scratch
+        let full_cost = self.estimate_full_paint_cost();
+
+        if delta_cost > full_cost {
+            (self.seqno, Cow::Owned(self.repaint_all()))
+        } else {
+            (self.seqno, Cow::Borrowed(&self.changes[seq - first..]))
+        }
+    }
+
+    pub fn has_changes(&self, seq: SequenceNo) -> bool {
+        self.seqno != seq
+    }
+
+    pub fn current_seqno(&self) -> SequenceNo {
+        self.seqno
+    }
+
+    /// After having called `get_changes` and processed the resultant
+    /// change stream, the caller can then pass the returned `SequenceNo`
+    /// value to this call to prune the list of changes and free up
+    /// resources from the change log.
+    pub fn flush_changes_older_than(&mut self, seq: SequenceNo) {
+        let first = self.seqno.saturating_sub(self.changes.len());
+        let idx = seq.saturating_sub(first);
+        if idx > self.changes.len() {
+            return;
+        }
+        self.changes = self.changes.split_off(idx);
+    }
+
+    /// Without allocating resources, estimate how many Change entries
+    /// we would produce in repaint_all for the current state.
+    fn estimate_full_paint_cost(&self) -> usize {
+        // Assume 1 per cell with 20% overhead for attribute changes.
+        let cells = self.width.saturating_mul(self.height);
+        cells.saturating_add(cells / 5).saturating_add(3)
+    }
+
+    fn repaint_all(&self) -> Vec<Change> {
+        let mut result = vec![
+            // Home the cursor and clear the screen to defaults.  Hide the
+            // cursor while we're repainting.
+            Change::CursorVisibility(CursorVisibility::Hidden),
+            Change::ClearScreen(Default::default()),
+        ];
+
+        if !self.title.is_empty() {
+            result.push(Change::Title(self.title.to_owned()));
+        }
+
+        let mut attr = CellAttributes::default();
+
+        let crlf = Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Relative(1),
+        };
+
+        // Walk backwards through the lines; the goal is to determine
+        // if the screen ends with a number of clear lines that we
+        // can coalesce together as a ClearToEndOfScreen op.
+        // We track the index (from the end) of the last matching
+        // run, together with the color of that run.
+        let mut trailing_color = None;
+        let mut trailing_idx = None;
+
+        for (idx, line) in self.lines.iter().rev().enumerate() {
+            let changes = line.changes(&attr);
+            if changes.is_empty() {
+                // The line recorded no changes; this means that the line
+                // consists of spaces and the default background color
+                match trailing_color {
+                    Some(other) if other != Default::default() => {
+                        // Color doesn't match up, so we have to stop
+                        // looking for the ClearToEndOfScreen run here
+                        break;
+                    }
+                    // Color does match
+                    Some(_) => continue,
+                    // we don't have a run, we should start one
+                    None => {
+                        trailing_color = Some(Default::default());
+                        trailing_idx = Some(idx);
+                        continue;
+                    }
+                }
+            } else {
+                let last_change = changes.len() - 1;
+                match (&changes[last_change], trailing_color) {
+                    (&Change::ClearToEndOfLine(ref color), None) => {
+                        trailing_color = Some(*color);
+                        trailing_idx = Some(idx);
+                    }
+                    (&Change::ClearToEndOfLine(ref color), Some(other)) => {
+                        if other == *color {
+                            trailing_idx = Some(idx);
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        for (idx, line) in self.lines.iter().enumerate() {
+            match trailing_idx {
+                Some(t) if self.height - t == idx => {
+                    let color =
+                        trailing_color.expect("didn't set trailing_color along with trailing_idx");
+
+                    // The first in the sequence of the ClearToEndOfLine may
+                    // be batched up here; let's remove it if that is the case.
+                    let last_result = result.len() - 1;
+                    match result[last_result] {
+                        Change::ClearToEndOfLine(col) if col == color => {
+                            result.remove(last_result);
+                        }
+                        _ => {}
+                    }
+
+                    result.push(Change::ClearToEndOfScreen(color));
+                    break;
+                }
+                _ => {}
+            }
+
+            let mut changes = line.changes(&attr);
+
+            if idx != 0 {
+                // We emit a relative move at the end of each
+                // line with the theory that this will translate
+                // to a short \r\n sequence rather than the longer
+                // absolute cursor positioning sequence
+                result.push(crlf.clone());
+            }
+
+            result.append(&mut changes);
+            if let Some(c) = line.visible_cells().last() {
+                attr = c.attrs().clone();
+            }
+        }
+
+        // Remove any trailing sequence of cursor movements, as we're
+        // going to just finish up with an absolute move anyway.
+        loop {
+            let result_len = result.len();
+            if result_len == 0 {
+                break;
+            }
+            match result[result_len - 1] {
+                Change::CursorPosition { .. } => {
+                    result.remove(result_len - 1);
+                }
+                _ => break,
+            }
+        }
+
+        // Place the cursor at its intended position, but only if we moved the
+        // cursor.  We don't explicitly track movement but can infer it from the
+        // size of the results: results will have an initial ClearScreen entry
+        // that homes the cursor and a CursorShape entry that hides the cursor.
+        // If the screen is otherwise blank there will be no further entries
+        // and we don't need to emit cursor movement.  However, in the
+        // optimization passes above, we may have removed some number of
+        // movement entries, so let's be sure to check the cursor position to
+        // make sure that we don't fail to emit movement.
+
+        let moved_cursor = result.len() != 2;
+        if moved_cursor || self.xpos != 0 || self.ypos != 0 {
+            result.push(Change::CursorPosition {
+                x: Position::Absolute(self.xpos),
+                y: Position::Absolute(self.ypos),
+            });
+        }
+
+        // Set the intended cursor shape.  We hid the cursor at the start
+        // of the repaint, so no need to hide it again.
+        if self.cursor_visibility != CursorVisibility::Hidden {
+            result.push(Change::CursorVisibility(CursorVisibility::Visible));
+            if let Some(shape) = self.cursor_shape {
+                result.push(Change::CursorShape(shape));
+            }
+        }
+
+        result
+    }
+
+    /// Computes the change stream required to make the region within `self`
+    /// at coordinates `x`, `y` and size `width`, `height` look like the
+    /// same sized region within `other` at coordinates `other_x`, `other_y`.
+    ///
+    /// `other` and `self` may be the same, causing regions within the same
+    /// `Surface` to be differenced; this is used by the `copy_region` method.
+    ///
+    /// The returned list of `Change`s can be passed to the `add_changes` method
+    /// to make the region within self match the region within other.
+    #[allow(clippy::too_many_arguments)]
+    pub fn diff_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        other: &Surface,
+        other_x: usize,
+        other_y: usize,
+    ) -> Vec<Change> {
+        let mut diff_state = DiffState::default();
+
+        for ((row_num, line), other_line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .skip(y)
+            .take_while(|(row_num, _)| *row_num < y + height)
+            .zip(other.lines.iter().skip(other_y))
+        {
+            diff_line(
+                &mut diff_state,
+                line,
+                row_num,
+                other_line,
+                x,
+                width,
+                other_x,
+            );
+        }
+
+        diff_state.changes
+    }
+
+    /// Compute dirty rectangles for the specified region, comparing `self`
+    /// against `other` without materializing a textual change stream.
+    ///
+    /// Rectangles are coalesced vertically when adjacent rows dirty the same
+    /// horizontal span, producing larger upload-friendly regions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dirty_rects_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        other: &Surface,
+        other_x: usize,
+        other_y: usize,
+    ) -> Vec<DirtyRect> {
+        let mut rects: Vec<DirtyRect> = Vec::new();
+        let y_end = y.saturating_add(height);
+
+        for ((row_num, line), other_line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .skip(y)
+            .take_while(|(row_num, _)| *row_num < y_end)
+            .zip(other.lines.iter().skip(other_y))
+        {
+            let spans = diff_line_spans(line, other_line, x, width, other_x);
+            for span in spans {
+                if let Some(last) = rects.last_mut() {
+                    if last.can_vertical_merge(row_num, &span) {
+                        last.height = last.height.saturating_add(1);
+                        continue;
+                    }
+                }
+                rects.push(DirtyRect {
+                    x: span.start,
+                    y: row_num,
+                    width: span.end.saturating_sub(span.start),
+                    height: 1,
+                });
+            }
+        }
+
+        rects
+    }
+
+    /// Compute full-surface dirty rectangles between `self` and `other`.
+    pub fn dirty_rects(&self, other: &Surface) -> Vec<DirtyRect> {
+        self.dirty_rects_region(0, 0, self.width, self.height, other, 0, 0)
+    }
+
+    /// Compute tile-aligned dirty regions for a target tile grid.
+    ///
+    /// This is intended as a staging primitive for partial GPU uploads.
+    /// A zero `tile_width` or `tile_height` returns an empty result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dirty_tiles_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        other: &Surface,
+        other_x: usize,
+        other_y: usize,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> Vec<DirtyRect> {
+        if tile_width == 0 || tile_height == 0 {
+            return Vec::new();
+        }
+
+        let mut touched_tiles = BTreeSet::new();
+        for rect in self.dirty_rects_region(x, y, width, height, other, other_x, other_y) {
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            let start_tx = rect.x / tile_width;
+            let end_tx = rect.x.saturating_add(rect.width.saturating_sub(1)) / tile_width;
+            let start_ty = rect.y / tile_height;
+            let end_ty = rect.y.saturating_add(rect.height.saturating_sub(1)) / tile_height;
+            for ty in start_ty..=end_ty {
+                for tx in start_tx..=end_tx {
+                    touched_tiles.insert((tx, ty));
+                }
+            }
+        }
+
+        let mut tiles = Vec::with_capacity(touched_tiles.len());
+        for (tx, ty) in touched_tiles {
+            let tile_x = tx.saturating_mul(tile_width);
+            let tile_y = ty.saturating_mul(tile_height);
+            if tile_x >= self.width || tile_y >= self.height {
+                continue;
+            }
+            tiles.push(DirtyRect {
+                x: tile_x,
+                y: tile_y,
+                width: min(tile_width, self.width - tile_x),
+                height: min(tile_height, self.height - tile_y),
+            });
+        }
+        tiles
+    }
+
+    /// Compute full-surface tile-aligned dirty regions between `self` and `other`.
+    pub fn dirty_tiles(
+        &self,
+        other: &Surface,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> Vec<DirtyRect> {
+        self.dirty_tiles_region(
+            0,
+            0,
+            self.width,
+            self.height,
+            other,
+            0,
+            0,
+            tile_width,
+            tile_height,
+        )
+    }
+
+    pub fn diff_lines(&self, other_lines: Vec<&Line>) -> Vec<Change> {
+        let mut diff_state = DiffState::default();
+        for ((row_num, line), other_line) in self.lines.iter().enumerate().zip(other_lines.iter()) {
+            diff_line(&mut diff_state, line, row_num, other_line, 0, line.len(), 0);
+        }
+        diff_state.changes
+    }
+
+    pub fn diff_against_numbered_line(&self, row_num: usize, other_line: &Line) -> Vec<Change> {
+        let mut diff_state = DiffState::default();
+        if let Some(line) = self.lines.get(row_num) {
+            diff_line(&mut diff_state, line, row_num, other_line, 0, line.len(), 0);
+        }
+        diff_state.changes
+    }
+
+    /// Computes the change stream required to make `self` have the same
+    /// screen contents as `other`.
+    pub fn diff_screens(&self, other: &Surface) -> Vec<Change> {
+        self.diff_region(0, 0, self.width, self.height, other, 0, 0)
+    }
+
+    /// Draw the contents of `other` into self at the specified coordinates.
+    /// The required updates are recorded as Change entries as well as stored
+    /// in the screen line/cell data.
+    /// Saves the cursor position and attributes that were in effect prior to
+    /// calling `draw_from_screen` and restores them after applying the changes
+    /// from the other surface.
+    pub fn draw_from_screen(&mut self, other: &Surface, x: usize, y: usize) -> SequenceNo {
+        self.draw_from_screen_with_dirty_rects(other, x, y).0
+    }
+
+    /// Like [`Surface::draw_from_screen`], but returns the dirty rectangles
+    /// for the drawn region in destination coordinates.
+    pub fn draw_from_screen_with_dirty_rects(
+        &mut self,
+        other: &Surface,
+        x: usize,
+        y: usize,
+    ) -> (SequenceNo, Vec<DirtyRect>) {
+        let attrs = self.attributes.clone();
+        let cursor = (self.xpos, self.ypos);
+        let dirty_rects = self.dirty_rects_region(x, y, other.width, other.height, other, 0, 0);
+        let changes = self.diff_region(x, y, other.width, other.height, other, 0, 0);
+        let seq = self.add_changes(changes);
+        self.xpos = cursor.0;
+        self.ypos = cursor.1;
+        self.attributes = attrs;
+        (seq, dirty_rects)
+    }
+
+    /// Like [`Surface::draw_from_screen_with_dirty_rects`], but returns tile-aligned
+    /// dirty regions suitable for partial upload staging.
+    pub fn draw_from_screen_with_dirty_tiles(
+        &mut self,
+        other: &Surface,
+        x: usize,
+        y: usize,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> (SequenceNo, Vec<DirtyRect>) {
+        let attrs = self.attributes.clone();
+        let cursor = (self.xpos, self.ypos);
+        let dirty_tiles = self.dirty_tiles_region(
+            x,
+            y,
+            other.width,
+            other.height,
+            other,
+            0,
+            0,
+            tile_width,
+            tile_height,
+        );
+        let changes = self.diff_region(x, y, other.width, other.height, other, 0, 0);
+        let seq = self.add_changes(changes);
+        self.xpos = cursor.0;
+        self.ypos = cursor.1;
+        self.attributes = attrs;
+        (seq, dirty_tiles)
+    }
+
+    /// Copy the contents of the specified region to the same sized
+    /// region elsewhere in the screen display.
+    /// The regions may overlap.
+    /// # Panics
+    /// The destination region must be the same size as the source
+    /// (which is implied by the function parameters) and must fit
+    /// within the width and height of the Surface or this operation
+    /// will panic.
+    pub fn copy_region(
+        &mut self,
+        src_x: usize,
+        src_y: usize,
+        width: usize,
+        height: usize,
+        dest_x: usize,
+        dest_y: usize,
+    ) -> SequenceNo {
+        let changes = self.diff_region(dest_x, dest_y, width, height, self, src_x, src_y);
+        self.add_changes(changes)
+    }
+}
+
+/// Populate `diff_state` with changes to replace contents of `line` in range [x,x+width)
+/// with the contents of `other_line` in range [other_x,other_x+width).
+fn diff_line(
+    diff_state: &mut DiffState,
+    line: &Line,
+    row_num: usize,
+    other_line: &Line,
+    x: usize,
+    width: usize,
+    other_x: usize,
+) {
+    let x_end = x.saturating_add(width);
+    let other_x_end = other_x.saturating_add(width);
+    let mut cells = line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < x)
+        .take_while(|cell| cell.cell_index() < x_end)
+        .peekable();
+    let other_cells = other_line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < other_x)
+        .take_while(|cell| cell.cell_index() < other_x_end);
+
+    for other_cell in other_cells {
+        let rel_x = other_cell.cell_index() - other_x;
+        let mut comparison_cell = None;
+
+        // Advance the `cells` iterator to try to find the visible cell in `line` in the equivalent
+        // position to `other_cell`. If there is no visible cell in equivalent position, advance
+        // one past and wait for next iteration.
+        while let Some(cell) = cells.peek() {
+            let cell_rel_x = cell.cell_index() - x;
+
+            if cell_rel_x == rel_x {
+                comparison_cell = Some(*cell);
+                break;
+            } else if cell_rel_x > rel_x {
+                break;
+            }
+
+            cells.next();
+        }
+
+        // If we find a cell in the equivalent position, diff against it. If not, we know
+        // there is a multi-cell grapheme in `line` that partially overlaps `other_cell`,
+        // so we have to overwrite anyway.
+        let col_num = x.saturating_add(rel_x);
+        if let Some(comparison_cell) = comparison_cell {
+            diff_state.diff_cells(col_num, row_num, comparison_cell, other_cell);
+        } else {
+            diff_state.set_cell(col_num, row_num, other_cell);
+        }
+    }
+}
+
+/// Compute horizontal dirty spans for one line diff.
+fn diff_line_spans(
+    line: &Line,
+    other_line: &Line,
+    x: usize,
+    width: usize,
+    other_x: usize,
+) -> Vec<core::ops::Range<usize>> {
+    let x_end = x.saturating_add(width);
+    let other_x_end = other_x.saturating_add(width);
+    let mut cells = line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < x)
+        .take_while(|cell| cell.cell_index() < x_end)
+        .peekable();
+    let other_cells = other_line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < other_x)
+        .take_while(|cell| cell.cell_index() < other_x_end);
+
+    let mut spans: Vec<core::ops::Range<usize>> = Vec::new();
+
+    for other_cell in other_cells {
+        let rel_x = other_cell.cell_index() - other_x;
+        let mut comparison_cell = None;
+
+        while let Some(cell) = cells.peek() {
+            let cell_rel_x = cell.cell_index() - x;
+            if cell_rel_x == rel_x {
+                comparison_cell = Some(*cell);
+                break;
+            } else if cell_rel_x > rel_x {
+                break;
+            }
+            cells.next();
+        }
+
+        let changed = match comparison_cell {
+            Some(comparison_cell) => !comparison_cell.same_contents(&other_cell),
+            None => true,
+        };
+
+        if changed {
+            let start = x.saturating_add(rel_x);
+            let end = min(start.saturating_add(other_cell.width().max(1)), x_end);
+            if end > start {
+                if let Some(last) = spans.last_mut() {
+                    if start <= last.end {
+                        last.end = last.end.max(end);
+                        continue;
+                    }
+                }
+                spans.push(start..end);
+            }
+        }
+    }
+
+    spans
+}
+
+/// Applies a Position update to either the x or y position.
+/// The value is clamped to be in the range: 0..limit
+fn compute_position_change(current: usize, pos: &Position, limit: usize) -> usize {
+    use self::Position::*;
+    match pos {
+        Relative(delta) => {
+            if *delta >= 0 {
+                min(
+                    current.saturating_add(*delta as usize),
+                    limit.saturating_sub(1),
+                )
+            } else {
+                current.saturating_sub(delta.unsigned_abs())
+            }
+        }
+        Absolute(abs) => min(*abs, limit.saturating_sub(1)),
+        EndRelative(delta) => limit.saturating_sub(delta.saturating_add(1)),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use alloc::format;
+    // This crate is no_std by default; std is linked for tests via the
+    // crate-root `#[cfg(test)] extern crate std;`, but expression paths
+    // starting with `std::` do not resolve in submodules, so import what
+    // the unwind-based tests need explicitly.
+    #[cfg(feature = "use_image")]
+    use alloc::sync::Arc;
+    use frankenterm_cell::color::AnsiColor;
+    #[cfg(feature = "use_image")]
+    use frankenterm_cell::image::ImageData;
+    use frankenterm_cell::{AttributeChange, Intensity};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // The \x20's look a little awkward, but we can't use a plain
+    // space in the first chararcter of a multi-line continuation;
+    // it gets eaten up and ignored.
+
+    #[test]
+    fn basic_print() {
+        let mut s = Surface::new(4, 3);
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "\x20\x20\x20\x20\n\
+             \x20\x20\x20\x20\n\
+             \x20\x20\x20\x20\n"
+        );
+
+        s.add_change("w00t");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "w00t\n\
+             \x20\x20\x20\x20\n\
+             \x20\x20\x20\x20\n"
+        );
+
+        s.add_change("foo");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "w00t\n\
+             foo\x20\n\
+             \x20\x20\x20\x20\n"
+        );
+
+        s.add_change("baar");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "w00t\n\
+             foob\n\
+             aar\x20\n"
+        );
+
+        s.add_change("baz");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "foob\n\
+             aarb\n\
+             az\x20\x20\n"
+        );
+    }
+
+    #[test]
+    fn newline() {
+        let mut s = Surface::new(4, 4);
+        s.add_change("bloo\rwat\n hey\r\nho");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "wato\n\
+             \x20\x20\x20\x20\n\
+             hey \n\
+             ho  \n"
+        );
+    }
+
+    #[test]
+    fn clear_screen() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("hello");
+        assert_eq!(s.xpos, 1);
+        assert_eq!(s.ypos, 1);
+        s.add_change(Change::ClearScreen(Default::default()));
+        assert_eq!(s.xpos, 0);
+        assert_eq!(s.ypos, 0);
+        assert_eq!(s.screen_chars_to_string(), "  \n  \n");
+    }
+
+    #[test]
+    fn clear_eol() {
+        let mut s = Surface::new(3, 3);
+        s.add_change("helwowfoo");
+        s.add_change(Change::ClearToEndOfLine(Default::default()));
+        assert_eq!(s.screen_chars_to_string(), "hel\nwow\nfoo\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(0),
+        });
+        s.add_change(Change::ClearToEndOfLine(Default::default()));
+        assert_eq!(s.screen_chars_to_string(), "   \nwow\nfoo\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        s.add_change(Change::ClearToEndOfLine(Default::default()));
+        assert_eq!(s.screen_chars_to_string(), "   \nw  \nfoo\n");
+    }
+
+    #[test]
+    fn clear_eos() {
+        let mut s = Surface::new(3, 3);
+        s.add_change("helwowfoo");
+        s.add_change(Change::ClearToEndOfScreen(Default::default()));
+        assert_eq!(s.screen_chars_to_string(), "hel\nwow\nfoo\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        s.add_change(Change::ClearToEndOfScreen(Default::default()));
+        assert_eq!(s.screen_chars_to_string(), "hel\nw  \n   \n");
+
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(
+            &[
+                Change::CursorVisibility(CursorVisibility::Hidden),
+                Change::ClearScreen(Default::default()),
+                Change::Text("hel".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(1),
+                },
+                Change::Text("w".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(1),
+                    y: Position::Absolute(1),
+                },
+                Change::CursorVisibility(CursorVisibility::Visible),
+            ],
+            &*changes
+        );
+    }
+
+    #[test]
+    fn clear_eos_back_color() {
+        let mut s = Surface::new(3, 3);
+        s.add_change(Change::ClearScreen(AnsiColor::Red.into()));
+        s.add_change("helwowfoo");
+        assert_eq!(s.screen_chars_to_string(), "hel\nwow\nfoo\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        s.add_change(Change::ClearToEndOfScreen(AnsiColor::Red.into()));
+        assert_eq!(s.screen_chars_to_string(), "hel\nw  \n   \n");
+
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(
+            &[
+                Change::CursorVisibility(CursorVisibility::Hidden),
+                Change::ClearScreen(Default::default()),
+                Change::AllAttributes(
+                    CellAttributes::default()
+                        .set_background(AnsiColor::Red)
+                        .clone()
+                ),
+                Change::Text("hel".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(1),
+                },
+                Change::Text("w".into()),
+                Change::ClearToEndOfScreen(AnsiColor::Red.into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(1),
+                    y: Position::Absolute(1),
+                },
+                Change::CursorVisibility(CursorVisibility::Visible),
+            ],
+            &*changes
+        );
+    }
+
+    #[test]
+    fn clear_eol_opt() {
+        let mut s = Surface::new(3, 3);
+        s.add_change(Change::Attribute(AttributeChange::Background(
+            AnsiColor::Red.into(),
+        )));
+        s.add_change("111   333");
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(
+            &[
+                Change::CursorVisibility(CursorVisibility::Hidden),
+                Change::ClearScreen(Default::default()),
+                Change::AllAttributes(
+                    CellAttributes::default()
+                        .set_background(AnsiColor::Red)
+                        .clone()
+                ),
+                Change::Text("111".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(1),
+                },
+                Change::ClearToEndOfLine(AnsiColor::Red.into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(1),
+                },
+                Change::Text("333".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(3),
+                    y: Position::Absolute(2),
+                },
+                Change::CursorVisibility(CursorVisibility::Visible),
+            ],
+            &*changes
+        );
+    }
+
+    #[test]
+    fn clear_and_move_cursor() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(3),
+            y: Position::Absolute(2),
+        });
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(
+            &[
+                Change::CursorVisibility(CursorVisibility::Hidden),
+                Change::ClearScreen(Default::default()),
+                Change::CursorPosition {
+                    x: Position::Absolute(3),
+                    y: Position::Absolute(2),
+                },
+                Change::CursorVisibility(CursorVisibility::Visible),
+            ],
+            &*changes
+        );
+    }
+
+    #[test]
+    fn cursor_movement() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(3),
+            y: Position::Absolute(2),
+        });
+        s.add_change("X");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "\x20\x20\x20\x20\n\
+             \x20\x20\x20\x20\n\
+             \x20\x20\x20X\n"
+        );
+
+        s.add_change(Change::CursorPosition {
+            x: Position::Relative(-2),
+            y: Position::Relative(-1),
+        });
+        s.add_change("-");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "\x20\x20\x20\x20\n\
+             \x20\x20-\x20\n\
+             \x20\x20\x20X\n"
+        );
+
+        s.add_change(Change::CursorPosition {
+            x: Position::Relative(1),
+            y: Position::Relative(-1),
+        });
+        s.add_change("-");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "\x20\x20\x20-\n\
+             \x20\x20-\x20\n\
+             \x20\x20\x20X\n"
+        );
+    }
+
+    #[test]
+    fn attribute_setting() {
+        use frankenterm_cell::Intensity;
+
+        let mut s = Surface::new(3, 1);
+        s.add_change("n");
+        s.add_change(AttributeChange::Intensity(Intensity::Bold));
+        s.add_change("b");
+
+        let mut bold = CellAttributes::default();
+        bold.set_intensity(Intensity::Bold);
+
+        assert_eq!(
+            s.screen_cells(),
+            [[
+                Cell::new('n', CellAttributes::default()),
+                Cell::new('b', bold),
+                Cell::default(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn empty_changes() {
+        let s = Surface::new(4, 3);
+
+        let empty = &[
+            Change::CursorVisibility(CursorVisibility::Hidden),
+            Change::ClearScreen(Default::default()),
+            Change::CursorVisibility(CursorVisibility::Visible),
+        ];
+
+        let (seq, changes) = s.get_changes(0);
+        assert_eq!(seq, 0);
+        assert_eq!(empty, &*changes);
+
+        // Using an invalid sequence number should get us the full
+        // repaint also.
+        let (seq, changes) = s.get_changes(1);
+        assert_eq!(seq, 0);
+        assert_eq!(empty, &*changes);
+    }
+
+    #[test]
+    fn add_changes_empty() {
+        let mut s = Surface::new(2, 2);
+        let last_seq = s.add_change("foo");
+        assert_eq!(0, last_seq);
+        assert_eq!(last_seq, s.add_changes(vec![]));
+        assert_eq!(last_seq + 1, s.add_changes(vec![Change::Text("a".into())]));
+    }
+
+    #[test]
+    fn add_changes_stamps_mutated_lines_with_the_committed_frontier() {
+        let mut s = Surface::new(2, 1);
+        s.add_change("a");
+        let prior_frontier = s.current_seqno();
+
+        s.add_changes(vec![
+            Change::CursorPosition {
+                x: Position::Absolute(0),
+                y: Position::Absolute(0),
+            },
+            Change::Text("b".to_string()),
+        ]);
+
+        assert_eq!(s.current_seqno(), prior_frontier + 2);
+        assert_eq!(s.lines[0].current_seqno(), s.current_seqno());
+        assert!(s.lines[0].changed_since(prior_frontier));
+    }
+
+    #[test]
+    fn resize_delta_flush() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("a");
+        let (seq, _) = s.get_changes(0);
+        s.resize(2, 2);
+
+        let full = &[
+            Change::CursorVisibility(CursorVisibility::Hidden),
+            Change::ClearScreen(Default::default()),
+            Change::Text("a".to_string()),
+            Change::CursorPosition {
+                x: Position::Absolute(1),
+                y: Position::Absolute(0),
+            },
+            Change::CursorVisibility(CursorVisibility::Visible),
+        ];
+
+        let (_seq, changes) = s.get_changes(seq);
+        // The resize causes get_changes to return a full repaint
+        assert_eq!(full, &*changes);
+    }
+
+    #[test]
+    fn dont_lose_first_char_on_attr_change() {
+        let mut s = Surface::new(2, 2);
+        s.add_change(Change::Attribute(AttributeChange::Foreground(
+            AnsiColor::Maroon.into(),
+        )));
+        s.add_change("ab");
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(
+            &[
+                Change::CursorVisibility(CursorVisibility::Hidden),
+                Change::ClearScreen(Default::default()),
+                Change::AllAttributes(
+                    CellAttributes::default()
+                        .set_foreground(AnsiColor::Maroon)
+                        .clone()
+                ),
+                Change::Text("ab".into()),
+                Change::CursorPosition {
+                    x: Position::Absolute(2),
+                    y: Position::Absolute(0),
+                },
+                Change::CursorVisibility(CursorVisibility::Visible),
+            ],
+            &*changes
+        );
+    }
+
+    #[test]
+    fn resize_cursor_position() {
+        let mut s = Surface::new(4, 4);
+
+        s.add_change(" a");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(3),
+            y: Position::Absolute(3),
+        });
+
+        assert_eq!(s.xpos, 3);
+        assert_eq!(s.ypos, 3);
+        s.resize(2, 2);
+        assert_eq!(s.xpos, 1);
+        assert_eq!(s.ypos, 1);
+
+        let full = &[
+            Change::CursorVisibility(CursorVisibility::Hidden),
+            Change::ClearScreen(Default::default()),
+            Change::Text(" a".to_string()),
+            Change::CursorPosition {
+                x: Position::Absolute(1),
+                y: Position::Absolute(1),
+            },
+            Change::CursorVisibility(CursorVisibility::Visible),
+        ];
+
+        let (_seq, changes) = s.get_changes(0);
+        assert_eq!(full, &*changes);
+    }
+
+    #[test]
+    fn delta_change() {
+        let mut s = Surface::new(4, 3);
+        // flushing nothing should be a NOP
+        s.flush_changes_older_than(0);
+
+        // check that using an invalid index doesn't panic
+        s.flush_changes_older_than(1);
+
+        let initial = &[
+            Change::CursorVisibility(CursorVisibility::Hidden),
+            Change::ClearScreen(Default::default()),
+            Change::Text("a".to_string()),
+            Change::CursorPosition {
+                x: Position::Absolute(1),
+                y: Position::Absolute(0),
+            },
+            Change::CursorVisibility(CursorVisibility::Visible),
+        ];
+
+        let seq_pos = {
+            let next_seq = s.add_change("a");
+            let (seq, changes) = s.get_changes(0);
+            assert_eq!(seq, next_seq + 1);
+            assert_eq!(initial, &*changes);
+            seq
+        };
+
+        let seq_pos = {
+            let next_seq = s.add_change("b");
+            let (seq, changes) = s.get_changes(seq_pos);
+            assert_eq!(seq, next_seq + 1);
+            assert_eq!(&[Change::Text("b".to_string())], &*changes);
+            seq
+        };
+
+        // prep some deltas for the loop to test below
+        {
+            s.add_change(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Bold,
+            )));
+            s.add_change("c");
+            s.add_change(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Normal,
+            )));
+            s.add_change("d");
+        }
+
+        // Do this three times to ennsure that the behavior is consistent
+        // across multiple flush calls
+        for _ in 0..3 {
+            {
+                let (_seq, changes) = s.get_changes(seq_pos);
+
+                assert_eq!(
+                    &[
+                        Change::Attribute(AttributeChange::Intensity(Intensity::Bold)),
+                        Change::Text("c".to_string()),
+                        Change::Attribute(AttributeChange::Intensity(Intensity::Normal)),
+                        Change::Text("d".to_string()),
+                    ],
+                    &*changes
+                );
+            }
+
+            // Flush the changes so that the next iteration is run on a pruned
+            // set of changes.  It should not change the outcome of the body
+            // of the loop.
+            s.flush_changes_older_than(seq_pos);
+        }
+    }
+
+    #[test]
+    fn diff_screens() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("w00t");
+        s.add_change("foo");
+        s.add_change("baar");
+        s.add_change("baz");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "foob\n\
+             aarb\n\
+             az  \n"
+        );
+
+        let s2 = Surface::new(2, 2);
+
+        {
+            // We want to sample the top left corner
+            let changes = s2.diff_region(0, 0, 2, 2, &s, 0, 0);
+            assert_eq!(
+                vec![
+                    Change::CursorPosition {
+                        x: Position::Absolute(0),
+                        y: Position::Absolute(0),
+                    },
+                    Change::AllAttributes(CellAttributes::default()),
+                    Change::Text("fo".into()),
+                    Change::CursorPosition {
+                        x: Position::Absolute(0),
+                        y: Position::Absolute(1),
+                    },
+                    Change::Text("aa".into()),
+                ],
+                changes
+            );
+        }
+
+        // Throw in some attribute changes too
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        s.add_change(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Bold,
+        )));
+        s.add_change("XO");
+
+        {
+            let changes = s2.diff_region(0, 0, 2, 2, &s, 1, 1);
+            assert_eq!(
+                vec![
+                    Change::CursorPosition {
+                        x: Position::Absolute(0),
+                        y: Position::Absolute(0),
+                    },
+                    Change::AllAttributes(
+                        CellAttributes::default()
+                            .set_intensity(Intensity::Bold)
+                            .clone(),
+                    ),
+                    Change::Text("XO".into()),
+                    Change::CursorPosition {
+                        x: Position::Absolute(0),
+                        y: Position::Absolute(1),
+                    },
+                    Change::AllAttributes(CellAttributes::default()),
+                    Change::Text("z".into()),
+                    /* There's no change for the final character
+                     * position because it is a space in both regions. */
+                ],
+                changes
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_rects_identical_surfaces_empty() {
+        let left = Surface::new(6, 4);
+        let right = Surface::new(6, 4);
+        assert!(left.dirty_rects(&right).is_empty());
+    }
+
+    #[test]
+    fn dirty_rects_merge_adjacent_cells_same_row() {
+        let left = Surface::new(8, 4);
+        let mut right = Surface::new(8, 4);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(1),
+        });
+        right.add_change("abc");
+
+        assert_eq!(
+            left.dirty_rects(&right),
+            vec![DirtyRect {
+                x: 2,
+                y: 1,
+                width: 3,
+                height: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_rects_merge_vertical_when_span_matches() {
+        let left = Surface::new(8, 5);
+        let mut right = Surface::new(8, 5);
+        for y in 1..=2 {
+            right.add_change(Change::CursorPosition {
+                x: Position::Absolute(3),
+                y: Position::Absolute(y),
+            });
+            right.add_change("ab");
+        }
+
+        assert_eq!(
+            left.dirty_rects(&right),
+            vec![DirtyRect {
+                x: 3,
+                y: 1,
+                width: 2,
+                height: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_line_spans_saturates_horizontal_region_end() {
+        let line = Line::from_text("ab", &CellAttributes::default(), SEQ_ZERO, None);
+
+        assert!(diff_line_spans(&line, &line, 1, usize::MAX, 1).is_empty());
+    }
+
+    #[test]
+    fn dirty_rects_region_saturates_vertical_region_end() {
+        let left = Surface::new(2, 2);
+        let mut right = Surface::new(2, 2);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        right.add_change("x");
+
+        assert_eq!(
+            left.dirty_rects_region(0, 1, 2, usize::MAX, &right, 0, 1),
+            vec![DirtyRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_dedup_and_clip_edges() {
+        let left = Surface::new(10, 6);
+        let mut right = Surface::new(10, 6);
+
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        right.add_change("ab");
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(8),
+            y: Position::Absolute(4),
+        });
+        right.add_change("z");
+
+        assert_eq!(
+            left.dirty_tiles(&right, 4, 3),
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+                DirtyRect {
+                    x: 8,
+                    y: 3,
+                    width: 2,
+                    height: 3,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_region_saturates_vertical_region_end() {
+        let left = Surface::new(2, 2);
+        let mut right = Surface::new(2, 2);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        right.add_change("x");
+
+        assert_eq!(
+            left.dirty_tiles_region(0, 1, 2, usize::MAX, &right, 0, 1, 1, 1),
+            vec![DirtyRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_zero_sized_tile_returns_empty() {
+        let left = Surface::new(4, 4);
+        let right = Surface::new(4, 4);
+        assert!(left.dirty_tiles(&right, 0, 4).is_empty());
+        assert!(left.dirty_tiles(&right, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn draw_screens() {
+        let mut s = Surface::new(4, 4);
+
+        let mut s1 = Surface::new(2, 2);
+        s1.add_change("1234");
+
+        let mut s2 = Surface::new(2, 2);
+        s2.add_change("XYZA");
+
+        s.draw_from_screen(&s1, 0, 0);
+        s.draw_from_screen(&s2, 2, 2);
+
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "12  \n\
+             34  \n\
+             \x20\x20XY\n\
+             \x20\x20ZA\n"
+        );
+    }
+
+    #[test]
+    fn draw_from_screen_with_dirty_rects_reports_regions() {
+        let mut dest = Surface::new(6, 4);
+        let mut src = Surface::new(2, 2);
+        src.add_change("ABCD");
+
+        let (_seq, rects) = dest.draw_from_screen_with_dirty_rects(&src, 2, 1);
+
+        assert_eq!(
+            rects,
+            vec![DirtyRect {
+                x: 2,
+                y: 1,
+                width: 2,
+                height: 2,
+            }]
+        );
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "      \n  AB  \n  CD  \n      \n"
+        );
+    }
+
+    #[test]
+    fn draw_from_screen_with_dirty_tiles_reports_tile_aligned_regions() {
+        let mut dest = Surface::new(10, 6);
+        let mut src = Surface::new(4, 2);
+        src.add_change("WXYZ1234");
+
+        let (_seq, tiles) = dest.draw_from_screen_with_dirty_tiles(&src, 3, 1, 4, 3);
+
+        assert_eq!(
+            tiles,
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+                DirtyRect {
+                    x: 4,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "          \n   WXYZ   \n   1234   \n          \n          \n          \n"
+        );
+    }
+
+    #[test]
+    fn draw_colored_region() {
+        let mut dest = Surface::new(4, 4);
+        dest.add_change("A");
+        let mut src = Surface::new(2, 2);
+        src.add_change(Change::ClearScreen(AnsiColor::Blue.into()));
+        dest.draw_from_screen(&src, 2, 2);
+
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "A   \n\
+             \x20   \n\
+             \x20   \n\
+             \x20   \n"
+        );
+
+        let blue_space = Cell::new(
+            ' ',
+            CellAttributes::default()
+                .set_background(AnsiColor::Blue)
+                .clone(),
+        );
+
+        assert_eq!(
+            dest.screen_cells(),
+            [
+                [
+                    Cell::new('A', CellAttributes::default()),
+                    Cell::default(),
+                    Cell::default(),
+                    Cell::default(),
+                ],
+                [
+                    Cell::default(),
+                    Cell::default(),
+                    Cell::default(),
+                    Cell::default(),
+                ],
+                [
+                    Cell::default(),
+                    Cell::default(),
+                    blue_space.clone(),
+                    blue_space.clone(),
+                ],
+                [
+                    Cell::default(),
+                    Cell::default(),
+                    blue_space.clone(),
+                    blue_space.clone(),
+                ]
+            ]
+        );
+
+        assert_eq!(dest.xpos, 1);
+        assert_eq!(dest.ypos, 0);
+        assert_eq!(dest.attributes, Default::default());
+        dest.add_change("B");
+
+        assert_eq!(
+            dest.screen_chars_to_string(),
+            "AB  \n\
+             \x20   \n\
+             \x20   \n\
+             \x20   \n"
+        );
+    }
+
+    #[test]
+    fn copy_region() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("w00t");
+        s.add_change("foo");
+        s.add_change("baar");
+        s.add_change("baz");
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "foob\n\
+             aarb\n\
+             az  \n"
+        );
+
+        // Copy top left to bottom left
+        s.copy_region(0, 0, 2, 2, 2, 1);
+        assert_eq!(
+            s.screen_chars_to_string(),
+            "foob\n\
+             aafo\n\
+             azaa\n"
+        );
+    }
+
+    #[test]
+    fn double_width() {
+        let mut s = Surface::new(4, 1);
+        s.add_change("🤷12");
+        assert_eq!(s.screen_chars_to_string(), "🤷12\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(0),
+        });
+        s.add_change("a🤷");
+        assert_eq!(s.screen_chars_to_string(), " a🤷\n");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(0),
+        });
+        s.add_change("x");
+        assert_eq!(s.screen_chars_to_string(), " ax \n");
+    }
+
+    #[test]
+    fn draw_double_width() {
+        let mut s = Surface::new(4, 1);
+        s.add_change("か a");
+        assert_eq!(s.screen_chars_to_string(), "か a\n");
+
+        let mut s2 = Surface::new(4, 1);
+        s2.draw_from_screen(&s, 0, 0);
+        // Verify no issue when the second visible cells on both sides
+        // are identical (' 's) but they are at different cell indices.
+        assert_eq!(s2.screen_chars_to_string(), "か a\n");
+
+        let s3 = Surface::new(4, 1);
+        s2.draw_from_screen(&s3, 0, 0);
+        // Verify same but in other direction
+        assert_eq!(s2.screen_chars_to_string(), "    \n");
+
+        let mut s4 = Surface::new(4, 1);
+        s4.add_change("abcd");
+        s.draw_from_screen(&s4, 0, 0);
+        // Verify that all overlapping cells are updated when cell widths
+        // differ on each side.
+        assert_eq!(s.screen_chars_to_string(), "abcd\n");
+    }
+
+    #[test]
+    fn diff_cursor_double_width() {
+        let mut s = Surface::new(3, 1);
+        s.add_change("かa");
+
+        let s2 = Surface::new(3, 1);
+        let changes = s2.diff_region(0, 0, 3, 1, &s, 0, 0);
+
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| matches!(change, Change::CursorPosition { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn zero_width() {
+        let mut s = Surface::new(4, 1);
+        // https://en.wikipedia.org/wiki/Zero-width_space
+        s.add_change("A\u{200b}B");
+        assert_eq!(s.screen_chars_to_string(), "A\u{200b}B \n");
+    }
+
+    #[test]
+    fn zero_sized_surface_text_is_noop() {
+        let mut s = Surface::new(0, 0);
+        s.add_change("x\r\ny");
+        assert_eq!(s.dimensions(), (0, 0));
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert_eq!(s.screen_chars_to_string(), "");
+    }
+
+    #[test]
+    fn zero_height_surface_clear_and_line_attributes_are_noops() {
+        let mut s = Surface::new(2, 0);
+        s.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+        s.add_change(Change::ClearToEndOfScreen(ColorAttribute::Default));
+        s.add_change(Change::LineAttribute(LineAttribute::DoubleWidthLine));
+        assert_eq!(s.dimensions(), (2, 0));
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert_eq!(s.screen_chars_to_string(), "");
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn images() {
+        // a dummy image blob with nonsense content
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut s = Surface::new(4, 2);
+        s.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data.clone(),
+            width: 4,
+            height: 2,
+        }));
+
+        // We're checking that we slice the image up and assign the correct
+        // texture coordinates for each cell.  The width and height are
+        // different from each other to help ensure that the right terms
+        // are used by add_image() function.
+        assert_eq!(
+            s.screen_cells(),
+            [
+                [
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.0, 0.0),
+                                TextureCoordinate::new_f32(0.25, 0.5),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.25, 0.0),
+                                TextureCoordinate::new_f32(0.5, 0.5),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.5, 0.0),
+                                TextureCoordinate::new_f32(0.75, 0.5),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.75, 0.0),
+                                TextureCoordinate::new_f32(1.0, 0.5),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                ],
+                [
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.0, 0.5),
+                                TextureCoordinate::new_f32(0.25, 1.0),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.25, 0.5),
+                                TextureCoordinate::new_f32(0.5, 1.0),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.5, 0.5),
+                                TextureCoordinate::new_f32(0.75, 1.0),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                    Cell::new(
+                        ' ',
+                        CellAttributes::default()
+                            .set_image(Box::new(ImageCell::new(
+                                TextureCoordinate::new_f32(0.75, 0.5),
+                                TextureCoordinate::new_f32(1.0, 1.0),
+                                data.clone()
+                            )))
+                            .clone()
+                    ),
+                ],
+            ]
+        );
+
+        // Check that starting at not the texture origin coordinates
+        // gives reasonable values in the resultant cell
+        let mut other = Surface::new(1, 1);
+        other.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.25, 0.3),
+            bottom_right: TextureCoordinate::new_f32(0.75, 0.8),
+            image: data.clone(),
+            width: 1,
+            height: 1,
+        }));
+        assert_eq!(
+            other.screen_cells(),
+            [[Cell::new(
+                ' ',
+                CellAttributes::default()
+                    .set_image(Box::new(ImageCell::new(
+                        TextureCoordinate::new_f32(0.25, 0.3),
+                        TextureCoordinate::new_f32(0.75, 0.8),
+                        data.clone()
+                    )))
+                    .clone()
+            ),]]
+        );
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn oversized_images_are_clipped_to_the_surface_without_unbounded_rows_or_columns() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut wide = Surface::new(2, 1);
+        wide.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::clone(&data),
+            width: usize::MAX,
+            height: 1,
+        }));
+        assert_eq!(wide.screen_cells()[0].len(), 2);
+        assert_eq!(wide.cursor_position().0, 2);
+
+        let mut tall = Surface::new(1, 2);
+        tall.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: 4,
+        }));
+        let cells = tall.screen_cells();
+        assert_eq!(cells.len(), 2);
+        let top_image = cells[0][0]
+            .attrs()
+            .images()
+            .and_then(|images| images.into_iter().next())
+            .expect("the first visible row must retain the third source slice");
+        let bottom_image = cells[1][0]
+            .attrs()
+            .images()
+            .and_then(|images| images.into_iter().next())
+            .expect("the last visible row must retain the final source slice");
+        assert_eq!(top_image.top_left(), TextureCoordinate::new_f32(0.0, 0.5));
+        assert_eq!(
+            top_image.bottom_right(),
+            TextureCoordinate::new_f32(1.0, 0.75)
+        );
+        assert_eq!(
+            bottom_image.top_left(),
+            TextureCoordinate::new_f32(0.0, 0.75)
+        );
+        assert_eq!(
+            bottom_image.bottom_right(),
+            TextureCoordinate::new_f32(1.0, 1.0)
+        );
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn invalid_or_zero_surface_image_geometry_is_a_noop() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut zero = Surface::new(0, 0);
+        zero.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::clone(&data),
+            width: usize::MAX,
+            height: usize::MAX,
+        }));
+        assert_eq!(zero.cursor_position(), (0, 0));
+
+        let mut invalid = Surface::new(1, 1);
+        invalid.add_change(Change::Text(String::new()));
+        let before_invalid = invalid.current_seqno();
+        invalid.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(f32::INFINITY, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: 1,
+        }));
+        assert_eq!(invalid.cursor_position(), (0, 0));
+        assert!(invalid.screen_cells()[0][0].attrs().images().is_none());
+
+        let (_, changes) = invalid.get_changes(before_invalid);
+        assert_eq!(changes.as_ref(), &[Change::Text(String::new())]);
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn incremental_image_change_is_the_same_bounded_geometry_applied_to_the_model() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut source = Surface::new(2, 2);
+        source.add_change(Change::Text(String::new()));
+        let before = source.current_seqno();
+        source.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 4,
+            height: 4,
+        }));
+
+        let (_, delta) = source.get_changes(before);
+        let [Change::Image(image)] = delta.as_ref() else {
+            panic!("expected one canonical image delta, got {:?}", delta);
+        };
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.top_left, TextureCoordinate::new_f32(0.0, 0.5));
+        assert_eq!(image.bottom_right, TextureCoordinate::new_f32(0.5, 1.0));
+
+        let mut replay = Surface::new(2, 2);
+        replay.add_changes(delta.into_owned());
+        assert_eq!(source.screen_cells(), replay.screen_cells());
+        assert_eq!(source.cursor_position(), replay.cursor_position());
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn unrepresentable_max_height_image_at_nonzero_cursor_is_rejected_before_journaling() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut surface = Surface::new(1, 2);
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        let before = surface.current_seqno();
+        surface.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: usize::MAX,
+        }));
+
+        assert_eq!(surface.cursor_position(), (0, 1));
+        assert!(surface.screen_cells()[1][0].attrs().images().is_none());
+        let (_, delta) = surface.get_changes(before);
+        assert_eq!(delta.as_ref(), &[Change::Text(String::new())]);
+    }
+
+    // === Position tests ===
+
+    #[test]
+    fn position_relative_zero() {
+        let p = Position::Relative(0);
+        assert_eq!(p, Position::Relative(0));
+    }
+
+    #[test]
+    fn position_absolute_zero() {
+        let p = Position::Absolute(0);
+        assert_eq!(p, Position::Absolute(0));
+    }
+
+    #[test]
+    fn position_end_relative_zero() {
+        let p = Position::EndRelative(0);
+        assert_eq!(p, Position::EndRelative(0));
+    }
+
+    #[test]
+    fn position_clone_eq() {
+        let p = Position::Relative(-3);
+        let p2 = p;
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn position_variants_not_equal() {
+        assert_ne!(Position::Relative(0), Position::Absolute(0));
+        assert_ne!(Position::Absolute(0), Position::EndRelative(0));
+        assert_ne!(Position::Relative(0), Position::EndRelative(0));
+    }
+
+    #[test]
+    fn position_debug_format() {
+        let dbg = format!("{:?}", Position::Absolute(5));
+        assert!(dbg.contains("Absolute"));
+        assert!(dbg.contains("5"));
+    }
+
+    // === CursorShape tests ===
+
+    #[test]
+    fn cursor_shape_default() {
+        assert_eq!(CursorShape::default(), CursorShape::Default);
+    }
+
+    #[test]
+    fn cursor_shape_blinking_block() {
+        assert!(CursorShape::BlinkingBlock.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_block_not_blinking() {
+        assert!(!CursorShape::SteadyBlock.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_blinking_underline() {
+        assert!(CursorShape::BlinkingUnderline.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_underline_not_blinking() {
+        assert!(!CursorShape::SteadyUnderline.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_blinking_bar() {
+        assert!(CursorShape::BlinkingBar.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_bar_not_blinking() {
+        assert!(!CursorShape::SteadyBar.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_default_not_blinking() {
+        assert!(!CursorShape::Default.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_clone_eq() {
+        let s = CursorShape::BlinkingBlock;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    // === CursorVisibility tests ===
+
+    #[test]
+    fn cursor_visibility_default_is_visible() {
+        assert_eq!(CursorVisibility::default(), CursorVisibility::Visible);
+    }
+
+    #[test]
+    fn cursor_visibility_hidden_not_default() {
+        assert_ne!(CursorVisibility::Hidden, CursorVisibility::default());
+    }
+
+    #[test]
+    fn cursor_visibility_clone_eq() {
+        let v = CursorVisibility::Hidden;
+        let v2 = v;
+        assert_eq!(v, v2);
+    }
+
+    // === compute_position_change tests ===
+
+    #[test]
+    fn compute_position_relative_positive() {
+        let result = compute_position_change(2, &Position::Relative(3), 10);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn compute_position_relative_negative() {
+        let result = compute_position_change(5, &Position::Relative(-2), 10);
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn compute_position_relative_clamps_to_limit() {
+        let result = compute_position_change(8, &Position::Relative(5), 10);
+        assert_eq!(result, 9); // clamped to limit - 1
+    }
+
+    #[test]
+    fn compute_position_relative_negative_saturates_at_zero() {
+        let result = compute_position_change(2, &Position::Relative(-5), 10);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn compute_position_relative_min_saturates_at_zero() {
+        let result = compute_position_change(2, &Position::Relative(isize::MIN), 10);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn compute_position_absolute() {
+        let result = compute_position_change(0, &Position::Absolute(7), 10);
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn compute_position_absolute_clamps() {
+        let result = compute_position_change(0, &Position::Absolute(15), 10);
+        assert_eq!(result, 9); // clamped to limit - 1
+    }
+
+    #[test]
+    fn compute_position_end_relative() {
+        let result = compute_position_change(0, &Position::EndRelative(2), 10);
+        assert_eq!(result, 7); // last position minus delta
+    }
+
+    #[test]
+    fn compute_position_end_relative_zero() {
+        let result = compute_position_change(0, &Position::EndRelative(0), 10);
+        assert_eq!(result, 9); // last position
+    }
+
+    #[test]
+    fn compute_position_end_relative_oversized_saturates_at_zero() {
+        let result = compute_position_change(0, &Position::EndRelative(usize::MAX), 10);
+        assert_eq!(result, 0);
+    }
+
+    // === Surface constructor and accessor tests ===
+
+    #[test]
+    fn surface_new_dimensions() {
+        let s = Surface::new(80, 24);
+        assert_eq!(s.dimensions(), (80, 24));
+    }
+
+    #[test]
+    fn surface_cursor_starts_at_origin() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn surface_cursor_shape_initially_none() {
+        let s = Surface::new(10, 5);
+        assert!(s.cursor_shape().is_none());
+    }
+
+    #[test]
+    fn surface_cursor_visibility_initially_visible() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Visible);
+    }
+
+    #[test]
+    fn surface_title_initially_empty() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.title(), "");
+    }
+
+    #[test]
+    fn surface_set_title() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::Title("hello".to_string()));
+        assert_eq!(s.title(), "hello");
+    }
+
+    #[test]
+    fn surface_set_cursor_shape() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorShape(CursorShape::BlinkingBar));
+        assert_eq!(s.cursor_shape(), Some(CursorShape::BlinkingBar));
+    }
+
+    #[test]
+    fn surface_set_cursor_visibility_hidden() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Hidden);
+    }
+
+    #[test]
+    fn surface_set_cursor_color() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorColor(AnsiColor::Red.into()));
+        // Cursor color is applied, no panic
+    }
+
+    #[test]
+    fn surface_has_changes_false_initially() {
+        let s = Surface::new(10, 5);
+        assert!(!s.has_changes(0));
+    }
+
+    #[test]
+    fn surface_has_changes_true_after_add() {
+        let mut s = Surface::new(10, 5);
+        s.add_change("hello");
+        assert!(s.has_changes(0));
+    }
+
+    #[test]
+    fn surface_current_seqno_advances() {
+        let mut s = Surface::new(10, 5);
+        let seq0 = s.current_seqno();
+        s.add_change("a");
+        let seq1 = s.current_seqno();
+        assert!(seq1 > seq0);
+    }
+
+    #[test]
+    fn surface_seqno_exhaustion_fails_before_reusing_a_change_token() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX - 1;
+
+        let seq = s.add_change("a");
+        assert_eq!(seq, SequenceNo::MAX - 1);
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        let before_screen = s.screen_chars_to_string();
+        let before_cursor = s.cursor_position();
+        let before_change_count = s.changes.len();
+
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
+            s.add_change("b");
+        }));
+        assert!(exhausted.is_err());
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        assert_eq!(s.screen_chars_to_string(), before_screen);
+        assert_eq!(s.cursor_position(), before_cursor);
+        assert_eq!(s.changes.len(), before_change_count);
+    }
+
+    #[test]
+    fn surface_batch_seqno_exhaustion_fails_before_any_change_is_applied() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX - 1;
+
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
+            s.add_changes(vec![
+                Change::Text("a".to_string()),
+                Change::CursorPosition {
+                    x: Position::Absolute(1),
+                    y: Position::Absolute(0),
+                },
+            ]);
+        }));
+        assert!(exhausted.is_err());
+        assert_eq!(s.current_seqno(), SequenceNo::MAX - 1);
+        assert_eq!(s.screen_chars_to_string(), "  \n");
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert!(s.changes.is_empty());
+    }
+
+    #[test]
+    fn estimate_full_paint_cost_uses_exact_integer_math() {
+        let s = Surface::new(80, 24);
+
+        assert_eq!(s.estimate_full_paint_cost(), 2_307);
+    }
+
+    #[test]
+    fn estimate_full_paint_cost_saturates_oversized_dimensions() {
+        let s = Surface {
+            width: usize::MAX,
+            height: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(s.estimate_full_paint_cost(), usize::MAX);
+    }
+
+    #[test]
+    fn surface_screen_lines_count() {
+        let s = Surface::new(4, 3);
+        assert_eq!(s.screen_lines().len(), 3);
+    }
+
+    // === Scroll region tests ===
+
+    #[test]
+    fn scroll_region_up() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 1,
+            region_size: 2,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nccc\n   \nddd\n");
+    }
+
+    #[test]
+    fn scroll_region_up_clamps_oversized_region_to_surface() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 2,
+            region_size: usize::MAX,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nddd\n   \n");
+    }
+
+    #[test]
+    fn scroll_region_up_oversized_count_clears_clamped_region() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: usize::MAX,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \n   \n   \n");
+    }
+
+    #[test]
+    fn scroll_region_down() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: 2,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \nbbb\nddd\n");
+    }
+
+    #[test]
+    fn scroll_region_down_clamps_oversized_region_to_surface() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \nbbb\nccc\n");
+    }
+
+    #[test]
+    fn scroll_region_out_of_range_or_zero_count_is_noop() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: usize::MAX,
+            region_size: usize::MAX,
+            scroll_count: usize::MAX,
+        });
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: 0,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
+    }
+
+    // === Line attribute tests ===
+
+    #[test]
+    fn surface_line_attribute_double_width() {
+        let mut s = Surface::new(4, 2);
+        s.add_change("test");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(0),
+        });
+        s.add_change(Change::LineAttribute(LineAttribute::DoubleWidthLine));
+        // No panic - line attribute applied
+    }
+
+    // === diff_screens test ===
+
+    #[test]
+    fn diff_screens_identical_is_empty() {
+        let mut s1 = Surface::new(3, 2);
+        let mut s2 = Surface::new(3, 2);
+        s1.add_change("abcdef");
+        s2.add_change("abcdef");
+        let changes = s1.diff_screens(&s2);
+        assert!(changes.is_empty());
+    }
+
+    // === text wrapping at screen edge ===
+
+    #[test]
+    fn text_wrapping_at_edge() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("abcdef");
+        assert_eq!(s.screen_chars_to_string(), "abc\ndef\n");
+    }
+
+    #[test]
+    fn text_scrolls_when_overflow() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("abcdefghi");
+        // "abc" on row 0, "def" on row 1, "ghi" scrolls: row0=def, row1=ghi
+        assert_eq!(s.screen_chars_to_string(), "def\nghi\n");
+    }
+
+    // === CR handling ===
+
+    #[test]
+    fn carriage_return_resets_x() {
+        let mut s = Surface::new(5, 1);
+        s.add_change("abc\rXY");
+        assert_eq!(s.screen_chars_to_string(), "XYc  \n");
+    }
+
+    // === resize edge cases ===
+
+    #[test]
+    fn resize_larger() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(4, 4);
+        assert_eq!(s.dimensions(), (4, 4));
+        // Content preserved, padded with spaces
+        assert_eq!(s.screen_chars_to_string(), "ab  \ncd  \n    \n    \n");
+    }
+
+    #[test]
+    fn resize_smaller_truncates() {
+        let mut s = Surface::new(4, 4);
+        s.add_change("abcdefghijklmnop");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        // Truncated to 2x2
+        assert_eq!(s.screen_chars_to_string(), "ab\nef\n");
+    }
+
+    // === Surface clone ===
+
+    #[test]
+    fn surface_clone() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("hello!");
+        let s2 = s.clone();
+        assert_eq!(s2.dimensions(), (3, 2));
+        assert_eq!(s2.screen_chars_to_string(), "hel\nlo!\n");
+    }
+
+    // === Default Surface ===
+
+    #[test]
+    fn surface_default() {
+        let s = Surface::default();
+        assert_eq!(s.dimensions(), (0, 0));
+    }
+
+    // === flush_changes_older_than ===
+
+    #[test]
+    fn flush_changes_noop_on_empty() {
+        let mut s = Surface::new(2, 2);
+        s.flush_changes_older_than(0);
+        // No panic
+    }
+
+    #[test]
+    fn flush_changes_invalid_seq() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("a");
+        s.flush_changes_older_than(999);
+        // No panic
+    }
+
+    // === repaint includes title ===
+
+    #[test]
+    fn repaint_includes_title() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::Title("myterm".to_string()));
+        let (_seq, changes) = s.get_changes(0);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
+    }
+
+    // === repaint includes cursor shape ===
+
+    #[test]
+    fn repaint_includes_cursor_shape() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
+        let (_seq, changes) = s.get_changes(0);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
+    }
+
+    // === hidden cursor not shown in repaint ===
+
+    #[test]
+    fn repaint_hidden_cursor() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        let (_seq, changes) = s.get_changes(0);
+        // Should not contain CursorVisibility::Visible at the end
+        let last = changes.last().unwrap();
+        assert!(!matches!(
+            last,
+            Change::CursorVisibility(CursorVisibility::Visible)
+        ));
+    }
+
+    // === draw_from_screen preserves cursor ===
+
+    #[test]
+    fn draw_from_screen_preserves_cursor() {
+        let mut dest = Surface::new(4, 4);
+        dest.add_change("ABCD");
+        let cursor_before = dest.cursor_position();
+        let src = Surface::new(2, 2);
+        dest.draw_from_screen(&src, 0, 0);
+        assert_eq!(dest.cursor_position(), cursor_before);
+    }
+
+    // === diff_against_numbered_line ===
+
+    #[test]
+    fn diff_against_numbered_line_out_of_bounds() {
+        let s = Surface::new(3, 2);
+        let line = Line::with_width(3, 0);
+        let changes = s.diff_against_numbered_line(99, &line);
+        assert!(changes.is_empty());
+    }
+
+    // =========================================================================
+    // Resize semantics — comprehensive edge cases
+    // =========================================================================
+
+    #[test]
+    fn resize_to_same_dimensions_is_noop() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("hello");
+        s.lines[0].compress_for_scrollback();
+        let before = s.screen_chars_to_string();
+        let before_line = s.lines[0].clone();
+        // Keep the Surface frontier deliberately ahead of this line so the
+        // assertion detects both a storage coercion and an otherwise hidden
+        // Line::resize sequence update.
+        s.seqno = 17;
+        let before_seqno = s.current_seqno();
+        let before_change_count = s.changes.len();
+        s.resize(4, 3);
+        assert_eq!(s.dimensions(), (4, 3));
+        assert_eq!(s.screen_chars_to_string(), before);
+        assert_eq!(s.lines[0], before_line);
+        assert_eq!(s.current_seqno(), before_seqno);
+        assert_eq!(s.changes.len(), before_change_count);
+    }
+
+    #[test]
+    fn resize_dimension_change_invalidates_an_empty_change_journal() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("a");
+        let seq_after_change = s.current_seqno();
+        s.flush_changes_older_than(seq_after_change);
+        assert!(s.changes.is_empty());
+
+        s.resize(3, 2);
+
+        assert_eq!(s.current_seqno(), seq_after_change + 1);
+        let (_, changes) = s.get_changes(seq_after_change);
+        assert!(matches!(
+            changes.first(),
+            Some(Change::CursorVisibility(CursorVisibility::Hidden))
+        ));
+        assert!(matches!(changes.get(1), Some(Change::ClearScreen(_))));
+    }
+
+    #[test]
+    fn resize_with_buffered_changes_invalidates_stream() {
+        let mut s = Surface::new(4, 3);
+        let seq = s.add_change("test");
+        // Changes are buffered. Resize should clear them.
+        s.resize(3, 2);
+        // get_changes should return a full repaint, not the delta
+        let (_, changes) = s.get_changes(seq);
+        // Full repaint starts with CursorVisibility::Hidden + ClearScreen
+        assert!(
+            changes.len() >= 2,
+            "repaint should have multiple entries, got {}",
+            changes.len()
+        );
+        assert!(matches!(
+            changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
+        assert!(matches!(changes[1], Change::ClearScreen(_)));
+    }
+
+    #[test]
+    fn resize_with_buffered_changes_fails_before_reusing_a_sequence_token() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX;
+        s.changes
+            .push(Change::CursorVisibility(CursorVisibility::Hidden));
+
+        let exhausted = catch_unwind(AssertUnwindSafe(|| {
+            s.resize(1, 2);
+        }));
+        assert!(exhausted.is_err());
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        assert_eq!(s.dimensions(), (2, 1));
+        assert_eq!(s.changes.len(), 1);
+        assert!(matches!(
+            s.changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
+    }
+
+    #[test]
+    fn resize_grow_width_only() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(4, 2);
+        assert_eq!(s.dimensions(), (4, 2));
+        assert_eq!(s.screen_chars_to_string(), "ab  \ncd  \n");
+    }
+
+    #[test]
+    fn resize_grow_height_only() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(2, 4);
+        assert_eq!(s.dimensions(), (2, 4));
+        assert_eq!(s.screen_chars_to_string(), "ab\ncd\n  \n  \n");
+    }
+
+    #[test]
+    fn resize_shrink_width_only() {
+        let mut s = Surface::new(4, 2);
+        s.add_change("abcdefgh");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        assert_eq!(s.screen_chars_to_string(), "ab\nef\n");
+    }
+
+    #[test]
+    fn resize_shrink_height_only() {
+        let mut s = Surface::new(2, 4);
+        s.add_change("ab");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        s.add_change("cd");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(2),
+        });
+        s.add_change("ef");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        // Only first 2 rows survive
+        assert_eq!(s.screen_chars_to_string(), "ab\ncd\n");
+    }
+
+    #[test]
+    fn resize_cursor_clamped_x() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(9),
+            y: Position::Absolute(0),
+        });
+        assert_eq!(s.cursor_position(), (9, 0));
+        s.resize(3, 5);
+        // Cursor x should be clamped to new width - 1
+        let (x, _) = s.cursor_position();
+        assert!(x < 3, "cursor x {} should be < new width 3", x);
+    }
+
+    #[test]
+    fn resize_cursor_clamped_y() {
+        let mut s = Surface::new(5, 10);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(9),
+        });
+        assert_eq!(s.cursor_position(), (0, 9));
+        s.resize(5, 3);
+        let (_, y) = s.cursor_position();
+        assert!(y < 3, "cursor y {} should be < new height 3", y);
+    }
+
+    #[test]
+    fn resize_cursor_stays_if_within_bounds() {
+        let mut s = Surface::new(10, 10);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(3),
+        });
+        s.resize(5, 5);
+        assert_eq!(s.cursor_position(), (2, 3));
+    }
+
+    #[test]
+    fn resize_preserves_attributes_on_grow() {
+        let mut s = Surface::new(2, 2);
+        s.add_change(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Bold,
+        )));
+        s.add_change("ab");
+        s.resize(4, 2);
+        // Bold "ab" should still be in the first row
+        let content = s.screen_chars_to_string();
+        assert!(content.starts_with("ab"), "content should start with ab");
+    }
+
+    #[test]
+    fn resize_after_scroll_preserves_visible_content() {
+        let mut s = Surface::new(3, 2);
+        // Fill 3 rows worth into a 2-row surface — causes scroll
+        s.add_change("aaabbbccc");
+        // After scroll: row0=bbb, row1=ccc
+        assert_eq!(s.screen_chars_to_string(), "bbb\nccc\n");
+        s.resize(3, 3);
+        // Grow height: old rows preserved, new row added
+        assert_eq!(s.screen_chars_to_string(), "bbb\nccc\n   \n");
+    }
+
+    #[test]
+    fn resize_oscillation_preserves_smaller_content() {
+        let mut s = Surface::new(4, 4);
+        s.add_change("ABCDEFGHIJKLMNOP");
+        // Shrink
+        s.resize(2, 2);
+        let small = s.screen_chars_to_string();
+        assert_eq!(small, "AB\nEF\n");
+        // Grow back
+        s.resize(4, 4);
+        // The truncated content doesn't come back
+        let grown = s.screen_chars_to_string();
+        assert_eq!(grown, "AB  \nEF  \n    \n    \n");
+    }
+
+    #[test]
+    fn resize_multiple_rapid_resizes() {
+        let mut s = Surface::new(5, 5);
+        s.add_change("hello");
+        // Rapidly grow through multiple sizes
+        for i in 5..=10 {
+            s.resize(i, i);
+        }
+        assert_eq!(s.dimensions(), (10, 10));
+        // Content from original 5x5 should be preserved in first row
+        let content = s.screen_chars_to_string();
+        assert!(content.starts_with("hello"));
+    }
+
+    #[test]
+    fn resize_rapid_shrink_sequence_truncates_progressively() {
+        let mut s = Surface::new(10, 10);
+        s.add_change("abcdefghij");
+        // Shrink progressively
+        for i in (1..=10).rev() {
+            s.resize(i, i);
+        }
+        assert_eq!(s.dimensions(), (1, 1));
+        // Only 'a' survives
+        assert_eq!(s.screen_chars_to_string(), "a\n");
+    }
+
+    #[test]
+    fn resize_to_1x1() {
+        let mut s = Surface::new(5, 5);
+        s.add_change("abcde");
+        s.resize(1, 1);
+        assert_eq!(s.dimensions(), (1, 1));
+        assert_eq!(s.screen_chars_to_string(), "a\n");
+        // Cursor should be clamped
+        let (x, y) = s.cursor_position();
+        assert_eq!(x, 0);
+        assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn resize_get_changes_after_resize_is_full_repaint() {
+        let mut s = Surface::new(4, 3);
+        let seq = s.add_change("text");
+        let (seq2, _) = s.get_changes(0);
+        s.resize(6, 4);
+        let (_, changes) = s.get_changes(seq2);
+        // Should be a full repaint (starts with hide cursor + clear)
+        assert!(changes.len() >= 2);
+        assert!(matches!(
+            changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
+        let _ = seq;
+    }
+
+    #[test]
+    fn resize_draw_from_screen_after_resize() {
+        let mut dest = Surface::new(4, 4);
+        let src = Surface::new(2, 2);
+        dest.resize(6, 6);
+        dest.draw_from_screen(&src, 0, 0);
+        assert_eq!(dest.dimensions(), (6, 6));
+    }
+
+    #[test]
+    fn resize_screen_cells_after_grow() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("ab");
+        s.resize(3, 3);
+        let cells = s.screen_cells();
+        assert_eq!(cells.len(), 3);
+        for row in &cells {
+            assert_eq!(row.len(), 3);
+        }
+    }
+
+    #[test]
+    fn resize_screen_lines_count_matches_height() {
+        let s = Surface::new(5, 3);
+        assert_eq!(s.screen_lines().len(), 3);
+    }
+
+    #[test]
+    fn resize_screen_lines_count_after_resize() {
+        let mut s = Surface::new(5, 3);
+        s.resize(5, 7);
+        assert_eq!(s.screen_lines().len(), 7);
+    }
+
+    #[test]
+    fn resize_title_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::Title("myterm".to_string()));
+        s.resize(6, 5);
+        assert_eq!(s.title(), "myterm");
+    }
+
+    #[test]
+    fn resize_cursor_visibility_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        s.resize(6, 5);
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Hidden);
+    }
+
+    #[test]
+    fn resize_cursor_shape_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorShape(CursorShape::SteadyBar));
+        s.resize(6, 5);
+        assert_eq!(s.cursor_shape(), Some(CursorShape::SteadyBar));
+    }
+}

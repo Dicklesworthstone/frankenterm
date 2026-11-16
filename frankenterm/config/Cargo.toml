@@ -1,0 +1,75 @@
+[package]
+name = "config"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dev-dependencies]
+criterion.workspace = true
+env_logger.workspace = true
+proptest = "1.8.0"
+tempfile.workspace = true
+
+[features]
+default = ["lua"]
+lua = ["dep:luahelper", "dep:mlua"]
+no-lua = []
+distro-defaults = []
+async-smol = ["frankenterm-ssh/async-smol"]
+async-asupersync = [
+    "promise/async-asupersync",
+    "frankenterm-ssh/async-asupersync",
+]
+
+[dependencies]
+anyhow.workspace = true
+base64 = { workspace = true, features = ["std"] }
+bitflags.workspace = true
+chrono.workspace = true
+colorgrad.workspace = true
+dirs-next.workspace = true
+enum-display-derive.workspace = true
+finl_unicode.workspace = true
+flume.workspace = true
+fs2.workspace = true
+hmac.workspace = true
+hostname.workspace = true
+lazy_static.workspace = true
+libc.workspace = true
+log.workspace = true
+luahelper = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
+notify.workspace = true
+openssl.workspace = true
+ordered-float = { workspace=true, features = ["serde"] }
+portable-pty = { workspace=true, features = ["serde_support"]}
+promise.workspace = true
+semver.workspace = true
+serde = {workspace=true, features = ["rc", "derive"]}
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+termwiz = { workspace=true, features=["use_serde"] }
+toml.workspace = true
+umask.workspace = true
+frankenterm-bidi.workspace = true
+frankenterm-cell.workspace = true
+frankenterm-config-derive.workspace = true
+frankenterm-dynamic.workspace = true
+frankenterm-input-types.workspace = true
+frankenterm-ssh.workspace = true
+frankenterm-term = { workspace = true, features=["use_serde"] }
+
+[target."cfg(unix)".dependencies]
+nix = {workspace=true, features=["resource", "user"]}
+
+[target."cfg(windows)".dependencies]
+winapi = { workspace=true, features = ["winuser"]}
+
+[[bench]]
+name = "config_loading"
+harness = false

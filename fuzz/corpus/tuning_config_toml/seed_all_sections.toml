@@ -1,0 +1,56 @@
+[runtime]
+tick_interval_ms = 10
+max_concurrent_panes = 256
+output_coalesce_window_ms = 0
+output_coalesce_max_delay_ms = 0
+output_coalesce_max_bytes = 0
+telemetry_percentile_window = 1
+resize_watchdog_warning_ms = 100
+
+[backpressure]
+green_threshold = 0
+yellow_threshold = 1
+red_threshold = 2
+
+[snapshot]
+interval_ms = 100
+max_snapshot_size_bytes = 1024
+
+[ingest]
+max_capture_bytes = 1
+rate_limit_per_sec = 1
+
+[patterns]
+max_rules = 1
+max_pattern_len = 1
+
+[policy]
+max_rules = 1
+evaluation_timeout_ms = 1
+
+[audit]
+max_entries = 100
+retention_days = 1
+
+[web]
+bind_address = "0.0.0.0:0"
+request_timeout_ms = 100
+
+[workflows]
+max_steps = 1
+step_timeout_ms = 100
+
+[search]
+max_results = 10
+query_timeout_ms = 500
+
+[wire_protocol]
+max_message_size = 1024
+connect_timeout_ms = 100
+
+[ipc]
+socket_timeout_ms = 500
+
+[wezterm]
+connect_timeout_ms = 100
+command_timeout_ms = 200

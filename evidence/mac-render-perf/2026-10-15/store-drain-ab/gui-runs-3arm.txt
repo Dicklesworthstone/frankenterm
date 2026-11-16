@@ -1,0 +1,18 @@
+{"arm": "old-on", "secs": 21.6215, "load_1m": 9.93, "dir": "/tmp/ftda.old-on.l82_o7j3", "dir_mb": 31, "presented_total": 653, "label": "seq20m-3arm", "round": 0}
+{"arm": "new-on", "secs": 18.4777, "load_1m": 10.81, "dir": "/tmp/ftda.new-on.d7843tpo", "dir_mb": 20, "presented_total": 557, "label": "seq20m-3arm", "round": 0}
+{"arm": "new-off", "secs": 14.6063, "load_1m": 9.93, "dir": "/tmp/ftda.new-off.7ah653lt", "dir_mb": 0, "presented_total": 440, "label": "seq20m-3arm", "round": 0}
+{"arm": "new-off", "secs": 15.7271, "load_1m": 9.39, "dir": "/tmp/ftda.new-off.q6y9k980", "dir_mb": 0, "presented_total": 475, "label": "seq20m-3arm", "round": 1}
+{"arm": "new-on", "secs": 19.1256, "load_1m": 9.88, "dir": "/tmp/ftda.new-on.f0uyhjib", "dir_mb": 16, "presented_total": 578, "label": "seq20m-3arm", "round": 1}
+{"arm": "old-on", "secs": 20.8591, "load_1m": 9.79, "dir": "/tmp/ftda.old-on.ti_67qp9", "dir_mb": 20, "presented_total": 632, "label": "seq20m-3arm", "round": 1}
+{"arm": "old-on", "secs": 21.2777, "load_1m": 9.11, "dir": "/tmp/ftda.old-on.nq3ywa6q", "dir_mb": 28, "presented_total": 643, "label": "seq20m-3arm", "round": 2}
+{"arm": "new-on", "secs": 19.7827, "load_1m": 9.76, "dir": "/tmp/ftda.new-on.ni9nhcbx", "dir_mb": 42, "presented_total": 599, "label": "seq20m-3arm", "round": 2}
+{"arm": "new-off", "secs": 14.4942, "load_1m": 12.24, "dir": "/tmp/ftda.new-off.4l2m9v8i", "dir_mb": 0, "presented_total": 438, "label": "seq20m-3arm", "round": 2}
+{"arm": "new-off", "secs": 15.014, "load_1m": 12.77, "dir": "/tmp/ftda.new-off.54265awz", "dir_mb": 0, "presented_total": 456, "label": "seq20m-3arm", "round": 3}
+{"arm": "new-on", "secs": 19.1548, "load_1m": 10.78, "dir": "/tmp/ftda.new-on.7075xdj9", "dir_mb": 2, "presented_total": 578, "label": "seq20m-3arm", "round": 3}
+{"arm": "old-on", "secs": 20.9524, "load_1m": 9.65, "dir": "/tmp/ftda.old-on.wyfn9pry", "dir_mb": 44, "presented_total": 633, "label": "seq20m-3arm", "round": 3}
+seq20m-3arm: old-on median 21.115 s [20.8591, 20.9524, 21.2777, 21.6215]
+seq20m-3arm: new-on median 19.140 s [18.4777, 19.1256, 19.1548, 19.7827]
+seq20m-3arm: new-off median 14.810 s [14.4942, 14.6063, 15.014, 15.7271]
+seq2m-3arm: old-on median 2.099 s [2.008, 2.0437, 2.1545, 2.1775]
+seq2m-3arm: new-on median 1.924 s [1.8558, 1.8905, 1.957, 2.0286]
+seq2m-3arm: new-off median 1.575 s [1.3901, 1.5235, 1.6255, 1.6468]

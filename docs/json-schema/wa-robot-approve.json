@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-approve.json",
+  "title": "WA Robot Approve Response",
+  "description": "Schema for the data field when calling 'wa robot approve <code>'. Validates and consumes approval tokens. On success, returns approval details. On failure, returns envelope error with stable E_* code.",
+  "type": "object",
+  "required": ["code", "valid"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "description": "The approval code that was submitted"
+    },
+    "valid": {
+      "type": "boolean",
+      "description": "Whether the approval code was valid and consumed (always true in success response; failures use envelope error)"
+    },
+    "action_kind": {
+      "type": "string",
+      "description": "The action type this approval was for (e.g., 'SendText', 'WorkflowRun')"
+    },
+    "created_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval token was created"
+    },
+    "pane_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The pane ID the approval was scoped to (null if not pane-specific)"
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval would have expired"
+    },
+    "consumed_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval was consumed"
+    },
+    "action_fingerprint": {
+      "type": "string",
+      "description": "Hash of the action this approval was issued for"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "If true, approval was validated but not consumed (--dry-run flag)"
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Error responses use envelope format: {ok: false, error: {code, message}}. Stable error codes: E_APPROVAL_NOT_FOUND, E_APPROVAL_EXPIRED, E_APPROVAL_CONSUMED, E_FINGERPRINT_MISMATCH, E_WRONG_PANE, E_WRONG_WORKSPACE"
+}

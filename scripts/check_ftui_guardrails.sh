@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# check_ftui_guardrails.sh — Build guardrails for the FTUI migration.
+#
+# Prevents accidental dual-stack drift by enforcing:
+#   1. Feature exclusion: `--features tui-oracle,ftui` must fail to compile
+#   2. Import isolation: ftui-only modules must not import ratatui/crossterm
+#   3. Feature matrix: both `tui-oracle` and `ftui` compile independently
+#
+# Implements: wa-eutd (FTUI-02.4)
+# Deletion: Remove when the `tui-oracle` feature is dropped (FTUI-09.3).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${FTUI_GUARDRAILS_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+ARTIFACT_DIR="${FTUI_GUARDRAILS_ARTIFACT_DIR:-target/ftui-guardrails/${RUN_ID}}"
+RCH_TARGET_DIR="${FTUI_GUARDRAILS_TARGET_DIR:-target/rch-ftui-guardrails-${RUN_ID}}"
+mkdir -p "$ARTIFACT_DIR"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "ftui_guardrails" "$PROJECT_ROOT"
+
+PASS=0
+FAIL=0
+SKIP=0
+
+pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
+skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
+
+cargo_check_step() {
+    local log_name="$1"
+    shift
+
+    run_rch_cargo_logged "$ARTIFACT_DIR/${log_name}.log" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo check -p frankenterm-core "$@"
+}
+
+cargo_clippy_step() {
+    local log_name="$1"
+    shift
+
+    run_rch_cargo_logged "$ARTIFACT_DIR/${log_name}.log" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo clippy -p frankenterm-core "$@"
+}
+
+echo "=== FTUI Migration Guardrails ==="
+echo ""
+echo "RCH artifacts: $ARTIFACT_DIR"
+echo "RCH cargo target: $RCH_TARGET_DIR"
+echo ""
+
+ensure_rch_ready
+
+# ---------------------------------------------------------------------------
+# 1. Feature exclusion: tui-oracle + ftui must not compile together (unless rollout)
+# ---------------------------------------------------------------------------
+echo "--- Check 1: Mutual exclusion (tui-oracle + ftui) ---"
+
+MUTUAL_EXCLUSION_LOG="$ARTIFACT_DIR/mutual_exclusion.log"
+if cargo_check_step "mutual_exclusion" --features tui-oracle,ftui; then
+    fail "tui-oracle + ftui compiled successfully — compile_error! guard is missing or broken"
+elif grep -qi "mutually exclusive" "$MUTUAL_EXCLUSION_LOG"; then
+    pass "tui-oracle + ftui correctly fails to compile"
+else
+    fail "tui-oracle + ftui failed without the mutual-exclusion diagnostic (see $MUTUAL_EXCLUSION_LOG)"
+fi
+
+if cargo_check_step "rollout" --features rollout; then
+    pass "rollout (tui + ftui) compiles with runtime dispatch"
+else
+    fail "rollout feature does not compile"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 2. Individual feature compilation
+# ---------------------------------------------------------------------------
+echo "--- Check 2: Individual feature compilation ---"
+
+for feature in tui-oracle ftui; do
+    log_feature="${feature//-/_}"
+    if cargo_check_step "feature_${log_feature}" --features "$feature"; then
+        pass "--features $feature compiles"
+    else
+        fail "--features $feature does not compile"
+    fi
+done
+
+if cargo_check_step "default"; then
+    pass "default (no features) compiles"
+else
+    fail "default (no features) does not compile"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3. Import isolation: ftui-only modules must not reference ratatui/crossterm
+# ---------------------------------------------------------------------------
+echo "--- Check 3: Import isolation ---"
+
+# Migration-complete modules that MUST NOT reference ratatui or crossterm
+# outside of cfg(feature = "tui") blocks.
+#
+# ALLOWLIST (files permitted to contain ratatui/crossterm):
+#   - tui/ftui_compat.rs   — compatibility adapter with cfg-gated conversions
+#   - tui/terminal_session.rs — CrosstermSession impl is cfg-gated
+#   - tui/mod.rs           — conditional module imports
+#   - tui/app.rs           — legacy ratatui backend (compiled only under tui-oracle)
+#   - tui/views.rs         — legacy ratatui backend (compiled only under tui-oracle)
+#
+# To add an exception: add the file path to the allowlist above AND file a
+# bead explaining why the exception is needed and when it expires.
+#
+# DEVELOPER GUIDANCE: If this check fails for your module:
+#   1. Replace `ratatui::` types with equivalents from `tui::ftui_compat`
+#   2. Replace `crossterm::` types with `tui::ftui_compat::InputEvent` etc.
+#   3. Use `ftui::` directly for FrankenTUI-native code
+#   4. If a conversion is genuinely needed, add it to ftui_compat.rs with
+#      a `#[cfg(feature = "tui")]` gate
+
+FTUI_AGNOSTIC_FILES=(
+    "crates/frankenterm-core/src/tui/query.rs"
+    "crates/frankenterm-core/src/tui/ftui_backend.rs"
+    "crates/frankenterm-core/src/tui/view_adapters.rs"
+    "crates/frankenterm-core/src/tui/keymap.rs"
+    "crates/frankenterm-core/src/tui/state.rs"
+    "crates/frankenterm-core/src/tui/command_handoff.rs"
+    "crates/frankenterm-core/src/tui/output_gate.rs"
+)
+
+# Forbidden patterns: bare (non-cfg-gated) references to ratatui or crossterm.
+# Matches `use ratatui`, `use crossterm`, `ratatui::`, `crossterm::` but
+# excludes lines that are inside cfg attributes or doc comments.
+FORBIDDEN_PATTERNS='(use ratatui|use crossterm|ratatui::|crossterm::)'
+
+for file in "${FTUI_AGNOSTIC_FILES[@]}"; do
+    if [ ! -f "$file" ]; then
+        skip "$file does not exist"
+        continue
+    fi
+
+    basename=$(basename "$file")
+
+    # Check for forbidden patterns, excluding cfg-gated lines and comments
+    violations=$(grep -nE "$FORBIDDEN_PATTERNS" "$file" \
+        | grep -v '#\[cfg' \
+        | grep -v '^ *///' \
+        | grep -v '^ *//' \
+        || true)
+
+    if [ -n "$violations" ]; then
+        fail "$basename contains bare ratatui/crossterm reference (not cfg-gated):"
+        echo "$violations" | while read -r line; do
+            echo "    $line"
+        done
+    else
+        pass "$basename is framework-agnostic"
+    fi
+done
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 4. Clippy pass for both features
+# ---------------------------------------------------------------------------
+echo "--- Check 4: Clippy for both features ---"
+
+for feature in tui-oracle ftui rollout; do
+    log_feature="${feature//-/_}"
+    if cargo_clippy_step "clippy_${log_feature}" --features "$feature" -- -D warnings; then
+        pass "clippy --features $feature passes"
+    else
+        fail "clippy --features $feature has warnings/errors"
+    fi
+done
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 5. Test presence: snapshot and E2E tests must exist in ftui_backend.rs
+# Implements: wa-36xw (FTUI-07.4)
+# ---------------------------------------------------------------------------
+echo "--- Check 5: FTUI test presence ---"
+
+FTUI_BACKEND="crates/frankenterm-core/src/tui/ftui_backend.rs"
+if [ -f "$FTUI_BACKEND" ]; then
+    SNAPSHOT_FNS=$(grep -c 'fn snapshot_' "$FTUI_BACKEND" || true)
+    E2E_FNS=$(grep -c 'fn e2e_' "$FTUI_BACKEND" || true)
+
+    if [ "$SNAPSHOT_FNS" -ge 20 ]; then
+        pass "Snapshot tests present ($SNAPSHOT_FNS functions)"
+    else
+        fail "Snapshot tests missing or below 20 (found $SNAPSHOT_FNS)"
+    fi
+
+    if [ "$E2E_FNS" -ge 10 ]; then
+        pass "E2E tests present ($E2E_FNS functions)"
+    else
+        fail "E2E tests missing or below 10 (found $E2E_FNS)"
+    fi
+else
+    fail "ftui_backend.rs not found"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo "=== Summary ==="
+echo "  Passed: $PASS"
+echo "  Failed: $FAIL"
+echo "  Skipped: $SKIP"
+
+if [ "$FAIL" -gt 0 ]; then
+    echo ""
+    echo "FTUI guardrail check FAILED — see errors above."
+    exit 1
+else
+    echo ""
+    echo "All FTUI guardrails passed."
+    exit 0
+fi

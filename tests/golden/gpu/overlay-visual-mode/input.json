@@ -1,0 +1,21 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Visual mode overlay fixture: active range spans columns.",
+    "NORMAL | VISUAL LINE | command palette overlay | status",
+    "Overlay color should sit above text cells without hiding them."
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 9,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 9,
+    "end_row": 1,
+    "end_col": 21
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

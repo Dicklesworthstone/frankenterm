@@ -1,0 +1,1076 @@
+use crate::color::RgbaColor;
+use crate::*;
+use bitflags::*;
+use enum_display_derive::Display;
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
+#[cfg(feature = "lua")]
+use luahelper::impl_lua_conversion_dynamic;
+use std::convert::TryFrom;
+use std::fmt::Display;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Display, PartialOrd, Ord, FromDynamic, ToDynamic,
+)]
+pub enum FontStyle {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+impl Default for FontStyle {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Display, PartialOrd, Ord, FromDynamic, ToDynamic,
+)]
+pub enum FontStretch {
+    UltraCondensed,
+    ExtraCondensed,
+    Condensed,
+    SemiCondensed,
+    Normal,
+    SemiExpanded,
+    Expanded,
+    ExtraExpanded,
+    UltraExpanded,
+}
+
+impl FontStretch {
+    pub fn from_opentype_stretch(w: u16) -> Self {
+        match w {
+            1 => Self::UltraCondensed,
+            2 => Self::ExtraCondensed,
+            3 => Self::Condensed,
+            4 => Self::SemiCondensed,
+            5 => Self::Normal,
+            6 => Self::SemiExpanded,
+            7 => Self::Expanded,
+            8 => Self::ExtraExpanded,
+            9 => Self::UltraExpanded,
+            _ if w < 1 => Self::UltraCondensed,
+            _ => Self::UltraExpanded,
+        }
+    }
+
+    pub fn to_opentype_stretch(self) -> u16 {
+        match self {
+            Self::UltraCondensed => 1,
+            Self::ExtraCondensed => 2,
+            Self::Condensed => 3,
+            Self::SemiCondensed => 4,
+            Self::Normal => 5,
+            Self::SemiExpanded => 6,
+            Self::Expanded => 7,
+            Self::ExtraExpanded => 8,
+            Self::UltraExpanded => 9,
+        }
+    }
+}
+
+impl Default for FontStretch {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FontWeight(u16);
+
+enum FontWeightOrLabel {
+    Weight(u16),
+    Label(&'static str),
+}
+
+impl FontWeight {
+    fn categorize_weight(&self) -> FontWeightOrLabel {
+        let label = if *self == Self::EXTRABLACK {
+            "ExtraBlack"
+        } else if *self == Self::BLACK {
+            "Black"
+        } else if *self == Self::EXTRABOLD {
+            "ExtraBold"
+        } else if *self == Self::BOLD {
+            "Bold"
+        } else if *self == Self::DEMIBOLD {
+            "DemiBold"
+        } else if *self == Self::MEDIUM {
+            "Medium"
+        } else if *self == Self::REGULAR {
+            "Regular"
+        } else if *self == Self::BOOK {
+            "Book"
+        } else if *self == Self::DEMILIGHT {
+            "DemiLight"
+        } else if *self == Self::LIGHT {
+            "Light"
+        } else if *self == Self::EXTRALIGHT {
+            "ExtraLight"
+        } else if *self == Self::THIN {
+            "Thin"
+        } else {
+            return FontWeightOrLabel::Weight(self.0);
+        };
+        FontWeightOrLabel::Label(label)
+    }
+
+    fn from_str(s: &str) -> Option<FontWeight> {
+        Some(match s {
+            "ExtraBlack" => Self::EXTRABLACK,
+            "Black" => Self::BLACK,
+            "ExtraBold" => Self::EXTRABOLD,
+            "Bold" => Self::BOLD,
+            "DemiBold" => Self::DEMIBOLD,
+            "Medium" => Self::MEDIUM,
+            "Regular" => Self::REGULAR,
+            "Book" => Self::BOOK,
+            "DemiLight" => Self::DEMILIGHT,
+            "Light" => Self::LIGHT,
+            "ExtraLight" => Self::EXTRALIGHT,
+            "Thin" => Self::THIN,
+            _ => return None,
+        })
+    }
+}
+
+impl ToDynamic for FontWeight {
+    fn to_dynamic(&self) -> Value {
+        match self.categorize_weight() {
+            FontWeightOrLabel::Weight(n) => Value::U64(n as u64),
+            FontWeightOrLabel::Label(l) => Value::String(l.to_string()),
+        }
+    }
+}
+
+impl FromDynamic for FontWeight {
+    fn from_dynamic(
+        value: &Value,
+        _options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        match value {
+            Value::String(s) => {
+                Ok(Self::from_str(s).ok_or_else(|| format!("invalid font weight {}", s))?)
+            }
+            other => {
+                if let Some(value) = value.coerce_unsigned() {
+                    if value > 0 && value <= (u16::MAX as u64) {
+                        Ok(FontWeight(value as u16))
+                    } else {
+                        Err(format!("invalid font weight {}", value).into())
+                    }
+                } else {
+                    Err(frankenterm_dynamic::Error::NoConversion {
+                        source_type: other.variant_name().to_string(),
+                        dest_type: "FontWeight",
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl Display for FontWeight {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.categorize_weight() {
+            FontWeightOrLabel::Weight(n) => write!(fmt, "{}", n),
+            FontWeightOrLabel::Label(l) => write!(fmt, "\"{}\"", l),
+        }
+    }
+}
+
+impl FontWeight {
+    pub const THIN: FontWeight = FontWeight(100);
+    pub const EXTRALIGHT: FontWeight = FontWeight(200);
+    pub const LIGHT: FontWeight = FontWeight(300);
+    pub const DEMILIGHT: FontWeight = FontWeight(350);
+    pub const BOOK: FontWeight = FontWeight(380);
+    pub const REGULAR: FontWeight = FontWeight(400);
+    pub const MEDIUM: FontWeight = FontWeight(500);
+    pub const DEMIBOLD: FontWeight = FontWeight(600);
+    pub const BOLD: FontWeight = FontWeight(700);
+    pub const EXTRABOLD: FontWeight = FontWeight(800);
+    pub const BLACK: FontWeight = FontWeight(900);
+    pub const EXTRABLACK: FontWeight = FontWeight(1000);
+}
+
+impl Default for FontWeight {
+    fn default() -> Self {
+        Self::REGULAR
+    }
+}
+
+impl FontWeight {
+    pub const fn from_opentype_weight(w: u16) -> Self {
+        Self(w)
+    }
+
+    pub fn to_opentype_weight(self) -> u16 {
+        self.0
+    }
+
+    pub fn lighter(self) -> Self {
+        Self::from_opentype_weight(self.to_opentype_weight().saturating_sub(200))
+    }
+
+    pub fn bolder(self) -> Self {
+        Self::from_opentype_weight(self.to_opentype_weight() + 200)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum DisplayPixelGeometry {
+    #[default]
+    RGB,
+    BGR,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum FreeTypeLoadTarget {
+    /// This corresponds to the default hinting algorithm, optimized
+    /// for standard gray-level rendering.
+    #[default]
+    Normal,
+    /// A lighter hinting algorithm for non-monochrome modes. Many
+    /// generated glyphs are more fuzzy but better resemble its
+    /// original shape. A bit like rendering on Mac OS X.  This target
+    /// implies FT_LOAD_FORCE_AUTOHINT.
+    Light,
+    /// Strong hinting algorithm that should only be used for
+    /// monochrome output. The result is probably unpleasant if the
+    /// glyph is rendered in non-monochrome modes.
+    Mono,
+    /// A variant of Normal optimized for horizontally decimated LCD displays.
+    HorizontalLcd,
+    /// A variant of Normal optimized for vertically decimated LCD displays.
+    VerticalLcd,
+}
+
+/// The FreeType filter applied to subpixel (`HorizontalLcd` or
+/// `VerticalLcd`) glyph renders to limit color fringes. Grayscale renders
+/// do not use it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum FreeTypeLcdFilter {
+    /// FreeType's default five-tap filter, weights 8, 77, 86, 77, 8 (in
+    /// 1/256): the least color fringing, slightly soft.
+    #[default]
+    Default,
+    /// Weights 0, 85, 86, 85, 0: sharper, with a little more fringing.
+    Light,
+    /// No filtering: the sharpest result and the most color fringing.
+    None,
+}
+
+bitflags! {
+    // Note that these are strongly coupled with deps/freetype/src/lib.rs,
+    // but we can't directly reference that from here without making config
+    // depend on freetype.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct FreeTypeLoadFlags: u32 {
+        /// FT_LOAD_DEFAULT
+        const DEFAULT = 0;
+        /// Disable hinting. This generally generates ‘blurrier’
+        /// bitmap glyph when the glyph is rendered in any of the
+        /// anti-aliased modes.
+        const NO_HINTING = 2;
+        const NO_BITMAP = 8;
+        /// Indicates that the auto-hinter is preferred over the
+        /// font’s native hinter.
+        const FORCE_AUTOHINT = 32;
+        const MONOCHROME = 4096;
+        /// Disable auto-hinter.
+        const NO_AUTOHINT = 32768;
+        const NO_SVG = 16777216;
+        const SVG_ONLY = 8388608;
+    }
+}
+
+impl FromDynamic for FreeTypeLoadFlags {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for FreeTypeLoadFlags {
+    fn to_dynamic(&self) -> Value {
+        self.to_string().to_dynamic()
+    }
+}
+
+impl FreeTypeLoadFlags {
+    pub fn default_hidpi() -> Self {
+        Self::NO_HINTING
+    }
+}
+
+impl Default for FreeTypeLoadFlags {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl From<FreeTypeLoadFlags> for String {
+    fn from(val: FreeTypeLoadFlags) -> Self {
+        val.to_string()
+    }
+}
+
+impl From<&FreeTypeLoadFlags> for String {
+    fn from(val: &FreeTypeLoadFlags) -> Self {
+        val.to_string()
+    }
+}
+
+impl ToString for FreeTypeLoadFlags {
+    fn to_string(&self) -> String {
+        let mut s = vec![];
+        if *self == Self::DEFAULT {
+            s.push("DEFAULT");
+        }
+        if self.contains(Self::NO_HINTING) {
+            s.push("NO_HINTING");
+        }
+        if self.contains(Self::NO_BITMAP) {
+            s.push("NO_BITMAP");
+        }
+        if self.contains(Self::NO_SVG) {
+            s.push("NO_SVG");
+        }
+        if self.contains(Self::SVG_ONLY) {
+            s.push("SVG_ONLY");
+        }
+        if self.contains(Self::FORCE_AUTOHINT) {
+            s.push("FORCE_AUTOHINT");
+        }
+        if self.contains(Self::MONOCHROME) {
+            s.push("MONOCHROME");
+        }
+        if self.contains(Self::NO_AUTOHINT) {
+            s.push("NO_AUTOHINT");
+        }
+        s.join("|")
+    }
+}
+
+impl TryFrom<String> for FreeTypeLoadFlags {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        let mut flags = FreeTypeLoadFlags::empty();
+
+        for ele in s.split('|') {
+            let ele = ele.trim();
+            match ele {
+                "DEFAULT" => flags |= Self::DEFAULT,
+                "NO_HINTING" => flags |= Self::NO_HINTING,
+                "NO_BITMAP" => flags |= Self::NO_BITMAP,
+                "NO_SVG" => flags |= Self::NO_SVG,
+                "SVG_ONLY" => flags |= Self::SVG_ONLY,
+                "FORCE_AUTOHINT" => flags |= Self::FORCE_AUTOHINT,
+                "MONOCHROME" => flags |= Self::MONOCHROME,
+                "NO_AUTOHINT" => flags |= Self::NO_AUTOHINT,
+                _ => {
+                    return Err(format!("invalid FreeTypeLoadFlags `{}` in `{}`", ele, s));
+                }
+            }
+        }
+
+        Ok(flags)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub struct FontAttributes {
+    /// The font family name
+    pub family: String,
+    /// Whether the font should be a bold variant
+    #[dynamic(default)]
+    pub weight: FontWeight,
+    #[dynamic(default)]
+    pub stretch: FontStretch,
+    /// Whether the font should be an italic variant
+    #[dynamic(default)]
+    pub style: FontStyle,
+    #[dynamic(default)]
+    pub is_fallback: bool,
+    #[dynamic(default)]
+    pub is_synthetic: bool,
+
+    #[dynamic(default)]
+    pub harfbuzz_features: Option<Vec<String>>,
+    #[dynamic(default)]
+    pub freetype_load_target: Option<FreeTypeLoadTarget>,
+    #[dynamic(default)]
+    pub freetype_render_target: Option<FreeTypeLoadTarget>,
+    #[dynamic(default)]
+    pub freetype_load_flags: Option<FreeTypeLoadFlags>,
+    #[dynamic(default)]
+    pub scale: Option<NotNan<f64>>,
+    #[dynamic(default)]
+    pub assume_emoji_presentation: Option<bool>,
+}
+#[cfg(feature = "lua")]
+impl_lua_conversion_dynamic!(FontAttributes);
+
+impl std::fmt::Display for FontAttributes {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(
+            fmt,
+            "wezterm.font('{}', {{weight={}, stretch='{}', style={}}})",
+            self.family, self.weight, self.stretch, self.style
+        )
+    }
+}
+
+impl FontAttributes {
+    pub fn new(family: &str) -> Self {
+        Self {
+            family: family.into(),
+            weight: FontWeight::default(),
+            stretch: FontStretch::default(),
+            style: FontStyle::Normal,
+            is_fallback: false,
+            is_synthetic: false,
+            harfbuzz_features: None,
+            freetype_load_target: None,
+            freetype_render_target: None,
+            freetype_load_flags: None,
+            scale: None,
+            assume_emoji_presentation: None,
+        }
+    }
+
+    pub fn new_fallback(family: &str) -> Self {
+        Self {
+            family: family.into(),
+            weight: FontWeight::default(),
+            stretch: FontStretch::default(),
+            style: FontStyle::Normal,
+            is_fallback: true,
+            is_synthetic: false,
+            harfbuzz_features: None,
+            freetype_load_target: None,
+            freetype_render_target: None,
+            freetype_load_flags: None,
+            scale: None,
+            assume_emoji_presentation: None,
+        }
+    }
+}
+
+impl Default for FontAttributes {
+    fn default() -> Self {
+        Self {
+            family: "Pragmasevka Nerd Font".into(),
+            weight: FontWeight::default(),
+            stretch: FontStretch::default(),
+            style: FontStyle::Normal,
+            is_fallback: false,
+            is_synthetic: false,
+            harfbuzz_features: None,
+            freetype_load_target: None,
+            freetype_render_target: None,
+            freetype_load_flags: None,
+            scale: None,
+            assume_emoji_presentation: None,
+        }
+    }
+}
+
+/// Represents textual styling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub struct TextStyle {
+    #[dynamic(default)]
+    pub font: Vec<FontAttributes>,
+
+    /// If set, when rendering text that is set to the default
+    /// foreground color, use this color instead.  This is most
+    /// useful in a `[[font_rules]]` section to implement changing
+    /// the text color for eg: bold text.
+    pub foreground: Option<RgbaColor>,
+}
+#[cfg(feature = "lua")]
+impl_lua_conversion_dynamic!(TextStyle);
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            foreground: None,
+            font: vec![FontAttributes::default()],
+        }
+    }
+}
+
+impl TextStyle {
+    /// Make a version of this style where the first entry
+    /// has any explicitly named bold/italic components
+    /// removed.  The intent is to set it up for make_bold
+    /// and make_italic below.
+    ///
+    /// This is done heuristically based on the family name
+    /// string as we cannot depend on the font parser from
+    /// this crate, and even if we did have a parser, that
+    /// doesn't help us know anything about the name until
+    /// we have a parsed font to compare with.
+    ///
+    /// <https://github.com/wezterm/wezterm/issues/456>
+    pub fn reduce_first_font_to_family(&self) -> Self {
+        fn reduce(mut family: &str) -> String {
+            loop {
+                let start = family;
+
+                for s in &[
+                    "Black",
+                    "Bold",
+                    "Book",
+                    "Condensed",
+                    "Demi",
+                    "Expanded",
+                    "Extra",
+                    "Italic",
+                    "Light",
+                    "Medium",
+                    "Regular",
+                    "Semi",
+                    "Thin",
+                    "Ultra",
+                ] {
+                    family = family.trim().trim_end_matches(s);
+                }
+
+                if family == start {
+                    break;
+                }
+            }
+
+            family.trim().to_string()
+        }
+        Self {
+            foreground: self.foreground,
+            font: self
+                .font
+                .iter()
+                .enumerate()
+                .map(|(idx, orig_attr)| {
+                    let mut attr = orig_attr.clone();
+                    if idx == 0 {
+                        attr.family = reduce(&attr.family);
+                    }
+                    attr
+                })
+                .collect(),
+        }
+    }
+
+    /// Make a version of this style with bold enabled.
+    pub fn make_bold(&self) -> Self {
+        Self {
+            foreground: self.foreground,
+            font: self
+                .font
+                .iter()
+                .map(|attr| {
+                    let mut attr = attr.clone();
+                    attr.weight = attr.weight.bolder();
+                    attr.is_synthetic = true;
+                    attr
+                })
+                .collect(),
+        }
+    }
+
+    pub fn make_half_bright(&self) -> Self {
+        Self {
+            foreground: self.foreground,
+            font: self
+                .font
+                .iter()
+                .map(|attr| {
+                    let mut attr = attr.clone();
+                    attr.weight = attr.weight.lighter();
+                    attr.is_synthetic = true;
+                    attr
+                })
+                .collect(),
+        }
+    }
+
+    /// Make a version of this style with italic enabled.
+    pub fn make_italic(&self) -> Self {
+        Self {
+            foreground: self.foreground,
+            font: self
+                .font
+                .iter()
+                .map(|attr| {
+                    let mut attr = attr.clone();
+                    attr.style = FontStyle::Italic;
+                    attr.is_synthetic = true;
+                    attr
+                })
+                .collect(),
+        }
+    }
+
+    #[allow(clippy::let_and_return)]
+    pub fn font_with_fallback(&self) -> Vec<FontAttributes> {
+        let mut font = self.font.clone();
+
+        let mut bundled_default_font = FontAttributes::default();
+
+        // Insert our bundled default Pragmasevka Nerd Font as a fallback
+        // in case their preference doesn't match anything.
+        // But don't add it if it is already their preference.
+        if !font.iter().any(|f| *f == bundled_default_font) {
+            bundled_default_font.is_fallback = true;
+            font.push(bundled_default_font);
+        }
+
+        // Keep the legacy built-in JetBrains Mono as a second fallback in
+        // case Pragmasevka is unavailable in older or manually assembled
+        // bundles.
+        if !font.iter().any(|f| f.family == "JetBrains Mono") {
+            font.push(FontAttributes::new_fallback("JetBrains Mono"));
+        }
+
+        // We bundle this emoji font as an in-memory fallback
+        font.push(FontAttributes::new_fallback("Noto Color Emoji"));
+
+        // Add symbols that many people end up using via patched fonts
+        font.push(FontAttributes::new_fallback("Symbols Nerd Font Mono"));
+
+        font
+    }
+}
+
+/// Defines a rule that can be used to select a `TextStyle` given
+/// an input `CellAttributes` value.  The logic that applies the
+/// matching can be found in src/font/mod.rs.  The concept is that
+/// the user can specify something like this:
+///
+/// ```toml
+/// [[font_rules]]
+/// italic = true
+/// font = { font = [{family = "Operator Mono SSm Lig", italic=true}]}
+/// ```
+///
+/// The above is translated as: "if the `CellAttributes` have the italic bit
+/// set, then use the italic style of font rather than the default", and
+/// stop processing further font rules.
+#[derive(Debug, Default, Clone, FromDynamic, ToDynamic)]
+pub struct StyleRule {
+    /// If present, this rule matches when CellAttributes::intensity holds
+    /// a value that matches this rule.  Valid values are "Bold", "Normal",
+    /// "Half".
+    pub intensity: Option<frankenterm_term::Intensity>,
+    /// If present, this rule matches when CellAttributes::underline holds
+    /// a value that matches this rule.  Valid values are "None", "Single",
+    /// "Double".
+    pub underline: Option<frankenterm_term::Underline>,
+    /// If present, this rule matches when CellAttributes::italic holds
+    /// a value that matches this rule.
+    pub italic: Option<bool>,
+    /// If present, this rule matches when CellAttributes::blink holds
+    /// a value that matches this rule.
+    pub blink: Option<frankenterm_term::Blink>,
+    /// If present, this rule matches when CellAttributes::reverse holds
+    /// a value that matches this rule.
+    pub reverse: Option<bool>,
+    /// If present, this rule matches when CellAttributes::strikethrough holds
+    /// a value that matches this rule.
+    pub strikethrough: Option<bool>,
+    /// If present, this rule matches when CellAttributes::invisible holds
+    /// a value that matches this rule.
+    pub invisible: Option<bool>,
+
+    /// When this rule matches, `font` specifies the styling to be used.
+    pub font: TextStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum AllowSquareGlyphOverflow {
+    Never,
+    Always,
+    WhenFollowedBySpace,
+}
+
+impl Default for AllowSquareGlyphOverflow {
+    fn default() -> Self {
+        Self::WhenFollowedBySpace
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum FontLocatorSelection {
+    /// Use fontconfig APIs to resolve fonts (!macos, posix systems)
+    FontConfig,
+    /// Use GDI on win32 systems
+    Gdi,
+    /// Use CoreText on macOS
+    CoreText,
+    /// Use only the font_dirs configuration to locate fonts
+    ConfigDirsOnly,
+}
+
+impl Default for FontLocatorSelection {
+    fn default() -> Self {
+        if cfg!(windows) {
+            FontLocatorSelection::Gdi
+        } else if cfg!(target_os = "macos") {
+            FontLocatorSelection::CoreText
+        } else {
+            FontLocatorSelection::FontConfig
+        }
+    }
+}
+
+/// Which glyph rasterizer draws font glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum FontRasterizerSelection {
+    FreeType,
+    Harfbuzz,
+    /// macOS CoreText (ft-yccm0.4.3.1): native outlines, Apple Color Emoji
+    /// (sbix) and COLR version 0 color glyphs. The default on macOS. A face
+    /// CoreText cannot draw (COLR version 1, CBDT bitmaps) or load falls back
+    /// to FreeType; elsewhere this selects FreeType.
+    CoreText,
+}
+
+impl Default for FontRasterizerSelection {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::CoreText
+        } else {
+            Self::FreeType
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, FromDynamic, ToDynamic, Default)]
+pub enum FontShaperSelection {
+    Allsorts,
+    #[default]
+    Harfbuzz,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_reduce() {
+        for family in &[
+            "Inconsolata SemiCondensed ExtraBold",
+            "Inconsolata SemiCondensed Regular",
+            "Inconsolata SemiCondensed Medium",
+            "Inconsolata SemiCondensed SemiBold",
+        ] {
+            let style = TextStyle {
+                font: vec![FontAttributes::new(family)],
+                foreground: None,
+            };
+            let style = style.reduce_first_font_to_family();
+            assert_eq!(style.font[0].family, "Inconsolata");
+        }
+    }
+
+    #[test]
+    fn font_weight_named_constants() {
+        assert_eq!(FontWeight::THIN.to_opentype_weight(), 100);
+        assert_eq!(FontWeight::EXTRALIGHT.to_opentype_weight(), 200);
+        assert_eq!(FontWeight::LIGHT.to_opentype_weight(), 300);
+        assert_eq!(FontWeight::DEMILIGHT.to_opentype_weight(), 350);
+        assert_eq!(FontWeight::BOOK.to_opentype_weight(), 380);
+        assert_eq!(FontWeight::REGULAR.to_opentype_weight(), 400);
+        assert_eq!(FontWeight::MEDIUM.to_opentype_weight(), 500);
+        assert_eq!(FontWeight::DEMIBOLD.to_opentype_weight(), 600);
+        assert_eq!(FontWeight::BOLD.to_opentype_weight(), 700);
+        assert_eq!(FontWeight::EXTRABOLD.to_opentype_weight(), 800);
+        assert_eq!(FontWeight::BLACK.to_opentype_weight(), 900);
+        assert_eq!(FontWeight::EXTRABLACK.to_opentype_weight(), 1000);
+    }
+
+    #[test]
+    fn font_weight_default_is_regular() {
+        assert_eq!(FontWeight::default(), FontWeight::REGULAR);
+    }
+
+    #[test]
+    fn font_weight_from_opentype_roundtrip() {
+        for w in [100, 200, 300, 400, 500, 600, 700, 800, 900] {
+            let fw = FontWeight::from_opentype_weight(w);
+            assert_eq!(fw.to_opentype_weight(), w);
+        }
+    }
+
+    #[test]
+    fn font_weight_bolder() {
+        let w = FontWeight::REGULAR.bolder();
+        assert_eq!(w.to_opentype_weight(), 600);
+    }
+
+    #[test]
+    fn font_weight_lighter() {
+        let w = FontWeight::REGULAR.lighter();
+        assert_eq!(w.to_opentype_weight(), 200);
+    }
+
+    #[test]
+    fn font_weight_lighter_saturates_at_zero() {
+        let w = FontWeight::THIN.lighter();
+        assert_eq!(w.to_opentype_weight(), 0);
+    }
+
+    #[test]
+    fn font_weight_display_named() {
+        assert_eq!(format!("{}", FontWeight::BOLD), "\"Bold\"");
+        assert_eq!(format!("{}", FontWeight::REGULAR), "\"Regular\"");
+    }
+
+    #[test]
+    fn font_weight_display_numeric() {
+        let w = FontWeight::from_opentype_weight(450);
+        assert_eq!(format!("{}", w), "450");
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_string() {
+        let v = Value::String("Bold".to_string());
+        let w = FontWeight::from_dynamic(&v, Default::default()).unwrap();
+        assert_eq!(w, FontWeight::BOLD);
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_numeric() {
+        let v = Value::U64(500);
+        let w = FontWeight::from_dynamic(&v, Default::default()).unwrap();
+        assert_eq!(w, FontWeight::MEDIUM);
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_invalid_string() {
+        let v = Value::String("NotAWeight".to_string());
+        assert!(FontWeight::from_dynamic(&v, Default::default()).is_err());
+    }
+
+    #[test]
+    fn font_weight_to_dynamic_named() {
+        let d = FontWeight::BOLD.to_dynamic();
+        assert_eq!(d, Value::String("Bold".to_string()));
+    }
+
+    #[test]
+    fn font_weight_to_dynamic_numeric() {
+        let d = FontWeight::from_opentype_weight(450).to_dynamic();
+        assert_eq!(d, Value::U64(450));
+    }
+
+    #[test]
+    fn font_stretch_opentype_roundtrip() {
+        for w in 1..=9 {
+            let fs = FontStretch::from_opentype_stretch(w);
+            assert_eq!(fs.to_opentype_stretch(), w);
+        }
+    }
+
+    #[test]
+    fn font_stretch_clamps_out_of_range() {
+        assert_eq!(
+            FontStretch::from_opentype_stretch(0),
+            FontStretch::UltraCondensed
+        );
+        assert_eq!(
+            FontStretch::from_opentype_stretch(100),
+            FontStretch::UltraExpanded
+        );
+    }
+
+    #[test]
+    fn font_stretch_default_is_normal() {
+        assert_eq!(FontStretch::default(), FontStretch::Normal);
+    }
+
+    #[test]
+    fn font_style_default_is_normal() {
+        assert_eq!(FontStyle::default(), FontStyle::Normal);
+    }
+
+    #[test]
+    fn font_attributes_new() {
+        let fa = FontAttributes::new("Fira Code");
+        assert_eq!(fa.family, "Fira Code");
+        assert_eq!(fa.weight, FontWeight::REGULAR);
+        assert_eq!(fa.stretch, FontStretch::Normal);
+        assert_eq!(fa.style, FontStyle::Normal);
+        assert!(!fa.is_fallback);
+        assert!(!fa.is_synthetic);
+    }
+
+    #[test]
+    fn font_attributes_new_fallback() {
+        let fa = FontAttributes::new_fallback("Noto Sans");
+        assert_eq!(fa.family, "Noto Sans");
+        assert!(fa.is_fallback);
+        assert!(!fa.is_synthetic);
+    }
+
+    #[test]
+    fn font_attributes_default_family() {
+        let fa = FontAttributes::default();
+        assert_eq!(fa.family, "Pragmasevka Nerd Font");
+    }
+
+    #[test]
+    fn text_style_make_bold() {
+        let style = TextStyle::default();
+        let bold = style.make_bold();
+        assert_eq!(bold.font[0].weight, FontWeight::DEMIBOLD);
+        assert!(bold.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_make_half_bright() {
+        let style = TextStyle::default();
+        let half = style.make_half_bright();
+        assert_eq!(half.font[0].weight, FontWeight::EXTRALIGHT);
+        assert!(half.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_make_italic() {
+        let style = TextStyle::default();
+        let italic = style.make_italic();
+        assert_eq!(italic.font[0].style, FontStyle::Italic);
+        assert!(italic.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_font_with_fallback_includes_defaults() {
+        let style = TextStyle::default();
+        let fonts = style.font_with_fallback();
+        assert!(fonts.len() >= 4);
+        assert!(fonts.iter().any(|f| f.family == "Pragmasevka Nerd Font"));
+        assert!(fonts.iter().any(|f| f.family == "JetBrains Mono"));
+        assert!(fonts.iter().any(|f| f.family == "Noto Color Emoji"));
+        assert!(fonts.iter().any(|f| f.family == "Symbols Nerd Font Mono"));
+    }
+
+    #[test]
+    fn freetype_load_flags_default_is_empty() {
+        assert_eq!(FreeTypeLoadFlags::default(), FreeTypeLoadFlags::DEFAULT);
+    }
+
+    #[test]
+    fn freetype_load_flags_to_string_default() {
+        assert_eq!(FreeTypeLoadFlags::DEFAULT.to_string(), "DEFAULT");
+    }
+
+    #[test]
+    fn freetype_load_flags_to_string_combined() {
+        let flags = FreeTypeLoadFlags::NO_HINTING | FreeTypeLoadFlags::NO_BITMAP;
+        let s = flags.to_string();
+        assert!(s.contains("NO_HINTING"));
+        assert!(s.contains("NO_BITMAP"));
+    }
+
+    #[test]
+    fn freetype_load_flags_try_from_string_roundtrip() {
+        let original = FreeTypeLoadFlags::NO_HINTING | FreeTypeLoadFlags::FORCE_AUTOHINT;
+        let s = original.to_string();
+        let parsed = FreeTypeLoadFlags::try_from(s).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn freetype_load_flags_try_from_invalid() {
+        let result = FreeTypeLoadFlags::try_from("INVALID_FLAG".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn freetype_load_flags_hidpi_default() {
+        assert_eq!(
+            FreeTypeLoadFlags::default_hidpi(),
+            FreeTypeLoadFlags::NO_HINTING
+        );
+    }
+
+    #[test]
+    fn allow_square_glyph_overflow_default() {
+        assert_eq!(
+            AllowSquareGlyphOverflow::default(),
+            AllowSquareGlyphOverflow::WhenFollowedBySpace
+        );
+    }
+
+    #[test]
+    fn font_rasterizer_default() {
+        // CoreText on macOS (ft-yccm0.4.3.1); FreeType everywhere else.
+        let expected = if cfg!(target_os = "macos") {
+            FontRasterizerSelection::CoreText
+        } else {
+            FontRasterizerSelection::FreeType
+        };
+        assert_eq!(FontRasterizerSelection::default(), expected);
+    }
+
+    #[test]
+    fn font_rasterizer_names_parse_including_coretext() {
+        for (name, expected) in [
+            ("FreeType", FontRasterizerSelection::FreeType),
+            ("Harfbuzz", FontRasterizerSelection::Harfbuzz),
+            ("CoreText", FontRasterizerSelection::CoreText),
+        ] {
+            let parsed = FontRasterizerSelection::from_dynamic(
+                &Value::String(name.to_string()),
+                Default::default(),
+            )
+            .unwrap_or_else(|err| panic!("{}: {}", name, err));
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn font_shaper_default() {
+        assert!(matches!(
+            FontShaperSelection::default(),
+            FontShaperSelection::Harfbuzz
+        ));
+    }
+
+    #[test]
+    fn display_pixel_geometry_default() {
+        assert_eq!(DisplayPixelGeometry::default(), DisplayPixelGeometry::RGB);
+    }
+
+    #[test]
+    fn freetype_load_target_default() {
+        assert_eq!(FreeTypeLoadTarget::default(), FreeTypeLoadTarget::Normal);
+    }
+
+    #[test]
+    fn reduce_preserves_non_first_fonts() {
+        let style = TextStyle {
+            font: vec![
+                FontAttributes::new("Fira Code Bold"),
+                FontAttributes::new("Noto Sans Bold"),
+            ],
+            foreground: None,
+        };
+        let reduced = style.reduce_first_font_to_family();
+        assert_eq!(reduced.font[0].family, "Fira Code");
+        assert_eq!(reduced.font[1].family, "Noto Sans Bold");
+    }
+
+    #[test]
+    fn font_attributes_display() {
+        let fa = FontAttributes::new("Fira Code");
+        let s = format!("{}", fa);
+        assert!(s.contains("Fira Code"));
+        assert!(s.contains("Regular"));
+    }
+}

@@ -1,0 +1,3374 @@
+//! Export module: JSONL/NDJSON export for wa data.
+//!
+//! Exports segments, gaps, events, workflows, sessions, audit actions,
+//! and reservations to newline-delimited JSON with optional redaction.
+
+use std::io::Write;
+
+use serde::Serialize;
+
+use crate::policy::Redactor;
+use crate::storage::{
+    AuditQuery, EventQuery, ExportQuery, Segment, StorageHandle, StoredEvent, WorkflowStepLogRecord,
+};
+
+/// Data kinds available for export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Segments,
+    Gaps,
+    Events,
+    Workflows,
+    Sessions,
+    Audit,
+    Reservations,
+}
+
+impl ExportKind {
+    /// Parse from a string (case-insensitive).
+    #[must_use]
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "segments" | "segment" | "output" => Some(Self::Segments),
+            "gaps" | "gap" => Some(Self::Gaps),
+            "events" | "event" | "detections" => Some(Self::Events),
+            "workflows" | "workflow" => Some(Self::Workflows),
+            "sessions" | "session" => Some(Self::Sessions),
+            "audit" | "audit_actions" | "audit-actions" => Some(Self::Audit),
+            "reservations" | "reservation" | "reserves" => Some(Self::Reservations),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Segments => "segments",
+            Self::Gaps => "gaps",
+            Self::Events => "events",
+            Self::Workflows => "workflows",
+            Self::Sessions => "sessions",
+            Self::Audit => "audit",
+            Self::Reservations => "reservations",
+        }
+    }
+
+    /// All valid kind strings for help text.
+    #[must_use]
+    pub fn all_names() -> &'static [&'static str] {
+        &[
+            "segments",
+            "gaps",
+            "events",
+            "workflows",
+            "sessions",
+            "audit",
+            "reservations",
+        ]
+    }
+}
+
+/// JSONL header written as the first line of export output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportHeader {
+    #[serde(rename = "_export")]
+    pub export: bool,
+    pub version: String,
+    pub kind: String,
+    pub redacted: bool,
+    pub exported_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    pub record_count: usize,
+}
+
+/// Options controlling export behavior.
+pub struct ExportOptions {
+    pub kind: ExportKind,
+    pub query: ExportQuery,
+    /// Filter by actor kind (audit exports only)
+    pub audit_actor: Option<String>,
+    /// Filter by action kind (audit exports only)
+    pub audit_action: Option<String>,
+    pub redact: bool,
+    pub pretty: bool,
+}
+
+/// Write JSONL export to the provided writer.
+///
+/// Writes a header line followed by one JSON object per line.
+/// Returns the number of records exported.
+pub async fn export_jsonl<W: Write>(
+    storage: &StorageHandle,
+    opts: &ExportOptions,
+    writer: &mut W,
+) -> crate::Result<usize> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    export_jsonl_with_cx(&cx, storage, opts, writer).await
+}
+
+/// Cx-first [`export_jsonl`] (ft-xbnl0.2.3). Pre-flight
+/// cx checkpoint gates the expensive storage query, and each
+/// storage call is routed through its cx-first sibling so
+/// caller cancellation propagates into storage's pre-flight
+/// checkpoints (tick 123 upgrade — previously this was a
+/// simple delegate that used legacy storage methods).
+///
+/// Per-record cancellation is out of scope: once the storage
+/// query returns a `Vec<Record>`, the write loop is CPU-only
+/// serialization + I/O. Adding checkpoints inside the loop
+/// would be excessive — storage query cost dominates export
+/// time on large tables.
+pub async fn export_jsonl_with_cx<W: Write>(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    opts: &ExportOptions,
+    writer: &mut W,
+) -> crate::Result<usize> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::RuntimeOperation {
+            operation: "export_jsonl",
+            source: crate::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?;
+
+    let redactor = if opts.redact {
+        Some(Redactor::new())
+    } else {
+        None
+    };
+
+    let count = match opts.kind {
+        ExportKind::Segments => {
+            let records = storage
+                .export_segments_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                let record = if let Some(ref r) = redactor {
+                    redact_segment(record, r)
+                } else {
+                    record
+                };
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Gaps => {
+            let records = storage.export_gaps_with_cx(cx, opts.query.clone()).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Events => {
+            let query = EventQuery {
+                limit: opts.query.limit,
+                pane_id: opts.query.pane_id,
+                since: opts.query.since,
+                until: opts.query.until,
+                ..Default::default()
+            };
+            let records = storage.get_events_with_cx(cx, query).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                let record = if let Some(ref r) = redactor {
+                    redact_event(record, r)
+                } else {
+                    record
+                };
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Workflows => {
+            let records = storage
+                .export_workflows_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for wf in &records {
+                write_record(writer, wf, opts.pretty)?;
+                if let Ok(steps) = storage.get_step_logs_with_cx(cx, &wf.id).await {
+                    for step in &steps {
+                        let step = if let Some(ref r) = redactor {
+                            redact_step_log(step.clone(), r)
+                        } else {
+                            step.clone()
+                        };
+                        write_record(writer, &step, opts.pretty)?;
+                    }
+                }
+            }
+            count
+        }
+        ExportKind::Sessions => {
+            let records = storage
+                .export_sessions_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &records {
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Audit => {
+            let query = AuditQuery {
+                limit: opts.query.limit,
+                pane_id: opts.query.pane_id,
+                since: opts.query.since,
+                until: opts.query.until,
+                actor_kind: opts.audit_actor.clone(),
+                action_kind: opts.audit_action.clone(),
+                ..Default::default()
+            };
+            let mut records = storage.get_audit_actions_with_cx(cx, query).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &mut records {
+                if let Some(ref r) = redactor {
+                    record.redact_fields(r);
+                }
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Reservations => {
+            let records = storage
+                .export_reservations_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &records {
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+    };
+
+    writer.flush().map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!("Flush failed: {e}")))
+    })?;
+
+    Ok(count)
+}
+
+fn write_header<W: Write>(
+    writer: &mut W,
+    opts: &ExportOptions,
+    record_count: usize,
+) -> crate::Result<()> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+
+    let header = ExportHeader {
+        export: true,
+        version: crate::VERSION.to_string(),
+        kind: opts.kind.as_str().to_string(),
+        redacted: opts.redact,
+        exported_at_ms: now_ms,
+        pane_id: opts.query.pane_id,
+        since: opts.query.since,
+        until: opts.query.until,
+        limit: opts.query.limit,
+        record_count,
+    };
+
+    write_record(writer, &header, opts.pretty)
+}
+
+fn write_record<W: Write, T: Serialize>(
+    writer: &mut W,
+    record: &T,
+    pretty: bool,
+) -> crate::Result<()> {
+    let json = if pretty {
+        serde_json::to_string_pretty(record)
+    } else {
+        serde_json::to_string(record)
+    }
+    .map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!(
+            "JSON serialization failed: {e}"
+        )))
+    })?;
+
+    writeln!(writer, "{json}").map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!("Write failed: {e}")))
+    })
+}
+
+// =============================================================================
+// Redaction helpers
+// =============================================================================
+
+fn redact_segment(mut seg: Segment, redactor: &Redactor) -> Segment {
+    seg.content = redactor.redact(&seg.content);
+    seg
+}
+
+/// Redact secret material from a stored event before emission: `matched_text`
+/// and every string leaf inside the structured `extracted` payload. Idempotent
+/// and secret-pattern-scoped (non-secret strings are untouched). Reused by the
+/// export path and `ft robot watch-events` (ft-7h5da.4.4).
+pub fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent {
+    if let Some(ref text) = event.matched_text {
+        event.matched_text = Some(redactor.redact(text));
+    }
+    if let Some(extracted) = event.extracted.take() {
+        event.extracted = Some(redact_json_value(extracted, redactor));
+    }
+    event
+}
+
+/// Recursively redact every string LEAF of a JSON value, rebuilding the tree.
+///
+/// This replaces an earlier serialize → redact-the-JSON-string → reparse
+/// approach that **failed open**: if redacting the serialized form produced
+/// invalid JSON (a secret pattern matching across a value's closing quote or an
+/// escape sequence), the reparse failed and the ORIGINAL, unredacted value was
+/// emitted — a redaction bypass that violates the fail-closed read-path
+/// doctrine. Walking the tree and redacting each unescaped string leaf can
+/// never produce malformed JSON, never retains the original secret-bearing
+/// value, and additionally redacts the true string content (not its
+/// JSON-escaped form, e.g. a secret spanning a real newline). Object keys are
+/// schema field names, not secrets, and are left intact so downstream
+/// field lookups keep working.
+fn redact_json_value(value: serde_json::Value, redactor: &Redactor) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(redactor.redact(&s)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json_value(item, redactor))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, val)| (key, redact_json_value(val, redactor)))
+                .collect(),
+        ),
+        // Numbers, booleans, and null cannot carry secret strings.
+        other => other,
+    }
+}
+
+fn redact_step_log(mut step: WorkflowStepLogRecord, redactor: &Redactor) -> WorkflowStepLogRecord {
+    if let Some(ref data) = step.result_data {
+        step.result_data = Some(redactor.redact(data));
+    }
+    if let Some(ref summary) = step.policy_summary {
+        step.policy_summary = Some(redactor.redact(summary));
+    }
+    step
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build export test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn export_kind_from_str_loose() {
+        assert_eq!(
+            ExportKind::from_str_loose("segments"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Segment"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("output"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(ExportKind::from_str_loose("gaps"), Some(ExportKind::Gaps));
+        assert_eq!(ExportKind::from_str_loose("Gap"), Some(ExportKind::Gaps));
+        assert_eq!(
+            ExportKind::from_str_loose("events"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("detections"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("workflows"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("sessions"),
+            Some(ExportKind::Sessions)
+        );
+        assert_eq!(ExportKind::from_str_loose("audit"), Some(ExportKind::Audit));
+        assert_eq!(
+            ExportKind::from_str_loose("audit-actions"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reservations"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(ExportKind::from_str_loose("unknown"), None);
+    }
+
+    #[test]
+    fn export_kind_round_trips() {
+        for name in ExportKind::all_names() {
+            let kind = ExportKind::from_str_loose(name).unwrap();
+            assert_eq!(kind.as_str(), *name);
+        }
+    }
+
+    #[test]
+    fn export_header_serializes() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: true,
+            exported_at_ms: 1000,
+            pane_id: Some(3),
+            since: None,
+            until: None,
+            limit: Some(100),
+            record_count: 42,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"_export\":true"));
+        assert!(json.contains("\"kind\":\"segments\""));
+        assert!(json.contains("\"record_count\":42"));
+        // None fields should be skipped
+        assert!(!json.contains("\"since\""));
+        assert!(!json.contains("\"until\""));
+    }
+
+    #[test]
+    fn redact_segment_removes_secrets() {
+        let r = Redactor::new();
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "key sk-abc123def456ghi789jkl012mno345pqr678stu901v here".to_string(),
+            content_len: 50,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let redacted = redact_segment(seg, &r);
+        assert!(redacted.content.contains("[REDACTED]"));
+        assert!(!redacted.content.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn redact_event_removes_secrets() {
+        let r = Redactor::new();
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "auth.error".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(
+                serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
+            ),
+            matched_text: Some("Error: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r);
+        assert!(redacted.matched_text.unwrap().contains("[REDACTED]"));
+        // The structured `extracted` payload must ALSO be redacted (this was
+        // previously unasserted, which let the serialize→reparse fail-open
+        // bypass hide).
+        let extracted = redacted.extracted.expect("extracted preserved");
+        let key = extracted["key"].as_str().expect("key is a string");
+        assert!(
+            key.contains("[REDACTED]"),
+            "extracted secret not redacted: {key}"
+        );
+        assert!(!key.contains("sk-abc123"), "extracted secret leaked: {key}");
+    }
+
+    #[test]
+    fn redact_event_redacts_nested_extracted_and_never_fails_open() {
+        // ft-fresh-eyes: the tree-walk must redact secrets at every depth
+        // (nested object, array elements) and must redact the true string
+        // content even when it contains JSON-significant characters (embedded
+        // quote + real newline) that would have broken the old
+        // serialize→redact→reparse path and caused it to fail open (emit the
+        // original, unredacted value).
+        let r = Redactor::new();
+        let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "auth.error".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({
+                "nested": { "token": format!("prefix \"{secret}\"\nmore") },
+                "list": [ format!("a {secret} b"), "clean", 42 ],
+                "count": 7,
+                "flag": true,
+                "missing": serde_json::Value::Null
+            })),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r).extracted.expect("extracted");
+
+        // No copy of the secret survives anywhere in the structured payload.
+        let serialized = serde_json::to_string(&redacted).expect("serialize");
+        assert!(
+            !serialized.contains(secret),
+            "secret leaked through redaction: {serialized}"
+        );
+        // Redaction reached both the nested object and the array element.
+        assert!(
+            redacted["nested"]["token"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        assert!(redacted["list"][0].as_str().unwrap().contains("[REDACTED]"));
+        // Non-secret leaves are untouched, including non-string types.
+        assert_eq!(redacted["list"][1], "clean");
+        assert_eq!(redacted["list"][2], 42);
+        assert_eq!(redacted["count"], 7);
+        assert_eq!(redacted["flag"], true);
+        assert!(redacted["missing"].is_null());
+    }
+
+    #[test]
+    fn write_record_jsonl() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 2,
+            seq: 3,
+            content: "hello".to_string(),
+            content_len: 5,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.ends_with('\n'));
+        // Should be exactly one line (no embedded newlines)
+        let trimmed = line.trim_end_matches('\n');
+        assert!(!trimmed.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap();
+        assert_eq!(parsed["pane_id"], 2);
+        assert_eq!(parsed["content"], "hello");
+    }
+
+    #[test]
+    fn export_segments_to_buffer() {
+        run_async_test(async {
+            // Create temp DB
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_export_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            // Insert a pane and segment
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage
+                .append_segment(1, "test content", None)
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            assert_eq!(count, 1);
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
+
+            // Verify header
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "segments");
+            assert_eq!(header["record_count"], 1);
+
+            // Verify record
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["content"], "test content");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `export_jsonl_with_cx` must match
+    /// `export_jsonl` on the same fixture. Uses the same
+    /// topology as `export_segments_to_buffer` with a fresh cx.
+    #[test]
+    fn export_jsonl_with_cx_matches_legacy() {
+        run_async_test(async {
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_export_cx_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage
+                .append_segment(1, "cx-test-content", None)
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let cx = crate::cx::for_request();
+            let mut buf = Vec::new();
+            let count = export_jsonl_with_cx(&cx, &storage, &opts, &mut buf)
+                .await
+                .unwrap();
+
+            assert_eq!(count, 1);
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
+
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["record_count"], 1);
+
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["content"], "cx-test-content");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_with_redaction() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_redact_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage
+                .append_segment(
+                    1,
+                    "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v",
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            let content = record["content"].as_str().unwrap();
+            assert!(content.contains("[REDACTED]"));
+            assert!(!content.contains("sk-abc123"));
+
+            // Header should indicate redacted
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["redacted"], true);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_with_pane_filter() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_filter_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            // Insert two panes
+            for pane_id in [1u64, 2u64] {
+                let pane = crate::storage::PaneRecord {
+                    pane_id,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1000,
+                    last_seen_at: 1000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                };
+                storage.upsert_pane(pane).await.unwrap();
+            }
+
+            storage.append_segment(1, "pane1 data", None).await.unwrap();
+            storage.append_segment(2, "pane2 data", None).await.unwrap();
+
+            // Export only pane 1
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery {
+                    pane_id: Some(1),
+                    ..Default::default()
+                },
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            assert!(output.contains("pane1 data"));
+            assert!(!output.contains("pane2 data"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_pretty_format() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_pretty_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage.append_segment(1, "test", None).await.unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: true,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            // Pretty format should have indentation
+            assert!(output.contains("  \""));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_audit_with_actor_filter() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_audit_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            // Insert a pane (required for FK)
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            // Insert two audit actions with different actor_kinds
+            let action1 = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 1000,
+                actor_kind: "workflow".to_string(),
+                actor_id: Some("wf-1".to_string()),
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "auth_required".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action1).await.unwrap();
+
+            let action2 = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 2000,
+                actor_kind: "operator".to_string(),
+                actor_id: Some("human-1".to_string()),
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "send_text".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action2).await.unwrap();
+
+            // Export with actor filter = "workflow"
+            let opts = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: Some("workflow".to_string()),
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
+
+            // Verify the record is the workflow one
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["actor_kind"], "workflow");
+            assert_eq!(record["action_kind"], "auth_required");
+
+            // Export with action filter = "send_text"
+            let opts2 = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: Some("send_text".to_string()),
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf2 = Vec::new();
+            let count2 = export_jsonl(&storage, &opts2, &mut buf2).await.unwrap();
+            assert_eq!(count2, 1);
+
+            let output2 = String::from_utf8(buf2).unwrap();
+            let lines2: Vec<&str> = output2.trim().lines().collect();
+            let record2: serde_json::Value = serde_json::from_str(lines2[1]).unwrap();
+            assert_eq!(record2["actor_kind"], "operator");
+            assert_eq!(record2["action_kind"], "send_text");
+
+            // Export all audit (no actor/action filter) should return 2
+            let opts3 = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf3 = Vec::new();
+            let count3 = export_jsonl(&storage, &opts3, &mut buf3).await.unwrap();
+            assert_eq!(count3, 2);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_audit_redacts_fields() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_test_export_audit_redact_{}.db",
+                std::process::id()
+            ));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let action = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 1000,
+                actor_kind: "workflow".to_string(),
+                actor_id: None,
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: None,
+                action_kind: "test".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: Some(
+                    "API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+                ),
+                rule_id: None,
+                input_summary: Some(
+                    "input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string(),
+                ),
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action).await.unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+            // Decision reason and input summary should be redacted
+            let reason = record["decision_reason"].as_str().unwrap();
+            assert!(reason.contains("[REDACTED]"));
+            assert!(!reason.contains("sk-abc123"));
+
+            let summary = record["input_summary"].as_str().unwrap();
+            assert!(summary.contains("[REDACTED]"));
+            assert!(!summary.contains("sk-abc123"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    // =========================================================================
+    // Schema documentation & field validation
+    // =========================================================================
+    //
+    // Each export kind produces JSONL where every data record (after the header)
+    // contains the fields defined on its storage struct. The expected field sets
+    // are codified below so that any accidental removal or rename breaks a test.
+    //
+    // Export Header (first line of every export):
+    //   _export (bool), version (string), kind (string), redacted (bool),
+    //   exported_at_ms (i64), pane_id? (u64), since? (i64), until? (i64),
+    //   limit? (usize), record_count (usize)
+    //
+    // Segment record:
+    //   id, pane_id, seq, content, content_len, content_hash?, captured_at
+    //
+    // Gap record:
+    //   id, pane_id, seq_before, seq_after, reason, detected_at
+    //
+    // Event record (StoredEvent):
+    //   id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+    //   extracted?, matched_text?, segment_id?, detected_at, dedupe_key?,
+    //   handled_at?, handled_by_workflow_id?, handled_status?
+    //
+    // Workflow record:
+    //   id, workflow_name, pane_id, trigger_event_id?, current_step, status,
+    //   wait_condition?, context?, result?, error?, started_at, updated_at,
+    //   completed_at?
+    //
+    // Workflow step log record:
+    //   id, workflow_id, audit_action_id?, step_index, step_name, step_id?,
+    //   step_kind?, result_type, result_data?, policy_summary?,
+    //   verification_refs?, error_code?, started_at, completed_at, duration_ms
+    //
+    // Agent session record:
+    //   id, pane_id, agent_type, session_id?, external_id?, external_meta?,
+    //   started_at, ended_at?, end_reason?, total_tokens?, input_tokens?,
+    //   output_tokens?, cached_tokens?, reasoning_tokens?, model_name?,
+    //   estimated_cost_usd?
+    //
+    // Audit action record:
+    //   id, ts, actor_kind, actor_id?, correlation_id?, pane_id?, domain?,
+    //   action_kind, policy_decision, decision_reason?, rule_id?,
+    //   input_summary?, verification_summary?, decision_context?, result
+    //
+    // Pane reservation record:
+    //   id, pane_id, owner_kind, owner_id, reason?, created_at, expires_at,
+    //   released_at?, status
+    //
+    // Versioning strategy:
+    //   The export header's `version` field carries the crate version from
+    //   Cargo.toml (crate::VERSION). Consumers should compare the major.minor
+    //   version to decide whether they understand the schema. Field additions
+    //   (new optional fields) are backward-compatible and do NOT require a
+    //   version bump. Field removals or renames MUST bump the minor version
+    //   at minimum. The schema drift test below enforces this invariant.
+
+    /// Expected required fields for each exported record type.
+    /// The schema drift test verifies that every field listed here appears
+    /// in the serialized JSON, and that no unlisted fields have appeared.
+    fn expected_segment_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "pane_id",
+            "seq",
+            "content",
+            "content_len",
+            "captured_at",
+        ]
+    }
+
+    fn expected_gap_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "pane_id",
+            "seq_before",
+            "seq_after",
+            "reason",
+            "detected_at",
+        ]
+    }
+
+    fn expected_event_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "pane_id",
+            "rule_id",
+            "agent_type",
+            "event_type",
+            "severity",
+            "confidence",
+            "detected_at",
+        ]
+    }
+
+    fn expected_workflow_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "workflow_name",
+            "pane_id",
+            "current_step",
+            "status",
+            "started_at",
+            "updated_at",
+        ]
+    }
+
+    fn expected_step_log_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "workflow_id",
+            "step_index",
+            "step_name",
+            "result_type",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+        ]
+    }
+
+    fn expected_session_fields() -> Vec<&'static str> {
+        vec!["id", "pane_id", "agent_type", "started_at"]
+    }
+
+    fn expected_audit_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "ts",
+            "actor_kind",
+            "action_kind",
+            "policy_decision",
+            "result",
+        ]
+    }
+
+    fn expected_reservation_fields() -> Vec<&'static str> {
+        vec![
+            "id",
+            "pane_id",
+            "owner_kind",
+            "owner_id",
+            "created_at",
+            "expires_at",
+            "status",
+        ]
+    }
+
+    fn expected_header_fields() -> Vec<&'static str> {
+        vec![
+            "_export",
+            "version",
+            "kind",
+            "redacted",
+            "exported_at_ms",
+            "record_count",
+        ]
+    }
+
+    /// Helper: parse JSONL output into header + records
+    fn parse_jsonl(output: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert!(
+            !lines.is_empty(),
+            "Export output must have at least a header line"
+        );
+        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let records: Vec<serde_json::Value> = lines[1..]
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (header, records)
+    }
+
+    /// Validate that a JSON object contains all expected fields.
+    fn assert_fields_present(obj: &serde_json::Value, expected: &[&str], context: &str) {
+        let map = obj.as_object().expect("Expected JSON object");
+        for field in expected {
+            assert!(
+                map.contains_key(*field),
+                "{context}: missing expected field '{field}'"
+            );
+        }
+    }
+
+    fn typed_audit_decision_context_json() -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.action = crate::policy::ActionKind::SendText;
+        context.actor = crate::policy::ActorKind::Workflow;
+        context.surface = crate::policy::PolicySurface::Mux;
+        context.set_determining_rule("policy.allow");
+        context.add_evidence("mode", "auto");
+        serde_json::to_string(&context).unwrap()
+    }
+
+    /// Helper to create a test DB with one pane already inserted.
+    async fn test_db_with_pane(suffix: &str) -> (StorageHandle, std::path::PathBuf) {
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_{suffix}_{}.db", std::process::id()));
+        let db_path = tmp.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+
+        let pane = crate::storage::PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1000,
+            last_seen_at: 1000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        (storage, tmp)
+    }
+
+    // =========================================================================
+    // Schema drift tests — fail if fields are added/removed without review
+    // =========================================================================
+
+    #[test]
+    fn schema_drift_segment() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "test".to_string(),
+            content_len: 4,
+            content_hash: Some("abc".to_string()),
+            captured_at: 1000,
+        };
+        let val: serde_json::Value = serde_json::to_value(&seg).unwrap();
+        assert_fields_present(&val, &expected_segment_fields(), "Segment");
+        // Also check no unexpected fields crept in without updating schema docs
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "pane_id",
+            "seq",
+            "content",
+            "content_len",
+            "content_hash",
+            "captured_at",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "Segment has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_gap() {
+        let gap = crate::storage::Gap {
+            id: 1,
+            pane_id: 1,
+            seq_before: 5,
+            seq_after: 6,
+            reason: "timeout".to_string(),
+            detected_at: 1000,
+        };
+        let val: serde_json::Value = serde_json::to_value(&gap).unwrap();
+        assert_fields_present(&val, &expected_gap_fields(), "Gap");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "pane_id",
+            "seq_before",
+            "seq_after",
+            "reason",
+            "detected_at",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "Gap has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_event() {
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "r1".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "error".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({"k": "v"})),
+            matched_text: Some("match".to_string()),
+            segment_id: Some(1),
+            detected_at: 1000,
+            dedupe_key: Some("dk".to_string()),
+            handled_at: Some(2000),
+            handled_by_workflow_id: Some("wf-1".to_string()),
+            handled_status: Some("resolved".to_string()),
+        };
+        let val: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_fields_present(&val, &expected_event_fields(), "StoredEvent");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "pane_id",
+            "rule_id",
+            "agent_type",
+            "event_type",
+            "severity",
+            "confidence",
+            "extracted",
+            "matched_text",
+            "segment_id",
+            "detected_at",
+            "dedupe_key",
+            "handled_at",
+            "handled_by_workflow_id",
+            "handled_status",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "StoredEvent has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_workflow() {
+        let wf = crate::storage::WorkflowRecord {
+            id: "wf-1".to_string(),
+            workflow_name: "auth_fix".to_string(),
+            pane_id: 1,
+            trigger_event_id: Some(10),
+            current_step: 2,
+            status: "running".to_string(),
+            wait_condition: Some(serde_json::json!({"type": "text"})),
+            context: Some(serde_json::json!({})),
+            result: None,
+            error: None,
+            started_at: 1000,
+            updated_at: 2000,
+            completed_at: None,
+        };
+        let val: serde_json::Value = serde_json::to_value(&wf).unwrap();
+        assert_fields_present(&val, &expected_workflow_fields(), "WorkflowRecord");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "workflow_name",
+            "pane_id",
+            "trigger_event_id",
+            "current_step",
+            "status",
+            "wait_condition",
+            "context",
+            "result",
+            "error",
+            "started_at",
+            "updated_at",
+            "completed_at",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "WorkflowRecord has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_step_log() {
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: Some(5),
+            step_index: 0,
+            step_name: "wait_for_prompt".to_string(),
+            step_id: Some("s1".to_string()),
+            step_kind: Some("wait_for".to_string()),
+            result_type: "continue".to_string(),
+            result_data: Some("found prompt".to_string()),
+            policy_summary: Some("allowed".to_string()),
+            verification_refs: Some("[]".to_string()),
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let val: serde_json::Value = serde_json::to_value(&step).unwrap();
+        assert_fields_present(&val, &expected_step_log_fields(), "WorkflowStepLogRecord");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "workflow_id",
+            "audit_action_id",
+            "step_index",
+            "step_name",
+            "step_id",
+            "step_kind",
+            "result_type",
+            "result_data",
+            "policy_summary",
+            "verification_refs",
+            "error_code",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "WorkflowStepLogRecord has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_session() {
+        let session = crate::storage::AgentSessionRecord {
+            id: 1,
+            pane_id: 1,
+            agent_type: "codex".to_string(),
+            session_id: Some("sess-1".to_string()),
+            external_id: Some("ext-1".to_string()),
+            external_meta: Some(serde_json::json!({"tool": "wa"})),
+            started_at: 1000,
+            ended_at: Some(2000),
+            end_reason: Some("completed".to_string()),
+            total_tokens: Some(1500),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            cached_tokens: Some(200),
+            reasoning_tokens: Some(100),
+            model_name: Some("gpt-4".to_string()),
+            estimated_cost_usd: Some(0.05),
+        };
+        let val: serde_json::Value = serde_json::to_value(&session).unwrap();
+        assert_fields_present(&val, &expected_session_fields(), "AgentSessionRecord");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "pane_id",
+            "agent_type",
+            "session_id",
+            "external_id",
+            "external_meta",
+            "started_at",
+            "ended_at",
+            "end_reason",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+            "model_name",
+            "estimated_cost_usd",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "AgentSessionRecord has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_audit() {
+        let audit = crate::storage::AuditActionRecord {
+            id: 1,
+            ts: 1000,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-1".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("auto".to_string()),
+            rule_id: Some("r1".to_string()),
+            input_summary: Some("input".to_string()),
+            verification_summary: Some("ok".to_string()),
+            decision_context: Some(typed_audit_decision_context_json()),
+            result: "ok".to_string(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&audit).unwrap();
+        assert_fields_present(&val, &expected_audit_fields(), "AuditActionRecord");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "ts",
+            "actor_kind",
+            "actor_id",
+            "correlation_id",
+            "pane_id",
+            "domain",
+            "action_kind",
+            "policy_decision",
+            "decision_reason",
+            "rule_id",
+            "input_summary",
+            "verification_summary",
+            "decision_context",
+            "result",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "AuditActionRecord has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_reservation() {
+        let res = crate::storage::PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-1".to_string(),
+            reason: Some("running fix".to_string()),
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&res).unwrap();
+        assert_fields_present(&val, &expected_reservation_fields(), "PaneReservation");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "id",
+            "pane_id",
+            "owner_kind",
+            "owner_id",
+            "reason",
+            "created_at",
+            "expires_at",
+            "released_at",
+            "status",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "PaneReservation has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_header() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: false,
+            exported_at_ms: 1000,
+            pane_id: Some(1),
+            since: Some(500),
+            until: Some(2000),
+            limit: Some(100),
+            record_count: 5,
+        };
+        let val: serde_json::Value = serde_json::to_value(&header).unwrap();
+        assert_fields_present(&val, &expected_header_fields(), "ExportHeader");
+        let map = val.as_object().unwrap();
+        let known: std::collections::HashSet<&str> = [
+            "_export",
+            "version",
+            "kind",
+            "redacted",
+            "exported_at_ms",
+            "pane_id",
+            "since",
+            "until",
+            "limit",
+            "record_count",
+        ]
+        .into_iter()
+        .collect();
+        for key in map.keys() {
+            assert!(
+                known.contains(key.as_str()),
+                "ExportHeader has unexpected field '{key}' — update schema docs and drift test"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Step log redaction
+    // =========================================================================
+
+    #[test]
+    fn redact_step_log_removes_secrets() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "check_auth".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "continue".to_string(),
+            result_data: Some(
+                "Found key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
+            policy_summary: Some(
+                "Token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012 validated".to_string(),
+            ),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        assert!(
+            redacted
+                .result_data
+                .as_ref()
+                .unwrap()
+                .contains("[REDACTED]"),
+            "result_data should be redacted"
+        );
+        assert!(
+            !redacted.result_data.as_ref().unwrap().contains("sk-abc123"),
+            "OpenAI key should not survive redaction"
+        );
+        assert!(
+            redacted
+                .policy_summary
+                .as_ref()
+                .unwrap()
+                .contains("[REDACTED]"),
+            "policy_summary should be redacted"
+        );
+        assert!(
+            !redacted.policy_summary.as_ref().unwrap().contains("ghp_"),
+            "GitHub PAT should not survive redaction"
+        );
+    }
+
+    #[test]
+    fn redact_step_log_noop_when_no_secrets() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "wait".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "continue".to_string(),
+            result_data: Some("clean data no secrets".to_string()),
+            policy_summary: Some("allowed by default policy".to_string()),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step.clone(), &r);
+        assert_eq!(redacted.result_data, step.result_data);
+        assert_eq!(redacted.policy_summary, step.policy_summary);
+    }
+
+    #[test]
+    fn redact_step_log_none_fields_unchanged() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "wait".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "continue".to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        assert!(redacted.result_data.is_none());
+        assert!(redacted.policy_summary.is_none());
+    }
+
+    // =========================================================================
+    // End-to-end export tests for less-covered kinds
+    // =========================================================================
+
+    #[test]
+    fn export_empty_produces_header_only() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("empty").await;
+
+            // Export events (none exist) — should produce header with count=0
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 0);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "events");
+            assert_eq!(header["record_count"], 0);
+            assert_eq!(records, [] as [serde_json::Value; 0]);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_gaps_end_to_end() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("gaps").await;
+
+            // Need a segment first (record_gap requires last_seq)
+            storage.append_segment(1, "before gap", None).await.unwrap();
+            // Record a gap
+            let gap = storage.record_gap(1, "timeout").await.unwrap();
+            assert!(gap.is_some(), "Gap should be recorded after segment exists");
+
+            let opts = ExportOptions {
+                kind: ExportKind::Gaps,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_fields_present(&header, &expected_header_fields(), "Gap export header");
+            assert_eq!(header["kind"], "gaps");
+            assert_eq!(records.len(), 1);
+            assert_fields_present(&records[0], &expected_gap_fields(), "Gap record");
+            assert_eq!(records[0]["reason"], "timeout");
+            assert_eq!(records[0]["pane_id"], 1);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_events_end_to_end() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("events_e2e").await;
+
+            let event = StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "api_key_leak".to_string(),
+                agent_type: "claude_code".to_string(),
+                event_type: "secret_detected".to_string(),
+                severity: "critical".to_string(),
+                confidence: 0.95,
+                extracted: Some(serde_json::json!({"type": "openai_key"})),
+                matched_text: Some("sk-test123".to_string()),
+                segment_id: None,
+                detected_at: 1000,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            storage.record_event(event).await.unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "events");
+            assert_fields_present(&records[0], &expected_event_fields(), "Event record");
+            assert_eq!(records[0]["event_type"], "secret_detected");
+            assert_eq!(records[0]["severity"], "critical");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_events_with_redaction() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("events_redact").await;
+
+            let event = StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "leak".to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "secret".to_string(),
+                severity: "high".to_string(),
+                confidence: 1.0,
+                extracted: Some(
+                    serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
+                ),
+                matched_text: Some(
+                    "Found sk-abc123def456ghi789jkl012mno345pqr678stu901v in output".to_string(),
+                ),
+                segment_id: None,
+                detected_at: 1000,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            storage.record_event(event).await.unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            let matched = records[0]["matched_text"].as_str().unwrap();
+            assert!(matched.contains("[REDACTED]"));
+            assert!(!matched.contains("sk-abc123"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_sessions_end_to_end() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("sessions").await;
+
+            let session = crate::storage::AgentSessionRecord {
+                id: 0,
+                pane_id: 1,
+                agent_type: "codex".to_string(),
+                session_id: Some("sess-42".to_string()),
+                external_id: None,
+                external_meta: None,
+                started_at: 1000,
+                ended_at: Some(5000),
+                end_reason: Some("completed".to_string()),
+                total_tokens: Some(2000),
+                input_tokens: Some(1500),
+                output_tokens: Some(500),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                model_name: Some("gpt-4".to_string()),
+                estimated_cost_usd: None,
+            };
+            storage.upsert_agent_session(session).await.unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Sessions,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "sessions");
+            assert_fields_present(&records[0], &expected_session_fields(), "Session record");
+            assert_eq!(records[0]["agent_type"], "codex");
+            assert_eq!(records[0]["model_name"], "gpt-4");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_reservations_end_to_end() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("reservations").await;
+
+            storage
+                .create_reservation(1, "workflow", "wf-auth-fix", Some("fixing auth"), 60_000)
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Reservations,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "reservations");
+            assert_fields_present(
+                &records[0],
+                &expected_reservation_fields(),
+                "Reservation record",
+            );
+            assert_eq!(records[0]["owner_kind"], "workflow");
+            assert_eq!(records[0]["owner_id"], "wf-auth-fix");
+            assert_eq!(records[0]["reason"], "fixing auth");
+            assert_eq!(records[0]["status"], "active");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_workflows_with_step_logs() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("workflows").await;
+
+            let wf = crate::storage::WorkflowRecord {
+                id: "wf-test-1".to_string(),
+                workflow_name: "auth_recovery".to_string(),
+                pane_id: 1,
+                trigger_event_id: None,
+                current_step: 1,
+                status: "running".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: None,
+                started_at: 1000,
+                updated_at: 2000,
+                completed_at: None,
+            };
+            storage.upsert_workflow(wf).await.unwrap();
+
+            storage
+                .insert_step_log(
+                    "wf-test-1",
+                    None,
+                    0,
+                    "wait_for_prompt",
+                    Some("s0".to_string()),
+                    Some("wait_for".to_string()),
+                    "continue",
+                    Some("matched prompt".to_string()),
+                    None,
+                    None,
+                    None,
+                    1000,
+                    1500,
+                )
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Workflows,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            // count reflects workflow records (not step logs)
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "workflows");
+            // Should have workflow record + step log record = 2 data lines
+            assert_eq!(records.len(), 2);
+
+            // First record is the workflow
+            assert_fields_present(&records[0], &expected_workflow_fields(), "Workflow record");
+            assert_eq!(records[0]["workflow_name"], "auth_recovery");
+            assert_eq!(records[0]["status"], "running");
+
+            // Second record is the step log
+            assert_fields_present(&records[1], &expected_step_log_fields(), "Step log record");
+            assert_eq!(records[1]["step_name"], "wait_for_prompt");
+            assert_eq!(records[1]["result_type"], "continue");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_workflows_redacts_step_logs() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("wf_redact").await;
+
+            let wf = crate::storage::WorkflowRecord {
+                id: "wf-redact-1".to_string(),
+                workflow_name: "fix_leak".to_string(),
+                pane_id: 1,
+                trigger_event_id: None,
+                current_step: 0,
+                status: "completed".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: None,
+                started_at: 1000,
+                updated_at: 2000,
+                completed_at: Some(2000),
+            };
+            storage.upsert_workflow(wf).await.unwrap();
+
+            storage
+                .insert_step_log(
+                    "wf-redact-1",
+                    None,
+                    0,
+                    "check",
+                    None,
+                    None,
+                    "done",
+                    Some("key sk-abc123def456ghi789jkl012mno345pqr678stu901v found".to_string()),
+                    Some("policy: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012".to_string()),
+                    None,
+                    None,
+                    1000,
+                    2000,
+                )
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Workflows,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            assert_eq!(records.len(), 2);
+
+            // Step log (second record) should be redacted
+            let step = &records[1];
+            let result_data = step["result_data"].as_str().unwrap();
+            assert!(result_data.contains("[REDACTED]"));
+            assert!(!result_data.contains("sk-abc123"));
+
+            let policy = step["policy_summary"].as_str().unwrap();
+            assert!(policy.contains("[REDACTED]"));
+            assert!(!policy.contains("ghp_"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_segment_schema_validation() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("seg_schema").await;
+            storage
+                .append_segment(1, "schema test content", None)
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+
+            // Validate header schema
+            assert_fields_present(&header, &expected_header_fields(), "Segment export header");
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "segments");
+            assert_ne!(header["version"].as_str().unwrap(), "");
+
+            // Validate record schema
+            assert_eq!(records.len(), 1);
+            assert_fields_present(&records[0], &expected_segment_fields(), "Segment record");
+            assert_eq!(records[0]["content"], "schema test content");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_header_version_matches_crate() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("version").await;
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            assert_eq!(
+                header["version"].as_str().unwrap(),
+                crate::VERSION,
+                "Export header version must match crate VERSION"
+            );
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn all_export_kinds_covered_by_all_names() {
+        let names = ExportKind::all_names();
+        assert_eq!(names.len(), 7);
+        // Every name should parse back
+        for name in names {
+            assert!(
+                ExportKind::from_str_loose(name).is_some(),
+                "all_names() entry '{name}' should parse via from_str_loose"
+            );
+        }
+    }
+
+    #[test]
+    fn export_kind_case_insensitive() {
+        assert_eq!(
+            ExportKind::from_str_loose("SEGMENTS"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Events"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(ExportKind::from_str_loose("AUDIT"), Some(ExportKind::Audit));
+        assert_eq!(
+            ExportKind::from_str_loose("Reservations"),
+            Some(ExportKind::Reservations)
+        );
+    }
+
+    #[test]
+    fn write_record_pretty_has_indentation() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "test".to_string(),
+            content_len: 4,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, true).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("  \""),
+            "Pretty output should have indentation"
+        );
+    }
+
+    #[test]
+    fn header_optional_fields_skipped_when_none() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "events".to_string(),
+            redacted: false,
+            exported_at_ms: 1000,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 0,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(!json.contains("pane_id"));
+        assert!(!json.contains("since"));
+        assert!(!json.contains("until"));
+        assert!(!json.contains("limit"));
+        // Required fields still present
+        assert!(json.contains("\"_export\""));
+        assert!(json.contains("\"version\""));
+        assert!(json.contains("\"record_count\""));
+    }
+
+    #[test]
+    fn redact_event_with_no_secrets_is_noop() {
+        let r = Redactor::new();
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "info".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.5,
+            extracted: Some(serde_json::json!({"note": "clean data"})),
+            matched_text: Some("just a normal message".to_string()),
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let original_text = event.matched_text.clone();
+        let original_extracted = event.extracted.clone();
+        let redacted = redact_event(event, &r);
+        assert_eq!(redacted.matched_text, original_text);
+        assert_eq!(redacted.extracted, original_extracted);
+    }
+
+    #[test]
+    fn redact_event_none_fields_unchanged() {
+        let r = Redactor::new();
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "info".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.5,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r);
+        assert!(redacted.matched_text.is_none());
+        assert!(redacted.extracted.is_none());
+    }
+
+    #[test]
+    fn redact_segment_preserves_metadata() {
+        let r = Redactor::new();
+        let seg = Segment {
+            id: 42,
+            pane_id: 7,
+            seq: 100,
+            content: "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v here".to_string(),
+            content_len: 55,
+            content_hash: Some("hash123".to_string()),
+            captured_at: 5000,
+        };
+        let redacted = redact_segment(seg, &r);
+        // Metadata fields must be preserved
+        assert_eq!(redacted.id, 42);
+        assert_eq!(redacted.pane_id, 7);
+        assert_eq!(redacted.seq, 100);
+        assert_eq!(redacted.content_len, 55);
+        assert_eq!(redacted.content_hash, Some("hash123".to_string()));
+        assert_eq!(redacted.captured_at, 5000);
+        // Content should be redacted
+        assert!(redacted.content.contains("[REDACTED]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch -- RubyBeaver wa-1u90p.7.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_kind_singular_aliases() {
+        // Verify all singular-form aliases parse correctly
+        assert_eq!(
+            ExportKind::from_str_loose("event"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("workflow"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("session"),
+            Some(ExportKind::Sessions)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reservation"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reserves"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("audit_actions"),
+            Some(ExportKind::Audit)
+        );
+    }
+
+    #[test]
+    fn export_kind_rejects_empty_and_whitespace() {
+        assert_eq!(ExportKind::from_str_loose(""), None);
+        assert_eq!(ExportKind::from_str_loose(" "), None);
+        assert_eq!(ExportKind::from_str_loose("  segments  "), None);
+        assert_eq!(ExportKind::from_str_loose("\t"), None);
+    }
+
+    #[test]
+    fn export_kind_rejects_similar_but_invalid() {
+        assert_eq!(ExportKind::from_str_loose("segmentation"), None);
+        assert_eq!(ExportKind::from_str_loose("auditing"), None);
+        assert_eq!(ExportKind::from_str_loose("reserved"), None);
+        assert_eq!(ExportKind::from_str_loose("eventlog"), None);
+        assert_eq!(ExportKind::from_str_loose("work_flows"), None);
+    }
+
+    #[test]
+    fn export_kind_as_str_all_variants() {
+        assert_eq!(ExportKind::Segments.as_str(), "segments");
+        assert_eq!(ExportKind::Gaps.as_str(), "gaps");
+        assert_eq!(ExportKind::Events.as_str(), "events");
+        assert_eq!(ExportKind::Workflows.as_str(), "workflows");
+        assert_eq!(ExportKind::Sessions.as_str(), "sessions");
+        assert_eq!(ExportKind::Audit.as_str(), "audit");
+        assert_eq!(ExportKind::Reservations.as_str(), "reservations");
+    }
+
+    #[test]
+    fn export_kind_debug_impl() {
+        // Verify Debug is derived and produces reasonable output
+        let debug_str = format!("{:?}", ExportKind::Segments);
+        assert_eq!(debug_str, "Segments");
+        let debug_str = format!("{:?}", ExportKind::Audit);
+        assert_eq!(debug_str, "Audit");
+    }
+
+    #[test]
+    fn export_kind_clone_and_copy() {
+        let kind = ExportKind::Events;
+        let cloned = kind;
+        let copied = kind; // Copy
+        assert_eq!(kind, cloned);
+        assert_eq!(kind, copied);
+        // After copy, original is still usable (Copy semantics)
+        assert_eq!(kind.as_str(), "events");
+    }
+
+    #[test]
+    fn export_kind_eq_and_ne() {
+        assert_eq!(ExportKind::Segments, ExportKind::Segments);
+        assert_ne!(ExportKind::Segments, ExportKind::Gaps);
+        assert_ne!(ExportKind::Audit, ExportKind::Events);
+        // All 7 variants are distinct
+        let all = [
+            ExportKind::Segments,
+            ExportKind::Gaps,
+            ExportKind::Events,
+            ExportKind::Workflows,
+            ExportKind::Sessions,
+            ExportKind::Audit,
+            ExportKind::Reservations,
+        ];
+        for i in 0..all.len() {
+            for j in 0..all.len() {
+                if i == j {
+                    assert_eq!(all[i], all[j]);
+                } else {
+                    assert_ne!(all[i], all[j]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn export_header_all_optional_fields_present() {
+        let header = ExportHeader {
+            export: true,
+            version: "1.2.3".to_string(),
+            kind: "audit".to_string(),
+            redacted: true,
+            exported_at_ms: 999999,
+            pane_id: Some(42),
+            since: Some(100),
+            until: Some(200),
+            limit: Some(50),
+            record_count: 10,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        // All optional fields should now be present
+        assert!(json.contains("\"pane_id\":42"));
+        assert!(json.contains("\"since\":100"));
+        assert!(json.contains("\"until\":200"));
+        assert!(json.contains("\"limit\":50"));
+        // Required fields
+        assert!(json.contains("\"_export\":true"));
+        assert!(json.contains("\"version\":\"1.2.3\""));
+        assert!(json.contains("\"kind\":\"audit\""));
+        assert!(json.contains("\"redacted\":true"));
+        assert!(json.contains("\"exported_at_ms\":999999"));
+        assert!(json.contains("\"record_count\":10"));
+    }
+
+    #[test]
+    fn export_header_clone_and_debug() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: false,
+            exported_at_ms: 1000,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 0,
+        };
+        let cloned = header.clone();
+        assert_eq!(cloned.version, "0.1.0");
+        assert_eq!(cloned.record_count, 0);
+        let debug = format!("{:?}", cloned);
+        assert!(debug.contains("ExportHeader"));
+        assert!(debug.contains("version"));
+    }
+
+    #[test]
+    fn write_record_unicode_content() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content:
+                "CJK chars: \u{4e16}\u{754c}; emoji: \u{1f680}; accents: \u{00e9}\u{00e8}\u{00ea}"
+                    .to_string(),
+            content_len: 30,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+        assert!(content.contains('\u{4e16}'));
+        assert!(content.contains('\u{1f680}'));
+    }
+
+    #[test]
+    fn write_record_empty_content() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: String::new(),
+            content_len: 0,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["content"], "");
+        assert_eq!(parsed["content_len"], 0);
+    }
+
+    #[test]
+    fn write_record_special_json_chars() {
+        // Content with JSON-special characters: quotes, backslash, newlines
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "line1\nline2\ttab \"quoted\" back\\slash".to_string(),
+            content_len: 35,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Must parse as valid JSON despite special chars
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+        assert!(content.contains("line1\nline2"));
+        assert!(content.contains("\"quoted\""));
+        assert!(content.contains("back\\slash"));
+    }
+
+    #[test]
+    fn write_record_compact_vs_pretty_size() {
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: "test".to_string(),
+            content_len: 4,
+            content_hash: Some("h".to_string()),
+            captured_at: 1000,
+        };
+        let mut compact_buf = Vec::new();
+        write_record(&mut compact_buf, &seg, false).unwrap();
+        let mut pretty_buf = Vec::new();
+        write_record(&mut pretty_buf, &seg, true).unwrap();
+        // Pretty should always be larger due to whitespace
+        assert!(
+            pretty_buf.len() > compact_buf.len(),
+            "Pretty output ({}) should be larger than compact ({})",
+            pretty_buf.len(),
+            compact_buf.len()
+        );
+        // Both should deserialize to the same value
+        let compact_val: serde_json::Value =
+            serde_json::from_str(String::from_utf8(compact_buf).unwrap().trim()).unwrap();
+        // Pretty has multiple lines; join them for parsing
+        let pretty_str = String::from_utf8(pretty_buf).unwrap();
+        let pretty_val: serde_json::Value = serde_json::from_str(pretty_str.trim()).unwrap();
+        assert_eq!(compact_val, pretty_val);
+    }
+
+    #[test]
+    fn redact_segment_empty_content() {
+        let r = Redactor::new();
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: String::new(),
+            content_len: 0,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let redacted = redact_segment(seg, &r);
+        assert_eq!(redacted.content, "");
+    }
+
+    #[test]
+    fn redact_event_extracted_with_nested_secret() {
+        let r = Redactor::new();
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "leak".to_string(),
+            severity: "high".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!({
+                "nested": {
+                    "key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"
+                }
+            })),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r);
+        // The extracted value should be redacted
+        let extracted_str = serde_json::to_string(&redacted.extracted.unwrap()).unwrap();
+        assert!(!extracted_str.contains("sk-abc123"));
+        assert!(extracted_str.contains("REDACTED"));
+    }
+
+    #[test]
+    fn redact_step_log_preserves_non_sensitive_fields() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 99,
+            workflow_id: "wf-preserve".to_string(),
+            audit_action_id: Some(42),
+            step_index: 3,
+            step_name: "send_notification".to_string(),
+            step_id: Some("step-abc".to_string()),
+            step_kind: Some("action".to_string()),
+            result_type: "success".to_string(),
+            result_data: Some(
+                "secret sk-abc123def456ghi789jkl012mno345pqr678stu901v leaked".to_string(),
+            ),
+            policy_summary: Some("clean summary no secrets".to_string()),
+            verification_refs: Some("[ref1, ref2]".to_string()),
+            error_code: Some("E001".to_string()),
+            started_at: 5000,
+            completed_at: 6000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        // Non-sensitive fields must be preserved exactly
+        assert_eq!(redacted.id, 99);
+        assert_eq!(redacted.workflow_id, "wf-preserve");
+        assert_eq!(redacted.audit_action_id, Some(42));
+        assert_eq!(redacted.step_index, 3);
+        assert_eq!(redacted.step_name, "send_notification");
+        assert_eq!(redacted.step_id, Some("step-abc".to_string()));
+        assert_eq!(redacted.step_kind, Some("action".to_string()));
+        assert_eq!(redacted.result_type, "success");
+        assert_eq!(redacted.verification_refs, Some("[ref1, ref2]".to_string()));
+        assert_eq!(redacted.error_code, Some("E001".to_string()));
+        assert_eq!(redacted.started_at, 5000);
+        assert_eq!(redacted.completed_at, 6000);
+        assert_eq!(redacted.duration_ms, 1000);
+        // result_data had a secret, so it must be redacted
+        assert!(redacted.result_data.unwrap().contains("[REDACTED]"));
+        // policy_summary had no secret, so it stays the same
+        assert_eq!(
+            redacted.policy_summary,
+            Some("clean summary no secrets".to_string())
+        );
+    }
+
+    #[test]
+    fn export_kind_mixed_case_all_aliases() {
+        // MiXeD case for every alias
+        assert_eq!(
+            ExportKind::from_str_loose("OUTPUT"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Detections"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("AUDIT_ACTIONS"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("AUDIT-ACTIONS"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Reserves"),
+            Some(ExportKind::Reservations)
+        );
+        assert_eq!(ExportKind::from_str_loose("Gap"), Some(ExportKind::Gaps));
+        assert_eq!(
+            ExportKind::from_str_loose("Workflow"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Session"),
+            Some(ExportKind::Sessions)
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_helper_single_line() {
+        // Header-only output (empty export)
+        let output = "{\"_export\":true,\"record_count\":0}\n";
+        let (header, records) = parse_jsonl(output);
+        assert_eq!(header["_export"], true);
+        assert_eq!(header["record_count"], 0);
+        assert_eq!(records, [] as [serde_json::Value; 0]);
+    }
+
+    #[test]
+    fn parse_jsonl_helper_multiple_records() {
+        let output = "{\"_export\":true,\"record_count\":2}\n{\"id\":1}\n{\"id\":2}\n";
+        let (header, records) = parse_jsonl(output);
+        assert_eq!(header["record_count"], 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], 1);
+        assert_eq!(records[1]["id"], 2);
+    }
+
+    #[test]
+    fn export_multiple_segments_count() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("multi_seg").await;
+
+            for i in 0..5 {
+                storage
+                    .append_segment(1, &format!("segment content {}", i), None)
+                    .await
+                    .unwrap();
+            }
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 5);
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["record_count"], 5);
+            assert_eq!(records.len(), 5);
+            // Verify all segments are present
+            for i in 0..5 {
+                let expected = format!("segment content {}", i);
+                assert!(
+                    records.iter().any(|r| r["content"] == expected),
+                    "Missing segment content {}",
+                    i
+                );
+            }
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_header_exported_at_ms_is_recent() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("timestamp").await;
+
+            let before_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let after_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            let exported_at = header["exported_at_ms"].as_i64().unwrap();
+            assert!(
+                exported_at >= before_ms,
+                "exported_at_ms ({}) should be >= before ({})",
+                exported_at,
+                before_ms
+            );
+            assert!(
+                exported_at <= after_ms,
+                "exported_at_ms ({}) should be <= after ({})",
+                exported_at,
+                after_ms
+            );
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_header_reflects_query_filters() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("query_hdr").await;
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery {
+                    pane_id: Some(42),
+                    since: Some(1000),
+                    until: Some(9000),
+                    limit: Some(25),
+                },
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            assert_eq!(header["pane_id"], 42);
+            assert_eq!(header["since"], 1000);
+            assert_eq!(header["until"], 9000);
+            assert_eq!(header["limit"], 25);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_empty_all_kinds_produce_header() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("empty_all").await;
+
+            let kinds = [
+                ExportKind::Segments,
+                ExportKind::Gaps,
+                ExportKind::Events,
+                ExportKind::Workflows,
+                ExportKind::Sessions,
+                ExportKind::Audit,
+                ExportKind::Reservations,
+            ];
+
+            for kind in &kinds {
+                let opts = ExportOptions {
+                    kind: *kind,
+                    query: ExportQuery::default(),
+                    audit_actor: None,
+                    audit_action: None,
+                    redact: false,
+                    pretty: false,
+                };
+
+                let mut buf = Vec::new();
+                let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+                assert_eq!(
+                    count,
+                    0,
+                    "Empty DB should have 0 records for kind {}",
+                    kind.as_str()
+                );
+
+                let output = String::from_utf8(buf).unwrap();
+                let (header, records) = parse_jsonl(&output);
+                assert_eq!(
+                    header["kind"],
+                    kind.as_str(),
+                    "Header kind mismatch for {}",
+                    kind.as_str()
+                );
+                assert_eq!(
+                    header["record_count"],
+                    0,
+                    "Header record_count should be 0 for {}",
+                    kind.as_str()
+                );
+                assert!(
+                    records.is_empty(),
+                    "No data records expected for {}",
+                    kind.as_str()
+                );
+            }
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_redact_false_does_not_alter_content() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("no_redact").await;
+
+            let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+            // We use an Event rather than a Segment to test export-time redaction
+            // because segments are unconditionally redacted at write-time by the
+            // storage writer thread.
+            storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "test".to_string(),
+                    agent_type: "test".to_string(),
+                    event_type: "test".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some(format!("has secret: {}", secret)),
+                    segment_id: None,
+                    detected_at: 0,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            let content = records[0]["matched_text"].as_str().unwrap();
+            // Secret should NOT be redacted when redact=false
+            assert!(
+                content.contains(secret),
+                "Content should contain secret when redact is false"
+            );
+            assert!(!content.contains("[REDACTED]"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // RubyBeaver wa-1u90p.7.1 — additional tests (batch 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_step_log_all_none_sensitive_fields_stay_none() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "check".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "skip".to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        assert!(redacted.result_data.is_none());
+        assert!(redacted.policy_summary.is_none());
+    }
+
+    #[test]
+    fn redact_step_log_policy_summary_with_secret() {
+        let r = Redactor::new();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: "verify".to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "ok".to_string(),
+            result_data: None,
+            policy_summary: Some(
+                "Policy used key sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let redacted = redact_step_log(step, &r);
+        let summary = redacted.policy_summary.unwrap();
+        assert!(!summary.contains("sk-abc123"), "secret should be redacted");
+        assert!(summary.contains("REDACTED"));
+    }
+
+    #[test]
+    fn export_kind_all_names_count_matches_variants() {
+        // There are 7 ExportKind variants and all_names should have 7 entries
+        let names = ExportKind::all_names();
+        assert_eq!(names.len(), 7);
+        // Each name should be unique
+        let mut unique = std::collections::HashSet::new();
+        for name in names {
+            assert!(unique.insert(name), "duplicate name: {}", name);
+        }
+    }
+
+    #[test]
+    fn export_header_exported_at_ms_field_name() {
+        let header = ExportHeader {
+            export: true,
+            version: "0.1.0".to_string(),
+            kind: "gaps".to_string(),
+            redacted: false,
+            exported_at_ms: 42,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 0,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"exported_at_ms\":42"));
+    }
+
+    #[test]
+    fn write_record_large_content() {
+        // Verify write_record handles large content (10KB) without issues
+        let big = "x".repeat(10_000);
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: big.clone(),
+            content_len: 10_000,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let mut buf = Vec::new();
+        write_record(&mut buf, &seg, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn export_kind_from_str_loose_returns_none_for_numbers() {
+        assert_eq!(ExportKind::from_str_loose("123"), None);
+        assert_eq!(ExportKind::from_str_loose("0"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // RubyBeaver wa-1u90p — additional pure tests (batch 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_header_export_field_renamed_to_underscore() {
+        // The `export` field has `#[serde(rename = "_export")]` — verify the
+        // serialized JSON key is literally "_export" and that "export" as a
+        // bare key does NOT appear (it would if the rename were missing).
+        let header = ExportHeader {
+            export: true,
+            version: "0.2.0".to_string(),
+            kind: "segments".to_string(),
+            redacted: false,
+            exported_at_ms: 5000,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: None,
+            record_count: 3,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            json.contains("\"_export\":true"),
+            "JSON must contain the renamed key \"_export\""
+        );
+        // Strip the `_export` occurrence and verify bare `"export"` key is absent
+        let without_underscore = json.replace("\"_export\"", "");
+        assert!(
+            !without_underscore.contains("\"export\""),
+            "No bare \"export\" key should exist; got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn write_record_sequential_produces_valid_ndjson() {
+        // Writing multiple records to the same buffer must produce one valid
+        // JSON object per line (NDJSON/JSONL format).
+        let mut buf = Vec::new();
+        for i in 0u64..4 {
+            let seg = Segment {
+                id: i as i64,
+                pane_id: i,
+                seq: i,
+                content: format!("record_{}", i),
+                content_len: 8,
+                content_hash: None,
+                captured_at: 1000 + i as i64,
+            };
+            write_record(&mut buf, &seg, false).unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 4, "Should have exactly 4 NDJSON lines");
+        for (idx, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("Line {} is not valid JSON: {} — {}", idx, line, e);
+            });
+            let expected_content = format!("record_{}", idx);
+            assert_eq!(
+                parsed["content"], expected_content,
+                "Line {} content mismatch",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn redact_segment_multiple_different_secret_types() {
+        // Verify that redaction handles multiple distinct secret patterns
+        // (OpenAI key + GitHub PAT) within the same content string.
+        let r = Redactor::new();
+        let openai_key = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+        let github_pat = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012";
+        let seg = Segment {
+            id: 1,
+            pane_id: 1,
+            seq: 1,
+            content: format!("key1={} key2={}", openai_key, github_pat),
+            content_len: 100,
+            content_hash: None,
+            captured_at: 1000,
+        };
+        let redacted = redact_segment(seg, &r);
+        assert!(
+            !redacted.content.contains("sk-abc123"),
+            "OpenAI key should be redacted"
+        );
+        assert!(
+            !redacted.content.contains("ghp_"),
+            "GitHub PAT should be redacted"
+        );
+        // At least one REDACTED marker should be present
+        assert!(
+            redacted.content.contains("[REDACTED]"),
+            "Redacted content should contain [REDACTED] marker(s)"
+        );
+    }
+
+    #[test]
+    fn export_header_field_types_in_serde_value() {
+        // Verify that each ExportHeader field serializes to the expected
+        // JSON type (bool, string, number, etc.) via serde_json::Value.
+        let header = ExportHeader {
+            export: true,
+            version: "1.0.0".to_string(),
+            kind: "workflows".to_string(),
+            redacted: true,
+            exported_at_ms: 123456789,
+            pane_id: Some(7),
+            since: Some(100),
+            until: Some(999),
+            limit: Some(50),
+            record_count: 25,
+        };
+        let val: serde_json::Value = serde_json::to_value(&header).unwrap();
+        let map = val.as_object().unwrap();
+
+        // Boolean fields
+        assert!(map["_export"].is_boolean(), "_export must be boolean");
+        assert!(map["redacted"].is_boolean(), "redacted must be boolean");
+
+        // String fields
+        assert!(map["version"].is_string(), "version must be string");
+        assert!(map["kind"].is_string(), "kind must be string");
+
+        // Numeric fields
+        assert!(
+            map["exported_at_ms"].is_number(),
+            "exported_at_ms must be number"
+        );
+        assert!(
+            map["record_count"].is_number(),
+            "record_count must be number"
+        );
+        assert!(map["pane_id"].is_number(), "pane_id must be number");
+        assert!(map["since"].is_number(), "since must be number");
+        assert!(map["until"].is_number(), "until must be number");
+        assert!(map["limit"].is_number(), "limit must be number");
+
+        // Verify actual values
+        assert_eq!(map["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(map["kind"].as_str().unwrap(), "workflows");
+        assert_eq!(map["exported_at_ms"].as_i64().unwrap(), 123456789);
+        assert_eq!(map["record_count"].as_u64().unwrap(), 25);
+    }
+}

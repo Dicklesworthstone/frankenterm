@@ -1,0 +1,15 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Cursor fixture: underline blink phase",
+    "The cursor uses the pinned dim blink frame.",
+    "0123456789 abcdefghijklmnopqrstuvwxyz"
+  ],
+  "cursor": {
+    "row": 2,
+    "col": 11,
+    "shape": "underline"
+  },
+  "cursor_blink_disabled": false,
+  "ime_disabled": true
+}

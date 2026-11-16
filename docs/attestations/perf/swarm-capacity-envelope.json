@@ -1,0 +1,120 @@
+{
+  "$schema": "https://frankenterm.dev/schemas/swarm-capacity-envelope/v1.json",
+  "schema_version": "1.0.0",
+  "kind": "swarm-capacity-envelope",
+  "category": "perf/headline-claims",
+  "produced_by_bead": "ft-b94bx.8",
+  "generated_at": "2026-05-15T05:30:00Z",
+  "status": "blocked_target_class_not_proven",
+  "scope": "Fail-closed release envelope for high-core swarm capacity and memory-envelope wording.",
+  "schema": {
+    "required_top_level_fields": [
+      "schema_version",
+      "kind",
+      "category",
+      "produced_by_bead",
+      "status",
+      "release_claim_posture",
+      "source_artifacts",
+      "capacity_envelope",
+      "regression_gate"
+    ],
+    "status_enum": [
+      "blocked_target_class_not_proven",
+      "candidate_target_class_proven",
+      "released_target_class_proven",
+      "retracted"
+    ]
+  },
+  "release_claim_posture": {
+    "benchmark_lane_capacity_rows": {
+      "allowed": true,
+      "source": "docs/perf/headline-claims.json",
+      "interpretation": "Benchmark-lane pane and memory rows remain hash-attested under perf/headline-claims but do not prove target-class 64 CPU / 256 GiB behavior."
+    },
+    "high_scale_memory_envelope": {
+      "allowed": false,
+      "blocked_reason": "target_class_artifact_status_not_proven",
+      "required_target_class_status": "proven_predicate_met",
+      "required_high_scale_claim_allowed": true,
+      "required_source_artifact": "tests/e2e/artifacts/target-class/linux-x86_64-high-core/<run_id>/summary.json"
+    }
+  },
+  "source_artifacts": {
+    "manifest": "docs/attestations/manifest.json",
+    "target_class_gate": {
+      "path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+      "status": "skipped_not_proven",
+      "produced_by_bead": "ft-tf6g3.14"
+    },
+    "current_target_class_summary": {
+      "path": "tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json",
+      "status": "skipped_not_proven",
+      "hardware_predicate": {
+        "target_class": false,
+        "proof_status": "skipped_not_proven"
+      },
+      "evidence": {
+        "high_scale_claim_allowed": false
+      }
+    },
+    "resource_budget_model": "docs/swarm-capacity-resource-budget-model.md",
+    "capacity_signal_inventory": "docs/swarm-capacity-signal-inventory.md"
+  },
+  "capacity_envelope": {
+    "target_class": {
+      "sku": "linux-x86_64-high-core",
+      "logical_cpus_floor": 64,
+      "memory_gib_floor": 256,
+      "proof_status": "skipped_not_proven",
+      "claim_allowed": false
+    },
+    "current_observed_host": {
+      "logical_cpus": 14,
+      "memory_gib": 64,
+      "source": "tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json"
+    },
+    "published_budget_class": {
+      "class": "high_core",
+      "source": "docs/swarm-capacity-resource-budget-model.md",
+      "claim_posture": "model_only_until_target_class_summary_is_non_skipped"
+    }
+  },
+  "regression_gate": {
+    "policy": "fail_closed",
+    "candidate_inputs": [
+      "docs/attestations/perf/swarm-capacity-envelope.json",
+      "docs/attestations/proofs/resource-cockpit-target-class.json",
+      "tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json",
+      "docs/perf/headline-claims.json"
+    ],
+    "fail_conditions": [
+      {
+        "code": "target_class_skipped_or_stale",
+        "meaning": "Reject high-scale wording when the target-class summary is missing, stale, skipped_not_proven, or lacks evidence.high_scale_claim_allowed=true."
+      },
+      {
+        "code": "capacity_envelope_shrinkage",
+        "meaning": "Reject a release candidate that lowers pane, CPU, memory, build-slot, RCH-slot, or subsystem budget floors without a new producing bead and operator-facing rationale."
+      },
+      {
+        "code": "telemetry_gap",
+        "meaning": "Reject claim graduation when any required host, resource cockpit, RCH worker, or workload-class telemetry source is unavailable, stale, or lower_bound_only."
+      },
+      {
+        "code": "regime_shift",
+        "meaning": "Reject reuse of prior evidence after hardware SKU, OS family, architecture, workload mix, or proof harness identity changes."
+      }
+    ],
+    "allow_conditions": [
+      {
+        "code": "non_skipped_target_class_artifact",
+        "meaning": "A retained linux-x86_64-high-core summary has hardware_predicate.proof_status=proven_predicate_met and evidence.high_scale_claim_allowed=true."
+      },
+      {
+        "code": "bundle_manifest_wired",
+        "meaning": "The envelope and target-class summary are hashed through docs/attestations/manifest.json and the release bundle verifies with --strict-required --strict-deferred."
+      }
+    ]
+  }
+}

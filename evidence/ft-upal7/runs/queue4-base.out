@@ -1,0 +1,29 @@
+[multi 12:28:36] app /Users/jemanuel/ft-build/upal7/fam-base/FrankenTerm.app retention 100000, 50 panes of 40000 rows
+[2026-11-06 12:28:36] published family 0.15.21-b4218ab
+[2026-11-06 12:28:36] recovery identities created
+[2026-11-06 12:28:36] recovery wrapping key created
+[2026-11-06 12:28:37] recovery store prepared
+[2026-11-06 12:28:37] recovery key enrolled
+[2026-11-06 12:28:41] install complete: mux /private/tmp/ftrt-5007/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, guardian /private/tmp/ftrt-5007/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, panes [0 1 2 3 4 5]
+[multi 12:30:02] first root 82 s after ready (capture 63824 ms)
+[multi 12:30:02] before the kill (no reads):
+   1 INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=N
+[multi 12:30:02] mux 11611 killed
+[2026-11-06 12:30:03] family 0.15.21-b4218ab already published
+[2026-11-06 12:31:06] install complete: mux /private/tmp/ftrt-5007/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, guardian /private/tmp/ftrt-5007/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b4218ab, panes [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49]
+[multi 12:31:06] came back in 64 s
+[multi 12:31:11] after:
+  31 INFO  frankenterm_mux_server_impl] pane N store continues into its recovered rows: N matched, M to append
+   1 INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=N
+   1 INFO  frankenterm_mux_server_impl::guardian_proxy] verified the recovery root of 50 panes in 6021 ms
+   1 INFO  frankenterm_mux_server_impl::guardian_proxy] restored 50 guardian panes in 56640 ms, 4382 ms of it connecting and claiming
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane f7740610-470d-4674-921e-ece028081475 store continues into its recovered rows across 1 overload ga
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane f4a37ca1-5b0e-47b3-b0a0-c0259e0c5ab2 store continues into its recovered rows across 2 overload ga
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane f2c763b5-0d2f-4236-a4e1-8b6ed4f74b86 store continues into its recovered rows across 3 overload ga
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane e4178494-8e55-46f5-b1bf-84e8f6b4c10b store continues into its recovered rows across 1 overload ga
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane ddccb959-30a2-45d1-985f-8286e4cf7abd store continues into its recovered rows across 1 overload ga
+   1 INFO  frankenterm_mux_server_impl::deferred_scrollback] pane daeda874-ea45-4730-8a71-5df0f011bfb1 store continues into its recovered rows across 1 overload ga
+[multi 12:31:53] panes up: 50; rows held: 0:32115 1:34698 2:17067 3:32115 4:40000 5:31859 6:24230 7:20731 8:35765 9:32345 10:23462 11:40000 12:40000 13:35443 14:21872 15:32115 16:36990 17:38671 18:40000 19:40000 20:29395 21:37564 22:40000 23:36847 24:34402 25:29570 26:32115 27:36941 28:40000 29:21725 30:12383 31:32115 32:29191 33:23934 34:18946 35:24230 36:24230 37:19399 38:32115 39:19149 40:17082 41:17754 42:16345 43:8460 44:24230 45:24230 46:21482 47:24685 48:8460 49:16345 
+[multi 12:31:53] panes holding every row 1..40000: 7 of 50
+[multi 12:31:53] PASS: all 50 panes hold their newest row; back in 64 s (the host script waits up to 310 s)
+[multi 12:31:54] sandbox /private/tmp/ftrt-5007, 1.5G

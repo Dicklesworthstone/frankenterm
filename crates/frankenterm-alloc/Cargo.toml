@@ -1,0 +1,45 @@
+[package]
+name = "frankenterm-alloc"
+description = "Allocator and per-pane arena helpers for FrankenTerm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["allocator", "jemalloc", "frankenterm"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
+[dependencies]
+log.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+# ft-p9hok: jemalloc's C sys-crate (tikv-jemalloc-sys) cannot build on
+# windows-msvc, so the allocator deps are gated to non-Windows targets. The
+# `jemalloc` feature still references them via `dep:` (see [features]); on
+# Windows that activation is a no-op because the optional deps are absent for
+# the target, and the crate falls back to the system allocator (see the
+# `not(windows)` cfgs in lib.rs). Mac/Linux are unchanged.
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+# use_std provides stats_print, the only safe way to read the decay options
+# back from jemalloc (ft-yccm0.2.8).
+tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["use_std"] }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "arena_throughput"
+harness = false

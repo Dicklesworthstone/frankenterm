@@ -1,0 +1,435 @@
+# vttest/iso6429-misc screen dumps (ft-yccm0.1.9): cursor, DECSCNM, then rows.
+# Golden expectations: change only with a recorded reason (README).
+# Screens corrected by hand where legacy is wrong (see xfail.txt): 03, 07, 09, 14.
+=== 00 key ''
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||
+=== 01 key '11\r'
+cursor 17,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11: Non-VT100 Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of VT220 features|
+09 |          2. Test of VT320 features|
+10 |          3. Test of VT420 features|
+11 |          4. Test of VT520 features|
+12 |          5. Test ISO-6429 cursor-movement|
+13 |          6. Test ISO-6429 colors|
+14 |          7. Test other ISO-6429 features|
+15 |          8. Test XTERM special features|
+16 ||
+17 |          Enter choice number (0 - 8):|
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 02 key '7\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 03 key '2\r'
+cursor 24,14 visible
+screen normal
+01 | ++|
+02 |  ++|
+03 |   ++|
+04 |    ++|
+05 |     ++|
+06 |      ++|
+07 |       ++|
+08 |        ++|
+09 |         ++|
+10 |          ++|
+11 |           ++|
+12 |            ++|
+13 |             ++|
+14 |              ++|
+15 |               ++|
+16 |                ++|
+17 |                 ++|
+18 |******************++************************************************************|
+19 |----+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8|
+20 |Test Repeat (REP)|
+21 |There should be a diagonal of 2 +'s down to the row of *'s above this message.|
+22 |The ++ in the row of *'s is the target.  If there are 11 +'s, ECMA-48 does|
+23 |not prohibit this, but treats it as undefined behavior (still nonstandard).|
+24 |Push <RETURN>|
+=== 04 key '\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 05 key '3\r'
+cursor 24,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 |********************|
+21 |----+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8|
+22 |Test Scroll-Down (SD)|
+23 |There should be a horizontal row of *'s above, just above the message.|
+24 |Push <RETURN>|
+=== 06 key '\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 07 key '4\r'
+cursor 24,14 visible
+screen normal
+01 |                                       *|
+02 |                                       *|
+03 |                                       *|
+04 |                                       *|
+05 |                                       *|
+06 |                                       *|
+07 |                                       *|
+08 |                                       *|
+09 |                                       *|
+10 |                                       *|
+11 |                                       *|
+12 |                                       *|
+13 |                                       *|
+14 |                                       *|
+15 |                                       *|
+16 |                                       *|
+17 |                                       *|
+18 |                                       *|
+19 |                                       *|
+20 |                                       *|
+21 |----+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8|
+22 |Test Scroll-Left (SL)|
+23 |There should be a vertical column of *'s centered above.|
+24 |Push <RETURN>|
+=== 08 key '\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 09 key '5\r'
+cursor 24,14 visible
+screen normal
+01 |                                       *|
+02 |                                       *|
+03 |                                       *|
+04 |                                       *|
+05 |                                       *|
+06 |                                       *|
+07 |                                       *|
+08 |                                       *|
+09 |                                       *|
+10 |                                       *|
+11 |                                       *|
+12 |                                       *|
+13 |                                       *|
+14 |                                       *|
+15 |                                       *|
+16 |                                       *|
+17 |                                       *|
+18 |                                       *|
+19 |                                       *|
+20 |                                       *|
+21 |----+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8|
+22 |Test Scroll-Right (SR)|
+23 |There should be a vertical column of *'s centered above.|
+24 |Push <RETURN>|
+=== 10 key '\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 11 key '6\r'
+cursor 24,14 visible
+screen normal
+01 |********************|
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 |----+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8|
+22 |Test Scroll-Up (SU)|
+23 |There should be a horizontal row of *'s above, on the top row.|
+24 |Push <RETURN>|
+=== 12 key '\r'
+cursor 15,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7: Miscellaneous ISO-6429 (ECMA-48) Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Protected-Area Tests|
+09 |          2. Test Repeat (REP)|
+10 |          3. Test Scroll-Down (SD)|
+11 |          4. Test Scroll-Left (SL)|
+12 |          5. Test Scroll-Right (SR)|
+13 |          6. Test Scroll-Up (SU)|
+14 ||
+15 |          Enter choice number (0 - 6):|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 13 key '1\r'
+cursor 11,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7.1: Protected-Areas Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Enable ERM (erase mode)|
+09 |          2. Test Protected-Areas (SPA)|
+10 ||
+11 |          Enter choice number (0 - 2):|
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 14 key '2\r'
+cursor 22,14 visible
+screen normal
+01 |Test Protected-Areas (SPA)|
+02 ||
+03 ||
+04 ||
+05 |                   ****************************************|
+06 |                   ****************************************|
+07 |                   ****************************************|
+08 |                   ****************************************|
+09 |                   ****************************************|
+10 |                   ****************************************|
+11 |                   ****************************************|
+12 |                   ****************************************|
+13 |                   ****************************************|
+14 |                   ****************************************|
+15 |                   ****************************************|
+16 |                   ****************************************|
+17 |                   ****************************************|
+18 |                   ****************************************|
+19 ||
+20 |There should be an solid box made of *'s in the middle of the screen.|
+21 |note: DEC terminals do not implement ERM (erase mode).|
+22 |Push <RETURN>|
+23 ||
+24 ||
+=== 15 key '\r'
+cursor 11,40 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 11.7.1: Protected-Areas Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Enable ERM (erase mode)|
+09 |          2. Test Protected-Areas (SPA)|
+10 ||
+11 |          Enter choice number (0 - 2):|
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||

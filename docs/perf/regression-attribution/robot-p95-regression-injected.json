@@ -1,0 +1,60 @@
+{
+  "schema_version": "ft.perf.regression-attribution.v1",
+  "event_id": "robot-p95-regression-injected",
+  "claim_id": "robot.p95",
+  "implicated_commit": "g43-regression-commit",
+  "alternatives": [
+    {
+      "factor": "commit_sha",
+      "value": "g43-regression-commit",
+      "support": 100,
+      "regression_probability": 0.66,
+      "counterfactual_regression_probability": 0.14,
+      "risk_lift": 0.52
+    },
+    {
+      "factor": "commit_sha",
+      "value": "fd89ed378-baseline",
+      "support": 100,
+      "regression_probability": 0.14,
+      "counterfactual_regression_probability": 0.66,
+      "risk_lift": -0.52
+    }
+  ],
+  "confounders": [],
+  "residual_unexplained_variance": 0.48,
+  "graph": {
+    "schema_version": "ft.perf.causal-graph.v1",
+    "claim_id": "robot.p95",
+    "sample_count": 200,
+    "variables": [
+      {
+        "name": "metric_regressed",
+        "role": "metric",
+        "cardinality": 2
+      },
+      {
+        "name": "commit_sha",
+        "role": "factor",
+        "cardinality": 2
+      }
+    ],
+    "edges": [
+      {
+        "left": "commit_sha",
+        "right": "metric_regressed",
+        "mutual_information_bits": 0.21642183614672564
+      }
+    ],
+    "separating_sets": [],
+    "decision": {
+      "kind": "accept",
+      "reason": "PC skeleton retained at least one metric-adjacent causal candidate"
+    }
+  },
+  "decision": {
+    "kind": "accept",
+    "reason": "ranked counterfactual attribution candidate exceeds risk-lift threshold",
+    "confidence": 0.52
+  }
+}

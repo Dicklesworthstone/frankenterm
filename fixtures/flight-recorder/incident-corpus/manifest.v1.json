@@ -1,0 +1,134 @@
+{
+  "schema_version": "ft.flight_recorder.incident_corpus.v1",
+  "contract_id": "ft.flight_recorder.incident_corpus.v1",
+  "bead_id": "ft-ogr3n.6",
+  "title": "Flight-recorder golden incident corpus and no-mock replay harness",
+  "proof_boundary": "Retained source-set replay fixtures prove deterministic incident classification and replay semantics. They do not prove new live remote Cargo execution unless a scenario carries retained RCH metadata from a real remote worker.",
+  "verification_command": "bash tests/e2e/test_flight_recorder_incident_corpus.sh",
+  "rust_verification_filter": "cargo test -p frankenterm-core-replay replay_incidents --lib -- --nocapture",
+  "proof_ledger_path": "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
+  "proof_summary_path": "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json",
+  "invalid_fragments_path": "fixtures/flight-recorder/incident-corpus/invalid/fragments.v1.json",
+  "required_scenarios": [
+    "rch_mirror_before_cargo",
+    "remote_cargo_pass",
+    "dirty_tree_contaminated",
+    "agent_mail_outage_beads_fallback",
+    "bead_closeout_mirror"
+  ],
+  "required_negative_cases": [
+    "missing-source-set-artifact",
+    "duplicate-scenario-id",
+    "absolute-artifact-path",
+    "parent-relative-artifact-path",
+    "local-cargo-counted",
+    "agent-mail-service-repair",
+    "remote-pass-missing-worker"
+  ],
+  "scenarios": [
+    {
+      "id": "rch_mirror_before_cargo",
+      "title": "RCH stale worker mirror blocks before Cargo",
+      "source_set": {
+        "path": "fixtures/flight-recorder/incident-corpus/source-sets/rch-mirror-before-cargo.json",
+        "sha256": "070bac6d0b719a039783515cf107cd4bd2eb939104a2336640e35e5ed6005a59"
+      },
+      "golden_json": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/rch-mirror-before-cargo.json",
+        "sha256": "70f0a33df08d13412c875ed9d4535df98064d952412ed2504f436ff52e0489e5"
+      },
+      "golden_toon": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/rch-mirror-before-cargo.toon",
+        "sha256": "cd14fb16440e4d71846587dab1d1a2a6252a36e95811686e5ce50c7e1575f99b"
+      },
+      "expected_outcome": "infrastructure_block",
+      "expected_proof_admissible": false,
+      "material_remote_rch_metadata": false
+    },
+    {
+      "id": "remote_cargo_pass",
+      "title": "Remote Cargo/test pass on retained attested worker",
+      "source_set": {
+        "path": "fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json",
+        "sha256": "82483a91a850bb14fdddf97995905a1eca8ebd91a0c5238f67400dd2851703db"
+      },
+      "golden_json": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/remote-cargo-pass.json",
+        "sha256": "6ac16041e115b0515f1a00b952c70d7d377bd15c1e533ac7f9a7494231f844bd"
+      },
+      "golden_toon": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/remote-cargo-pass.toon",
+        "sha256": "ddd6d0bf8ae845e07aee845154a3ccccf2c3c8269758aeafabfc8b6417d645d7"
+      },
+      "expected_outcome": "source_pass",
+      "expected_proof_admissible": true,
+      "material_remote_rch_metadata": true
+    },
+    {
+      "id": "dirty_tree_contaminated",
+      "title": "Remote proof contaminated by unrelated tracked dirty paths",
+      "source_set": {
+        "path": "fixtures/flight-recorder/incident-corpus/source-sets/dirty-tree-contaminated.json",
+        "sha256": "00ef3356d64908f01d9ff90cb5e517d1f929fb6455a73df0a9cf5b5076b4eab1"
+      },
+      "golden_json": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/dirty-tree-contaminated.json",
+        "sha256": "c614b1ff14038a4c90ed8a684c43666bc146856f7cac66571e52c1b83381a33a"
+      },
+      "golden_toon": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/dirty-tree-contaminated.toon",
+        "sha256": "16b0cb2cb58619bff70d8e14f868f26cb7e06f684f390771e9e22f8116126f74"
+      },
+      "expected_outcome": "contaminated_proof_attempt",
+      "expected_proof_admissible": false,
+      "material_remote_rch_metadata": true
+    },
+    {
+      "id": "agent_mail_outage_beads_fallback",
+      "title": "Agent Mail unavailable after retry with Beads fallback",
+      "source_set": {
+        "path": "fixtures/flight-recorder/incident-corpus/source-sets/agent-mail-outage-beads-fallback.json",
+        "sha256": "b846dee7796543f986722781f25bdbbe39b3cbfeb7bfd7a67ee9b13e01f70363"
+      },
+      "golden_json": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/agent-mail-outage-beads-fallback.json",
+        "sha256": "d229646a1c4541462908d56f108e727e0c078b98fb40cb20ca228af333c71209"
+      },
+      "golden_toon": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/agent-mail-outage-beads-fallback.toon",
+        "sha256": "e106cf483e04bbfb5a142ced58734cd03bb129b4d8caad89c435e891479fcf55"
+      },
+      "expected_outcome": "source_unavailable",
+      "expected_proof_admissible": false,
+      "material_remote_rch_metadata": false
+    },
+    {
+      "id": "bead_closeout_mirror",
+      "title": "Bead closeout with dep-cycle check and legacy branch mirror evidence",
+      "source_set": {
+        "path": "fixtures/flight-recorder/incident-corpus/source-sets/bead-closeout-mirror.json",
+        "sha256": "1300b00d7df328772442d9f662c761d6b31212a4e7bcbf2f414dd5b583b835c0"
+      },
+      "golden_json": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/bead-closeout-mirror.json",
+        "sha256": "0f75fd53d096da7fc3f5ebabfdcf496b2508c70715234706067d4d4a21adf04e"
+      },
+      "golden_toon": {
+        "path": "fixtures/flight-recorder/incident-corpus/golden/bead-closeout-mirror.toon",
+        "sha256": "13a27f9d5684928fd2b69eb4f1b4862b857c0d892c45b8a7c84987cb235eecc3"
+      },
+      "expected_outcome": "source_pass",
+      "expected_proof_admissible": true,
+      "material_remote_rch_metadata": true
+    }
+  ],
+  "side_effects_forbidden": {
+    "live_panes_mutated": true,
+    "external_services_called": true,
+    "agent_mail_repair_attempted": true,
+    "agent_mail_service_restarted": true,
+    "rch_worker_mutated": true,
+    "file_deleted": true,
+    "local_cargo_counted": true
+  }
+}

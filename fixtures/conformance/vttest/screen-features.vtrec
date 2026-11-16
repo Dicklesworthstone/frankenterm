@@ -1,0 +1,375 @@
+# vttest recording for the conformance runner (ft-yccm0.1.9).
+# Captured by capture_vttest.py; do not edit by hand.
+@vttest VT100 test program, version 2.7 (20251205)
+@geometry 24x80.80 24x80 TERM=vt100 LC_ALL=C
+@session screen-features keys '2\r' '*'
+@screen 00 key ''
+\e[0c\eP$q"p\e\\\e[>c\e[?1l\e[?3l\e[?4l\e[?5l\e[?6l\e[?7h\e[?8l\e[?40h\e[?45l\e[r\e[0m\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)
+\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20
+@screen 01 key '2\r'
+2\r\n
+\e[2J\e[1;1H\e[?7h****************************************************************************************************************************************************************
+\e[?7l\e[3;1H****************************************************************************************************************************************************************
+\e[?7h\e[5;1HThis should be three identical lines of *'s completely filling\r\r\n
+the top of the screen without any empty lines between.\r\r\n
+(Test of WRAP AROUND mode setting.)\r\r\n
+Push <RETURN>
+@screen 02 key '\r'
+\e[2J\e[3g\e[1;1H\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH
+\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH
+\e[3C\eH\e[3C\eH\e[3C\eH\e[3C\eH\e[1;4H\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C
+\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[0g\e[6C\e[1;7H\e[1g\e[2g\e[1;1H\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*
+\e[2;2H     *     *     *     *     *     *     *     *     *     *     *     *     *\e[4;1HTest of TAB setting/resetting. These two lines\r\r\n
+should look the same. Push <RETURN>
+@screen 03 key '\r'
+\e[?5h\e[?3h\e[2J\e[1;1H\e[3g\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C
+\eH\e[8C\eH\e[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+\e[3;3HThis is 80 column mode, light background.\e[4;4HThis is 80 column mode, light background.
+\e[5;5HThis is 80 column mode, light background.\e[6;6HThis is 80 column mode, light background.
+\e[7;7HThis is 80 column mode, light background.\e[8;8HThis is 80 column mode, light background.
+\e[9;9HThis is 80 column mode, light background.\e[10;10HThis is 80 column mode, light background.
+\e[11;11HThis is 80 column mode, light background.\e[12;12HThis is 80 column mode, light background.
+\e[13;13HThis is 80 column mode, light background.\e[14;14HThis is 80 column mode, light background.
+\e[15;15HThis is 80 column mode, light background.\e[16;16HThis is 80 column mode, light background.
+\e[17;17HThis is 80 column mode, light background.\e[18;18HThis is 80 column mode, light background.
+\e[19;19HThis is 80 column mode, light background.\e[20;20HThis is 80 column mode, light background.Push <RETURN>
+@screen 04 key '\r'
+\e[?3l\e[2J\e[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+\e[3;3HThis is 80 column mode, light background.\e[4;4HThis is 80 column mode, light background.
+\e[5;5HThis is 80 column mode, light background.\e[6;6HThis is 80 column mode, light background.
+\e[7;7HThis is 80 column mode, light background.\e[8;8HThis is 80 column mode, light background.
+\e[9;9HThis is 80 column mode, light background.\e[10;10HThis is 80 column mode, light background.
+\e[11;11HThis is 80 column mode, light background.\e[12;12HThis is 80 column mode, light background.
+\e[13;13HThis is 80 column mode, light background.\e[14;14HThis is 80 column mode, light background.
+\e[15;15HThis is 80 column mode, light background.\e[16;16HThis is 80 column mode, light background.
+\e[17;17HThis is 80 column mode, light background.\e[18;18HThis is 80 column mode, light background.
+\e[19;19HThis is 80 column mode, light background.\e[20;20HThis is 80 column mode, light background.Push <RETURN>
+@screen 05 key '\r'
+\e[?5l\e[?3h\e[2J\e[1;1H\e[3g\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C
+\eH\e[8C\eH\e[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+\e[3;3HThis is 80 column mode, dark background.\e[4;4HThis is 80 column mode, dark background.\e[5;5HThis is 80 column mode, dark background.
+\e[6;6HThis is 80 column mode, dark background.\e[7;7HThis is 80 column mode, dark background.\e[8;8HThis is 80 column mode, dark background.
+\e[9;9HThis is 80 column mode, dark background.\e[10;10HThis is 80 column mode, dark background.
+\e[11;11HThis is 80 column mode, dark background.\e[12;12HThis is 80 column mode, dark background.
+\e[13;13HThis is 80 column mode, dark background.\e[14;14HThis is 80 column mode, dark background.
+\e[15;15HThis is 80 column mode, dark background.\e[16;16HThis is 80 column mode, dark background.
+\e[17;17HThis is 80 column mode, dark background.\e[18;18HThis is 80 column mode, dark background.
+\e[19;19HThis is 80 column mode, dark background.\e[20;20HThis is 80 column mode, dark background.Push <RETURN>
+@screen 06 key '\r'
+\e[?3l\e[2J\e[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+\e[3;3HThis is 80 column mode, dark background.\e[4;4HThis is 80 column mode, dark background.\e[5;5HThis is 80 column mode, dark background.
+\e[6;6HThis is 80 column mode, dark background.\e[7;7HThis is 80 column mode, dark background.\e[8;8HThis is 80 column mode, dark background.
+\e[9;9HThis is 80 column mode, dark background.\e[10;10HThis is 80 column mode, dark background.
+\e[11;11HThis is 80 column mode, dark background.\e[12;12HThis is 80 column mode, dark background.
+\e[13;13HThis is 80 column mode, dark background.\e[14;14HThis is 80 column mode, dark background.
+\e[15;15HThis is 80 column mode, dark background.\e[16;16HThis is 80 column mode, dark background.
+\e[17;17HThis is 80 column mode, dark background.\e[18;18HThis is 80 column mode, dark background.
+\e[19;19HThis is 80 column mode, dark background.\e[20;20HThis is 80 column mode, dark background.Push <RETURN>
+@screen 07 key '\r'
+\e[2J\e[?6h\e[?4h\e[12;13r\e[2J\e[24BSoft scroll up region [12..13] size 2 Line 1\r\n
+Soft scroll up region [12..13] size 2 Line 2\r\n
+Soft scroll up region [12..13] size 2 Line 3\r\n
+Soft scroll up region [12..13] size 2 Line 4\r\n
+Soft scroll up region [12..13] size 2 Line 5\r\n
+Soft scroll up region [12..13] size 2 Line 6\r\n
+Soft scroll up region [12..13] size 2 Line 7\r\n
+Soft scroll up region [12..13] size 2 Line 8\r\n
+Soft scroll up region [12..13] size 2 Line 9\r\n
+Soft scroll up region [12..13] size 2 Line 10\r\n
+Soft scroll up region [12..13] size 2 Line 11\r\n
+Soft scroll up region [12..13] size 2 Line 12\r\n
+Soft scroll up region [12..13] size 2 Line 13\r\n
+Soft scroll up region [12..13] size 2 Line 14\r\n
+Soft scroll up region [12..13] size 2 Line 15\r\n
+Soft scroll up region [12..13] size 2 Line 16\r\n
+Soft scroll up region [12..13] size 2 Line 17\r\n
+Soft scroll up region [12..13] size 2 Line 18\r\n
+Soft scroll up region [12..13] size 2 Line 19\r\n
+Soft scroll up region [12..13] size 2 Line 20\r\n
+Soft scroll up region [12..13] size 2 Line 21\r\n
+Soft scroll up region [12..13] size 2 Line 22\r\n
+Soft scroll up region [12..13] size 2 Line 23\r\n
+Soft scroll up region [12..13] size 2 Line 24\r\n
+Soft scroll up region [12..13] size 2 Line 25\r\n
+Soft scroll up region [12..13] size 2 Line 26\r\n
+Soft scroll up region [12..13] size 2 Line 27\r\n
+Soft scroll up region [12..13] size 2 Line 28\r\n
+Soft scroll up region [12..13] size 2 Line 29\r\n
+\e[24ASoft scroll down region [12..13] size 2 Line 1\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 2\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 3\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 4\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 5\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 6\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 7\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 8\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 9\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 10\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 11\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 12\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 13\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 14\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 15\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 16\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 17\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 18\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 19\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 20\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 21\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 22\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 23\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 24\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 25\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 26\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 27\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 28\r\n
+\eM\eMSoft scroll down region [12..13] size 2 Line 29\r\n
+\eM\eMPush <RETURN>
+@screen 08 key '\r'
+\e[1;24r\e[2J\e[24BSoft scroll up region [1..24] size 24 Line 1\r\n
+Soft scroll up region [1..24] size 24 Line 2\r\n
+Soft scroll up region [1..24] size 24 Line 3\r\n
+Soft scroll up region [1..24] size 24 Line 4\r\n
+Soft scroll up region [1..24] size 24 Line 5\r\n
+Soft scroll up region [1..24] size 24 Line 6\r\n
+Soft scroll up region [1..24] size 24 Line 7\r\n
+Soft scroll up region [1..24] size 24 Line 8\r\n
+Soft scroll up region [1..24] size 24 Line 9\r\n
+Soft scroll up region [1..24] size 24 Line 10\r\n
+Soft scroll up region [1..24] size 24 Line 11\r\n
+Soft scroll up region [1..24] size 24 Line 12\r\n
+Soft scroll up region [1..24] size 24 Line 13\r\n
+Soft scroll up region [1..24] size 24 Line 14\r\n
+Soft scroll up region [1..24] size 24 Line 15\r\n
+Soft scroll up region [1..24] size 24 Line 16\r\n
+Soft scroll up region [1..24] size 24 Line 17\r\n
+Soft scroll up region [1..24] size 24 Line 18\r\n
+Soft scroll up region [1..24] size 24 Line 19\r\n
+Soft scroll up region [1..24] size 24 Line 20\r\n
+Soft scroll up region [1..24] size 24 Line 21\r\n
+Soft scroll up region [1..24] size 24 Line 22\r\n
+Soft scroll up region [1..24] size 24 Line 23\r\n
+Soft scroll up region [1..24] size 24 Line 24\r\n
+Soft scroll up region [1..24] size 24 Line 25\r\n
+Soft scroll up region [1..24] size 24 Line 26\r\n
+Soft scroll up region [1..24] size 24 Line 27\r\n
+Soft scroll up region [1..24] size 24 Line 28\r\n
+Soft scroll up region [1..24] size 24 Line 29\r\n
+\e[24ASoft scroll down region [1..24] size 24 Line 1\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 2\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 3\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 4\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 5\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 6\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 7\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 8\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 9\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 10\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 11\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 12\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 13\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 14\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 15\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 16\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 17\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 18\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 19\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 20\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 21\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 22\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 23\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 24\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 25\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 26\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 27\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 28\r\n
+\eM\eMSoft scroll down region [1..24] size 24 Line 29\r\n
+\eM\eMPush <RETURN>
+@screen 09 key '\r'
+\e[?4l\e[12;13r\e[2J\e[24BJump scroll up region [12..13] size 2 Line 1\r\n
+Jump scroll up region [12..13] size 2 Line 2\r\n
+Jump scroll up region [12..13] size 2 Line 3\r\n
+Jump scroll up region [12..13] size 2 Line 4\r\n
+Jump scroll up region [12..13] size 2 Line 5\r\n
+Jump scroll up region [12..13] size 2 Line 6\r\n
+Jump scroll up region [12..13] size 2 Line 7\r\n
+Jump scroll up region [12..13] size 2 Line 8\r\n
+Jump scroll up region [12..13] size 2 Line 9\r\n
+Jump scroll up region [12..13] size 2 Line 10\r\n
+Jump scroll up region [12..13] size 2 Line 11\r\n
+Jump scroll up region [12..13] size 2 Line 12\r\n
+Jump scroll up region [12..13] size 2 Line 13\r\n
+Jump scroll up region [12..13] size 2 Line 14\r\n
+Jump scroll up region [12..13] size 2 Line 15\r\n
+Jump scroll up region [12..13] size 2 Line 16\r\n
+Jump scroll up region [12..13] size 2 Line 17\r\n
+Jump scroll up region [12..13] size 2 Line 18\r\n
+Jump scroll up region [12..13] size 2 Line 19\r\n
+Jump scroll up region [12..13] size 2 Line 20\r\n
+Jump scroll up region [12..13] size 2 Line 21\r\n
+Jump scroll up region [12..13] size 2 Line 22\r\n
+Jump scroll up region [12..13] size 2 Line 23\r\n
+Jump scroll up region [12..13] size 2 Line 24\r\n
+Jump scroll up region [12..13] size 2 Line 25\r\n
+Jump scroll up region [12..13] size 2 Line 26\r\n
+Jump scroll up region [12..13] size 2 Line 27\r\n
+Jump scroll up region [12..13] size 2 Line 28\r\n
+Jump scroll up region [12..13] size 2 Line 29\r\n
+\e[24AJump scroll down region [12..13] size 2 Line 1\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 2\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 3\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 4\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 5\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 6\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 7\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 8\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 9\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 10\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 11\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 12\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 13\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 14\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 15\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 16\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 17\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 18\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 19\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 20\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 21\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 22\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 23\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 24\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 25\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 26\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 27\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 28\r\n
+\eM\eMJump scroll down region [12..13] size 2 Line 29\r\n
+\eM\eMPush <RETURN>
+@screen 10 key '\r'
+\e[1;24r\e[2J\e[24BJump scroll up region [1..24] size 24 Line 1\r\n
+Jump scroll up region [1..24] size 24 Line 2\r\n
+Jump scroll up region [1..24] size 24 Line 3\r\n
+Jump scroll up region [1..24] size 24 Line 4\r\n
+Jump scroll up region [1..24] size 24 Line 5\r\n
+Jump scroll up region [1..24] size 24 Line 6\r\n
+Jump scroll up region [1..24] size 24 Line 7\r\n
+Jump scroll up region [1..24] size 24 Line 8\r\n
+Jump scroll up region [1..24] size 24 Line 9\r\n
+Jump scroll up region [1..24] size 24 Line 10\r\n
+Jump scroll up region [1..24] size 24 Line 11\r\n
+Jump scroll up region [1..24] size 24 Line 12\r\n
+Jump scroll up region [1..24] size 24 Line 13\r\n
+Jump scroll up region [1..24] size 24 Line 14\r\n
+Jump scroll up region [1..24] size 24 Line 15\r\n
+Jump scroll up region [1..24] size 24 Line 16\r\n
+Jump scroll up region [1..24] size 24 Line 17\r\n
+Jump scroll up region [1..24] size 24 Line 18\r\n
+Jump scroll up region [1..24] size 24 Line 19\r\n
+Jump scroll up region [1..24] size 24 Line 20\r\n
+Jump scroll up region [1..24] size 24 Line 21\r\n
+Jump scroll up region [1..24] size 24 Line 22\r\n
+Jump scroll up region [1..24] size 24 Line 23\r\n
+Jump scroll up region [1..24] size 24 Line 24\r\n
+Jump scroll up region [1..24] size 24 Line 25\r\n
+Jump scroll up region [1..24] size 24 Line 26\r\n
+Jump scroll up region [1..24] size 24 Line 27\r\n
+Jump scroll up region [1..24] size 24 Line 28\r\n
+Jump scroll up region [1..24] size 24 Line 29\r\n
+\e[24AJump scroll down region [1..24] size 24 Line 1\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 2\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 3\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 4\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 5\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 6\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 7\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 8\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 9\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 10\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 11\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 12\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 13\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 14\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 15\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 16\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 17\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 18\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 19\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 20\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 21\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 22\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 23\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 24\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 25\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 26\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 27\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 28\r\n
+\eM\eMJump scroll down region [1..24] size 24 Line 29\r\n
+\eM\eMPush <RETURN>
+@screen 11 key '\r'
+\e[2J\e[23;24r\r\n
+Origin mode test. This line should be at the bottom of the screen.\e[1;1HThis line should be the one above the bottom of the screen. Push <RETURN>
+@screen 12 key '\r'
+\e[2J\e[?6l\e[24;1HOrigin mode test. This line should be at the bottom of the screen.\e[1;1HThis line should be at the top of the screen. Push <RETURN>
+@screen 13 key '\r'
+\e[1;24r\e[2J\e[1;20HGraphic rendition test pattern:\e[4;1H\e[0mvanilla\e[4;40H\e[0;1mbold\e[6;6H
+\e[;4munderline\e[6;45H\e[;1m\e[4mbold underline\e[8;1H\e[0;5mblink\e[8;40H\e[0;5;1mbold blink\e[10;6H
+\e[0;4;5munderline blink\e[10;45H\e[0;1;4;5mbold underline blink\e[12;1H\e[1;4;5;0;7mnegative\e[12;40H
+\e[0;1;7mbold negative\e[14;6H\e[0;4;7munderline negative\e[14;45H\e[0;1;4;7mbold underline negative
+\e[16;1H\e[1;4;;5;7mblink negative\e[16;40H\e[0;1;5;7mbold blink negative\e[18;6H\e[0;4;5;7munderline blink negative
+\e[18;45H\e[0;1;4;5;7mbold underline blink negative\e[m\e[?5l\e[23;1H\e[0KDark background. Push <RETURN>
+@screen 14 key '\r'
+\e[?5h\e[23;1H\e[0KLight background. Push <RETURN>
+@screen 15 key '\r'
+\e[?5l\e[2J\e[8;12Hnormal\e[8;24Hbold\e[8;36Hunderscored\e[8;48Hblinking\e[8;60Hreversed\e[10;1Hstars:
+\e[12;1Hline:\e[14;1Hx'es:\e[16;1Hdiamonds:\e[10;12H\e[;0m\e(B\e)B\x0f*****\e7\e[1;1H\e[m\e(B\e)B\x0fA
+\e8*****\e[10;24H\e[;1m\e(B\e)B\x0f*****\e7\e[1;2H\e[m\e(B\e)B\x0fA\e8*****\e[10;36H\e[;4m\e(B\e)B\x0f*****
+\e7\e[1;3H\e[m\e(B\e)B\x0fA\e8*****\e[10;48H\e[;5m\e(B\e)B\x0f*****\e7\e[1;4H\e[m\e(B\e)B\x0fA\e8*****
+\e[10;60H\e[;7m\e(B\e)B\x0f*****\e7\e[1;5H\e[m\e(B\e)B\x0fA\e8*****\e[12;12H\e[;0m\e(0\e)B\x0fqqqqq
+\e7\e[2;1H\e[m\e(B\e)B\x0fA\e8qqqqq\e[12;24H\e[;1m\e(0\e)B\x0fqqqqq\e7\e[2;2H\e[m\e(B\e)B\x0fA\e8qqqqq
+\e[12;36H\e[;4m\e(0\e)B\x0fqqqqq\e7\e[2;3H\e[m\e(B\e)B\x0fA\e8qqqqq\e[12;48H\e[;5m\e(0\e)B\x0fqqqqq
+\e7\e[2;4H\e[m\e(B\e)B\x0fA\e8qqqqq\e[12;60H\e[;7m\e(0\e)B\x0fqqqqq\e7\e[2;5H\e[m\e(B\e)B\x0fA\e8qqqqq
+\e[14;12H\e[;0m\e(B\e)B\x0fxxxxx\e7\e[3;1H\e[m\e(B\e)B\x0fA\e8xxxxx\e[14;24H\e[;1m\e(B\e)B\x0fxxxxx
+\e7\e[3;2H\e[m\e(B\e)B\x0fA\e8xxxxx\e[14;36H\e[;4m\e(B\e)B\x0fxxxxx\e7\e[3;3H\e[m\e(B\e)B\x0fA\e8xxxxx
+\e[14;48H\e[;5m\e(B\e)B\x0fxxxxx\e7\e[3;4H\e[m\e(B\e)B\x0fA\e8xxxxx\e[14;60H\e[;7m\e(B\e)B\x0fxxxxx
+\e7\e[3;5H\e[m\e(B\e)B\x0fA\e8xxxxx\e[16;12H\e[;0m\e(0\e)B\x0f`````\e7\e[4;1H\e[m\e(B\e)B\x0fA\e8`````
+\e[16;24H\e[;1m\e(0\e)B\x0f`````\e7\e[4;2H\e[m\e(B\e)B\x0fA\e8`````\e[16;36H\e[;4m\e(0\e)B\x0f`````
+\e7\e[4;3H\e[m\e(B\e)B\x0fA\e8`````\e[16;48H\e[;5m\e(0\e)B\x0f`````\e7\e[4;4H\e[m\e(B\e)B\x0fA\e8`````
+\e[16;60H\e[;7m\e(0\e)B\x0f`````\e7\e[4;5H\e[m\e(B\e)B\x0fA\e8`````\e[0m\e(B\e)B\x0f\e[21;1HTest of the SAVE/RESTORE CURSOR feature. There should\r\r\n
+be ten characters of each flavour, and a rectangle\r\r\n
+of 5 x 4 A's filling the top left of the screen.\r\r\n
+Push <RETURN>
+@screen 16 key '\r'
+\r\n
+\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20

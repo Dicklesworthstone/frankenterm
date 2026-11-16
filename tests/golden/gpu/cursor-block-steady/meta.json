@@ -1,0 +1,17 @@
+{
+  "fixture": "cursor-block-steady",
+  "viewport": {
+    "width": 320,
+    "height": 112,
+    "dpi": 96.0
+  },
+  "texture_format": "Rgba8UnormSrgb",
+  "font_set_sha": "headless-rasterizer-v1-no-font-fetch",
+  "harness_version": 1,
+  "generated_at_runner": "macos-metal-cod_2-2026-04-28",
+  "thresholds": {
+    "min_ssim": 0.99,
+    "max_l_inf": 8,
+    "max_changed_pixel_fraction": 0.001
+  }
+}

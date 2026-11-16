@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-wait-for.json",
+  "title": "WA Robot Wait-For Response",
+  "description": "Schema for the data field when calling 'wa robot wait-for' or 'wa send --wait-for'. Waits for a pattern to match.",
+  "type": "object",
+  "required": ["pane_id", "pattern", "matched", "elapsed_ms", "polls"],
+  "properties": {
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The pane being monitored"
+    },
+    "pattern": {
+      "type": "string",
+      "description": "The pattern string being waited for"
+    },
+    "matched": {
+      "type": "boolean",
+      "description": "Whether the pattern was matched before timeout"
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Actual time spent waiting (milliseconds)"
+    },
+    "polls": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of polling attempts"
+    },
+    "is_regex": {
+      "type": "boolean",
+      "default": false,
+      "description": "True if the pattern is a regex, false for substring match"
+    }
+  },
+  "additionalProperties": false
+}

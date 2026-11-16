@@ -1,0 +1,2891 @@
+//! Replay capture adapter — bridges the ingest/event pipeline to
+//! `.ftreplay`-compatible [`RecorderEvent`] records.
+//!
+//! The adapter converts [`CapturedSegment`] egress events and lifecycle/control
+//! markers into fully populated [`RecorderEvent`] records with deterministic
+//! event IDs and merge keys assigned at capture time.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ingest.rs ──► CapturedSegment ──► CaptureAdapter ──► RecorderEvent
+//! events.rs ──► Event           ──► CaptureAdapter ──► RecorderEvent
+//! ```
+//!
+//! The adapter is designed as an observer (tap) that does not modify the
+//! upstream pipeline. Disabling capture returns after the enabled-flag check
+//! and avoids sequence, redaction, and sink work, but the caller and adapter
+//! still execute that branch; no literal zero-cost claim is made.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+// Re-export decision types from replay_decision_graph for callers that
+// reference `crate::replay_capture::DecisionEvent` / `DecisionType`.
+pub use crate::replay_decision_graph::{DecisionEvent, DecisionType};
+
+use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
+use crate::ingest::CapturedSegment;
+use crate::recording::{
+    EgressEvent, EgressTap, IngressEvent, IngressOutcome, IngressTap,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
+    RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
+};
+use crate::redactor::{REDACTED_MARKER, Redactor};
+
+// br-ft-zkthg HIGH-tier: replay determinism observability for
+// PolicyDecision capture. `capture_decision` previously absorbed
+// `serde_json::to_value(&decision)` failures via `unwrap_or_default()`,
+// substituting `Value::Null` into the recorded payload. The replay log
+// is the source of truth for re-deriving operator decisions; a silently
+// truncated PolicyDecision payload defeats determinism (replay observes
+// `null` instead of the original details and re-runs against the wrong
+// branch).
+//
+// In practice `serde_json::to_value` on a `DecisionEvent` (composed of
+// primitives + String + structured serializable variants) never fails,
+// but the absorption pattern is a code smell and the observability gap
+// means operators have no signal if it ever does. Same shape as
+// ft-jyywz (audit_chain_export_dropped_count), shipped at dc5b42a8c.
+static REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Failure to reserve a collision-free per-pane identity for replay capture.
+///
+/// `u64::MAX` is permanently reserved as the terminal sentinel. Once a pane
+/// reaches that frontier, capture remains failed closed for that pane rather
+/// than wrapping to zero and reusing plausible recorder identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayCaptureSequenceError {
+    /// The pane emitted its final usable identity (`u64::MAX - 1`) already.
+    #[error(
+        "replay capture sequence exhausted for pane {pane_id}; u64::MAX is the sticky terminal sentinel"
+    )]
+    PaneExhausted {
+        /// Pane whose replay identity space is exhausted.
+        pane_id: u64,
+    },
+    /// An upstream durable identity attempted to use the reserved sentinel.
+    #[error(
+        "replay capture rejected reserved sequence u64::MAX for pane {pane_id}; the sentinel cannot identify an event"
+    )]
+    ReservedSuppliedSequence {
+        /// Pane associated with the rejected identity.
+        pane_id: u64,
+    },
+    /// An upstream durable identity would collide with an admitted event.
+    #[error(
+        "replay capture rejected regressing sequence {supplied} for pane {pane_id}; next admissible sequence is {next_admissible}"
+    )]
+    RegressingSuppliedSequence {
+        /// Pane associated with the rejected identity.
+        pane_id: u64,
+        /// Durable identity supplied by the upstream persistence path.
+        supplied: u64,
+        /// Lowest identity that could be admitted without reuse.
+        next_admissible: u64,
+    },
+}
+
+/// Increment an operator-facing counter without ever allowing it to regress.
+#[inline]
+fn saturating_increment(counter: &AtomicU64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current != u64::MAX {
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Cumulative count of `PolicyDecision` capture events that recorded a
+/// `Value::Null` payload due to `serde_json::to_value` serialization
+/// failure since process load. The capture path always increments
+/// `total_captured` even on failure — this counter is the operator's
+/// only signal that any captured PolicyDecision payload was dropped
+/// from the replay log.
+#[must_use]
+pub fn replay_capture_policy_decision_drop_count() -> u64 {
+    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate capture
+/// failures can assert post-increment values without state leakage
+/// between tests.
+#[cfg(test)]
+pub fn reset_replay_capture_policy_decision_drop_count_for_test() {
+    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_replay_capture_policy_decision_drop() {
+    saturating_increment(&REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT);
+}
+
+// ---------------------------------------------------------------------------
+// Capture sink trait
+// ---------------------------------------------------------------------------
+
+/// Receiver for captured [`RecorderEvent`] records.
+///
+/// Implementations should be fast and non-blocking. Heavy work (disk I/O,
+/// network) should be offloaded to a background task via a channel.
+pub trait CaptureSink: Send + Sync {
+    /// Called for each captured event. Must not block.
+    fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey);
+}
+
+/// No-op sink that discards all events.
+///
+/// Capture still constructs and routes an event before this sink discards it,
+/// so this type is a behavioral fixture rather than a zero-overhead guarantee.
+pub struct NoopCaptureSink;
+
+impl CaptureSink for NoopCaptureSink {
+    #[inline]
+    fn on_event(&self, _event: RecorderEvent, _merge_key: RecorderMergeKey) {}
+}
+
+/// Collecting sink that stores all events for testing.
+#[derive(Debug, Default)]
+pub struct CollectingCaptureSink {
+    events: Mutex<Vec<(RecorderEvent, RecorderMergeKey)>>,
+}
+
+impl CollectingCaptureSink {
+    /// Create a new empty collecting sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_events(&self) -> MutexGuard<'_, Vec<(RecorderEvent, RecorderMergeKey)>> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Return a snapshot of all collected events.
+    pub fn events(&self) -> Vec<(RecorderEvent, RecorderMergeKey)> {
+        self.lock_events().clone()
+    }
+
+    /// Return just the recorder events without merge keys.
+    pub fn recorder_events(&self) -> Vec<RecorderEvent> {
+        self.lock_events().iter().map(|(e, _)| e.clone()).collect()
+    }
+
+    /// Return the number of collected events.
+    pub fn len(&self) -> usize {
+        self.lock_events().len()
+    }
+
+    /// Return true if no events have been collected.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear all collected events.
+    pub fn clear(&self) {
+        self.lock_events().clear();
+    }
+}
+
+impl CaptureSink for CollectingCaptureSink {
+    fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey) {
+        self.lock_events().push((event, merge_key));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capture adapter
+// ---------------------------------------------------------------------------
+
+/// Configuration for the capture adapter.
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    /// Session identifier to stamp on all events.
+    pub session_id: Option<String>,
+    /// Default event source for egress events.
+    pub default_source: RecorderEventSource,
+    /// Whether capture is enabled (can be toggled at runtime).
+    pub enabled: bool,
+    /// Policy applied before captured ingress/egress text leaves the adapter.
+    pub redaction_policy: CaptureRedactionPolicy,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            default_source: RecorderEventSource::WeztermMux,
+            enabled: true,
+            redaction_policy: CaptureRedactionPolicy::default(),
+        }
+    }
+}
+
+impl CaptureConfig {
+    /// Validate capture configuration before any recorder sink observes data.
+    pub fn validate(&self) -> Result<(), String> {
+        self.redaction_policy.validate()
+    }
+}
+
+/// Configuration rejected before an adapter can emit any recorder event.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid replay capture configuration: {0}")]
+pub struct ReplayCaptureConfigError(String);
+
+/// Runtime capture adapter that converts pipeline events into
+/// [`RecorderEvent`] records with deterministic ordering metadata.
+///
+/// The adapter maintains per-pane sequence frontiers for recorder identity.
+/// Cross-pane order is the documented [`RecorderMergeKey`]; the adapter does
+/// not allocate a separate transient identity that RecorderEvent v1 cannot
+/// persist.
+/// Events are emitted to a [`CaptureSink`] which can buffer, persist, or
+/// discard them.
+pub struct CaptureAdapter {
+    /// Sink receiving captured events.
+    sink: Arc<dyn CaptureSink>,
+    /// Per-pane sequence counters for recorder events.
+    pane_sequences: Mutex<HashMap<u64, AtomicU64>>,
+    /// Runtime enable/disable flag.
+    enabled: AtomicBool,
+    /// Session identifier stamped on all events.
+    session_id: Option<String>,
+    /// Default source for egress events.
+    default_source: RecorderEventSource,
+    /// Compiled redaction policy for captured text.
+    redaction: CaptureRedactionRuntime,
+    /// Total events captured (monotonic counter for diagnostics).
+    total_captured: AtomicU64,
+    /// Sequence failures absorbed by void observer/runtime boundaries.
+    sequence_error_count: AtomicU64,
+    /// Ensures void boundaries warn at most once per adapter.
+    sequence_error_warned: AtomicBool,
+}
+
+impl CaptureAdapter {
+    /// Create a new capture adapter with the given sink and configuration.
+    /// Returns an error before touching the sink if the policy is invalid.
+    pub fn new(
+        sink: Arc<dyn CaptureSink>,
+        config: CaptureConfig,
+    ) -> Result<Self, ReplayCaptureConfigError> {
+        config.validate().map_err(ReplayCaptureConfigError)?;
+        let redaction = CaptureRedactionRuntime::new(config.redaction_policy.clone())
+            .map_err(ReplayCaptureConfigError)?;
+        Ok(Self {
+            sink,
+            pane_sequences: Mutex::new(HashMap::new()),
+            enabled: AtomicBool::new(config.enabled),
+            session_id: config.session_id,
+            default_source: config.default_source,
+            redaction,
+            total_captured: AtomicU64::new(0),
+            sequence_error_count: AtomicU64::new(0),
+            sequence_error_warned: AtomicBool::new(false),
+        })
+    }
+
+    /// Create a capture adapter with a no-op sink.
+    pub fn disabled() -> Result<Self, ReplayCaptureConfigError> {
+        Self::new(
+            Arc::new(NoopCaptureSink),
+            CaptureConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Enable or disable capture at runtime.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Check if capture is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Return the total number of events captured so far.
+    pub fn total_captured(&self) -> u64 {
+        self.total_captured.load(Ordering::Relaxed)
+    }
+
+    /// Return sequence failures absorbed by void observer/runtime boundaries.
+    /// The counter saturates at `u64::MAX`.
+    #[must_use]
+    pub fn sequence_error_count(&self) -> u64 {
+        self.sequence_error_count.load(Ordering::Relaxed)
+    }
+
+    /// Get or create a per-pane sequence counter, returning the next value.
+    ///
+    /// ft-xvrlp: every capture_egress / capture_ingress / capture_lifecycle
+    /// / capture_control / capture_decision call routes through here, so a
+    /// `.lock().unwrap()` would brick the recorder for the rest of the
+    /// process the first time another caller panics while holding this lock.
+    /// Poison recovery is safe in this code path because:
+    ///   * the protected `HashMap<u64, AtomicU64>` is structurally consistent
+    ///     even if a panic interrupts another caller — `entry().or_insert_with`
+    ///     is atomic w.r.t. the mutex (no torn allocation), and every frontier
+    ///     transition occurs while this mutex is held; and
+    ///   * the only invariant the lock enforces is single-writer access to the
+    ///     map's internal hashing structure, which `PoisonError::into_inner`
+    ///     restores intact.
+    ///
+    /// We therefore recover from poison and continue rather than aborting the
+    /// recorder.
+    fn next_pane_seq(&self, pane_id: u64) -> Result<u64, ReplayCaptureSequenceError> {
+        let mut map = self
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
+        let next = counter.load(Ordering::Relaxed);
+        if next == u64::MAX {
+            return Err(ReplayCaptureSequenceError::PaneExhausted { pane_id });
+        }
+        counter.store(next + 1, Ordering::Relaxed);
+        Ok(next)
+    }
+
+    /// Admit an authoritative upstream identity and advance the local pane
+    /// frontier so later locally allocated lifecycle/control events cannot
+    /// collide with it.
+    fn reconcile_supplied_pane_seq(
+        &self,
+        pane_id: u64,
+        supplied: u64,
+    ) -> Result<u64, ReplayCaptureSequenceError> {
+        if supplied == u64::MAX {
+            return Err(ReplayCaptureSequenceError::ReservedSuppliedSequence { pane_id });
+        }
+
+        let mut map = self
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
+        let next_admissible = counter.load(Ordering::Relaxed);
+        if supplied < next_admissible {
+            return Err(ReplayCaptureSequenceError::RegressingSuppliedSequence {
+                pane_id,
+                supplied,
+                next_admissible,
+            });
+        }
+
+        counter.store(supplied + 1, Ordering::Relaxed);
+        Ok(supplied)
+    }
+
+    /// Record a sequence failure at an observer trait that cannot return it.
+    ///
+    /// The count saturates and the warning is emitted at most once per adapter,
+    /// keeping a permanently exhausted hot pane from producing an unbounded
+    /// log stream.
+    pub(crate) fn record_sequence_error(
+        &self,
+        boundary: &'static str,
+        error: ReplayCaptureSequenceError,
+    ) {
+        saturating_increment(&self.sequence_error_count);
+        if !self.sequence_error_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                target: "ft.replay.capture",
+                boundary,
+                error = %error,
+                "Replay capture boundary failed closed on an unsafe pane sequence"
+            );
+        }
+    }
+
+    #[inline]
+    fn record_capture_success(&self) {
+        saturating_increment(&self.total_captured);
+    }
+
+    // -----------------------------------------------------------------------
+    // Egress capture (from CapturedSegment)
+    // -----------------------------------------------------------------------
+
+    /// Capture an egress event from a [`CapturedSegment`].
+    ///
+    /// Converts the segment into a [`RecorderEvent`] with
+    /// [`RecorderEventPayload::EgressOutput`], assigns a deterministic event ID,
+    /// and emits to the sink.
+    pub fn capture_egress(
+        &self,
+        segment: &CapturedSegment,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let (segment_kind, is_gap) = captured_kind_to_segment(&segment.kind);
+        let occurred_at_ms = if segment.captured_at >= 0 {
+            segment.captured_at as u64
+        } else {
+            epoch_ms_now()
+        };
+        let recorded_at_ms = epoch_ms_now();
+        let Some(redacted) = self
+            .redaction
+            .apply(&segment.content, RecorderRedactionLevel::None)
+        else {
+            return Ok(());
+        };
+        let sequence = self.next_pane_seq(segment.pane_id)?;
+
+        let payload = RecorderEventPayload::EgressOutput {
+            text: redacted.text,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: redacted.redaction,
+            segment_kind,
+            is_gap,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(), // computed below
+            pane_id: segment.pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id: None,
+            source: self.default_source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        };
+
+        // Deterministic event ID from content
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+
+    /// Prepare an egress event from an [`EgressEvent`] (pre-built metadata).
+    ///
+    /// This path is used when the upstream already has an EgressEvent struct
+    /// (e.g., from an existing EgressTap implementation). The authoritative
+    /// `EgressEvent::sequence` is preserved and advances the pane frontier.
+    ///
+    /// The returned event is not sent to this adapter's sink. This split is
+    /// intentional: the observation runtime uses the same canonical identity,
+    /// sequence, and redaction logic before awaiting its selected durable
+    /// recorder backend. Callers must not call this method and then call
+    /// [`Self::capture_egress_event`] for the same event, because preparation
+    /// consumes the supplied per-pane sequence exactly once.
+    pub fn prepare_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<Option<(RecorderEvent, RecorderMergeKey)>, ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+
+        let sequence = self.reconcile_supplied_pane_seq(egress.pane_id, egress.sequence)?;
+        Ok(self.prepare_egress_event_with_sequence(egress, sequence))
+    }
+
+    /// Prepare an egress event whose sequence was assigned by an upstream
+    /// durable authority.
+    ///
+    /// Unlike [`Self::prepare_egress_event`], this method does not advance the
+    /// adapter-local frontier. The recorder-storage path uses a deterministic
+    /// batch ID derived from the returned event, so retrying the same durable
+    /// event is idempotent instead of being misclassified as a sequence
+    /// regression. The reserved terminal sequence remains rejected.
+    pub fn prepare_authoritative_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<Option<(RecorderEvent, RecorderMergeKey)>, ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        if egress.sequence == u64::MAX {
+            return Err(ReplayCaptureSequenceError::ReservedSuppliedSequence {
+                pane_id: egress.pane_id,
+            });
+        }
+        Ok(self.prepare_egress_event_with_sequence(egress, egress.sequence))
+    }
+
+    fn prepare_egress_event_with_sequence(
+        &self,
+        egress: &EgressEvent,
+        sequence: u64,
+    ) -> Option<(RecorderEvent, RecorderMergeKey)> {
+        let recorded_at_ms = epoch_ms_now();
+        let redacted = self.redaction.apply(&egress.text, egress.redaction)?;
+
+        let payload = RecorderEventPayload::EgressOutput {
+            text: redacted.text,
+            encoding: egress.encoding,
+            redaction: redacted.redaction,
+            segment_kind: egress.segment_kind,
+            is_gap: egress.is_gap,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id: egress.pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id: None,
+            source: self.default_source,
+            occurred_at_ms: egress.occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        Some((event, merge_key))
+    }
+
+    /// Capture an egress event from an [`EgressEvent`] (pre-built metadata).
+    ///
+    /// This sink-facing wrapper delegates event construction to
+    /// [`Self::prepare_egress_event`] so replay sinks and selected recorder
+    /// storage consume identical redaction and identity semantics.
+    pub fn capture_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        let Some((event, merge_key)) = self.prepare_egress_event(egress)? else {
+            return Ok(());
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle capture
+    // -----------------------------------------------------------------------
+
+    /// Capture a lifecycle event (pane open/close, capture start/stop).
+    pub fn capture_lifecycle(
+        &self,
+        pane_id: u64,
+        phase: RecorderLifecyclePhase,
+        reason: Option<String>,
+        details: serde_json::Value,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let occurred_at_ms = epoch_ms_now();
+        let recorded_at_ms = occurred_at_ms;
+        let sequence = self.next_pane_seq(pane_id)?;
+
+        let payload = RecorderEventPayload::LifecycleMarker {
+            lifecycle_phase: phase,
+            reason,
+            details,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id: None,
+            source: self.default_source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Control marker capture
+    // -----------------------------------------------------------------------
+
+    /// Capture a control marker event (resize, prompt boundary, etc.).
+    pub fn capture_control(
+        &self,
+        pane_id: u64,
+        marker_type: crate::recording::RecorderControlMarkerType,
+        details: serde_json::Value,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let occurred_at_ms = epoch_ms_now();
+        let recorded_at_ms = occurred_at_ms;
+        let sequence = self.next_pane_seq(pane_id)?;
+
+        let payload = RecorderEventPayload::ControlMarker {
+            control_marker_type: marker_type,
+            details,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id: None,
+            source: self.default_source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Ingress capture
+    // -----------------------------------------------------------------------
+
+    /// Capture an ingress (input) event.
+    pub fn capture_ingress(
+        &self,
+        pane_id: u64,
+        text: String,
+        ingress_kind: crate::recording::RecorderIngressKind,
+        source: RecorderEventSource,
+        workflow_id: Option<String>,
+        causality: RecorderEventCausality,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let occurred_at_ms = epoch_ms_now();
+        let recorded_at_ms = occurred_at_ms;
+        let Some(redacted) = self.redaction.apply(&text, RecorderRedactionLevel::None) else {
+            return Ok(());
+        };
+        let sequence = self.next_pane_seq(pane_id)?;
+
+        let payload = RecorderEventPayload::IngressText {
+            text: redacted.text,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: redacted.redaction,
+            ingress_kind,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id,
+            correlation_id: None,
+            source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality,
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+
+    /// Capture a decision event (policy evaluation, workflow step, etc.).
+    ///
+    /// Converts the [`DecisionEvent`] into a [`RecorderEvent`] with a
+    /// `ControlMarker` payload and forwards it to the configured sink.
+    pub fn capture_decision(
+        &self,
+        source: RecorderEventSource,
+        correlation_id: Option<String>,
+        decision: DecisionEvent,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let pane_id = decision.pane_id;
+        let occurred_at_ms = decision.timestamp_ms;
+        let recorded_at_ms = epoch_ms_now();
+        let sequence = self.next_pane_seq(pane_id)?;
+
+        // br-ft-zkthg HIGH-tier: replay determinism requires that a
+        // silently-null payload be observable. Bump the drop counter
+        // and emit a structured warn so operators can cross-reference
+        // total_captured against the drop count.
+        let details = match serde_json::to_value(&decision) {
+            Ok(v) => v,
+            Err(err) => {
+                record_replay_capture_policy_decision_drop();
+                tracing::warn!(
+                    target: "ft.replay.capture",
+                    pane_id,
+                    occurred_at_ms,
+                    error = %err,
+                    "PolicyDecision serialization failed; recording Value::Null payload \
+                     (replay determinism degraded — see replay_capture_policy_decision_drop_count)"
+                );
+                serde_json::Value::Null
+            }
+        };
+
+        let payload = RecorderEventPayload::ControlMarker {
+            control_marker_type: RecorderControlMarkerType::PolicyDecision,
+            details,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id,
+            source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.record_capture_success();
+        self.sink.on_event(event, merge_key);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EgressTap implementation — allows CaptureAdapter to be used as an EgressTap
+// ---------------------------------------------------------------------------
+
+impl EgressTap for CaptureAdapter {
+    fn on_egress(&self, event: EgressEvent) {
+        if let Err(error) = self.capture_egress_event(&event) {
+            self.record_sequence_error("EgressTap::on_egress", error);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IngressTap implementation — allows CaptureAdapter to be used as an IngressTap
+// ---------------------------------------------------------------------------
+
+impl IngressTap for CaptureAdapter {
+    fn on_ingress(&self, event: IngressEvent) {
+        if let Err(error) = self.capture_ingress(
+            event.pane_id,
+            event.text.clone(),
+            event.ingress_kind,
+            event.source,
+            event.workflow_id.clone(),
+            RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+        ) {
+            self.record_sequence_error("IngressTap::on_ingress", error);
+            return;
+        }
+
+        use crate::recording::RecorderControlMarkerType;
+        let (marker_type, details) = match event.outcome {
+            IngressOutcome::Allowed => (
+                RecorderControlMarkerType::PolicyDecision,
+                serde_json::json!({
+                    "outcome": "allow",
+                    "ingress_kind": event.ingress_kind,
+                }),
+            ),
+            IngressOutcome::Denied { reason } => (
+                RecorderControlMarkerType::PolicyDecision,
+                serde_json::json!({
+                    "outcome": "deny",
+                    "reason": reason,
+                    "ingress_kind": event.ingress_kind,
+                }),
+            ),
+            IngressOutcome::RequiresApproval => (
+                RecorderControlMarkerType::ApprovalCheckpoint,
+                serde_json::json!({
+                    "outcome": "requires_approval",
+                    "ingress_kind": event.ingress_kind,
+                }),
+            ),
+            IngressOutcome::Error { error } => (
+                RecorderControlMarkerType::PolicyDecision,
+                serde_json::json!({
+                    "outcome": "error",
+                    "error": error,
+                    "ingress_kind": event.ingress_kind,
+                }),
+            ),
+        };
+
+        if let Err(error) = self.capture_control(event.pane_id, marker_type, details) {
+            self.record_sequence_error("IngressTap::on_ingress", error);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared handle alias
+// ---------------------------------------------------------------------------
+
+/// Convenience alias for a thread-safe capture adapter handle.
+pub type SharedCaptureAdapter = Arc<CaptureAdapter>;
+
+// ---------------------------------------------------------------------------
+// Sensitivity / Redaction types for capture policy.
+//
+// ft-2aiow wires the ft-pfton scaffolding into CaptureAdapter: adapter
+// construction validates the policy fail-closed, ingress/egress text is
+// classified before emission, built-in + custom secret spans are redacted, and
+// tier-specific retention values are available as the authoritative capture
+// policy mapping for the recorder retention manager.
+// ---------------------------------------------------------------------------
+
+/// Sensitivity tier for captured content.
+///
+/// T1 (lowest) is routine terminal output; T3 (highest) is sensitive
+/// data like credentials or tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSensitivityTier {
+    /// Routine output: commands, build logs, test results.
+    T1,
+    /// Moderate: internal paths, configuration values, agent reasoning.
+    T2,
+    /// Sensitive: credentials, tokens, secrets, PII.
+    T3,
+}
+
+impl CaptureSensitivityTier {
+    /// Stable string tag matching the serde representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::T1 => "t1",
+            Self::T2 => "t2",
+            Self::T3 => "t3",
+        }
+    }
+
+    #[must_use]
+    fn redaction_level(self, baseline: RecorderRedactionLevel) -> RecorderRedactionLevel {
+        match self {
+            Self::T1 => baseline,
+            Self::T2 => match baseline {
+                RecorderRedactionLevel::None => RecorderRedactionLevel::Partial,
+                level => level,
+            },
+            Self::T3 => RecorderRedactionLevel::Full,
+        }
+    }
+}
+
+/// How captured sensitive content is redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureRedactionMode {
+    /// Replace sensitive spans with the standard redaction marker.
+    Mask,
+    /// Replace sensitive spans with a one-way hash.
+    Hash,
+    /// Drop the entire capture event.
+    Drop,
+}
+
+/// Policy for what gets captured and how long each tier is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureRedactionPolicy {
+    /// Whether redaction is active.
+    pub enabled: bool,
+    /// Default redaction mode for sensitive spans.
+    pub mode: CaptureRedactionMode,
+    /// T1 content retention in days.
+    pub t1_retention_days: u64,
+    /// T2 content retention in days.
+    pub t2_retention_days: u64,
+    /// T3 content retention in days.
+    pub t3_retention_days: u64,
+    /// Custom regex patterns that trigger T3 redaction.
+    #[serde(default)]
+    pub custom_patterns: Vec<String>,
+}
+
+impl Default for CaptureRedactionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: CaptureRedactionMode::Mask,
+            t1_retention_days: 90,
+            t2_retention_days: 30,
+            t3_retention_days: 7,
+            custom_patterns: Vec::new(),
+        }
+    }
+}
+
+const CAPTURE_REDACTION_MAX_RETENTION_DAYS: u64 = 90;
+const CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS: usize = 64;
+const CAPTURE_REDACTION_MAX_PATTERN_BYTES: usize = 4096;
+const CAPTURE_REDACTION_HASH_PREFIX_HEX: usize = 16;
+
+impl CaptureRedactionPolicy {
+    /// Validate operator-supplied policy fail-closed before capture starts.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.t1_retention_days == 0 {
+            return Err("t1_retention_days must be > 0".to_string());
+        }
+        if self.t2_retention_days == 0 {
+            return Err("t2_retention_days must be > 0".to_string());
+        }
+        if self.t3_retention_days == 0 {
+            return Err("t3_retention_days must be > 0".to_string());
+        }
+        if self.t1_retention_days > CAPTURE_REDACTION_MAX_RETENTION_DAYS {
+            return Err(format!(
+                "t1_retention_days must be <= {CAPTURE_REDACTION_MAX_RETENTION_DAYS}"
+            ));
+        }
+        if self.t2_retention_days > self.t1_retention_days {
+            return Err("t2_retention_days must be <= t1_retention_days".to_string());
+        }
+        if self.t3_retention_days > self.t2_retention_days {
+            return Err("t3_retention_days must be <= t2_retention_days".to_string());
+        }
+        if self.custom_patterns.len() > CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS {
+            return Err(format!(
+                "custom_patterns must contain at most {CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS} entries"
+            ));
+        }
+
+        for (idx, pattern) in self.custom_patterns.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                return Err(format!("custom_patterns[{idx}] must not be empty"));
+            }
+            if pattern.len() > CAPTURE_REDACTION_MAX_PATTERN_BYTES {
+                return Err(format!(
+                    "custom_patterns[{idx}] must be <= {CAPTURE_REDACTION_MAX_PATTERN_BYTES} bytes"
+                ));
+            }
+            Regex::new(pattern)
+                .map_err(|err| format!("custom_patterns[{idx}] is invalid regex: {err}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Retention window configured for a capture sensitivity tier.
+    #[must_use]
+    pub fn retention_days_for_tier(&self, tier: CaptureSensitivityTier) -> u64 {
+        match tier {
+            CaptureSensitivityTier::T1 => self.t1_retention_days,
+            CaptureSensitivityTier::T2 => self.t2_retention_days,
+            CaptureSensitivityTier::T3 => self.t3_retention_days,
+        }
+    }
+
+    /// Convert the capture policy into the existing recorder retention config.
+    pub fn to_retention_config(
+        &self,
+    ) -> Result<crate::recorder_retention::RetentionConfig, String> {
+        self.validate()?;
+        let config = crate::recorder_retention::RetentionConfig {
+            t3_max_hours: checked_days_to_hours_u32("t3_retention_days", self.t3_retention_days)?,
+            t1_extended_days: u32::try_from(self.t1_retention_days)
+                .map_err(|_| "t1_retention_days is out of range".to_string())?,
+            cold_days: u32::try_from(self.t2_retention_days)
+                .map_err(|_| "t2_retention_days is out of range".to_string())?,
+            ..Default::default()
+        };
+        config.validate().map_err(|err| err.to_string())?;
+        Ok(config)
+    }
+}
+
+fn checked_days_to_hours_u32(field: &str, days: u64) -> Result<u32, String> {
+    let hours = days
+        .checked_mul(24)
+        .ok_or_else(|| format!("{field} overflows hours"))?;
+    u32::try_from(hours).map_err(|_| format!("{field} hours are out of range"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureRedactionSpan {
+    start: usize,
+    end: usize,
+}
+
+impl CaptureRedactionSpan {
+    fn new(start: usize, end: usize) -> Option<Self> {
+        (start < end).then_some(Self { start, end })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CaptureRedactionRuntime {
+    policy: CaptureRedactionPolicy,
+    redactor: Redactor,
+    custom_patterns: Vec<Regex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureRedactionResult {
+    text: String,
+    redaction: RecorderRedactionLevel,
+}
+
+impl CaptureRedactionRuntime {
+    fn new(policy: CaptureRedactionPolicy) -> Result<Self, String> {
+        policy.validate()?;
+        let custom_patterns = policy
+            .custom_patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern).map_err(|err| err.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            policy,
+            redactor: Redactor::new(),
+            custom_patterns,
+        })
+    }
+
+    fn classify(&self, text: &str, baseline: RecorderRedactionLevel) -> CaptureSensitivityTier {
+        if !self.policy.enabled {
+            return match baseline {
+                RecorderRedactionLevel::None => CaptureSensitivityTier::T1,
+                RecorderRedactionLevel::Partial | RecorderRedactionLevel::Full => {
+                    CaptureSensitivityTier::T2
+                }
+            };
+        }
+
+        if self.contains_sensitive_span(text) {
+            CaptureSensitivityTier::T3
+        } else {
+            match baseline {
+                RecorderRedactionLevel::None => CaptureSensitivityTier::T1,
+                RecorderRedactionLevel::Partial | RecorderRedactionLevel::Full => {
+                    CaptureSensitivityTier::T2
+                }
+            }
+        }
+    }
+
+    fn apply(
+        &self,
+        text: &str,
+        baseline: RecorderRedactionLevel,
+    ) -> Option<CaptureRedactionResult> {
+        let tier = self.classify(text, baseline);
+        let _retention_days = self.policy.retention_days_for_tier(tier);
+
+        if !self.policy.enabled {
+            return Some(CaptureRedactionResult {
+                text: text.to_string(),
+                redaction: tier.redaction_level(baseline),
+            });
+        }
+
+        let spans = self.sensitive_spans(text);
+        if spans.is_empty() {
+            return Some(CaptureRedactionResult {
+                text: text.to_string(),
+                redaction: tier.redaction_level(baseline),
+            });
+        }
+
+        if self.policy.mode == CaptureRedactionMode::Drop {
+            return None;
+        }
+
+        Some(CaptureRedactionResult {
+            text: self.redact_spans(text, &spans),
+            redaction: tier.redaction_level(baseline),
+        })
+    }
+
+    fn contains_sensitive_span(&self, text: &str) -> bool {
+        self.redactor.contains_secrets(text)
+            || self
+                .custom_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(text))
+    }
+
+    fn sensitive_spans(&self, text: &str) -> Vec<CaptureRedactionSpan> {
+        let mut spans: Vec<CaptureRedactionSpan> = self
+            .redactor
+            .detect(text)
+            .into_iter()
+            .filter_map(|(_, start, end)| CaptureRedactionSpan::new(start, end))
+            .collect();
+
+        for pattern in &self.custom_patterns {
+            spans.extend(
+                pattern
+                    .find_iter(text)
+                    .filter_map(|mat| CaptureRedactionSpan::new(mat.start(), mat.end())),
+            );
+        }
+
+        normalize_redaction_spans(spans)
+    }
+
+    fn redact_spans(&self, text: &str, spans: &[CaptureRedactionSpan]) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0;
+
+        for span in spans {
+            output.push_str(&text[cursor..span.start]);
+            match self.policy.mode {
+                CaptureRedactionMode::Mask | CaptureRedactionMode::Drop => {
+                    output.push_str(REDACTED_MARKER);
+                }
+                CaptureRedactionMode::Hash => {
+                    let digest = sha256_hex(&text[span.start..span.end]);
+                    output.push_str("[REDACTED:sha256:");
+                    output.push_str(&digest[..CAPTURE_REDACTION_HASH_PREFIX_HEX]);
+                    output.push(']');
+                }
+            }
+            cursor = span.end;
+        }
+
+        output.push_str(&text[cursor..]);
+        output
+    }
+}
+
+fn normalize_redaction_spans(mut spans: Vec<CaptureRedactionSpan>) -> Vec<CaptureRedactionSpan> {
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| right.end.cmp(&left.end))
+    });
+
+    let mut normalized: Vec<CaptureRedactionSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match normalized.last_mut() {
+            Some(last) if span.start <= last.end => {
+                last.end = last.end.max(span.end);
+            }
+            _ => normalized.push(span),
+        }
+    }
+    normalized
+}
+
+// ---------------------------------------------------------------------------
+// Hashing / summarization utilities
+// ---------------------------------------------------------------------------
+
+/// FNV-1a hash of a text string, returning the raw u64 digest.
+///
+/// Deterministic and fast; not cryptographic.
+#[must_use]
+pub fn fnv1a_hash_text(text: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// SHA-256 hex digest of a text string (lowercase, 64 chars).
+#[must_use]
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Truncate a decision input to at most 256 bytes on a valid UTF-8 boundary.
+///
+/// Returns a slice of the original string.
+#[must_use]
+pub fn summarize_decision_input(input: &str) -> &str {
+    const MAX_BYTES: usize = 256;
+    if input.len() <= MAX_BYTES {
+        return input;
+    }
+    // Walk backward from MAX_BYTES to find a char boundary.
+    let mut end = MAX_BYTES;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recording::{RecorderControlMarkerType, RecorderIngressKind, RecorderSegmentKind};
+    use serde_json::json;
+
+    fn make_adapter() -> (Arc<CollectingCaptureSink>, CaptureAdapter) {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let config = CaptureConfig {
+            session_id: Some("test-session-001".into()),
+            ..Default::default()
+        };
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
+        (sink, adapter)
+    }
+
+    #[test]
+    fn capture_constructor_rejects_invalid_policy_without_unwind_or_sink_events() {
+        for enabled in [true, false] {
+            for (policy, expected) in [
+                (
+                    CaptureRedactionPolicy {
+                        custom_patterns: vec!["[".to_string()],
+                        ..Default::default()
+                    },
+                    "custom_patterns[0]",
+                ),
+                (
+                    CaptureRedactionPolicy {
+                        t1_retention_days: 0,
+                        ..Default::default()
+                    },
+                    "t1_retention_days",
+                ),
+            ] {
+                let sink = Arc::new(CollectingCaptureSink::new());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    CaptureAdapter::new(
+                        sink.clone(),
+                        CaptureConfig {
+                            enabled,
+                            redaction_policy: policy,
+                            ..Default::default()
+                        },
+                    )
+                }))
+                .expect("invalid configuration must return an error, not unwind");
+                let error = result.err().expect("invalid policy must be rejected");
+                assert!(error.to_string().contains(expected), "{error}");
+                assert!(sink.is_empty(), "rejected construction must emit nothing");
+
+                // Correcting the policy preserves the positive capture path.
+                let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+                    .expect("valid capture configuration");
+                expect_capture(adapter.capture_egress(&make_segment(1, "valid capture", 0)));
+                assert_eq!(sink.len(), 1);
+            }
+        }
+    }
+
+    fn make_segment(pane_id: u64, content: &str, seq: u64) -> CapturedSegment {
+        CapturedSegment {
+            pane_id,
+            seq,
+            seq_correction: 0,
+            content: content.to_string(),
+            kind: crate::ingest::CapturedSegmentKind::Delta,
+            captured_at: 1700000000000,
+        }
+    }
+
+    fn make_gap_segment(pane_id: u64, reason: &str, seq: u64) -> CapturedSegment {
+        CapturedSegment {
+            pane_id,
+            seq,
+            seq_correction: 0,
+            content: String::new(),
+            kind: crate::ingest::CapturedSegmentKind::Gap {
+                reason: reason.to_string(),
+            },
+            captured_at: 1700000000000,
+        }
+    }
+
+    fn expect_capture(result: Result<(), ReplayCaptureSequenceError>) {
+        result.expect("test capture sequence must remain available");
+    }
+
+    fn seed_pane_frontier(adapter: &CaptureAdapter, pane_id: u64, next: u64) {
+        adapter
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pane_id, AtomicU64::new(next));
+    }
+
+    fn pane_frontier(adapter: &CaptureAdapter, pane_id: u64) -> u64 {
+        adapter
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pane_id)
+            .expect("pane frontier must exist")
+            .load(Ordering::Relaxed)
+    }
+
+    fn make_egress_event(pane_id: u64, sequence: u64) -> EgressEvent {
+        EgressEvent {
+            pane_id,
+            text: format!("pane-{pane_id}-sequence-{sequence}"),
+            segment_kind: RecorderSegmentKind::Delta,
+            is_gap: false,
+            gap_reason: None,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 1_700_000_000_000,
+            sequence,
+        }
+    }
+
+    // --- Basic egress capture ---
+
+    #[test]
+    fn test_capture_egress_delta_produces_recorder_event() {
+        let (sink, adapter) = make_adapter();
+        let seg = make_segment(42, "hello world", 0);
+        expect_capture(adapter.capture_egress(&seg));
+
+        assert_eq!(sink.len(), 1);
+        let events = sink.recorder_events();
+        let evt = &events[0];
+        assert_eq!(evt.pane_id, 42);
+        assert_eq!(evt.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
+        assert_eq!(evt.session_id, Some("test-session-001".into()));
+        match &evt.payload {
+            RecorderEventPayload::EgressOutput {
+                text,
+                is_gap,
+                segment_kind,
+                ..
+            } => {
+                assert_eq!(text, "hello world");
+                assert!(!is_gap);
+                assert_eq!(*segment_kind, RecorderSegmentKind::Delta);
+            }
+            _ => panic!("expected EgressOutput payload"),
+        }
+    }
+
+    #[test]
+    fn test_capture_egress_gap_produces_gap_event() {
+        let (sink, adapter) = make_adapter();
+        let seg = make_gap_segment(42, "stream_overflow", 0);
+        expect_capture(adapter.capture_egress(&seg));
+
+        assert_eq!(sink.len(), 1);
+        let evt = &sink.recorder_events()[0];
+        match &evt.payload {
+            RecorderEventPayload::EgressOutput {
+                is_gap,
+                segment_kind,
+                ..
+            } => {
+                assert!(*is_gap);
+                assert_eq!(*segment_kind, RecorderSegmentKind::Gap);
+            }
+            _ => panic!("expected EgressOutput"),
+        }
+    }
+
+    #[test]
+    fn test_capture_egress_assigns_deterministic_event_id() {
+        let (sink, adapter) = make_adapter();
+        let seg = make_segment(1, "deterministic", 0);
+        expect_capture(adapter.capture_egress(&seg));
+
+        let evt = &sink.recorder_events()[0];
+        assert_ne!(evt.event_id, "");
+        assert_eq!(evt.event_id.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn test_event_id_differs_for_different_content() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "aaa", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "bbb", 1)));
+
+        let events = sink.recorder_events();
+        assert_ne!(events[0].event_id, events[1].event_id);
+    }
+
+    #[test]
+    fn test_event_id_same_content_same_pane_different_sequence() {
+        let (sink, adapter) = make_adapter();
+        // Same content but different sequence → different event_id
+        expect_capture(adapter.capture_egress(&make_segment(1, "same", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "same", 1)));
+
+        let events = sink.recorder_events();
+        // sequence is assigned by adapter (internal counter), so IDs differ
+        assert_ne!(events[0].event_id, events[1].event_id);
+    }
+
+    // --- Sequence numbering ---
+
+    #[test]
+    fn test_per_pane_sequences_are_monotonic() {
+        let (sink, adapter) = make_adapter();
+        for i in 0..5 {
+            expect_capture(adapter.capture_egress(&make_segment(1, &format!("msg{i}"), i)));
+        }
+
+        let events = sink.recorder_events();
+        for (i, event) in events.iter().enumerate().take(5) {
+            assert_eq!(event.sequence, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_different_panes_have_independent_sequences() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "p1a", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(2, "p2a", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "p1b", 1)));
+        expect_capture(adapter.capture_egress(&make_segment(2, "p2b", 1)));
+
+        let events = sink.recorder_events();
+        // Pane 1: seq 0, 1
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[2].sequence, 1);
+        // Pane 2: seq 0, 1
+        assert_eq!(events[1].sequence, 0);
+        assert_eq!(events[3].sequence, 1);
+    }
+
+    #[test]
+    fn pane_sequence_reserves_max_as_a_sticky_sentinel() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 91;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+
+        expect_capture(adapter.capture_lifecycle(
+            pane_id,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+        assert_eq!(adapter.total_captured(), 1);
+
+        for _ in 0..2 {
+            let error = adapter
+                .capture_control(pane_id, RecorderControlMarkerType::Resize, json!({}))
+                .expect_err("the terminal sentinel must remain sticky");
+            assert_eq!(error, ReplayCaptureSequenceError::PaneExhausted { pane_id });
+            assert_eq!(
+                sink.len(),
+                1,
+                "an exhausted capture must not reach the sink"
+            );
+            assert_eq!(
+                adapter.total_captured(),
+                1,
+                "an exhausted capture must not mutate diagnostics"
+            );
+            assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn concurrent_pane_exhaustion_emits_max_minus_one_exactly_once() {
+        const THREADS: usize = 16;
+
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = Arc::new(
+            CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+                .expect("valid capture configuration"),
+        );
+        let pane_id = 92;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        // Spawn every barrier participant eagerly before joining any of them;
+        // a lazy spawn-and-join iterator would deadlock on the first handle.
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let adapter = Arc::clone(&adapter);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                adapter.capture_lifecycle(
+                    pane_id,
+                    RecorderLifecyclePhase::PaneOpened,
+                    None,
+                    json!({}),
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("capture thread must not panic"))
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    **result == Err(ReplayCaptureSequenceError::PaneExhausted { pane_id })
+                })
+                .count(),
+            THREADS - 1
+        );
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, u64::MAX - 1);
+        assert_eq!(adapter.total_captured(), 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+    }
+
+    #[test]
+    fn supplied_durable_sequence_advances_frontier_and_rejects_reuse() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 93;
+
+        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, 7)));
+        expect_capture(adapter.capture_lifecycle(
+            pane_id,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 7);
+        assert_eq!(events[1].sequence, 8);
+        assert_eq!(pane_frontier(&adapter, pane_id), 9);
+
+        let error = adapter
+            .capture_egress_event(&make_egress_event(pane_id, 7))
+            .expect_err("a supplied durable identity must never be reused");
+        assert_eq!(
+            error,
+            ReplayCaptureSequenceError::RegressingSuppliedSequence {
+                pane_id,
+                supplied: 7,
+                next_admissible: 9,
+            }
+        );
+        assert_eq!(sink.len(), 2, "rejected reuse must not invoke the sink");
+        assert_eq!(adapter.total_captured(), 2);
+        assert_eq!(pane_frontier(&adapter, pane_id), 9);
+
+        let reserved_pane = 94;
+        let error = adapter
+            .capture_egress_event(&make_egress_event(reserved_pane, u64::MAX))
+            .expect_err("u64::MAX is not an event identity");
+        assert_eq!(
+            error,
+            ReplayCaptureSequenceError::ReservedSuppliedSequence {
+                pane_id: reserved_pane
+            }
+        );
+        assert_eq!(sink.len(), 2);
+        assert_eq!(adapter.total_captured(), 2);
+        assert!(
+            !adapter
+                .pane_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&reserved_pane),
+            "reserved identity rejection must not create pane state"
+        );
+    }
+
+    #[test]
+    fn supplied_max_minus_one_is_last_usable_identity() {
+        let (sink, adapter) = make_adapter();
+        let pane_id = 95;
+
+        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, u64::MAX - 1)));
+        assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+
+        let error = adapter
+            .capture_lifecycle(
+                pane_id,
+                RecorderLifecyclePhase::CaptureStopped,
+                None,
+                json!({}),
+            )
+            .expect_err("the supplied last identity must exhaust the pane");
+        assert_eq!(error, ReplayCaptureSequenceError::PaneExhausted { pane_id });
+        assert_eq!(sink.len(), 1);
+        assert_eq!(adapter.total_captured(), 1);
+    }
+
+    #[test]
+    fn independent_capture_adapters_produce_the_same_v1_identity() {
+        let (left_sink, left) = make_adapter();
+        let (right_sink, right) = make_adapter();
+        let pane_id = 96;
+
+        expect_capture(left.capture_egress_event(&make_egress_event(pane_id, 3)));
+        expect_capture(right.capture_egress_event(&make_egress_event(pane_id, 3)));
+
+        let left_event = &left_sink.recorder_events()[0];
+        let right_event = &right_sink.recorder_events()[0];
+        assert_eq!(left_event.sequence, 3);
+        assert_eq!(right_event.sequence, 3);
+        assert_eq!(
+            left_event.event_id, right_event.event_id,
+            "independent observers must derive identity only from RecorderEvent v1 fields"
+        );
+    }
+
+    #[test]
+    fn total_captured_saturates_without_regression() {
+        let (sink, adapter) = make_adapter();
+        adapter
+            .total_captured
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        expect_capture(adapter.capture_egress(&make_segment(1, "last-count", 0)));
+        assert_eq!(adapter.total_captured(), u64::MAX);
+        expect_capture(adapter.capture_egress(&make_segment(2, "saturated-count", 0)));
+        assert_eq!(adapter.total_captured(), u64::MAX);
+        assert_eq!(
+            sink.len(),
+            2,
+            "counter saturation must not drop valid events"
+        );
+    }
+
+    #[test]
+    fn egress_tap_failure_is_bounded_and_never_reaches_sink() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+            .expect("valid capture configuration");
+        let pane_id = 97;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX);
+        adapter
+            .sequence_error_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 0));
+        EgressTap::on_egress(&adapter, make_egress_event(pane_id, 1));
+
+        assert!(sink.is_empty());
+        assert_eq!(adapter.total_captured(), 0);
+        assert_eq!(adapter.sequence_error_count(), u64::MAX);
+        assert!(
+            adapter.sequence_error_warned.load(Ordering::Acquire),
+            "the first void-boundary failure must publish its one warning"
+        );
+    }
+
+    #[test]
+    fn ingress_tap_stops_after_the_first_sequence_error() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(sink.clone(), CaptureConfig::default())
+            .expect("valid capture configuration");
+        let pane_id = 98;
+        seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
+
+        let ingress = || IngressEvent {
+            pane_id,
+            text: "bounded tap".to_string(),
+            source: RecorderEventSource::OperatorAction,
+            ingress_kind: RecorderIngressKind::SendText,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 1_700_000_000_000,
+            outcome: IngressOutcome::Allowed,
+            workflow_id: None,
+        };
+
+        IngressTap::on_ingress(&adapter, ingress());
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, u64::MAX - 1);
+        assert!(matches!(
+            events[0].payload,
+            RecorderEventPayload::IngressText { .. }
+        ));
+        assert_eq!(adapter.sequence_error_count(), 1);
+        assert_eq!(adapter.total_captured(), 1);
+
+        IngressTap::on_ingress(&adapter, ingress());
+        assert_eq!(
+            sink.len(),
+            1,
+            "the tap must not invoke either sink path after ingress admission fails"
+        );
+        assert_eq!(adapter.sequence_error_count(), 2);
+        assert_eq!(adapter.total_captured(), 1);
+        assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
+    }
+
+    // --- Merge key ---
+
+    #[test]
+    fn test_merge_key_has_correct_stream_kind() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "test", 0)));
+
+        let (_, mk) = &sink.events()[0];
+        assert_eq!(mk.stream_kind, StreamKind::Egress);
+    }
+
+    #[test]
+    fn test_merge_key_matches_event_fields() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "test", 0)));
+
+        let (evt, mk) = &sink.events()[0];
+        assert_eq!(mk.pane_id, evt.pane_id);
+        assert_eq!(mk.sequence, evt.sequence);
+        assert_eq!(mk.event_id, evt.event_id);
+        assert_eq!(mk.recorded_at_ms, evt.recorded_at_ms);
+    }
+
+    // --- Lifecycle capture ---
+
+    #[test]
+    fn test_capture_lifecycle_pane_opened() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_lifecycle(
+            10,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({"title": "bash"}),
+        ));
+
+        assert_eq!(sink.len(), 1);
+        let evt = &sink.recorder_events()[0];
+        assert_eq!(evt.pane_id, 10);
+        match &evt.payload {
+            RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase,
+                details,
+                ..
+            } => {
+                assert_eq!(*lifecycle_phase, RecorderLifecyclePhase::PaneOpened);
+                assert_eq!(details["title"], "bash");
+            }
+            _ => panic!("expected LifecycleMarker"),
+        }
+    }
+
+    #[test]
+    fn test_capture_lifecycle_pane_closed_with_reason() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_lifecycle(
+            10,
+            RecorderLifecyclePhase::PaneClosed,
+            Some("user_exit".into()),
+            json!({}),
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        match &evt.payload {
+            RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase,
+                reason,
+                ..
+            } => {
+                assert_eq!(*lifecycle_phase, RecorderLifecyclePhase::PaneClosed);
+                assert_eq!(reason.as_deref(), Some("user_exit"));
+            }
+            _ => panic!("expected LifecycleMarker"),
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_has_lifecycle_stream_kind() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
+
+        let (_, mk) = &sink.events()[0];
+        assert_eq!(mk.stream_kind, StreamKind::Lifecycle);
+    }
+
+    #[test]
+    fn test_capture_started_and_stopped() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_lifecycle(
+            0,
+            RecorderLifecyclePhase::CaptureStarted,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_lifecycle(
+            0,
+            RecorderLifecyclePhase::CaptureStopped,
+            None,
+            json!({}),
+        ));
+        assert_eq!(sink.len(), 2);
+    }
+
+    // --- Control marker capture ---
+
+    #[test]
+    fn test_capture_control_resize() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_control(
+            5,
+            RecorderControlMarkerType::Resize,
+            json!({"cols": 120, "rows": 40}),
+        ));
+
+        assert_eq!(sink.len(), 1);
+        let evt = &sink.recorder_events()[0];
+        match &evt.payload {
+            RecorderEventPayload::ControlMarker {
+                control_marker_type,
+                details,
+            } => {
+                assert_eq!(*control_marker_type, RecorderControlMarkerType::Resize);
+                assert_eq!(details["cols"], 120);
+                assert_eq!(details["rows"], 40);
+            }
+            _ => panic!("expected ControlMarker"),
+        }
+    }
+
+    #[test]
+    fn test_capture_control_prompt_boundary() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_control(
+            5,
+            RecorderControlMarkerType::PromptBoundary,
+            json!({"cwd": "/home/user"}),
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        match &evt.payload {
+            RecorderEventPayload::ControlMarker {
+                control_marker_type,
+                ..
+            } => {
+                assert_eq!(
+                    *control_marker_type,
+                    RecorderControlMarkerType::PromptBoundary
+                );
+            }
+            _ => panic!("expected ControlMarker"),
+        }
+    }
+
+    #[test]
+    fn test_control_has_control_stream_kind() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
+
+        let (_, mk) = &sink.events()[0];
+        assert_eq!(mk.stream_kind, StreamKind::Control);
+    }
+
+    // --- Ingress capture ---
+
+    #[test]
+    fn test_capture_ingress_send_text() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            7,
+            "ls -la\n".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::RobotMode,
+            None,
+            RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+        ));
+
+        assert_eq!(sink.len(), 1);
+        let evt = &sink.recorder_events()[0];
+        assert_eq!(evt.pane_id, 7);
+        assert_eq!(evt.source, RecorderEventSource::RobotMode);
+        match &evt.payload {
+            RecorderEventPayload::IngressText {
+                text, ingress_kind, ..
+            } => {
+                assert_eq!(text, "ls -la\n");
+                assert_eq!(*ingress_kind, RecorderIngressKind::SendText);
+            }
+            _ => panic!("expected IngressText"),
+        }
+    }
+
+    #[test]
+    fn test_capture_ingress_workflow_action() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            7,
+            "approve".into(),
+            RecorderIngressKind::WorkflowAction,
+            RecorderEventSource::WorkflowEngine,
+            Some("wf-001".into()),
+            RecorderEventCausality {
+                parent_event_id: Some("parent-evt".into()),
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        assert_eq!(evt.workflow_id, Some("wf-001".into()));
+        assert_eq!(evt.causality.parent_event_id, Some("parent-evt".into()));
+    }
+
+    #[test]
+    fn test_ingress_has_ingress_stream_kind() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            1,
+            "x".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+
+        let (_, mk) = &sink.events()[0];
+        assert_eq!(mk.stream_kind, StreamKind::Ingress);
+    }
+
+    // --- Enable/disable ---
+
+    #[test]
+    fn test_disabled_adapter_captures_nothing() {
+        let (sink, adapter) = make_adapter();
+        adapter.set_enabled(false);
+        expect_capture(adapter.capture_egress(&make_segment(1, "should be dropped", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
+        expect_capture(adapter.capture_ingress(
+            1,
+            "x".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_enabled_at_runtime() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "first", 0)));
+        assert_eq!(sink.len(), 1);
+
+        adapter.set_enabled(false);
+        expect_capture(adapter.capture_egress(&make_segment(1, "dropped", 1)));
+        assert_eq!(sink.len(), 1);
+
+        adapter.set_enabled(true);
+        expect_capture(adapter.capture_egress(&make_segment(1, "third", 2)));
+        assert_eq!(sink.len(), 2);
+    }
+
+    #[test]
+    fn test_disabled_constructor_captures_nothing() {
+        let adapter = CaptureAdapter::disabled().expect("valid disabled capture configuration");
+        expect_capture(adapter.capture_egress(&make_segment(1, "nope", 0)));
+        assert_eq!(adapter.total_captured(), 0);
+    }
+
+    // --- Total captured counter ---
+
+    #[test]
+    fn test_total_captured_increments() {
+        let (_sink, adapter) = make_adapter();
+        assert_eq!(adapter.total_captured(), 0);
+        expect_capture(adapter.capture_egress(&make_segment(1, "a", 0)));
+        assert_eq!(adapter.total_captured(), 1);
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        assert_eq!(adapter.total_captured(), 2);
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
+        assert_eq!(adapter.total_captured(), 3);
+    }
+
+    // --- Schema version ---
+
+    #[test]
+    fn test_all_events_have_correct_schema_version() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
+        expect_capture(adapter.capture_ingress(
+            1,
+            "y".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+
+        for evt in sink.recorder_events() {
+            assert_eq!(evt.schema_version, "ft.recorder.event.v1");
+        }
+    }
+
+    // --- Causality ---
+
+    #[test]
+    fn test_egress_has_empty_causality_by_default() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+
+        let evt = &sink.recorder_events()[0];
+        assert!(evt.causality.parent_event_id.is_none());
+        assert!(evt.causality.trigger_event_id.is_none());
+        assert!(evt.causality.root_event_id.is_none());
+    }
+
+    #[test]
+    fn test_ingress_preserves_causality_chain() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            1,
+            "cmd".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::WorkflowEngine,
+            None,
+            RecorderEventCausality {
+                parent_event_id: Some("p1".into()),
+                trigger_event_id: Some("t1".into()),
+                root_event_id: Some("r1".into()),
+            },
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        assert_eq!(evt.causality.parent_event_id.as_deref(), Some("p1"));
+        assert_eq!(evt.causality.trigger_event_id.as_deref(), Some("t1"));
+        assert_eq!(evt.causality.root_event_id.as_deref(), Some("r1"));
+    }
+
+    // --- Empty content ---
+
+    #[test]
+    fn test_empty_text_egress_captured() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "", 0)));
+        assert_eq!(sink.len(), 1);
+        match &sink.recorder_events()[0].payload {
+            RecorderEventPayload::EgressOutput { text, .. } => {
+                assert_eq!(text, "");
+            }
+            _ => panic!("expected EgressOutput"),
+        }
+    }
+
+    #[test]
+    fn test_empty_text_ingress_captured() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            1,
+            String::new(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+        assert_eq!(sink.len(), 1);
+    }
+
+    // --- JSON serialization roundtrip ---
+
+    #[test]
+    fn test_captured_event_serializes_to_valid_json() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "hello", 0)));
+
+        let evt = &sink.recorder_events()[0];
+        let json_str = serde_json::to_string(evt).unwrap();
+        assert!(json_str.contains("egress_output"));
+        assert!(json_str.contains("hello"));
+
+        // Roundtrip
+        let parsed: RecorderEvent = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.event_id, evt.event_id);
+        assert_eq!(parsed.pane_id, evt.pane_id);
+    }
+
+    #[test]
+    fn test_lifecycle_event_serializes_to_valid_json() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        let json_str = serde_json::to_string(evt).unwrap();
+        assert!(json_str.contains("lifecycle_marker"));
+        assert!(json_str.contains("pane_opened"));
+    }
+
+    #[test]
+    fn test_control_event_serializes_to_valid_json() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_control(
+            1,
+            RecorderControlMarkerType::Resize,
+            json!({"cols": 80}),
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        let json_str = serde_json::to_string(evt).unwrap();
+        assert!(json_str.contains("control_marker"));
+        assert!(json_str.contains("resize"));
+    }
+
+    // --- EgressTap implementation ---
+
+    #[test]
+    fn test_egress_tap_impl() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let config = CaptureConfig::default();
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
+
+        let egress = EgressEvent {
+            pane_id: 99,
+            text: "tap test".into(),
+            segment_kind: RecorderSegmentKind::Delta,
+            is_gap: false,
+            gap_reason: None,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 1700000000000,
+            sequence: 0,
+        };
+
+        // Use the EgressTap trait
+        EgressTap::on_egress(&adapter, egress);
+
+        assert_eq!(sink.len(), 1);
+        let evt = &sink.recorder_events()[0];
+        assert_eq!(evt.pane_id, 99);
+    }
+
+    #[test]
+    fn test_ingress_tap_impl_records_ingress_and_decision_marker() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let config = CaptureConfig::default();
+        let adapter =
+            CaptureAdapter::new(sink.clone(), config).expect("valid capture configuration");
+
+        IngressTap::on_ingress(
+            &adapter,
+            IngressEvent {
+                pane_id: 77,
+                text: "rm -rf /".to_string(),
+                source: RecorderEventSource::OperatorAction,
+                ingress_kind: RecorderIngressKind::SendText,
+                redaction: RecorderRedactionLevel::Partial,
+                occurred_at_ms: 1700000000000,
+                outcome: IngressOutcome::Denied {
+                    reason: "policy deny".to_string(),
+                },
+                workflow_id: Some("wf-77".to_string()),
+            },
+        );
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].payload,
+            RecorderEventPayload::IngressText { .. }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            RecorderEventPayload::ControlMarker { .. }
+        ));
+    }
+
+    // --- Negative timestamp ---
+
+    #[test]
+    fn test_negative_captured_at_uses_epoch_now() {
+        let (sink, adapter) = make_adapter();
+        let mut seg = make_segment(1, "neg", 0);
+        seg.captured_at = -1;
+        expect_capture(adapter.capture_egress(&seg));
+
+        let evt = &sink.recorder_events()[0];
+        // Should be a recent timestamp, not negative or zero
+        assert!(evt.occurred_at_ms > 1600000000000);
+    }
+
+    // --- Mixed event types maintain independent sequences ---
+
+    #[test]
+    fn test_mixed_event_types_share_pane_sequence() {
+        let (sink, adapter) = make_adapter();
+        // All events for pane 1 share one sequence counter
+        expect_capture(adapter.capture_egress(&make_segment(1, "e1", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
+        expect_capture(adapter.capture_ingress(
+            1,
+            "i1".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 4);
+        // Sequences should be 0, 1, 2, 3
+        for (i, evt) in events.iter().enumerate() {
+            assert_eq!(evt.sequence, i as u64, "event {i} has wrong sequence");
+        }
+    }
+
+    // --- Collecting sink operations ---
+
+    #[test]
+    fn test_collecting_sink_clear() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+        assert_eq!(sink.len(), 1);
+        sink.clear();
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn test_collecting_sink_events_returns_clone() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+        let events1 = sink.events();
+        let events2 = sink.events();
+        assert_eq!(events1.len(), events2.len());
+        assert_eq!(events1[0].0.event_id, events2[0].0.event_id);
+    }
+
+    #[test]
+    fn collecting_sink_recovers_from_poisoned_events_lock() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig {
+                session_id: Some("test-session-sink-poison".into()),
+                ..Default::default()
+            },
+        )
+        .expect("valid capture configuration");
+
+        let sink_for_poison = Arc::clone(&sink);
+        let poison = std::thread::spawn(move || {
+            let _guard = sink_for_poison
+                .events
+                .lock()
+                .expect("acquire fresh collecting sink lock to poison");
+            panic!("deliberately poisoning the collecting sink mutex");
+        });
+        let _ = poison.join();
+        assert!(
+            sink.events.is_poisoned(),
+            "spawned thread should have poisoned the collecting sink lock"
+        );
+
+        assert!(sink.is_empty(), "read helpers recover from poison");
+        expect_capture(adapter.capture_egress(&make_segment(1, "after-poison", 0)));
+
+        assert_eq!(sink.len(), 1);
+        assert_eq!(sink.recorder_events().len(), 1);
+        assert_eq!(sink.events().len(), 1);
+
+        sink.clear();
+        assert!(sink.is_empty(), "clear recovers from poison too");
+    }
+
+    // --- Merge key ordering ---
+
+    #[test]
+    fn test_merge_keys_sortable_across_panes() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(2, "pane2", 0)));
+        expect_capture(adapter.capture_egress(&make_segment(1, "pane1", 0)));
+
+        let events = sink.events();
+        let mut keys: Vec<_> = events.iter().map(|(_, mk)| mk.clone()).collect();
+        keys.sort();
+
+        // After sorting, pane 1 should come before pane 2 (same timestamp)
+        assert!(
+            keys[0].pane_id <= keys[1].pane_id || keys[0].recorded_at_ms < keys[1].recorded_at_ms
+        );
+    }
+
+    #[test]
+    fn test_merge_key_stream_kind_ordering() {
+        let (sink, adapter) = make_adapter();
+        // Egress (rank 3) then Lifecycle (rank 0)
+        expect_capture(adapter.capture_egress(&make_segment(1, "e", 0)));
+        expect_capture(adapter.capture_lifecycle(
+            1,
+            RecorderLifecyclePhase::PaneOpened,
+            None,
+            json!({}),
+        ));
+
+        let events = sink.events();
+        let mut kinds: Vec<_> = events.iter().map(|(_, mk)| mk.stream_kind).collect();
+        kinds.sort();
+
+        // Lifecycle (rank 0) should sort before Egress (rank 3)
+        assert_eq!(kinds[0], StreamKind::Lifecycle);
+        assert_eq!(kinds[1], StreamKind::Egress);
+    }
+
+    // --- Default source ---
+
+    #[test]
+    fn test_default_source_is_wezterm_mux() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "x", 0)));
+        assert_eq!(
+            sink.recorder_events()[0].source,
+            RecorderEventSource::WeztermMux
+        );
+    }
+
+    // --- parse roundtrip via parse_recorder_event_json ---
+
+    #[test]
+    fn test_captured_event_passes_schema_validation() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "validate me", 0)));
+
+        let evt = &sink.recorder_events()[0];
+        let json_str = serde_json::to_string(evt).unwrap();
+        let parsed = crate::recording::parse_recorder_event_json(&json_str);
+        assert!(parsed.is_ok(), "schema validation failed: {parsed:?}");
+    }
+
+    #[test]
+    fn test_ingress_event_passes_schema_validation() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_ingress(
+            1,
+            "cmd".into(),
+            RecorderIngressKind::SendText,
+            RecorderEventSource::OperatorAction,
+            None,
+            RecorderEventCausality::default(),
+        ));
+
+        let evt = &sink.recorder_events()[0];
+        let json_str = serde_json::to_string(evt).unwrap();
+        let parsed = crate::recording::parse_recorder_event_json(&json_str);
+        assert!(
+            parsed.is_ok(),
+            "ingress schema validation failed: {parsed:?}"
+        );
+    }
+
+    // --- Unicode content ---
+
+    #[test]
+    fn test_unicode_content_captured_correctly() {
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_egress(&make_segment(1, "日本語テスト 🎉", 0)));
+
+        let evt = &sink.recorder_events()[0];
+        match &evt.payload {
+            RecorderEventPayload::EgressOutput { text, .. } => {
+                assert_eq!(text, "日本語テスト 🎉");
+            }
+            _ => panic!("expected EgressOutput"),
+        }
+    }
+
+    // --- Large content ---
+
+    #[test]
+    fn test_large_content_captured() {
+        let (sink, adapter) = make_adapter();
+        let large = "x".repeat(1_000_000);
+        expect_capture(adapter.capture_egress(&make_segment(1, &large, 0)));
+
+        assert_eq!(sink.len(), 1);
+        match &sink.recorder_events()[0].payload {
+            RecorderEventPayload::EgressOutput { text, .. } => {
+                assert_eq!(text.len(), 1_000_000);
+            }
+            _ => panic!("expected EgressOutput"),
+        }
+    }
+
+    // --- Multiple panes interleaved ---
+
+    #[test]
+    fn test_interleaved_panes_all_captured() {
+        let (sink, adapter) = make_adapter();
+        for i in 0..10u64 {
+            let pane_id = i % 3;
+            expect_capture(adapter.capture_egress(&make_segment(pane_id, &format!("msg{i}"), i)));
+        }
+        assert_eq!(sink.len(), 10);
+    }
+
+    /// ft-xvrlp: poison the `pane_sequences` Mutex by panicking inside a
+    /// lock guard, then confirm the next capture call (which calls
+    /// `next_pane_seq` internally) recovers gracefully and the recorder
+    /// keeps producing events. Pre-fix, this test would panic at
+    /// `Mutex::lock().unwrap()` and abort the recorder for the rest of
+    /// the process.
+    #[test]
+    fn next_pane_seq_recovers_from_poisoned_mutex() {
+        // CaptureAdapter is owned by `make_adapter`; wrap in Arc so a
+        // poisoning thread can hold a reference to its internal Mutex
+        // while the main thread continues to drive captures.
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = Arc::new(
+            CaptureAdapter::new(
+                sink.clone(),
+                CaptureConfig {
+                    session_id: Some("test-session-poison".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("valid capture configuration"),
+        );
+
+        // Baseline: the recorder works pre-poison.
+        expect_capture(adapter.capture_egress(&make_segment(7, "before-poison", 0)));
+        assert_eq!(sink.len(), 1);
+
+        // Poison the pane_sequences Mutex from a separate thread.
+        let adapter_for_poison = Arc::clone(&adapter);
+        let poison = std::thread::spawn(move || {
+            let _guard = adapter_for_poison
+                .pane_sequences
+                .lock()
+                .expect("acquire fresh lock to poison");
+            panic!("ft-xvrlp: deliberately poisoning the pane_sequences mutex");
+        });
+        let _ = poison.join();
+        assert!(
+            adapter.pane_sequences.is_poisoned(),
+            "spawned thread should have poisoned the lock"
+        );
+
+        // Contract: capture_egress must still emit after poison. The
+        // pre-fix `.lock().unwrap()` would abort this thread on the
+        // next next_pane_seq call.
+        expect_capture(adapter.capture_egress(&make_segment(7, "after-poison", 1)));
+        assert_eq!(
+            sink.len(),
+            2,
+            "capture_egress must succeed after pane_sequences poison"
+        );
+
+        // Fresh pane id forces a HashMap entry insert through the
+        // recovered lock guard. Confirms the recovered HashMap is
+        // structurally usable, not just readable.
+        expect_capture(adapter.capture_egress(&make_segment(99, "fresh-pane-after-poison", 0)));
+        assert_eq!(sink.len(), 3);
+    }
+
+    // --- br-ft-zkthg: PolicyDecision drop counter regression tests ---
+
+    fn make_decision(pane_id: u64) -> DecisionEvent {
+        DecisionEvent {
+            decision_type: DecisionType::PolicyEvaluation,
+            rule_id: "rule-001".into(),
+            definition_hash: "def-hash".into(),
+            input_hash: "in-hash".into(),
+            input_summary: "input".into(),
+            output_hash: "out-hash".into(),
+            timestamp_ms: 1700000000000,
+            pane_id,
+            parent_event_id: None,
+            confidence: Some(0.95),
+            triggered_by: None,
+            overrides: None,
+            wall_clock_ms: 1700000000000,
+            replay_run_id: "ft-zkthg-test-run".into(),
+        }
+    }
+
+    #[test]
+    fn ft_zkthg_drop_counter_starts_at_zero_after_reset() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 0);
+    }
+
+    #[test]
+    fn ft_zkthg_clean_capture_decision_does_not_bump_drop_counter() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        let baseline = replay_capture_policy_decision_drop_count();
+
+        let (sink, adapter) = make_adapter();
+        expect_capture(adapter.capture_decision(
+            RecorderEventSource::WorkflowEngine,
+            Some("corr-zkthg-001".into()),
+            make_decision(123),
+        ));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            RecorderEventPayload::ControlMarker {
+                control_marker_type,
+                details,
+            } => {
+                assert!(matches!(
+                    control_marker_type,
+                    RecorderControlMarkerType::PolicyDecision
+                ));
+                assert!(
+                    !details.is_null(),
+                    "DecisionEvent serializes to a non-null Value on success"
+                );
+            }
+            other => panic!("Expected ControlMarker payload, got {other:?}"),
+        }
+
+        assert_eq!(
+            replay_capture_policy_decision_drop_count(),
+            baseline,
+            "no drop expected on successful PolicyDecision serialization"
+        );
+    }
+
+    #[test]
+    fn ft_zkthg_drop_counter_saturates_and_resets_deterministically() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Without a way to force serde_json::to_value(&DecisionEvent) to
+        // fail (the type is composed of primitives + String + structured
+        // serializable variants — Serialize is effectively infallible),
+        // this test pins the contract that the counter is at least
+        // observable, monotonic across reads, and resettable. The actual
+        // drop path is exercised whenever the underlying serde
+        // implementation breaks for the type — at which point operators
+        // see the counter rise and the warn! emits structured context.
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        let initial = replay_capture_policy_decision_drop_count();
+        let later = replay_capture_policy_decision_drop_count();
+        assert_eq!(initial, 0);
+        assert_eq!(
+            later, initial,
+            "counter is stable across reads when no drops occur"
+        );
+
+        // Direct bumper exercise (private helper; tests live in the
+        // same module via the inline `mod tests`).
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 1);
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 2);
+
+        REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.store(u64::MAX - 1, Ordering::Relaxed);
+        record_replay_capture_policy_decision_drop();
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(
+            replay_capture_policy_decision_drop_count(),
+            u64::MAX,
+            "the adjacent replay diagnostic must saturate rather than wrap"
+        );
+
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 0);
+    }
+
+    // ft-pfton introduced the policy shape; ft-2aiow wires it into
+    // CaptureAdapter. These tests keep the secure defaults, validation, and
+    // custom-pattern capture path from silently regressing.
+    #[test]
+    fn capture_redaction_policy_default_is_secure_target() {
+        let policy = CaptureRedactionPolicy::default();
+        assert!(policy.enabled, "default policy must target redaction ON");
+        assert_eq!(policy.mode, CaptureRedactionMode::Mask);
+        assert_eq!(policy.t1_retention_days, 90);
+        assert_eq!(policy.t2_retention_days, 30);
+        assert_eq!(policy.t3_retention_days, 7);
+        // T3 (most sensitive) must not be retained longer than T1 (routine).
+        assert!(
+            policy.t3_retention_days <= policy.t1_retention_days,
+            "sensitive T3 retention must not exceed routine T1 retention"
+        );
+        assert_eq!(policy.custom_patterns, [] as [std::string::String; 0]);
+    }
+
+    #[test]
+    fn capture_redaction_policy_rejects_malformed_custom_pattern() {
+        let policy = CaptureRedactionPolicy {
+            custom_patterns: vec!["(".to_string()],
+            ..Default::default()
+        };
+        let err = policy
+            .validate()
+            .expect_err("invalid regex must fail closed");
+        assert!(
+            err.contains("custom_patterns[0] is invalid regex"),
+            "unexpected validation error: {err}"
+        );
+
+        let config = CaptureConfig {
+            redaction_policy: policy,
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "CaptureConfig must reject malformed redaction policy"
+        );
+    }
+
+    #[test]
+    fn capture_redaction_policy_retention_config_uses_policy_tiers() {
+        let policy = CaptureRedactionPolicy {
+            t1_retention_days: 60,
+            t2_retention_days: 14,
+            t3_retention_days: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T1),
+            60
+        );
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T2),
+            14
+        );
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T3),
+            2
+        );
+
+        let retention = policy
+            .to_retention_config()
+            .expect("policy must convert into retention config");
+        assert_eq!(retention.t1_extended_days, 60);
+        assert_eq!(retention.cold_days, 14);
+        assert_eq!(retention.t3_max_hours, 48);
+    }
+
+    #[test]
+    fn capture_redaction_policy_custom_pattern_redacts_egress_on_wired_path() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig {
+                redaction_policy: CaptureRedactionPolicy {
+                    custom_patterns: vec![r"codex-secret-[0-9]{4}".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("valid capture configuration");
+
+        expect_capture(adapter.capture_egress(&make_segment(
+            42,
+            "safe prefix codex-secret-1234 safe suffix",
+            0,
+        )));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            RecorderEventPayload::EgressOutput {
+                text, redaction, ..
+            } => {
+                assert!(
+                    !text.contains("codex-secret-1234"),
+                    "custom-pattern secret leaked through capture path: {text}"
+                );
+                assert!(text.contains(crate::redactor::REDACTED_MARKER), "{text}");
+                assert_eq!(*redaction, RecorderRedactionLevel::Full);
+            }
+            other => panic!("expected EgressOutput payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_redaction_policy_serde_roundtrip() {
+        let policy = CaptureRedactionPolicy {
+            enabled: true,
+            mode: CaptureRedactionMode::Drop,
+            t1_retention_days: 10,
+            t2_retention_days: 5,
+            t3_retention_days: 1,
+            custom_patterns: vec!["sk-[A-Za-z0-9]+".to_string()],
+        };
+        let json = serde_json::to_string(&policy).expect("serialize policy");
+        let back: CaptureRedactionPolicy = serde_json::from_str(&json).expect("deserialize policy");
+        assert_eq!(policy, back);
+        // custom_patterns is #[serde(default)] — absent input must not error.
+        let minimal = r#"{"enabled":false,"mode":"hash","t1_retention_days":1,"t2_retention_days":1,"t3_retention_days":1}"#;
+        let parsed: CaptureRedactionPolicy =
+            serde_json::from_str(minimal).expect("deserialize without custom_patterns");
+        assert_eq!(parsed.custom_patterns, [] as [std::string::String; 0]);
+        assert_eq!(parsed.mode, CaptureRedactionMode::Hash);
+    }
+}

@@ -1,0 +1,220 @@
+{
+  "schema_version": "ft.demo.scenario-manifest.v1",
+  "title": "Bundled ft demo scenario manifest fixture",
+  "proof_boundary": "Bundled demo fixtures prove deterministic onboarding and regression behavior only; they are not target-class high-scale production capacity evidence.",
+  "scenarios": [
+    {
+      "id": "quickstart",
+      "title": "Quickstart pane discovery and detection",
+      "purpose": "Validate the first-run demo path for pane setup, capture, detection, and machine-readable state output.",
+      "scenario_path": "fixtures/demo-lab/scenarios/quickstart.yaml",
+      "deterministic_seed": "demo-lab-v1-quickstart-1001",
+      "required_features": ["simulation", "robot-json", "robot-toon"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
+      "redaction_tier": "t1_standard",
+      "proof_category": "conformance",
+      "max_output_bytes": 262144,
+      "expected_artifacts": [
+        {
+          "id": "manifest",
+          "kind": "manifest",
+          "path": "fixtures/demo-lab/manifest.v1.json",
+          "max_bytes": 65536,
+          "content_hash_required": true
+        },
+        {
+          "id": "scenario_yaml",
+          "kind": "scenario_yaml",
+          "path": "fixtures/demo-lab/scenarios/quickstart.yaml",
+          "max_bytes": 65536,
+          "content_hash_required": true,
+          "sha256": "7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b"
+        },
+        {
+          "id": "golden_json",
+          "kind": "golden_json",
+          "path": "fixtures/demo-lab/golden/quickstart.json",
+          "max_bytes": 131072,
+          "content_hash_required": true,
+          "sha256": "17c1881cb23c0fd4997968cb575a10568f5aa9c88aba8e8e5318cf10f4081be4"
+        },
+        {
+          "id": "golden_toon",
+          "kind": "golden_toon",
+          "path": "fixtures/demo-lab/golden/quickstart.toon",
+          "max_bytes": 131072,
+          "content_hash_required": true,
+          "sha256": "ba37430a0878469e96489219149c724e3166eb5c9f6a6ddfdb5fc9263e581e28"
+        },
+        {
+          "id": "proof_ledger",
+          "kind": "structured_log",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
+          "id": "proof_summary",
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        }
+      ],
+      "degradation": [
+        {
+          "reason": "agent_mail_unavailable",
+          "status": "degraded",
+          "operator_action": "Continue with Beads and git evidence; do not repair or restart Agent Mail from the demo runner."
+        },
+        {
+          "reason": "disabled_feature",
+          "status": "unavailable",
+          "operator_action": "Report the disabled feature in the JSON envelope and skip scenario execution without side effects."
+        },
+        {
+          "reason": "rch_proof_unavailable",
+          "status": "proof_blocked",
+          "operator_action": "Retain the preflight artifact and do not count local Cargo output as proof."
+        },
+        {
+          "reason": "unsupported_platform",
+          "status": "unavailable",
+          "operator_action": "Emit unsupported_platform with the target triple and leave the scenario unrun."
+        }
+      ]
+    },
+    {
+      "id": "usage_limit",
+      "title": "Usage-limit detection and safe recovery guidance",
+      "purpose": "Validate rate-limit text classification, event emission, and policy-safe recovery guidance without calling an external provider.",
+      "scenario_path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
+      "deterministic_seed": "demo-lab-v1-usage-limit-2002",
+      "required_features": ["simulation", "patterns", "events", "robot-json"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
+      "redaction_tier": "t1_standard",
+      "proof_category": "golden",
+      "max_output_bytes": 262144,
+      "expected_artifacts": [
+        {
+          "id": "scenario_yaml",
+          "kind": "scenario_yaml",
+          "path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
+          "max_bytes": 65536,
+          "content_hash_required": true,
+          "sha256": "7c33f4ae15bace7246f67d0220c61b8bbc75e908e324f4a0b28c5232043f01d1"
+        },
+        {
+          "id": "golden_json",
+          "kind": "golden_json",
+          "path": "fixtures/demo-lab/golden/usage_limit.json",
+          "max_bytes": 131072,
+          "content_hash_required": true,
+          "sha256": "4c70fad0c14a94616637b5c71a6587558cce851668098f61e063d076edae19b1"
+        },
+        {
+          "id": "proof_ledger",
+          "kind": "structured_log",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
+          "id": "proof_summary",
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        }
+      ],
+      "degradation": [
+        {
+          "reason": "agent_mail_unavailable",
+          "status": "degraded",
+          "operator_action": "Continue with Beads and git evidence; do not repair or restart Agent Mail from the demo runner."
+        },
+        {
+          "reason": "disabled_feature",
+          "status": "unavailable",
+          "operator_action": "Report the disabled feature in the JSON envelope and skip scenario execution without side effects."
+        },
+        {
+          "reason": "rch_proof_unavailable",
+          "status": "proof_blocked",
+          "operator_action": "Retain the preflight artifact and do not count local Cargo output as proof."
+        },
+        {
+          "reason": "unsupported_platform",
+          "status": "unavailable",
+          "operator_action": "Emit unsupported_platform with the target triple and leave the scenario unrun."
+        }
+      ]
+    },
+    {
+      "id": "compaction",
+      "title": "Context compaction detection and handoff guidance",
+      "purpose": "Validate context-compaction signal detection, event classification, and operator-safe follow-up guidance.",
+      "scenario_path": "fixtures/demo-lab/scenarios/compaction.yaml",
+      "deterministic_seed": "demo-lab-v1-compaction-3003",
+      "required_features": ["simulation", "patterns", "events", "robot-toon"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
+      "redaction_tier": "t1_standard",
+      "proof_category": "e2e",
+      "max_output_bytes": 262144,
+      "expected_artifacts": [
+        {
+          "id": "scenario_yaml",
+          "kind": "scenario_yaml",
+          "path": "fixtures/demo-lab/scenarios/compaction.yaml",
+          "max_bytes": 65536,
+          "content_hash_required": true,
+          "sha256": "9aedeec0f804e01cb24f8ad97e9960c991504957cccd7f6b0e03e3ad5d40821e"
+        },
+        {
+          "id": "golden_toon",
+          "kind": "golden_toon",
+          "path": "fixtures/demo-lab/golden/compaction.toon",
+          "max_bytes": 131072,
+          "content_hash_required": true,
+          "sha256": "d515a387a2766e746b00951b4d5d287ed6dd0fdee4902e73772be0eee1f466c6"
+        },
+        {
+          "id": "proof_ledger",
+          "kind": "structured_log",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
+          "id": "proof_summary",
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        }
+      ],
+      "degradation": [
+        {
+          "reason": "agent_mail_unavailable",
+          "status": "degraded",
+          "operator_action": "Continue with Beads and git evidence; do not repair or restart Agent Mail from the demo runner."
+        },
+        {
+          "reason": "disabled_feature",
+          "status": "unavailable",
+          "operator_action": "Report the disabled feature in the JSON envelope and skip scenario execution without side effects."
+        },
+        {
+          "reason": "rch_proof_unavailable",
+          "status": "proof_blocked",
+          "operator_action": "Retain the preflight artifact and do not count local Cargo output as proof."
+        },
+        {
+          "reason": "unsupported_platform",
+          "status": "unavailable",
+          "operator_action": "Emit unsupported_platform with the target triple and leave the scenario unrun."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+[engine]
+type = "wasm"
+entry = "main.wasm"

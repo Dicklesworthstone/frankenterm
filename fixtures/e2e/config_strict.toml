@@ -1,0 +1,51 @@
+# Strict E2E test configuration
+# Restrictive settings for policy/safety testing
+
+[ingest]
+poll_interval_ms = 100
+batch_size = 50
+max_segment_bytes = 65536
+
+[storage]
+retention_days = 1
+vacuum_interval_hours = 24
+
+[search]
+snippet_context_chars = 80
+max_results = 1000
+
+[patterns]
+pack_dirs = ["fixtures/e2e/patterns"]
+
+[workflows]
+max_concurrent = 2
+default_timeout_secs = 30
+
+[safety]
+# Strict safety settings - block alt screen, require confirmation
+block_alt_screen = true
+require_confirmation = true
+audit_all_actions = true
+max_chars_per_send = 1000
+rate_limit_sends_per_minute = 10
+
+[safety.actors.robot]
+send_text = true
+send_keys = false
+split_pane = false
+close_pane = false
+
+[safety.actors.workflow]
+send_text = true
+send_keys = false
+split_pane = false
+close_pane = false
+
+[safety.protected_patterns]
+# Patterns that identify protected panes (don't send to these)
+titles = ["*vim*", "*nvim*", "*htop*", "*less*"]
+processes = ["vim", "nvim", "htop", "less", "man"]
+
+[logging]
+level = "debug"
+format = "json"
