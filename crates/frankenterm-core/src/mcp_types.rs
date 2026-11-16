@@ -134,7 +134,9 @@ pub(super) struct McpGetTextData {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct TruncationInfo {
-    pub original_bytes: usize,
+    /// Unknown when the mux bounded the read before hydrating older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<usize>,
     pub returned_bytes: usize,
     pub original_lines: usize,
     pub returned_lines: usize,
@@ -1151,12 +1153,35 @@ pub(super) fn apply_tail_truncation(
         truncated_text,
         true,
         Some(TruncationInfo {
-            original_bytes,
+            original_bytes: Some(original_bytes),
             returned_bytes,
             original_lines,
             returned_lines,
         }),
     )
+}
+
+/// Finish a source-bounded pane read without fetching the omitted prefix just
+/// to calculate its byte length. Source metadata remains authoritative even
+/// when a backend returns more rows than requested and needs a final slice.
+pub(super) fn finalize_pane_text_tail(
+    pane_text: crate::wezterm::MuxPaneText,
+    tail_lines: usize,
+) -> (String, bool, Option<TruncationInfo>) {
+    if !pane_text.truncated {
+        return apply_tail_truncation(&pane_text.text, tail_lines);
+    }
+
+    let lines: Vec<&str> = pane_text.text.lines().collect();
+    let start = lines.len().saturating_sub(tail_lines);
+    let text = lines[start..].join("\n");
+    let info = TruncationInfo {
+        original_bytes: pane_text.original_bytes,
+        returned_bytes: text.len(),
+        original_lines: pane_text.original_lines,
+        returned_lines: lines.len() - start,
+    };
+    (text, true, Some(info))
 }
 
 // ── Event mutation types ─────────────────────────────────────────────────
@@ -1315,6 +1340,87 @@ mod tests {
     #[test]
     fn default_tail_is_500() {
         assert_eq!(default_tail(), 500);
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_preserves_known_source_metadata_after_slicing() {
+        let (text, truncated, info) = finalize_pane_text_tail(
+            crate::wezterm::MuxPaneText {
+                text: "prefix\n界\nlast\n".to_string(),
+                original_lines: 100,
+                original_bytes: Some(4_096),
+                truncated: true,
+            },
+            2,
+        );
+        assert_eq!(text, "界\nlast");
+        assert!(truncated);
+        assert_eq!(
+            info,
+            Some(TruncationInfo {
+                original_bytes: Some(4_096),
+                original_lines: 100,
+                returned_bytes: 8,
+                returned_lines: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_keeps_full_read_byte_count_and_newline_contract() {
+        let (text, truncated, info) = finalize_pane_text_tail(
+            crate::wezterm::MuxPaneText {
+                text: "first\r\n界\r\nlast\r\n".to_string(),
+                original_lines: 3,
+                original_bytes: Some(18),
+                truncated: false,
+            },
+            2,
+        );
+        assert_eq!(text, "界\nlast");
+        assert!(truncated);
+        let info = info.unwrap();
+        assert_eq!(info.original_bytes, Some(18));
+        assert_eq!(info.original_lines, 3);
+        assert_eq!(info.returned_bytes, 8);
+        assert_eq!(info.returned_lines, 2);
+
+        let (text, truncated, info) = finalize_pane_text_tail(
+            crate::wezterm::MuxPaneText {
+                text: "ready\r\n".to_string(),
+                original_lines: 1,
+                original_bytes: Some(7),
+                truncated: false,
+            },
+            2,
+        );
+        assert_eq!(text, "ready\r\n");
+        assert!(!truncated);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_does_not_fabricate_empty_or_unknown_prefix_bytes() {
+        let (text, truncated, info) = finalize_pane_text_tail(
+            crate::wezterm::MuxPaneText {
+                text: String::new(),
+                original_lines: 10_000,
+                original_bytes: None,
+                truncated: true,
+            },
+            2,
+        );
+        assert!(text.is_empty());
+        assert!(truncated);
+        let info = info.unwrap();
+        assert_eq!(info.original_lines, 10_000);
+        assert_eq!(info.returned_lines, 0);
+        assert_eq!(info.returned_bytes, 0);
+        assert_eq!(info.original_bytes, None);
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("original_bytes").is_none());
+        let roundtrip: TruncationInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, info);
     }
 
     // ========================================================================
@@ -2441,7 +2547,7 @@ mod tests {
             returned_lines in any::<usize>(),
         ) {
             let info = TruncationInfo {
-                original_bytes,
+                original_bytes: Some(original_bytes),
                 returned_bytes,
                 original_lines,
                 returned_lines,
@@ -2930,7 +3036,7 @@ mod tests {
                 escapes_included: false,
                 truncated: true,
                 truncation_info: Some(TruncationInfo {
-                    original_bytes: orig_bytes,
+                    original_bytes: Some(orig_bytes),
                     returned_bytes: ret_bytes,
                     original_lines: orig_lines,
                     returned_lines: ret_lines,
@@ -3204,7 +3310,7 @@ mod tests {
 
     fn arb_truncation_info() -> impl Strategy<Value = TruncationInfo> {
         (
-            0usize..=1_000_000,
+            prop::option::of(0usize..=1_000_000),
             0usize..=1_000_000,
             0usize..=10_000,
             0usize..=10_000,

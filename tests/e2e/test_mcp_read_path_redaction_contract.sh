@@ -41,15 +41,32 @@ echo "=== MCP/robot read-path redaction + Contract-Doctor honesty contract (ft-s
 echo ""
 
 # --- R1: wa.state redacts pane title + cwd + ignore_reason (ft-yj375/ft-ps9fu parity) ---
-# Slice the redact_mcp_pane_state_fields helper body and require all three fields.
+# Follow the bounded field helper as well as its callers. The field helper
+# normalizes and redacts before truncating; looking only for an inline
+# REDACTOR.redact in the caller rejects that production path and would miss a
+# redactor removed from the helper.
 r1_body="$(awk '/fn redact_mcp_pane_state_fields/{f=1} f{print} f&&/^}/{exit}' "$MCP_TOOLS")"
-if grep -q 'REDACTOR.redact' <<<"$r1_body" \
-  && grep -q 'state.title' <<<"$r1_body" \
-  && grep -q 'state.cwd' <<<"$r1_body" \
-  && grep -q 'ignore_reason' <<<"$r1_body"; then
-  pass "R1 wa.state redact_mcp_pane_state_fields redacts title + cwd + ignore_reason"
+r1_field_body="$(awk '/^fn bounded_mcp_pane_state_field\(/{f=1} f{print} f&&/^}/{exit}' "$MCP_TOOLS")"
+state_redaction_is_wired() {
+  local state_body="$1" field_body="$2"
+  grep -Fq 'state.pane_uuid.as_mut()' <<<"$state_body" \
+    && grep -Fq '*pane_uuid = bounded_mcp_pane_state_field(pane_uuid);' <<<"$state_body" \
+    && grep -Fq 'state.domain = bounded_mcp_pane_state_field(&state.domain);' <<<"$state_body" \
+    && grep -Fq 'state.title.as_mut()' <<<"$state_body" \
+    && grep -Fq '*title = bounded_mcp_pane_state_field(title);' <<<"$state_body" \
+    && grep -Fq 'state.cwd.as_mut()' <<<"$state_body" \
+    && grep -Fq '*cwd = bounded_mcp_pane_state_field(cwd);' <<<"$state_body" \
+    && grep -Fq 'state.ignore_reason.as_mut()' <<<"$state_body" \
+    && grep -Fq '*ignore_reason = bounded_mcp_pane_state_field(ignore_reason);' <<<"$state_body" \
+    && grep -Fq 'text.len() > MCP_STATE_FIELD_INPUT_MAX_BYTES' <<<"$field_body" \
+    && grep -Fq 'return MCP_STATE_FIELD_OVERSIZE.to_string();' <<<"$field_body" \
+    && grep -Fq 'crate::output::sanitize_redact_truncate_bounded(' <<<"$field_body" \
+    && grep -Fq '|normalized| MCP_OUTPUT_REDACTOR.redact(normalized),' <<<"$field_body"
+}
+if state_redaction_is_wired "$r1_body" "$r1_field_body"; then
+  pass "R1 wa.state bounds and redacts pane_uuid + domain + title + cwd + ignore_reason"
 else
-  fail "R1 wa.state metadata redaction regressed (title/cwd/ignore_reason must run through Redactor)"
+  fail "R1 wa.state metadata must route through the bounded normalizing Redactor helper"
 fi
 
 # --- R2: ft-ps9fu wa://swarm/scent read path enforces read policy (fail-closed) ---

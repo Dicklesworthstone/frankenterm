@@ -29,7 +29,7 @@ use super::mcp_types::{
     OperatingEnvelopeParams, RehearsalScoreParams, ReleaseParams, ReservationsParams,
     ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams,
     TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
-    WorkflowStatusParams, apply_tail_truncation, now_ms,
+    WorkflowStatusParams, finalize_pane_text_tail, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -3041,6 +3041,8 @@ impl ToolHandler for WaStateTool {
 pub(super) struct WaGetTextTool {
     config: Arc<Config>,
     db_path: Option<Arc<PathBuf>>,
+    #[cfg(test)]
+    wezterm_override: Option<crate::wezterm::WeztermHandle>,
     policy_rate_limiter: SharedRateLimiter,
 }
 
@@ -3059,6 +3061,33 @@ impl WaGetTextTool {
         Self {
             config,
             db_path,
+            #[cfg(test)]
+            wezterm_override: None,
+            policy_rate_limiter,
+        }
+    }
+
+    fn wezterm_handle(&self) -> crate::wezterm::WeztermHandle {
+        #[cfg(test)]
+        if let Some(wezterm) = self.wezterm_override.as_ref() {
+            return Arc::clone(wezterm);
+        }
+        // Discover the mux and construct its pool inside each request runtime.
+        // A tool may outlive that runtime or a mux started after the MCP server.
+        crate::wezterm::wezterm_handle_from_config(self.config.as_ref())
+    }
+
+    #[cfg(test)]
+    fn with_wezterm_handle(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        wezterm: crate::wezterm::WeztermHandle,
+    ) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self {
+            config,
+            db_path,
+            wezterm_override: Some(wezterm),
             policy_rate_limiter,
         }
     }
@@ -3151,7 +3180,7 @@ impl ToolHandler for WaGetTextTool {
                     .await
                     .map_err(McpToolError::from_error)?;
                 // GH#72: honor any configured vendored mux socket.
-                let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
+                let wezterm = self.wezterm_handle();
                 // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
                 let wezterm_cx = open_cx.clone();
                 let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await {
@@ -3273,12 +3302,20 @@ impl ToolHandler for WaGetTextTool {
                     ));
                 }
 
-                let full_text = wezterm
-                    .get_text(params.pane_id, params.escapes)
+                // Bound native hydration at the source, just as robot get-text
+                // does. Retain the request Cx through the RPC and do not fetch
+                // old cold rows merely to fill original_bytes in the response.
+                let pane_text = wezterm
+                    .get_text_tail_with_cx(
+                        &wezterm_cx,
+                        params.pane_id,
+                        params.escapes,
+                        Some(params.tail),
+                    )
                     .await
                     .map_err(McpToolError::from_error)?;
                 let (text, truncated, truncation_info) =
-                    apply_tail_truncation(&full_text, params.tail);
+                    finalize_pane_text_tail(pane_text, params.tail);
 
                 // Preserve the documented raw-escape contract when no secret
                 // is present, but detect secrets against escape-stripped text
@@ -27234,6 +27271,342 @@ exit 17",
             .expect("wa.get_text should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.get_text should require pane_id");
+    }
+
+    const MCP_TAIL_TEST_PANE_ID: u64 = 942_001;
+
+    /// A source that only implements bounded text reads. A regression to the
+    /// full-history API fails the real handler call instead of silently using
+    /// an in-memory mock that can serve either route.
+    struct TailOnlyMux {
+        pane: crate::wezterm::PaneInfo,
+        response: crate::wezterm::MuxPaneText,
+        requests: std::sync::Mutex<Vec<(u64, bool, Option<usize>)>>,
+        cancel_on_read: bool,
+    }
+
+    impl TailOnlyMux {
+        fn new(response: crate::wezterm::MuxPaneText) -> Self {
+            Self {
+                pane: serde_json::from_value(serde_json::json!({
+                    "pane_id": MCP_TAIL_TEST_PANE_ID,
+                    "tab_id": 0,
+                    "window_id": 0,
+                    "domain_name": "local"
+                }))
+                .expect("tail fixture pane metadata"),
+                response,
+                requests: std::sync::Mutex::new(Vec::new()),
+                cancel_on_read: false,
+            }
+        }
+
+        fn unexpected<T: Send + 'static>(&self) -> crate::wezterm::WeztermFuture<'_, T> {
+            Box::pin(async {
+                Err(crate::Error::Wezterm(
+                    crate::error::WeztermError::CommandFailed(
+                        "tail-only fixture refuses full reads and mutations".to_string(),
+                    ),
+                ))
+            })
+        }
+    }
+
+    impl crate::wezterm::MuxInterface for TailOnlyMux {
+        fn list_panes(&self) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            Box::pin(async { Ok(vec![self.pane.clone()]) })
+        }
+
+        fn get_pane(
+            &self,
+            pane_id: u64,
+        ) -> crate::wezterm::WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            Box::pin(async move {
+                if pane_id == self.pane.pane_id {
+                    Ok(self.pane.clone())
+                } else {
+                    Err(crate::Error::Wezterm(
+                        crate::error::WeztermError::PaneNotFound(pane_id),
+                    ))
+                }
+            })
+        }
+
+        fn get_text(&self, _: u64, _: bool) -> crate::wezterm::WeztermFuture<'_, String> {
+            self.unexpected()
+        }
+
+        fn get_text_tail_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+            escapes: bool,
+            tail: Option<usize>,
+        ) -> crate::wezterm::WeztermFuture<'a, crate::wezterm::MuxPaneText> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push((pane_id, escapes, tail));
+                if self.cancel_on_read {
+                    cx.set_cancel_requested(true);
+                }
+                cx.checkpoint().map_err(|_| {
+                    crate::Error::Cancelled("bounded pane read cancelled".to_string())
+                })?;
+                Ok(self.response.clone())
+            })
+        }
+
+        fn send_text(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn send_text_no_paste(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn send_text_with_options(
+            &self,
+            _: u64,
+            _: &str,
+            _: bool,
+            _: bool,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn send_control(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn send_ctrl_c(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn send_ctrl_d(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn spawn(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.unexpected()
+        }
+
+        fn spawn_targeted(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: crate::wezterm::SpawnTarget,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.unexpected()
+        }
+
+        fn split_pane(
+            &self,
+            _: u64,
+            _: crate::wezterm::SplitDirection,
+            _: Option<&str>,
+            _: Option<u8>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.unexpected()
+        }
+
+        fn activate_pane(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn get_pane_direction(
+            &self,
+            _: u64,
+            _: crate::wezterm::MoveDirection,
+        ) -> crate::wezterm::WeztermFuture<'_, Option<u64>> {
+            self.unexpected()
+        }
+
+        fn kill_pane(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn zoom_pane(&self, _: u64, _: bool) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.unexpected()
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            crate::circuit_breaker::CircuitBreakerStatus::default()
+        }
+    }
+
+    #[test]
+    fn get_text_tool_bounds_source_read_and_preserves_unknown_prefix_size() {
+        let mux = Arc::new(TailOnlyMux::new(crate::wezterm::MuxPaneText {
+            // A source can over-return its viewport; the public tail remains
+            // bounded without turning that viewport into the prefix metadata.
+            text: "older row\n界\nlatest\n".to_string(),
+            original_lines: 1_000_000,
+            original_bytes: None,
+            truncated: true,
+        }));
+        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 2}),
+            )
+            .expect("bounded get-text response"),
+        );
+
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(envelope["data"]["text"], "界\nlatest");
+        assert_eq!(envelope["data"]["truncated"], true);
+        let info = &envelope["data"]["truncation_info"];
+        assert_eq!(info["original_lines"], 1_000_000);
+        assert_eq!(info["returned_lines"], 2);
+        assert_eq!(info["returned_bytes"], "界\nlatest".len());
+        assert!(info.get("original_bytes").is_none());
+        assert_eq!(
+            *mux.requests.lock().unwrap(),
+            vec![(MCP_TAIL_TEST_PANE_ID, false, Some(2))]
+        );
+    }
+
+    #[test]
+    fn get_text_tool_enforces_tail_bounds_at_source_boundary() {
+        let mux = Arc::new(TailOnlyMux::new(crate::wezterm::MuxPaneText {
+            text: "ready\n".to_string(),
+            original_lines: 1,
+            original_bytes: Some(6),
+            truncated: false,
+        }));
+        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        for arguments in [
+            serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID}),
+            serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 10_000}),
+        ] {
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments)
+                    .expect("bounded get-text response"),
+            );
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            assert_eq!(envelope["data"]["text"], "ready\n");
+            assert!(envelope["data"].get("truncation_info").is_none());
+        }
+        for tail in [0, 10_001, usize::MAX] {
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": tail}),
+                )
+                .expect("invalid tail response"),
+            );
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        }
+        assert_eq!(
+            *mux.requests.lock().unwrap(),
+            vec![
+                (MCP_TAIL_TEST_PANE_ID, false, Some(500)),
+                (MCP_TAIL_TEST_PANE_ID, false, Some(10_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_text_tool_denies_policy_before_bounded_hydration() {
+        let mux = Arc::new(TailOnlyMux::new(crate::wezterm::MuxPaneText {
+            text: "must not be read".to_string(),
+            original_lines: 100_000,
+            original_bytes: None,
+            truncated: true,
+        }));
+        let tool = WaGetTextTool::with_wezterm_handle(
+            deny_mcp_read_output_config("local", "pane read blocked"),
+            None,
+            mux.clone(),
+        );
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 1}),
+            )
+            .expect("policy refusal response"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert!(mux.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_text_tool_bounded_read_preserves_request_cancellation() {
+        let mut mux = TailOnlyMux::new(crate::wezterm::MuxPaneText {
+            text: "must not be returned".to_string(),
+            original_lines: 100_000,
+            original_bytes: None,
+            truncated: true,
+        });
+        mux.cancel_on_read = true;
+        let mux = Arc::new(mux);
+        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        let ctx = test_mcp_context();
+        let envelope = parse_json_content(
+            tool.call(
+                &ctx,
+                serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 1}),
+            )
+            .expect("cancelled bounded read response"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_TIMEOUT);
+        assert!(
+            ctx.cx().checkpoint().is_err(),
+            "source must see the request Cx"
+        );
+        assert_eq!(mux.requests.lock().unwrap().len(), 1);
+        assert!(envelope.get("data").is_none());
+    }
+
+    #[test]
+    fn get_text_tool_bounded_read_keeps_escape_and_redaction_contracts() {
+        let secret = redaction_test_token();
+        let split = secret.len() / 2;
+        for (text, redacted) in [
+            ("\x1b[31mready\x1b[0m\n".to_string(), false),
+            (
+                format!("{}\x1b[31m{}\x1b[0m\n", &secret[..split], &secret[split..]),
+                true,
+            ),
+        ] {
+            let mux = Arc::new(TailOnlyMux::new(crate::wezterm::MuxPaneText {
+                text: text.clone(),
+                original_lines: 100_000,
+                original_bytes: None,
+                truncated: true,
+            }));
+            let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 1, "escapes": true
+                    }),
+                )
+                .expect("escaped bounded read response"),
+            );
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            assert_eq!(envelope["data"]["escapes_included"], true);
+            let returned = envelope["data"]["text"].as_str().unwrap();
+            if redacted {
+                assert!(returned.contains("[REDACTED]"));
+                assert!(!returned.contains(&secret));
+                assert!(!returned.contains('\x1b'));
+            } else {
+                assert_eq!(returned, text.trim_end_matches('\n'));
+            }
+            assert_eq!(
+                *mux.requests.lock().unwrap(),
+                vec![(MCP_TAIL_TEST_PANE_ID, true, Some(1))]
+            );
+        }
     }
 
     /// ft-7h5da.2.6: the wa.dom MCP mirror's definition must match the

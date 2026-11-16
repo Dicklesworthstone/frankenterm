@@ -2543,7 +2543,10 @@ mod tests {
         let info = info.expect("truncation info present");
         assert_eq!(info.original_lines, 5);
         assert_eq!(info.returned_lines, 2);
-        assert!(info.returned_bytes < info.original_bytes);
+        assert!(
+            info.original_bytes
+                .is_some_and(|bytes| info.returned_bytes < bytes)
+        );
     }
 
     #[test]
@@ -3767,7 +3770,7 @@ mod tests {
             escapes_included: true,
             truncated: true,
             truncation_info: Some(TruncationInfo {
-                original_bytes: 1000,
+                original_bytes: Some(1000),
                 returned_bytes: 100,
                 original_lines: 50,
                 returned_lines: 2,
@@ -3931,7 +3934,7 @@ mod tests {
     #[test]
     fn truncation_info_serialization() {
         let info = TruncationInfo {
-            original_bytes: 5000,
+            original_bytes: Some(5000),
             returned_bytes: 500,
             original_lines: 100,
             returned_lines: 10,
