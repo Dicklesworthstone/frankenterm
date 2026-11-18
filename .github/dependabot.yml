@@ -44,3 +44,13 @@ updates:
       - dependency-name: "phf"
       - dependency-name: "phf_shared"
       - dependency-name: "phf_codegen"
+      # zstd 0.14.4 writes the frame content size from encode_all but not from
+      # the stream encoder the codec's bounded outbound path uses, so the codec's
+      # byte-identity tests fail. Unpinning needs a codec decision on wire bytes.
+      - dependency-name: "zstd"
+        versions: [">=0.14.4"]
+      # zbus 6 drops zvariant for its own type system: the zvariant derives behind
+      # toast-notification's #[proxy] no longer satisfy it (window's xdg portal
+      # proxy uses zvariant too). Linux-only build break; port by hand.
+      - dependency-name: "zbus"
+        versions: [">=6"]
