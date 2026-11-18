@@ -370,7 +370,7 @@ dependencies = [
  "js-sys",
  "libc",
  "memchr",
- "nix 0.31.3",
+ "nix 0.31.4",
  "nkeys",
  "parking_lot 0.12.5",
  "pin-project",
@@ -1051,9 +1051,9 @@ dependencies = [
 
 [[package]]
 name = "cairo-rs"
-version = "0.22.9"
+version = "0.22.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df683f1d30b457964673a5541a4603208ef95ab6873d2a55871895cf310f3b56"
+checksum = "62bf7f026ae17fe688938438ec1da2b69f69832f1428a17258f6ee9a7f6e1815"
 dependencies = [
  "bitflags 2.13.2",
  "cairo-sys-rs",
@@ -1139,9 +1139,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.11.1"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
+checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1528,7 +1528,7 @@ dependencies = [
  "log",
  "luahelper",
  "mlua",
- "nix 0.31.3",
+ "nix 0.32.0",
  "notify",
  "openssl",
  "ordered-float 5.5.1",
@@ -3683,7 +3683,7 @@ dependencies = [
  "hex",
  "memchr",
  "mux",
- "nix 0.31.3",
+ "nix 0.32.0",
  "portable-pty",
  "predicates",
  "promise",
@@ -3939,7 +3939,7 @@ dependencies = [
  "memchr",
  "metrics",
  "mux",
- "nix 0.31.3",
+ "nix 0.32.0",
  "proc-macro2",
  "procinfo",
  "promise",
@@ -4227,7 +4227,7 @@ dependencies = [
  "image",
  "k9",
  "log",
- "nix 0.31.3",
+ "nix 0.32.0",
  "num-derive 0.5.1",
  "num-traits",
  "ordered-float 5.5.1",
@@ -4625,7 +4625,7 @@ dependencies = [
  "log",
  "mio",
  "mux",
- "nix 0.31.3",
+ "nix 0.32.0",
  "portable-pty",
  "procinfo",
  "rustix 1.1.6",
@@ -7515,9 +7515,9 @@ dependencies = [
 
 [[package]]
 name = "libloading"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
 dependencies = [
  "cfg-if",
  "windows-link 0.2.1",
@@ -7763,7 +7763,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3d0581a75c45969c63afd2bb87b1d8b25cfcc556c7a918cf9bb13b0fe8d2381"
 dependencies = [
- "nix 0.31.3",
+ "nix 0.31.4",
  "windows-sys 0.61.2",
 ]
 
@@ -7943,9 +7943,9 @@ checksum = "c505b3e17ed6b70a7ed2e67fbb2c560ee327353556120d6e72f5232b6880d536"
 
 [[package]]
 name = "mio"
-version = "1.2.4"
+version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
 dependencies = [
  "libc",
  "log",
@@ -8090,7 +8090,7 @@ dependencies = [
  "metrics",
  "mlua",
  "names",
- "nix 0.31.3",
+ "nix 0.32.0",
  "ntapi",
  "parking_lot 0.13.0",
  "percent-encoding",
@@ -8251,9 +8251,22 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.31.3"
+version = "0.31.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -9383,7 +9396,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
- "nix 0.31.3",
+ "nix 0.32.0",
  "proptest",
  "serde",
  "serde_json",
@@ -11697,7 +11710,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix 0.31.3",
+ "nix 0.32.0",
  "num-derive 0.5.1",
  "num-traits",
  "ordered-float 5.5.1",
@@ -12219,9 +12232,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "trybuild"
-version = "1.0.122"
+version = "1.0.123"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62db9c92d704393fbf2132041720cc80b689f2d3f28521015c2ac866223c11b8"
+checksum = "5dc7029163734745d9a24da4e1c74122e719d5045495c2d8d55c4cc2f6055fdf"
 dependencies = [
  "glob",
  "serde",
@@ -13677,7 +13690,7 @@ dependencies = [
  "k9",
  "lazy_static",
  "libc",
- "libloading 0.9.0",
+ "libloading 0.9.1",
  "line_drawing",
  "log",
  "metrics",
@@ -14500,7 +14513,7 @@ dependencies = [
  "indexmap 2.14.2",
  "libc",
  "memchr",
- "nix 0.31.3",
+ "nix 0.31.4",
  "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
