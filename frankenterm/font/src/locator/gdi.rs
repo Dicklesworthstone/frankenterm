@@ -268,11 +268,17 @@ impl FontLocator for GdiFontLocator {
         &self,
         codepoints: &[char],
     ) -> anyhow::Result<Vec<ParsedFont>> {
-        let text: Vec<u16> = codepoints
-            .iter()
-            .map(|&c| c as u16)
-            .chain(std::iter::once(0))
-            .collect();
+        // DirectWrite maps UTF-16 text, and its positions and lengths count
+        // UTF-16 code units. Truncating each char to u16 would turn emoji and
+        // every other non-BMP codepoint (U+1F600 became U+F600, a private-use
+        // codepoint) into a query for the wrong character.
+        let mut text: Vec<u16> = Vec::with_capacity(codepoints.len() * 2 + 1);
+        for c in codepoints {
+            let mut units = [0u16; 2];
+            text.extend_from_slice(c.encode_utf16(&mut units));
+        }
+        let text_len = text.len();
+        text.push(0);
 
         let collection = dwrote::FontCollection::system();
         struct Source {
@@ -291,7 +297,7 @@ impl FontLocator for GdiFontLocator {
         let source = dwrote::TextAnalysisSource::from_text(
             Box::new(Source {
                 locale: "".to_string(),
-                len: codepoints.len() as u32,
+                len: text_len as u32,
             }),
             Cow::Borrowed(&text),
         );
@@ -301,7 +307,7 @@ impl FontLocator for GdiFontLocator {
 
         if let Some(fallback) = dwrote::FontFallback::get_system_fallback() {
             let mut start = 0usize;
-            let mut len = codepoints.len();
+            let mut len = text_len;
             loop {
                 let result = fallback.map_characters(
                     &source,
@@ -355,10 +361,10 @@ impl FontLocator for GdiFontLocator {
                 } else {
                     break;
                 }
-                if start == codepoints.len() {
+                if start >= text_len {
                     break;
                 }
-                len = codepoints.len() - start;
+                len = text_len - start;
             }
         } else {
             log::error!("Unable to get system fallback from dwrote");
