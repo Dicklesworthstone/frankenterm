@@ -38,14 +38,24 @@ non-system library dependencies, and the bundle's native closure is empty.
   `pixman/COPYING`.
 - `src/lib.rs`: the `use_glib` module (`gobject.rs`) is removed, since this
   package has no `glib-sys` dependency.
-- `build.rs`: on non-Windows targets cairo is built with pthread mutexes and
-  compiler atomics (`CAIRO_HAS_PTHREAD`, `HAVE_CXX11_ATOMIC_PRIMITIVES`) and
-  pixman with thread-local caches (`TLS=__thread`). WezTerm builds both without
-  thread safety (`CAIRO_NO_MUTEX`, `PIXMAN_NO_TLS`) because it rasterizes on one
-  thread; FrankenTerm's Metal front end rasterizes on a render thread per
-  window, and the system libraries this replaces are thread-safe. Windows keeps
-  WezTerm's settings; the font crate depends on cairo only on non-Windows
-  targets, so nothing builds it there.
+- `build.rs`: cairo and pixman are built thread-safe on every target. WezTerm
+  builds both without thread safety (`CAIRO_NO_MUTEX`, `PIXMAN_NO_TLS`) because
+  it rasterizes on one thread; FrankenTerm's Metal front end rasterizes on a
+  render thread per window, the font tests rasterize on parallel threads, and
+  the system libraries this replaces are thread-safe.
+  - Non-Windows targets: pthread mutexes and compiler atomics
+    (`CAIRO_HAS_PTHREAD`, `HAVE_CXX11_ATOMIC_PRIMITIVES`).
+  - Windows: cairo's own `_WIN32` choice, CRITICAL_SECTION mutexes and
+    `Interlocked*` atomics, as in a stock Windows cairo. cairo initializes
+    those mutexes lazily without synchronization, so `frankenterm-font`
+    creates its first cairo surface under a `Once`
+    (`rasterizer::initialize_cairo`).
+  - pixman's caches are thread-local: `TLS=__declspec(thread)` for MSVC (what
+    pixman's meson build selects there) and `TLS=__thread` for GCC and Clang,
+    MinGW included.
+
+  `frankenterm-font` paints COLR glyphs with cairo on Windows too, so the
+  Windows GUI builds this package (with MSVC, from the same sources).
 
 ## Verification (2026-10-13)
 

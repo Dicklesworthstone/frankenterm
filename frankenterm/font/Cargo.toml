@@ -15,6 +15,9 @@ vendor-nerd-font-symbols = []
 
 [dependencies]
 anyhow.workspace = true
+# Paints COLR glyphs (FreeType and HarfBuzz rasterizers) on every platform.
+# The vendored cairo-sys-rs builds cairo and pixman from source, MSVC included.
+cairo-rs.workspace = true
 config.workspace = true
 encoding_rs.workspace = true
 enum-display-derive.workspace = true
@@ -38,9 +41,6 @@ wezterm-color-types.workspace = true
 wezterm-input-types.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 frankenterm-toast-notification.workspace = true
-
-[target.'cfg(not(windows))'.dependencies]
-cairo-rs.workspace = true
 
 [target.'cfg(any(target_os = "android", all(unix, not(target_os = "macos"))))'.dependencies]
 fontconfig.workspace = true
