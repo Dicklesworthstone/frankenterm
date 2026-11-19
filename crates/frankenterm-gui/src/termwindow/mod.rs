@@ -5067,20 +5067,30 @@ impl TermWindow {
         };
         let effective_front_end = config.front_end.effective(metal.is_some());
 
+        // Renderer initialization yields to native callbacks. Keep the
+        // TermWindow RefCell unborrowed so resize/config events can run.
+        // WebGpu is the bundled default on every platform. A machine where
+        // it cannot start (a VM or remote session with no D3D12, Vulkan or
+        // Metal adapter) gets an OpenGL window rather than no window.
+        let webgpu = match effective_front_end {
+            FrontEndSelection::WebGpu => {
+                match WebGpuState::new(&window, dimensions, &config).await {
+                    Ok(state) => Some(Rc::new(state)),
+                    Err(err) => {
+                        log::warn!("front_end=WebGpu unavailable: {err:#}; falling back to OpenGL");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let gl = match effective_front_end {
-            FrontEndSelection::WebGpu | FrontEndSelection::Metal => None,
             FrontEndSelection::OpenGL | FrontEndSelection::Software => {
                 Some(window.enable_opengl().await?)
             }
-        };
-
-        // Renderer initialization yields to native callbacks. Keep the
-        // TermWindow RefCell unborrowed so resize/config events can run.
-        let webgpu = match effective_front_end {
-            FrontEndSelection::WebGpu => Some(Rc::new(
-                WebGpuState::new(&window, dimensions, &config).await?,
-            )),
-            _ => None,
+            FrontEndSelection::WebGpu if webgpu.is_none() => Some(window.enable_opengl().await?),
+            FrontEndSelection::WebGpu | FrontEndSelection::Metal => None,
         };
         ensure!(
             try_front_end().is_some_and(|current| Rc::ptr_eq(&current, &front_end))
