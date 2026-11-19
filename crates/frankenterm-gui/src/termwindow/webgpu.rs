@@ -713,6 +713,27 @@ pub struct WebGpuState {
 /// the layer's window-size drawables (ft-34at5).
 const PARKED_EXTENT: (u32, u32) = (1, 1);
 
+const EVERY_BACKEND: [wgpu::Backends; 1] = [wgpu::Backends::all()];
+const DIRECT3D_12_FIRST: [wgpu::Backends; 2] = [wgpu::Backends::DX12, wgpu::Backends::all()];
+
+/// The backend sets WebGpu tries, in order. Windows starts with Direct3D 12:
+/// it presents through DXGI, which the compositor owns, and DXGI ranks a
+/// hybrid laptop's discrete GPU first. Among adapters of one type wgpu
+/// ranks Vulkan ahead of Direct3D 12, and on SurfaceBookJE the Intel UHD 620
+/// Vulkan driver (30.0.101.1339) crashed the GUI with an access violation
+/// right after adapter selection, while the same GPU renders on Direct3D 12.
+/// Every backend stays as the fallback when no Direct3D 12 adapter can
+/// drive the window. A configured `webgpu_preferred_adapter` is looked up
+/// among every backend, so an explicit choice (Vulkan, say) still holds.
+fn backend_attempts(preferred_adapter: bool) -> &'static [wgpu::Backends] {
+    if cfg!(windows) && !preferred_adapter {
+        &DIRECT3D_12_FIRST
+    } else {
+        &EVERY_BACKEND
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
@@ -1303,7 +1324,25 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let backends = wgpu::Backends::all();
+        let attempts = backend_attempts(config.webgpu_preferred_adapter.is_some());
+        for (index, backends) in attempts.iter().copied().enumerate() {
+            match Self::new_with_backends(handle, dimensions, config, backends).await {
+                Ok(state) => return Ok(state),
+                Err(err) if index + 1 < attempts.len() => {
+                    log::warn!("webgpu on {backends:?} unavailable: {err:#}; trying every backend");
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("backend_attempts() is never empty")
+    }
+
+    async fn new_with_backends(
+        handle: RawHandlePair,
+        dimensions: Dimensions,
+        config: &ConfigHandle,
+        backends: wgpu::Backends,
+    ) -> anyhow::Result<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends;
         let instance = wgpu::Instance::new(descriptor);
@@ -2004,6 +2043,24 @@ impl WebGpuState {
             wgpu::CurrentSurfaceTexture::Outdated => Err(WebGpuSurfaceTextureError::Outdated),
             wgpu::CurrentSurfaceTexture::Lost => Err(WebGpuSurfaceTextureError::Lost),
             wgpu::CurrentSurfaceTexture::Validation => Err(WebGpuSurfaceTextureError::Validation),
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_attempt_tests {
+    use super::backend_attempts;
+
+    #[test]
+    fn windows_tries_direct3d_12_before_every_backend() {
+        for preferred in [false, true] {
+            let attempts = backend_attempts(preferred);
+            assert_eq!(attempts.last(), Some(&wgpu::Backends::all()));
+            if cfg!(windows) && !preferred {
+                assert_eq!(attempts, [wgpu::Backends::DX12, wgpu::Backends::all()]);
+            } else {
+                assert_eq!(attempts, [wgpu::Backends::all()]);
+            }
         }
     }
 }

@@ -226,7 +226,8 @@ config.mux_output_parser_coalesce_delay_ms = 3
 -- Renderer: Metal-backed WebGpu, NOT legacy OpenGL. On Apple Silicon the OpenGL
 -- backend (_NSOpenGLViewBackingLayer) causes multi-second/minute render stalls
 -- under heavy multi-pane agent-swarm output; WebGpu eliminates them. On Windows
--- the same setting renders through Direct3D 12 on the discrete GPU.
+-- the same setting renders through Direct3D 12, on the discrete GPU when there
+-- is one.
 config.front_end = "WebGpu"
 config.webgpu_power_preference = "HighPerformance"
 
