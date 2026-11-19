@@ -990,6 +990,26 @@ mod tests {
         assert!(ink(glyph) > 0, "{what}: bitmap has no ink");
     }
 
+    /// How far right, in pixels, the ink of the bitmap's top third sits from
+    /// the ink of its bottom third: it grows with a forward slant. Bitmap rows
+    /// run downwards.
+    fn slant(glyph: &RasterizedGlyph) -> f64 {
+        let centroid = |rows: std::ops::Range<usize>| {
+            let (mut moment, mut weight) = (0.0, 0.0);
+            for y in rows {
+                for x in 0..glyph.width {
+                    let alpha = f64::from(glyph.data[(y * glyph.width + x) * 4 + 3]);
+                    moment += alpha * x as f64;
+                    weight += alpha;
+                }
+            }
+            assert!(weight > 0.0, "a third of the glyph has no ink");
+            moment / weight
+        };
+        let third = glyph.height / 3;
+        centroid(0..third) - centroid(glyph.height - third..glyph.height)
+    }
+
     /// Some pixel is visibly colored, not a shade of gray.
     fn has_chroma(glyph: &RasterizedGlyph) -> bool {
         glyph
@@ -1081,12 +1101,13 @@ mod tests {
                 ink(&emboldened),
                 ink(&upright)
             );
-            // The skew moves the top of a vertical stem right of its foot.
+            // FAKE_ITALIC_SKEW moves the top third of a 16 px glyph about
+            // 1.6 px right of its bottom third. The bitmap need not widen:
+            // the foot of 'l' is as wide as the slanted stem and its flag.
+            let skew = slant(&slanted) - slant(&upright);
             assert!(
-                slanted.width > upright.width,
-                "{ch:?}: synthetic italic is not slanted ({} vs {} wide)",
-                slanted.width,
-                upright.width
+                skew > 0.8,
+                "{ch:?}: synthetic italic is not slanted (skew {skew:.2} px)"
             );
             assert_ne!(slanted.data, upright.data, "{ch:?}");
         }
