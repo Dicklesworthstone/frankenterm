@@ -561,9 +561,10 @@ impl Window {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: h_inst,
-            // FIXME: this resource is specific to the wezterm build and this should
-            // really be made generic for other sorts of windows.
-            // The ID is defined in assets/windows/resource.rc
+            // The FrankenTerm icon, resource 0x101 of frankenterm-gui.exe:
+            // crates/frankenterm-gui/build.rs (ICON_RESOURCE_ID) embeds
+            // assets/windows/frankenterm.ico. An executable without that
+            // resource gets a null icon, and Windows draws its default.
             hIcon: unsafe { LoadIconW(h_inst, MAKEINTRESOURCEW(0x101)) },
             hCursor: null_mut(),
             hbrBackground: null_mut(),
@@ -1869,6 +1870,36 @@ unsafe fn wm_windowposchanged(
 ) -> Option<LRESULT> {
     // let pos = &*(lparam as *const WINDOWPOS);
     wm_size(hwnd, 0, 0, 0)?;
+    Some(0)
+}
+
+/// The GUI's manifest declares PerMonitorV2 DPI awareness, so Windows no
+/// longer bitmap-scales the window: when it moves to a monitor with another
+/// scale factor, or the user changes the scale, it keeps its pixel size until
+/// it applies the rectangle Windows suggests in `lparam`. Applying it raises
+/// WM_WINDOWPOSCHANGED, whose resize callback carries the new DPI from
+/// `GetDpiForWindow`, so the GUI rescales its fonts and cell metrics.
+unsafe fn wm_dpichanged(
+    hwnd: HWND,
+    _msg: UINT,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    // SAFETY: for WM_DPICHANGED, lparam points to a RECT that Windows owns
+    // for the duration of this message.
+    let suggested = &*(lparam as *const RECT);
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        suggested.left,
+        suggested.top,
+        rect_width(suggested),
+        rect_height(suggested),
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    // The suggested rectangle can equal the current one, in which case no
+    // resize arrives; the DPI itself still changed, so check it here.
+    wm_size(hwnd, 0, 0, 0);
     Some(0)
 }
 
@@ -3254,6 +3285,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_PAINT => wm_paint(hwnd, msg, wparam, lparam),
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => wm_enter_exit_size_move(hwnd, msg, wparam, lparam),
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
+        WM_DPICHANGED => wm_dpichanged(hwnd, msg, wparam, lparam),
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => wm_kill_focus(hwnd, msg, wparam, lparam),
         WM_DEADCHAR | WM_KEYDOWN | WM_KEYUP | WM_SYSCHAR | WM_CHAR | WM_IME_CHAR | WM_SYSKEYUP
