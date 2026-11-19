@@ -1191,37 +1191,13 @@ impl WindowOps for Window {
                             frame_dpi,
                         );
                         let window_state = get_window_state(hwnd.0);
-                        if window_state.can_resize() {
-                            log::trace!(
-                                "set_inner_size now calling SetWindowPos with {width}x{height}"
-                            );
-                            unsafe {
-                                SetWindowPos(
-                                    hwnd.0,
-                                    hwnd.0,
-                                    0,
-                                    0,
-                                    width,
-                                    height,
-                                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
-                                );
-                                if !hwnd_still_owned_by(hwnd, &owner) {
-                                    return;
-                                }
-                                wm_paint(hwnd.0, 0, 0, 0);
-                                if hwnd_still_owned_by(hwnd, &owner) {
-                                    let mut inner = owner.borrow_mut();
-                                    inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
-                                }
-                            }
-                        } else {
-                            log::trace!(
-                                "ignoring set_inner_size({width}, {height}) call \
-                                because window_state is {window_state:?}"
-                            );
-                        }
+                        apply_inner_size(hwnd, &owner, width, height, window_state);
                     })
                     .detach();
+            } else {
+                // The scheduler logged the rejection. The request is over,
+                // so it completes, as in apply_inner_size.
+                inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
             }
             Ok(())
         });
@@ -1586,6 +1562,48 @@ unsafe fn wm_nchittest(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
     }
 
     Some(HTCLIENT)
+}
+
+/// Applies a set_inner_size request on the main thread, given the window's
+/// outer size. While the window is still ours the request always ends with
+/// SetInnerSizeCompleted, even when a maximized or full-screen window refuses
+/// the size: the caller defers every paint until its requests complete, so a
+/// startup resize that lost the race with maximize left the window unpainted
+/// (ft-vb1xj8). macOS and Wayland complete a refused size the same way.
+fn apply_inner_size(
+    hwnd: HWindow,
+    owner: &Rc<RefCell<WindowInner>>,
+    width: i32,
+    height: i32,
+    window_state: WindowState,
+) {
+    if window_state.can_resize() {
+        log::trace!("set_inner_size now calling SetWindowPos with {width}x{height}");
+        unsafe {
+            SetWindowPos(
+                hwnd.0,
+                hwnd.0,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+            );
+            if !hwnd_still_owned_by(hwnd, owner) {
+                return;
+            }
+            wm_paint(hwnd.0, 0, 0, 0);
+        }
+    } else {
+        log::trace!(
+            "ignoring set_inner_size({width}, {height}) call \
+            because window_state is {window_state:?}"
+        );
+    }
+    if hwnd_still_owned_by(hwnd, owner) {
+        let mut inner = owner.borrow_mut();
+        inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
+    }
 }
 
 fn get_window_state(hwnd: HWND) -> WindowState {
@@ -3701,6 +3719,39 @@ mod tests {
         drop(executor); // Retire the actual detached, still-unpolled Render future.
         assert!(!state.throttled.get());
         assert_ne!(unsafe { GetUpdateRect(window.window.0, null_mut(), 0) }, 0);
+    }
+
+    #[test]
+    fn windows_inner_size_request_completes_when_the_window_refuses_it() {
+        use promise::spawn::{MainThreadAdmissionLimits, SimpleExecutor};
+        let _lock = crate::REPAINT_SCHEDULER_TEST_LOCK.lock().unwrap();
+        let _executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 16 * 1024, 1, 8 * 1024).unwrap(),
+        )
+        .unwrap();
+        let completed = Rc::new(Cell::new(0));
+        let paints = Rc::new(Cell::new(0));
+        let (seen_completed, seen_paints) = (Rc::clone(&completed), Rc::clone(&paints));
+        let window = TestWindow::new(WindowEventSender::new(move |event, _| match event {
+            WindowEvent::SetInnerSizeCompleted => seen_completed.set(seen_completed.get() + 1),
+            WindowEvent::NeedRepaint => seen_paints.set(seen_paints.get() + 1),
+            _ => {}
+        }));
+
+        let request = |state| apply_inner_size(window.window, &window.owner, 320, 200, state);
+
+        // A maximized or full-screen window keeps its size, and the request
+        // still completes: TermWindow defers every paint until it does.
+        request(WindowState::MAXIMIZED);
+        assert_eq!(completed.get(), 1, "a refused size completes");
+        request(WindowState::FULL_SCREEN);
+        assert_eq!(completed.get(), 2, "a refused size completes");
+        assert_eq!(paints.get(), 0, "a refused size is not painted");
+
+        // A normal window takes the size, paints it and completes.
+        request(WindowState::empty());
+        assert_eq!(completed.get(), 3);
+        assert_eq!(paints.get(), 1);
     }
 
     #[test]
