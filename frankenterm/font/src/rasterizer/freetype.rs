@@ -1030,13 +1030,15 @@ mod tests {
 
     /// Windows and macOS always ship CJK and color emoji faces; a Linux
     /// host may have neither installed.
+    const SYSTEM_SHIPS_CJK_AND_EMOJI: bool = cfg!(any(windows, target_os = "macos"));
+
+    /// The system face for `ch`, required where [`SYSTEM_SHIPS_CJK_AND_EMOJI`].
     fn system_fallback_required(ch: char) -> Option<ParsedFont> {
         let found = system_fallback(ch);
         if found.is_none() {
-            assert!(
-                !(cfg!(windows) || cfg!(target_os = "macos")),
-                "the system fallback locator found no face for {ch:?}"
-            );
+            if SYSTEM_SHIPS_CJK_AND_EMOJI {
+                panic!("the system fallback locator found no face for {ch:?}");
+            }
             eprintln!("no system face maps {ch:?} on this host; skipped");
         }
         found
@@ -1069,7 +1071,7 @@ mod tests {
         // system's color emoji face rasterizes in color: Segoe UI Emoji (COLR)
         // on Windows, Apple Color Emoji (sbix) on macOS. A Linux host's
         // fallback for it may be a monochrome face, so it is not checked there.
-        if cfg!(windows) || cfg!(target_os = "macos") {
+        if SYSTEM_SHIPS_CJK_AND_EMOJI {
             let emoji_font = system_fallback_required('\u{1F600}').expect("a system emoji face");
             let system_emoji = raster(&emoji_font, '\u{1F600}');
             let what = format!("{} U+1F600", emoji_font.handle.diagnostic_string());
