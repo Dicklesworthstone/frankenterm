@@ -175,7 +175,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
          initialMachineID: String, connections: MobileConnections,
          initialGroup: TerminalConnectionIntent.Group? = nil, autoConnect: Bool = true,
          maximumRetainedConnections: Int = 16, watchesNetworkPath: Bool = true,
-         initialMuxAccessMode: TerminalMuxAccessMode = .viewOnly) throws {
+         initialMuxAccessMode: TerminalMuxAccessMode = .interactive) throws {
         self.workspaceID = workspaceID; self.revision = revision; self.autoConnect = autoConnect
         self.workspaceName = workspaceName; self.machines = machines; self.connections = connections
         self.initialMuxAccessMode = initialMuxAccessMode
@@ -399,6 +399,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// Orphaned tabs survive only as bounded durable metadata. Loading them
     /// cannot reconnect, execute input, or grant permission to a new shell.
+    /// They leave the operator nothing to decide, so they are released as
+    /// soon as they load instead of waiting for a review that fills the
+    /// journal's unresolved limit.
     func refreshTerminalHistory() {
         let generation = UUID(); terminalHistoryGeneration = generation
         Task { [weak self] in
@@ -407,6 +410,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 let records = try await self.connections.journal.records()
                 guard !self.closed, self.terminalHistoryGeneration == generation else { return }
                 self.orphanedTerminalRecords = self.orphanedRecords(in: records)
+                if !self.orphanedTerminalRecords.isEmpty { self.releaseEarlierTerminals(self.orphanedTerminalRecords) }
             } catch {
                 guard !self.closed, self.terminalHistoryGeneration == generation else { return }
                 self.terminalHistoryFailure = "Earlier terminal history could not be read: \(TerminalSessionController.describe(error))"
@@ -426,11 +430,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         orphanedTerminalRecords.filter { $0.scope.machineID == machineID }
     }
 
-    /// The button supplies the exact snapshots it displayed. A later record
-    /// stays visible; ambiguous writes require a successful explicit retry.
-    func acknowledgeEarlierTerminals(_ reviewed: [TerminalSessionRecord], machineID: String) {
-        guard permitsTerminalCreation, onScreen, selectedMachineID == machineID, !reviewingTerminalHistory,
-              reviewed.allSatisfy({ $0.scope.machineID == machineID && orphanedTerminalRecords.contains($0) }) else { return }
+    /// Releases exactly the loaded snapshots. A record written after them
+    /// waits for the next refresh; a failed write is retried by that refresh.
+    private func releaseEarlierTerminals(_ reviewed: [TerminalSessionRecord]) {
+        guard permitsTerminalCreation, !reviewingTerminalHistory,
+              reviewed.allSatisfy({ orphanedTerminalRecords.contains($0) }) else { return }
         reviewingTerminalHistory = true
         terminalHistoryGeneration = UUID()
         Task { [weak self] in
@@ -448,7 +452,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     self.clearReviewedTerminalHints(reviewed, current: current)
                     self.orphanedTerminalRecords = self.orphanedRecords(in: current)
                 }
-                self.terminalHistoryFailure = "Earlier terminal history could not be acknowledged: \(TerminalSessionController.describe(error)) Review again to retry."
+                self.terminalHistoryFailure = "Earlier terminal history could not be released: \(TerminalSessionController.describe(error))"
             }
         }
     }
@@ -799,18 +803,18 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
     }
 
-    /// Input notices remain meaningful after reconnect, independently of the
-    /// machine's current connected state. An intentional Disconnect is not a
-    /// failure. Unavailable routes still need their key or trust requirement
-    /// resolved before the machine can connect.
+    /// What the operator can act on: a keyboard decision, a connection that
+    /// needs them, new output. An intentional Disconnect is not a failure.
+    /// Unavailable routes still need their key or trust requirement resolved
+    /// before the machine can connect. How earlier input ended is not shown:
+    /// the live screen says more than a notice can.
     func attentionReasons(_ machineID: String) -> Set<TerminalAttentionReason> {
-        var reasons = TerminalAttentionReason.observed(input: .init(),
+        var reasons = TerminalAttentionReason.observed(
             keyboardNeedsDecision: false,
-            connectionNeedsAttention: status(of: machineID) == .attention || status(of: machineID) == .unavailable
-                || !earlierTerminals(machineID).isEmpty,
+            connectionNeedsAttention: status(of: machineID) == .attention || status(of: machineID) == .unavailable,
             newOutput: hasUnseenOutput(machineID))
         for controller in terminalControllers(machineID) {
-            reasons.formUnion(TerminalAttentionReason.observed(input: controller.inputDelivery,
+            reasons.formUnion(TerminalAttentionReason.observed(
                 keyboardNeedsDecision: controller.localInputNeedsDecision,
                 connectionNeedsAttention: false, newOutput: false))
         }
@@ -1212,9 +1216,6 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             for controller in controllers {
                 let source = TerminalUnseenOutput.Source(machineID: id, terminalSessionID: controller.terminalSessionID)
                 ring.append(source)
-                if id != selectedMachineID, controller.terminalSessionID == nil, !earlierTerminals(id).isEmpty {
-                    attention.insert(source)
-                }
                 let selected = selectedSession === controller
                 let needsConnection: Bool
                 switch controller.phase {
@@ -1222,7 +1223,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 case .ended: needsConnection = controller.dropped
                 case .idle, .connecting, .ready, .live: needsConnection = false
                 }
-                let reasons = TerminalAttentionReason.observed(input: controller.inputDelivery,
+                let reasons = TerminalAttentionReason.observed(
                     keyboardNeedsDecision: controller.localInputNeedsDecision,
                     connectionNeedsAttention: needsConnection,
                     newOutput: controller.phase == .live && controller.hasUnseenOutput)
@@ -1451,7 +1452,6 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             reconnectingFrom: preservingSuccessfulCandidate ? continuity : nil,
             retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : continuity,
             inputDelivery: previous?.inputDelivery ?? .init(),
-            persistentShellNotice: previous?.persistentShellNotice,
             muxAccessMode: muxAccessSelections[machineID] ?? continuity?.muxAccessMode ?? initialMuxAccessMode,
             requiresExistingMux: existingMuxRequired.contains(machineID) || continuity?.requiresExistingMux == true)
         controller.onChange = { [weak self, weak controller] in
@@ -1473,6 +1473,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             case .couldNotConnect:
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
             case .idle, .connecting, .ready: break
+            }
+            // A shared pane too large to view at its own size is fitted to
+            // the phone instead, as the default mode does from the start. A
+            // size the person chose in Screen Size is theirs to change back.
+            if controller.paneTooLargeToView, !controller.muxAccessMode.controlsSize,
+               self.muxAccessSelections[machineID] == nil {
+                self.takePaneAtPhoneSize(machineID, from: controller)
             }
             self.reconcile()
         }
@@ -1616,9 +1623,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         muxModeJobs[machineID] = (id, task)
     }
 
-    /// A shared pane larger than the phone can draw needs explicit permission
-    /// to change its size. The prior owner must settle first; an absent mux
-    /// still cannot become a new SSH shell.
+    /// Fits a shared pane larger than the phone can draw to the phone: by
+    /// itself, or from Fit to Phone after the person chose a desktop size.
+    /// The prior owner settles first; an absent mux still cannot become a new
+    /// SSH shell.
     func takePaneAtPhoneSize(_ machineID: String, from session: TerminalSessionController) {
         guard permitsTerminalCreation, sessions[machineID] === session, session.paneTooLargeToView,
               !session.muxAccessMode.controlsSize, muxModeJobs[machineID] == nil else { return }
@@ -2177,20 +2185,7 @@ struct WorkspaceTerminalScreen: View {
     @State private var retainedOutput: TerminalRetainedOutput?
     /// A machine attached to its mux searches its panes' history on the server.
     @State private var muxSearch: TerminalSessionController?
-    @State private var useTerminalReview: TerminalSessionController?
     @State private var hostKeyReview: TerminalSessionController?
-    private struct PersistentShellReview: Identifiable {
-        var id: UUID { request.id }
-        let session: TerminalSessionController
-        let request: TerminalSessionController.PersistentShellReview
-    }
-    @State private var persistentShellReview: PersistentShellReview?
-    private struct EarlierTerminalsReview: Identifiable {
-        let id = UUID()
-        let machineID: String, machineName: String
-        let records: [TerminalSessionRecord]
-    }
-    @State private var earlierTerminalsReview: EarlierTerminalsReview?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -2207,23 +2202,19 @@ struct WorkspaceTerminalScreen: View {
                 || scene.sessions[machine.id]?.additionalTerminalTarget != nil {
                 directTerminalStrip(machine).environment(\.colorScheme, chrome)
             }
-            if let machine, !scene.earlierTerminals(machine.id).isEmpty || scene.terminalHistoryFailure != nil {
-                earlierTerminalBar(machine).environment(\.colorScheme, chrome)
-            }
             if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState {
-                muxAccessBar(session).environment(\.colorScheme, chrome)
                 if !mux.panes.isEmpty {
                     PaneStrip(session: session, state: mux,
                               accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
-                              onKeyboard: { Task { await scene.activateKeyboard() } })
+                              onKeyboard: { Task { await scene.activateKeyboard() } },
+                              onNewTab: { session.newPersistentShell() })
                         .environment(\.colorScheme, chrome)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
             if let notice = scene.selectedSession?.persistentShellNotice {
                 HStack(spacing: 10) {
-                    if scene.selectedSession?.muxState?.shellCreation?.pending == true { ProgressView() }
-                    else { Image(systemName: "terminal") }
+                    ProgressView()
                     Text(notice).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.horizontal, 14).padding(.vertical, 8).background(.regularMaterial)
@@ -2276,11 +2267,6 @@ struct WorkspaceTerminalScreen: View {
             } else if scene.selectedSession?.resolvingLocalInput == true {
                 ProgressView("Resetting keyboard…")
                     .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
-            } else if let session = scene.selectedSession,
-                      let delivery = session.inputDeliveryMessage {
-                problemBanner(delivery) { session.dismissInputDelivery() }
-                    .accessibilityElement(children: .contain)
-                    .accessibilityIdentifier("terminal.input.delivery")
             } else if let session = scene.selectedSession, let problem = session.interactionProblem {
                 problemBanner(problem) { session.dismissInteractionProblem() }
             } else if let problem = scene.problem {
@@ -2312,36 +2298,6 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $hostKeyReview) { session in
             TerminalHostKeyMismatchScreen(scene: scene, session: session)
         }
-        .sheet(item: $earlierTerminalsReview) { review in earlierTerminalReview(review) }
-        .sheet(item: Binding(get: { persistentShellReview }, set: { review in
-            if let review { persistentShellReview = review }
-            else { dismissPersistentShellReview() }
-        })) { review in persistentShellConfirmation(review) }
-        .confirmationDialog("How should this phone use the shared terminal?",
-            isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
-            titleVisibility: .visible, presenting: useTerminalReview) { session in
-                if session.muxAccessMode != .inputOnly {
-                    Button("Type at Shared Size") {
-                        scene.reconnectMux(.inputOnly, machineID: session.target.machineID, controllerID: session.id)
-                        useTerminalReview = nil
-                    }
-                }
-                if session.muxAccessMode != .interactive {
-                    Button("Type and Fit to Phone") {
-                        scene.reconnectMux(.interactive, machineID: session.target.machineID, controllerID: session.id)
-                        useTerminalReview = nil
-                    }
-                }
-                if session.muxAccessMode != .viewOnly {
-                    Button("View Only") {
-                        scene.reconnectMux(.viewOnly, machineID: session.target.machineID, controllerID: session.id)
-                        useTerminalReview = nil
-                    }
-                }
-                Button("Cancel", role: .cancel) { useTerminalReview = nil }
-            } message: { session in
-                Text("Reconnect to \(session.target.machineName) with the selected permissions. Type at Shared Size keeps the pane's current dimensions. Type and Fit to Phone changes them for every client and permits separately reviewed new persistent shells. Other connected clients can still type and resize it.")
-            }
         .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
             if !visible { scene.dismissOverview() }
         }), onDismiss: { if let overviewSessionID { scene.finishOverviewDismissal(overviewSessionID) } }) {
@@ -2368,8 +2324,6 @@ struct WorkspaceTerminalScreen: View {
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             hostKeyReview = nil
-            earlierTerminalsReview = nil
-            dismissPersistentShellReview(resumingView: false)
             scene.disappear()
             if !scene.closed { onShowing?(nil) }
         }
@@ -2378,66 +2332,11 @@ struct WorkspaceTerminalScreen: View {
             if phase != .active {
                 historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
                 hostKeyReview = nil
-                earlierTerminalsReview = nil
-                dismissPersistentShellReview(resumingView: false)
             }
         }
         .onChange(of: scene.selectedSession?.id) { _, _ in
-            hostKeyReview = nil; earlierTerminalsReview = nil
-            dismissPersistentShellReview(resumingView: false)
+            hostKeyReview = nil
         }
-    }
-
-    private func dismissPersistentShellReview(resumingView: Bool = true) {
-        // A review can be cancelled before SwiftUI ever mounts its sheet.
-        // Retire the captured controller now; onDisappear is only a backstop.
-        guard let review = persistentShellReview else { return }
-        persistentShellReview = nil
-        review.session.endPersistentShellReview(review.request, resumingView: resumingView)
-    }
-
-    private func beginPersistentShell(_ session: TerminalSessionController) {
-        do { persistentShellReview = .init(session: session, request: try session.preparePersistentShell()) }
-        catch { session.reportPersistentShellProblem(error) }
-    }
-
-    private func persistentShellConfirmation(_ review: PersistentShellReview) -> some View {
-        NavigationStack {
-            Form {
-                Section("Connected machine") {
-                    Text(verbatim: review.request.machineName).font(.headline)
-                    Text(verbatim: "\(review.request.user)@\(review.request.host):\(review.request.port)")
-                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                    Text(verbatim: Self.via(review.request.route)).font(.caption)
-                }
-                Section("New persistent shell") {
-                    LabeledContent("Domain", value: "Server's default domain")
-                    LabeledContent("Workspace", value: review.request.plan.workspace)
-                    LabeledContent("Initial size", value: "\(review.request.plan.columns) columns × \(review.request.plan.rows) rows")
-                    Text("Creates a new window and tab using the default domain's configured shell and working directory. That domain may be local or remote. The shell remains in the mux when this phone disconnects.")
-                    Text("After confirmation, select the new pane from the pane list. This phone keeps its current pane selected.")
-                }
-                if let previous = review.session.persistentShellNotice {
-                    Section("Previous request") { Text(previous) }
-                }
-            }
-            .navigationTitle("New Persistent Shell").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismissPersistentShellReview() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Create Shell") {
-                        do { try review.session.createPersistentShell(review.request) }
-                        catch { review.session.reportPersistentShellProblem(error) }
-                        dismissPersistentShellReview()
-                    }
-                    .disabled(scene.selectedSession !== review.session || !review.session.canConfirmPersistentShell(review.request))
-                    .accessibilityIdentifier("terminal.mux.creation.confirm")
-                }
-            }
-        }
-        .onDisappear { review.session.endPersistentShellReview(review.request) }
     }
 
     private func directTerminalStrip(_ machine: SceneMachine) -> some View {
@@ -2453,7 +2352,7 @@ struct WorkspaceTerminalScreen: View {
                                 if !selected, controller.hasUnseenOutput {
                                     Circle().fill(.orange).frame(width: 6, height: 6)
                                 }
-                                if controller.inputDeliveryMessage != nil || controller.localInputNeedsDecision {
+                                if controller.localInputNeedsDecision {
                                     Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
                                 }
                             }
@@ -2482,65 +2381,6 @@ struct WorkspaceTerminalScreen: View {
         }
     }
 
-    private func earlierTerminalBar(_ machine: SceneMachine) -> some View {
-        let records = scene.earlierTerminals(machine.id)
-        return HStack(spacing: 10) {
-            Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Earlier Terminals").font(.caption.weight(.semibold))
-                Text(scene.terminalHistoryFailure ?? (records.contains(where: \.hasRecoveryNotice)
-                    ? "Earlier input may have unknown remote effects."
-                    : "Closed tabs have local history to review."))
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 4)
-            if scene.reviewingTerminalHistory { ProgressView() }
-            else {
-                Button("Review") {
-                    earlierTerminalsReview = .init(machineID: machine.id, machineName: machine.name, records: records)
-                }
-                .font(.caption.weight(.semibold)).buttonStyle(.bordered)
-                .accessibilityIdentifier("terminal.tabs.history")
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8).background(.regularMaterial)
-    }
-
-    private func earlierTerminalReview(_ review: EarlierTerminalsReview) -> some View {
-        NavigationStack {
-            List {
-                Section {
-                    Text("These terminals are no longer open in this app. Reviewing their saved metadata does not reconnect or replay input.")
-                    if review.records.contains(where: \.hasRecoveryNotice) {
-                        Text("Some earlier input may have reached the remote machine. Its effects are unknown; check the machine before repeating a command.")
-                    }
-                    if let failure = scene.terminalHistoryFailure { Text(failure).foregroundStyle(.secondary) }
-                } header: { Text(verbatim: review.machineName) }
-                ForEach(review.records) { record in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Earlier terminal \(record.scope.terminalSessionID?.uuidString.prefix(8) ?? "")")
-                            .font(.headline)
-                        Text(verbatim: "Route: \(record.scope.routeID)").font(.caption).foregroundStyle(.secondary)
-                        Text(record.hasRecoveryNotice ? "Input outcome is uncertain." : "The local connection was closed.")
-                            .font(.callout)
-                    }
-                }
-                Section {
-                    Button("Acknowledge Reviewed History") {
-                        scene.acknowledgeEarlierTerminals(review.records, machineID: review.machineID)
-                        earlierTerminalsReview = nil
-                    }
-                    .disabled(scene.reviewingTerminalHistory || scene.selectedMachineID != review.machineID)
-                    .accessibilityIdentifier("terminal.tabs.history.acknowledge")
-                } footer: {
-                    Text("This dismisses only the displayed local records. It does not claim that a remote command ran or that the remote shell exited.")
-                }
-            }
-            .navigationTitle("Earlier Terminals").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { earlierTerminalsReview = nil } } }
-        }
-    }
-
     @ToolbarContentBuilder private func toolbar(_ machine: SceneMachine?) -> some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button("Fleet Overview", systemImage: "square.grid.2x2") { scene.beginOverview() }
@@ -2557,14 +2397,36 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                     .keyboardShortcut("f", modifiers: .command)
                     .accessibilityIdentifier("terminal.history.open")
-                Button("Paste", systemImage: "doc.on.clipboard") { session.paste() }
-                    .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
+                // The system paste control reads the pasteboard without iOS
+                // asking for permission each time, and needs no keyboard.
+                PasteButton(payloadType: String.self) { strings in
+                    let text = strings.joined(separator: "\n")
+                    Task { @MainActor in session.paste(text: text) }
+                }
+                .labelStyle(.iconOnly)
+                .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
+                .accessibilityIdentifier("terminal.paste")
             }
             Menu {
                 if let session = scene.selectedSession, session.phase == .live, session.attachedToMux {
-                    Button("New Persistent Shell", systemImage: "plus.rectangle") { beginPersistentShell(session) }
+                    Button("New Tab", systemImage: "plus.rectangle") { session.newPersistentShell() }
                         .disabled(!session.canCreatePersistentShell)
                         .accessibilityIdentifier("terminal.mux.creation.new")
+                    // Fit to Phone is the default; the others are for a
+                    // desktop that must keep its size, or watching only.
+                    Menu("Screen Size", systemImage: "rectangle.dashed") {
+                        ForEach([TerminalMuxAccessMode.interactive, .inputOnly, .viewOnly], id: \.self) { mode in
+                            let title = mode == .interactive ? "Fit to Phone" : mode == .inputOnly ? "Keep Desktop Size" : "View Only"
+                            Button {
+                                scene.reconnectMux(mode, machineID: session.target.machineID, controllerID: session.id)
+                            } label: {
+                                if session.muxAccessMode == mode { Label(title, systemImage: "checkmark") } else { Text(title) }
+                            }
+                            .disabled(session.muxAccessMode == mode || session.clipboardIsPresenting
+                                || session.localInputNeedsDecision || scene.changingMuxModes.contains(session.target.machineID))
+                        }
+                    }
+                    .accessibilityIdentifier("terminal.mux.access.change")
                     Divider()
                 }
                 if let session = scene.selectedSession, !session.attachedToMux,
@@ -2700,33 +2562,6 @@ struct WorkspaceTerminalScreen: View {
         .accessibilityIdentifier("terminal.split.focus.\(machine.id)")
     }
 
-    private func muxAccessBar(_ session: TerminalSessionController) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Label(session.isViewingOnly ? "View Only" : "Using Shared Terminal",
-                      systemImage: session.isViewingOnly ? "eye" : "keyboard").font(.caption.weight(.semibold))
-                Text(session.isViewingOnly ? "Shared size · Input is off"
-                    : session.muxAccessMode.controlsSize ? "Phone size · Input is on" : "Shared size · Input is on")
-                    .font(.caption2).foregroundStyle(.secondary)
-                if session.keepsSharedMuxSize && session.prefersReadableViewport {
-                    Text("Readable view · Drag to pan; pinch to zoom")
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .accessibilityIdentifier("terminal.viewport.status")
-                }
-            }
-            Spacer(minLength: 4)
-            Button(session.isViewingOnly ? "Use Terminal" : "Change…") {
-                useTerminalReview = session
-            }
-            .font(.caption.weight(.semibold)).buttonStyle(.bordered)
-            .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision
-                || scene.changingMuxModes.contains(session.target.machineID))
-            .accessibilityIdentifier("terminal.mux.access.change")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 6).background(.thinMaterial)
-        .accessibilityElement(children: .contain).accessibilityIdentifier("terminal.mux.access")
-    }
-
     private func inputRecoveryBanner(_ recovery: TerminalKeyboardRecovery, session: TerminalSessionController) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("Keyboard paused", systemImage: "keyboard.badge.ellipsis").font(.headline)
@@ -2816,19 +2651,17 @@ struct WorkspaceTerminalScreen: View {
                 if session.terminal == nil {
                     if let mux = session.muxState, mux.shown == nil {
                         if mux.panes.isEmpty {
-                            sceneCard(symbol: "terminal", title: "No Persistent Shells",
-                                      message: "Connected to this machine's mux. Create its first shell, or wait for a pane opened by another client.", accent: accent) {
-                                Button("New Persistent Shell") { beginPersistentShell(session) }
-                                    .buttonStyle(.borderedProminent).disabled(!session.canCreatePersistentShell)
+                            sceneCard(symbol: "terminal", title: "No Tabs Open",
+                                      message: "Nothing is running in FrankenTerm on \(machine.name) yet.", accent: accent) {
+                                Button("New Tab", systemImage: "plus") { session.newPersistentShell() }
+                                    .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+                                    .disabled(!session.canCreatePersistentShell)
                                     .accessibilityIdentifier("terminal.mux.creation.empty")
-                                if !session.muxAccessMode.permitsShellCreation {
-                                    Text("Choose Type and Fit to Phone in the access menu to enable shell creation.")
-                                        .font(.caption)
-                                }
                             }
                         } else {
-                            sceneCard(symbol: "rectangle.split.2x1", title: "Select a Pane",
-                                      message: mux.notice ?? "Choose a pane above to continue on this machine.", accent: accent) {}
+                            // The transport opens a pane by itself; this is
+                            // the moment before its screen arrives.
+                            ProgressView().controlSize(.large).tint(accent)
                         }
                     } else { ProgressView().controlSize(.large).tint(accent) }
                 }
@@ -2924,18 +2757,18 @@ struct WorkspaceTerminalScreen: View {
     private func endedCard(_ machine: SceneMachine, message: String, session: TerminalSessionController,
                            accent: Color) -> some View {
         // Viewing a pane too large to view would end the same way again;
-        // only the phone's own size can show it.
+        // only the phone's own size can show it. The scene fits it by itself
+        // (takePaneAtPhoneSize); this button is the fallback when it could not.
         let fits = session.paneTooLargeToView
         let routeChanged = session.terminalSessionID.map { scene.invalidatedTerminalSlots.contains($0) } == true
-        return sceneCard(symbol: "moon.zzz", title: "Session ended", message: fits
-            ? message + " Use at Phone Size fits it to this phone while you use it; the desktop gets its size back when you leave."
-            : routeChanged ? "This tab used the earlier connection choice. Remove it and open a new terminal after connecting with the new route."
+        return sceneCard(symbol: "moon.zzz", title: "Session ended", message: routeChanged
+            ? "This tab used the earlier connection choice. Remove it and open a new terminal after connecting with the new route."
             : message, accent: accent) {
             Group {
                 if routeChanged {
                     Button("Remove This Tab", systemImage: "xmark.rectangle") { scene.removeTerminal(session) }
                 } else if fits {
-                    Button("Use at Phone Size", systemImage: "arrow.down.right.and.arrow.up.left") {
+                    Button("Fit to Phone", systemImage: "arrow.down.right.and.arrow.up.left") {
                         scene.takePaneAtPhoneSize(machine.id, from: session)
                     }
                     .accessibilityIdentifier("terminal.ended.fit")
@@ -4149,6 +3982,8 @@ private struct PaneStrip: View {
     /// Brings up the keyboard: needed while the pane's program has the mouse,
     /// since a tap on the terminal is then a click.
     let onKeyboard: () -> Void
+    /// Opens a new tab on this machine, which is shown when it appears.
+    let onNewTab: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -4158,6 +3993,18 @@ private struct PaneStrip: View {
                         Image(systemName: "square.split.2x1").font(.caption).foregroundStyle(.secondary)
                             .accessibilityHidden(true)
                         ForEach(state.panes) { pane in chip(pane).id(pane.paneId) }
+                        if !session.isViewingOnly {
+                            Button(action: onNewTab) {
+                                Image(systemName: "plus").font(.callout.weight(.semibold))
+                                    .frame(width: 36, height: 32)
+                                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+                                    .contentShape(RoundedRectangle(cornerRadius: 9))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!session.canCreatePersistentShell)
+                            .accessibilityLabel("New tab")
+                            .accessibilityIdentifier("terminal.mux.newTab")
+                        }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 6)
                 }

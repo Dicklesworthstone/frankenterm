@@ -25,6 +25,9 @@ public final class NativeTerminalClipboardController: NSObject {
     private var textView: UITextView?
     private var detailLabel: UILabel?
     private var panelID: UUID?
+    /// Only a composed draft's Review shows the paste panel. A Paste the
+    /// person chose is sent at once: choosing it was the confirmation.
+    private var reviewsNextPaste = false
     private var panelGestures: [(UIGestureRecognizer, Bool)] = []
     private var commandDraft: TerminalCommandDraft<TerminalCommandDraftDestination>?
     private var commandTask: Task<Void, Never>?
@@ -147,6 +150,15 @@ public final class NativeTerminalClipboardController: NSObject {
         terminal.input.paste(nil)
     }
 
+    /// Text the system's paste control handed over (SwiftUI `PasteButton`,
+    /// which reads the pasteboard without iOS asking for permission). The
+    /// person chose to paste it, so it goes to this terminal at once.
+    public func paste(text: String) {
+        guard canPresent, !isPresenting, let terminal else { return }
+        guard terminal.input.canReviewPaste else { onFailure?(TerminalClipboardError.unavailable); return }
+        terminal.input.requestPasteReview(text: text)
+    }
+
     /// A local multiline editor, opened only by the user's Compose action.
     /// It reads no clipboard and sends no input. The native responder retires
     /// before the editor appears, including any uncommitted terminal IME text.
@@ -225,6 +237,8 @@ public final class NativeTerminalClipboardController: NSObject {
                     // only the existing source/focus-bound paste path may offer
                     // the next decision. This does not confirm or admit it.
                     self.commandDraft = nil; self.commandTask = nil; self.commandTaskID = nil
+                    self.reviewsNextPaste = true
+                    defer { self.reviewsNextPaste = false }
                     terminal.input.requestPasteReview(text: text)
                     guard let candidate = self.review.candidate,
                           candidate.id == terminal.input.pendingPaste?.id else {
@@ -263,6 +277,15 @@ public final class NativeTerminalClipboardController: NSObject {
         do {
             let destination = Destination(keyboardID: candidate.keyboardID, focus: candidate.focus)
             try review.offer(id: candidate.id, destination: destination, text: candidate.text)
+            guard reviewsNextPaste else {
+                // The paste control, the edit menu's Paste and ⌘V are the
+                // person's own choice; a second confirmation adds nothing.
+                // Shells that enable bracketed paste still receive it marked.
+                try review.confirm(id: candidate.id, destination: destination) { _ in
+                    try terminal.confirmPaste(id: candidate.id)
+                }
+                return
+            }
             terminal.input.setReviewingPaste(true)
             let preview = PassiveClipboardTextView()
             preview.isEditable = false; preview.isSelectable = false

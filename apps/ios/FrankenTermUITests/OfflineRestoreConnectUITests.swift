@@ -720,11 +720,11 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     }
 
     /// iOS can end the whole app, not just a connection, before the machine
-    /// answers what was typed. The killed launch cannot say so; the next one
-    /// retains the durable notice across new output and relaunch until the
-    /// person dismisses it, and sends nothing again.
+    /// answers what was typed. The next launch opens a working terminal with
+    /// no notice to dismiss (there is nothing the person could do about it),
+    /// sends nothing again, and the launch after that is just as quiet.
     @MainActor
-    func test5BAKilledLaunchTellsInputThatHadNoAnswer() throws {
+    func test5BAKilledLaunchComesBackQuietlyWithoutResendingInput() throws {
         let inputs = try inputs()
         var app = launch()
         // The previous test leaves the workspace list on screen.
@@ -739,20 +739,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         app = launch()
         terminal = reopen(app, inputs)
-        var notice = app.descendants(matching: .any)["terminal.input.delivery"]
-        XCTAssertTrue(notice.waitForExistence(timeout: 30), "the next launch tells the input that had no answer")
-        let told = notice.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "It may or may not have arrived.")).firstMatch
-        XCTAssertTrue(told.exists, "it says the input may or may not have arrived")
-        snapshot("k1-told")
+        let notice = app.descendants(matching: .any)["terminal.input.delivery"]
         app.typeText("echo FRESH-$((6*7))\n")
-        waitFor("FRESH-42", in: terminal, timeout: 30, "the new session runs commands")
+        waitFor("FRESH-42", in: terminal, timeout: 30, "the new session runs commands at once")
         never("unanswered", in: terminal, "nothing typed before is sent again")
-        XCTAssertTrue(notice.exists, "new output cannot establish the old command's outcome")
+        XCTAssertFalse(notice.exists, "no notice about the earlier launch's input")
+        snapshot("k1-quiet")
 
         // Finish this new shell and wait for joined cleanup before killing
-        // the app again. Merely navigating away keeps sessions alive. A new
-        // crash marker must not mask loss of the original notice, and the
-        // consumed UserDefaults hint cannot supply it again.
+        // the app again. Merely navigating away keeps sessions alive.
         app.typeText("exit\n")
         let newSession = app.buttons["New Session"].firstMatch
         XCTAssertTrue(newSession.waitForExistence(timeout: 30))
@@ -768,15 +763,10 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.terminate()
         app = launch()
         terminal = connect(app, inputs)
-        notice = app.descendants(matching: .any)["terminal.input.delivery"]
-        XCTAssertTrue(notice.waitForExistence(timeout: 30), "the original durable notice survives another launch")
-        let durable = notice.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Input may have been in flight")).firstMatch
-        XCTAssertTrue(durable.exists, "the journal speaks conservatively after the detail hint was consumed")
-        notice.buttons["Dismiss"].tap()
-        XCTAssertTrue(notice.waitForNonExistence(timeout: 5), "explicit durable dismissal removes the notice")
-        app.typeText("echo DISMISSED-$((6*7))\n")
-        waitFor("DISMISSED-42", in: terminal, timeout: 30, "dismissal does not interrupt the new connection")
-        XCTAssertFalse(notice.exists)
+        app.typeText("echo AGAIN-$((6*7))\n")
+        waitFor("AGAIN-42", in: terminal, timeout: 30, "the launch after runs commands at once")
+        XCTAssertFalse(app.descendants(matching: .any)["terminal.input.delivery"].exists,
+                       "the earlier record was released, not kept for another launch")
 
         list = app.buttons["Add machines"]
         for _ in 0..<3 where !list.exists {

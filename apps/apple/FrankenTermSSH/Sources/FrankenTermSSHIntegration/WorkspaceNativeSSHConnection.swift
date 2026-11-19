@@ -785,6 +785,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var panes: [TerminalMuxPane] = []
         var listed = false, ready = false, flushing = false
         var shown: Int?
+        /// A shell this phone created: it is shown as soon as a listing has it.
+        var selectWhenListed: Int?
         /// The shown pane is subscribed, independently of size ownership.
         var showing = false
         var controllingSize = false
@@ -932,20 +934,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     try await validateForeground()
                 }
             }
-            let (chosen, lost, restarted, unverified, unconfirmed) = state.shownPane.choose(
-                from: state.panes, incarnation: state.incarnation, identities: state.identities)
-            if restarted {
-                control.recordNotice("FrankenTerm restarted on this machine while you were away. Select a pane to continue.")
-            } else if unverified {
-                control.recordNotice("The previous pane's identity could not be verified on this connection. Select a pane to continue.")
-            } else if lost {
-                control.recordNotice("The pane you were viewing is gone or has been replaced. Select a pane to continue.")
-            }
-            if unconfirmed { control.recordInputUnconfirmed() }
-            // Unverified saved selection stays empty: a same-number successor
-            // cannot acquire input merely because it is the desktop's active
-            // pane. The connected inventory/picker remains available.
-            if let chosen {
+            // The phone always opens on a pane when the machine has one: the
+            // pane it showed last, else the desktop's active pane, else the
+            // first. Nothing is typed before the pane is on screen, so the
+            // operator sees which pane they are in before any input reaches it.
+            if let chosen = state.shownPane.choose(from: state.panes, incarnation: state.incarnation,
+                                                   identities: state.identities) {
                 state.shown = chosen.paneId
                 state.shownPane.set(chosen, incarnation: state.incarnation, identity: state.identities[chosen.paneId])
                 try control.inputRouting.select(pane: chosen.paneId)
@@ -1166,8 +1160,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.recordNotice(reason)
             case .shellCreated(let request, let pane, let tab, let window):
                 if state.control.finishShellCreation(request: request, outcome: .created(pane: pane, tab: tab, window: window)) {
-                    // A numeric spawn receipt cannot prove a later pane's live
-                    // registration. Refresh the picker; selection remains explicit.
+                    // The new tab is shown once a listing registers it, like
+                    // a new tab on the desktop.
+                    state.selectWhenListed = pane
                     state.nextListing = .now
                 }
             case .shellCreationFailed(let request, let reason, let uncertain):
@@ -1189,24 +1184,38 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// shared size after focus relinquishes that override.
     private func reconcileMux() throws {
         guard let state = mux else { return }
-        if let requested = state.control.takeRequest(), requested != state.shown,
-           state.panes.contains(where: { $0.paneId == requested }) {
+        func switchTo(_ pane: Int) throws {
             if let old = state.shown {
                 if state.showing { try state.client.hide(pane: old) }
                 if state.controllingSize { try state.client.restoreSize(pane: old) }
             }
-            state.shown = requested; state.showing = false; state.controllingSize = false
-            state.shownPane.set(state.panes.first { $0.paneId == requested }, incarnation: state.incarnation,
-                                identity: state.identities[requested])
-            try state.control.inputRouting.select(pane: requested)
+            state.shown = pane; state.showing = false; state.controllingSize = false
+            state.shownPane.set(state.panes.first { $0.paneId == pane }, incarnation: state.incarnation,
+                                identity: state.identities[pane])
+            try state.control.inputRouting.select(pane: pane)
             // Finish already-decoded output events before the replacement.
             // Dropping a chunk's suffix could strand the canonical parser in
             // UTF-8 or an escape sequence. Old visit markers cannot enable the
             // new pane, and its retired view no longer accepts these frames.
-            state.control.publish(shown: requested)
+            state.control.publish(shown: pane)
         }
-        // A vanished selection stays vanished. Neither old queued input nor a
-        // newly created responder may silently inherit an unrelated pane.
+        if let requested = state.control.takeRequest() {
+            // The operator's own choice wins over a shell still being listed.
+            state.selectWhenListed = nil
+            if requested != state.shown, state.panes.contains(where: { $0.paneId == requested }) {
+                try switchTo(requested)
+            }
+        } else if let created = state.selectWhenListed, state.panes.contains(where: { $0.paneId == created }) {
+            state.selectWhenListed = nil
+            if created != state.shown { try switchTo(created) }
+        } else if state.shown == nil, state.listed,
+                  let next = state.panes.first(where: \.isActive) ?? state.panes.first {
+            // A machine with panes always shows one. When the shown pane
+            // closes, the desktop's active pane (else the first) takes its
+            // place. Input already admitted for the closed pane stays bound
+            // to it and is never redirected to this one.
+            try switchTo(next.paneId)
+        }
         // One bounded scheduler owns all accepted remote lookup IDs, including
         // superseded and timed-out work. Terminal input keeps its separate lane.
         state.queries.step()

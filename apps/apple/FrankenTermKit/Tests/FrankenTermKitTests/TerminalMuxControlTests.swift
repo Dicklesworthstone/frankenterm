@@ -72,12 +72,17 @@ final class TerminalMuxControlTests: XCTestCase {
                        .failed(reason: "The connection is no longer active.", uncertain: false))
     }
 
-    func testShellCreationPermissionIsSeparateFromInputAndValidatesBounds() throws {
-        for mode in [TerminalMuxAccessMode.viewOnly, .inputOnly] {
+    func testShellCreationFollowsInputPermissionAndValidatesBounds() throws {
+        let observer = TerminalMuxControl(accessMode: .viewOnly)
+        observer.setVisible(true); observer.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+        XCTAssertFalse(TerminalMuxAccessMode.viewOnly.permitsShellCreation)
+        XCTAssertThrowsError(try observer.prepareShellCreation(workspace: "default"))
+        // A connection that can type can open a tab, at the shared size too.
+        for mode in [TerminalMuxAccessMode.inputOnly, .interactive] {
             let control = TerminalMuxControl(accessMode: mode)
             control.setVisible(true); control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
-            XCTAssertFalse(mode.permitsShellCreation)
-            XCTAssertThrowsError(try control.prepareShellCreation(workspace: "default"))
+            XCTAssertTrue(mode.permitsShellCreation)
+            XCTAssertNoThrow(try control.prepareShellCreation(workspace: "default"))
         }
         let control = TerminalMuxControl()
         control.setVisible(true)
@@ -772,7 +777,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run, identities: identities).keys), [9])
     }
 
-    func testANewConnectionComesBackToTheShownPaneOnlyWhileItIsStillThere() throws {
+    func testANewConnectionComesBackToTheShownPaneAndOtherwiseOpensTheActivePane() throws {
         let suite = "frankenterm.tests.shownPane.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -784,30 +789,33 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         let run = Data(repeating: 0x1c, count: 16), identity = try paneIdentity(4)
         let identities = [4: identity]
         let first = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        // Nothing remembered: the desktop's active pane, and nothing to say.
-        XCTAssertEqual(first.choose(from: listed, incarnation: nil).pane, listed[0])
-        XCTAssertFalse(first.choose(from: listed, incarnation: nil).lost)
+        // Nothing remembered: the desktop's active pane.
+        XCTAssertEqual(first.choose(from: listed, incarnation: nil), listed[0])
         first.set(listed[1], incarnation: run, identity: identity)
 
         // The next connection to the same machine comes back to it.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
         XCTAssertEqual(next.record, .init(listed[1], incarnation: run, identity: identity))
-        XCTAssertEqual(next.choose(from: listed, incarnation: run, identities: identities).pane, listed[1])
-        XCTAssertFalse(next.choose(from: listed, incarnation: run, identities: identities).lost)
+        XCTAssertEqual(next.choose(from: listed, incarnation: run, identities: identities), listed[1])
         XCTAssertNil(TerminalMuxShownPane(workspace: "w", machine: "ts2", defaults: defaults).record)
 
+        // Its verified identity finds it under another tab.
         let moved = pane(4, tab: 9)
-        XCTAssertEqual(next.choose(from: [listed[0], moved, listed[2]], incarnation: run, identities: identities).pane, moved)
-        let missing = next.choose(from: [listed[0], listed[2]], incarnation: run, identities: identities)
-        XCTAssertNil(missing.pane); XCTAssertTrue(missing.lost); XCTAssertFalse(missing.restarted)
-        let replaced = next.choose(from: listed, incarnation: run, identities: [4: try paneIdentity(4, registration: 0x99)])
-        XCTAssertNil(replaced.pane); XCTAssertTrue(replaced.lost)
-        XCTAssertTrue(next.choose(from: listed, incarnation: run).unverified)
-        XCTAssertNil(next.choose(from: [], incarnation: nil).pane)
-        // A pane that closed while shown is forgotten: nothing to say later.
+        XCTAssertEqual(next.choose(from: [listed[0], moved, listed[2]], incarnation: run, identities: identities), moved)
+        // Gone, or its number now names another pane: the active pane, never none.
+        XCTAssertEqual(next.choose(from: [listed[0], listed[2]], incarnation: run, identities: identities), listed[0])
+        XCTAssertEqual(next.choose(from: listed, incarnation: run,
+                                   identities: [4: try paneIdentity(4, registration: 0x99)]), listed[0])
+        // Not yet identified on this connection: its number on the same run.
+        XCTAssertEqual(next.choose(from: listed, incarnation: run), listed[1])
+        XCTAssertEqual(next.choose(from: [listed[2], listed[1]], incarnation: run), listed[1])
+        // Without an active pane, the first.
+        XCTAssertEqual(next.choose(from: [listed[2], pane(8, tab: 5)], incarnation: run), listed[2])
+        XCTAssertNil(next.choose(from: [], incarnation: nil))
+        // A pane that closed while shown is forgotten.
         next.set(nil, incarnation: nil)
         XCTAssertNil(first.record)
-        XCTAssertFalse(first.choose(from: [listed[0]], incarnation: nil).lost)
+        XCTAssertEqual(first.choose(from: [listed[2], listed[0]], incarnation: nil), listed[0])
 
         let control = TerminalMuxControl()
         XCTAssertNil(control.current.notice)
@@ -815,7 +823,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(control.current.notice, "The pane you were viewing closed while you were away.")
     }
 
-    func testUnconfirmedInputSurvivesIdentityDiscontinuityUntilANewSelectionIsRecorded() throws {
+    func testUnconfirmedInputMarkNeverKeepsTheNextConnectionFromOpeningAPane() throws {
         let suite = "frankenterm.tests.unconfirmedInput.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -830,21 +838,19 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         ending.markInputUnconfirmed()
         XCTAssertNil(ending.record)
         ending.set(listed[1], incarnation: run, identity: identity)
-        XCTAssertFalse(ending.choose(from: listed, incarnation: run, identities: identities).inputUnconfirmed)
+        XCTAssertEqual(ending.record?.inputUnconfirmed, false)
         ending.markInputUnconfirmed()
 
-        // The next connection comes back to that pane and is told; showing it
-        // clears the mark, so the one after is not.
+        // The next connection still comes back to that pane, or opens the
+        // active one, whatever the last connection's input did; showing a
+        // pane clears the mark.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        let choice = next.choose(from: listed, incarnation: run, identities: identities)
-        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertTrue(choice.inputUnconfirmed)
-        let gone = next.choose(from: [listed[0]], incarnation: run, identities: identities)
-        XCTAssertTrue(gone.lost); XCTAssertTrue(gone.inputUnconfirmed); XCTAssertNil(gone.pane)
-        let unverified = next.choose(from: listed, incarnation: run)
-        XCTAssertTrue(unverified.unverified); XCTAssertTrue(unverified.inputUnconfirmed); XCTAssertNil(unverified.pane)
+        XCTAssertEqual(next.record?.inputUnconfirmed, true)
+        XCTAssertEqual(next.choose(from: listed, incarnation: run, identities: identities), listed[1])
+        XCTAssertEqual(next.choose(from: [listed[0]], incarnation: run, identities: identities), listed[0])
+        XCTAssertEqual(next.choose(from: listed, incarnation: run), listed[1])
         next.set(listed[1], incarnation: run, identity: identity)
-        XCTAssertFalse(TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-            .choose(from: listed, incarnation: run, identities: identities).inputUnconfirmed)
+        XCTAssertEqual(TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults).record?.inputUnconfirmed, false)
     }
 
     func testAPaneShownBeforeTheServerRestartedIsNotTheOneUnderItsNumbersNow() throws {
@@ -863,25 +869,22 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         shown.markInputUnconfirmed()
         XCTAssertEqual(shown.record?.incarnation, run, "marking input keeps the run")
 
-        // The same run: the same pane, and the input it never confirmed.
-        var choice = shown.choose(from: listed, incarnation: run, identities: identities)
-        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertFalse(choice.restarted)
-        XCTAssertTrue(choice.inputUnconfirmed)
-        // Another run can restore the same durable UUID and all numeric IDs;
-        // a new registration still requires explicit selection and never
-        // clears uncertainty about the previous connection's input.
-        choice = shown.choose(from: listed, incarnation: restarted, identities: [1: try paneIdentity(1, run: restarted)])
-        XCTAssertNil(choice.pane); XCTAssertTrue(choice.lost); XCTAssertTrue(choice.restarted)
-        XCTAssertTrue(choice.inputUnconfirmed)
-        XCTAssertNil(shown.choose(from: listed, incarnation: nil).pane)
+        // The same run: the same pane.
+        XCTAssertEqual(shown.choose(from: listed, incarnation: run, identities: identities), listed[1])
+        // Another run reuses the numbers, and can restore the same durable
+        // UUID, for unrelated panes: the restarted server's active pane.
+        XCTAssertEqual(shown.choose(from: listed, incarnation: restarted,
+                                   identities: [1: try paneIdentity(1, run: restarted)]), listed[0])
+        XCTAssertEqual(shown.choose(from: listed, incarnation: restarted), listed[0])
+        // A server that does not name its run: the number is all there is.
+        XCTAssertEqual(shown.choose(from: listed, incarnation: nil), listed[1])
         shown.set(listed[1], incarnation: nil)
-        choice = shown.choose(from: listed, incarnation: restarted)
-        XCTAssertNil(choice.pane); XCTAssertTrue(choice.unverified); XCTAssertFalse(choice.restarted)
+        XCTAssertEqual(shown.choose(from: listed, incarnation: restarted), listed[1])
         // A record kept before runs were named reads as not saying.
         defaults.set(Data(#"{"paneId":1,"tabId":1,"windowId":0,"inputUnconfirmed":false}"#.utf8),
                      forKey: "frankenterm.mux.shownPane.w.mac")
         XCTAssertEqual(shown.record, .init(listed[1], incarnation: nil))
-        XCTAssertTrue(shown.choose(from: listed, incarnation: restarted, identities: identities).unverified)
+        XCTAssertEqual(shown.choose(from: listed, incarnation: restarted, identities: identities), listed[1])
     }
 
     func testMalformedSavedPaneCannotBecomeAFirstConnectionOrGrantResumeAuthority() throws {
@@ -902,15 +905,18 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
             bad["identity"] = witness
             malformed.append(try JSONSerialization.data(withJSONObject: bad))
         }
+        // A malformed record is no record: the first connection's default
+        // (the active pane), and choosing never rewrites what is stored.
+        let other = queryPane(2)
         for bytes in malformed {
             defaults.set(bytes, forKey: key)
-            let choice = shown.choose(from: [pane], incarnation: run, identities: [1: identity])
-            XCTAssertNil(choice.pane); XCTAssertTrue(choice.unverified)
+            XCTAssertNil(shown.record)
+            XCTAssertEqual(shown.choose(from: [other, pane], incarnation: run, identities: [1: identity]), pane)
             XCTAssertEqual(defaults.data(forKey: key), bytes)
         }
         shown.set(nil, incarnation: nil)
         XCTAssertNil(defaults.object(forKey: key))
-        XCTAssertEqual(shown.choose(from: [pane], incarnation: run).pane, pane)
+        XCTAssertEqual(shown.choose(from: [pane], incarnation: run), pane)
     }
 
     func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {

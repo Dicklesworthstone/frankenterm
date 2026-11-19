@@ -323,9 +323,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
         // A session goes live before the machine on screen gets its view.
         for _ in 0..<400 where session.phase == .live && session.terminal == nil && scene.shows(machineID: machine) {
-            // A reconnect whose old pane cannot be verified stays live at
-            // the picker; it has no terminal to await before explicit selection.
-            if let mux = session.muxState, mux.shown == nil { break }
+            // A mux with no panes stays live with nothing shown; it has no
+            // terminal to await until a tab opens.
+            if let mux = session.muxState, mux.shown == nil, mux.panes.isEmpty { break }
             try await Task.sleep(for: .milliseconds(25))
         }
         return session
@@ -952,13 +952,20 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(scene.selectedSession === survivor, "Removing an ended hidden sibling cannot steal focus")
         XCTAssertEqual(primary.phase, .live)
         XCTAssertEqual(survivor.phase, .live)
-        for _ in 0..<200 where scene.earlierTerminals("alpha").isEmpty { try await Task.sleep(for: .milliseconds(10)) }
-        let reviewed = scene.earlierTerminals("alpha")
-        XCTAssertTrue(reviewed.contains { $0.scope.terminalSessionID == removed.terminalSessionID })
-        scene.acknowledgeEarlierTerminals(reviewed, machineID: "alpha")
-        for _ in 0..<200 where scene.reviewingTerminalHistory { try await Task.sleep(for: .milliseconds(10)) }
-        let records = try await live.connections.journal.records()
-        XCTAssertEqual(records.filter { $0.state == .creationStarted }.count, 3, "History review cannot retire live siblings")
+        // The removed tab's record is released by itself; live siblings stay.
+        var records = try await live.connections.journal.records()
+        for _ in 0..<200 {
+            let pending = records.contains {
+                $0.scope.terminalSessionID == removed.terminalSessionID && ($0.blocksNewSession || $0.hasRecoveryNotice)
+            }
+            if !pending, !scene.reviewingTerminalHistory { break }
+            try await Task.sleep(for: .milliseconds(10))
+            records = try await live.connections.journal.records()
+        }
+        XCTAssertFalse(records.contains { $0.scope.terminalSessionID == removed.terminalSessionID
+            && ($0.blocksNewSession || $0.hasRecoveryNotice) }, "a removed tab leaves nothing to review")
+        XCTAssertTrue(scene.earlierTerminals("alpha").isEmpty)
+        XCTAssertEqual(records.filter { $0.state == .creationStarted }.count, 3, "Releasing history cannot retire live siblings")
 
         let endedID = survivor.id, slotID = survivor.terminalSessionID
         try await type("exit", into: survivorView)
@@ -1220,39 +1227,42 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
-    /// Paste shows the exact clipboard text bound to this terminal. Cancel sends
-    /// nothing; confirmation sends it once, without a Return.
-    func testReviewedPasteIsSentOnlyOnConfirmationAndAddsNoReturn() async throws {
+    /// The toolbar's Paste (the system paste control, so iOS asks nothing)
+    /// sends its text to this terminal at once: no review panel, no Return,
+    /// and nothing needs typing first. The edit menu's Paste is sent at once
+    /// too.
+    func testPasteIsSentAtOnceWithoutReviewAndAddsNoReturn() async throws {
         let live = try await liveScene(), scene = live.scene, path = live.outPath
+        let run = UUID().uuidString.prefix(8)
         let session = try await connect(scene, "alpha")
         let terminal = try shown(session)
         defer { terminal.removeFromSuperview() }
-        try await type("echo READY-$((40+2)) > \(path)", into: terminal)
-        _ = try await hostFile(path, containing: "READY-42")
+        for _ in 0..<200 where terminal.renderer.admittedFrame?.isLive != true {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        func submit() async throws {
+            for _ in 0..<200 where !terminal.input.isEditable { try await Task.sleep(for: .milliseconds(50)) }
+            terminal.input.insertText("\n")
+        }
 
-        let cancelled = "echo CANCELLED-$((40+2)) >> \(path)"
-        UIPasteboard.general.string = cancelled
-        session.paste()
-        let preview = try await subview(UITextView.self, in: terminal) { $0.accessibilityLabel == "Text to paste" }
-        XCTAssertEqual(preview.text, cancelled)
-        try await tap("Cancel", in: terminal)
-        XCTAssertFalse(session.clipboardIsPresenting)
-        try await type("echo AFTER-$((40+2)) >> \(path)", into: terminal)
-        let afterCancel = try await hostFile(path, containing: "AFTER-42")
-        XCTAssertEqual(afterCancel.split(separator: "\n"), ["READY-42", "AFTER-42"], "a cancelled paste sends nothing")
-
-        let confirmed = "echo PASTE-$((40+2)) >> \(path)"
-        UIPasteboard.general.string = confirmed
-        session.paste()
-        _ = try await subview(UITextView.self, in: terminal) { $0.accessibilityLabel == "Text to paste" && $0.text == confirmed }
-        try await tap("Paste to This Terminal", in: terminal)
-        XCTAssertFalse(session.clipboardIsPresenting)
+        session.paste(text: "echo PASTE-\(run)-$((40+2)) > \(path)")
+        XCTAssertFalse(session.clipboardIsPresenting, "nothing to review")
         try await Task.sleep(for: .seconds(2))
+        XCTAssertNil(session.interactionProblem)
+        XCTAssertFalse(session.clipboardIsPresenting)
         let unsubmitted = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        XCTAssertFalse(unsubmitted.contains("PASTE-42"), "a paste adds no Return, so the line has not run")
-        terminal.input.insertText("\n")
-        let submitted = try await hostFile(path, containing: "PASTE-42")
-        XCTAssertEqual(submitted.split(separator: "\n"), ["READY-42", "AFTER-42", "PASTE-42"], "the pasted line runs once")
+        XCTAssertFalse(unsubmitted.contains("PASTE-\(run)-42"), "a paste adds no Return, so the line has not run")
+        try await submit()
+        let submitted = try await hostFile(path, containing: "PASTE-\(run)-42")
+        XCTAssertEqual(submitted.split(separator: "\n"), ["PASTE-\(run)-42"], "the pasted line runs once")
+
+        UIPasteboard.general.string = "echo MENU-\(run)-$((40+2)) >> \(path)"
+        session.paste()
+        XCTAssertFalse(session.clipboardIsPresenting, "the edit menu's paste is not reviewed either")
+        try await Task.sleep(for: .seconds(1))
+        try await submit()
+        let menu = try await hostFile(path, containing: "MENU-\(run)-42")
+        XCTAssertEqual(menu.split(separator: "\n"), ["PASTE-\(run)-42", "MENU-\(run)-42"])
         await scene.close()
         await assertReleased(session, connections: live.connections)
     }
@@ -2847,10 +2857,10 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// M2: a new connection (the phone is back after its connection ended)
     /// shows the pane the phone was showing, with the same program in it, not
     /// whichever pane the desktop has active. When that pane closed meanwhile
-    /// the screen says so and waits for an explicit pane selection. Needs a
-    /// disposable mux with two panes (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this
+    /// the desktop's active pane opens instead, with nothing to dismiss. Needs
+    /// a disposable mux with two panes (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this
     /// test types into them and ends one.
-    func testAMuxReconnectComesBackToTheShownPaneAndSaysWhenItClosed() async throws {
+    func testAMuxReconnectComesBackToTheShownPaneOrOpensTheActivePane() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
         }
@@ -2891,28 +2901,19 @@ final class TerminalSessionControllerTests: XCTestCase {
         await second.stop()
         await assertReleased(second, connections: live.connections)
 
-        // That pane ended while the phone was away.
+        // That pane ended while the phone was away: the desktop's active pane
+        // opens instead of no pane, and nothing asks to choose one.
         try await Task.sleep(for: .seconds(4))
         let third = try await connect(scene, "alpha")
-        for _ in 0..<200 where third.muxState == nil || third.interactionProblem == nil {
+        for _ in 0..<400 where third.muxState?.shown == nil || third.terminal == nil || third.paneNavigationBusy {
             try await Task.sleep(for: .milliseconds(25))
         }
         let now = try XCTUnwrap(third.muxState)
-        XCTAssertEqual(third.phase, .live, "the inventory remains connected for explicit selection")
+        XCTAssertEqual(third.phase, .live)
         XCTAssertFalse(now.panes.contains { $0.paneId == other.paneId }, "the pane it was showing closed")
-        XCTAssertNil(now.shown, "an unrelated desktop pane must not inherit the old selection")
-        XCTAssertNil(third.terminal)
-        let control = try XCTUnwrap(third.muxControl)
-        XCTAssertFalse(control.inputRouting.current.ready)
-        XCTAssertThrowsError(try control.inputRouting.capture())
-        XCTAssertEqual(third.interactionProblem,
-                       "The pane you were viewing is gone or has been replaced. Select a pane to continue.")
         let chosen = try XCTUnwrap(now.panes.first(where: \.isActive) ?? now.panes.first)
-        third.showPane(chosen.paneId)
-        for _ in 0..<400 where third.muxState?.shown != chosen.paneId || third.paneNavigationBusy || third.terminal == nil {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTAssertEqual(third.muxState?.shown, chosen.paneId)
+        XCTAssertEqual(now.shown, chosen.paneId, "the active pane opened by itself")
+        XCTAssertNil(third.interactionProblem, "nothing to dismiss")
         let chosenView = try shown(third)
         try await type("echo CHOSEN-\(run)-$((40+2)) >> \(out)", into: chosenView)
         let chosenText = try await hostFile(out, containing: "CHOSEN-\(run)-42")
@@ -2922,16 +2923,74 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(third, connections: live.connections)
     }
 
+    /// New Tab on a machine reached through its mux: one call opens a shell
+    /// there and shows it ready to type, with nothing to confirm. When that
+    /// shell exits, another pane opens by itself. Needs a disposable mux
+    /// (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this test adds a pane and ends it.
+    func testNewTabOnAMuxOpensAShellShowsItAndFallsBackWhenItEnds() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
+        let run = UUID().uuidString.prefix(8)
+        let session = try await connect(scene, "alpha")
+        let firstView = try shown(session)
+        let before = try XCTUnwrap(session.muxState)
+        let existing = Set(before.panes.map(\.paneId))
+        XCTAssertNotNil(before.shown)
+        XCTAssertTrue(session.canCreatePersistentShell, "a connection that can type can open a tab")
+        session.newPersistentShell()
+        XCTAssertNil(session.interactionProblem)
+        func showsNewPane() -> Bool {
+            guard let state = session.muxState, let shown = state.shown else { return false }
+            return !existing.contains(shown) && !session.paneNavigationBusy
+                && session.terminal != nil && session.terminal !== firstView
+        }
+        for _ in 0..<600 where !showsNewPane() { try await Task.sleep(for: .milliseconds(25)) }
+        let state = try XCTUnwrap(session.muxState)
+        let created = try XCTUnwrap(state.shown)
+        XCTAssertFalse(existing.contains(created), "the new tab's pane is the one shown (\(state.panes))")
+        XCTAssertTrue(state.panes.contains { $0.paneId == created })
+        XCTAssertNil(session.persistentShellNotice)
+        XCTAssertNil(session.interactionProblem, "opening a tab asks and reports nothing")
+        firstView.removeFromSuperview()
+        let view = try shown(session)
+        try await type("echo NEWTAB-\(run)-$((40+2)) > \(out)", into: view)
+        let text = try await hostFile(out, containing: "NEWTAB-\(run)-42")
+        XCTAssertTrue(text.contains("NEWTAB-\(run)-42"), "the new tab's shell runs commands (\(text))")
+
+        // Its shell ends: a remaining pane opens, with nothing to dismiss.
+        try await type("exit", into: view)
+        for _ in 0..<600 where session.muxState?.shown.map({ $0 == created }) != false
+            || session.muxState?.shown == nil || session.paneNavigationBusy || session.terminal == nil
+            || session.terminal === view {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let after = try XCTUnwrap(session.muxState)
+        XCTAssertFalse(after.panes.contains { $0.paneId == created }, "the new tab closed")
+        let fallback = try XCTUnwrap(after.shown, "a machine with panes always shows one")
+        XCTAssertTrue(existing.contains(fallback))
+        XCTAssertNil(session.interactionProblem)
+        view.removeFromSuperview()
+        let again = try shown(session)
+        try await type("echo BACK-\(run)-$((40+2)) >> \(out)", into: again)
+        let back = try await hostFile(out, containing: "BACK-\(run)-42")
+        XCTAssertTrue(back.contains("BACK-\(run)-42"), back)
+        again.removeFromSuperview()
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// Plan 2.2, "lose Wi-Fi after pressing Enter", against a real mux. The
     /// pane's program freezes its mux server, so what is typed next goes
-    /// unanswered, and then the phone's relay dies. The ended session says at
-    /// once that its last input may or may not have arrived. The next
-    /// connection comes back to the same pane and program and says it again
-    /// even after the first notice is gone (as after a relaunch), from the
-    /// pane's own record; one after an ordinary close says nothing. Needs a disposable
-    /// mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this test stops and resumes its
-    /// server and kills the relay processes running that command.
-    func testAMuxConnectionLostBeforeInputWasAnsweredSaysSoOnReturn() async throws {
+    /// unanswered, and then the phone's relay dies. The ended session records
+    /// that its last input had no answer (the screen shows no notice for it).
+    /// The next connection comes back to the same pane and program without
+    /// reporting it, and one after an ordinary close has nothing recorded.
+    /// Needs a disposable mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this test
+    /// stops and resumes its server and kills the relay processes running
+    /// that command.
+    func testAMuxConnectionLostBeforeInputWasAnsweredReturnsToThePaneQuietly() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux on the loopback host")
         }
@@ -2963,8 +3022,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         let second = try await connect(scene, "alpha")
         for _ in 0..<200 where second.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertEqual(second.muxState?.shown, pane, "the phone came back to the same pane")
-        XCTAssertTrue(second.inputDelivery.unanswered, "the pane's record says it again (\(second.inputDelivery))")
-        XCTAssertNil(second.interactionProblem, "one notice, not two")
+        XCTAssertTrue(second.inputDelivery.isEmpty, "the earlier outcome is not reported again (\(second.inputDelivery))")
+        XCTAssertNil(second.interactionProblem, "no notice")
         let again = try shown(second)
         try await type("echo AGAIN-\(run)-$$ >> \(out)", into: again)
         let text = try await hostFile(out, containing: "AGAIN-\(run)-")
@@ -2989,8 +3048,8 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// server restarts while the phone is away and builds its startup layout
     /// again, so the pane the phone was showing has a successor under the same
     /// pane, tab and window numbers. The phone knows the new run by the
-    /// server's incarnation: it says the server restarted and waits for an
-    /// explicit selection before a successor can receive input. Needs a
+    /// server's incarnation: it opens the new server's active pane, not the
+    /// successor under the numbers it left, and says nothing. Needs a
     /// disposable mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND) and a
     /// script that restarts it from one of its panes
     /// (TEST_RUNNER_FT_LIVE_MUX_RESTART; arguments: the server's pid, a file,
@@ -3003,7 +3062,6 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
         let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
         let run = UUID().uuidString.prefix(8)
-        let restarted = "FrankenTerm restarted on this machine while you were away. Select a pane to continue."
         // Ends the session, then the server restarts (the pane's shell is the
         // server's child; the script outlives it).
         func restartServer(from session: TerminalSessionController, _ marker: String) async throws {
@@ -3020,28 +3078,24 @@ final class TerminalSessionControllerTests: XCTestCase {
             }
             XCTAssertTrue(text.contains("RESTARTED-\(marker)"), "the server restarted (\(text))")
         }
-        func selectionRequired(_ session: TerminalSessionController) async throws -> TerminalMuxControl.State {
-            for _ in 0..<200 where session.muxState == nil || session.interactionProblem == nil {
+        func opensActivePane(_ session: TerminalSessionController) async throws -> TerminalMuxControl.State {
+            for _ in 0..<400 where session.muxState?.shown == nil || session.terminal == nil || session.paneNavigationBusy {
                 try await Task.sleep(for: .milliseconds(25))
             }
             let state = try XCTUnwrap(session.muxState)
-            XCTAssertEqual(session.phase, .live, "the replacement server's picker remains usable")
-            XCTAssertFalse(state.panes.isEmpty)
-            XCTAssertNil(state.shown, "reused pane numbers cannot select a new program automatically")
-            XCTAssertNil(session.terminal)
-            let control = try XCTUnwrap(session.muxControl)
-            XCTAssertFalse(control.inputRouting.current.ready)
-            XCTAssertThrowsError(try control.inputRouting.capture())
+            XCTAssertEqual(session.phase, .live)
+            let active = try XCTUnwrap(state.panes.first(where: \.isActive) ?? state.panes.first)
+            XCTAssertEqual(state.shown, active.paneId, "a new run opens its active pane, whatever numbers it reuses")
+            XCTAssertNil(session.interactionProblem, "nothing to dismiss")
             return state
         }
 
         // A fresh server and layout, whatever earlier tests left.
         try await restartServer(from: try await connect(scene, "alpha"), "A-\(run)")
 
-        // Back on a new run: told so, with no pane authorized to receive input.
+        // Back on a new run: its active pane, with no notice.
         let second = try await connect(scene, "alpha")
-        var state = try await selectionRequired(second)
-        XCTAssertEqual(second.interactionProblem, restarted)
+        var state = try await opensActivePane(second)
         // Leave it on the pane the desktop is not on, and restart again into
         // the same layout.
         let other = try XCTUnwrap(state.panes.first { !$0.isActive }, "the startup layout has two panes")
@@ -3053,18 +3107,11 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await restartServer(from: second, "B-\(run)")
 
         let third = try await connect(scene, "alpha")
-        state = try await selectionRequired(third)
+        state = try await opensActivePane(third)
         XCTAssertTrue(state.panes.contains {
             $0.paneId == other.paneId && $0.tabId == other.tabId && $0.windowId == other.windowId
         }, "the new run repeats the numbers of the pane the phone left (\(state.panes))")
-        XCTAssertEqual(third.interactionProblem, restarted)
-        // Deliberate selection gives the new run's pane its own input visit.
-        let chosen = try XCTUnwrap(state.panes.first(where: \.isActive))
-        third.showPane(chosen.paneId)
-        for _ in 0..<400 where third.muxState?.shown != chosen.paneId || third.paneNavigationBusy || third.terminal == nil {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTAssertEqual(third.muxState?.shown, chosen.paneId)
+        XCTAssertNotEqual(state.shown, other.paneId, "the successor under the old numbers is not taken for it")
         let view = try shown(third)
         try await type("echo NEW-\(run)-$((40+2)) >> \(out)", into: view)
         let text = try await hostFile(out, containing: "NEW-\(run)-42")
@@ -3174,10 +3221,11 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A desktop pane larger than View Only can draw (the mux reached by
-    /// TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND has one 300 x 120 pane) waits for
-    /// explicit permission before changing shared geometry. Leaving that
-    /// connection restores the desktop size without silently taking it again.
-    func testAPaneTooLargeToViewWaitsForExplicitPhoneSizePermission() async throws {
+    /// TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND has one 300 x 120 pane) is fitted
+    /// to the phone by itself. Choosing View Only in Screen Size afterwards
+    /// restores the desktop size and is not overridden; Fit to Phone on the
+    /// ended card takes it again.
+    func testAPaneTooLargeToViewIsFittedToThePhoneUnlessViewOnlyWasChosen() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_LARGE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND to reach a disposable mux whose pane is too large to view")
         }
@@ -3190,16 +3238,8 @@ final class TerminalSessionControllerTests: XCTestCase {
             }
             return try XCTUnwrap(scene.sessions["alpha"])
         }
+        // Started in View Only without choosing it: fitted with no question.
         let observer = try await connect(scene, "alpha")
-        for _ in 0..<400 where !observer.settled { try await Task.sleep(for: .milliseconds(25)) }
-        XCTAssertTrue(observer.paneTooLargeToView); XCTAssertTrue(observer.settled)
-        XCTAssertEqual(observer.muxAccessMode, .viewOnly)
-        XCTAssertNil(observer.terminal)
-        try await Task.sleep(for: .seconds(1))
-        XCTAssertIdentical(scene.sessions["alpha"], observer, "an oversized grid cannot grant resize authority")
-        XCTAssertEqual(scene.status(of: "alpha"), .attention)
-        XCTAssertNil(scene.changingMuxMode("alpha"))
-        scene.takePaneAtPhoneSize("alpha", from: observer)
         let fitted = try await replacement(of: observer)
         XCTAssertNotIdentical(fitted, observer)
         XCTAssertTrue(observer.paneTooLargeToView); XCTAssertTrue(observer.settled)
@@ -3237,7 +3277,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertIdentical(scene.sessions["alpha"], viewer, "the chosen View Only is neither retaken nor retried")
         XCTAssertEqual(scene.status(of: "alpha"), .attention)
 
-        // Use at Phone Size, on the ended card.
+        // Fit to Phone, on the ended card.
         scene.takePaneAtPhoneSize("alpha", from: viewer)
         XCTAssertEqual(scene.changingMuxMode("alpha"), .interactive)
         let taken = try await replacement(of: viewer)
@@ -3334,7 +3374,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
-    func testEarlierTerminalReviewIncludesJoinedOrphansAndCannotResolveLiveOrUnseenSiblings() async throws {
+    func testEarlierTerminalHistoryReleasesOrphansByItselfAndNeverLiveSiblings() async throws {
         let (connections, scene, target) = try dormantScene()
         try await appear(scene, selecting: target.machineID)
         func scope(_ slot: UUID?) throws -> TerminalSessionScope {
@@ -3351,30 +3391,41 @@ final class TerminalSessionControllerTests: XCTestCase {
             launch: "earlier-test-launch", terminalSessionID: activeSibling.scope.terminalSessionID)
         orphanHint.set(true); siblingHint.set(true)
         try await connections.journal.markInterrupted(epoch: orphan)
-        scene.refreshTerminalHistory()
-        for _ in 0..<200 where scene.earlierTerminals(target.machineID).count != 1 {
-            try await Task.sleep(for: .milliseconds(10))
+        func released(_ id: UUID) async throws -> Bool {
+            let record = try await connections.journal.records().first { $0.id == id }
+            return record.map { !$0.blocksNewSession && !$0.hasRecoveryNotice } ?? true
         }
-        let reviewed = scene.earlierTerminals(target.machineID)
-        XCTAssertEqual(reviewed.map(\.id), [orphan.id])
-        let first = try XCTUnwrap(reviewed.first)
-        XCTAssertTrue(first.blocksNewSession)
-        XCTAssertFalse(first.hasRecoveryNotice, "Ordinary joined tab history must also be releasable before the unresolved limit fills")
-
-        let unseen = try await connections.journal.beginCreation(scope: scope(UUID()))
-        try await connections.journal.markInterrupted(epoch: unseen)
-        scene.acknowledgeEarlierTerminals(reviewed, machineID: target.machineID)
-        for _ in 0..<200 where scene.reviewingTerminalHistory { try await Task.sleep(for: .milliseconds(10)) }
-        let records = try await connections.journal.records()
-        XCTAssertEqual(records.first { $0.id == orphan.id }?.state, .acknowledged)
+        func waitReleased(_ id: UUID) async throws -> Bool {
+            for _ in 0..<200 {
+                if try await released(id), !scene.reviewingTerminalHistory { return true }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            return try await released(id)
+        }
+        // Loading it releases a closed tab's record; nothing asks for a review.
+        scene.refreshTerminalHistory()
+        let released1 = try await waitReleased(orphan.id)
+        XCTAssertTrue(released1, "ordinary joined tab history is released before the unresolved limit fills")
+        var records = try await connections.journal.records()
         XCTAssertEqual(records.first { $0.id == primary.id }?.state, .creationStarted)
         XCTAssertEqual(records.first { $0.id == activeSibling.id }?.state, .creationStarted)
-        XCTAssertEqual(scene.earlierTerminals(target.machineID).map(\.id), [unseen.id], "Unseen history stays reviewable after the exact captured batch")
+
+        // A record written after that load waits for the next one.
+        let unseen = try await connections.journal.beginCreation(scope: scope(UUID()))
+        try await connections.journal.markInterrupted(epoch: unseen)
+        let unseenBefore = try await released(unseen.id)
+        XCTAssertFalse(unseenBefore)
+        scene.refreshTerminalHistory()
+        let unseenAfter = try await waitReleased(unseen.id)
+        XCTAssertTrue(unseenAfter)
+        records = try await connections.journal.records()
+        XCTAssertEqual(records.first { $0.id == activeSibling.id }?.state, .creationStarted, "a live sibling is never released")
+        XCTAssertTrue(scene.earlierTerminals(target.machineID).isEmpty)
         XCTAssertFalse(TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
             terminalSessionID: orphan.scope.terminalSessionID).takeFromEarlierLaunch(), "Resolved orphan hints cannot accumulate after a killed launch")
         XCTAssertTrue(TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
-            terminalSessionID: activeSibling.scope.terminalSessionID).takeFromEarlierLaunch(), "Review cannot consume a live sibling's hint")
-        XCTAssertTrue(scene.sessions.isEmpty, "Loading or acknowledging old tab metadata never creates a shell")
+            terminalSessionID: activeSibling.scope.terminalSessionID).takeFromEarlierLaunch(), "Releasing cannot consume a live sibling's hint")
+        XCTAssertTrue(scene.sessions.isEmpty, "Loading or releasing old tab metadata never creates a shell")
         let connected = await connections.manager.connections()
         XCTAssertTrue(connected.isEmpty)
         try await connections.journal.markInterrupted(epoch: primary)
@@ -3417,11 +3468,11 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
-    func testWorkspaceSceneStartsSharedTerminalIntentInViewOnly() async throws {
+    func testWorkspaceSceneStartsSharedTerminalsReadyToTypeAndFittedToThePhone() async throws {
         let (connections, scene, _) = try dormantScene()
         scene.connect("machine")
         let controller = try XCTUnwrap(scene.sessions["machine"])
-        XCTAssertEqual(controller.muxAccessMode, .viewOnly)
+        XCTAssertEqual(controller.muxAccessMode, .interactive)
         XCTAssertFalse(controller.requiresExistingMux, "Generic Connect can still discover a direct-only machine")
         await scene.close()
         await assertReleased(controller, connections: connections)

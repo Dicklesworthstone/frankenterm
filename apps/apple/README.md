@@ -54,11 +54,11 @@ automatically. The primary connection retains the existing group, mux and
 reconnection behavior.
 
 Each additional tab has a stable local slot UUID. Retrying that tab preserves
-its history while creating fresh transport and channel identities. Input
-uncertainty, review and dismissal stay with that slot. **Earlier Terminals** also
-exposes records left by removed tabs or an earlier launch, including settled
-records that still need review before their history capacity can be reclaimed.
-No command content or output is persisted in that journal.
+its history while creating fresh transport and channel identities. Records left
+by removed tabs or an earlier launch are released by themselves when the
+journal loads, so their history capacity is reclaimed without a review step;
+live siblings are never released. No command content or output is persisted in
+that journal.
 
 All tabs share the existing limit of sixteen retained connections and three
 pending attempts. Explicit tabs cannot be evicted by background preparation of
@@ -232,7 +232,7 @@ Both next actions capture the original session and exact mux navigation plan bef
 
 Reconnecting a saved mux pane now requires a fresh match of the server incarnation, durable pane UUID and registration ID. The mobile Rust client exposes the existing v71 passive identity query through the C ABI and Swift adapter without subscribing, typing, resizing or changing the desktop's active pane. It bounds concurrent queries to eight, expires them after five seconds and ignores retired replies. Showing a pane rechecks a previously learned identity before attaching.
 
-The phone persists this complete witness with its selected pane and saved phone-size metadata. Moving the same pane between tabs or windows preserves continuity. A restarted server, replaced registration, unavailable witness or legacy numeric-only bookmark leaves the connection open with no pane selected; the person chooses from the current inventory. First attachment without a saved bookmark can still show the desktop's active pane. Unconfirmed input remains disclosed and is never replayed. Numeric pane IDs alone cannot restore a saved phone size.
+The phone persists this complete witness with its selected pane and saved phone-size metadata. Moving the same pane between tabs or windows preserves continuity. The phone always opens on a pane when the machine has one, with no notice to dismiss: the remembered pane when its witness matches (or, on the same server run, when this connection cannot learn a witness), otherwise the desktop's active pane, otherwise the first. A restarted server or replaced registration therefore opens the active pane rather than a successor under the old numbers, and a shell this phone creates opens as soon as the pane list has it. Unconfirmed input is never replayed and is not reported, since nothing about it is actionable. Numeric pane IDs alone cannot restore a saved phone size.
 
 Display subscription and permission to control remote geometry are separate: a visible observer can continue receiving output after size control is disabled. Disabling it restores a size this connection adopted, including when the first show did not finish. Enabling it cannot broaden a view-only or input-only connection. This uses the existing geometry protocol; server-enforced controller leases and atomic registration-conditional geometry mutations remain separate work.
 
@@ -702,11 +702,13 @@ The optional native SSH package separately passed 40 XCTest cases with warnings-
 
 ## Shared terminal input and size permissions
 
-Shared panes open in **View Only**. **Use Terminal** offers **Type at Shared Size**, which enables typing, paste and pointer input while preserving the remote grid, or **Type and Fit to Phone**, which also permits resizing the pane. Shared-size viewing and input initially fit the existing grid locally; keyboard, rotation, pane selection and disconnect never resize, adopt or restore a shared pane. Changing access modes reconnects only after the previous owner settles. A grid beyond the supported terminal limits waits for an explicit **Use at Phone Size** action. These are restrictions on this phone; other connected clients retain their own input and resize permissions.
+Shared panes open ready to type and fitted to the phone. **More → Screen Size** offers **Fit to Phone** (the default), **Keep Desktop Size**, which enables typing, paste and pointer input while preserving the remote grid, and **View Only**. Desktop-size viewing and input initially fit the existing grid locally; keyboard, rotation, pane selection and disconnect never resize, adopt or restore a shared pane in those modes. Changing modes reconnects only after the previous owner settles. A grid beyond the supported terminal limits is fitted to the phone by itself unless the person chose a desktop size in Screen Size; then the ended card offers **Fit to Phone**. These are restrictions on this phone; other connected clients retain their own input and resize permissions.
+
+**New Tab** (in More, the **+** after the pane chips, or the empty machine's card) opens a shell on the machine's mux in one tap and shows it as soon as the pane list has it; a failure is reported once. The toolbar's Paste is the system paste control, so iOS shows no paste permission prompt, and it works without first opening the keyboard: the terminal takes input focus without raising the keyboard and sends the text at once. A paste drafted in Compose keeps its preview.
 
 ### Read a wide shared pane at a useful size
 
-For **View Only** and **Type at Shared Size**, **More → Text Size → Readable Size** shows the grid at the chosen font size and clips it to the phone's viewport. Drag to pan across the pane, pinch or choose Bigger/Smaller to change the text size, and choose **Reveal Cursor** to bring the current cursor into view. **Fit Entire Pane** returns to the overview. A deliberate text-size gesture also enters readable mode from the fitted view. The mode stays with that session controller when its native view is rebuilt; changing the font preference on another machine does not switch this pane's viewing mode.
+For **View Only** and **Keep Desktop Size**, **More → Text Size → Readable Size** shows the grid at the chosen font size and clips it to the phone's viewport. Drag to pan across the pane, pinch or choose Bigger/Smaller to change the text size, and choose **Reveal Cursor** to bring the current cursor into view. **Fit Entire Pane** returns to the overview. A deliberate text-size gesture also enters readable mode from the fitted view. The mode stays with that session controller when its native view is rebuilt; changing the font preference on another machine does not switch this pane's viewing mode.
 
 Local pan owns canvas drags while readable mode is active. The machine/pane strips and hardware navigation remain available. Mouse targeting, links, selection, caret placement and accessibility use the same clamped offset as the drawn grid; a retired or superseded projection cannot direct input. Zoom, pan, cursor reveal and fitting use the existing bounded drawable and do not acquire input authority, reconnect, or propose a different shared PTY size.
 

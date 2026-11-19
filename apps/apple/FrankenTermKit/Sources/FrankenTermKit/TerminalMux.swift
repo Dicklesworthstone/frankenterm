@@ -296,10 +296,10 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 /// and launches: a connection that dropped while the phone was away comes
 /// back to that pane, not to whichever one the desktop has active.
 ///
-/// Automatic restoration requires a freshly verified server incarnation,
-/// durable UUID and live registration. Numeric topology is only a lookup hint.
-/// A missing witness, restart or replacement requires explicit pane selection;
-/// nothing typed before is ever replayed into that fresh selection.
+/// A verified identity finds the pane even when its number changed; otherwise
+/// its number on the same server run does. When neither finds it, the
+/// connection opens on the desktop's active pane instead of on no pane.
+/// Nothing typed before is ever replayed into that selection.
 public final class TerminalMuxShownPane: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
@@ -362,32 +362,28 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
     }
 
     /// The pane a new connection shows from the server's list (`incarnation`
-    /// is the server's run, when it says). Only a first connection without a
-    /// remembered pane defaults to the desktop's active pane. A discontinuity
-    /// leaves selection empty and the live picker available. Unconfirmed
-    /// input remains attached to the prior connection even on discontinuity.
+    /// is the server's run, when it says); nil only when the list is empty.
+    /// The remembered pane when it is still there: its verified identity
+    /// first, else its number on the same run (or a run the server did not
+    /// name). After a restart, or when the remembered pane is gone, the
+    /// desktop's active pane, else the first. Nothing typed on an earlier
+    /// connection is replayed into the pane this returns.
     public func choose(from panes: [TerminalMuxPane], incarnation: Data?,
-                       identities: [Int: TerminalMuxPaneIdentity] = [:])
-        -> (pane: TerminalMuxPane?, lost: Bool, restarted: Bool, unverified: Bool, inputUnconfirmed: Bool) {
+                       identities: [Int: TerminalMuxPaneIdentity] = [:]) -> TerminalMuxPane? {
         let fallback = panes.first(where: \.isActive) ?? panes.first
-        let stored = lock.withLock { (load(), defaults.object(forKey: key) != nil) }
-        guard let record = stored.0 else {
-            return stored.1 ? (nil, false, false, true, false) : (fallback, false, false, false, false)
+        guard let record = lock.withLock({ load() }) else { return fallback }
+        if let expected = record.identity, expected.incarnation == incarnation {
+            let matching = panes.filter { identities[$0.paneId] == expected }
+            if matching.count == 1 { return matching[0] }
         }
-        if let incarnation, let shownOn = record.incarnation, shownOn != incarnation {
-            return (nil, true, true, false, record.inputUnconfirmed)
+        // Pane numbers restart with the server, so a number from another run
+        // names an unrelated pane.
+        let sameRun = incarnation == nil || record.incarnation == nil || record.incarnation == incarnation
+        if sameRun, let numbered = panes.first(where: { $0.paneId == record.paneId }),
+           record.identity == nil || identities[numbered.paneId] == nil || identities[numbered.paneId] == record.identity {
+            return numbered
         }
-        guard let expected = record.identity, expected.incarnation == incarnation else {
-            return (nil, false, false, true, record.inputUnconfirmed)
-        }
-        let matching = panes.filter { identities[$0.paneId] == expected }
-        if matching.count == 1 {
-            return (matching[0], false, false, false, record.inputUnconfirmed)
-        }
-        if panes.contains(where: { $0.paneId == record.paneId }), identities[record.paneId] == nil {
-            return (nil, false, false, true, record.inputUnconfirmed)
-        }
-        return (nil, true, false, false, record.inputUnconfirmed)
+        return fallback
     }
 }
 
@@ -477,9 +473,9 @@ public enum TerminalMuxAccessMode: String, Equatable, Sendable {
     case interactive
     public var permitsInput: Bool { self != .viewOnly }
     public var controlsSize: Bool { self == .interactive }
-    /// Creation is a separate, explicitly reviewed topology action. Input-only
-    /// and observer connections cannot gain it from keyboard permission.
-    public var permitsShellCreation: Bool { self == .interactive }
+    /// A connection that can type can open a new tab, as on the desktop. An
+    /// observer cannot.
+    public var permitsShellCreation: Bool { permitsInput }
 }
 
 public enum TerminalMuxShellCreationError: Error, Equatable, Sendable, LocalizedError {
@@ -570,13 +566,10 @@ public final class TerminalMuxControl: @unchecked Sendable {
         }
         public var message: String {
             switch outcome {
-            case .queued: return "Preparing the new persistent shell…"
-            case .awaitingReply: return "Waiting for the server to confirm the new shell…"
-            case .created(let pane, _, _): return "Created pane \(pane). Select it in the pane list to view it."
+            case .queued, .awaitingReply: return "Opening a new tab…"
+            case .created(let pane, _, _): return "Opened pane \(pane)."
             case .failed(let reason, let uncertain):
-                return uncertain
-                    ? "A shell may have been created. Check the pane list before creating another. \(reason)"
-                    : "The shell was not created. \(reason)"
+                return uncertain ? "The new tab may not have opened. \(reason)" : "The new tab did not open. \(reason)"
             }
         }
     }

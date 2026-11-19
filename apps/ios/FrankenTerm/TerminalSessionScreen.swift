@@ -801,20 +801,12 @@ final class TerminalSessionController {
         return target.restricted(to: selected)
     }
 
-    struct PersistentShellReview: Identifiable {
-        var id: UUID { plan.id }
-        let controllerID: UUID, connectionID: UUID
-        let control: TerminalMuxControl
-        let plan: TerminalMuxControl.ShellCreationPlan
-        let machineName: String, user: String, host: String
-        let port: UInt16
-        let route: TerminalSessionRoute
-    }
-    private var persistentShellReviewID: UUID?
-    /// Bounded presentation only, carried across connection replacement. It
-    /// contains neither a request to replay nor authority for a later pane.
+    /// A new tab that is still opening; nil once it opened (the tab itself
+    /// says so) or failed (a dismissable problem says why). Bounded
+    /// presentation only: neither a request to replay nor authority for a
+    /// later pane.
     private(set) var persistentShellNotice: String?
-    private var persistentShellDestination: String?
+    @ObservationIgnored private var reportedShellCreation: UUID?
 
     private static func boundedShellNotice(_ value: String, bytes: Int = 1024) -> String {
         String(decoding: value.utf8.prefix(bytes), as: UTF8.self)
@@ -822,69 +814,40 @@ final class TerminalSessionController {
 
     private func rememberPersistentShellOutcome(_ state: TerminalMuxControl.State) {
         guard let creation = state.shellCreation else { return }
-        let destination = persistentShellDestination ?? Self.boundedShellNotice(target.machineName, bytes: 384)
-        persistentShellNotice = Self.boundedShellNotice("Shell request on \(destination): \(creation.message)")
+        switch creation.outcome {
+        case .queued, .awaitingReply: persistentShellNotice = creation.message
+        case .created: persistentShellNotice = nil
+        case .failed:
+            persistentShellNotice = nil
+            // Once per request: state updates repeat the outcome.
+            guard reportedShellCreation != creation.plan.id else { return }
+            reportedShellCreation = creation.plan.id
+            interactionProblem = Self.boundedShellNotice(creation.message)
+        }
     }
 
-    private var permitsPersistentShellReview: Bool {
+    var canCreatePersistentShell: Bool {
         !stopped && phase == .live && attachedToMux && hasFocusedPresentation
             && focus?.permitsTerminalCreation == true && !overviewBlocking && !paneNavigationBusy
             && !localInputNeedsDecision && clipboard?.blocksKeyboardActivation != true
             && historyInspection == nil && !historyReturning && !muxSearchPresented
+            && muxControl?.canCreateShell == true
     }
 
-    var canCreatePersistentShell: Bool {
-        permitsPersistentShellReview && persistentShellReviewID == nil && muxControl?.canCreateShell == true
+    /// A new tab on the machine's mux, like a new tab on the desktop: the
+    /// server's default shell in the shown pane's workspace. No pane, working
+    /// directory or command is inherited. The transport shows the new pane as
+    /// soon as the server lists it.
+    func newPersistentShell() {
+        guard canCreatePersistentShell, let control = connection?.muxControl else { return }
+        do {
+            let state = control.current
+            let workspace = state.panes.first(where: { $0.paneId == state.shown })?.workspace ?? "default"
+            try control.requestShellCreation(try control.prepareShellCreation(workspace: workspace))
+            interactionProblem = nil
+            rememberPersistentShellOutcome(control.current)
+        } catch { interactionProblem = error.localizedDescription }
     }
-
-    func preparePersistentShell() throws -> PersistentShellReview {
-        guard canCreatePersistentShell, let connection, let control = connection.muxControl else {
-            throw TerminalMuxShellCreationError.unavailable
-        }
-        // Workspace metadata is only a reviewed destination label. No pane,
-        // working directory, command or numeric domain is inherited.
-        let state = control.current
-        let workspace = state.panes.first(where: { $0.paneId == state.shown })?.workspace ?? "default"
-        let plan = try control.prepareShellCreation(workspace: workspace)
-        persistentShellReviewID = plan.id
-        control.inputRouting.discardPointers()
-        pointerFocusActivation?.cancel(); viewAttachment?.cancel()
-        terminal?.input.retire(); keyboard?.suspend()
-        return PersistentShellReview(controllerID: id, connectionID: connection.id, control: control, plan: plan,
-            machineName: target.machineName, user: connection.user, host: connection.host, port: connection.port, route: route)
-    }
-
-    func canConfirmPersistentShell(_ review: PersistentShellReview) -> Bool {
-        permitsPersistentShellReview && persistentShellReviewID == review.id && review.controllerID == id
-            && connection?.id == review.connectionID && connection?.muxControl === review.control
-            && review.control.canCreateShell
-            && review.control.current.shellCreationIncarnation == review.plan.incarnation
-    }
-
-    func createPersistentShell(_ review: PersistentShellReview) throws {
-        guard canConfirmPersistentShell(review) else { throw TerminalMuxShellCreationError.stale }
-        let destination = Self.boundedShellNotice(
-            "\(review.machineName) · \(review.user)@\(review.host):\(review.port)", bytes: 384)
-        try review.control.requestShellCreation(review.plan)
-        persistentShellDestination = destination
-        rememberPersistentShellOutcome(review.control.current)
-    }
-
-    func endPersistentShellReview(_ review: PersistentShellReview, resumingView: Bool = true) {
-        review.control.cancelShellCreationReview(review.plan)
-        guard persistentShellReviewID == review.id else { return }
-        persistentShellReviewID = nil
-        guard resumingView, !stopped, phase == .live, hasFocusedPresentation else { return }
-        showView()
-        let source = pump?.source
-        Task { [weak self] in
-            guard let self, self.hasFocusedPresentation, self.persistentShellReviewID == nil,
-                  self.pump?.source == source else { return }
-            await self.focus?.activateKeyboard(showKeyboard: false, source: source)
-        }
-    }
-
-    func reportPersistentShellProblem(_ error: Error) { interactionProblem = error.localizedDescription }
 
     func makeRemoteFiles(scene: WorkspaceTerminalScene) throws -> TerminalRemoteFilesController {
         guard let target = remoteFilesTarget else { throw WorkspaceSSHConnectionError.stale }
@@ -1088,7 +1051,6 @@ final class TerminalSessionController {
 
     var clipboardIsPresenting: Bool {
         clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
-            || persistentShellReviewID != nil
     }
     var localInputNeedsDecision: Bool { localInputRecovery != nil || resolvingLocalInput }
     /// A local command editor blocks input. Its explicit Review transition is
@@ -1096,7 +1058,6 @@ final class TerminalSessionController {
     /// existing native paste review can bind to a fresh focus generation.
     var keyboardActivationBlocked: Bool {
         clipboard?.blocksKeyboardActivation == true || historyInspection != nil || historyReturning || muxSearchPresented
-            || persistentShellReviewID != nil
     }
 
     /// The fleet picker owns the text responder while open. Its machine/pane
@@ -1141,6 +1102,23 @@ final class TerminalSessionController {
         guard !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
+    }
+    /// Text from the toolbar's system paste control, which iOS hands over
+    /// without asking for permission. The keyboard need not be up: the
+    /// terminal's input is activated without showing it, then the text is sent.
+    func paste(text: String) {
+        guard !text.isEmpty, !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation,
+              !clipboardIsPresenting, !localInputNeedsDecision else { return }
+        connection?.muxControl?.inputRouting.discardPointers()
+        interactionProblem = nil
+        if terminal?.input.canReviewPaste == true { clipboard?.paste(text: text); return }
+        let source = pump?.source
+        Task { [weak self] in
+            await self?.focus?.activateKeyboard(showKeyboard: false, source: source)
+            guard let self, !self.stopped, self.phase == .live, self.pump?.source == source else { return }
+            if self.terminal?.input.canReviewPaste == true { self.clipboard?.paste(text: text) }
+            else { self.interactionProblem = "This terminal is not ready for input yet. Paste again in a moment." }
+        }
     }
     func composeCommand() {
         guard !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting,
@@ -1513,12 +1491,9 @@ final class TerminalSessionController {
         }
         guard state.ready, !state.retired, let selected = state.destination else {
             if state.destination == nil, phase == .live {
+                // The shown pane closed. The transport opens another one by
+                // itself; pending input stays bound to the closed pane.
                 requestedMuxPane = nil; requestedMuxNavigation = nil
-                // A reconnect can deliberately leave selection empty when the
-                // server restarted or could not prove the saved pane's identity.
-                // Preserve that explanation instead of claiming the pane closed.
-                interactionProblem = control.current.notice
-                    ?? "The selected pane is no longer available. Choose another pane; pending input was not redirected."
             }
             return
         }
@@ -2090,18 +2065,17 @@ final class TerminalSessionController {
         }
     }
 
-    /// Retire earlier owners so an independently approved connection can
-    /// start. This is not acknowledgement of earlier input: unclean epochs
-    /// retain their nonmodal recovery notice until the person dismisses it.
-    /// An owner whose cleanup is still running holds the start briefly.
+    /// Retire earlier owners so a new connection can start. An earlier
+    /// session that ended with an unknown input outcome is acknowledged here
+    /// rather than shown: the operator sees the live screen and has nothing to
+    /// decide. An owner whose cleanup is still running holds the start briefly.
     private func connectContinuingEarlierSessions() async throws -> WorkspaceSSHConnection {
         for attempt in 0..<20 {
             let records = try await connections.journal.records()
-            inputRecoveryRecords = records.filter {
+            var recovered = records.filter {
                 $0.hasRecoveryNotice && $0.belongsTo(workspaceID: target.workspaceID,
                     machineID: target.machineID, terminalSessionID: terminalSessionID)
             }
-            if !inputRecoveryRecords.isEmpty { inputDelivery.setRecoveryNotice(true) }
             for record in records
                 where record.blocksNewSession
                     && record.belongsTo(workspaceID: target.workspaceID,
@@ -2113,11 +2087,17 @@ final class TerminalSessionController {
                 }
                 let continued = try await connections.journal.continueAfterInterruption(record)
                 if continued.hasRecoveryNotice {
-                    inputRecoveryRecords.removeAll { $0.id == continued.id }
-                    inputRecoveryRecords.append(continued)
-                    inputDelivery.setRecoveryNotice(true)
+                    recovered.removeAll { $0.id == continued.id }
+                    recovered.append(continued)
                 }
             }
+            // A failed acknowledgement only leaves the record for the next
+            // connection to acknowledge; it never blocks this one.
+            if !recovered.isEmpty {
+                do { try await connections.journal.acknowledgeRecovery(recovered) }
+                catch { Self.log.info("earlier input outcome not yet acknowledged: \(Self.describe(error), privacy: .public)") }
+            }
+            inputRecoveryRecords = []
             do { return try await connectFirstReachable() }
             catch TerminalSessionJournalError.reviewRequired where attempt < 19 {
                 try await Task.sleep(for: .milliseconds(250))

@@ -385,31 +385,37 @@ final class MuxObservationTests: XCTestCase {
             let pump = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
                 try await consumer.prepare($0)
             }
-            let resumed = mode == "identity-same" || mode == "identity-moved"
-            XCTAssertTrue(control.current.inputUnconfirmed,
-                          "fresh identity cannot prove the previous connection's input outcome")
+            // Verified, or not identifiable on this connection: the same pane by
+            // number on the same run. Replaced: its number names another pane
+            // now, so the desktop's active pane 1 opens instead of no pane.
+            let resumed = mode != "identity-replaced"
+            XCTAssertFalse(control.current.inputUnconfirmed, "an earlier connection's unknown outcome is not reported")
+            XCTAssertNil(control.current.notice, "opening a pane needs no notice")
             if resumed {
-                XCTAssertEqual(control.current.shown, 2, "resume the verified pane, not active pane 1")
-                XCTAssertEqual(shown.record?.identity, witness)
+                XCTAssertEqual(control.current.shown, 2, "resume the remembered pane, not active pane 1")
+                XCTAssertEqual(shown.record?.identity, mode == "identity-unavailable" ? nil : witness)
                 XCTAssertEqual(shown.record?.tabId, mode == "identity-moved" ? 12 : 2)
-                XCTAssertTrue(client.recorded.contains(.init(name: "adopt", pane: 2)))
+                if mode != "identity-unavailable" {
+                    XCTAssertTrue(client.recorded.contains(.init(name: "adopt", pane: 2)))
+                }
             } else {
-                XCTAssertNil(control.current.shown)
-                XCTAssertThrowsError(try control.inputRouting.capture())
-                XCTAssertTrue(client.effects.isEmpty)
-                XCTAssertFalse(client.recorded.contains { $0.name == "show" })
-                XCTAssertTrue(control.current.notice?.contains("Select a pane") == true)
-                XCTAssertEqual(shown.record?.identity, witness, "a failed resume preserves the original record")
+                XCTAssertEqual(control.current.shown, 1)
+                XCTAssertEqual(shown.record?.paneId, 1)
+                XCTAssertFalse(client.recorded.contains { $0.name == "adopt" },
+                               "a replacement never inherits the earlier pane's saved size")
             }
             let run = Task { try await pump.run(consumer: consumer) }
             let watchdog = Task { try await Task.sleep(for: .seconds(8)); pump.requestStop() }
             defer { watchdog.cancel(); pump.requestStop() }
-            if !resumed { control.request(pane: 2) }
+            if !resumed {
+                try await waitUntil { control.current.shown == 1 && control.inputRouting.current.ready }
+                control.request(pane: 2)
+            }
             try await waitUntil { control.current.shown == 2 && control.inputRouting.current.ready }
-            XCTAssertFalse(client.recorded.contains(.init(name: "show", pane: 1)))
+            if resumed { XCTAssertFalse(client.recorded.contains(.init(name: "show", pane: 1))) }
             if !resumed {
                 XCTAssertFalse(client.recorded.contains { $0.name == "adopt" },
-                               "explicit fresh selection cannot inherit a replacement's saved size")
+                               "explicit selection cannot inherit a replacement's saved size")
             }
             let identityIndex = try XCTUnwrap(client.recorded.firstIndex { $0 == .init(name: "identity", pane: 2) })
             let firstEffect = try XCTUnwrap(client.recorded.firstIndex { ["adopt", "resize", "show"].contains($0.name) })
