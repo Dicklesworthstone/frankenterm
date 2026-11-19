@@ -443,7 +443,7 @@ metrics = "0.24.6"
 miniz_oxide = "0.9.1"
 mlua = "0.12.1"
 names = { version = "0.14.0", default-features = false }
-nix = "0.31.3"
+nix = "0.32.0"
 ntapi = "0.4.3"
 num = "0.4.3"
 num-derive = "0.5.1"
