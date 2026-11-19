@@ -9,13 +9,14 @@ use config::{
 use dwrote::{FontDescriptor, FontStretch, FontStyle, FontWeight};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::ffi::c_int;
 use std::sync::Arc;
-use winapi::shared::windef::{HDC, HFONT};
+use winapi::shared::windef::HFONT;
 use winapi::um::dwrite::*;
 use winapi::um::winbase::MulDiv;
 use winapi::um::wingdi::{
-    CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, GetDeviceCaps, GetFontData,
-    SelectObject, FIXED_PITCH, GDI_ERROR, LF_FACESIZE, LOGFONTW, LOGPIXELSY, OUT_TT_ONLY_PRECIS,
+    CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, GetFontData, SelectObject,
+    FIXED_PITCH, GDI_ERROR, LF_FACESIZE, LOGFONTW, OUT_TT_ONLY_PRECIS,
 };
 
 /// A FontLocator implemented using the system font loading
@@ -135,7 +136,10 @@ fn load_font(font_attr: &FontAttributes, pixel_size: u16) -> anyhow::Result<Pars
     }
 }
 
-pub fn parse_log_font(log_font: &LOGFONTW, hdc: HDC) -> anyhow::Result<(ParsedFont, f64)> {
+/// The face `log_font` names and its size in points. `logpixelsy` is the
+/// vertical resolution of the device the font is meant for, as
+/// `GetDeviceCaps(hdc, LOGPIXELSY)` reports it.
+pub fn parse_log_font(log_font: &LOGFONTW, logpixelsy: c_int) -> anyhow::Result<(ParsedFont, f64)> {
     let name = String::from_utf16(&log_font.lfFaceName)?;
     unsafe {
         let font = CreateFontIndirectW(log_font);
@@ -143,8 +147,8 @@ pub fn parse_log_font(log_font: &LOGFONTW, hdc: HDC) -> anyhow::Result<(ParsedFo
         DeleteObject(font as *mut _);
         let source = source?;
 
-        let point_size = MulDiv(-log_font.lfHeight, 72, GetDeviceCaps(hdc, LOGPIXELSY)) as f64;
-        let pixel_size = log_font.lfHeight.abs() as u16;
+        let point_size = MulDiv(-log_font.lfHeight, 72, logpixelsy) as f64;
+        let pixel_size = log_font.lfHeight.unsigned_abs() as u16;
 
         let mut attr = FontAttributes::new(&name);
         attr.weight = config::FontWeight::from_opentype_weight(log_font.lfWeight as u16);

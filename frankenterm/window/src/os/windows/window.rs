@@ -46,7 +46,7 @@ use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
 use winapi::um::uxtheme::{
     CloseThemeData, GetThemeFont, GetThemeSysFont, OpenThemeData, SetWindowTheme,
 };
-use winapi::um::wingdi::{LOGFONTW, MAKEPOINTS};
+use winapi::um::wingdi::{GetDeviceCaps, LOGFONTW, LOGPIXELSY, MAKEPOINTS};
 use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
 use windows::UI::Color as WUIColor;
@@ -1368,7 +1368,8 @@ unsafe fn update_title_font(hwnd: HWND) {
 
     let mut font = lock_title_font_cache("updating title font parameters");
     if let Some(lf) = get_title_log_font(hwnd, hdc) {
-        *font = frankenterm_font::locator::gdi::parse_log_font(&lf, hdc).ok();
+        let logpixelsy = GetDeviceCaps(hdc, LOGPIXELSY);
+        *font = frankenterm_font::locator::gdi::parse_log_font(&lf, logpixelsy).ok();
     }
 
     ReleaseDC(hwnd, hdc);
