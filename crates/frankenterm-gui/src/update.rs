@@ -66,6 +66,31 @@ pub fn get_latest_release_info() -> anyhow::Result<Release> {
     get_github_release_info(FRANKENTERM_RELEASES_API_LATEST)
 }
 
+/// Whether `release` carries an archive for `os` and `arch` (the values of
+/// `std::env::consts`). Assets are named `<name>-<os>-<arch>.<ext>`, with
+/// macOS as `darwin` and either spelling of each architecture.
+fn release_ships_platform(release: &Release, os: &str, arch: &str) -> bool {
+    let os = if os == "macos" { "darwin" } else { os };
+    let arches: &[&str] = match arch {
+        "x86_64" => &["amd64", "x86_64"],
+        "aarch64" => &["arm64", "aarch64"],
+        _ => std::slice::from_ref(&arch),
+    };
+    release.assets.iter().any(|asset| {
+        arches
+            .iter()
+            .any(|arch| asset.name.contains(&format!("-{os}-{arch}.")))
+    })
+}
+
+/// A release is announced when it is newer than this build and ships this
+/// platform: the macOS-only App Store release is not offered on Windows.
+fn release_is_offered(latest: &Release, force_ui: bool) -> bool {
+    force_ui
+        || (release_tag_is_newer(&latest.tag_name)
+            && release_ships_platform(latest, std::env::consts::OS, std::env::consts::ARCH))
+}
+
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
     get_github_release_info(FRANKENTERM_RELEASES_API_NIGHTLY)
@@ -88,7 +113,7 @@ pub fn load_last_release_info_and_set_banner() {
         };
 
         let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
-        if !release_tag_is_newer(&latest.tag_name) && !force_ui {
+        if !release_is_offered(&latest, force_ui) {
             return;
         }
 
@@ -142,7 +167,7 @@ fn set_banner_from_release_info(latest: &Release) {
 
 fn schedule_set_banner_from_release_info(latest: &Release) {
     let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
-    if !release_tag_is_newer(&latest.tag_name) && !force_ui {
+    if !release_is_offered(latest, force_ui) {
         return;
     }
     match promise::spawn::try_reserve_main_thread(
@@ -220,7 +245,7 @@ fn update_checker() {
             if let Ok(latest) = get_latest_release_info() {
                 schedule_set_banner_from_release_info(&latest);
                 let current = wezterm_version();
-                if release_tag_is_newer(&latest.tag_name) || force_ui {
+                if release_is_offered(&latest, force_ui) {
                     log::info!(
                         "showing release {} information for current build {} (forced: {})",
                         latest.tag_name,
@@ -294,6 +319,48 @@ mod tests {
             release_browser_url(&latest),
             "https://github.com/Dicklesworthstone/frankenterm/releases/tag/v1"
         );
+    }
+
+    fn release_with_assets(names: &[&str]) -> Release {
+        let mut release = release_with_urls("", "v0.15.22-appstore.15");
+        release.assets = names
+            .iter()
+            .map(|name| Asset {
+                name: name.to_string(),
+                size: 1,
+                url: String::new(),
+                browser_download_url: String::new(),
+            })
+            .collect();
+        release
+    }
+
+    #[test]
+    fn a_release_is_offered_only_where_it_ships_an_archive() {
+        // v0.15.22-appstore.15: macOS assets only.
+        let appstore = release_with_assets(&[
+            "FrankenTerm-darwin-arm64.app.zip",
+            "ft-darwin-arm64.tar.xz",
+            "ft-darwin-arm64.tar.xz.sha256",
+            "FrankenTerm-Exporter.dmg",
+            "SHA256SUMS",
+        ]);
+        assert!(release_ships_platform(&appstore, "macos", "aarch64"));
+        assert!(!release_ships_platform(&appstore, "windows", "x86_64"));
+        assert!(!release_ships_platform(&appstore, "linux", "x86_64"));
+        assert!(!release_ships_platform(&appstore, "linux", "aarch64"));
+
+        // v0.15.1 and v0.13.0 name architectures both ways.
+        let full = release_with_assets(&[
+            "ft-windows-amd64.zip",
+            "ft-linux-aarch64.tar.gz",
+            "ft-linux-x86_64.tar.xz",
+        ]);
+        assert!(release_ships_platform(&full, "windows", "x86_64"));
+        assert!(release_ships_platform(&full, "linux", "aarch64"));
+        assert!(release_ships_platform(&full, "linux", "x86_64"));
+        assert!(!release_ships_platform(&full, "macos", "aarch64"));
+        assert!(!release_ships_platform(&full, "windows", "aarch64"));
     }
 
     #[test]
