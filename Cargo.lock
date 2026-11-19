@@ -4417,6 +4417,7 @@ dependencies = [
  "spawn-funcs",
  "ssh-funcs",
  "tabout",
+ "tar",
  "tempfile",
  "terminfo",
  "termwiz 0.24.0",
@@ -4436,6 +4437,7 @@ dependencies = [
  "window",
  "window-funcs",
  "windows",
+ "zstd",
 ]
 
 [[package]]

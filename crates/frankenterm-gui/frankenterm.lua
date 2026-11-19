@@ -1,6 +1,7 @@
 -- FrankenTerm default GUI config.
 --
--- Ships inside FrankenTerm.app at Contents/Resources/frankenterm.lua and is loaded
+-- Ships inside FrankenTerm.app at Contents/Resources/frankenterm.lua (and in
+-- resources\frankenterm.lua beside the Windows executables) and is loaded
 -- automatically when no user config (~/.frankenterm.lua or
 -- ~/.config/frankenterm/{frankenterm,wezterm}.lua) is present.
 --
@@ -14,12 +15,27 @@ local frankenterm = require 'frankenterm'
 local config = frankenterm.config_builder()
 local act = frankenterm.action
 
+-- The Windows package ships this file in resources\ beside frankenterm-gui.exe.
+-- It carries the same look as the Mac app; the few Windows-specific settings
+-- are marked "Windows" below.
+local is_windows = frankenterm.target_triple:find('windows') ~= nil
+
+-- macOS lays fonts out at 72 dpi and Windows at 96, so the same on-screen size
+-- takes three quarters of the points on Windows.
+local function points(mac_size)
+  if is_windows then
+    return mac_size * 0.75
+  end
+  return mac_size
+end
+
 -- ============================================================================
 -- Helper: is the pane running an interactive shell?
 -- ============================================================================
 local function is_shell(foreground_process_name)
-  local shell_names = { 'bash', 'zsh', 'fish', 'sh', 'ksh', 'dash' }
+  local shell_names = { 'bash', 'zsh', 'fish', 'sh', 'ksh', 'dash', 'pwsh', 'powershell', 'cmd', 'nu' }
   local process = string.match(foreground_process_name, '[^/\\]+$') or foreground_process_name
+  process = process:gsub('%.[Ee][Xx][Ee]$', '')
   for _, shell in ipairs(shell_names) do
     if process == shell then
       return true
@@ -100,22 +116,23 @@ end)
 -- FONT + WINDOW APPEARANCE
 -- ============================================================================
 -- Pragmasevka is bundled at Contents/Resources/fonts/ inside the .app bundle
--- and registered automatically via prepend_bundled_app_font_dirs() in
--- frankenterm/config/src/config.rs. The four faces (Regular/Bold/Italic/
--- BoldItalic) come from the v1.7.0 zstd-packed payload at
--- crates/frankenterm/assets/Pragmasevka_NF.zip.zst.
+-- (resources\fonts\ in the Windows package) and registered automatically via
+-- prepend_bundled_app_font_dirs() in frankenterm/config/src/config.rs. The
+-- four faces (Regular/Bold/Italic/BoldItalic) come from the v1.7.0
+-- zstd-packed payload at crates/frankenterm/assets/Pragmasevka_NF.zip.zst.
 config.font = frankenterm.font {
   family = 'Pragmasevka Nerd Font',
   harfbuzz_features = { 'calt', 'clig', 'liga' },
 }
-config.font_size = 16.0
+config.font_size = points(16.0)
 config.warn_about_missing_glyphs = false
 
 -- Window translucency: 0.95 so the effective alpha with the gradient layer
 -- (0.92) is ~0.87. A bit of desktop bleed-through for the glassy look, but
 -- enough opacity that text on a busy wallpaper stays legible. The blur
--- smooths whatever does show through.
-config.window_background_opacity = 0.95
+-- smooths whatever does show through. Windows has no blur that stays smooth
+-- while a window moves, so its window is opaque over the same gradient.
+config.window_background_opacity = is_windows and 1.0 or 0.95
 config.macos_window_background_blur = 30
 config.background = {
   {
@@ -149,7 +166,7 @@ config.colors = {
 
 config.window_frame = {
   font = frankenterm.font { family = 'Pragmasevka Nerd Font', weight = 'Bold' },
-  font_size = 12.0,
+  font_size = points(12.0),
   active_titlebar_bg = '#060a10',
   inactive_titlebar_bg = '#060a10',
 }
@@ -158,7 +175,20 @@ config.window_padding = { left = 12, right = 12, top = 12, bottom = 12 }
 config.inactive_pane_hsb = { saturation = 0.85, brightness = 0.7 }
 config.default_cursor_style = 'BlinkingBar'
 config.cursor_blink_rate = 500
-config.window_decorations = 'RESIZE'
+-- No system title bar: the tab bar is the top of the window. Windows draws
+-- its minimize, maximize and close buttons in the tab bar.
+config.window_decorations = is_windows and 'INTEGRATED_BUTTONS|RESIZE' or 'RESIZE'
+
+-- Windows: start PowerShell 7 when it is installed, else Windows PowerShell
+-- (the Windows default would be cmd.exe).
+if is_windows then
+  local pwsh = frankenterm.glob('C:/Program Files/PowerShell/*/pwsh.exe')
+  if #pwsh > 0 then
+    config.default_prog = { pwsh[#pwsh], '-NoLogo' }
+  else
+    config.default_prog = { 'powershell.exe', '-NoLogo' }
+  end
+end
 
 config.use_fancy_tab_bar = true
 config.tab_bar_at_bottom = false
@@ -171,12 +201,14 @@ config.skip_close_confirmation_for_processes_named = {
   'bash', 'sh', 'zsh', 'fish', 'tmux', 'nu', 'ssh',
   'wezterm-mux-server', 'frankenterm-mux-server',
   'claude', 'node', 'python', 'python3',
+  'cmd.exe', 'pwsh.exe', 'powershell.exe', 'ssh.exe',
 }
 
 config.hyperlink_rules = frankenterm.default_hyperlink_rules()
 
+-- Cmd-click on the Mac, Ctrl-click on Windows, opens a link.
 config.mouse_bindings = {
-  { event = { Up   = { streak = 1, button = 'Left'   } }, mods = 'CMD',  action = act.OpenLinkAtMouseCursor },
+  { event = { Up   = { streak = 1, button = 'Left'   } }, mods = is_windows and 'CTRL' or 'CMD', action = act.OpenLinkAtMouseCursor },
   { event = { Down = { streak = 1, button = 'Right'  } }, mods = 'NONE', action = act.PasteFrom('Clipboard') },
   { event = { Down = { streak = 1, button = 'Middle' } }, mods = 'NONE', action = act.PasteFrom('PrimarySelection') },
 }
@@ -188,7 +220,8 @@ config.mux_output_parser_coalesce_delay_ms = 3
 
 -- Renderer: Metal-backed WebGpu, NOT legacy OpenGL. On Apple Silicon the OpenGL
 -- backend (_NSOpenGLViewBackingLayer) causes multi-second/minute render stalls
--- under heavy multi-pane agent-swarm output; WebGpu eliminates them.
+-- under heavy multi-pane agent-swarm output; WebGpu eliminates them. On Windows
+-- the same setting renders through Direct3D 12 on the discrete GPU.
 config.front_end = "WebGpu"
 config.webgpu_power_preference = "HighPerformance"
 

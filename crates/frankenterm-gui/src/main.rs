@@ -77,6 +77,8 @@ mod spawn;
 mod stats;
 mod tabbar;
 mod termwindow;
+#[cfg(any(windows, test))]
+mod windows_bundle;
 // br-ft-wysai: `unicode_names.rs` is a 5.8MB / 140K-line generated
 // table (`ucd-generate names .`, Unicode 16.0.0). Single consumer is
 // `termwindow/charselect.rs` (character-picker fuzzy-search). Cold
@@ -5858,6 +5860,11 @@ fn run() -> anyhow::Result<()> {
 
     stats::Stats::init()?;
     let _saver = umask::UmaskSaver::new();
+
+    // The Windows package is bare executables: the default config and fonts
+    // the Mac app keeps in its bundle are embedded and unpacked once per user.
+    #[cfg(windows)]
+    windows_bundle::install();
 
     config::common_init(
         opts.config_file.as_ref(),

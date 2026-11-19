@@ -210,6 +210,9 @@ socket2 = { workspace = true, features = ["all"] }
 
 [target.'cfg(windows)'.dependencies]
 shared_library.workspace = true
+# Unpacks the embedded Pragmasevka payload (windows_bundle.rs).
+tar.workspace = true
+zstd.workspace = true
 winapi = { workspace = true, features = [
     "winuser",
     "consoleapi",
@@ -228,6 +231,9 @@ benchmarking = "0.4.13"
 criterion.workspace = true
 k9.workspace = true
 proptest = "1.8.0"
+# windows_bundle.rs is also tested off Windows.
+tar.workspace = true
+zstd.workspace = true
 
 # NOTE: Workspace lints intentionally omitted - vendored GUI code carries
 # upstream style that does not conform to our pedantic clippy profile.

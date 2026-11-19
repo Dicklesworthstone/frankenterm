@@ -1607,22 +1607,15 @@ impl Config {
             paths.push(PathPossibility::optional(dir.join("wezterm.lua")));
         }
 
-        // Last-resort fallback: bundled default config that ships inside the
-        // FrankenTerm.app on macOS (Contents/Resources/{frankenterm,wezterm}.lua).
-        // Lets a freshly-installed app launch with sensible defaults — fonts,
-        // ssh-domain remotes, keybindings, host-aware colors — without the user
-        // having to author a config first. User configs above still win.
-        #[cfg(target_os = "macos")]
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
-                    if let Some(contents_dir) = exe_dir.parent() {
-                        let resources = contents_dir.join("Resources");
-                        paths.push(PathPossibility::optional(resources.join("frankenterm.lua")));
-                        paths.push(PathPossibility::optional(resources.join("wezterm.lua")));
-                    }
-                }
-            }
+        // Last-resort fallback: the bundled default config, inside
+        // FrankenTerm.app on macOS (Contents/Resources/) and in `resources\`
+        // beside the executables in the Windows package. Lets a fresh install
+        // launch with the FrankenTerm look — fonts, colors, tab bar,
+        // keybindings, GPU renderer — without the user authoring a config
+        // first. User configs above still win.
+        for resources in bundled_resources_dirs() {
+            paths.push(PathPossibility::optional(resources.join("frankenterm.lua")));
+            paths.push(PathPossibility::optional(resources.join("wezterm.lua")));
         }
 
         if cfg!(windows) {
@@ -3094,6 +3087,10 @@ fn bundled_app_font_dirs() -> Vec<PathBuf> {
         }
     }
 
+    if let Some(resources) = BUNDLED_RESOURCES_DIR.get() {
+        dirs.push(resources.join("fonts"));
+    }
+
     dirs.retain(|dir| dir.is_dir());
 
     // Canonicalize each directory before deduplicating so logically
@@ -3112,23 +3109,64 @@ fn bundled_app_font_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn bundled_app_font_dirs_from_executable_dir(exe_dir: &Path) -> Vec<PathBuf> {
+static BUNDLED_RESOURCES_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where an executable that carries its own resources unpacked them (the
+/// Windows GUI embeds its default config and fonts). It is searched like the
+/// Mac bundle's `Contents/Resources`: after every user config, and its
+/// `fonts` directory before the system's fonts. Set it before the first
+/// config load; later calls are ignored.
+pub fn set_bundled_resources_dir(dir: PathBuf) {
+    let _ = BUNDLED_RESOURCES_DIR.set(dir);
+}
+
+/// The bundled resources directories, in search order: the one the
+/// executable's own location implies, then the one set at startup.
+fn bundled_resources_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe
+            .parent()
+            .and_then(bundled_config_dir_from_executable_dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    if let Some(dir) = BUNDLED_RESOURCES_DIR.get() {
+        dirs.push(dir.clone());
+    }
+    dirs
+}
+
+/// Where the bundled default config lives for an executable in `exe_dir`:
+/// `Contents/Resources` of FrankenTerm.app, or `resources` beside the
+/// Windows executables. Other platforms ship none.
+fn bundled_config_dir_from_executable_dir(exe_dir: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let mut dirs = Vec::new();
         if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
-            if let Some(contents_dir) = exe_dir.parent() {
-                dirs.push(contents_dir.join("Resources").join("fonts"));
-            }
+            return exe_dir.parent().map(|contents| contents.join("Resources"));
         }
-        dirs
+        None
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        Some(exe_dir.join("resources"))
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = exe_dir;
-        Vec::new()
+        None
     }
+}
+
+fn bundled_app_font_dirs_from_executable_dir(exe_dir: &Path) -> Vec<PathBuf> {
+    bundled_config_dir_from_executable_dir(exe_dir)
+        .map(|resources| resources.join("fonts"))
+        .into_iter()
+        .collect()
 }
 
 fn default_status_update_interval() -> u64 {
@@ -4323,8 +4361,44 @@ mod tests {
             vec![dir.path().join("FrankenTerm.app/Contents/Resources/fonts")]
         );
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        assert_eq!(dirs, vec![macos_dir.join("resources").join("fonts")]);
+
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn bundled_config_dir_is_the_app_resources_or_the_windows_resources_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos_dir = dir.path().join("FrankenTerm.app/Contents/MacOS");
+        let plain_dir = dir.path().join("frankenterm");
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                bundled_config_dir_from_executable_dir(&macos_dir),
+                Some(dir.path().join("FrankenTerm.app/Contents/Resources"))
+            );
+            assert_eq!(bundled_config_dir_from_executable_dir(&plain_dir), None);
+        }
+
+        // Not the executable's own directory: a frankenterm.lua there is the
+        // portable config, which outranks every user config.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                bundled_config_dir_from_executable_dir(&plain_dir),
+                Some(plain_dir.join("resources"))
+            );
+            let _ = macos_dir;
+        }
+
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            assert_eq!(bundled_config_dir_from_executable_dir(&macos_dir), None);
+            assert_eq!(bundled_config_dir_from_executable_dir(&plain_dir), None);
+        }
     }
 
     /// Regression guard for the config-reload main-thread panic (#3).
