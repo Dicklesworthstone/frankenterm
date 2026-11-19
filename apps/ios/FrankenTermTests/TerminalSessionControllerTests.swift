@@ -1668,11 +1668,10 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// The network goes away after Enter, before the machine answered: the
-    /// phone says the line left it and may or may not have arrived, sends
-    /// nothing again, and the next session keeps saying so until dismissed.
-    /// Input the machine answered is not reported. A relay to the loopback
-    /// sshd stands in for the network.
-    func testInputTheMachineNeverAnsweredIsReportedAfterADropAndNotSentAgain() async throws {
+    /// phone sends nothing again, and the next session just works. The
+    /// machine is not put in Needs Attention and nothing waits to be
+    /// dismissed. A relay to the loopback sshd stands in for the network.
+    func testInputTheMachineNeverAnsweredIsNotSentAgainAfterADropAndNeedsNoAttention() async throws {
         guard let sshPort = ProcessInfo.processInfo.environment["FT_LIVE_SSH_PORT"].flatMap(UInt16.init) else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_SSH_PORT to run against a live sshd")
         }
@@ -1694,38 +1693,29 @@ final class TerminalSessionControllerTests: XCTestCase {
         relay.down()
         for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertTrue(first.dropped, "the connection was lost (\(first.phase))")
-        XCTAssertTrue(first.inputDelivery.unanswered, "the line left the phone with no answer")
-        XCTAssertFalse(first.inputDelivery.unsent)
-        let message = try XCTUnwrap(first.inputDelivery.message(machine: first.target.machineName))
-        XCTAssertTrue(message.contains("before Alpha answered it. It may or may not have arrived."), message)
+        XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain), "nothing for the person to do")
         await assertReleased(first, connections: live.connections)
-        // This launch told it; a later launch does not tell it again.
-        XCTAssertFalse(TerminalUnansweredInput(workspace: first.target.workspaceID.uuidString, machine: "alpha",
-                                               launch: "later").takeFromEarlierLaunch(), "told by this launch only")
 
-        // The next session keeps the notice and types nothing again.
+        // The next session types nothing again and needs no dismissal.
         try await relay.up()
         let again = try await connect(scene, "alpha")
         XCTAssertFalse(again === first)
         XCTAssertEqual(again.phase, .live)
-        XCTAssertEqual(again.inputDelivery, first.inputDelivery, "a new live terminal does not erase it")
-        XCTAssertTrue(scene.attentionReasons("alpha").contains(.inputUncertain),
-                      "reconnected machines remain in Needs Attention until their input notice is dismissed")
+        XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain),
+                       "a reconnected machine is not in Needs Attention")
+        XCTAssertNil(again.interactionProblem)
         let fresh = try shown(again)
         defer { fresh.removeFromSuperview() }
         try await type("echo SEEN-$((40+2))", into: fresh)
         let seen = try await rows(of: fresh) { self.shows($0, "SEEN-42") }
         XCTAssertFalse(shows(seen, "LOST-\(run)"), "the lost line was not typed again (screen: \(seen))")
-        again.dismissInputDelivery()
-        XCTAssertTrue(again.inputDelivery.isEmpty)
-        XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain))
 
         // Input the machine answered is not reported when the connection drops.
         try await Task.sleep(for: .milliseconds(500))
         relay.down()
         for _ in 0..<200 where !again.settled { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertTrue(again.dropped, "the connection was lost (\(again.phase))")
-        XCTAssertTrue(again.inputDelivery.isEmpty, "answered input is not reported (\(again.inputDelivery))")
+        XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain), "answered input is not reported")
         await assertReleased(again, connections: live.connections)
         await scene.close()
     }
