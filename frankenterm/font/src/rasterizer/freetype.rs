@@ -796,6 +796,7 @@ fn record_to_cairo_surface(
     scale_x: f64,
     scale_y: f64,
 ) -> anyhow::Result<(RecordingSurface, bool)> {
+    crate::rasterizer::initialize_cairo();
     let mut has_color = false;
     let surface = RecordingSurface::create(Content::ColorAlpha, None)?;
     let context = Context::new(&surface)?;
@@ -905,6 +906,215 @@ fn record_to_cairo_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::FontDatabase;
+    use crate::locator::{new_locator, FontLocatorSelection};
+    use crate::rasterizer::new_rasterizer;
+    use crate::shaper::harfbuzz::HarfbuzzShaper;
+    use crate::shaper::FontShaper;
+    use config::FontAttributes;
+    use wezterm_bidi::Direction;
+
+    const SIZE_PT: f64 = 12.0;
+    const DPI: u32 = 96;
+
+    fn built_in(family: &str) -> ParsedFont {
+        FontDatabase::with_built_in()
+            .expect("built-in fonts")
+            .resolve(
+                &FontAttributes {
+                    family: family.into(),
+                    ..FontAttributes::default()
+                },
+                16,
+            )
+            .unwrap_or_else(|| panic!("{family} is built in"))
+            .clone()
+    }
+
+    /// The glyph HarfBuzz shapes `ch` into with `font` alone, if it has one.
+    fn glyph_for(font: &ParsedFont, ch: char) -> Option<u32> {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, std::slice::from_ref(font)).expect("shaper");
+        let mut no_glyphs = vec![];
+        let infos = shaper
+            .shape(
+                &ch.to_string(),
+                SIZE_PT,
+                DPI,
+                &mut no_glyphs,
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .expect("shape");
+        match infos.as_slice() {
+            [info] if no_glyphs.is_empty() && info.glyph_pos != 0 => Some(info.glyph_pos),
+            _ => None,
+        }
+    }
+
+    /// `ch` through the rasterizer the GUI builds for `font` by default.
+    fn raster(font: &ParsedFont, ch: char) -> RasterizedGlyph {
+        let glyph = glyph_for(font, ch).unwrap_or_else(|| {
+            panic!(
+                "{} has no glyph for {ch:?}",
+                font.handle.diagnostic_string()
+            )
+        });
+        let rasterizer = new_rasterizer(
+            FontRasterizerSelection::FreeType,
+            font,
+            DisplayPixelGeometry::RGB,
+        )
+        .expect("rasterizer");
+        let glyph = rasterizer
+            .rasterize_glyph(glyph, SIZE_PT, DPI)
+            .unwrap_or_else(|err| panic!("rasterize {ch:?}: {err:#}"));
+        assert_eq!(glyph.data.len(), glyph.width * glyph.height * 4, "{ch:?}");
+        glyph
+    }
+
+    /// Total coverage: the sum of the premultiplied alpha channel.
+    fn ink(glyph: &RasterizedGlyph) -> u64 {
+        glyph.data.chunks(4).map(|px| u64::from(px[3])).sum()
+    }
+
+    fn assert_inked(glyph: &RasterizedGlyph, what: &str) {
+        assert!(
+            glyph.width > 0 && glyph.height > 0,
+            "{what}: empty {}x{} bitmap",
+            glyph.width,
+            glyph.height
+        );
+        assert!(ink(glyph) > 0, "{what}: bitmap has no ink");
+    }
+
+    /// Some pixel is visibly colored, not a shade of gray.
+    fn has_chroma(glyph: &RasterizedGlyph) -> bool {
+        glyph
+            .data
+            .chunks(4)
+            .any(|px| px[3] > 0 && (px[0].abs_diff(px[1]) > 16 || px[1].abs_diff(px[2]) > 16))
+    }
+
+    /// The first face the platform's own fallback locator (DirectWrite,
+    /// CoreText or fontconfig, as in the GUI) offers that maps `ch`.
+    fn system_fallback(ch: char) -> Option<ParsedFont> {
+        new_locator(FontLocatorSelection::default())
+            .locate_fallback_for_codepoints(&[ch])
+            .unwrap_or_else(|err| panic!("fallback lookup for {ch:?}: {err:#}"))
+            .into_iter()
+            .find(|font| glyph_for(font, ch).is_some())
+    }
+
+    /// Windows and macOS always ship CJK and color emoji faces; a Linux
+    /// host may have neither installed.
+    fn system_fallback_required(ch: char) -> Option<ParsedFont> {
+        let found = system_fallback(ch);
+        if found.is_none() {
+            assert!(
+                !(cfg!(windows) || cfg!(target_os = "macos")),
+                "the system fallback locator found no face for {ch:?}"
+            );
+            eprintln!("no system face maps {ch:?} on this host; skipped");
+        }
+        found
+    }
+
+    #[test]
+    fn real_ascii_cjk_and_color_emoji_glyphs_rasterize_with_ink() {
+        config::use_test_configuration();
+
+        let ascii = raster(&built_in("JetBrains Mono"), 'A');
+        assert_inked(&ascii, "JetBrains Mono 'A'");
+        assert!(!ascii.has_color);
+
+        // The bundled Noto Color Emoji is COLR version 1, painted with cairo.
+        let emoji = raster(&built_in("Noto Color Emoji"), '\u{1F600}');
+        assert_inked(&emoji, "Noto Color Emoji U+1F600");
+        assert!(emoji.has_color, "COLR emoji must be a color glyph");
+        assert!(has_chroma(&emoji), "COLR emoji painted without color");
+
+        if let Some(cjk_font) = system_fallback_required('\u{6F22}') {
+            let cjk = raster(&cjk_font, '\u{6F22}');
+            let what = format!("{} U+6F22", cjk_font.handle.diagnostic_string());
+            assert_inked(&cjk, &what);
+            assert!(!cjk.has_color, "{what}");
+            // A full-width ideograph is wider than a half-width Latin letter.
+            assert!(cjk.width > ascii.width, "{what}: {} wide", cjk.width);
+        }
+
+        // A non-BMP codepoint reaches the system locator intact, and the
+        // system's color emoji face rasterizes in color: Segoe UI Emoji (COLR)
+        // on Windows, Apple Color Emoji (sbix) on macOS. A Linux host's
+        // fallback for it may be a monochrome face, so it is not checked there.
+        if cfg!(windows) || cfg!(target_os = "macos") {
+            let emoji_font = system_fallback_required('\u{1F600}').expect("a system emoji face");
+            let system_emoji = raster(&emoji_font, '\u{1F600}');
+            let what = format!("{} U+1F600", emoji_font.handle.diagnostic_string());
+            assert_inked(&system_emoji, &what);
+            assert!(system_emoji.has_color, "{what}");
+            assert!(has_chroma(&system_emoji), "{what}");
+        }
+    }
+
+    #[test]
+    fn synthetic_bold_and_italic_change_real_glyph_pixels() {
+        config::use_test_configuration();
+        let regular = built_in("JetBrains Mono");
+        let mut bold = regular.clone();
+        bold.synthesize_bold = true;
+        let mut italic = regular.clone();
+        italic.synthesize_italic = true;
+
+        for ch in ['l', 'H'] {
+            let upright = raster(&regular, ch);
+            let emboldened = raster(&bold, ch);
+            let slanted = raster(&italic, ch);
+            assert_inked(&upright, "regular");
+            assert_inked(&emboldened, "synthetic bold");
+            assert_inked(&slanted, "synthetic italic");
+            assert!(
+                ink(&emboldened) > ink(&upright) * 11 / 10,
+                "{ch:?}: synthetic bold adds no weight ({} vs {})",
+                ink(&emboldened),
+                ink(&upright)
+            );
+            // The skew moves the top of a vertical stem right of its foot.
+            assert!(
+                slanted.width > upright.width,
+                "{ch:?}: synthetic italic is not slanted ({} vs {} wide)",
+                slanted.width,
+                upright.width
+            );
+            assert_ne!(slanted.data, upright.data, "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn color_glyphs_rasterize_identically_on_parallel_threads() {
+        config::use_test_configuration();
+        let font = built_in("Noto Color Emoji");
+        let text = ['\u{1F600}', '\u{1F680}', '\u{2764}', '\u{1F30D}'];
+        let expected: Vec<Vec<u8>> = text.iter().map(|&ch| raster(&font, ch).data).collect();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..8 {
+                            for (ch, expected) in text.iter().zip(&expected) {
+                                assert_eq!(&raster(&font, *ch).data, expected, "{ch:?}");
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("worker thread panicked");
+            }
+        });
+    }
 
     #[test]
     fn colr_sweep_angle_to_radians_matches_spec_convention() {

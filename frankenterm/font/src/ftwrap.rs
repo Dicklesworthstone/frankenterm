@@ -2,7 +2,6 @@
 
 use crate::locator::{FontDataHandle, FontDataSource};
 use crate::parser::ParsedFont;
-#[cfg(not(windows))]
 use crate::rasterizer::colr::DrawOp;
 use anyhow::{anyhow, Context};
 use config::{configuration, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget};
@@ -11,9 +10,7 @@ use memmap2::{Mmap, MmapOptions};
 use rangeset::RangeSet;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::ffi::CStr;
-#[cfg(not(windows))]
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, CStr};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
@@ -832,7 +829,6 @@ impl Face {
         }
     }
 
-    #[cfg(not(windows))]
     pub fn load_glyph_outlines(
         &mut self,
         glyph_index: FT_UInt,
@@ -1557,7 +1553,6 @@ pub fn vector_x_y(vector: &FT_Vector) -> (f32, f32) {
     (vector.x.f16d16().to_num(), vector.y.f16d16().to_num())
 }
 
-#[cfg(not(windows))]
 pub fn composite_mode_to_operator(mode: FT_Composite_Mode) -> cairo::Operator {
     use cairo::Operator;
     use FT_Composite_Mode::*;

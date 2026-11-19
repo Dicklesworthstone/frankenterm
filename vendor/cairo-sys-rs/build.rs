@@ -49,12 +49,15 @@ fn pixman() {
     }
 
     cfg.include("pixman/pixman");
-    if target_is_windows() {
-        cfg.define("PIXMAN_NO_TLS", None);
+    // FrankenTerm rasterizes on more than one thread (the Metal front end
+    // draws each window on its own render thread, and the font tests run in
+    // parallel on every platform), as the system pixman this replaces allows:
+    // keep pixman's per-thread caches per thread. MSVC spells thread-local
+    // storage `__declspec(thread)`, which is what pixman's own meson build
+    // selects there; GCC and Clang, MinGW included, accept `__thread`.
+    if target_is_msvc() {
+        cfg.define("TLS", Some("__declspec(thread)"));
     } else {
-        // FrankenTerm rasterizes on more than one thread (the Metal front end
-        // draws each window on its own render thread), as the system pixman
-        // this replaces allows: keep pixman's per-thread caches per thread.
         cfg.define("TLS", Some("__thread"));
     }
     cfg.define("PACKAGE", "pixman-1");
@@ -208,13 +211,17 @@ fn cairo() {
         .parse()
         .unwrap();
     let ptr_width_bytes = format!("{}", ptr_width_bits / 8);
-    if target_is_windows() {
-        cfg.define("CAIRO_NO_MUTEX", Some("1"));
-    } else {
-        // Thread-safe like the system cairo this replaces: pthread mutexes
-        // around cairo's shared caches and compiler atomics for its
-        // reference counts. Upstream WezTerm builds with CAIRO_NO_MUTEX
-        // because it only rasterizes on one thread.
+    // Thread-safe like the system cairo this replaces. Upstream WezTerm builds
+    // with CAIRO_NO_MUTEX because it only rasterizes on one thread.
+    //
+    // On Windows nothing needs defining: cairo-mutex-impl-private.h selects
+    // CRITICAL_SECTION mutexes for _WIN32 and cairo-atomic-private.h the
+    // Interlocked* functions, as in a stock Windows cairo. Those mutexes are
+    // initialized lazily on first use; frankenterm-font serializes cairo's
+    // first use (`rasterizer::initialize_cairo`) so two threads cannot race it.
+    if !target_is_windows() {
+        // pthread mutexes around cairo's shared caches and compiler atomics
+        // for its reference counts.
         cfg.define("CAIRO_HAS_PTHREAD", Some("1"));
         cfg.define("HAVE_CXX11_ATOMIC_PRIMITIVES", Some("1"));
     }
@@ -227,6 +234,10 @@ fn cairo() {
 
 fn target_is_windows() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+}
+
+fn target_is_msvc() -> bool {
+    std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
 }
 
 fn main() {

@@ -102,6 +102,7 @@ impl FontRasterizer for HarfbuzzRasterizer {
 }
 
 fn record_to_cairo_surface(paint_ops: Vec<PaintOp>) -> anyhow::Result<(RecordingSurface, bool)> {
+    crate::rasterizer::initialize_cairo();
     let mut has_color = false;
     let surface = RecordingSurface::create(Content::ColorAlpha, None)?;
     let context = Context::new(&surface)?;

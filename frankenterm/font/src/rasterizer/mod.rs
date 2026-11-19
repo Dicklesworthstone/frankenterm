@@ -1,23 +1,18 @@
 use crate::parser::ParsedFont;
 use crate::units::*;
 use config::FontRasterizerSelection;
-#[cfg(not(windows))]
 use image::{ImageBuffer, Rgba};
 
 pub(crate) mod cache;
 
 /// The amount, as a number in [0,1], to horizontally skew a glyph when rendering synthetic
 /// italics
-#[cfg(not(windows))]
 pub(crate) const FAKE_ITALIC_SKEW: f64 = 0.2;
 
-#[cfg(not(windows))]
 pub mod colr;
 #[cfg(target_os = "macos")]
 pub mod coretext;
-#[cfg(not(windows))]
 pub mod freetype;
-#[cfg(not(windows))]
 pub mod harfbuzz;
 
 /// A bitmap representation of a glyph.
@@ -46,7 +41,6 @@ pub trait FontRasterizer {
     ) -> anyhow::Result<RasterizedGlyph>;
 }
 
-#[cfg(not(windows))]
 pub fn new_rasterizer(
     rasterizer: FontRasterizerSelection,
     handle: &ParsedFont,
@@ -85,7 +79,7 @@ fn coretext_or_freetype(
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 fn coretext_or_freetype(
     handle: &ParsedFont,
     pixel_geometry: config::DisplayPixelGeometry,
@@ -97,17 +91,24 @@ fn coretext_or_freetype(
     )?))
 }
 
-#[cfg(windows)]
-pub fn new_rasterizer(
-    rasterizer: FontRasterizerSelection,
-    handle: &ParsedFont,
-    pixel_geometry: config::DisplayPixelGeometry,
-) -> anyhow::Result<Box<dyn FontRasterizer>> {
-    let _ = (rasterizer, handle, pixel_geometry);
-    anyhow::bail!("Windows font rasterization is not wired without cairo");
+/// Runs cairo's one-time setup on one thread, before any rasterizer paints.
+///
+/// On Windows cairo's mutexes are critical sections, which cairo initializes
+/// lazily and without synchronization the first time it creates a surface or
+/// pattern. Two threads painting their first color glyph at once could both
+/// run that setup and re-initialize a critical section the other already
+/// holds. Creating one surface under a `Once` closes that window. Elsewhere
+/// the mutexes are statically initialized and this costs one atomic load.
+pub(crate) fn initialize_cairo() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Creating any surface runs the setup (`_cairo_surface_init`). The
+        // surface itself is not needed, and an allocation failure here
+        // resurfaces at the caller's own surface creation.
+        let _ = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1);
+    });
 }
 
-#[cfg(not(windows))]
 pub(crate) fn swap_red_and_blue<Container: std::ops::Deref<Target = [u8]> + std::ops::DerefMut>(
     image: &mut ImageBuffer<Rgba<u8>, Container>,
 ) {
@@ -118,7 +119,6 @@ pub(crate) fn swap_red_and_blue<Container: std::ops::Deref<Target = [u8]> + std:
     }
 }
 
-#[cfg(not(windows))]
 pub(crate) fn crop_to_non_transparent<Container>(
     image: &mut image::ImageBuffer<Rgba<u8>, Container>,
 ) -> image::SubImage<&mut ImageBuffer<Rgba<u8>, Container>>
@@ -151,7 +151,6 @@ where
 /// Crop a FreeType color bitmap without changing its position relative to the
 /// glyph origin. Cropping translates the bitmap; it does not scale its metrics.
 /// Bitmap rows run downwards, while the top bearing measures up from the baseline.
-#[cfg(not(windows))]
 fn rasterize_bgra_image<Container>(
     image: &mut ImageBuffer<Rgba<u8>, Container>,
     bearing_x: f64,
@@ -178,7 +177,7 @@ where
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
