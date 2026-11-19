@@ -8273,6 +8273,13 @@ impl BrokerPaneInputWriterV1 {
             return GuardianInputWriteResult::Indeterminate;
         }
         self.attempted = true;
+        // Poison from an earlier exchange belongs to that earlier effect.
+        // This connection is shared by every pane of its mux, and exchange
+        // refuses a poisoned session before sending a byte. Do not turn a
+        // fresh pane's known-zero input into another unresolved WAL entry.
+        if self.session.client.poisoned {
+            return GuardianInputWriteResult::KnownNotApplied;
+        }
         // A short count is the exact prefix the PTY took (ft-twwf2), which the
         // input WAL records as such; the mux sends the rest as new input.
         match self

@@ -443,7 +443,7 @@ metrics = "0.24.6"
 miniz_oxide = "0.9.1"
 mlua = "0.12.1"
 names = { version = "0.14.0", default-features = false }
-nix = "0.32.0"
+nix = "0.31.3"
 ntapi = "0.4.3"
 num = "0.4.3"
 num-derive = "0.5.1"
@@ -540,7 +540,7 @@ x11 = "2.21"
 xcb = "1.7.0"
 xcb-imdkit = { version = "0.3", git = "https://github.com/wezterm/xcb-imdkit-rs.git", rev = "212330f7c6c37794d78061a773e8f4f9e4785bbb" }
 xkbcommon = "0.9.0"
-zbus = "6.2.1"
+zbus = "5.16.0"
 zvariant = "5.12.0"
 # 0.21 redesigned the dispatch API (generic SurfaceData, no delegate_* macros); window/wayland targets 0.20.
 smithay-client-toolkit = { version = "0.20.0", default-features = false }
