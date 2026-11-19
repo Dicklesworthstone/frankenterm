@@ -180,11 +180,16 @@ config.cursor_blink_rate = 500
 config.window_decorations = is_windows and 'INTEGRATED_BUTTONS|RESIZE' or 'RESIZE'
 
 -- Windows: start PowerShell 7 when it is installed, else Windows PowerShell
--- (the Windows default would be cmd.exe).
+-- (the Windows default would be cmd.exe). Every 7.x installs into the same
+-- directory. The config is evaluated synchronously, so it must not call
+-- async helpers such as frankenterm.glob or read_dir here: they fail with
+-- "attempt to yield from outside a coroutine" and the whole file is lost.
 if is_windows then
-  local pwsh = frankenterm.glob('C:/Program Files/PowerShell/*/pwsh.exe')
-  if #pwsh > 0 then
-    config.default_prog = { pwsh[#pwsh], '-NoLogo' }
+  local pwsh = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+  local found = io.open(pwsh, 'rb')
+  if found then
+    found:close()
+    config.default_prog = { pwsh, '-NoLogo' }
   else
     config.default_prog = { 'powershell.exe', '-NoLogo' }
   end

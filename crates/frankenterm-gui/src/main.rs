@@ -4001,6 +4001,62 @@ mod tests {
         assert_eq!(screens, "function");
     }
 
+    /// The bundled default config loads for each platform it has a branch
+    /// for, evaluated synchronously as `Config::try_load` evaluates it. An
+    /// async helper at load time (it once called `glob` on Windows) fails
+    /// with "attempt to yield from outside a coroutine", and the GUI then
+    /// runs with stock defaults instead of the Mac app's look.
+    #[test]
+    fn the_bundled_config_loads_for_macos_windows_and_linux() {
+        use mlua::FromLua;
+        register_gui_lua_modules();
+        let source = include_str!("../frankenterm.lua");
+        for (triple, font_size, integrated_buttons) in [
+            ("aarch64-apple-darwin", 16.0, false),
+            ("x86_64-pc-windows-msvc", 12.0, true),
+            ("x86_64-unknown-linux-gnu", 16.0, false),
+        ] {
+            let lua = config::lua::make_lua_context(std::path::Path::new("frankenterm.lua"))
+                .expect("lua context");
+            let module: mlua::Table = lua
+                .load("return require('frankenterm')")
+                .eval()
+                .expect("frankenterm module");
+            module
+                .set("target_triple", triple)
+                .expect("set target_triple");
+            let value: mlua::Value = lua
+                .load(source)
+                .set_name("frankenterm.lua")
+                .eval()
+                .unwrap_or_else(|err| panic!("the bundled config fails for {triple}: {err:#}"));
+            let config = config::Config::from_lua(value, &lua)
+                .unwrap_or_else(|err| panic!("the bundled config for {triple}: {err:#}"));
+            assert_eq!(config.font_size, font_size, "{triple}");
+            assert_eq!(
+                config.front_end,
+                config::FrontEndSelection::WebGpu,
+                "{triple}"
+            );
+            assert_eq!(
+                format!("{:?}", config.window_decorations).contains("INTEGRATED_BUTTONS"),
+                integrated_buttons,
+                "{triple}: {:?}",
+                config.window_decorations
+            );
+            let shell = config.default_prog.as_ref().and_then(|prog| prog.first());
+            if integrated_buttons {
+                let shell = shell.expect("Windows starts PowerShell");
+                assert!(
+                    shell == "powershell.exe" || shell.ends_with("\\pwsh.exe"),
+                    "{shell}"
+                );
+            } else {
+                assert_eq!(shell, None, "{triple} starts the login shell");
+            }
+        }
+    }
+
     /// The rest of WezTerm's Lua API that configs call at load time or from
     /// event handlers (the operator's own `open-uri` handler calls
     /// `run_child_process`) is in the GUI's Lua context.
