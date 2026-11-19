@@ -1500,7 +1500,49 @@ final class TerminalSessionController {
         if let requestedMuxPane, requestedMuxPane != selected.paneID { return }
         requestedMuxPane = nil; requestedMuxNavigation = nil
         guard paneHandoff == nil, focus?.shows(controllerID: id, machineID: target.machineID) == true else { return }
+        if terminal != nil, displayedMuxDestination != selected {
+            followTransportPane(control: control); return
+        }
         showView()
+    }
+
+    /// The transport moved to another pane by itself: a tab this phone just
+    /// opened, or another pane after the shown one closed. The old view,
+    /// keyboard and clipboard are released as for a deliberate switch, then
+    /// the new pane is shown. Nothing typed for the old pane follows it.
+    private func followTransportPane(control: TerminalMuxControl) {
+        guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil, requestedMuxPane == nil else { return }
+        paneHandoff = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.paneHandoff = nil
+                self.muxInputChanged(control.inputRouting.current, control: control)
+            }
+            if let keyboard = self.keyboard, keyboard.acceptsInput,
+               let vacant = try? await keyboard.handoff(to: nil) {
+                _ = try? await self.connections.coordinator.suspend(vacant)
+            } else {
+                self.keyboard?.suspend()
+                await self.keyboard?.waitUntilSuspended()
+            }
+            guard !self.stopped, self.connection?.muxControl === control else { return }
+            self.presenter?.acceptsFrames = false
+            self.terminal?.retire(); self.terminal = nil
+            self.presenter?.view = nil
+            self.displayedMuxDestination = nil; self.lastViewportRevision = 0
+            let clipboard = self.clipboard
+            clipboard?.retire(); self.clipboard = nil; self.presenter?.clipboard = nil
+            await clipboard?.waitUntilSettled()
+            if let presentation = self.presentation, !presentation.isRetired {
+                try? presentation.request(false, source: presentation.source)
+                await presentation.waitUntilSettled()
+            }
+            if let history = self.history {
+                try? history.request(top: nil, source: history.source)
+                await history.waitUntilSettled()
+            }
+            self.historyReturnBookmark = nil
+        }
     }
 
     /// Metadata and readiness notifications are latest-value presentation, not
