@@ -222,7 +222,7 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
     let identity: NativeSSHIdentity, host: Data, mode: String
     let queue = DispatchQueue(label: "test.only.ssh-signing-ipc")
     let lock = NSLock()
-    var cancelled = false, validations = 0
+    var cancelled = false, signed = false, checksAfterSignature = 0, establishedChecks = 0
     weak var session: NativeSSHSession?
     init(publicKey: Data, host: Data, mode: String) throws {
         identity = try .init(user: "operator", publicKey: publicKey)
@@ -241,6 +241,7 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
     func signature(for challenge: NativeSSHChallenge, peer: NativeSSHPeer) async throws -> Data {
         guard challenge.identity == identity, challenge.transportID == peer.transportID,
               [32, 48, 64].contains(challenge.sessionIdentifier.count) else { throw ProbeFailure.invalid }
+        markSigned()
         if mode == "cancelSigner" { await session?.close() }
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -271,14 +272,27 @@ private final class Authority: NativeSSHAuthentication, @unchecked Sendable {
             }
         }
     }
-    private func incrementValidation() -> Int {
-        lock.lock(); defer { lock.unlock() }; validations += 1; return validations
+    private func markSigned() { lock.lock(); signed = true; lock.unlock() }
+    private func nextCheckAfterSignature() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        guard signed else { return 0 }
+        checksAfterSignature += 1; return checksAfterSignature
     }
+    private func nextEstablishedCheck() -> Int {
+        lock.lock(); defer { lock.unlock() }; establishedChecks += 1; return establishedChecks
+    }
+    /// Each mode names its boundary by phase, not by a call count that shifts
+    /// whenever the session adds a check. Authentication checks run before the
+    /// unsigned offer, after a signature returns (before it reaches the peer)
+    /// and after the server accepts the login.
+    func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws {
+        let afterSignature = nextCheckAfterSignature()
+        if mode == "revokeBeforeSign" && afterSignature == 1 { throw ProbeFailure.denied }
+        if mode == "cancelFinalValidation" && afterSignature == 2 { await session?.close() }
+    }
+    /// Established checks: before a channel opens and while it is live.
     func validate(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws {
-        let call = incrementValidation()
-        if mode == "revokeBeforeSign" && call == 1 { throw ProbeFailure.denied }
-        if mode == "revokeBeforeShell" && call == 3 { throw ProbeFailure.denied }
-        if mode == "cancelFinalValidation" && call == 2 { await session?.close() }
+        if mode == "revokeBeforeShell" && nextEstablishedCheck() == 1 { throw ProbeFailure.denied }
     }
     func cancel(transportID: UUID) { lock.lock(); cancelled = true; lock.unlock() }
 }

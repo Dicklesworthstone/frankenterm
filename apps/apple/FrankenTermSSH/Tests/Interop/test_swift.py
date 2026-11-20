@@ -128,7 +128,10 @@ class SwiftInteropTests(unittest.TestCase):
                 if mode in ["cancelSigner", "deadlineSigner", "revokeBeforeSign", "signerFailure", "signerTimeout",
                             "signatureMalformed", "keyRefused", "unsignedSuccess", "disconnectOffer"]:
                     self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0])
-                if mode in ["rejectSignature", "partial", "disconnectSignature"]:
+                # The final check and the pre-shell check run only after the
+                # server accepted the signed login.
+                if mode in ["rejectSignature", "partial", "disconnectSignature",
+                            "cancelFinalValidation", "revokeBeforeShell"]:
                     self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
                 expected_native = {"keyRefused": -1006, "publickeyDisabled": -1010, "noneSucceeds": -1010,
                                    "unsignedSuccess": -1010, "rejectSignature": -1011, "partial": -1011,
