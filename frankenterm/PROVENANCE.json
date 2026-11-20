@@ -64,17 +64,18 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
+        "feat": 1,
         "fix": 5,
         "other": 1,
         "test": 5
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-11-15T22:56:51-05:00",
-        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
-        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
+        "classification": "feat",
+        "committed_at": "2026-11-20T14:40:08-05:00",
+        "sha": "81306ef925370646211b3bbc978a2bb908abddd2",
+        "subject": "feat(bintree): clone pane trees with a bounded iterative arena"
       },
       "name": "bintree",
       "path": "frankenterm/bintree",
@@ -453,19 +454,19 @@
         "cosmetic": 8,
         "docs": 1,
         "feat": 5,
-        "fix": 31,
+        "fix": 32,
         "other": 10,
         "refactor": 1,
         "rename": 1,
         "test": 4
       },
-      "fork_side_commit_count": 62,
+      "fork_side_commit_count": 63,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-11-18T22:29:13-05:00",
-        "sha": "35657c4b106cdbf0205fec6687db8a1d5daac1a2",
-        "subject": "fix(font,window): pass parse_log_font the device's LOGPIXELSY, not its HDC (ft-dc4bs)"
+        "committed_at": "2026-11-20T14:40:11-05:00",
+        "sha": "ca66aa3608584654dc1c0d52d353e235d1a01856",
+        "subject": "fix(font): rasterize padded CoreText glyphs without a vertical CTM shift"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -795,7 +796,7 @@
         "cleanup": 3,
         "cosmetic": 34,
         "docs": 7,
-        "feat": 232,
+        "feat": 233,
         "fix": 366,
         "other": 85,
         "refactor": 12,
@@ -804,13 +805,13 @@
         "security-fix": 7,
         "test": 121
       },
-      "fork_side_commit_count": 882,
+      "fork_side_commit_count": 883,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-11-20T12:50:34-05:00",
-        "sha": "7ac5fc825ac8b7ee5023232ad5f20d12ee655a45",
-        "subject": "fix(mux): an idle pane's coherent render facts carry its current sequence (ft-jh8jen)"
+        "classification": "feat",
+        "committed_at": "2026-11-20T14:40:08-05:00",
+        "sha": "81306ef925370646211b3bbc978a2bb908abddd2",
+        "subject": "feat(bintree): clone pane trees with a bounded iterative arena"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1222,8 +1223,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3700,
-  "generated_at": "2026-11-20T19:15:15.931640Z",
+  "fork_side_commit_total": 3703,
+  "generated_at": "2026-11-20T19:45:45.172443Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
