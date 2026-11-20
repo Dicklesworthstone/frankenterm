@@ -36,58 +36,84 @@ pub fn install() {
     }
 }
 
-/// The directory for this build's config and fonts under `base`, written if
-/// it is not already complete.
-fn unpack(base: &Path) -> anyhow::Result<PathBuf> {
+/// The name of this build's directory: a digest of what it holds.
+fn bundle_name() -> String {
     let mut digest = Sha256::new();
     digest.update(DEFAULT_CONFIG.as_bytes());
     digest.update(FONT_PAYLOAD_ZST);
-    let name: String = digest.finalize()[..8]
+    digest.finalize()[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let dir = base.join(name);
-    if dir.join(COMPLETE).is_file() {
+        .collect()
+}
+
+/// A finished directory for this build's config and fonts under `base`,
+/// written if there is none yet.
+///
+/// Several GUI processes may start at once, and one may already be reading
+/// fonts from a directory while another starts. So a directory only ever
+/// appears by renaming a finished staging copy into place, marker included,
+/// and none is ever deleted or rewritten here: no process can remove or
+/// change a copy another one uses.
+fn unpack(base: &Path) -> anyhow::Result<PathBuf> {
+    let name = bundle_name();
+    if let Some(dir) = finished(base, &name) {
         return Ok(dir);
     }
+    // Only this process uses this name, so a leftover is its own.
     let staging = base.join(format!(".staging-{}", std::process::id()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .with_context(|| format!("clearing {}", staging.display()))?;
     }
-    let installed = write_bundle(&staging).and_then(|()| install_staged(&staging, &dir));
+    let installed = write_bundle(&staging).and_then(|()| install_staged(&staging, base, &name));
     if installed.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
-    installed.map(|()| dir)
+    installed
 }
 
-/// Moves a finished `staging` directory to `dir`. Another GUI process
-/// starting at the same time may have installed `dir` first; its directory is
-/// kept and used, since it may already be in use. A directory is only ever
-/// created by this rename, marker included, so one without the marker was
-/// changed from outside and is replaced.
-fn install_staged(staging: &Path, dir: &Path) -> anyhow::Result<()> {
-    // A failed rename is fine when another process's finished directory is
-    // in place: this copy is cleared (it costs only disk space) and that one
-    // is used.
-    let installed_by_another = |err: std::io::Error| {
-        if dir.join(COMPLETE).is_file() {
-            let _ = std::fs::remove_dir_all(staging);
-            Ok(())
-        } else {
-            Err(err).with_context(|| format!("installing {}", dir.display()))
-        }
-    };
-    let Err(err) = std::fs::rename(staging, dir) else {
-        return Ok(());
-    };
-    if dir.join(COMPLETE).is_file() || !dir.exists() {
-        return installed_by_another(err);
+/// A finished copy of the bundle called `name`: the directory of that name,
+/// else the first finished copy installed beside it (see [`install_staged`]).
+fn finished(base: &Path, name: &str) -> Option<PathBuf> {
+    let dir = base.join(name);
+    if dir.join(COMPLETE).is_file() {
+        return Some(dir);
     }
-    std::fs::remove_dir_all(dir).with_context(|| format!("clearing {}", dir.display()))?;
-    // Another process may have replaced the same unfinished directory first.
-    std::fs::rename(staging, dir).or_else(installed_by_another)
+    // Several may exist when processes started together; any is complete,
+    // and taking the least name makes every process pick the same one.
+    let prefix = format!("{name}-");
+    std::fs::read_dir(base)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .filter(|copy| copy.join(COMPLETE).is_file())
+        .min()
+}
+
+/// Moves the finished `staging` directory into place as `name` and returns
+/// the directory to use. When another process installed `name` first, its
+/// copy is used and this one dropped. When the name is held by a directory
+/// without the marker, which only a change from outside leaves, that
+/// directory is left alone and this copy goes beside it as `name-<pid>`.
+fn install_staged(staging: &Path, base: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let dir = base.join(name);
+    let Err(err) = std::fs::rename(staging, &dir) else {
+        return Ok(dir);
+    };
+    if dir.join(COMPLETE).is_file() {
+        // Only this process's own copy is deleted; it costs disk space only.
+        let _ = std::fs::remove_dir_all(staging);
+        return Ok(dir);
+    }
+    if !dir.exists() {
+        return Err(err).with_context(|| format!("installing {}", dir.display()));
+    }
+    let beside = base.join(format!("{name}-{}", std::process::id()));
+    std::fs::rename(staging, &beside)
+        .with_context(|| format!("installing {}", beside.display()))?;
+    Ok(beside)
 }
 
 fn write_bundle(dir: &Path) -> anyhow::Result<()> {
@@ -165,30 +191,49 @@ mod tests {
         // rename, wrote its own copy, and now installs it.
         let staging = base.path().join(".staging-second");
         write_bundle(&staging).unwrap();
-        install_staged(&staging, &dir).unwrap();
+        let used = install_staged(&staging, base.path(), &bundle_name()).unwrap();
 
+        assert_eq!(
+            used, dir,
+            "the second process uses the first one's directory"
+        );
         assert!(in_use.is_file(), "the first directory is kept");
         assert!(dir.join(COMPLETE).is_file());
         assert!(!staging.exists(), "the second copy is cleared");
     }
 
     #[test]
-    fn an_unfinished_directory_is_written_again() {
+    fn an_unfinished_directory_is_left_alone_and_a_copy_installed_beside_it() {
         let base = tempfile::tempdir().unwrap();
         let dir = unpack(base.path()).unwrap();
+        // Changed from outside: its marker and one face are gone, and a
+        // process may still be reading the faces that are left.
         std::fs::remove_file(dir.join(COMPLETE)).unwrap();
         std::fs::remove_file(dir.join("fonts").join(FONT_FILES[1])).unwrap();
-        assert_eq!(unpack(base.path()).unwrap(), dir);
-        assert!(dir.join(COMPLETE).is_file());
-        assert!(dir.join("fonts").join(FONT_FILES[1]).is_file());
-        let leftovers: Vec<_> = std::fs::read_dir(base.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
+
+        let copy = unpack(base.path()).unwrap();
         assert_eq!(
-            leftovers.len(),
-            1,
-            "no staging directory is left behind ({leftovers:?})"
+            copy,
+            base.path()
+                .join(format!("{}-{}", bundle_name(), std::process::id()))
         );
+        assert!(copy.join(COMPLETE).is_file());
+        for face in FONT_FILES {
+            assert!(copy.join("fonts").join(face).is_file(), "{face}");
+        }
+        assert!(
+            dir.join("fonts").join(FONT_FILES[0]).is_file(),
+            "the unfinished directory is not touched"
+        );
+        assert!(!dir.join(COMPLETE).exists());
+
+        // Later starts use that copy as it is.
+        assert_eq!(unpack(base.path()).unwrap(), copy);
+        let mut entries: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, [dir, copy], "no staging directory is left behind");
     }
 }
