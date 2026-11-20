@@ -31,14 +31,16 @@ checked in; they exist for cross-lane regression triage.
 
 ## Generation cadence
 
-- **On release tag (`v*.*.*`):**
-  `.github/workflows/headline-claims-bench.yml` (br-ft-vl7lp)
-  runs all 5 benches on each lane; the macos-14-m1 lane commits
-  the canonical artifact to a `bot/headline-claims-<version>`
-  branch. Open a PR from that branch to land the file on `main`.
-- **Manual (`workflow_dispatch`):** the workflow runs but does
-  not commit; per-lane JSONL artifacts are still uploaded for
-  90 days.
+Per repository release policy (`AGENTS.md` Rule 0.1), FrankenTerm uses
+Doodlestein Self-Releaser (`dsr`) as its primary and exclusive release system
+(never GitHub Actions):
+
+- **On release build/publication (`dsr build` / `dsr release`):**
+  Run all 5 benches on the target baseline lane via `dsr` / strict remote RCH
+  proof workflows and commit the canonical `<version>.headline-claims.json`
+  artifact to `main` alongside the signed DSR release attestation bundle.
+- **Cross-lane regression triage:** non-canonical lane JSONL artifacts remain
+  local/DSR receipt artifacts and are not checked into `docs/perf/releases/`.
 
 ## Cross-references
 
@@ -46,5 +48,5 @@ checked in; they exist for cross-lane regression triage.
 - Per-bench schema: [`docs/perf/bench-stats-schema.json`](../bench-stats-schema.json)
 - Methodology: [`docs/perf/bench-stats-spec.md`](../bench-stats-spec.md)
 - Audit harness: [`crates/frankenterm-core/tests/headline_claims_audit.rs`](../../../crates/frankenterm-core/tests/headline_claims_audit.rs)
-- Workflow: [`.github/workflows/headline-claims-bench.yml`](../../../.github/workflows/headline-claims-bench.yml)
-- Bead: [`ft-vl7lp`](https://example.invalid/ft-vl7lp) (BR-RC-FOUNDATION.G3.5.cont.runners)
+- Release gate harness: [`scripts/release-gates.sh`](../../../scripts/release-gates.sh)
+- Bead: `ft-vl7lp` (BR-RC-FOUNDATION.G3.5.cont.runners)
