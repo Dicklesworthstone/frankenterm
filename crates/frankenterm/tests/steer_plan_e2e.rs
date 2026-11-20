@@ -812,7 +812,10 @@ fn steer_run_commits_durable_store_data_with_workspace_global_ledger() {
 #[test]
 fn steer_plan_binds_the_default_tx_contract_so_steer_run_admits_its_receipt() {
     let w = workspace();
-    let (_path, contract) = write_executable_tx_contract(&w);
+    // Use an executable StoreData contract whose real prepare gates pass in a
+    // clean workspace (ft-hhisq: a SendText contract targeting a missing pane
+    // is now refused at plan time even under `--scenario clean-ready`).
+    let (_path, contract) = write_tx_contract(&w, store_data_tx_contract());
     let out = stdout(
         ft(w.path())
             .args([
@@ -835,6 +838,11 @@ fn steer_plan_binds_the_default_tx_contract_so_steer_run_admits_its_receipt() {
         Some(tx_hash.as_str()),
         "{out}"
     );
+    assert_eq!(
+        receipt["envelope_verdict"].as_str(),
+        Some("envelope.admit"),
+        "{out}"
+    );
     let id = receipt["receipt_id"].as_str().expect("receipt_id");
 
     // The public plan-to-run contract: the receipt `steer plan` printed passes
@@ -855,6 +863,119 @@ fn steer_plan_binds_the_default_tx_contract_so_steer_run_admits_its_receipt() {
     assert!(
         !run_out.contains("robot.steer_"),
         "a receipt bound by steer plan must pass the steer run gate: {run_out}"
+    );
+}
+
+#[test]
+fn steer_plan_clean_ready_cannot_admit_contract_with_missing_target_pane() {
+    let w = workspace();
+    // executable_tx_contract targets pane 0 which does not exist in storage.
+    // Even under `--scenario clean-ready`, `ft steer plan` must evaluate the
+    // real contract prepare gates and refuse admission (ft-hhisq).
+    let (_path, contract) = write_executable_tx_contract(&w);
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "plan",
+                "--objective",
+                "attempt bypass",
+                "--scenario",
+                "clean-ready",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success(),
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
+    assert_eq!(
+        receipt["tx_contract_hash"].as_str(),
+        Some(contract.compute_hash().as_str()),
+        "{out}"
+    );
+    assert_ne!(
+        receipt["envelope_verdict"].as_str(),
+        Some("envelope.admit"),
+        "ft-hhisq: --scenario clean-ready must not emit envelope.admit for missing pane target: {out}"
+    );
+    let id = receipt["receipt_id"].as_str().expect("receipt_id");
+
+    // `ft steer run` must refuse executing that non-admitted receipt.
+    let run_out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "run",
+                "--receipt",
+                id,
+                "--dry-run",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .failure(),
+    );
+    let run_json: serde_json::Value = serde_json::from_str(&run_out).expect("run json");
+    assert_eq!(
+        run_json["error_code"],
+        serde_json::json!("robot.steer_receipt_not_admitted"),
+        "{run_out}"
+    );
+}
+
+#[test]
+fn steer_plan_clean_ready_blocks_when_persisted_kill_switch_is_hard_stop() {
+    let w = workspace();
+    let (_path, contract) = write_tx_contract(&w, store_data_tx_contract());
+    // Persist a HardStop kill switch into the workspace DB before planning.
+    let db_path = Config::default().effective_db_path(w.path());
+    let conn = rusqlite::Connection::open(&db_path).expect("open workspace DB");
+    let mut ks = frankenterm_core::policy_quarantine::KillSwitch::new();
+    ks.trip(
+        frankenterm_core::policy_quarantine::KillSwitchLevel::HardStop,
+        "operator",
+        "ft-hhisq e2e test",
+        1_704_000_000_000,
+    );
+    let encoded = frankenterm_core::policy_kill_switch_state::encode_kill_switch_state(&ks)
+        .expect("encode kill switch");
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            frankenterm_core::policy_kill_switch_state::KILL_SWITCH_STATE_KEY,
+            encoded,
+            1_704_000_000_000i64
+        ],
+    )
+    .expect("persist hard_stop kill switch");
+    drop(conn);
+
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "plan",
+                "--objective",
+                "run under kill switch",
+                "--scenario",
+                "clean-ready",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success(),
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
+    assert_eq!(
+        receipt["tx_contract_hash"].as_str(),
+        Some(contract.compute_hash().as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        receipt["envelope_verdict"].as_str(),
+        Some("envelope.blocked.kill_switch"),
+        "ft-hhisq: persisted HardStop kill switch must block admission: {out}"
     );
 }
 

@@ -65340,6 +65340,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             } => {
                 use frankenterm_core::steer_plan::{
                     SteerPlanScenario, plan_status_label, steer_plan_bound,
+                    steer_plan_for_contract,
                 };
                 let as_json = format.eq_ignore_ascii_case("json");
                 let scenario = match SteerPlanScenario::parse(&scenario) {
@@ -65371,11 +65372,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // a silently unbound receipt.
                 let explicit_contract = contract_file.is_some();
                 let contract_path = resolve_mission_tx_file_path(&layout, contract_file);
-                let tx_contract_hash = if explicit_contract || contract_path.exists() {
+                let bound_contract = if explicit_contract || contract_path.exists() {
                     match enforce_robot_mission_path_containment(&layout, &contract_path)
                         .and_then(|()| load_mission_tx_contract_from_path(&contract_path))
                     {
-                        Ok(contract) => Some(steering_tx_contract_hash(&contract)),
+                        Ok(contract) => Some(contract),
                         Err(err) => {
                             if as_json {
                                 println!(
@@ -65406,15 +65407,114 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     None
                 };
                 let now = now_ms_i64();
-                let result = steer_plan_bound(
-                    scenario,
-                    &objective,
-                    &workspace_id,
-                    now.max(0) as u64,
-                    now,
-                    ttl_ms,
-                    tx_contract_hash,
-                );
+                let db_path = layout.db_path.to_string_lossy();
+                let open_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let storage_result =
+                    frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path).await;
+
+                // ft-hhisq: when a tx contract is bound, evaluate its real steps
+                // through the exact prepare gates `ft steer run` enforces rather
+                // than letting `--scenario clean-ready` mint `envelope.admit`.
+                let result = if let Some(contract) = bound_contract.as_ref() {
+                    let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                        layout.root.to_string_lossy().to_string(),
+                    )
+                    .with_surface(frankenterm_core::policy::PolicySurface::Robot)
+                    .with_actor(frankenterm_core::policy::ActorKind::Robot);
+                    if let Ok(storage) = storage_result.as_ref() {
+                        let base_engine = frankenterm_core::policy::PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            config.safety.require_prompt_active,
+                        )
+                        .with_tuning(&config.tuning)
+                        .with_command_gate_config(config.safety.command_gate.clone())
+                        .with_policy_rules(config.safety.rules.clone());
+                        let engine =
+                            with_persisted_kill_switch(base_engine, storage, "steer plan").await;
+                        let persisted_ks = match engine.kill_switch_state().level {
+                            frankenterm_core::policy_quarantine::KillSwitchLevel::Disarmed => {
+                                frankenterm_core::plan::MissionKillSwitchLevel::Off
+                            }
+                            frankenterm_core::policy_quarantine::KillSwitchLevel::SoftStop => {
+                                frankenterm_core::plan::MissionKillSwitchLevel::SafeMode
+                            }
+                            frankenterm_core::policy_quarantine::KillSwitchLevel::HardStop
+                            | frankenterm_core::policy_quarantine::KillSwitchLevel::EmergencyHalt => {
+                                frankenterm_core::plan::MissionKillSwitchLevel::HardStop
+                            }
+                        };
+                        let policy_engine = std::cell::RefCell::new(engine);
+                        let approvals =
+                            frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(Some(
+                                storage,
+                            ));
+                        let resolved_capabilities = resolve_tx_contract_capabilities(
+                            &open_cx,
+                            contract,
+                            storage,
+                            Some(layout.ipc_socket_path.as_path()),
+                        )
+                        .await;
+                        let targets =
+                            frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                                None,
+                                Some(storage),
+                            )
+                            .with_resolved_capabilities(resolved_capabilities);
+                        steer_plan_for_contract(
+                            scenario,
+                            &objective,
+                            &workspace_id,
+                            now.max(0) as u64,
+                            now,
+                            ttl_ms,
+                            contract,
+                            &policy_engine,
+                            &approvals,
+                            &targets,
+                            &prepare_context,
+                            persisted_ks,
+                        )
+                    } else {
+                        // Fail closed when storage is unavailable: we cannot verify
+                        // persisted kill-switch state, approvals, or live targets.
+                        let policy_engine = std::cell::RefCell::new(
+                            frankenterm_core::policy::PolicyEngine::strict(),
+                        );
+                        let approvals =
+                            frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(None);
+                        let targets =
+                            frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                                None, None,
+                            );
+                        steer_plan_for_contract(
+                            scenario,
+                            &objective,
+                            &workspace_id,
+                            now.max(0) as u64,
+                            now,
+                            ttl_ms,
+                            contract,
+                            &policy_engine,
+                            &approvals,
+                            &targets,
+                            &prepare_context,
+                            frankenterm_core::plan::MissionKillSwitchLevel::HardStop,
+                        )
+                    }
+                } else {
+                    steer_plan_bound(
+                        scenario,
+                        &objective,
+                        &workspace_id,
+                        now.max(0) as u64,
+                        now,
+                        ttl_ms,
+                        None,
+                    )
+                };
 
                 // Persist the receipt as a content-addressed artifact so
                 // `ft steer run --receipt <id>` (W5.3 execute) can load +
@@ -65435,12 +65535,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
 
                 // The only side effect beyond the receipt artifact: one audit row.
-                let db_path = layout.db_path.to_string_lossy();
-                let open_cx = frankenterm_core::cx::Cx::current()
-                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                match frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path)
-                    .await
-                {
+                let verification_summary = result.contract_prepare.as_ref().map(|summary| {
+                    format!(
+                        "prepare={} steps={} passed=[{}] failed=[{}]",
+                        summary.outcome,
+                        summary.step_count,
+                        summary.gates_passed.join(","),
+                        summary.gates_failed.join(",")
+                    )
+                });
+                match storage_result {
                     Ok(storage) => {
                         let policy_decision = if result.policy_verdict.starts_with("envelope.admit")
                         {
@@ -65467,7 +65571,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             )),
                             rule_id: None,
                             input_summary: Some(format!("objective={}", result.receipt.objective)),
-                            verification_summary: None,
+                            verification_summary,
                             decision_context: None,
                             result: "success".to_string(),
                         };
@@ -65496,6 +65600,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     println!("  verdict:   {}", result.receipt.envelope_verdict);
                     println!("  score:     {:?}", result.receipt.rehearsal_score);
                     println!("  approvals: {:?}", result.receipt.required_approvals);
+                    if let Some(summary) = result.contract_prepare.as_ref() {
+                        println!(
+                            "  prepare:   {} ({} step(s), kill_switch={})",
+                            summary.outcome, summary.step_count, summary.kill_switch
+                        );
+                        println!("  passed:    {:?}", summary.gates_passed);
+                        if !summary.gates_failed.is_empty() {
+                            println!("  failed:    {:?}", summary.gates_failed);
+                        }
+                    }
                 }
             }
             SteerCommands::Run {
@@ -71865,9 +71979,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .manifest()
                                 .to_toml()
                                 .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
-                            std::fs::create_dir_all(&registry_base).ok();
-                            std::fs::write(&manifest_path, &toml_str)
-                                .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                            frankenterm_core::lock::write_file_atomic(
+                                &manifest_path,
+                                toml_str.as_bytes(),
+                            )
+                            .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
                             println!("Added: {path}");
                         }
                         Err(e) => {
@@ -71887,8 +72003,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .manifest()
                                 .to_toml()
                                 .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
-                            std::fs::write(&manifest_path, &toml_str)
-                                .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                            frankenterm_core::lock::write_file_atomic(
+                                &manifest_path,
+                                toml_str.as_bytes(),
+                            )
+                            .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
                             println!("Retired: {path}");
                         }
                         Err(e) => {
@@ -71917,8 +72036,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             .manifest()
                             .to_toml()
                             .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
-                        std::fs::write(&manifest_path, &toml_str)
-                            .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
+                        frankenterm_core::lock::write_file_atomic(
+                            &manifest_path,
+                            toml_str.as_bytes(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
                     }
                 }
             }
@@ -75250,14 +75372,10 @@ fn handle_config_profile_command(
                 return Ok(());
             }
 
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
             let backup_path = profile_backup_path(&config_path);
-            std::fs::write(&backup_path, &base_toml)?;
+            frankenterm_core::lock::write_file_atomic(&backup_path, base_toml.as_bytes())?;
 
-            std::fs::write(&config_path, &merged_toml)?;
+            frankenterm_core::lock::write_file_atomic(&config_path, merged_toml.as_bytes())?;
 
             let applied_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -75271,7 +75389,8 @@ fn handle_config_profile_command(
                 config_path: config_path.display().to_string(),
             };
             let meta_path = profile_meta_path(&config_path);
-            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+            let meta_json = serde_json::to_string_pretty(&meta)?;
+            frankenterm_core::lock::write_file_atomic(&meta_path, meta_json.as_bytes())?;
 
             let profiles_dir =
                 frankenterm_core::config_profiles::resolve_profiles_dir(Some(&config_path));
@@ -75390,9 +75509,11 @@ fn handle_config_profile_command(
                 frankenterm_core::config::Config::from_toml(&source_toml)?;
             }
 
-            let tmp_path = profile_path.with_extension("toml.tmp");
-            std::fs::write(&tmp_path, &source_toml)?;
-            std::fs::rename(&tmp_path, &profile_path)?;
+            frankenterm_core::lock::write_file_atomic_with_policy(
+                &profile_path,
+                source_toml.as_bytes(),
+                frankenterm_core::lock::AtomicWritePolicy::default().with_require_absent(!force),
+            )?;
 
             let applied_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -75447,10 +75568,7 @@ fn handle_config_profile_command(
             }
 
             let backup_contents = std::fs::read_to_string(&backup_path)?;
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&config_path, backup_contents)?;
+            frankenterm_core::lock::write_file_atomic(&config_path, backup_contents.as_bytes())?;
             println!("Rollback complete: {}", config_path.display());
         }
     }
@@ -75605,10 +75723,8 @@ async fn handle_rules_profile_command(
 
             update_patterns_in_doc(&mut doc, &resolved_patterns)?;
 
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&config_path, doc.to_string())?;
+            let rendered_doc = doc.to_string();
+            frankenterm_core::lock::write_file_atomic(&config_path, rendered_doc.as_bytes())?;
 
             let canonical = name.trim().to_lowercase();
             if canonical != "default" {
@@ -76100,15 +76216,14 @@ async fn handle_config_command(
                 );
             }
 
-            // Create parent directories
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            // Write default config
+            // Write default config atomically (fail-closed if target appeared concurrently).
             let _default_config = Config::default();
             let toml_content = generate_default_config_toml();
-            std::fs::write(&config_path, toml_content)?;
+            frankenterm_core::lock::write_file_atomic_with_policy(
+                &config_path,
+                toml_content.as_bytes(),
+                frankenterm_core::lock::AtomicWritePolicy::default().with_require_absent(!force),
+            )?;
 
             println!("Created config at: {}", config_path.display());
             println!();
@@ -76309,13 +76424,8 @@ async fn handle_config_command(
                 return Ok(());
             }
 
-            // Create parent directory if needed
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            // Write back
-            std::fs::write(&config_path, updated)?;
+            // Write back atomically
+            frankenterm_core::lock::write_file_atomic(&config_path, updated.as_bytes())?;
 
             println!("Set {key} = {value}");
             println!("Config file: {}", config_path.display());
@@ -76348,10 +76458,7 @@ async fn handle_config_command(
 
             if let Some(out_path) = output {
                 let out = std::path::PathBuf::from(&out_path);
-                if let Some(parent) = out.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&out, &exported)?;
+                frankenterm_core::lock::write_file_atomic(&out, exported.as_bytes())?;
                 println!("Exported config to: {out_path}");
             } else {
                 print!("{exported}");
@@ -76429,18 +76536,14 @@ async fn handle_config_command(
                 }
             }
 
-            // Backup existing config before overwriting
+            // Backup existing config atomically before overwriting
             if config_path.exists() {
                 let backup = config_path.with_extension("toml.bak");
-                std::fs::copy(&config_path, &backup)?;
+                frankenterm_core::lock::write_file_atomic(&backup, existing_toml.as_bytes())?;
                 println!("Backup saved to: {}", backup.display());
             }
 
-            // Write the new config
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
+            // Write the new config atomically
             if replace {
                 // Full replacement
                 let header = format!(
@@ -76448,7 +76551,8 @@ async fn handle_config_command(
                     utc_now_iso8601(),
                     source,
                 );
-                std::fs::write(&config_path, format!("{header}{incoming_toml}"))?;
+                let rendered = format!("{header}{incoming_toml}");
+                frankenterm_core::lock::write_file_atomic(&config_path, rendered.as_bytes())?;
             } else {
                 // Merge: load incoming on top of existing defaults
                 // Parse both as TOML documents and overlay incoming sections
@@ -76463,7 +76567,8 @@ async fn handle_config_command(
                 for (key, item) in incoming_doc.iter() {
                     existing_doc[key] = item.clone();
                 }
-                std::fs::write(&config_path, existing_doc.to_string())?;
+                let rendered = existing_doc.to_string();
+                frankenterm_core::lock::write_file_atomic(&config_path, rendered.as_bytes())?;
             }
 
             println!("Config updated: {}", config_path.display());

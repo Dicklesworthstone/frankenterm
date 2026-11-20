@@ -1918,7 +1918,7 @@ impl ToolHandler for WaSteerPlanTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: SteerPlanParams = match parse_mcp_tool_params(
             "wa.steer_plan",
@@ -1949,9 +1949,10 @@ impl ToolHandler for WaSteerPlanTool {
         // content-addressed over workspace_id, so the default must be the
         // same resolved workspace root the CLI binds — never a
         // surface-specific constant.
+        let layout_result = self.config.workspace_layout(None);
         let workspace_id = match params.workspace_id {
             Some(id) => id,
-            None => match self.config.workspace_layout(None) {
+            None => match layout_result.as_ref() {
                 Ok(layout) => layout.root.to_string_lossy().to_string(),
                 Err(e) => {
                     let envelope = McpEnvelope::<()>::error(
@@ -1979,9 +1980,9 @@ impl ToolHandler for WaSteerPlanTool {
                 return envelope_to_content(envelope);
             }
         };
-        let tx_contract_hash = if explicit_contract || contract_path.exists() {
+        let bound_contract = if explicit_contract || contract_path.exists() {
             match mcp_load_mission_tx_contract_from_path(&contract_path) {
-                Ok(contract) => Some(contract.compute_hash()),
+                Ok(contract) => Some(contract),
                 Err(err) => {
                     let envelope = McpEnvelope::<()>::error(
                         err.code,
@@ -1996,15 +1997,112 @@ impl ToolHandler for WaSteerPlanTool {
             None
         };
         let now = now_ms();
-        let result = crate::steer_plan::steer_plan_bound(
-            scenario,
-            &params.objective,
-            &workspace_id,
-            now,
-            i64::try_from(now).unwrap_or(i64::MAX),
-            params.ttl_ms,
-            tx_contract_hash,
-        );
+        let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+        // ft-hhisq: when a tx contract is bound, evaluate its real steps
+        // against the configured PolicyEngine, persisted kill switch,
+        // approvals, and target capabilities (failing closed if storage is
+        // unavailable) instead of trusting the scenario label alone.
+        let result = if let Some(contract) = bound_contract.as_ref() {
+            let eval_workspace = layout_result
+                .as_ref()
+                .map_or_else(|_| workspace_id.clone(), |l| l.root.to_string_lossy().to_string());
+            let prepare_context = crate::plan::TxPrepareEvaluationContext::new(eval_workspace)
+                .with_surface(PolicySurface::Mcp)
+                .with_actor(crate::policy::ActorKind::Mcp);
+            let runtime_and_storage = layout_result.as_ref().ok().and_then(|layout| {
+                let runtime = CompatRuntimeBuilder::current_thread().build().ok()?;
+                let db_path = layout.db_path.to_string_lossy().to_string();
+                let storage = runtime
+                    .block_on(async { StorageHandle::new_with_cx(ctx.cx(), &db_path).await })
+                    .ok()?;
+                Some((runtime, storage))
+            });
+            if let Some((runtime, storage)) = runtime_and_storage {
+                let mut engine = crate::policy::PolicyEngine::new(
+                    self.config.safety.rate_limit_per_pane,
+                    self.config.safety.rate_limit_global,
+                    self.config.safety.require_prompt_active,
+                )
+                .with_tuning(&self.config.tuning)
+                .with_command_gate_config(self.config.safety.command_gate.clone())
+                .with_policy_rules(self.config.safety.rules.clone());
+                let _ = runtime.block_on(
+                    crate::policy_kill_switch_state::restore_kill_switch_from_storage_with_cx(
+                        ctx.cx(),
+                        &mut engine,
+                        &storage,
+                        now,
+                    ),
+                );
+                let persisted_ks = match engine.kill_switch_state().level {
+                    crate::policy_quarantine::KillSwitchLevel::Disarmed => {
+                        crate::plan::MissionKillSwitchLevel::Off
+                    }
+                    crate::policy_quarantine::KillSwitchLevel::SoftStop => {
+                        crate::plan::MissionKillSwitchLevel::SafeMode
+                    }
+                    crate::policy_quarantine::KillSwitchLevel::HardStop
+                    | crate::policy_quarantine::KillSwitchLevel::EmergencyHalt => {
+                        crate::plan::MissionKillSwitchLevel::HardStop
+                    }
+                };
+                let policy_engine = RefCell::new(engine);
+                let approvals =
+                    crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
+                let resolved_capabilities = runtime.block_on(resolve_tx_prepare_capabilities(
+                    ctx.cx(),
+                    self.config.as_ref(),
+                    &storage,
+                    contract,
+                ));
+                let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+                    .with_resolved_capabilities(resolved_capabilities);
+                let planned = crate::steer_plan::steer_plan_for_contract(
+                    scenario,
+                    &params.objective,
+                    &workspace_id,
+                    now,
+                    now_i64,
+                    params.ttl_ms,
+                    contract,
+                    &policy_engine,
+                    &approvals,
+                    &targets,
+                    &prepare_context,
+                    persisted_ks,
+                );
+                let _ = runtime.block_on(storage.shutdown());
+                planned
+            } else {
+                let policy_engine = RefCell::new(crate::policy::PolicyEngine::strict());
+                let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(None);
+                let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, None);
+                crate::steer_plan::steer_plan_for_contract(
+                    scenario,
+                    &params.objective,
+                    &workspace_id,
+                    now,
+                    now_i64,
+                    params.ttl_ms,
+                    contract,
+                    &policy_engine,
+                    &approvals,
+                    &targets,
+                    &prepare_context,
+                    crate::plan::MissionKillSwitchLevel::HardStop,
+                )
+            }
+        } else {
+            crate::steer_plan::steer_plan_bound(
+                scenario,
+                &params.objective,
+                &workspace_id,
+                now,
+                now_i64,
+                params.ttl_ms,
+                None,
+            )
+        };
         let envelope = McpEnvelope::success(result.receipt, elapsed_ms(start));
         envelope_to_content(envelope)
     }
