@@ -785,12 +785,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var panes: [TerminalMuxPane] = []
         var listed = false, ready = false, flushing = false
         var shown: Int?
-        /// A shell this phone created: it is shown as soon as a listing has it.
+        /// A shell this phone created: it is shown as soon as a listing has it,
+        /// unless the person chose a pane after pressing New Tab.
         var selectWhenListed: Int?
-        /// No pane was chosen on the phone since its last New Tab was sent,
-        /// so the created shell is shown. A pane chosen while the server was
-        /// still creating it wins.
-        var showCreatedShell = false
         /// The shown pane is subscribed, independently of size ownership.
         var showing = false
         var controllingSize = false
@@ -1165,8 +1162,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             case .shellCreated(let request, let pane, let tab, let window):
                 if state.control.finishShellCreation(request: request, outcome: .created(pane: pane, tab: tab, window: window)) {
                     // The new tab is shown once a listing registers it, like
-                    // a new tab on the desktop, unless a pane was chosen since.
-                    if state.showCreatedShell { state.selectWhenListed = pane }
+                    // a new tab on the desktop.
+                    state.selectWhenListed = pane
                     state.nextListing = .now
                 }
             case .shellCreationFailed(let request, let reason, let uncertain):
@@ -1204,15 +1201,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             state.control.publish(shown: pane)
         }
         if let requested = state.control.takeRequest() {
-            // The operator's own choice wins over a shell still being created
-            // or listed.
-            state.selectWhenListed = nil; state.showCreatedShell = false
+            // The operator's own choice wins over a shell still being listed.
+            state.selectWhenListed = nil
             if requested != state.shown, state.panes.contains(where: { $0.paneId == requested }) {
                 try switchTo(requested)
             }
         } else if let created = state.selectWhenListed, state.panes.contains(where: { $0.paneId == created }) {
             state.selectWhenListed = nil
-            if created != state.shown { try switchTo(created) }
+            // A pane chosen after New Tab wins even before its request gets
+            // here (the phone sends it only after its keyboard handoff),
+            // unless this listing already made that choice stale.
+            if created != state.shown, !state.control.paneChosenSinceShellCreation { try switchTo(created) }
         } else if state.shown == nil, state.listed,
                   let next = state.panes.first(where: \.isActive) ?? state.panes.first {
             // A machine with panes always shows one. When the shown pane
@@ -1364,7 +1363,6 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             let request = try state.client.createShell(workspace: plan.workspace, rows: plan.rows,
                 columns: plan.columns, expectedIncarnation: plan.incarnation)
             state.control.shellCreationAdmitted(plan.id, request: request)
-            state.showCreatedShell = true
         } catch {
             // The native API throws only before admission. Sent operations
             // settle through their correlated events, including unknown effects.

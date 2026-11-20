@@ -615,6 +615,10 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private let lock = NSLock()
     private var state = State()
     private var requested: TerminalMuxInputRouting.NavigationPlan?
+    /// The person's pane choice since the latest New Tab request: none, one
+    /// still in its keyboard handoff, or one the transport took.
+    private enum PaneChoice { case none, pending(TerminalMuxInputRouting.NavigationPlan), taken }
+    private var paneChoice = PaneChoice.none
     private var pendingSearch: Search?
     private var pendingContext: (id: UUID, first: Int64, count: Int)?
     private var waker: (@Sendable () -> Void)?
@@ -688,9 +692,32 @@ public final class TerminalMuxControl: @unchecked Sendable {
             shellCreationReview = nil
             state.shellCreation = ShellCreation(plan: plan, request: nil, outcome: .queued)
             pendingShellCreation = plan; state.revision = UUID()
+            paneChoice = .none
             return (observer, state, waker)
         }
         notify?(snapshot); wake?()
+    }
+
+    /// The person starts switching to a pane. Called when the choice is made,
+    /// before its keyboard handoff: the transport only sees the request after
+    /// that, and the tab a New Tab opens meanwhile must not override it.
+    public func notePaneChoice(_ plan: TerminalMuxInputRouting.NavigationPlan) {
+        lock.withLock { paneChoice = .pending(plan) }
+    }
+
+    /// Whether a pane chosen after the latest New Tab request keeps that
+    /// request's tab in the background: the transport took the choice, or it
+    /// is still in its handoff and can still be taken. A choice that can no
+    /// longer land, such as one the listing of the new tab made stale, does
+    /// not, so the new tab is shown rather than neither.
+    public var paneChosenSinceShellCreation: Bool {
+        lock.withLock {
+            switch paneChoice {
+            case .none: return false
+            case .taken: return true
+            case .pending(let plan): return (try? inputRouting.validateNavigation(plan)) != nil
+            }
+        }
     }
 
     /// Under the control lock. Once focus leaves, returning cannot revive an
@@ -1169,6 +1196,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
             if !queriesEnded, state.visible,
                state.panes.contains(where: { $0.paneId == plan.paneID }),
                (try? inputRouting.validateNavigation(plan)) != nil {
+                paneChoice = .taken
                 return (plan.paneID, nil, state)
             }
             state.rejectedNavigation = plan; state.revision = UUID()

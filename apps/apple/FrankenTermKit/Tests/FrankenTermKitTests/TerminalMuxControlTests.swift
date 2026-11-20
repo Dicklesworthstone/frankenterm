@@ -962,6 +962,36 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
         return control
     }
 
+    /// A pane chosen after New Tab keeps that request's tab in the background
+    /// while the choice can still land and after it lands, but a choice the
+    /// new tab's listing made stale gives way to that tab. Each New Tab
+    /// starts afresh.
+    func testAPaneChosenAfterNewTabHoldsTheTabBackOnlyWhileItCanLand() throws {
+        let control = try fixture()
+        control.enableShellCreation(incarnation: Data(repeating: 0x32, count: 16))
+        XCTAssertFalse(control.paneChosenSinceShellCreation)
+        try control.requestShellCreation(control.prepareShellCreation(workspace: "default"))
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "New Tab alone shows its tab")
+        let choice = try control.inputRouting.navigation(pane: 20)
+        control.notePaneChoice(choice)
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "a choice in its handoff holds the tab back")
+        let creation = try XCTUnwrap(control.takeShellCreation())
+        control.shellCreationAdmitted(creation.id, request: 7)
+        XCTAssertTrue(control.finishShellCreation(request: 7, outcome: .created(pane: 40, tab: 4, window: 1)))
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "creation finishing does not undo the choice")
+        try control.request(choice)
+        XCTAssertEqual(control.takeRequest(), 20)
+        try control.inputRouting.replaceInventory([10, 20, 30, 40])
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "a choice the transport took holds after the listing")
+
+        try control.requestShellCreation(control.prepareShellCreation(workspace: "default"))
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "the next New Tab shows its own tab")
+        control.notePaneChoice(try control.inputRouting.navigation(pane: 30))
+        XCTAssertTrue(control.paneChosenSinceShellCreation)
+        try control.inputRouting.replaceInventory([10, 20, 30, 40, 50])
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "a choice the new tab's listing made stale gives way")
+    }
+
     func testQueuedRequestKeepsExactCandidateAndDoesNotSelectItEarly() throws {
         let control = try fixture()
         let plan = try XCTUnwrap(control.inputRouting.navigation(forward: true))

@@ -1411,6 +1411,9 @@ final class TerminalSessionController {
         guard paneID != control.current.shown || requestedMuxPane != nil else { return nil }
         requestedMuxPane = paneID
         requestedMuxNavigation = plan
+        // A tab still opening from an earlier New Tab must not take over
+        // while this choice waits for its keyboard handoff.
+        control.notePaneChoice(plan)
         paneHandoff = Task { [weak self] in
             guard let self else { return }
             defer {

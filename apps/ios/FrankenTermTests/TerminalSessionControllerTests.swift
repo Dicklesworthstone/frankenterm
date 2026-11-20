@@ -2981,9 +2981,9 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// disposable mux (TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND): the test
     /// opens a tab, ends every other pane from it, then ends the tab, and it
     /// leaves the mux with the one pane its last New Tab opened. The pane it
-    /// first shows must be one the phone can draw: a pane never resized since
-    /// it was spawned does not draw yet (ft-jh8jen), so start that mux with
-    /// two-panes.lua, whose split resizes it.
+    /// first shows must be one the phone can draw: a fresh mux's lone 24 x 80
+    /// startup pane does not draw yet (ft-jh8jen), and two-panes.lua's panes
+    /// do, so start that mux with two-panes.lua.
     func testTheLastPaneEndingOffersNewTabInsteadOfItsFrozenScreen() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_EMPTYING_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND to reach a disposable mux on the loopback host")
@@ -2994,8 +2994,11 @@ final class TerminalSessionControllerTests: XCTestCase {
         // before New Tab. The test's own tab is the one it ends last.
         let session = try await connect(scene, "alpha")
         let first = try shown(session)
+        // A failed check must not leave a view in the window for later tests.
+        defer { first.removeFromSuperview() }
         let existing = Set(try XCTUnwrap(session.muxState).panes.map(\.paneId))
         for _ in 0..<400 where !session.canCreatePersistentShell { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(session.canCreatePersistentShell, "New Tab is offered")
         session.newPersistentShell()
         for _ in 0..<600 where session.muxState?.shown.map(existing.contains) != false
             || session.terminal == nil || session.terminal === first || session.paneNavigationBusy {
@@ -3012,6 +3015,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(existing.contains(tab), "the new tab is shown")
         first.removeFromSuperview()
         let view = try shown(session)
+        defer { view.removeFromSuperview() }
         // Every pane's shell is a child of the mux server; end the others.
         try await type("for p in $(pgrep -P $PPID); do [ $p = $$ ] || kill -HUP $p; done; echo LAST-\(run)-$((40+2)) > \(out)",
                        into: view)
@@ -3042,6 +3046,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(session.muxState?.panes.count, 1, "New Tab opened one pane")
         XCTAssertNil(session.interactionProblem)
         let fresh = try shown(session)
+        defer { fresh.removeFromSuperview() }
         try await type("echo REOPENED-\(run)-$((40+2)) > \(out)", into: fresh)
         let text = try await hostFile(out, containing: "REOPENED-\(run)-42")
         XCTAssertTrue(text.contains("REOPENED-\(run)-42"), "the new tab's shell runs commands (\(text))")
