@@ -252,6 +252,9 @@ fn capture_tree_with_provider(
     provider: &mut impl ProcessSnapshotProvider,
 ) -> Option<ProcessTree> {
     let root = capture_node(root_pid, 0, config.max_depth, provider)?;
+    if !provider.capture_complete() {
+        return None;
+    }
     let mut total_processes = 0;
     let mut total_rss_kb = 0;
     count_tree(&root, &mut total_processes, &mut total_rss_kb);
@@ -314,17 +317,75 @@ trait ProcessSnapshotProvider {
     fn read_process_info(&mut self, pid: u32) -> Option<RawProcessInfo>;
 
     fn find_children(&mut self, pid: u32) -> Vec<u32>;
+
+    fn capture_complete(&self) -> bool {
+        true
+    }
 }
 
 struct PlatformProcessSnapshotProvider {
+    #[cfg(target_os = "macos")]
+    probe_deadline: std::time::Instant,
+    #[cfg(target_os = "macos")]
+    probe_failed: std::cell::Cell<bool>,
     #[cfg(windows)]
     system: Option<sysinfo::System>,
 }
 
 impl PlatformProcessSnapshotProvider {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn new() -> Self {
         Self {}
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new() -> Self {
+        Self {
+            probe_deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            probe_failed: std::cell::Cell::new(false),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn probe(&self, program: &str, args: &[&str], max_stdout_bytes: usize) -> Option<String> {
+        if self.probe_failed.get() {
+            return None;
+        }
+        let remaining = self
+            .probe_deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            self.probe_failed.set(true);
+            return None;
+        }
+        let mut command = crate::runtime_async::process::Command::new(program);
+        command.args(args);
+        let output = match capture_process_probe(
+            &mut command,
+            remaining.min(std::time::Duration::from_secs(2)),
+            max_stdout_bytes,
+        ) {
+            Ok(output) => output,
+            Err(_) => {
+                self.probe_failed.set(true);
+                return None;
+            }
+        };
+        if !output.status.success() {
+            // ps may race process exit; pgrep uses 1 for no children. Neither
+            // is a failed capture, unlike a timeout, flood, or tool failure.
+            if output.status.code() != Some(1) {
+                self.probe_failed.set(true);
+            }
+            return None;
+        }
+        match String::from_utf8(output.stdout) {
+            Ok(output) => Some(output),
+            Err(_) => {
+                self.probe_failed.set(true);
+                None
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -350,6 +411,11 @@ impl ProcessSnapshotProvider for PlatformProcessSnapshotProvider {
 
     fn find_children(&mut self, pid: u32) -> Vec<u32> {
         find_children(self, pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_complete(&self) -> bool {
+        !self.probe_failed.get()
     }
 }
 
@@ -476,25 +542,46 @@ fn scan_children_from_proc(ppid: u32) -> Vec<u32> {
 // macOS: ps command (safe, no FFI)
 // =============================================================================
 
+/// Retain only a complete bounded capture. In particular, a valid-looking
+/// prefix from a flooded pipe must never become process identity or ancestry.
+/// The supervisor owns the deadline, bounded pipes and child-tree cleanup.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn capture_process_probe(
+    command: &mut crate::runtime_async::process::Command,
+    timeout: std::time::Duration,
+    max_stdout_bytes: usize,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdout_limit(max_stdout_bytes)
+        .stderr_limit(8 * 1024)
+        .output_blocking(timeout)
+}
+
 #[cfg(target_os = "macos")]
 fn read_process_info(
-    _provider: &PlatformProcessSnapshotProvider,
+    provider: &PlatformProcessSnapshotProvider,
     pid: u32,
 ) -> Option<RawProcessInfo> {
     // Use `ps` to get process info in a single call.
     // Format: pid ppid state rss comm (args...)
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,state=,rss=,comm="])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    let line = provider.probe(
+        "/bin/ps",
+        &["-p", &pid.to_string(), "-o", "pid=,ppid=,state=,rss=,comm="],
+        16 * 1024,
+    )?;
+    let Some(mut info) = parse_macos_process_info(pid, &line) else {
+        provider.probe_failed.set(true);
         return None;
-    }
+    };
+    // Get argv separately (ps -o args= gives the full command line).
+    info.argv = read_macos_argv(provider, pid);
+    Some(info)
+}
 
-    let line = String::from_utf8(output.stdout).ok()?;
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_process_info(pid: u32, line: &str) -> Option<RawProcessInfo> {
     let line = line.trim();
-    if line.is_empty() {
+    if line.is_empty() || line.lines().count() != 1 {
         return None;
     }
 
@@ -504,27 +591,27 @@ fn read_process_info(
     }
 
     let pid_val = fields[0].parse::<u32>().ok()?;
+    if pid_val != pid {
+        return None;
+    }
     let parent_pid = fields[1].parse::<u32>().ok()?;
     let state = parse_macos_state(fields[2]);
-    let rss_kb = fields[3].parse::<u64>().unwrap_or(0);
+    let rss_kb = fields[3].parse::<u64>().ok()?;
     // comm= gives the full path; extract basename.
     let comm = fields[4..].join(" ");
     let name = comm.rsplit('/').next().unwrap_or(&comm).to_string();
-
-    // Get argv separately (ps -o args= gives the full command line).
-    let argv = read_macos_argv(pid_val);
 
     Some(RawProcessInfo {
         pid: pid_val,
         ppid: parent_pid,
         name,
-        argv,
+        argv: Vec::new(),
         state,
         rss_kb,
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_state(s: &str) -> ProcessState {
     // macOS ps state codes: R=running, S=sleeping, I=idle, U=uninterruptible,
     // T=stopped, Z=zombie. First char is primary state.
@@ -539,40 +626,49 @@ fn parse_macos_state(s: &str) -> ProcessState {
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_argv(pid: u32) -> Vec<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .output()
-        .ok();
-
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+fn read_macos_argv(provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<String> {
+    provider
+        .probe(
+            "/bin/ps",
+            &["-p", &pid.to_string(), "-o", "args="],
+            256 * 1024,
+        )
         .map(|s| s.split_whitespace().take(8).map(String::from).collect())
         .unwrap_or_default()
 }
 
 #[cfg(target_os = "macos")]
-fn find_children(_provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
+fn find_children(provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
     // Use pgrep to find child processes.
-    let output = std::process::Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-        .ok();
+    let Some(output) = provider.probe("/usr/bin/pgrep", &["-P", &pid.to_string()], 64 * 1024)
+    else {
+        return Vec::new();
+    };
+    match parse_macos_children(pid, &output) {
+        Some(children) => children,
+        None => {
+            provider.probe_failed.set(true);
+            Vec::new()
+        }
+    }
+}
 
-    output
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_children(parent_pid: u32, output: &str) -> Option<Vec<u32>> {
+    if output.trim().is_empty() {
+        return None;
+    }
+    let children: Vec<u32> = output
+        .lines()
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid != 0 && *pid != parent_pid)
         })
-        .map(|s| {
-            s.lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+        .collect::<Option<_>>()?;
+    let unique: std::collections::HashSet<_> = children.iter().collect();
+    (unique.len() == children.len()).then_some(children)
 }
 
 // =============================================================================
@@ -751,6 +847,7 @@ mod tests {
     struct FakeProcessSnapshotProvider {
         infos: HashMap<u32, RawProcessInfo>,
         children: HashMap<u32, Vec<u32>>,
+        incomplete: bool,
     }
 
     impl ProcessSnapshotProvider for FakeProcessSnapshotProvider {
@@ -760,6 +857,10 @@ mod tests {
 
         fn find_children(&mut self, pid: u32) -> Vec<u32> {
             self.children.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn capture_complete(&self) -> bool {
+            !self.incomplete
         }
     }
 
@@ -772,6 +873,88 @@ mod tests {
             state: ProcessState::Running,
             rss_kb,
         }
+    }
+
+    #[test]
+    fn incomplete_process_snapshot_is_not_reported_as_an_idle_tree() {
+        let mut provider = FakeProcessSnapshotProvider {
+            incomplete: true,
+            ..Default::default()
+        };
+        provider.infos.insert(42, fake_info(42, 1, "bash", 128));
+        assert!(
+            capture_tree_with_provider(42, &ProcessTreeConfig::default(), &mut provider).is_none()
+        );
+
+        provider.incomplete = false;
+        provider.infos.insert(42, fake_info(42, 1, "bash", 128));
+        let tree = capture_tree_with_provider(42, &ProcessTreeConfig::default(), &mut provider)
+            .expect("a complete childless snapshot is valid");
+        assert_eq!(infer_activity(&tree), PaneActivity::Idle);
+    }
+
+    #[test]
+    fn macos_process_probe_parsers_refuse_partial_or_mismatched_identity() {
+        let info = parse_macos_process_info(42, " 42 1 S 128 /usr/bin/a process\n")
+            .expect("valid complete process record");
+        assert_eq!(info.pid, 42);
+        assert_eq!(info.ppid, 1);
+        assert_eq!(info.rss_kb, 128);
+        assert_eq!(info.name, "a process");
+        for output in [
+            "43 1 S 128 /bin/bash\n",
+            "42 1 S invalid /bin/bash\n",
+            "42 1 S 128\n",
+            "42 1 S 128 /bin/bash\n43 1 S 1 /bin/sh\n",
+        ] {
+            assert!(parse_macos_process_info(42, output).is_none());
+        }
+        assert_eq!(parse_macos_children(42, "43\n44\n"), Some(vec![43, 44]));
+        for output in ["43\ninvalid\n", "43\n43\n", "0\n", "42\n", "", " \n"] {
+            assert!(parse_macos_children(42, output).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_probe_bounds_both_streams_and_child_lifetime() {
+        use crate::runtime_async::process::{Command, CommandOutputLimitExceeded};
+        use std::time::Duration;
+
+        let mut valid = Command::new("/bin/sh");
+        valid.args(["-c", "printf '42 1 S 128 /bin/bash\\n'"]);
+        let output = capture_process_probe(&mut valid, Duration::from_secs(5), 128)
+            .expect("bounded complete capture");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"42 1 S 128 /bin/bash\n");
+
+        for script in [
+            "printf '42 1 S 128 /bin/bash\\n'; while :; do printf 0123456789; done",
+            "printf '42 1 S 128 /bin/bash\\n'; while :; do printf 0123456789 >&2; done",
+        ] {
+            let mut flood = Command::new("/bin/sh");
+            flood.args(["-c", script]);
+            let error = capture_process_probe(&mut flood, Duration::from_secs(5), 128)
+                .expect_err("no usable prefix may survive a flooded capture");
+            assert!(CommandOutputLimitExceeded::from_io_error(&error).is_some());
+        }
+
+        let mut hung = Command::new("/bin/sh");
+        hung.args(["-c", "exec sleep 30"]);
+        let error = capture_process_probe(&mut hung, Duration::from_millis(100), 128)
+            .expect_err("a nonproductive child must have a finite lifetime");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exhausted_process_tree_budget_refuses_new_probes() {
+        let provider = PlatformProcessSnapshotProvider {
+            probe_deadline: std::time::Instant::now(),
+            probe_failed: std::cell::Cell::new(false),
+        };
+        assert!(provider.probe("/bin/ps", &["-p", "1"], 1024).is_none());
+        assert!(!provider.capture_complete());
     }
 
     #[test]

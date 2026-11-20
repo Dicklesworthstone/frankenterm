@@ -6,14 +6,21 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::patterns::AgentType;
+use crate::runtime_async::process::Command;
 use crate::setup::{ShellType, has_shell_ft_block, locate_shell_rc};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
+
+// Version and sysctl probes return one short line. Keep diagnostic subprocesses
+// within the same finite envelope even when PATH selects a noisy or stuck tool.
+const ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const ENVIRONMENT_PROBE_MAX_STDOUT_BYTES: usize = 512;
+const ENVIRONMENT_PROBE_MAX_STDERR_BYTES: usize = 16 * 1024;
 
 /// WezTerm capability flags inferred from local probes.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -142,28 +149,27 @@ impl WeztermInfo {
     /// (tick 27 trait extension) so caller cancellation
     /// propagates into the subprocess.
     ///
-    /// The synchronous detection steps (version probe, socket
-    /// discovery) fire regardless of cx state — they're
-    /// subprocess spawns via `std::process::Command` that
-    /// don't use the async runtime. A pre-flight checkpoint
-    /// could skip them, but the detection fast path is short
-    /// enough (~100ms typical) that a checkpoint there adds
-    /// ceremony without much value. The cx-aware seam is the
-    /// `list_panes` call which can be slow on a loaded
-    /// wezterm instance.
+    /// The version probe also honors caller cancellation and runs on the
+    /// runtime's blocking pool with finite output and process-lifetime bounds.
+    /// Failed probes remain best-effort absence; they never contribute partial
+    /// or malformed output to capability detection.
     pub async fn detect_with_cx(
         cx: &crate::cx::Cx,
         wezterm: Option<&WeztermHandle>,
         shell: &ShellInfo,
     ) -> (Self, Vec<PaneInfo>) {
-        let version = detect_wezterm_version();
+        let version = detect_wezterm_version_with_cx(cx).await;
         let cli_available = version.is_some();
-        let socket_path = detect_wezterm_socket();
+        let socket_path = if cx.checkpoint().is_ok() {
+            detect_wezterm_socket()
+        } else {
+            None
+        };
 
         let mut panes = Vec::new();
         let mut list_ok = false;
 
-        if cli_available {
+        if cli_available && cx.checkpoint().is_ok() {
             let handle = wezterm.cloned().unwrap_or_else(default_wezterm_handle);
             match handle.list_panes_with_cx(cx).await {
                 Ok(found) => {
@@ -210,8 +216,37 @@ impl SystemInfo {
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let memory_mb = detect_memory_mb();
-        let load_average = detect_load_average();
+        Self::from_observations(cpu_count, detect_memory_mb(), detect_load_average())
+    }
+
+    async fn detect_with_cx(cx: &crate::cx::Cx) -> Self {
+        if cx.checkpoint().is_err() {
+            return Self::from_observations(1, None, None);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let cpu_count = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let memory_mb = macos_sysctl_stdout_with_cx(cx, "hw.memsize")
+                .await
+                .and_then(|text| parse_macos_memory_mb(&text));
+            let load_average = macos_sysctl_stdout_with_cx(cx, "vm.loadavg")
+                .await
+                .and_then(|text| parse_macos_load_average(&text));
+            Self::from_observations(cpu_count, memory_mb, load_average)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::detect()
+        }
+    }
+
+    fn from_observations(
+        cpu_count: usize,
+        memory_mb: Option<u64>,
+        load_average: Option<f64>,
+    ) -> Self {
         let detected_at_epoch_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()
@@ -238,15 +273,18 @@ impl DetectedEnvironment {
 
     /// Cx-first [`Self::detect`] (ft-xbnl0.2.3). Routes the
     /// wezterm detection through [`WeztermInfo::detect_with_cx`]
-    /// so the `list_panes` call honors caller cancellation. All
-    /// other detection steps (shell, agents, remotes, system)
-    /// are pure-sync and don't need cx threading.
+    /// so the version and `list_panes` calls honor caller cancellation. macOS
+    /// system probes use the same caller-owned, bounded subprocess path.
     pub async fn detect_with_cx(cx: &crate::cx::Cx, wezterm: Option<&WeztermHandle>) -> Self {
-        let shell = ShellInfo::detect();
+        let shell = if cx.checkpoint().is_ok() {
+            ShellInfo::detect()
+        } else {
+            ShellInfo::from_shell_path(None)
+        };
         let (wezterm_info, panes) = WeztermInfo::detect_with_cx(cx, wezterm, &shell).await;
         let agents = detect_agents_from_panes(&panes);
         let remotes = detect_remotes_from_panes(&panes);
-        let system = SystemInfo::detect();
+        let system = SystemInfo::detect_with_cx(cx).await;
 
         Self {
             wezterm: wezterm_info,
@@ -274,19 +312,55 @@ fn detect_wezterm_socket() -> Option<PathBuf> {
     crate::wezterm::discover_mux_socket(None)
 }
 
-fn detect_wezterm_version() -> Option<String> {
-    let output = std::process::Command::new("wezterm")
-        .arg("--version")
-        .output()
-        .ok()?;
+async fn detect_wezterm_version_with_cx(cx: &crate::cx::Cx) -> Option<String> {
+    if cx.checkpoint().is_err() {
+        return None;
+    }
+    let mut command = environment_probe_command(crate::wezterm::wezterm_binary(), &["--version"]);
+    environment_probe_with_cx(cx, &mut command, ENVIRONMENT_PROBE_TIMEOUT).await
+}
+
+fn environment_probe_command(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .stdout_limit(ENVIRONMENT_PROBE_MAX_STDOUT_BYTES)
+        .stderr_limit(ENVIRONMENT_PROBE_MAX_STDERR_BYTES);
+    command
+}
+
+async fn environment_probe_with_cx(
+    cx: &crate::cx::Cx,
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<String> {
+    let output = command.output_with_cx_timeout(cx, timeout).await.ok()?;
+    admit_environment_probe_output(output)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn environment_probe_blocking(command: &mut Command, timeout: Duration) -> Option<String> {
+    let output = command.output_blocking(timeout).ok()?;
+    admit_environment_probe_output(output)
+}
+
+fn admit_environment_probe_output(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
+    admit_environment_probe_text(&output.stdout)
+}
+
+fn admit_environment_probe_text(stdout: &[u8]) -> Option<String> {
+    if stdout.len() > ENVIRONMENT_PROBE_MAX_STDOUT_BYTES {
         return None;
     }
-    Some(version)
+    let text = std::str::from_utf8(stdout).ok()?.trim();
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Detect agents using pane titles and basic heuristics.
@@ -420,16 +494,14 @@ fn detect_load_average() -> Option<f64> {
 
 #[cfg(target_os = "macos")]
 fn macos_sysctl_stdout(name: &str) -> Option<String> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", name])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let mut command = environment_probe_command("/usr/sbin/sysctl", &["-n", name]);
+    environment_probe_blocking(&mut command, ENVIRONMENT_PROBE_TIMEOUT)
+}
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+#[cfg(target_os = "macos")]
+async fn macos_sysctl_stdout_with_cx(cx: &crate::cx::Cx, name: &str) -> Option<String> {
+    let mut command = environment_probe_command("/usr/sbin/sysctl", &["-n", name]);
+    environment_probe_with_cx(cx, &mut command, ENVIRONMENT_PROBE_TIMEOUT).await
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -999,6 +1071,253 @@ fn auto_safety(env: &DetectedEnvironment, recs: &mut Vec<ConfigRecommendation>) 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn run_probe_async_test<F>(make_future: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        // Each probe test owns its runtime/TLS. Cleanup failures still fail the
+        // test instead of hiding an unacknowledged process or watcher task.
+        let joined = std::thread::spawn(move || {
+            use crate::runtime_async::CompatRuntime;
+
+            let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .expect("build environment probe runtime");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(make_future());
+            }));
+            let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::runtime_async::clear_runtime_handle();
+            }));
+            for result in [outcome, teardown, cleanup] {
+                if let Err(payload) = result {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        })
+        .join();
+        if let Err(payload) = joined {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn environment_probe_text_admission_requires_complete_single_line_utf8() {
+        assert_eq!(
+            admit_environment_probe_text(b"wezterm 20261120-test\n"),
+            Some("wezterm 20261120-test".to_string())
+        );
+        assert_eq!(
+            admit_environment_probe_text(b"{ 2.50 1.75 1.25 }\n"),
+            Some("{ 2.50 1.75 1.25 }".to_string())
+        );
+        for rejected in [
+            b"".as_slice(),
+            b" \r\n",
+            b"version\nextra",
+            b"version\tvalue",
+            b"version\x1b[31m",
+            b"version\0",
+            b"version\xff",
+        ] {
+            assert_eq!(admit_environment_probe_text(rejected), None);
+        }
+        assert!(
+            admit_environment_probe_text(&vec![b'x'; ENVIRONMENT_PROBE_MAX_STDOUT_BYTES]).is_some()
+        );
+        assert_eq!(
+            admit_environment_probe_text(&vec![b'x'; ENVIRONMENT_PROBE_MAX_STDOUT_BYTES + 1]),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_blocking_probe_enforces_both_capture_limits() {
+        let mut exact_stdout = environment_probe_command("sh", &["-c", "printf '%0512d' 0"]);
+        assert_eq!(
+            environment_probe_blocking(&mut exact_stdout, ENVIRONMENT_PROBE_TIMEOUT)
+                .expect("exact stdout cap is accepted")
+                .len(),
+            ENVIRONMENT_PROBE_MAX_STDOUT_BYTES
+        );
+        let mut excess_stdout = environment_probe_command("sh", &["-c", "printf '%0513d' 0"]);
+        assert_eq!(
+            environment_probe_blocking(&mut excess_stdout, ENVIRONMENT_PROBE_TIMEOUT),
+            None
+        );
+        let mut exact_stderr =
+            environment_probe_command("sh", &["-c", "printf '%016384d' 0 >&2; printf ok"]);
+        assert_eq!(
+            environment_probe_blocking(&mut exact_stderr, ENVIRONMENT_PROBE_TIMEOUT),
+            Some("ok".to_string())
+        );
+        let mut excess_stderr =
+            environment_probe_command("sh", &["-c", "printf '%016385d' 0 >&2; printf ok"]);
+        assert_eq!(
+            environment_probe_blocking(&mut excess_stderr, ENVIRONMENT_PROBE_TIMEOUT),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_async_probe_admits_only_successful_complete_output() {
+        run_probe_async_test(|| async {
+            let cx = crate::cx::for_testing();
+            let mut success = environment_probe_command("sh", &["-c", "printf 'version 1\n'"]);
+            assert_eq!(
+                environment_probe_with_cx(&cx, &mut success, ENVIRONMENT_PROBE_TIMEOUT).await,
+                Some("version 1".to_string())
+            );
+            for script in [
+                "printf 'version 1'; exit 7",
+                "printf '%0513d' 0",
+                "printf '%016385d' 0 >&2; printf 'version 1'",
+                "printf '\\377'",
+            ] {
+                let mut command = environment_probe_command("sh", &["-c", script]);
+                assert_eq!(
+                    environment_probe_with_cx(&cx, &mut command, ENVIRONMENT_PROBE_TIMEOUT).await,
+                    None
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_environment_detection_skips_probes_and_shell_files() {
+        run_probe_async_test(|| async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("probe cancelled"));
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("must-not-exist");
+            let mut command =
+                environment_probe_command("sh", &["-c", "printf spawned > \"$1\"", "probe"]);
+            command.arg(&marker);
+            assert_eq!(
+                environment_probe_with_cx(&cx, &mut command, ENVIRONMENT_PROBE_TIMEOUT).await,
+                None
+            );
+            assert!(!marker.exists(), "a cancelled probe must not spawn");
+
+            let environment = DetectedEnvironment::detect_with_cx(&cx, None).await;
+            assert!(environment.wezterm.version.is_none());
+            assert!(environment.wezterm.socket_path.is_none());
+            assert!(!environment.wezterm.capabilities.cli_available);
+            assert!(environment.shell.config_file.is_none());
+            assert!(environment.agents.is_empty());
+            assert!(environment.remotes.is_empty());
+            assert_eq!(environment.system.cpu_count, 1);
+            assert!(environment.system.memory_mb.is_none());
+            assert!(environment.system.load_average.is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_probe_timeout_settles_a_hung_child() {
+        run_probe_async_test(|| async {
+            let cx = crate::cx::for_testing();
+            let directory = tempfile::tempdir().unwrap();
+            let pid_path = directory.path().join("probe.pid");
+            let mut command = environment_probe_command(
+                "sh",
+                &["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 30", "probe"],
+            );
+            command.arg(&pid_path);
+            let started = std::time::Instant::now();
+            let result =
+                environment_probe_with_cx(&cx, &mut command, Duration::from_millis(500)).await;
+            assert_eq!(result, None);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let pid: i64 = std::fs::read_to_string(&pid_path)
+                .expect("hung child must start before its deadline")
+                .parse()
+                .unwrap();
+            let alive = crate::runtime_async::process::send_unix_signal_to_pid(pid, "0")
+                .expect("probe owned child state");
+            assert!(!alive.success(), "timeout must reap the owned child");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_probe_cancellation_settles_a_running_child() {
+        run_probe_async_test(|| async {
+            let cx = crate::cx::for_testing();
+            let directory = tempfile::tempdir().unwrap();
+            let pid_path = directory.path().join("probe.pid");
+            let cancel_cx = cx.clone();
+            let started_path = pid_path.clone();
+            let trigger = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !started_path.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let spawned = started_path.exists();
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("running probe cancelled"),
+                );
+                spawned
+            });
+            let mut command = environment_probe_command(
+                "sh",
+                &["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 30", "probe"],
+            );
+            command.arg(&pid_path);
+            let started = std::time::Instant::now();
+            let result =
+                environment_probe_with_cx(&cx, &mut command, Duration::from_secs(20)).await;
+            let spawned = trigger.join().expect("cancellation trigger settles");
+            assert!(spawned, "cancellation must follow actual child startup");
+            assert_eq!(result, None);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let pid: i64 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+            let alive = crate::runtime_async::process::send_unix_signal_to_pid(pid, "0")
+                .expect("probe owned child state");
+            assert!(!alive.success(), "cancellation must reap the owned child");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_probe_never_admits_output_with_inherited_open_pipes() {
+        // Hold the descendant's inherited pipes open until capture settles,
+        // rather than depending on a short sleep racing the supervisor. Its
+        // finite fallback also guarantees exit if the test panics early.
+        let directory = tempfile::tempdir().unwrap();
+        let release_path = directory.path().join("release");
+        let settled_path = directory.path().join("settled");
+        let mut command = environment_probe_command(
+            "sh",
+            &[
+                "-c",
+                "(attempt=0; while [ ! -e \"$1\" ] && [ \"$attempt\" -lt 100 ]; do \
+                 sleep 0.1; attempt=$((attempt + 1)); done; \
+                 exec 1>&- 2>&-; printf settled > \"$2\") & printf 'version 1\n'",
+                "probe",
+            ],
+        );
+        command.arg(&release_path).arg(&settled_path);
+        let result = environment_probe_blocking(&mut command, ENVIRONMENT_PROBE_TIMEOUT);
+        std::fs::write(&release_path, b"release").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !settled_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            settled_path.exists(),
+            "the finite descendant must close its pipes"
+        );
+        assert_eq!(result, None);
+    }
+
     fn pane_with_title(id: u64, title: &str) -> PaneInfo {
         PaneInfo {
             pane_id: id,
@@ -1064,9 +1383,8 @@ mod tests {
                 // Detection counts must match (same backend, same pane).
                 assert_eq!(legacy.agents.len(), cx_first.agents.len());
                 assert_eq!(legacy.remotes.len(), cx_first.remotes.len());
-                // System + shell are pure-sync detection and
-                // should produce identical results on the same
-                // host.
+                // Stable system and shell identifiers should match on the
+                // same host regardless of probe scheduling.
                 assert_eq!(legacy.system.os, cx_first.system.os);
                 assert_eq!(legacy.system.arch, cx_first.system.arch);
                 assert_eq!(legacy.shell.shell_type, cx_first.shell.shell_type);
