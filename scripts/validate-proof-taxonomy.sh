@@ -85,7 +85,9 @@ for issue in sorted(issues, key=lambda item: [int(part) if part.isdigit() else p
     checked += 1
     issue_id = issue["id"]
     description = issue.get("description") or ""
-    match = line_re.search(description)
+    notes = issue.get("notes") or ""
+    body = f"{description}\n{notes}" if notes else description
+    match = line_re.search(body)
     if not match:
         violations.append({
             "id": issue_id,
