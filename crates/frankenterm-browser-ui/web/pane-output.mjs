@@ -51,8 +51,9 @@ export function createPaneOutput({
   maxChunks = 2048,
   maxFrameChars = 1024 * 1024,
   captureTimeoutMs = 10_000,
+  readyTimeoutMs = 10_000,
 } = {}) {
-  for (const [limit, cap] of [[maxChars, 8 * 1024 * 1024], [maxChunks, 32768], [maxFrameChars, 8 * 1024 * 1024], [captureTimeoutMs, 60_000]]) {
+  for (const [limit, cap] of [[maxChars, 8 * 1024 * 1024], [maxChunks, 32768], [maxFrameChars, 8 * 1024 * 1024], [captureTimeoutMs, 60_000], [readyTimeoutMs, 60_000]]) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > cap) {
       throw new Error("invalid transcript limit");
     }
@@ -61,6 +62,8 @@ export function createPaneOutput({
   let pane = null;
   let source = null;
   let timer = null;
+  let readyTimer = null;
+  let readyGeneration = 0;
   let captureTimer = null;
   let capture = null;
   let capturePending = false;
@@ -86,8 +89,28 @@ export function createPaneOutput({
   let text = "";
   const eligible = () => pane !== null && !paused && !suspended && (capture === null || capturePending);
 
+  function clearReadyDeadline() {
+    readyGeneration += 1;
+    if (readyTimer !== null) clearTimer(readyTimer);
+    readyTimer = null;
+  }
+
+  function awaitReady(current) {
+    // Historical capture already has a total delivery deadline. Live streams
+    // need a bounded initial/native-reconnect handshake, not an idle timeout:
+    // EventSource does not expose the server's comment-only keepalives.
+    if (capture !== null || readyTimer !== null) return;
+    const expected = ++readyGeneration;
+    readyTimer = setTimer(() => {
+      if (!current() || readyGeneration !== expected) return;
+      readyTimer = null;
+      reconnect("output connection timed out before becoming ready; reconnecting");
+    }, readyTimeoutMs);
+  }
+
   function retire() {
     generation += 1;
+    clearReadyDeadline();
     if (timer !== null) clearTimer(timer);
     timer = null;
     if (captureTimer !== null) clearTimer(captureTimer);
@@ -175,6 +198,7 @@ export function createPaneOutput({
     const expected = generation;
     const selectedPane = pane;
     const current = () => eligible() && source === candidate && generation === expected;
+    awaitReady(current);
     if (capture !== null) {
       captureTimer = setTimer(() => {
         if (current()) settleCapture("Historical capture was not received before the deadline. Search again to check retained history.");
@@ -220,9 +244,16 @@ export function createPaneOutput({
             settleCapture(null, true);
             return;
           }
+          // A validated pane delta also establishes a working stream; unlike
+          // a ready frame, new delivered rows reset the retry backoff below.
+          clearReadyDeadline();
           // Reconnect may overlap with already admitted rows. Do not regress
           // the received cursor, append duplicates, or interpret ids as floats.
-          if (received !== null && BigInt(segment) <= BigInt(received)) return;
+          if (received !== null && BigInt(segment) <= BigInt(received)) {
+            status = "connected";
+            dirty = true;
+            return;
+          }
           // Global segment ids interleave panes; only this pane's stored seq
           // can reveal an omitted range. Keep the last admitted sequence over
           // disconnect, pause and suspension: ephemeral bus gap notifications
@@ -249,6 +280,7 @@ export function createPaneOutput({
           if (typeof data.pane_id !== "number" || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane) {
             throw new Error("wrong ready pane");
           }
+          clearReadyDeadline();
           status = capture === null ? "connected" : "loading";
           // A ready frame does not establish delivery or complete replay.
         } else if (message.type === "gap") {
@@ -281,6 +313,7 @@ export function createPaneOutput({
         status = "connecting";
         if (received === null && !history) unanchored = true;
         dirty = true;
+        awaitReady(current);
       }
     });
   }

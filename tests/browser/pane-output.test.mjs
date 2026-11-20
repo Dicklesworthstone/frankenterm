@@ -71,6 +71,115 @@ test("selection opens one pane-scoped, read-only live stream", () => {
   assert.equal(f.output.snapshot().cursor, null);
 });
 
+test("a hanging initial output connection is replaced without accepting a late pane response", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  f.output.select("7");
+  const first = f.latest();
+  assert.equal(f.retry(), 25);
+  assert.equal(first.closed, true);
+  assert.equal(f.output.snapshot().status, "retrying");
+  assert.match(f.output.snapshot().error, /timed out before becoming ready/);
+  assert.equal(f.output.snapshot().unanchored, true);
+  control(first, "ready");
+  delta(first, "99", "late");
+  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().text, "");
+  assert.equal(f.retry(), 1000);
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.latest().url.searchParams.has("since_id"), false);
+  control(f.latest(), "ready");
+  assert.equal(f.timers.size, 0, "an admitted quiet stream is not subject to an idle timeout");
+  delta(f.latest(), "100", "recovered");
+  assert.equal(f.output.snapshot().text, "recovered");
+});
+
+test("native reconnect grace cannot be renewed by repeated errors and preserves exact received identity", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  f.output.select("7");
+  const first = f.latest();
+  delta(first, "9007199254740993", "before", "7", { sequence: "9007199254740992" });
+  first.fail(false);
+  const deadline = f.timers.values().next().value;
+  for (let i = 0; i < 20; i += 1) first.fail(false);
+  assert.equal(f.timers.size, 1);
+  assert.equal(f.timers.values().next().value, deadline);
+  assert.equal(f.retry(), 25);
+  assert.equal(first.closed, true);
+  assert.equal(f.retry(), 1000);
+  assert.equal(f.latest().url.searchParams.get("since_id"), "9007199254740993");
+  delta(first, "9007199254740994", "late");
+  delta(f.latest(), "9007199254740994", "after", "7", { sequence: "9007199254740993" });
+  assert.equal(f.output.snapshot().text, "beforeafter");
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test("valid ready or pane delta fences queued watchdogs without resetting retry evidence", () => {
+  for (const response of ["ready", "delta", "duplicate"]) {
+    const f = fixture({ readyTimeoutMs: 25 });
+    f.output.select("7");
+    const first = f.latest();
+    const initialDeadline = f.timers.values().next().value.fn;
+    delta(first, "4", "before");
+    initialDeadline();
+    assert.equal(first.closed, false);
+    first.fail(false);
+    const reconnectDeadline = f.timers.values().next().value.fn;
+    initialDeadline();
+    assert.equal(f.timers.values().next().value.fn, reconnectDeadline);
+    if (response === "ready") control(first, "ready");
+    else delta(first, response === "duplicate" ? "4" : "5", response === "duplicate" ? "duplicate" : "after");
+    reconnectDeadline();
+    assert.equal(first.closed, false);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.output.snapshot().status, "connected");
+    assert.equal(f.output.snapshot().text, response === "delta" ? "beforeafter" : "before");
+  }
+});
+
+test("pane retirement fences pending ready callbacks before new selection or resume", () => {
+  for (const action of ["close", "switch", "pause", "suspend"]) {
+    const f = fixture({ readyTimeoutMs: 25 });
+    f.output.select("7");
+    const first = f.latest();
+    const oldDeadline = f.timers.values().next().value.fn;
+    if (action === "switch") f.output.select("8");
+    else f.output[action]();
+    oldDeadline();
+    control(first, "ready");
+    delta(first, "8", "stale");
+    assert.equal(first.closed, true);
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.timers.size, action === "switch" ? 1 : 0);
+    if (action === "pause") f.output.resume();
+    if (action === "suspend") f.output.restore();
+    oldDeadline();
+    assert.equal(f.sources.length, action === "close" ? 1 : 2);
+    if (action !== "close") {
+      assert.equal(f.latest().closed, false);
+      assert.equal(f.timers.size, 1, "the new pane/resume owns its own readiness budget");
+    }
+    f.output.close();
+    assert.equal(f.timers.size, 0);
+  }
+});
+
+test("repeated handshake timeouts use the existing bounded backoff until new output arrives", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  f.output.select("7", { retainedHistory: true });
+  const delays = [];
+  for (let i = 0; i < 7; i += 1) {
+    assert.equal(f.retry(), 25);
+    delays.push(f.retry());
+    assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  }
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+  delta(f.latest(), "1", "delivered", "7", { sequence: "0" });
+  f.latest().fail();
+  assert.equal(f.retry(), 1000);
+  f.output.close();
+});
+
 test("retained history is explicit and resumes from the accepted row", () => {
   const f = fixture();
   f.output.select("7", { retainedHistory: true });
@@ -278,7 +387,7 @@ test("retiring a pane clears its transcript and ignores old source callbacks", (
   f.output.select("8");
   assert.equal(old.closed, true);
   delta(old, "2", "late pane seven"); old.fail(); control(old, "gap");
-  assert.equal(f.timers.size, 0);
+  assert.equal(f.timers.size, 1, "only the newly selected pane's ready deadline remains");
   assert.equal(f.output.snapshot().text, "");
   assert.equal(f.output.snapshot().cursor, null);
   delta(f.latest(), "3", "pane eight", "8");
@@ -431,10 +540,11 @@ test("server error diagnostics are finite and persist until actual delivery", ()
 test("transient EventSource reconnects do not create replacement owners", () => {
   const f = fixture(); f.output.select("7"); delta(f.latest(), "1", "A");
   f.latest().fail(false);
-  assert.equal(f.sources.length, 1); assert.equal(f.timers.size, 0);
+  assert.equal(f.sources.length, 1); assert.equal(f.timers.size, 1);
   assert.equal(f.latest().closed, false); assert.equal(f.output.snapshot().status, "connecting");
   control(f.latest(), "ready"); delta(f.latest(), "2", "B");
   assert.equal(f.output.snapshot().text, "AB");
+  assert.equal(f.timers.size, 0);
 });
 
 test("reconnecting before the first fresh cursor reports the unanchored boundary", () => {
@@ -462,7 +572,9 @@ test("flooded updates coalesce for frame-paced rendering", () => {
 
 test("invalid bounds are rejected before a source can be opened", () => {
   for (const options of [{ maxChars: 0 }, { maxChunks: -1 }, { maxFrameChars: Infinity },
-    { maxChars: 1.5 }, { maxChars: 9 * 1024 * 1024 }, { maxChunks: 32769 }]) {
+    { maxChars: 1.5 }, { maxChars: 9 * 1024 * 1024 }, { maxChunks: 32769 },
+    { readyTimeoutMs: 0 }, { readyTimeoutMs: -1 }, { readyTimeoutMs: 0.5 },
+    { readyTimeoutMs: 60_001 }, { readyTimeoutMs: Infinity }, { readyTimeoutMs: NaN }]) {
     assert.throws(() => fixture(options), /invalid transcript limit/);
   }
 });
@@ -922,7 +1034,7 @@ test("closing, switching, and page suspension retire historical callbacks and de
     capturedDelta(old, hit, "late private capture");
     old.fail();
     assert.equal(old.closed, true);
-    assert.equal(f.timers.size, 0);
+    assert.equal(f.timers.size, action === "switch" ? 1 : 0);
     assert.equal(f.output.snapshot().text, "");
     assert.equal(f.output.snapshot().status, action === "close" ? "closed" : action === "switch" ? "connecting" : "unavailable");
     assert.equal(f.sources.length, action === "switch" ? 2 : 1);
