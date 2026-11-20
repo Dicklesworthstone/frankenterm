@@ -2980,10 +2980,10 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// No Tabs Open; its New Tab opens a shell that runs commands. Needs a
     /// disposable mux (TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND): the test
     /// opens a tab, ends every other pane from it, then ends the tab, and it
-    /// leaves the mux with the one pane its last New Tab opened. The pane it
-    /// first shows must be one the phone can draw: a fresh mux's lone 24 x 80
-    /// startup pane does not draw yet (ft-jh8jen), and two-panes.lua's panes
-    /// do, so start that mux with two-panes.lua.
+    /// leaves the mux with the one pane its last New Tab opened. Start that
+    /// mux fresh with one pane (one-pane.lua): the test's first view is then
+    /// also a first connection to a never-resized 24 x 80 startup pane, which
+    /// did not draw before ft-jh8jen was fixed in the server.
     func testTheLastPaneEndingOffersNewTabInsteadOfItsFrozenScreen() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_EMPTYING_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND to reach a disposable mux on the loopback host")
