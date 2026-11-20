@@ -1108,14 +1108,21 @@ final class TerminalSessionController {
     /// terminal's input is activated without showing it, then the text is sent.
     func paste(text: String) {
         guard !text.isEmpty, !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation,
-              !clipboardIsPresenting, !localInputNeedsDecision else { return }
+              !clipboardIsPresenting, !localInputNeedsDecision, !overviewBlocking, !paneNavigationBusy else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil
         if terminal?.input.canReviewPaste == true { clipboard?.paste(text: text); return }
-        let source = pump?.source
+        // The text belongs to the pane on screen now. Activating input waits,
+        // and the transport may show another pane meanwhile (a closed pane's
+        // replacement, a new tab); the text never follows it there.
+        let source = pump?.source, view = terminal, destination = displayedMuxDestination
         Task { [weak self] in
             await self?.focus?.activateKeyboard(showKeyboard: false, source: source)
             guard let self, !self.stopped, self.phase == .live, self.pump?.source == source else { return }
+            guard self.terminal === view, self.displayedMuxDestination == destination else {
+                self.interactionProblem = "The pane changed before the paste was sent. Paste again."
+                return
+            }
             if self.terminal?.input.canReviewPaste == true { self.clipboard?.paste(text: text) }
             else { self.interactionProblem = "This terminal is not ready for input yet. Paste again in a moment." }
         }
@@ -1494,6 +1501,11 @@ final class TerminalSessionController {
                 // The shown pane closed. The transport opens another one by
                 // itself; pending input stays bound to the closed pane.
                 requestedMuxPane = nil; requestedMuxNavigation = nil
+                // When it was the last pane there is none to open. Its frozen
+                // view is released so the machine offers New Tab instead.
+                if terminal != nil, muxState?.panes.isEmpty == true {
+                    followTransportPane(control: control)
+                }
             }
             return
         }
@@ -1509,7 +1521,8 @@ final class TerminalSessionController {
     /// The transport moved to another pane by itself: a tab this phone just
     /// opened, or another pane after the shown one closed. The old view,
     /// keyboard and clipboard are released as for a deliberate switch, then
-    /// the new pane is shown. Nothing typed for the old pane follows it.
+    /// the new pane is shown, if there is one: after the last pane closed the
+    /// machine shows New Tab. Nothing typed for the old pane follows it.
     private func followTransportPane(control: TerminalMuxControl) {
         guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil, requestedMuxPane == nil else { return }
         paneHandoff = Task { [weak self] in

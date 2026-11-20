@@ -1693,6 +1693,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         relay.down()
         for _ in 0..<200 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertTrue(first.dropped, "the connection was lost (\(first.phase))")
+        // The scenario happened: the line left the phone with no answer. The
+        // phone keeps that to itself; it shows nothing and asks for nothing.
+        XCTAssertTrue(first.inputDelivery.unanswered, "the line left the phone with no answer")
         XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain), "nothing for the person to do")
         await assertReleased(first, connections: live.connections)
 
