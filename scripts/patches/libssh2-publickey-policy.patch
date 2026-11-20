@@ -1,10 +1,9 @@
-diff --git a/include/libssh2.h b/include/libssh2.h
 --- a/include/libssh2.h
 +++ b/include/libssh2.h
-@@ -785,6 +785,19 @@
+@@ -723,6 +723,19 @@
                                      char *methods, size_t methods_capacity,
                                      size_t *methods_length);
- 
+
 +/* FrankenTerm exact user-authentication request algorithm policy. This
 + * additive API does not alter defaults unless explicitly called. The copied
 + * bounded CSV is checked after algorithm selection and before every unsigned
@@ -18,37 +17,35 @@ diff --git a/include/libssh2.h b/include/libssh2.h
 +libssh2_frankenterm_publickey_policy(LIBSSH2_SESSION *session,
 +                                   const char *algorithms, size_t length);
 +
- LIBSSH2_API int
- libssh2_userauth_hostbased_fromfile_ex(LIBSSH2_SESSION *session,
-                                        const char *username,
-diff --git a/src/libssh2_priv.h b/src/libssh2_priv.h
+ LIBSSH2_API int libssh2_userauth_hostbased_fromfile_ex(
+     LIBSSH2_SESSION *session,
+     const char *username,
 --- a/src/libssh2_priv.h
 +++ b/src/libssh2_priv.h
-@@ -856,6 +856,10 @@
+@@ -887,6 +887,10 @@
      size_t ft_auth_methods_length;
      char ft_auth_methods[LIBSSH2_FRANKENTERM_AUTH_METHODS_MAX + 1];
- 
+
 +    int ft_publickey_policy_active;
 +    size_t ft_publickey_policy_length;
 +    char ft_publickey_algorithms[LIBSSH2_FRANKENTERM_PUBLICKEY_ALGORITHMS_MAX];
 +
      /* State variables used in libssh2_userauth_keyboard_interactive_ex() */
-     libssh2_nonblocking_states userauth_kybd_state;
+     ssh2_NB_states userauth_kybd_state;
      unsigned char *userauth_kybd_data;
-diff --git a/src/userauth.c b/src/userauth.c
 --- a/src/userauth.c
 +++ b/src/userauth.c
-@@ -1624,6 +1624,70 @@
+@@ -1470,6 +1470,70 @@
      return result;
  }
- 
+
 +/* Exact request names are distinct from key-blob and signature-wrapper names.
 + * This check is deliberately outside the upgrade helper: it must cover the
 + * no-extension, legacy-server, and second-attempt fallback paths too. */
 +static int
 +frankenterm_publickey_algorithm_permitted(LIBSSH2_SESSION *session,
-+                                        const unsigned char *method,
-+                                        size_t method_length)
++                                          const char *method,
++                                          size_t method_length)
 +{
 +    size_t start = 0;
 +    if(!session->ft_publickey_policy_active)
@@ -77,13 +74,13 @@ diff --git a/src/userauth.c b/src/userauth.c
 +
 +LIBSSH2_API int
 +libssh2_frankenterm_publickey_policy(LIBSSH2_SESSION *session,
-+                                   const char *algorithms, size_t length)
++                                     const char *algorithms, size_t length)
 +{
 +    size_t i, component = 0;
 +    if(!session || (!algorithms && length) ||
 +       length >= LIBSSH2_FRANKENTERM_PUBLICKEY_ALGORITHMS_MAX ||
-+       session->userauth_pblc_state != libssh2_NB_state_idle ||
-+       (session->state & LIBSSH2_STATE_AUTHENTICATED))
++       session->userauth_pblc_state != ssh2_NB_state_idle ||
++       (session->state & SSH2_STATE_AUTHENTICATED))
 +        return LIBSSH2_ERROR_INVAL;
 +    for(i = 0; i < length; i++) {
 +        unsigned char value = (unsigned char)algorithms[i];
@@ -106,23 +103,22 @@ diff --git a/src/userauth.c b/src/userauth.c
 +    return 0;
 +}
 +
- int
- _libssh2_userauth_publickey(LIBSSH2_SESSION *session,
-                             const char *username,
-@@ -1704,6 +1768,16 @@
-                 return rc;
+ int ssh2_userauth_publickey(
+     LIBSSH2_SESSION *session,
+     const char *username, size_t username_len,
+@@ -1564,6 +1628,15 @@
+             }
          }
- 
+
 +        if(!frankenterm_publickey_algorithm_permitted(session,
 +                    session->userauth_pblc_method,
-+                    session->userauth_pblc_method_len)) {
-+            LIBSSH2_FREE(session, session->userauth_pblc_method);
-+            session->userauth_pblc_method = NULL;
-+            session->userauth_pblc_method_len = 0;
-+            return _libssh2_error(session, LIBSSH2_ERROR_METHOD_NONE,
-+                                  "Public key algorithm denied by policy");
++                    session->userauth_pblc_method ?
++                    strlen(session->userauth_pblc_method) : 0)) {
++            SSH2_SAFEFREE(session, session->userauth_pblc_method);
++            return ssh2_err(session, LIBSSH2_ERROR_METHOD_NONE,
++                            "Public key algorithm denied by policy");
 +        }
 +
-         if(session->userauth_pblc_method_len &&
-            session->userauth_pblc_method) {
-             _libssh2_debug((session,
+         if(session->userauth_pblc_method && *session->userauth_pblc_method) {
+             ssh2_deb((session, LIBSSH2_TRACE_KEX, "Signing using %s",
+                       session->userauth_pblc_method));

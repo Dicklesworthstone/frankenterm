@@ -1,6 +1,13 @@
 /* Exercise the actual patched libssh2 parser, without a production test API.
  * Compile with the prepared src/include directories and generated config,
  * then link the same static libssh2 archive plus its crypto dependencies.
+ * With P the prepared source scripts/build-apple-ssh-xcframework.sh prints
+ * ("==> libssh2 ... from P", which is B/sources/libssh2-auth-<digest>) and B
+ * its build directory, run from the package:
+ * clang -std=c11 -Wall -Wextra -Werror -DHAVE_CONFIG_H -DLIBSSH2_OPENSSL \
+ *   -I B/libssh2-auth-<digest>/macos-arm64/src \
+ *   -I P/src -I P/include -I B/install/macos-arm64/include \
+ *   Tests/Native/test_partial_auth_evidence.c B/merged/macos-arm64/libssh2-openssl.a
  */
 #include <assert.h>
 #include <stdint.h>
@@ -115,14 +122,14 @@ static void actual_attempt_freshness_and_exhaustion(void) {
     for(libssh2_uint64_t attempt = 1; attempt <= 3; attempt++) {
         /* Actual upstream attempt entry, with an early failure before any
          * allocation, network activity, or signing callback invocation. */
-        assert(_libssh2_userauth_publickey(&s, "operator", 8, NULL, 0, NULL, NULL)
+        assert(ssh2_userauth_publickey(&s, "operator", 8, NULL, 0, NULL, NULL)
             == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED);
         assert(libssh2_frankenterm_publickey_attempt(&s) == attempt); none(&s);
         frankenterm_record_publickey_failure(&s, wire, n, 1);
         assert(s.ft_auth_failure_attempt == attempt);
     }
     s.ft_auth_attempt = ~(libssh2_uint64_t)0;
-    assert(_libssh2_userauth_publickey(&s, "operator", 8, NULL, 0, NULL, NULL)
+    assert(ssh2_userauth_publickey(&s, "operator", 8, NULL, 0, NULL, NULL)
         == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED);
     assert(s.ft_auth_attempt_exhausted && s.ft_auth_attempt == ~(libssh2_uint64_t)0);
     frankenterm_record_publickey_failure(&s, wire, n, 1); none(&s);

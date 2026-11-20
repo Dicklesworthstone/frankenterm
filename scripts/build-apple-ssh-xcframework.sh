@@ -65,13 +65,13 @@ crate_source() {
 }
 
 # The libssh2 source the patches in scripts/patches were reviewed against:
-# the copy libssh2-sys 0.3.2 vendors (libssh2 1.11.1_DEV), pinned by its
-# crates.io checksum. It is pinned apart from Cargo.lock, which the desktop's
-# libssh2-sys follows: dependabot's 18c844c58 moved that to 0.3.4, whose
-# libssh2 these patches do not fit. Moving this source is a deliberate patch
-# review (ft-0su778), never a lockfile bump.
-LIBSSH2_SYS_VERSION=0.3.2
-LIBSSH2_SYS_SHA256=c04141a07bb0c0bc461cb657808764de571702a59bc5c726c400ac9a7625e3ab
+# the copy libssh2-sys 0.3.4 vendors (libssh2 1.11.2_DEV), pinned by its
+# crates.io checksum (ft-0su778). It is pinned apart from Cargo.lock, which
+# the desktop's libssh2-sys follows, so a lockfile bump never changes this
+# source. Moving it is a deliberate patch review: the patches apply only to
+# the five files whose sums are in scripts/patches.
+LIBSSH2_SYS_VERSION=0.3.4
+LIBSSH2_SYS_SHA256=fce5a0b125f6aeac93b304b35f7f1e9f054aad29ddac57091928e41df3ccd233
 pinned_crate_source() {
     local name="$1" version="$2" sha256="$3"
     local home="${CARGO_HOME:-$HOME/.cargo}" candidate

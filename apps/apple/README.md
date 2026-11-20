@@ -135,11 +135,13 @@ the remote path automatically. Metadata comparisons detect ordinary concurrent
 changes; they do not promise a server-side immutable snapshot or disk durability.
 
 Rebuild the native SSH artifact with `scripts/build-apple-ssh-xcframework.sh`.
-The reviewed libssh2 source patch checks a READLINK/REALPATH response's declared
-string extent before copying and releases malformed READ response buffers on
-all three affected error exits. SFTP startup owns its partial and queued
-response buffers before VERSION completes, so interruption during startup also
-releases them. The source hashes and prepared-cache checks include `src/sftp.c`.
+It builds libssh2 1.11.2_DEV, the copy libssh2-sys 0.3.4 vendors, pinned by
+its crates.io checksum. That libssh2 checks a READLINK/REALPATH response's
+declared string extent before copying and releases malformed READ response
+buffers on its error exits. The reviewed source patch makes SFTP startup own
+its partial and queued response buffers before VERSION completes, so
+interruption during startup also releases them. The source hashes and
+prepared-cache checks include `src/sftp.c`.
 Both a header declaration and a linked version marker are required before SFTP
 is available; an older native library is refused before file-connection
 networking or authentication. Preparation retains the host-certificate patch
@@ -845,7 +847,7 @@ Native artifacts are built locally on a Mac (RCH workers cannot link Apple targe
 
 ```sh
 scripts/build-apple-terminal-xcframework.sh   # frankenterm-term native-ffi -> FrankenTermTerminal/Artifacts
-scripts/build-apple-ssh-xcframework.sh        # libssh2 + OpenSSL (Cargo.lock-pinned sources) -> FrankenTermSSH/Artifacts
+scripts/build-apple-ssh-xcframework.sh        # libssh2 + OpenSSL (checksum-pinned crates.io sources) -> FrankenTermSSH/Artifacts
 xcodebuild test -project apps/apple/FrankenTerm.xcodeproj -scheme FrankenTerm \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```

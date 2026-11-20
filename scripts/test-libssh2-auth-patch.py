@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Exercise the actual RSA-certificate negotiation helpers after applying our patch.
+"""Exercise the RSA signature-upgrade helpers and our public-key policy after patching.
 
 Usage: python3 scripts/test-libssh2-auth-patch.py UPSTREAM_LIBSSH2_SOURCE
 
 The input must be the exact libssh2-sys snapshot accepted by the production
 preparer. No download, registry edit or full native build occurs. The small C
-harness checks request/wrapper names, allocation failures and peer duplicates;
-it is a diagnostic, not Apple-native, SSH integration or RCH proof. Generated
-source and executable are retained in a fresh temporary directory for review.
+harness checks request/wrapper names, the SHA-1 default, allocation failures,
+peer duplicates and the exact request policy; it is a diagnostic, not
+Apple-native, SSH integration or RCH proof. Generated source and executable are
+retained in a fresh temporary directory for review.
 """
 
 import argparse
@@ -16,6 +17,16 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+
+
+def extract(source: str, first: str, last: str, what: str) -> str:
+    """Return source[first, last), where each marker occurs exactly once."""
+    if source.count(first) != 1 or source.count(last) != 1:
+        raise RuntimeError(f"{what} boundaries changed; review the extraction")
+    start, end = source.index(first), source.index(last)
+    if end <= start:
+        raise RuntimeError(f"invalid {what} extent")
+    return source[start:end]
 
 
 def main() -> None:
@@ -30,23 +41,33 @@ def main() -> None:
          str(args.upstream_source.resolve(strict=True)), str(work / "sources")],
         check=True, text=True, stdout=subprocess.PIPE,
     )
-    source = (Path(prepared.stdout.strip()) / "src/userauth.c").read_text()
-    first = "size_t plain_method(char *method, size_t method_len)"
-    last = "/* This additive API deliberately preserves all upstream userauth return codes."
-    if source.count(first) != 1 or source.count(last) != 1:
-        raise RuntimeError("patched helper boundaries changed; review the extraction")
-    start, end = source.index(first), source.index(last)
-    if end <= start:
-        raise RuntimeError("invalid patched helper extent")
-    policy_first = "/* Exact request names are distinct from key-blob and signature-wrapper names."
-    policy_last = "int\n_libssh2_userauth_publickey("
-    if source.count(policy_first) != 1 or source.count(policy_last) != 1:
-        raise RuntimeError("public-key policy helper boundaries changed; review the extraction")
-    policy_start, policy_end = source.index(policy_first), source.index(policy_last)
-    if policy_end <= policy_start:
-        raise RuntimeError("invalid public-key policy helper extent")
+    prepared_root = Path(prepared.stdout.strip())
+    misc = (prepared_root / "src/misc.c").read_text()
+    number_definition = "int ssh2_str_number(const char **linep,"
+    number = extract(
+        misc,
+        "/* given an ASCII character and max ascii, return TRUE if valid */",
+        number_definition,
+        "version-number parser",
+    )
+    body_start = misc.index(number_definition)
+    body_end = misc.index("\n}\n", body_start) + len("\n}\n")
+    number += misc[body_start:body_end]
+    userauth = (prepared_root / "src/userauth.c").read_text()
+    helpers = extract(
+        userauth,
+        "void ssh2_userauth_plain_method(char *method)\n{",
+        "/* This additive API deliberately preserves all upstream userauth return codes.",
+        "signature-upgrade helper",
+    )
+    policy = extract(
+        userauth,
+        "/* Exact request names are distinct from key-blob and signature-wrapper names.",
+        "int ssh2_userauth_publickey(\n",
+        "public-key policy helper",
+    )
     (work / "libssh2-algorithms-under-test.h").write_text(
-        source[start:end] + "\n" + source[policy_start:policy_end]
+        number + "\n" + helpers + "\n" + policy
     )
     compiler = shlex.split(args.cc)
     if not compiler:
@@ -54,7 +75,8 @@ def main() -> None:
     executable = work / "key-sign-algorithms"
     subprocess.run(
         compiler + ["-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-I", str(work), str(scripts / "fixtures/libssh2-key-sign-algorithms.c"),
+                    "-I", str(work), "-I", str(prepared_root / "include"),
+                    str(scripts / "fixtures/libssh2-key-sign-algorithms.c"),
                     "-o", str(executable)],
         check=True,
     )

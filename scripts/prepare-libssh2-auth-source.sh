@@ -1,7 +1,7 @@
 #!/bin/bash
-# Prepare libssh2's signed-key MFA evidence, corrected RSA-certificate
-# signature negotiation, exact public-key algorithm policy, host-certificate
-# KEX, and bounded SFTP responses.
+# Prepare libssh2's signed-key MFA evidence, exact public-key algorithm
+# policy, host-certificate signature binding, and early ownership of a
+# starting SFTP handle.
 # One digest binds all patches and their linked capability markers.
 # The Cargo registry remains untouched. The patch accepts only the reviewed
 # source bytes, and every cached result is checked before reuse.
