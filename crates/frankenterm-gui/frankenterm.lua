@@ -52,7 +52,10 @@ frankenterm.on('open-uri', function(window, pane, uri)
   if uri:find '^https?:' then
     return true
   end
-  if uri:find '^file:' == 1 and not pane:is_alt_screen_active() then
+  -- Windows has no `file` command to tell a directory from a text file, and
+  -- an error here would drop the click, so Windows opens file links the
+  -- default way: with the program the file type is associated with.
+  if not is_windows and uri:find '^file:' == 1 and not pane:is_alt_screen_active() then
     local url = frankenterm.url.parse(uri)
     if is_shell(pane:get_foreground_process_name()) then
       local success, stdout, _ = frankenterm.run_child_process {
@@ -180,12 +183,14 @@ config.cursor_blink_rate = 500
 config.window_decorations = is_windows and 'INTEGRATED_BUTTONS|RESIZE' or 'RESIZE'
 
 -- Windows: start PowerShell 7 when it is installed, else Windows PowerShell
--- (the Windows default would be cmd.exe). Every 7.x installs into the same
--- directory. The config is evaluated synchronously, so it must not call
--- async helpers such as frankenterm.glob or read_dir here: they fail with
--- "attempt to yield from outside a coroutine" and the whole file is lost.
+-- (the Windows default would be cmd.exe). Every 7.x installs into
+-- %ProgramFiles%\PowerShell\7. The config is evaluated synchronously, so it
+-- must not call async helpers such as frankenterm.glob or read_dir here: they
+-- fail with "attempt to yield from outside a coroutine" and the whole file is
+-- lost.
 if is_windows then
-  local pwsh = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+  local program_files = os.getenv('ProgramFiles') or 'C:\\Program Files'
+  local pwsh = program_files .. '\\PowerShell\\7\\pwsh.exe'
   local found = io.open(pwsh, 'rb')
   if found then
     found:close()
