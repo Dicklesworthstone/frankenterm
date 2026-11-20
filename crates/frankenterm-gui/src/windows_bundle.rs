@@ -50,25 +50,44 @@ fn unpack(base: &Path) -> anyhow::Result<PathBuf> {
     if dir.join(COMPLETE).is_file() {
         return Ok(dir);
     }
-    // Directories appear complete by rename, so only outside changes leave
-    // an unfinished one; it is written again.
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
-    }
     let staging = base.join(format!(".staging-{}", std::process::id()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .with_context(|| format!("clearing {}", staging.display()))?;
     }
-    write_bundle(&staging)?;
-    if let Err(err) = std::fs::rename(&staging, &dir) {
-        // Another window may have finished the same directory first.
+    let installed = write_bundle(&staging).and_then(|()| install_staged(&staging, &dir));
+    if installed.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
-        if !dir.join(COMPLETE).is_file() {
-            return Err(err).with_context(|| format!("installing {}", dir.display()));
-        }
     }
-    Ok(dir)
+    installed.map(|()| dir)
+}
+
+/// Moves a finished `staging` directory to `dir`. Another GUI process
+/// starting at the same time may have installed `dir` first; its directory is
+/// kept and used, since it may already be in use. A directory is only ever
+/// created by this rename, marker included, so one without the marker was
+/// changed from outside and is replaced.
+fn install_staged(staging: &Path, dir: &Path) -> anyhow::Result<()> {
+    // A failed rename is fine when another process's finished directory is
+    // in place: this copy is cleared (it costs only disk space) and that one
+    // is used.
+    let installed_by_another = |err: std::io::Error| {
+        if dir.join(COMPLETE).is_file() {
+            let _ = std::fs::remove_dir_all(staging);
+            Ok(())
+        } else {
+            Err(err).with_context(|| format!("installing {}", dir.display()))
+        }
+    };
+    let Err(err) = std::fs::rename(staging, dir) else {
+        return Ok(());
+    };
+    if dir.join(COMPLETE).is_file() || !dir.exists() {
+        return installed_by_another(err);
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("clearing {}", dir.display()))?;
+    // Another process may have replaced the same unfinished directory first.
+    std::fs::rename(staging, dir).or_else(installed_by_another)
 }
 
 fn write_bundle(dir: &Path) -> anyhow::Result<()> {
@@ -132,6 +151,25 @@ mod tests {
             std::fs::metadata(&marker).unwrap().modified().unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn a_directory_another_process_installed_first_is_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = unpack(base.path()).unwrap();
+        // The first process is using its directory.
+        let in_use = dir.join("in-use");
+        std::fs::write(&in_use, b"").unwrap();
+
+        // A second process found no marker just before the first one's
+        // rename, wrote its own copy, and now installs it.
+        let staging = base.path().join(".staging-second");
+        write_bundle(&staging).unwrap();
+        install_staged(&staging, &dir).unwrap();
+
+        assert!(in_use.is_file(), "the first directory is kept");
+        assert!(dir.join(COMPLETE).is_file());
+        assert!(!staging.exists(), "the second copy is cleared");
     }
 
     #[test]
