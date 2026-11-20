@@ -1118,7 +1118,21 @@ final class TerminalSessionController {
         let source = pump?.source, view = terminal, destination = displayedMuxDestination
         Task { [weak self] in
             await self?.focus?.activateKeyboard(showKeyboard: false, source: source)
-            guard let self, !self.stopped, self.phase == .live, self.pump?.source == source else { return }
+            // Paste needs the caret, which the view places with its next drawn
+            // frame: the first live one, or the redraw after a resize or a new
+            // text size. A paste made just before that waits for it briefly
+            // instead of asking the user to paste again. Switching to View Only
+            // or reaching an input decision meanwhile drops it, as it would
+            // have been refused had it come then.
+            for _ in 0..<100 {
+                guard let self, !self.stopped, self.phase == .live, self.pump?.source == source,
+                      !self.isViewingOnly, !self.localInputNeedsDecision,
+                      self.terminal === view, self.displayedMuxDestination == destination,
+                      self.terminal?.input.canReviewPaste != true else { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard let self, !self.stopped, self.phase == .live, self.pump?.source == source,
+                  !self.isViewingOnly, !self.localInputNeedsDecision else { return }
             guard self.terminal === view, self.displayedMuxDestination == destination else {
                 self.interactionProblem = "The pane changed before the paste was sent. Paste again."
                 return

@@ -1250,8 +1250,14 @@ final class TerminalSessionControllerTests: XCTestCase {
 
         session.paste(text: "echo PASTE-\(run)-$((40+2)) > \(path)")
         XCTAssertFalse(session.clipboardIsPresenting, "nothing to review")
-        try await Task.sleep(for: .seconds(2))
+        // A paste made before the caret is placed waits for it, so Return is
+        // typed only once the pasted text is on screen.
+        let pasted = try await rows(of: terminal) {
+            $0.joined().contains("PASTE-\(run)") || session.interactionProblem != nil
+        }
         XCTAssertNil(session.interactionProblem)
+        XCTAssertTrue(pasted.joined().contains("PASTE-\(run)"), "the pasted text is shown")
+        try await Task.sleep(for: .seconds(1))
         XCTAssertFalse(session.clipboardIsPresenting)
         let unsubmitted = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         XCTAssertFalse(unsubmitted.contains("PASTE-\(run)-42"), "a paste adds no Return, so the line has not run")
