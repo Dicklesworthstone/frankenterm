@@ -931,7 +931,7 @@ fn steer_plan_clean_ready_blocks_when_persisted_kill_switch_is_hard_stop() {
     // Persist a HardStop kill switch into the workspace DB before planning.
     let db_path = Config::default().effective_db_path(w.path());
     let conn = rusqlite::Connection::open(&db_path).expect("open workspace DB");
-    let mut ks = frankenterm_core::policy_quarantine::KillSwitch::new();
+    let mut ks = frankenterm_core::policy_quarantine::KillSwitch::disarmed();
     ks.trip(
         frankenterm_core::policy_quarantine::KillSwitchLevel::HardStop,
         "operator",
