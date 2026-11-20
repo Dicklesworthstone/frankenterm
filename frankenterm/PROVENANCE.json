@@ -4,17 +4,17 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 4,
+        "fix": 6,
         "other": 5,
         "runtime-swap": 3
       },
-      "fork_side_commit_count": 13,
+      "fork_side_commit_count": 15,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-07-28T10:14:22-04:00",
-        "sha": "12afdb51f775db09b07abe6b4e2c864287ab8c4e",
-        "subject": "perf(mux): bound interactive delivery and harden topology lifecycle"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "async_ossl",
       "path": "frankenterm/async_ossl",
@@ -23,17 +23,17 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "fix": 4,
+        "fix": 6,
         "other": 1,
         "test": 5
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 12,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-03-27T13:51:05-04:00",
-        "sha": "43a9d5264bd4890dfb55b5c4396a43f35d733733",
-        "subject": "fix: eliminate 6 panic-on-unwrap sites and 3 arithmetic correctness bugs"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "base91",
       "path": "frankenterm/base91",
@@ -42,19 +42,19 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "fix": 4,
+        "fix": 6,
         "other": 1,
         "rename": 1,
         "security-fix": 1,
         "test": 3
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 12,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-08-07T09:16:59-04:00",
-        "sha": "229c714f91010da65e316ff6c505f1b000d718df",
-        "subject": "fix(mux): keep prepared tree callbacks outside tab lock"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-bidi",
       "path": "frankenterm/bidi",
@@ -64,17 +64,17 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 3,
+        "fix": 5,
         "other": 1,
         "test": 5
       },
-      "fork_side_commit_count": 10,
+      "fork_side_commit_count": 12,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-04-21T16:30:49-04:00",
-        "sha": "0b65bc0b284d0551c25893455f36bb9a0a6f0551",
-        "subject": "fix(pane_tiers): port 4 test helper sites to DashMap API (ft-x2fvv)"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "bintree",
       "path": "frankenterm/bintree",
@@ -84,18 +84,18 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 2,
-        "fix": 9,
+        "fix": 14,
         "other": 1,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 19,
+      "fork_side_commit_count": 24,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-08T17:36:56-04:00",
-        "sha": "4292de04e8cec4b82fe50fcb969d4f3cad883f9b",
-        "subject": "feat(cell,blob-leases): support alloc serde deserialization in TeenyString"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-blob-leases",
       "path": "frankenterm/blob-leases",
@@ -107,20 +107,20 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 7,
-        "fix": 19,
+        "fix": 23,
         "other": 9,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 47,
+      "fork_side_commit_count": 51,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-17T20:02:13-04:00",
-        "sha": "e6a2f92dee8ac233376633dad6c22273a58a3867",
-        "subject": "feat(checkpoint): keep Kitty images, placements, and cell image layers"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 10,
+        "fix": 12,
         "other": 7,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 29,
+      "fork_side_commit_count": 31,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-19T17:00:43-04:00",
-        "sha": "9f378263c8c6a097ef93cdc04cf12180358b2f23",
-        "subject": "fix(char-props): restore the phf =0.13.1 pin the dependabot group bump moved again"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -154,24 +154,24 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 2,
-        "cosmetic": 21,
+        "cosmetic": 22,
         "docs": 1,
-        "feat": 57,
-        "fix": 137,
-        "other": 17,
+        "feat": 58,
+        "fix": 159,
+        "other": 20,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 42
+        "test": 43
       },
-      "fork_side_commit_count": 293,
+      "fork_side_commit_count": 321,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-11-01T07:52:58-05:00",
-        "sha": "9613efc91971f3cf35cd889c94618591ce78367a",
-        "subject": "test(client): await metadata scheduling"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -182,10 +182,10 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 1,
-        "cosmetic": 22,
+        "cosmetic": 23,
         "docs": 2,
-        "feat": 48,
-        "fix": 68,
+        "feat": 50,
+        "fix": 81,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -193,13 +193,13 @@
         "security-fix": 1,
         "test": 87
       },
-      "fork_side_commit_count": 260,
+      "fork_side_commit_count": 276,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-11-01T08:43:44-05:00",
-        "sha": "7671c6038f3097ffae56581770d19e2b97cda816",
-        "subject": "test(codec): move the non-canonical LEB128 fixture off ident 117"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -209,19 +209,19 @@
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 3,
+        "fix": 5,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 14,
+      "fork_side_commit_count": 16,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-color-types",
       "path": "frankenterm/color-types",
@@ -234,22 +234,22 @@
         "cleanup": 1,
         "cosmetic": 9,
         "docs": 1,
-        "feat": 75,
-        "fix": 63,
+        "feat": 78,
+        "fix": 68,
         "other": 17,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
-        "test": 15
+        "test": 16
       },
-      "fork_side_commit_count": 200,
+      "fork_side_commit_count": 209,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-11-01T06:28:42-05:00",
-        "sha": "fc506f17fd61ca428405d616daf1beef1e895d4d",
-        "subject": "fix(mobile): stabilize theme catalog JSON order"
+        "classification": "feat",
+        "committed_at": "2026-11-18T23:39:08-05:00",
+        "sha": "6d444ad6389b69065311e19664b35a3cdbf36485",
+        "subject": "feat(gui,config): give Windows the Mac app's look by default (ft-vb1xj8)"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -260,18 +260,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 5,
+        "fix": 7,
         "other": 3,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-04T12:21:37-04:00",
-        "sha": "5871557dbe67f26cf5efc98fbde7809d9f686109",
-        "subject": "style(config-derive): satisfy release rustfmt proof"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-config-derive",
       "path": "frankenterm/config/derive",
@@ -280,15 +280,16 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-03-02T14:01:56-05:00",
-        "sha": "80b0bcc9463434a945892c4fe0243eb42300d202",
-        "subject": "feat(workspace): vendor GUI layer crates into workspace (ft-1memj.2)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "fontconfig",
       "path": "frankenterm/deps-fontconfig",
@@ -298,17 +299,17 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "feat": 3,
-        "fix": 4,
+        "fix": 6,
         "security-fix": 1,
         "test": 1
       },
-      "fork_side_commit_count": 9,
+      "fork_side_commit_count": 11,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-13T21:04:55-04:00",
-        "sha": "ad2b366bc8df91e5be6a5c18b686de267ca60375",
-        "subject": "fix(font): update vendored FreeType 2.13.3 -> 2.14.3"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "freetype",
       "path": "frankenterm/deps-freetype",
@@ -319,16 +320,16 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 8,
+        "fix": 10,
         "test": 1
       },
-      "fork_side_commit_count": 13,
+      "fork_side_commit_count": 15,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-30T16:51:29-04:00",
-        "sha": "f3f2d31012ddc70fef7e1b3201f0dc91d8310783",
-        "subject": "fix(release): preserve portable source and classify parent-gated imports"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "harfbuzz",
       "path": "frankenterm/deps-harfbuzz",
@@ -341,19 +342,19 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 1,
-        "fix": 1,
+        "fix": 3,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "test": 3
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-29T22:55:03-04:00",
-        "sha": "d89487407ecba35b470fd101a583487557ab9b4a",
-        "subject": "fix(dynamic): let a deprecated field without a default compile, unbreaking config"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-dynamic",
       "path": "frankenterm/dynamic",
@@ -364,18 +365,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 1,
+        "fix": 3,
         "other": 1,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 6,
+      "fork_side_commit_count": 8,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-29T22:55:03-04:00",
-        "sha": "d89487407ecba35b470fd101a583487557ab9b4a",
-        "subject": "fix(dynamic): let a deprecated field without a default compile, unbreaking config"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-dynamic-derive",
       "path": "frankenterm/dynamic/derive",
@@ -385,15 +386,15 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
-        "fix": 1
+        "fix": 3
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-04-02T23:46:10-04:00",
-        "sha": "eb97fb6966e8538046ffa8a6cf779c29186947cd",
-        "subject": "fix(env-bootstrap): graduate setup_logger from no-op stub to real env_logger init (ft-akx00.3.2)"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "env-bootstrap",
       "path": "frankenterm/env-bootstrap",
@@ -406,20 +407,20 @@
         "cosmetic": 6,
         "docs": 1,
         "feat": 8,
-        "fix": 22,
+        "fix": 24,
         "other": 13,
         "refactor": 1,
         "rename": 1,
         "security-fix": 57,
         "test": 6
       },
-      "fork_side_commit_count": 117,
+      "fork_side_commit_count": 119,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "security-fix",
-        "committed_at": "2026-10-20T13:58:56-04:00",
-        "sha": "571fef19efa5cfde879bb2134be3adaa1d0b2d06",
-        "subject": "perf(escape-parser): the 256-color SGR shortcut matches fixed patterns"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -429,17 +430,17 @@
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
         "feat": 3,
-        "fix": 7,
+        "fix": 9,
         "other": 2,
         "test": 4
       },
-      "fork_side_commit_count": 16,
+      "fork_side_commit_count": 18,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-25T01:45:04-04:00",
-        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
-        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "filedescriptor",
       "path": "frankenterm/filedescriptor",
@@ -452,19 +453,19 @@
         "cosmetic": 8,
         "docs": 1,
         "feat": 5,
-        "fix": 24,
+        "fix": 31,
         "other": 10,
         "refactor": 1,
         "rename": 1,
-        "test": 2
+        "test": 4
       },
-      "fork_side_commit_count": 53,
+      "fork_side_commit_count": 62,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-29T19:40:19-04:00",
-        "sha": "9af5ecf6ff6026ed64123952749bd2260609dd46",
-        "subject": "fix(term): satisfy clippy on the browser model and the codec assertion"
+        "committed_at": "2026-11-18T22:29:13-05:00",
+        "sha": "35657c4b106cdbf0205fec6687db8a1d5daac1a2",
+        "subject": "fix(font,window): pass parse_log_font the device's LOGPIXELSY, not its HDC (ft-dc4bs)"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -475,15 +476,15 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 1
+        "fix": 3
       },
-      "fork_side_commit_count": 3,
+      "fork_side_commit_count": 5,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-03-05T13:27:37-05:00",
-        "sha": "014db1cb9519a2382c0682f75d6aa6b54779de70",
-        "subject": "Rustfmt pass + distributed message size limits + kill_on_drop fixes"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frecency",
       "path": "frankenterm/frecency",
@@ -493,16 +494,17 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 3,
+        "fix": 2,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 5,
+      "fork_side_commit_count": 7,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-09-01T18:46:02-04:00",
-        "sha": "f862716ce873f76f5fbe9bb8fdffc044e4072fb3",
-        "subject": "refactor(socket): centralize GUI socket naming in config and track discovered mux socket on UnifiedClient"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-gui-subcommands",
       "path": "frankenterm/gui-subcommands",
@@ -514,19 +516,19 @@
         "chore": 1,
         "cosmetic": 1,
         "feat": 1,
-        "fix": 6,
+        "fix": 8,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 17,
+      "fork_side_commit_count": 19,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-03T22:08:30-04:00",
-        "sha": "94bf79a0b05e6963aa4dcbe1d8bacd8392566b6c",
-        "subject": "fix(input-types): kitty disambiguate mode sends ESC as CSI 27;1u"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-input-types",
       "path": "frankenterm/input-types",
@@ -537,17 +539,17 @@
       "classification_summary": {
         "cosmetic": 2,
         "feat": 4,
-        "fix": 2,
+        "fix": 4,
         "other": 3,
         "refactor": 3
       },
-      "fork_side_commit_count": 14,
+      "fork_side_commit_count": 16,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-12T08:20:01-04:00",
-        "sha": "cc87ad61641589efeae514e800e501323114a741",
-        "subject": "perf(gui,lfucache): count cache lookups in place and emit .rate metrics every 256, cutting the GUI main thread's metrics overhead from 4.8% to 0.3%"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "lfucache",
       "path": "frankenterm/lfucache",
@@ -556,15 +558,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "color-funcs",
       "path": "frankenterm/lua-api-crates/color-funcs",
@@ -574,15 +577,16 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
+        "fix": 2,
         "test": 1
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-10-30T15:50:35-04:00",
-        "sha": "5109abb50e4cf2fbb7bbd143bcf818265a2a00b5",
-        "subject": "test(lua): poll filesystem and spawn futures on the futures executor"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "filesystem",
       "path": "frankenterm/lua-api-crates/filesystem",
@@ -593,18 +597,18 @@
       "classification_summary": {
         "cosmetic": 3,
         "feat": 8,
-        "fix": 13,
+        "fix": 15,
         "other": 5,
         "refactor": 3,
         "test": 2
       },
-      "fork_side_commit_count": 34,
+      "fork_side_commit_count": 36,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-19T22:47:09-04:00",
-        "sha": "6767dea4cf79f2f497e832d8945dcf5a3b0babf9",
-        "subject": "fix(mux): admit ordered alerts before terminal mutation"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "mux-lua",
       "path": "frankenterm/lua-api-crates/mux-lua",
@@ -613,15 +617,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "procinfo-funcs",
       "path": "frankenterm/lua-api-crates/procinfo-funcs",
@@ -630,15 +635,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "serde-funcs",
       "path": "frankenterm/lua-api-crates/serde-funcs",
@@ -647,15 +653,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "share-data",
       "path": "frankenterm/lua-api-crates/share-data",
@@ -665,15 +672,16 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
+        "fix": 2,
         "test": 1
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-10-30T15:50:35-04:00",
-        "sha": "5109abb50e4cf2fbb7bbd143bcf818265a2a00b5",
-        "subject": "test(lua): poll filesystem and spawn futures on the futures executor"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "spawn-funcs",
       "path": "frankenterm/lua-api-crates/spawn-funcs",
@@ -682,15 +690,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "fix": 2
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 3,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "ssh-funcs",
       "path": "frankenterm/lua-api-crates/ssh-funcs",
@@ -700,20 +709,20 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
-        "fix": 1,
+        "fix": 3,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "runtime-swap": 2,
         "test": 1
       },
-      "fork_side_commit_count": 8,
+      "fork_side_commit_count": 10,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "termwiz-funcs",
       "path": "frankenterm/lua-api-crates/termwiz-funcs",
@@ -723,15 +732,16 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
+        "fix": 2,
         "refactor": 1
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "url-funcs",
       "path": "frankenterm/lua-api-crates/url-funcs",
@@ -741,15 +751,16 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
+        "fix": 2,
         "refactor": 1
       },
-      "fork_side_commit_count": 2,
+      "fork_side_commit_count": 4,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-03-02T14:51:01-05:00",
-        "sha": "5f6ed1f5ce27876b4448919ddd4268c4bc65f0f0",
-        "subject": "refactor: simplify Lua API crate module imports via extern crate aliases"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "window-funcs",
       "path": "frankenterm/lua-api-crates/window-funcs",
@@ -760,18 +771,18 @@
       "classification_summary": {
         "cosmetic": 2,
         "feat": 2,
-        "fix": 3,
+        "fix": 5,
         "other": 2,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-12T15:27:50-04:00",
-        "sha": "fd49880b2110fb1f07b8f97f033056113f38275f",
-        "subject": "feat(config): selection-related TOML and lua enum construction"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "luahelper",
       "path": "frankenterm/luahelper",
@@ -782,24 +793,24 @@
       "classification_summary": {
         "chore": 10,
         "cleanup": 3,
-        "cosmetic": 33,
+        "cosmetic": 34,
         "docs": 7,
-        "feat": 229,
-        "fix": 342,
-        "other": 82,
+        "feat": 232,
+        "fix": 366,
+        "other": 85,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 116
+        "test": 121
       },
-      "fork_side_commit_count": 846,
+      "fork_side_commit_count": 882,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-11-01T06:00:56-05:00",
-        "sha": "e9bf5b79d705600472acca6d8c884cf10eb14b7f",
-        "subject": "fix(guardian): a full disk stalls a guardian pane's output instead of freezing it for good"
+        "committed_at": "2026-11-20T12:50:34-05:00",
+        "sha": "7ac5fc825ac8b7ee5023232ad5f20d12ee655a45",
+        "subject": "fix(mux): an idle pane's coherent render facts carry its current sequence (ft-jh8jen)"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -809,18 +820,18 @@
       "authors_raw": null,
       "classification_summary": {
         "feat": 1,
-        "fix": 2,
+        "fix": 4,
         "other": 2,
         "rename": 1,
         "test": 1
       },
-      "fork_side_commit_count": 7,
+      "fork_side_commit_count": 9,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "rename",
-        "committed_at": "2026-05-01T07:57:46-04:00",
-        "sha": "b41ea8d7904cd4f1adb02372af403d8d81fe779f",
-        "subject": "refactor(vendored): rename wezterm-* crates to frankenterm-* (br-ft-i2eni.4)"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-open-url",
       "path": "frankenterm/open-url",
@@ -831,20 +842,20 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 8,
+        "fix": 11,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "runtime-swap": 1,
         "test": 5
       },
-      "fork_side_commit_count": 23,
+      "fork_side_commit_count": 26,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-15T09:32:23-04:00",
-        "sha": "68211106847a2c2b2ecaff495dcb516ca32110c1",
-        "subject": "fix(mux): background threads stay below input when ananicy re-nices the server (ft-4p4uo)"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "procinfo",
       "path": "frankenterm/procinfo",
@@ -855,19 +866,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 9,
-        "fix": 27,
+        "fix": 29,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 5,
-        "test": 8
+        "test": 9
       },
-      "fork_side_commit_count": 62,
+      "fork_side_commit_count": 65,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "runtime-swap",
-        "committed_at": "2026-10-08T02:48:36-04:00",
-        "sha": "bd7d270ec15b6607cff98bc0725b85085a9445ea",
-        "subject": "perf(promise,gui,procinfo): every busy GUI pool thread starts with an explicit QoS class: promise's two asupersync runtimes and its background I/O thread at user-initiated, frame decoding and background gradients at user-initiated, background image decodes at utility; none runs at the host's default 31 (ft-yccm0.6 slice 3) code-first, batch-verify pending, native proof pending"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -878,19 +889,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 7,
-        "fix": 26,
+        "fix": 28,
         "other": 5,
         "refactor": 2,
         "runtime-swap": 1,
         "test": 17
       },
-      "fork_side_commit_count": 63,
+      "fork_side_commit_count": 65,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-18T22:39:07-04:00",
-        "sha": "99ade443aaf17e3e48ab2f5822feb5cd82495ccb",
-        "subject": "fix(pty): a command's Debug names its environment, never the values"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -901,18 +912,18 @@
       "classification_summary": {
         "cleanup": 1,
         "cosmetic": 3,
-        "fix": 4,
+        "fix": 6,
         "other": 3,
         "refactor": 1,
         "test": 5
       },
-      "fork_side_commit_count": 17,
+      "fork_side_commit_count": 19,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "rangeset",
       "path": "frankenterm/rangeset",
@@ -923,16 +934,17 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
+        "fix": 2,
         "refactor": 1,
         "test": 1
       },
-      "fork_side_commit_count": 4,
+      "fork_side_commit_count": 6,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "ratelim",
       "path": "frankenterm/ratelim",
@@ -944,19 +956,19 @@
         "cosmetic": 1,
         "docs": 1,
         "feat": 7,
-        "fix": 23,
+        "fix": 25,
         "refactor": 2,
         "runtime-swap": 2,
         "security-fix": 5,
         "test": 8
       },
-      "fork_side_commit_count": 49,
+      "fork_side_commit_count": 51,
       "last_modified": {
-        "author": "Dicklesworthstone",
+        "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-24T00:42:19-04:00",
-        "sha": "84fbfd1782d20211dcdba1ad351b0c7230389f13",
-        "subject": "fix: compile zip 9 names and SSE mpsc send"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-scripting",
       "path": "frankenterm/scripting",
@@ -968,7 +980,7 @@
         "chore": 1,
         "cosmetic": 5,
         "feat": 7,
-        "fix": 22,
+        "fix": 24,
         "other": 4,
         "refactor": 3,
         "rename": 1,
@@ -976,13 +988,13 @@
         "security-fix": 1,
         "test": 8
       },
-      "fork_side_commit_count": 59,
+      "fork_side_commit_count": 61,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T06:11:15-04:00",
-        "sha": "ce304e44f5278c64798bff60c48a41761aadd001",
-        "subject": "fix(ssh): preserve symlink payload and destination ordering in libssh"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-ssh",
       "path": "frankenterm/ssh",
@@ -995,20 +1007,20 @@
         "cleanup": 1,
         "cosmetic": 10,
         "feat": 16,
-        "fix": 59,
+        "fix": 63,
         "other": 55,
         "refactor": 4,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 176,
+      "fork_side_commit_count": 180,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-10-28T03:05:14-04:00",
-        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
-        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1019,16 +1031,16 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 1,
+        "fix": 3,
         "other": 1
       },
-      "fork_side_commit_count": 4,
+      "fork_side_commit_count": 6,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-03-05T13:27:37-05:00",
-        "sha": "014db1cb9519a2382c0682f75d6aa6b54779de70",
-        "subject": "Rustfmt pass + distributed message size limits + kill_on_drop fixes"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "tabout",
       "path": "frankenterm/tabout",
@@ -1039,23 +1051,23 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 3,
-        "cosmetic": 22,
+        "cosmetic": 23,
         "docs": 4,
-        "feat": 101,
-        "fix": 189,
-        "other": 135,
+        "feat": 103,
+        "fix": 200,
+        "other": 136,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 87
       },
-      "fork_side_commit_count": 555,
+      "fork_side_commit_count": 570,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-10-31T23:21:57-04:00",
-        "sha": "01d9c7db2abbcd8d051bb0d43ba30b2301c517ce",
-        "subject": "style(term, config): restore edition-2018 formatting the workspace proof checks"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1068,21 +1080,21 @@
         "cleanup": 1,
         "cosmetic": 9,
         "feat": 11,
-        "fix": 62,
-        "other": 8,
+        "fix": 64,
+        "other": 9,
         "refactor": 2,
         "rename": 1,
         "runtime-swap": 1,
         "security-fix": 5,
         "test": 10
       },
-      "fork_side_commit_count": 111,
+      "fork_side_commit_count": 114,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-20T22:12:33-04:00",
-        "sha": "67bf8e2c199c0920459fe7ab241e9139571ca4b8",
-        "subject": "fix(term,termwiz): build the canonical terminal C ABI for iOS device and simulator"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "termwiz",
       "path": "frankenterm/termwiz",
@@ -1093,19 +1105,19 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 5,
+        "fix": 7,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "test": 1
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-09T22:04:16-04:00",
-        "sha": "dd2e096109fee880547b7f2c0bc0a89ca7994b0e",
-        "subject": "test(term): exercise short cold-read batches through screen retrieval"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-toast-notification",
       "path": "frankenterm/toast-notification",
@@ -1115,19 +1127,19 @@
       "authors_raw": null,
       "classification_summary": {
         "cosmetic": 1,
-        "fix": 9,
+        "fix": 11,
         "other": 4,
         "rename": 1,
         "runtime-swap": 3,
         "test": 6
       },
-      "fork_side_commit_count": 24,
+      "fork_side_commit_count": 26,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-18T05:42:50-04:00",
-        "sha": "d702b14db849f5b116bff4ed89bb501fb565ab0d",
-        "subject": "perf(mux): reuse bounded line readers and avoid redundant readiness ioctls"
+        "classification": "fix",
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "frankenterm-uds",
       "path": "frankenterm/uds",
@@ -1138,17 +1150,17 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 7,
+        "fix": 9,
         "other": 1,
         "test": 5
       },
-      "fork_side_commit_count": 15,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-05-18T19:10:27-04:00",
-        "sha": "1775a630f42b845d23b1678e8b0b2e917efbf832",
-        "subject": "fix(filedescriptor): repair poll timeout commit scope"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "umask",
       "path": "frankenterm/umask",
@@ -1159,18 +1171,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 2,
-        "fix": 6,
+        "fix": 8,
         "other": 2,
         "security-fix": 2,
         "test": 4
       },
-      "fork_side_commit_count": 17,
+      "fork_side_commit_count": 19,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-06T20:07:07-04:00",
-        "sha": "8ae0acb8bcf97b2e6eb6d5dfd7306fc0ca6cbf84",
-        "subject": "fix(vtparse): a raw 0x80..0x9f byte in the ground state is a C1 control again, the parser's legacy contract; the maximal-subpart UTF-8 decoding stays (ft-fjxga rework)"
+        "committed_at": "2026-11-15T22:56:51-05:00",
+        "sha": "78869998f664e7f5e148704808ff970ae9fd3871",
+        "subject": "fix(repo): restore the 14,636 files 1b6e74080 deleted"
       },
       "name": "vtparse",
       "path": "frankenterm/vtparse",
@@ -1183,21 +1195,21 @@
         "cleanup": 1,
         "cosmetic": 9,
         "docs": 2,
-        "feat": 19,
-        "fix": 103,
-        "other": 18,
+        "feat": 20,
+        "fix": 110,
+        "other": 23,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 166,
+      "fork_side_commit_count": 179,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-10-28T03:05:14-04:00",
-        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
-        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
+        "classification": "fix",
+        "committed_at": "2026-11-19T01:08:53-05:00",
+        "sha": "19d3af8f52aff17e189b28690fb5ee70002d6564",
+        "subject": "fix(window): a resize a maximized Windows window refuses still completes (ft-vb1xj8)"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1210,8 +1222,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3468,
-  "generated_at": "2026-11-01T15:56:29.112223Z",
+  "fork_side_commit_total": 3700,
+  "generated_at": "2026-11-20T19:15:15.931640Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
