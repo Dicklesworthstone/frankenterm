@@ -6,11 +6,13 @@
 # apps/apple/FrankenTermSSH/Artifacts/CLibssh2.xcframework, built here for iOS
 # devices (arm64), the arm64 iOS simulator and Apple-silicon macOS.
 #
-# Sources begin with the copies Cargo.lock already pins and checksums: libssh2
-# from the libssh2-sys crate and OpenSSL from the openssl-src crate (fetched
-# with `cargo fetch --locked` if absent). A source-hash-checked libssh2 patch
-# exposes the final signed-key partial-success evidence needed for MFA; the
-# registry copy is never modified. Each is built with its own upstream
+# Sources are crates.io copies with known checksums: OpenSSL from the
+# openssl-src crate Cargo.lock pins (fetched with `cargo fetch --locked` if
+# absent), and libssh2 from the libssh2-sys version pinned below, which the
+# patches were reviewed against (fetched and checked if absent). Patches,
+# applied only to source whose hashes were reviewed, add the MFA evidence and
+# the certificate and public-key policy the driver needs; the registry copy is
+# never modified. Each is built with its own upstream
 # build system (OpenSSL Configure, libssh2 CMake), static only, with the
 # OpenSSL crypto backend that the driver's Ed25519/ECDSA/curve25519 profile
 # needs. Each slice's libssh2.a and libcrypto.a are merged into one archive so
@@ -62,7 +64,37 @@ crate_source() {
     echo "$path"
 }
 
-LIBSSH2_UPSTREAM="$(crate_source libssh2-sys)/libssh2"
+# The libssh2 source the patches in scripts/patches were reviewed against:
+# the copy libssh2-sys 0.3.2 vendors (libssh2 1.11.1_DEV), pinned by its
+# crates.io checksum. It is pinned apart from Cargo.lock, which the desktop's
+# libssh2-sys follows: dependabot's 18c844c58 moved that to 0.3.4, whose
+# libssh2 these patches do not fit. Moving this source is a deliberate patch
+# review (ft-0su778), never a lockfile bump.
+LIBSSH2_SYS_VERSION=0.3.2
+LIBSSH2_SYS_SHA256=c04141a07bb0c0bc461cb657808764de571702a59bc5c726c400ac9a7625e3ab
+pinned_crate_source() {
+    local name="$1" version="$2" sha256="$3"
+    local home="${CARGO_HOME:-$HOME/.cargo}" candidate
+    for candidate in "$home"/registry/src/*/"$name-$version"; do
+        if [ -d "$candidate" ]; then echo "$candidate"; return; fi
+    done
+    # Cargo has not unpacked it here: fetch the crate itself and check it.
+    local dir="$BUILD/crates" crate="$BUILD/crates/$name-$version.crate" staging
+    mkdir -p "$dir"
+    if [ ! -f "$crate" ]; then
+        curl -fsSL --proto '=https' -o "$crate.part" "https://static.crates.io/crates/$name/$name-$version.crate"
+        mv "$crate.part" "$crate"
+    fi
+    echo "$sha256  $crate" | shasum -a 256 -c - >&2 ||
+        { echo "error: $crate does not match its pinned checksum" >&2; exit 1; }
+    if [ ! -d "$dir/$name-$version" ]; then
+        staging="$(mktemp -d "$dir/.unpack.XXXXXX")"
+        tar -xzf "$crate" -C "$staging"
+        mv "$staging/$name-$version" "$dir/$name-$version"
+    fi
+    echo "$dir/$name-$version"
+}
+LIBSSH2_UPSTREAM="$(pinned_crate_source libssh2-sys "$LIBSSH2_SYS_VERSION" "$LIBSSH2_SYS_SHA256")/libssh2"
 OPENSSL_SRC="$(crate_source openssl-src)/openssl"
 [ -f "$LIBSSH2_UPSTREAM/CMakeLists.txt" ] || { echo "error: $LIBSSH2_UPSTREAM lacks CMakeLists.txt" >&2; exit 1; }
 [ -x "$OPENSSL_SRC/Configure" ] || { echo "error: $OPENSSL_SRC lacks Configure" >&2; exit 1; }
