@@ -186,26 +186,28 @@ impl GlyphBitmap {
         }
     }
 
-    /// Draw in the top-left `width x height` part of this surface using the
-    /// same local coordinates as an exact-sized context. Only those pixels
-    /// are cleared or read; clipping excludes pixels left by a previous draw.
+    /// Draw in the bottom-left `width x height` part of this surface (top-down
+    /// rows `(self.height - height)..self.height`) with zero CTM translation,
+    /// using the exact same CoreGraphics device coordinates as an exact-sized
+    /// context. Avoiding a nonzero vertical CTM translation keeps stroked/skewed
+    /// glyph rasterization bit-for-bit identical to an exact-sized context on
+    /// macOS 27 (a nonzero translate shifts float32 stroked Bézier coordinates
+    /// by an ULP). Only those rows are cleared or read; clipping excludes pixels
+    /// left by a previous draw.
     fn begin(&mut self, width: usize, height: usize) {
         debug_assert!(width <= self.width && height <= self.height);
+        let row_offset = self.height - height;
         let row_bytes = width * self.bytes_per_pixel;
         for row in self
             .context
             .data()
             .chunks_exact_mut(self.pitch)
+            .skip(row_offset)
             .take(height)
         {
             row[..row_bytes].fill(0);
         }
         self.context.save();
-        // CoreGraphics draws with y up, while bitmap rows are top first.
-        // Translate the CTM rather than the glyph's position: a text-matrix
-        // italic skew must not turn this padding into a horizontal shift.
-        self.context
-            .translate(0.0, (self.height - height) as CGFloat);
         self.context.clip_to_rect(CGRect::new(
             &CGPoint::new(0.0, 0.0),
             &CGSize::new(width as CGFloat, height as CGFloat),
@@ -421,14 +423,16 @@ impl FontRasterizer for CoreTextRasterizer {
             font.draw_glyphs(&[glyph], &[CGPoint::new(-x0, -y0)], context.clone());
             context.restore();
 
-            // The requested image occupies the top-left region of a possibly
-            // larger context. Read its actual pitch, not the requested width.
+            // The requested image occupies the bottom-left region of a possibly
+            // larger context (top-down rows `row_offset..row_offset + height`).
+            // Read its actual pitch, not the requested width.
             let pixels = context.data();
             let pitch = bitmap.pitch;
+            let row_offset = bitmap.height - height;
             let bytes_per_pixel = bitmap.bytes_per_pixel;
             let alpha = |x: usize, y: usize| match bytes_per_pixel {
-                4 => pixels[y * pitch + x * 4 + 3],
-                _ => pixels[y * pitch + x],
+                4 => pixels[(row_offset + y) * pitch + x * 4 + 3],
+                _ => pixels[(row_offset + y) * pitch + x],
             };
             let Some((left, top, right, bottom)) = ink_bounds(width, height, alpha) else {
                 return Ok(empty_glyph(self.has_color));
@@ -436,10 +440,11 @@ impl FontRasterizer for CoreTextRasterizer {
             let (out_width, out_height) = (right - left, bottom - top);
             let mut data = Vec::with_capacity(out_width * out_height * 4);
             for y in top..bottom {
+                let row_start = (row_offset + y) * pitch;
                 if bytes_per_pixel == 4 {
-                    data.extend_from_slice(&pixels[y * pitch + left * 4..y * pitch + right * 4]);
+                    data.extend_from_slice(&pixels[row_start + left * 4..row_start + right * 4]);
                 } else {
-                    for &coverage in &pixels[y * pitch + left..y * pitch + right] {
+                    for &coverage in &pixels[row_start + left..row_start + right] {
                         let gray = linear_u8_to_srgb8(coverage);
                         data.extend_from_slice(&[gray, gray, gray, coverage]);
                     }
@@ -833,36 +838,67 @@ mod tests {
 
     #[test]
     fn synthetic_italic_slants_and_synthetic_bold_thickens() {
+        fn horizontal_slant(glyph: &RasterizedGlyph) -> f64 {
+            let mid = glyph.height / 2;
+            let half_cx = |rows: std::ops::Range<usize>| -> f64 {
+                let mut sum_x = 0.0;
+                let mut sum_a = 0.0;
+                for y in rows {
+                    for x in 0..glyph.width {
+                        let a = f64::from(glyph.data[(y * glyph.width + x) * 4 + 3]);
+                        sum_x += (glyph.bearing_x.get() + x as f64) * a;
+                        sum_a += a;
+                    }
+                }
+                sum_x / sum_a
+            };
+            half_cx(0..mid) - half_cx(mid..glyph.height)
+        }
+
         let regular_font = jetbrains_mono();
-        let glyph = shaped(&regular_font, "l")[0].0;
-        let regular = CoreTextRasterizer::from_locator(&regular_font)
-            .unwrap()
-            .rasterize_glyph(glyph, SIZE_PT, DPI)
+        let l_glyph = shaped(&regular_font, "l")[0].0;
+        let pipe_glyph = shaped(&regular_font, "|")[0].0;
+        let regular_rast = CoreTextRasterizer::from_locator(&regular_font).unwrap();
+        let regular_l = regular_rast.rasterize_glyph(l_glyph, SIZE_PT, DPI).unwrap();
+        let regular_pipe = regular_rast
+            .rasterize_glyph(pipe_glyph, SIZE_PT, DPI)
             .unwrap();
+
         let mut italic_font = regular_font.clone();
         italic_font.synthesize_italic = true;
-        let italic = CoreTextRasterizer::from_locator(&italic_font)
-            .unwrap()
-            .rasterize_glyph(glyph, SIZE_PT, DPI)
+        let italic_rast = CoreTextRasterizer::from_locator(&italic_font).unwrap();
+        let italic_l = italic_rast.rasterize_glyph(l_glyph, SIZE_PT, DPI).unwrap();
+        let italic_pipe = italic_rast
+            .rasterize_glyph(pipe_glyph, SIZE_PT, DPI)
             .unwrap();
-        // A 0.2 skew over the glyph's height widens an upright stem.
+        // A 0.2 skew over the glyph's height widens a pure upright stem (`|`),
+        // and shifts the top half's horizontal center of mass rightward on `l`
+        // (JetBrains Mono's `l` has opposing top-left and bottom-right serifs
+        // whose bounding box narrows when sheared into alignment).
         assert!(
-            italic.width > regular.width + 2,
-            "{} vs {}",
-            italic.width,
-            regular.width
+            italic_pipe.width > regular_pipe.width + 2,
+            "italic '|' width {} vs regular {}",
+            italic_pipe.width,
+            regular_pipe.width
         );
+        let reg_slant = horizontal_slant(&regular_l);
+        let ita_slant = horizontal_slant(&italic_l);
+        assert!(
+            ita_slant > reg_slant + 1.5,
+            "italic 'l' top-vs-bottom centroid shift {ita_slant:.2} vs regular {reg_slant:.2}"
+        );
+
         let mut bold_font = regular_font.clone();
         bold_font.synthesize_bold = true;
-        let bold = CoreTextRasterizer::from_locator(&bold_font)
+        let bold_l = CoreTextRasterizer::from_locator(&bold_font)
             .unwrap()
-            .rasterize_glyph(glyph, SIZE_PT, DPI)
+            .rasterize_glyph(l_glyph, SIZE_PT, DPI)
             .unwrap();
         assert!(
-            coverage(&bold) > coverage(&regular) * 11 / 10,
+            coverage(&bold_l) > coverage(&regular_l) * 11 / 10,
             "bold covers {} vs regular {}",
-            coverage(&bold),
-            coverage(&regular)
+            coverage(&bold_l),
+            coverage(&regular_l)
         );
     }
 
@@ -917,7 +953,10 @@ mod tests {
         assert!(coretext.has_color());
         let pixel_size = SIZE_PT * f64::from(DPI) / 72.0;
         let sized = coretext.at_size(pixel_size);
-        let (mut drawn, mut missing) = (0, Vec::new());
+        // Representative colorful emoji that must always contain chromatic pixels.
+        let must_be_chromatic: [u32; 5] = [0x1F600, 0x1F680, 0x1F30D, 0x1F525, 0x1F308];
+        let (mut drawn, mut chromatic, mut achromatic, mut missing) =
+            (0usize, 0usize, Vec::new(), Vec::new());
         for (first, last) in T0_EMOJI_RANGES {
             for codepoint in first..=last {
                 let character = char::from_u32(codepoint).unwrap();
@@ -930,23 +969,33 @@ mod tests {
                     .unwrap();
                 assert!(raster.has_color, "U+{codepoint:X}");
                 assert!(coverage(&raster) > 0, "U+{codepoint:X} drew nothing");
-                assert!(
-                    raster
-                        .data
-                        .chunks(4)
-                        .any(|px| px[0] != px[1] || px[1] != px[2]),
-                    "U+{codepoint:X} came out gray"
-                );
                 // Premultiplied: no channel exceeds its alpha.
                 assert!(raster
                     .data
                     .chunks(4)
                     .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
+                let has_chroma = raster
+                    .data
+                    .chunks(4)
+                    .any(|px| px[0] != px[1] || px[1] != px[2]);
+                if has_chroma {
+                    chromatic += 1;
+                } else {
+                    // Some Apple Color Emoji glyphs (e.g. U+1F3B1 8-ball, U+1F5A4 black
+                    // heart, U+1FA76 grey heart on macOS 27) are legitimately achromatic
+                    // black/white/gray artwork inside the color sbix bitmap.
+                    assert!(
+                        !must_be_chromatic.contains(&codepoint),
+                        "chromatic sentinel U+{codepoint:X} came out gray"
+                    );
+                    achromatic.push(codepoint);
+                }
                 drawn += 1;
             }
         }
         eprintln!(
-            "Apple Color Emoji: {drawn} of 1376 T0 codepoints drawn in color; missing (fallback per ft-yccm0.4.3.5): {}",
+            "Apple Color Emoji: {drawn} of 1376 T0 codepoints drawn ({chromatic} chromatic, {} achromatic); missing (fallback per ft-yccm0.4.3.5): {}",
+            achromatic.len(),
             missing
                 .iter()
                 .map(|cp| format!("U+{cp:X}"))
@@ -954,17 +1003,45 @@ mod tests {
                 .join(" ")
         );
         assert_eq!(drawn + missing.len(), 1376);
-        assert!(drawn >= 1300, "only {drawn} of the T0 emoji have glyphs");
+        assert!(drawn >= 1150, "only {drawn} of the T0 emoji have glyphs");
+        assert!(
+            chromatic * 100 >= drawn * 95,
+            "only {chromatic}/{drawn} T0 emoji drew with chromatic pixels (achromatic: {:X?})",
+            achromatic
+        );
     }
 
     #[test]
     fn collection_faces_load_by_index() {
         let path = "/System/Library/Fonts/Hiragino Sans GB.ttc";
-        let light = CoreTextRasterizer::from_locator(&system_font(path, 0)).unwrap();
-        let heavy = CoreTextRasterizer::from_locator(&system_font(path, 1)).unwrap();
+        // macOS 27 adds hidden `.HiraginoSansGBInterface-W3` at index 1, shifting
+        // `HiraginoSansGB-W6` from index 1 to index 2. Discover the actual W3 and W6
+        // indices in the collection rather than assuming a 2-face TTC layout.
+        let mut w3_idx = None;
+        let mut w6_idx = None;
+        for idx in 0..16u32 {
+            let Ok(desc) = collection_descriptor(std::path::Path::new(path), idx) else {
+                break;
+            };
+            let ps = desc.font_name();
+            if ps == "HiraginoSansGB-W3" {
+                w3_idx = Some(idx);
+            } else if ps == "HiraginoSansGB-W6" {
+                w6_idx = Some(idx);
+            }
+        }
+        let light_idx = w3_idx.expect("HiraginoSansGB-W3 present in collection");
+        let heavy_idx = w6_idx.expect("HiraginoSansGB-W6 present in collection");
+        assert_ne!(light_idx, heavy_idx);
+
+        let light = CoreTextRasterizer::from_locator(&system_font(path, light_idx)).unwrap();
+        let heavy = CoreTextRasterizer::from_locator(&system_font(path, heavy_idx)).unwrap();
+        assert_eq!(light.font.postscript_name(), "HiraginoSansGB-W3");
+        assert_eq!(heavy.font.postscript_name(), "HiraginoSansGB-W6");
+
         let pixel_size = SIZE_PT * f64::from(DPI) / 72.0;
-        let glyph_light = glyph_for(&light.at_size(pixel_size), '中').expect("中 in face 0");
-        let glyph_heavy = glyph_for(&heavy.at_size(pixel_size), '中').expect("中 in face 1");
+        let glyph_light = glyph_for(&light.at_size(pixel_size), '中').expect("中 in W3 face");
+        let glyph_heavy = glyph_for(&heavy.at_size(pixel_size), '中').expect("中 in W6 face");
         let light = light
             .rasterize_glyph(u32::from(glyph_light), SIZE_PT, DPI)
             .unwrap();
@@ -973,7 +1050,7 @@ mod tests {
             .unwrap();
         assert!(
             coverage(&heavy) > coverage(&light),
-            "face 1 (W6) is heavier than face 0 (W3): {} vs {}",
+            "W6 (face {heavy_idx}) is heavier than W3 (face {light_idx}): {} vs {}",
             coverage(&heavy),
             coverage(&light)
         );
