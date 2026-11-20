@@ -2974,6 +2974,82 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    /// The last pane on a machine's mux ends, so the transport has no other
+    /// pane to open. The machine stays connected and the ended pane's screen
+    /// is released rather than left frozen on display, so the machine shows
+    /// No Tabs Open; its New Tab opens a shell that runs commands. Needs a
+    /// disposable mux (TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND): the test
+    /// opens a tab, ends every other pane from it, then ends the tab, and it
+    /// leaves the mux with the one pane its last New Tab opened. The pane it
+    /// first shows must be one the phone can draw: a pane never resized since
+    /// it was spawned does not draw yet (ft-jh8jen), so start that mux with
+    /// two-panes.lua, whose split resizes it.
+    func testTheLastPaneEndingOffersNewTabInsteadOfItsFrozenScreen() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_EMPTYING_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_EMPTYING_MUX_COMMAND to reach a disposable mux on the loopback host")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
+        let run = UUID().uuidString.prefix(8)
+        // As on a phone, a pane is on screen (so the phone has its grid)
+        // before New Tab. The test's own tab is the one it ends last.
+        let session = try await connect(scene, "alpha")
+        let first = try shown(session)
+        let existing = Set(try XCTUnwrap(session.muxState).panes.map(\.paneId))
+        for _ in 0..<400 where !session.canCreatePersistentShell { try await Task.sleep(for: .milliseconds(25)) }
+        session.newPersistentShell()
+        for _ in 0..<600 where session.muxState?.shown.map(existing.contains) != false
+            || session.terminal == nil || session.terminal === first || session.paneNavigationBusy {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        if session.terminal == nil || session.terminal === first {
+            XCTFail("""
+                the new tab's screen never arrived: \(session.phase), problem \(String(describing: session.interactionProblem)), \
+                busy \(session.paneNavigationBusy), mux \(String(describing: session.muxState)), \
+                routing \(String(describing: session.muxControl?.inputRouting.current))
+                """)
+        }
+        let tab = try XCTUnwrap(session.muxState?.shown)
+        XCTAssertFalse(existing.contains(tab), "the new tab is shown")
+        first.removeFromSuperview()
+        let view = try shown(session)
+        // Every pane's shell is a child of the mux server; end the others.
+        try await type("for p in $(pgrep -P $PPID); do [ $p = $$ ] || kill -HUP $p; done; echo LAST-\(run)-$((40+2)) > \(out)",
+                       into: view)
+        _ = try await hostFile(out, containing: "LAST-\(run)-42")
+        for _ in 0..<600 where session.muxState?.panes.map(\.paneId) != [tab] { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(session.muxState?.panes.map(\.paneId), [tab], "the tab is the mux's last pane")
+        XCTAssertTrue(session.terminal === view, "the tab stays on screen while the others end")
+
+        try await type("exit", into: view)
+        for _ in 0..<600 where session.terminal != nil || session.muxState?.panes.isEmpty != true
+            || session.paneNavigationBusy {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(session.phase, .live, "the machine stays connected with no panes")
+        XCTAssertEqual(session.muxState?.panes.isEmpty, true, "the only pane ended")
+        XCTAssertNil(session.muxState?.shown)
+        XCTAssertNil(session.terminal, "the ended pane's screen is not left on display")
+        XCTAssertNil(session.interactionProblem, "nothing to read or dismiss")
+        view.removeFromSuperview()
+
+        // No Tabs Open offers New Tab, and it opens a working shell.
+        for _ in 0..<200 where !session.canCreatePersistentShell { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(session.canCreatePersistentShell, "New Tab is offered")
+        session.newPersistentShell()
+        for _ in 0..<600 where session.muxState?.shown == nil || session.terminal == nil || session.paneNavigationBusy {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(session.muxState?.panes.count, 1, "New Tab opened one pane")
+        XCTAssertNil(session.interactionProblem)
+        let fresh = try shown(session)
+        try await type("echo REOPENED-\(run)-$((40+2)) > \(out)", into: fresh)
+        let text = try await hostFile(out, containing: "REOPENED-\(run)-42")
+        XCTAssertTrue(text.contains("REOPENED-\(run)-42"), "the new tab's shell runs commands (\(text))")
+        fresh.removeFromSuperview()
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// Plan 2.2, "lose Wi-Fi after pressing Enter", against a real mux. The
     /// pane's program freezes its mux server, so what is typed next goes
     /// unanswered, and then the phone's relay dies. The ended session records
