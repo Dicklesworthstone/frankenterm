@@ -217,29 +217,22 @@ pub enum Tree<L, N = ()> {
     Leaf(L),
 }
 
-impl<L, N> Drop for Tree<L, N> {
-    fn drop(&mut self) {
-        let Self::Node { left, right, .. } = self else {
-            return;
-        };
-        if matches!(&**left, Self::Empty) && matches!(&**right, Self::Empty) {
-            return;
-        }
+impl<L, N> Tree<L, N> {
+    /// Drop a tree iteratively without call-stack recursion.
+    ///
+    /// `Tree` intentionally does not implement `Drop` directly so callers can
+    /// destructure `Tree::Node` and `Tree::Leaf` by value; use this method when
+    /// releasing arbitrarily deep trees on a bounded stack.
+    pub fn drop_iteratively(self) {
         let mut stack = Vec::new();
-        if !matches!(&**left, Self::Empty) {
-            stack.push(std::mem::replace(&mut **left, Self::Empty));
+        if let Self::Node { left, right, .. } = self {
+            stack.push(*left);
+            stack.push(*right);
         }
-        if !matches!(&**right, Self::Empty) {
-            stack.push(std::mem::replace(&mut **right, Self::Empty));
-        }
-        while let Some(mut node) = stack.pop() {
-            if let Self::Node { left, right, .. } = &mut node {
-                if !matches!(&**left, Self::Empty) {
-                    stack.push(std::mem::replace(&mut **left, Self::Empty));
-                }
-                if !matches!(&**right, Self::Empty) {
-                    stack.push(std::mem::replace(&mut **right, Self::Empty));
-                }
+        while let Some(node) = stack.pop() {
+            if let Self::Node { left, right, .. } = node {
+                stack.push(*left);
+                stack.push(*right);
             }
         }
     }
@@ -341,21 +334,68 @@ enum Path<L, N> {
     },
 }
 
+enum PathStep<L, N> {
+    Top,
+    Left {
+        right: Box<Tree<L, N>>,
+        data: Option<N>,
+        up: Box<Path<L, N>>,
+    },
+    Right {
+        left: Box<Tree<L, N>>,
+        data: Option<N>,
+        up: Box<Path<L, N>>,
+    },
+}
+
+impl<L, N> Path<L, N> {
+    fn take_step(&mut self) -> PathStep<L, N> {
+        match self {
+            Self::Top => PathStep::Top,
+            Self::Left { right, data, up } => PathStep::Left {
+                right: std::mem::replace(right, Box::new(Tree::Empty)),
+                data: data.take(),
+                up: std::mem::replace(up, Box::new(Self::Top)),
+            },
+            Self::Right { left, data, up } => PathStep::Right {
+                left: std::mem::replace(left, Box::new(Tree::Empty)),
+                data: data.take(),
+                up: std::mem::replace(up, Box::new(Self::Top)),
+            },
+        }
+    }
+
+    fn is_drained(&self) -> bool {
+        match self {
+            Self::Top => true,
+            Self::Left { right, up, .. } => {
+                matches!(**right, Tree::Empty) && matches!(**up, Self::Top)
+            }
+            Self::Right { left, up, .. } => {
+                matches!(**left, Tree::Empty) && matches!(**up, Self::Top)
+            }
+        }
+    }
+}
+
 impl<L, N> Drop for Path<L, N> {
     fn drop(&mut self) {
-        let mut cursor = match self {
-            Self::Top => return,
-            Self::Left { up, .. } | Self::Right { up, .. } => {
-                std::mem::replace(&mut **up, Self::Top)
-            }
-        };
-        while !matches!(cursor, Self::Top) {
-            cursor = match &mut cursor {
-                Self::Top => unreachable!(),
-                Self::Left { up, .. } | Self::Right { up, .. } => {
-                    std::mem::replace(&mut **up, Self::Top)
+        if self.is_drained() {
+            return;
+        }
+        let mut next = self.take_step();
+        loop {
+            match next {
+                PathStep::Top => break,
+                PathStep::Left { right, mut up, .. } => {
+                    (*right).drop_iteratively();
+                    next = up.take_step();
                 }
-            };
+                PathStep::Right { left, mut up, .. } => {
+                    (*left).drop_iteratively();
+                    next = up.take_step();
+                }
+            }
         }
     }
 }
@@ -608,13 +648,14 @@ impl<L, N> Cursor<L, N> {
     /// the newly unsplit node, along with the leaf value and prior
     /// parent node value.
     /// On failure, yields `Err` containing the unchanged cursor.
-    pub fn unsplit_leaf(self) -> Result<(Self, L, Option<N>), Self> {
+    pub fn unsplit_leaf(mut self) -> Result<(Self, L, Option<N>), Self> {
         if !self.is_leaf() || self.is_top() {
             return Err(self);
         }
 
-        match (*self.it, *self.path) {
-            (Tree::Leaf(l), Path::Left { right, data, up }) => Ok((
+        let path_step = self.path.take_step();
+        match (*self.it, path_step) {
+            (Tree::Leaf(l), PathStep::Left { right, data, up }) => Ok((
                 Self {
                     it: right,
                     path: up,
@@ -622,10 +663,10 @@ impl<L, N> Cursor<L, N> {
                 l,
                 data,
             )),
-            (Tree::Leaf(l), Path::Right { left, data, up }) => {
+            (Tree::Leaf(l), PathStep::Right { left, data, up }) => {
                 Ok((Self { it: left, path: up }, l, data))
             }
-            (Tree::Leaf(_), Path::Top) => unreachable!(),
+            (Tree::Leaf(_), PathStep::Top) => unreachable!(),
             (Tree::Empty, _) => unreachable!(),
             (Tree::Node { .. }, _) => unreachable!(),
         }
@@ -641,7 +682,10 @@ impl<L, N> Cursor<L, N> {
                 }),
                 path: self.path,
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -655,7 +699,10 @@ impl<L, N> Cursor<L, N> {
                 }),
                 path: self.path,
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -677,7 +724,10 @@ impl<L, N> Cursor<L, N> {
                 }),
                 path: self.path,
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -699,7 +749,10 @@ impl<L, N> Cursor<L, N> {
                 }),
                 path: self.path,
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -719,7 +772,10 @@ impl<L, N> Cursor<L, N> {
                     up: self.path,
                 }),
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -739,7 +795,10 @@ impl<L, N> Cursor<L, N> {
                     up: self.path,
                 }),
             }),
-            _ => Err(self),
+            other => Err(Self {
+                it: Box::new(other),
+                path: self.path,
+            }),
         }
     }
 
@@ -749,10 +808,10 @@ impl<L, N> Cursor<L, N> {
     /// new location.
     /// If the current position is the top of the tree,
     /// yields `Err` containing the unchanged cursor.
-    pub fn go_up(self) -> Result<Self, Self> {
-        match *self.path {
-            Path::Top => Err(self),
-            Path::Right { left, data, up } => Ok(Self {
+    pub fn go_up(mut self) -> Result<Self, Self> {
+        match self.path.take_step() {
+            PathStep::Top => Err(self),
+            PathStep::Right { left, data, up } => Ok(Self {
                 it: Box::new(Tree::Node {
                     left,
                     right: self.it,
@@ -760,7 +819,7 @@ impl<L, N> Cursor<L, N> {
                 }),
                 path: up,
             }),
-            Path::Left { right, data, up } => Ok(Self {
+            PathStep::Left { right, data, up } => Ok(Self {
                 it: Box::new(Tree::Node {
                     right,
                     left: self.it,
@@ -2343,12 +2402,18 @@ mod tests {
                 // Walk a Cursor all the way down the skewed spine and drop it
                 // at maximum Path depth to verify iterative Path::drop.
                 let mut cursor = cloned.cursor();
-                while let Ok(next) = cursor.go_left() {
-                    cursor = next;
+                loop {
+                    match cursor.go_left() {
+                        Ok(next) => cursor = next,
+                        Err(leaf_cursor) => {
+                            cursor = leaf_cursor;
+                            break;
+                        }
+                    }
                 }
                 drop(cursor);
-                drop(rebuilt);
-                drop(tree);
+                rebuilt.drop_iteratively();
+                tree.drop_iteratively();
             })
             .expect("spawn bounded-stack test thread");
         handle.join().expect("deeply skewed tree thread panicked");
@@ -2394,26 +2459,30 @@ mod tests {
         assert_eq!(rebuilt, tree);
 
         for candidate in [cloned, rebuilt] {
-            match candidate {
+            match &candidate {
                 Tree::Node {
                     left,
                     right,
                     data: Some(2),
                 } => {
-                    match *left {
+                    match left.as_ref() {
                         Tree::Node {
                             left: ll,
                             right: lr,
                             data: Some(1),
                         } => {
-                            assert!(matches!(*ll, Tree::Leaf(ref a) if Arc::ptr_eq(a, &leaf_a)));
-                            assert!(matches!(*lr, Tree::Leaf(ref b) if Arc::ptr_eq(b, &leaf_b)));
+                            assert!(
+                                matches!(ll.as_ref(), Tree::Leaf(a) if Arc::ptr_eq(a, &leaf_a))
+                            );
+                            assert!(
+                                matches!(lr.as_ref(), Tree::Leaf(b) if Arc::ptr_eq(b, &leaf_b))
+                            );
                         }
-                        other => panic!("unexpected left subtree: {other:?}"),
+                        other => panic!("unexpected left subtree: {:?}", other),
                     }
-                    assert!(matches!(*right, Tree::Leaf(ref c) if Arc::ptr_eq(c, &leaf_c)));
+                    assert!(matches!(right.as_ref(), Tree::Leaf(c) if Arc::ptr_eq(c, &leaf_c)));
                 }
-                other => panic!("unexpected root: {other:?}"),
+                other => panic!("unexpected root: {:?}", other),
             }
         }
     }
