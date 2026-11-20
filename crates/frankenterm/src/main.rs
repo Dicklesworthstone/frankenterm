@@ -11196,8 +11196,8 @@ fn proof_doctor_cargo_argv(command: &[String]) -> &[String] {
 }
 
 fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
-    let raw = frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024)
-        .ok()?;
+    let raw =
+        frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024).ok()?;
     // toml 1.x: `parse::<toml::Value>()` parses a single bare VALUE, not a
     // document, so a real Cargo.toml fails to parse and this silently returns
     // None. Parse the document as a `toml::Table` instead (ft-vxxzk, mirrors the
@@ -11212,8 +11212,8 @@ fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
 }
 
 fn proof_doctor_workspace_members_from_manifest(manifest_path: &Path) -> Option<Vec<String>> {
-    let raw = frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024)
-        .ok()?;
+    let raw =
+        frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024).ok()?;
     // toml 1.x: parse the document as a `toml::Table` (not `toml::Value`, which
     // parses a single bare value and would fail on a real Cargo.toml, silently
     // returning None). ft-vxxzk, mirrors the ft-crsdl fix.
@@ -44087,10 +44087,7 @@ fn production_cli_filesystem_reads_and_writes_use_capability_safe_surfaces_canar
             }
 
             if pending_test_item {
-                if trimmed.is_empty()
-                    || trimmed.starts_with("//")
-                    || trimmed.starts_with('#')
-                {
+                if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
                     brace_depth += opens - closes;
                     continue;
                 }
@@ -65611,8 +65608,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 format,
             } => {
                 use frankenterm_core::steer_plan::{
-                    SteerPlanScenario, plan_status_label, steer_plan_bound,
-                    steer_plan_for_contract,
+                    SteerPlanScenario, plan_status_label, steer_plan_bound, steer_plan_for_contract,
                 };
                 let as_json = format.eq_ignore_ascii_case("json");
                 let scenario = match SteerPlanScenario::parse(&scenario) {
@@ -65757,10 +65753,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         );
                         let approvals =
                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(None);
-                        let targets =
-                            frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
-                                None, None,
-                            );
+                        let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                            None, None,
+                        );
                         steer_plan_for_contract(
                             scenario,
                             &objective,
@@ -74052,8 +74047,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         until: None,
                         include_matched_text: include_text,
                     };
-                    let page =
-                        export_events_page_with_cx(&analytics_cx, &storage, &req).await?;
+                    let page = export_events_page_with_cx(&analytics_cx, &storage, &req).await?;
                     let rendered = match export_format.to_lowercase().as_str() {
                         "jsonl" => page.to_jsonl()?,
                         "json" => serde_json::to_string_pretty(&page)?,
@@ -74383,9 +74377,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         .with_tuning(&config.tuning)
                         .with_command_gate_config(config.safety.command_gate.clone())
                         .with_policy_rules(config.safety.rules.clone());
-                        let engine =
-                            with_persisted_kill_switch(base_engine, &storage, "process triage apply")
-                                .await;
+                        let engine = with_persisted_kill_switch(
+                            base_engine,
+                            &storage,
+                            "process triage apply",
+                        )
+                        .await;
                         match engine.kill_switch_state().level {
                             frankenterm_core::policy_quarantine::KillSwitchLevel::Disarmed => {
                                 "allow"
@@ -93507,33 +93504,63 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
 
 #[cfg(target_os = "linux")]
 fn refresh_linux_font_cache(font_dir: &Path, verbose: u8) -> Option<String> {
-    let output = std::process::Command::new("fc-cache")
+    let mut command = frankenterm_core::runtime_async::process::Command::new("fc-cache");
+    Some(run_linux_font_cache_refresh(
+        &mut command,
+        font_dir,
+        verbose,
+        Duration::from_secs(15),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_font_cache_refresh(
+    command: &mut frankenterm_core::runtime_async::process::Command,
+    font_dir: &Path,
+    verbose: u8,
+    timeout: Duration,
+) -> String {
+    use frankenterm_core::runtime_async::process::CommandOutputLimitExceeded;
+
+    let output = command
         .arg("-f")
         .arg(font_dir)
-        .output();
+        .stdout_limit(64 * 1024)
+        .stderr_limit(16 * 1024)
+        .output_blocking(timeout);
 
     match output {
-        Ok(output) if output.status.success() => Some(format!(
-            "✓ Refreshed font cache: fc-cache -f {}",
-            font_dir.display()
-        )),
+        Ok(output) if output.status.success() => {
+            format!("✓ Refreshed font cache: fc-cache -f {}", font_dir.display())
+        }
         Ok(output) => {
             if verbose > 0 {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Some(format!(
-                    "⚠ fc-cache returned {} ({}). You may need to refresh fonts manually.",
-                    output.status, stderr
-                ));
+                return format!(
+                    "⚠ fc-cache returned {}. You may need to refresh fonts manually.",
+                    output.status
+                );
             }
-            Some(
-                "⚠ Could not refresh fc-cache automatically. Run `fc-cache -f` manually if needed."
-                    .to_string(),
+            "⚠ Could not refresh fc-cache automatically. Run `fc-cache -f` manually if needed."
+                .to_string()
+        }
+        Err(error) => {
+            // This command mutates the font cache. A bounded failure cannot
+            // promise rollback and must not trigger an automatic retry. Keep
+            // child stderr and OS paths out of operator-facing diagnostics.
+            let reason = if CommandOutputLimitExceeded::from_io_error(&error).is_some() {
+                "output_limit"
+            } else {
+                match error.kind() {
+                    std::io::ErrorKind::TimedOut => "timeout",
+                    std::io::ErrorKind::NotFound => "not_found",
+                    std::io::ErrorKind::PermissionDenied => "permission_denied",
+                    _ => "capture_failed",
+                }
+            };
+            format!(
+                "⚠ Font cache refresh did not finish ({reason}). It may have partially updated the cache; run `fc-cache -f` manually if needed."
             )
         }
-        Err(err) => Some(format!(
-            "⚠ Could not run fc-cache ({}). Run `fc-cache -f` manually if needed.",
-            err
-        )),
     }
 }
 
@@ -148600,6 +148627,56 @@ A  docs/new-proof.md\n";
             }
             _ => panic!("unexpected command parse result"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn font_cache_refresh_bounds_children_and_keeps_errors_content_free() {
+        use frankenterm_core::runtime_async::process::Command;
+
+        let dir = tempfile::tempdir().expect("font-cache fixture");
+        let font_dir = dir.path().join("fonts with spaces");
+        let mut success = Command::new("/bin/sh");
+        success
+            .args([
+                "-c",
+                "test \"$1\" = '-f' && test \"$2\" = \"$EXPECTED_FONT_DIR\"",
+                "font-cache-fixture",
+            ])
+            .env("EXPECTED_FONT_DIR", &font_dir);
+        let message =
+            run_linux_font_cache_refresh(&mut success, &font_dir, 1, Duration::from_secs(5));
+        assert!(message.starts_with("✓ Refreshed font cache"));
+
+        let mut failed = Command::new("/bin/sh");
+        failed.args([
+            "-c",
+            "printf 'PRIVATE_STDERR_MARKER' >&2; exit 7",
+            "font-cache-fixture",
+        ]);
+        let message =
+            run_linux_font_cache_refresh(&mut failed, &font_dir, 1, Duration::from_secs(5));
+        assert!(message.starts_with("⚠ fc-cache returned"));
+        assert!(!message.contains("PRIVATE_STDERR_MARKER"));
+
+        let mut flood = Command::new("/bin/sh");
+        flood.args([
+            "-c",
+            "while :; do printf 'PRIVATE_STDERR_MARKER' >&2; done",
+            "font-cache-fixture",
+        ]);
+        let message =
+            run_linux_font_cache_refresh(&mut flood, &font_dir, 1, Duration::from_secs(5));
+        assert!(message.contains("output_limit"));
+        assert!(!message.contains("PRIVATE_STDERR_MARKER"));
+        assert!(message.contains("may have partially updated"));
+
+        let mut hung = Command::new("/bin/sh");
+        hung.args(["-c", "exec sleep 30", "font-cache-fixture"]);
+        let message =
+            run_linux_font_cache_refresh(&mut hung, &font_dir, 1, Duration::from_millis(100));
+        assert!(message.contains("timeout"));
+        assert!(message.contains("may have partially updated"));
     }
 
     #[test]

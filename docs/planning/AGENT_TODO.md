@@ -1542,3 +1542,63 @@ Validation limit: RCH is absent; the local execution service repeatedly became
 unavailable. These exact manual source edits were reconstructed against verified
 GitHub blobs and reviewed, but no Rust compile/test/Clippy/format or E2E result
 is claimed. Existing Beads were not closed; evidence remains to be attached.
+
+## 2026-11-20 — Bounded probes, cancellable storage, and capture identity
+
+### Bounded subprocess observations and font refresh
+
+Related Bead: ft-interactive-systems-performance-4tenz.50. Environment and
+process-tree changes landed in ebcb7f81fea726621eeeed6c84bfc21c29503651.
+
+- [x] Route version, sysctl, ps, and pgrep through the canonical owned process
+  supervisor with finite deadlines, output caps, and strict output admission.
+- [x] Honor the configured mux binary and explicit caller cancellation; stop
+  process-tree capture at its aggregate deadline and reject incomplete trees
+  instead of turning probe failure into a false idle observation.
+- [x] Bound Linux fc-cache to 15 seconds and finite output; report content-free
+  failure categories without retrying a possibly partially completed refresh.
+- [x] Add regressions for limits, malformed output, cancelled and hung children,
+  inherited pipes, incomplete trees, and font-cache diagnostics.
+- [ ] Execute the focused environment/process_tree/font-cache regressions via
+  strict RCH, including native macOS paths, then finish the broader .50 inventory.
+
+### Caller-owned storage response waits
+
+Related Bead: ft-interactive-systems-performance-4tenz.10.4. Implementation landed
+in 4ce07322257133ccd8e63e9f0be591e25e997397.
+
+- [x] Thread the caller Cx through all 80 serialized response waits. Observe
+  ready writer results before caller cancellation; wake pending waits directly
+  on cancellation and honor caller deadlines and exhausted budgets.
+- [x] Preserve writer authority after mutation admission: interrupted waiting
+  returns non-retryable WriterSettlementIndeterminate. Classify the three
+  serialized read operations separately from mutations.
+- [x] Add seven regressions for result/cancellation ties, direct wakeups, caller
+  budgets, virtual deadlines, disconnected responses, read cancellation, and a
+  real queued SQLite write that commits after its caller stops waiting.
+- [ ] Execute the focused storage regressions via strict RCH. Keep the separate
+  independent-cleanup capability obligation (.10.5) open; the existing 30-second
+  response watchdog still applies and can report indeterminate settlement.
+
+### Same-snapshot agent filtering
+
+Related Bead: ft-2ko47y; preserve its current assignee and in-progress state.
+Implementation landed in 413dc8656f347c4aa0bc2d27b07c5b2549a106a2.
+
+- [x] Derive conservative composer evidence from each complete polling snapshot
+  and carry it through admitted persistence into rule filtering without another
+  mux read. Native/streaming deltas and unknown snapshots remain unfiltered.
+- [x] Bound inspection before scanning; reject quoted history and unrecognized
+  footers. Clear pattern fragments across capture gaps and agent changes.
+- [x] Add regression coverage for durable wrong-agent suppression, same-snapshot
+  propagation, delta exclusion, unknown controls, and fragment separation.
+- [ ] Execute the focused classifier/tailer/runtime regressions via strict RCH.
+  Raw replay has no new identity metadata; do not claim authenticated identity,
+  replay parity, or broader live-capture qualification from these changes.
+
+Validation: pinned nightly formatting and git diff --check passed for all eight
+changed Rust files; independent source reviews completed and their findings were
+fixed. Rust compilation, tests, and Clippy were not run because RCH is unavailable.
+Complete those remote gates before closing these Beads. The br 0.7.6 import also
+failed to produce its database; no forced issue updates were made. The tracked
+JSONL was refreshed from main, preserving concurrent Beads changes and assignees.
