@@ -8755,12 +8755,11 @@ impl Tab {
                 "tab {} lost active mux-owner authority",
                 self.tab_id
             );
-            let baseline = if split.is_some() {
+            if split.is_some() {
                 clone_tab_inner_bounded(&inner)?
             } else {
                 inner.clone()
-            };
-            baseline
+            }
         };
         let prior_structural_count = {
             let (tiled, floating) = baseline.snapshot_structural_panes_callback_free_checked()?;
