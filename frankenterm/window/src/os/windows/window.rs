@@ -3415,14 +3415,31 @@ mod tests {
         }
 
         fn create(&self, owner: &Rc<RefCell<WindowInner>>) -> HWND {
+            self.create_styled(owner, false)
+        }
+
+        /// `visible` creates the window shown, but far off screen, without
+        /// activation and with no taskbar button. Windows keeps no update
+        /// region for a hidden window (InvalidateRect leaves GetUpdateRect
+        /// at 0), so tests of the paint region need a visible one.
+        fn create_styled(&self, owner: &Rc<RefCell<WindowInner>>, visible: bool) -> HWND {
+            let (ex_style, style, origin) = if visible {
+                (
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    -32_000,
+                )
+            } else {
+                (0, WS_OVERLAPPEDWINDOW, 0)
+            };
             unsafe {
                 CreateWindowExW(
-                    0,
+                    ex_style,
                     self.name.as_ptr(),
                     self.name.as_ptr(),
-                    WS_OVERLAPPEDWINDOW,
-                    0,
-                    0,
+                    style,
+                    origin,
+                    origin,
                     160,
                     100,
                     null_mut(),
@@ -3449,9 +3466,19 @@ mod tests {
 
     impl TestWindow {
         fn new(events: WindowEventSender) -> Self {
+            Self::create(events, false)
+        }
+
+        /// A window whose paint region a test can invalidate and read back;
+        /// see [`TestWindowClass::create_styled`].
+        fn visible(events: WindowEventSender) -> Self {
+            Self::create(events, true)
+        }
+
+        fn create(events: WindowEventSender, visible: bool) -> Self {
             let class = TestWindowClass::new(Some(ownership_test_proc));
             let owner = test_window_owner(events);
-            let hwnd = class.create(&owner);
+            let hwnd = class.create_styled(&owner, visible);
             assert!(!hwnd.is_null(), "{}", IoError::last_os_error());
             let window = owner.borrow().hwnd;
             owner.borrow_mut().events.assign_window(Window(window));
@@ -3633,7 +3660,7 @@ mod tests {
 
     #[test]
     fn windows_throttled_paint_validates_region_then_requeues_once() {
-        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        let window = TestWindow::visible(WindowEventSender::new(|_, _| {}));
         let state = Rc::clone(&window.owner.borrow().repaint);
         state.throttled.set(true);
         unsafe {
@@ -3662,7 +3689,7 @@ mod tests {
 
     #[test]
     fn windows_unpolled_repaint_cancellation_releases_latch() {
-        let window = TestWindow::new(WindowEventSender::new(|_, _| {}));
+        let window = TestWindow::visible(WindowEventSender::new(|_, _| {}));
         let state = Rc::clone(&window.owner.borrow().repaint);
         state.throttled.set(true);
         state.invalidated.set(true);
@@ -3694,7 +3721,7 @@ mod tests {
         .unwrap();
         let paints = Rc::new(Cell::new(0));
         let observed = Rc::clone(&paints);
-        let window = TestWindow::new(WindowEventSender::new(move |event, _| {
+        let window = TestWindow::visible(WindowEventSender::new(move |event, _| {
             if matches!(event, WindowEvent::NeedRepaint) {
                 observed.set(observed.get() + 1);
             }
