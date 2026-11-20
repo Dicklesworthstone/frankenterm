@@ -40,7 +40,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("add_event_mute", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Remove a persistent event mute by identity key.
@@ -68,7 +68,7 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("remove_event_mute", error))?;
 
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Check whether an identity key is muted (and not expired).

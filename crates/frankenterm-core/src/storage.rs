@@ -2363,6 +2363,14 @@ const WRITER_TERMINAL_CLOSED_CLEANLY: u8 = 2;
 /// from a permanently wedged writer without fabricating retry safety.
 const WRITER_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[derive(Clone, Copy)]
+enum WriterResponseKind {
+    /// A serialized read has no durable effect to reconcile after cancellation.
+    ReadOnly,
+    /// Once admitted, the writer may commit even if its caller stops waiting.
+    Mutation,
+}
+
 #[derive(Debug)]
 enum WriteCommandSendError {
     Channel(Box<mpsc::SendError<WriteCommand>>),
@@ -3255,9 +3263,9 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::ConnectorMutation { mutation, respond })
             .await
             .map_err(|error| Self::writer_send_error("connector_mutation", error))?;
-        // Once queued, await the serialized writer's actual settlement. Caller
-        // cancellation cannot turn a committed dispatch into permission to retry.
-        Self::recv_writer_response(receipt).await
+        // Once queued, cancellation can only report an indeterminate dispatch;
+        // it cannot turn a possibly committed effect into permission to retry.
+        Self::recv_writer_response_with_cx(cx, receipt).await
     }
 
     pub async fn get_connector_outbox_with_cx(
@@ -3648,33 +3656,87 @@ impl StorageHandle {
         }
     }
 
-    async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
-        Self::recv_writer_response_with_timeout(rx, WRITER_SETTLEMENT_TIMEOUT).await
+    /// Await an admitted mutation without refunding its durable effect when
+    /// the caller cancels. A response already available at the same poll wins;
+    /// otherwise cancellation, budget expiry, timeout or disconnection is
+    /// indeterminate and must be reconciled before any retry.
+    async fn recv_writer_response_with_cx<T>(
+        cx: &crate::cx::Cx,
+        rx: oneshot::Receiver<Result<T>>,
+    ) -> Result<T> {
+        Self::recv_writer_response_with_cx_timeout(
+            cx,
+            rx,
+            WRITER_SETTLEMENT_TIMEOUT,
+            WriterResponseKind::Mutation,
+        )
+        .await
     }
 
-    async fn recv_writer_response_with_timeout<T>(
+    /// Preserve FIFO ordering for reads served by the writer while allowing
+    /// their caller to stop waiting without claiming an uncertain mutation.
+    async fn recv_writer_read_response_with_cx<T>(
+        cx: &crate::cx::Cx,
+        rx: oneshot::Receiver<Result<T>>,
+    ) -> Result<T> {
+        Self::recv_writer_response_with_cx_timeout(
+            cx,
+            rx,
+            WRITER_SETTLEMENT_TIMEOUT,
+            WriterResponseKind::ReadOnly,
+        )
+        .await
+    }
+
+    async fn recv_writer_response_with_cx_timeout<T>(
+        cx: &crate::cx::Cx,
         rx: oneshot::Receiver<Result<T>>,
         timeout: std::time::Duration,
+        kind: WriterResponseKind,
     ) -> Result<T> {
-        // Once a command is admitted, the writer may already have committed
-        // durable effects. Await its authoritative response on a live cleanup
-        // context instead of an unrelated ambient Cx; surfacing ambient
-        // cancellation here could falsely report that an admitted write did
-        // not happen.
+        use crate::runtime_async::ContextErrorKind;
+
+        // Keep result reception independent of caller/ambient cancellation so
+        // a published writer result remains authoritative. The outer canonical
+        // race polls this result first, then registers a direct cancellation
+        // waker and (only for a finite caller budget) its deadline timer. No
+        // polling task or periodic timer is needed to wake a cancelled caller.
         let response_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
         let timeout_cx = crate::cx::for_request();
-        match crate::runtime_async::timeout_with_cx(
+        let response = crate::runtime_async::timeout_with_cx_typed(
             &timeout_cx,
             timeout,
             crate::runtime_async::oneshot_recv_with_cx(&response_cx, rx),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(StorageError::WriterSettlementIndeterminate {
-                phase: "command_response",
+        );
+        let (phase, caller_terminated) =
+            match crate::runtime_async::until_cancelled(cx, response).await {
+                Ok(Ok(Ok(result))) => return result,
+                Ok(Ok(Err(_))) => ("command_response_disconnected", false),
+                Ok(Err(crate::runtime_async::TimeoutError::Elapsed)) => {
+                    ("command_response_timeout", false)
+                }
+                Err(error) => (
+                    match error.kind() {
+                        ContextErrorKind::Cancelled => "command_response_cancelled",
+                        ContextErrorKind::DeadlineExceeded => "command_response_deadline",
+                        ContextErrorKind::PollQuotaExhausted => "command_response_poll_budget",
+                        ContextErrorKind::CostQuotaExhausted => "command_response_cost_budget",
+                        ContextErrorKind::CancelTimeout => "command_response_cancel_timeout",
+                        _ => "command_response_context_failure",
+                    },
+                    true,
+                ),
+            };
+        match kind {
+            WriterResponseKind::Mutation => {
+                Err(StorageError::WriterSettlementIndeterminate { phase }.into())
             }
-            .into()),
+            WriterResponseKind::ReadOnly if caller_terminated => Err(crate::Error::Cancelled(
+                format!("storage writer read interrupted: {phase}"),
+            )),
+            WriterResponseKind::ReadOnly => {
+                Err(StorageError::Database(format!("storage writer read failed: {phase}")).into())
+            }
         }
     }
 
@@ -4278,7 +4340,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("append_segment", error))?;
-        let result = Self::recv_writer_response(rx).await;
+        let result = Self::recv_writer_response_with_cx(cx, rx).await;
         timer.finish_result(&result);
         result
     }
@@ -4322,7 +4384,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("acknowledge_recorder_delivery", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Record a gap event
@@ -4430,7 +4492,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_gap", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Record an event (pattern detection)
@@ -4512,7 +4574,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_event", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Mark an event as handled
@@ -4556,7 +4618,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("mark_event_handled", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Atomically reserve an unhandled event for downstream delivery.
@@ -4608,7 +4670,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("reserve_event_delivery", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Finalize a successfully flushed event delivery.
@@ -4657,7 +4719,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("finalize_event_delivery", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Release an unhandled event-delivery lease after a known downstream
@@ -4686,7 +4748,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("release_event_delivery", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Atomically finalize a bounded set of successfully flushed deliveries.
@@ -4754,12 +4816,10 @@ impl StorageHandle {
             .map_err(|error| {
                 Self::writer_send_error("finalize_event_delivery_leases_bulk", error)
             })?;
-        // Sending the command is the cancellation commit point. Once the
-        // serialized writer may have changed durable state, return its exact
-        // result even if cancellation arrives while the transaction runs;
-        // reporting cancellation after a successful commit would conceal the
-        // finalized leases from the caller.
-        Self::recv_writer_response(rx).await
+        // After admission the writer owns lease finalization. A published
+        // result wins a cancellation tie; if the caller stops waiting before
+        // publication, the outcome is indeterminate and requires reconciliation.
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Atomically release a bounded set of delivery leases after a known
@@ -4806,7 +4866,7 @@ impl StorageHandle {
                 Self::writer_send_error("release_event_delivery_leases_bulk", error)
             })?;
         // As above, do not turn a committed release into a cancellation error.
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Set or clear an event's triage state.
@@ -4846,7 +4906,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("set_event_triage_state", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Set or clear an event's note.
@@ -4886,7 +4946,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("set_event_note", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Add a label to an event.
@@ -4926,7 +4986,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("add_event_label", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Remove a label from an event.
@@ -4958,7 +5018,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("remove_event_label", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Fetch triage state, note, and labels for an event.
@@ -5078,7 +5138,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_audit_action", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Attach submit verification metadata to the policy audit row that emitted the send.
@@ -5122,7 +5182,7 @@ impl StorageHandle {
             .map_err(|error| {
                 Self::writer_send_error("update_audit_action_submit_receipt", error)
             })?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Record an audit action after applying redaction
@@ -5159,7 +5219,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_policy_denial_audit", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
@@ -5201,7 +5261,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("upsert_action_undo", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Upsert undo metadata after applying redaction
@@ -5281,7 +5341,7 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("mark_action_undone", error))?;
 
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Purge audit actions older than a cutoff timestamp
@@ -5342,7 +5402,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_maintenance", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Purge old high-frequency operational maintenance telemetry.
@@ -5413,7 +5473,7 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("record_secret_scan_report", error))?;
 
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Insert a saved search definition.
@@ -5441,7 +5501,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_saved_search", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Update last-run metadata for a saved search.
@@ -5482,7 +5542,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("update_saved_search_run", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Update scheduling settings for a saved search.
@@ -5520,7 +5580,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("update_saved_search_schedule", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Delete a saved search by name. Returns number of rows deleted.
@@ -5548,7 +5608,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("delete_saved_search", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Fetch a saved search by name.
@@ -5624,7 +5684,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_pane_bookmark", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
@@ -5652,7 +5712,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("delete_pane_bookmark", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     // ------------------------------------------------------------------------
@@ -5691,7 +5751,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_agent_profile", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get an agent profile by name. Returns `None` when no row
@@ -5722,7 +5782,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("get_agent_profile", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_read_response_with_cx(cx, rx).await
     }
 
     /// List agent profiles. When `role_filter` is `Some`, restricts
@@ -5754,7 +5814,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("list_agent_profiles", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_read_response_with_cx(cx, rx).await
     }
 
     /// Delete an agent profile by name. Returns `true` if a row
@@ -5782,7 +5842,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("delete_agent_profile", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// ft-pohny: read a JSON value from the generic `config` KV table.
@@ -5810,7 +5870,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("get_config_value", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_read_response_with_cx(cx, rx).await
     }
 
     /// ft-pohny: upsert a JSON value into the generic `config` KV table.
@@ -5839,7 +5899,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("set_config_value", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get a pane bookmark by alias.
@@ -5960,7 +6020,7 @@ impl StorageHandle {
                 };
             }
 
-            let deleted = match Self::recv_writer_response(rx).await {
+            let deleted = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -6090,7 +6150,7 @@ impl StorageHandle {
                     error,
                 };
             }
-            let turn = match Self::recv_writer_response(rx).await {
+            let turn = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(turn) => turn,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -6164,7 +6224,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_usage_metric", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Record multiple usage metrics for analytics tracking in a single transaction.
@@ -6197,7 +6257,7 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("record_usage_metrics_batch", error))?;
 
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Purge usage metrics older than a cutoff timestamp.
@@ -6336,7 +6396,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("record_notification", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Update the delivery status of a notification.
@@ -6374,7 +6434,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("update_notification_status", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Acknowledge a notification (marks when and by whom).
@@ -6412,7 +6472,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("acknowledge_notification", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Increment the retry count for a notification and reset its status to pending.
@@ -6437,7 +6497,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("increment_notification_retry", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Purge notification history older than the given timestamp.
@@ -6545,7 +6605,7 @@ impl StorageHandle {
                     error,
                 };
             }
-            let deleted = match Self::recv_writer_response(rx).await {
+            let deleted = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -6935,7 +6995,7 @@ impl StorageHandle {
                 };
             }
 
-            let deleted = match Self::recv_writer_response(rx).await {
+            let deleted = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -7128,7 +7188,7 @@ impl StorageHandle {
                 };
             }
 
-            let deleted = match Self::recv_writer_response(rx).await {
+            let deleted = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -7224,7 +7284,7 @@ impl StorageHandle {
                     error,
                 };
             }
-            let turn = match Self::recv_writer_response(rx).await {
+            let turn = match Self::recv_writer_response_with_cx(cx, rx).await {
                 Ok(turn) => turn,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
@@ -7406,7 +7466,7 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::Vacuum { respond: tx })
             .await
             .map_err(|error| Self::writer_send_error("vacuum", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Lightweight WAL checkpoint (PASSIVE) + PRAGMA optimize.
@@ -7427,7 +7487,7 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::Checkpoint { respond: tx })
             .await
             .map_err(|error| Self::writer_send_error("checkpoint", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
@@ -7525,7 +7585,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("sync_fts", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Perform a full FTS rebuild regardless of current state.
@@ -7555,7 +7615,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("rebuild_fts", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get the current FTS index state (version, last rebuild time).
@@ -7596,7 +7656,7 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::InsertApprovalToken { token, respond: tx })
             .await
             .map_err(|error| Self::writer_send_error("insert_approval_token", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Consume an approval token if it matches scope and is valid
@@ -7648,7 +7708,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("consume_approval_token", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get an approval token by code hash (without consuming)
@@ -7719,7 +7779,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("consume_approval_token_by_code", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Consume an approval token by storage row id within a workspace.
@@ -7757,7 +7817,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("consume_approval_token_by_id", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Upsert a pane record
@@ -7786,7 +7846,7 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::UpsertPane { pane, respond: tx })
             .await
             .map_err(|error| Self::writer_send_error("upsert_pane", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Prepare capture provenance before publishing capture admission.
@@ -7815,7 +7875,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("prepare_pane_capture", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Read the immutable provenance stamped by a captured segment's producer.
@@ -7866,7 +7926,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("upsert_workflow", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Persist a workflow's terminal record (`completed` or `failed`) and mark
@@ -7892,7 +7952,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("settle_workflow_terminal", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Create an execution identity exactly once. Unlike progress upserts, a
@@ -7916,7 +7976,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("create_workflow", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Create a fresh workflow's budget before admitting any step. A crash
@@ -7942,12 +8002,13 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("create_workflow_budget", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Compare-and-set admission. The writer commits the budget and execution
-    /// cursor in one transaction. After queue admission the caller retains the
-    /// authoritative response even if its Cx is subsequently cancelled.
+    /// cursor in one transaction. After queue admission a ready response wins
+    /// cancellation; an interrupted wait instead requires reconciliation of
+    /// the authoritative revision before another attempt.
     pub async fn compare_exchange_workflow_budget_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7970,7 +8031,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("compare_exchange_workflow_budget", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Atomically abort the observed active execution, settle its owned trigger,
@@ -8001,9 +8062,9 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("abort_workflow", error))?;
-        // Admission is the cancellation commit point: retain the writer's
-        // authoritative outcome even when the caller is cancelled afterwards.
-        Self::recv_writer_response(rx).await
+        // The writer still owns its transaction and on_commit cleanup if
+        // caller cancellation makes the observed outcome indeterminate.
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Upsert a workflow action plan (canonical JSON + hash)
@@ -8038,7 +8099,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("upsert_action_plan", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Insert a prepared plan preview for later commit
@@ -8066,7 +8127,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_prepared_plan", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Consume a prepared plan by plan_id (marks as used if valid)
@@ -8101,7 +8162,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("consume_prepared_plan", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Insert a workflow step log entry
@@ -8186,7 +8247,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_step_log", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     // Upsert an agent session record
@@ -8253,7 +8314,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_mux_session", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Insert a snapshot checkpoint with row-local topology and per-pane state.
@@ -8316,7 +8377,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("insert_session_checkpoint", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Prune old checkpoints beyond the retention limit.
@@ -8353,7 +8414,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("prune_session_checkpoints", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Mark a session clean only when `receipt` still names its exact latest
@@ -8386,7 +8447,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("mark_session_shutdown_clean", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get the state_hash of the latest checkpoint for a session.
@@ -8438,7 +8499,7 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("upsert_agent_session", error))?;
 
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get an agent session by ID
@@ -10177,7 +10238,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("upsert_account", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Update an account's last_used_at timestamp
@@ -10217,7 +10278,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("update_account_last_used", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Delete an account by service and account_id
@@ -10249,7 +10310,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("delete_account", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get all accounts for a service
@@ -10338,7 +10399,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("upsert_limit_window", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get a single durable rate-limit window by pane/service/account key.
@@ -10474,7 +10535,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("create_reservation", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Release a pane reservation by ID.
@@ -10504,7 +10565,7 @@ impl StorageHandle {
             )
             .await
             .map_err(|error| Self::writer_send_error("release_reservation", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Get the active reservation for a pane (read-only).
@@ -10876,7 +10937,7 @@ impl StorageHandle {
             .send_with_cx(cx, WriteCommand::ExpireStaleReservations { respond: tx })
             .await
             .map_err(|error| Self::writer_send_error("expire_stale_reservations", error))?;
-        Self::recv_writer_response(rx).await
+        Self::recv_writer_response_with_cx(cx, rx).await
     }
 
     /// Shutdown the storage handle
@@ -39407,12 +39468,12 @@ fn v35_performance_campaign_event_retention_writer_yields_and_public_calls_conve
             .expect("release writer lock");
 
         assert_eq!(
-            StorageHandle::recv_writer_response(delete_rx)
+            StorageHandle::recv_writer_response_with_cx(&cx, delete_rx)
                 .await
                 .expect("receive bounded retention result"),
             1
         );
-        StorageHandle::recv_writer_response(pane_rx)
+        StorageHandle::recv_writer_response_with_cx(&cx, pane_rx)
             .await
             .expect("unrelated write must run after one batch");
         assert!(storage.get_pane(2).await.expect("read follower pane").is_some());
@@ -39680,12 +39741,12 @@ fn v35_performance_campaign_segment_retention_writer_yields_and_preserves_fts() 
             .expect("release segment writer lock");
 
         assert_eq!(
-            StorageHandle::recv_writer_response(prune_rx)
+            StorageHandle::recv_writer_response_with_cx(&cx, prune_rx)
                 .await
                 .expect("receive one-segment batch"),
             1
         );
-        StorageHandle::recv_writer_response(pane_rx)
+        StorageHandle::recv_writer_response_with_cx(&cx, pane_rx)
             .await
             .expect("follower write runs after one segment batch");
         assert_eq!(
@@ -40550,14 +40611,14 @@ fn v35_performance_campaign_size_eviction_yields_between_bounded_writer_turns() 
             .execute_batch("COMMIT")
             .expect("release size FIFO writer lock");
 
-        let first_turn = StorageHandle::recv_writer_response(evict_rx)
+        let first_turn = StorageHandle::recv_writer_response_with_cx(&cx, evict_rx)
             .await
             .expect("receive first bounded size turn");
         assert!(
             (1..=SIZE_EVICTION_BATCH).contains(&first_turn.deleted_segments),
             "one writer turn must delete a non-empty bounded batch: {first_turn:?}"
         );
-        StorageHandle::recv_writer_response(pane_rx)
+        StorageHandle::recv_writer_response_with_cx(&cx, pane_rx)
             .await
             .expect("latency follower must run after one bounded size turn");
 
@@ -40811,12 +40872,12 @@ async fn exercise_bounded_auxiliary_retention(table: AuxiliaryRetentionTable) {
         .execute_batch("COMMIT")
         .expect("release auxiliary writer lock");
     assert_eq!(
-        StorageHandle::recv_writer_response(purge_rx)
+        StorageHandle::recv_writer_response_with_cx(&cx, purge_rx)
             .await
             .expect("receive one auxiliary batch"),
         AUXILIARY_RETENTION_DELETE_BATCH_MAX
     );
-    StorageHandle::recv_writer_response(pane_rx)
+    StorageHandle::recv_writer_response_with_cx(&cx, pane_rx)
         .await
         .expect("auxiliary follower runs between purge batches");
 
@@ -45305,20 +45366,276 @@ fn blocking_storage_mutation_cancel_before_result_publication_is_indeterminate()
 #[test]
 fn admitted_writer_response_has_a_finite_indeterminate_timeout() {
     run_storage_async_test(async {
+        let cx = crate::cx::for_testing();
         let (_sender, receiver) = oneshot::channel::<Result<u64>>();
-        let error = StorageHandle::recv_writer_response_with_timeout(
+        let error = StorageHandle::recv_writer_response_with_cx_timeout(
+            &cx,
             receiver,
             std::time::Duration::ZERO,
+            WriterResponseKind::Mutation,
         )
         .await
         .expect_err("a writer that withholds its response must not block forever");
         assert!(matches!(
             error,
             crate::Error::Storage(StorageError::WriterSettlementIndeterminate {
-                phase: "command_response"
+                phase: "command_response_timeout"
             })
         ));
     });
+}
+
+#[cfg(test)]
+mod writer_response_cancellation_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn assert_indeterminate(error: &crate::Error, expected_phase: &str) {
+        match error {
+            crate::Error::Storage(StorageError::WriterSettlementIndeterminate { phase }) => {
+                assert_eq!(*phase, expected_phase);
+            }
+            other => panic!("admitted mutation must require reconciliation: {other:?}"),
+        }
+        assert!(
+            !crate::retry::is_retryable(error),
+            "an admitted mutation must never become a blind retry"
+        );
+    }
+
+    #[test]
+    fn published_writer_results_win_cancellation_ties() {
+        run_storage_async_test(async {
+            for poll_before_cancel in [false, true] {
+                for writer_rejected in [false, true] {
+                    let cx = crate::cx::for_testing();
+                    let delivery_cx = crate::cx::for_testing();
+                    let (sender, receiver) = oneshot::channel::<Result<u64>>();
+                    let mut response = Box::pin(StorageHandle::recv_writer_response_with_cx(
+                        &cx, receiver,
+                    ));
+                    let waker = Waker::from(Arc::new(WakeCounter::default()));
+                    let mut context = Context::from_waker(&waker);
+                    if poll_before_cancel {
+                        assert!(response.as_mut().poll(&mut context).is_pending());
+                    }
+                    cx.cancel_with(crate::outcome::CancelKind::User, Some("response tie"));
+                    let result = if writer_rejected {
+                        Err(StorageError::Database("authoritative writer refusal".into()).into())
+                    } else {
+                        Ok(17)
+                    };
+                    sender.send_with_cx(&delivery_cx, result).expect("publish result");
+                    let Poll::Ready(result) = response.as_mut().poll(&mut context) else {
+                        panic!("published response must be immediately available");
+                    };
+                    if writer_rejected {
+                        assert!(matches!(
+                            result,
+                            Err(crate::Error::Storage(StorageError::Database(detail)))
+                                if detail == "authoritative writer refusal"
+                        ));
+                    } else {
+                        assert_eq!(result.expect("published commit wins cancellation"), 17);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn caller_cancellation_directly_wakes_suspended_writer_response() {
+        run_storage_async_test(async {
+            let cx = crate::cx::for_testing();
+            let ambient = crate::cx::for_testing();
+            ambient.cancel_with(crate::outcome::CancelKind::User, Some("unrelated task"));
+            let _ambient_guard = crate::cx::Cx::set_current(Some(ambient));
+            let (sender, receiver) = oneshot::channel::<Result<u64>>();
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut context = Context::from_waker(&waker);
+            let mut response = Box::pin(StorageHandle::recv_writer_response_with_cx(&cx, receiver));
+            assert!(response.as_mut().poll(&mut context).is_pending());
+            let registered_wakes = counter.0.load(Ordering::SeqCst);
+            for _ in 0..3 {
+                assert!(response.as_mut().poll(&mut context).is_pending());
+            }
+            assert_eq!(counter.0.load(Ordering::SeqCst), registered_wakes);
+
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("cancel admitted writer wait"));
+            assert!(
+                counter.0.load(Ordering::SeqCst) > registered_wakes,
+                "cancellation must wake the task without waiting for the settlement timer"
+            );
+            let Poll::Ready(Err(error)) = response.as_mut().poll(&mut context) else {
+                panic!("cancelled writer wait must settle on its next poll");
+            };
+            assert_indeterminate(&error, "command_response_cancelled");
+            drop(response);
+            let delivery_cx = crate::cx::for_testing();
+            assert!(sender.send_with_cx(&delivery_cx, Ok(17)).is_err());
+        });
+    }
+
+    #[test]
+    fn exhausted_caller_budget_preserves_only_published_writer_results() {
+        run_storage_async_test(async {
+            for already_published in [false, true] {
+                let cx = crate::cx::Cx::for_testing_with_budget(
+                    crate::cx::Budget::new().with_poll_quota(0),
+                );
+                let delivery_cx = crate::cx::for_testing();
+                let (sender, receiver) = oneshot::channel::<Result<u64>>();
+                let held_sender = if already_published {
+                    sender.send_with_cx(&delivery_cx, Ok(23)).expect("publish result");
+                    None
+                } else {
+                    Some(sender)
+                };
+                let result = StorageHandle::recv_writer_response_with_cx(&cx, receiver).await;
+                if already_published {
+                    assert_eq!(result.expect("published result survives exhausted budget"), 23);
+                } else {
+                    assert_indeterminate(
+                        &result.expect_err("exhausted caller must stop waiting"),
+                        "command_response_poll_budget",
+                    );
+                }
+                drop(held_sender);
+            }
+        });
+    }
+
+    #[test]
+    fn caller_deadline_ends_writer_response_in_virtual_time() {
+        let observed = Arc::new(Mutex::new(None));
+        let task_observed = Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x5702_CA11)
+                .with_auto_advance()
+                .max_steps(10_000),
+        );
+        let region = runtime.state.create_root_region(crate::cx::Budget::INFINITE);
+        let budget = crate::cx::Budget::new().with_deadline(asupersync::Time::from_millis(100));
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, budget, async move {
+                let cx = crate::cx::Cx::current().expect("LabRuntime caller context");
+                let (sender, receiver) = oneshot::channel::<Result<u64>>();
+                let result = StorageHandle::recv_writer_response_with_cx(&cx, receiver).await;
+                *task_observed.lock().expect("publish deadline outcome") = Some(result);
+                drop(sender);
+            })
+            .expect("create deadline-bound writer caller");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_with_auto_advance();
+        let result = observed.lock().expect("deadline outcome").take().expect(
+            "caller deadline must wake the waiter without a response or external cancellation",
+        );
+        assert_indeterminate(
+            &result.expect_err("unsettled mutation requires reconciliation"),
+            "command_response_deadline",
+        );
+        assert_eq!(runtime.now(), asupersync::Time::from_millis(100));
+        assert_eq!(runtime.pending_timer_count(), 0);
+    }
+
+    #[test]
+    fn disconnected_writer_response_is_indeterminate() {
+        run_storage_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (sender, receiver) = oneshot::channel::<Result<u64>>();
+            drop(sender);
+            let error = StorageHandle::recv_writer_response_with_cx(&cx, receiver)
+                .await
+                .expect_err("lost response cannot establish rollback");
+            assert_indeterminate(&error, "command_response_disconnected");
+        });
+    }
+
+    #[test]
+    fn serialized_read_cancellation_does_not_claim_an_uncertain_mutation() {
+        run_storage_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (sender, receiver) = oneshot::channel::<Result<u64>>();
+            let waker = Waker::from(Arc::new(WakeCounter::default()));
+            let mut context = Context::from_waker(&waker);
+            let mut response = Box::pin(StorageHandle::recv_writer_read_response_with_cx(
+                &cx, receiver,
+            ));
+            assert!(response.as_mut().poll(&mut context).is_pending());
+            cx.cancel_with(crate::outcome::CancelKind::User, Some("stop serialized read"));
+            assert!(matches!(
+                response.as_mut().poll(&mut context),
+                Poll::Ready(Err(crate::Error::Cancelled(detail)))
+                    if detail.contains("command_response_cancelled")
+            ));
+            drop(response);
+            drop(sender);
+        });
+    }
+
+    #[test]
+    fn admitted_write_commits_after_its_caller_stops_waiting() {
+        run_storage_async_test(async {
+            let temp = tempfile::tempdir().expect("writer cancellation fixture");
+            let db_path = temp.path().join("writer-cancellation.db");
+            let live_cx = crate::cx::for_testing();
+            let storage = StorageHandle::new_with_cx(&live_cx, &db_path.to_string_lossy())
+                .await
+                .expect("open writer cancellation fixture");
+            let (entered, release) = storage.pause_writer_before_receive_for_test();
+            storage.write_tx.wakeup.notify();
+            let entered_result = entered.recv_timeout(std::time::Duration::from_secs(5));
+            let caller_cx = crate::cx::for_testing();
+            let waker = Waker::from(Arc::new(WakeCounter::default()));
+            let mut context = Context::from_waker(&waker);
+            let mut mutation = Box::pin(storage.set_config_value_with_cx(
+                &caller_cx,
+                "cancelled-writer-receipt",
+                "committed",
+            ));
+            let initial = mutation.as_mut().poll(&mut context);
+            let initially_pending = initial.is_pending();
+            let cancelled = if initially_pending {
+                caller_cx.cancel_with(crate::outcome::CancelKind::User, Some("stop admitted write"));
+                mutation.as_mut().poll(&mut context)
+            } else {
+                initial
+            };
+            drop(mutation);
+            // Release the writer even on assertion failure. Its queued command
+            // retains ownership independently of the dropped response receiver.
+            let _ = release.send(());
+            entered_result.expect("writer must enter the owned pre-receive barrier");
+            assert!(initially_pending, "write must be admitted before publication");
+            let Poll::Ready(Err(error)) = cancelled else {
+                panic!("admitted caller must observe cancellation while the writer is paused");
+            };
+            assert_indeterminate(&error, "command_response_cancelled");
+            let committed = storage
+                .get_config_value_with_cx(&live_cx, "cancelled-writer-receipt")
+                .await
+                .expect("FIFO read reconciles the admitted write");
+            assert_eq!(committed.as_deref(), Some("committed"));
+            storage.shutdown_with_cx(&live_cx).await.expect("join writer");
+        });
+    }
 }
 
 #[test]
