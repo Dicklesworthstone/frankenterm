@@ -792,6 +792,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var showing = false
         var controllingSize = false
         var outgoing = Data()
+        /// Events taken from the client so far, to tell whether a drain found any.
+        var takenEvents = 0
         /// Panes left at the phone's size on this machine, across connections.
         let sizes: TerminalMuxPhoneSizes
         /// The pane shown on this machine, across connections.
@@ -1015,6 +1017,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard state.output.isEmpty else { return false }
         for _ in 0..<64 {
             guard let event = try state.client.nextEvent() else { return true }
+            state.takenEvents &+= 1
             switch event {
             case .ready:
                 state.ready = true
@@ -1353,6 +1356,13 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // A bounded control-only turn yields to input/cancellation. Only an
         // observed-empty event queue permits the next receive/decode operation.
         guard drained else { return TerminalSessionUpdate(output: Data()) }
+        // That reconcile may have queued events the client answers itself,
+        // with nothing on the network to end the wait below: an older peer's
+        // identity answer, say. Observe the queue once more before waiting.
+        if let state = mux {
+            let taken = state.takenEvents
+            guard try drainMux(), state.takenEvents == taken else { return TerminalSessionUpdate(output: Data()) }
+        }
         let now = ContinuousClock.now
         if let state = mux, now >= state.nextListing {
             try state.client.refreshPanes()

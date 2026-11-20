@@ -476,14 +476,24 @@ final class MuxObservationTests: XCTestCase {
         let coordinator = try TerminalInputCoordinator(), consumer = try ObservationConsumer(identity: owner.identity)
         do {
             if mode == "no-panes" {
-                do {
-                    _ = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
-                        try await consumer.prepare($0)
-                    }
-                    XCTFail("Missing existing panes manufactured a terminal")
-                } catch { XCTAssertEqual(error as? TerminalMuxError, .noPanes) }
+                // An empty mux is a live connection that shows nothing until
+                // its inventory changes or a reviewed New Tab creates a shell
+                // (4d22723bf). Opening it shows, sizes and sends nothing.
+                let pump = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
+                    try await consumer.prepare($0)
+                }
+                XCTAssertTrue(control.current.panes.isEmpty)
+                XCTAssertNil(control.current.shown)
+                XCTAssertFalse(client.recorded.contains { $0.name == "show" })
                 XCTAssertTrue(client.effects.isEmpty)
+                let run = Task { try await pump.run(consumer: consumer) }
+                pump.requestStop()
+                _ = try await run.value
+                let pending = try await coordinator.pendingOutcomes(pump.source)
+                if !pending.outcomes.isEmpty { try await coordinator.acknowledgeOutcomes(pending) }
+                try await coordinator.retire(pump.source)
                 await owner.close()
+                XCTAssertTrue(client.effects.isEmpty, "Closing an empty mux sizes and sends nothing")
                 XCTAssertEqual(activity.accounting().connections, 0)
                 return
             }
