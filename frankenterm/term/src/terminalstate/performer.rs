@@ -41,7 +41,20 @@ const LINE_FEED_FLOOD_ENV: &str = "FT_LINE_FEED_FLOOD";
 /// Conservative expanded cell/step work, separate from the bounded number of
 /// input bytes. One compact CSI may otherwise request u32::MAX operations.
 /// Reset for each performer (one native feed), never for each CSI command.
+/// A feed on a large grid gets more; see [`NATIVE_FULL_SCREEN_EDITS_PER_FEED`].
 pub(crate) const NATIVE_EXPANDED_WORK_BUDGET: usize = 65_536;
+
+/// Full-screen edits (ED, IL, DL, DECALN and the like, each charged
+/// rows * cols) that one native feed may always perform, whatever the grid
+/// size. With the fixed budget alone, a shell prompt redraw (two ED and a few
+/// EL) poisoned an 85x385 session: 2 * 32,725 + 3 * 385 = 66,605.
+pub(crate) const NATIVE_FULL_SCREEN_EDITS_PER_FEED: usize = 32;
+
+/// One native feed's expanded-work budget for the grid it starts on.
+pub(crate) fn native_expanded_work_budget(rows: usize, cols: usize) -> usize {
+    let screen = rows.max(1).saturating_mul(cols.max(1));
+    NATIVE_EXPANDED_WORK_BUDGET.max(NATIVE_FULL_SCREEN_EDITS_PER_FEED.saturating_mul(screen))
+}
 
 impl TerminalState {
     /// Bytes retained by an unfinished legacy tmux title sequence.
@@ -621,7 +634,10 @@ impl<'a> Performer<'a> {
     pub fn new(state: &'a mut TerminalState) -> Self {
         let native_work_remaining = (state.config.feature_profile()
             == crate::config::TerminalFeatureProfile::NativeText)
-            .then_some(NATIVE_EXPANDED_WORK_BUDGET);
+            .then(|| {
+                let screen = state.screen();
+                native_expanded_work_budget(screen.physical_rows, screen.physical_cols)
+            });
         Self {
             state,
             print: String::new(),

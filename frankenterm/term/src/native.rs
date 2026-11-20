@@ -1320,6 +1320,52 @@ mod tests {
         assert!(terminal.capture_frame(None).is_ok());
     }
 
+    /// The largest grid the phone shows (9 pt on an 1800x1200 pt view): both
+    /// screens fit MAX_RESIDENT_CELLS, so no history is retained beside them.
+    fn largest_shown_grid() -> NativeTerminal {
+        NativeTerminal::new(NativeTerminalConfig {
+            size: TerminalSize {
+                rows: 85,
+                cols: 385,
+                ..TerminalSize::default()
+            },
+            scrollback_rows: 256,
+            ..config()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_shell_prompt_redraw_on_the_largest_shown_grid_fits_one_feed() {
+        // ft-w9lwkb: a themed zsh prompt redraws with two ED and three EL in
+        // one write. Charged rows * cols each, that is 66,605 cells at 85x385,
+        // past the fixed 65,536 budget, and it ended the iPad session.
+        let mut terminal = largest_shown_grid();
+        let redraw: &[u8] = b"\r\x1b[0m\x1b[K\r\x1b[0m\x1b[J\x1b[38;5;76m> \x1b[0mseq 1 400\
+            \x1b[K\x1b[372D\r\r\x1b[J> seq 1 400\x1b[K\r\r\n";
+        terminal.feed(redraw).unwrap();
+        assert!(!terminal.terminal.native_execution_limit_exceeded());
+        assert!(terminal.capture_frame(None).is_ok());
+    }
+
+    #[test]
+    fn a_large_grid_still_bounds_full_screen_edits_in_one_feed() {
+        use crate::terminalstate::performer::NATIVE_FULL_SCREEN_EDITS_PER_FEED;
+        let mut admitted = largest_shown_grid();
+        admitted
+            .feed(&b"\x1b[2J".repeat(NATIVE_FULL_SCREEN_EDITS_PER_FEED))
+            .unwrap();
+        assert!(!admitted.terminal.native_execution_limit_exceeded());
+        assert!(admitted.capture_frame(None).is_ok());
+
+        let mut refused = largest_shown_grid();
+        assert_eq!(
+            refused.feed(&b"\x1b[2J".repeat(NATIVE_FULL_SCREEN_EDITS_PER_FEED + 1)),
+            Err(NativeTerminalError::Capacity)
+        );
+        assert!(refused.terminal.native_execution_limit_exceeded());
+    }
+
     #[test]
     fn parser_reply_overflow_closes_instead_of_silently_losing_a_reply() {
         let mut terminal = terminal();
