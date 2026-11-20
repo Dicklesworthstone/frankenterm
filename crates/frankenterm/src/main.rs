@@ -11076,7 +11076,8 @@ fn proof_doctor_cargo_argv(command: &[String]) -> &[String] {
 }
 
 fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let raw = frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024)
+        .ok()?;
     // toml 1.x: `parse::<toml::Value>()` parses a single bare VALUE, not a
     // document, so a real Cargo.toml fails to parse and this silently returns
     // None. Parse the document as a `toml::Table` instead (ft-vxxzk, mirrors the
@@ -11091,7 +11092,8 @@ fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
 }
 
 fn proof_doctor_workspace_members_from_manifest(manifest_path: &Path) -> Option<Vec<String>> {
-    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let raw = frankenterm_core::lock::read_file_to_string_bounded(manifest_path, 4 * 1024 * 1024)
+        .ok()?;
     // toml 1.x: parse the document as a `toml::Table` (not `toml::Value`, which
     // parses a single bare value and would fail on a real Cargo.toml, silently
     // returning None). ft-vxxzk, mirrors the ft-crsdl fix.
@@ -11257,7 +11259,10 @@ fn proof_doctor_merge_evidence_artifacts(
             workspace_root.join(path)
         };
 
-        let raw = match std::fs::read_to_string(&resolved_path) {
+        let raw = match frankenterm_core::lock::read_file_to_string_bounded(
+            &resolved_path,
+            frankenterm_core::lock::DEFAULT_BOUNDED_READ_MAX_BYTES,
+        ) {
             Ok(raw) => raw,
             Err(error) => {
                 proof_doctor_record_artifact_read_error(
@@ -15069,7 +15074,9 @@ fn collect_fixture_rule_ids(
             && path.to_string_lossy().contains(".expect.")
         {
             *total_fixtures += 1;
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(content) =
+                frankenterm_core::lock::read_file_to_string_bounded(&path, 4 * 1024 * 1024)
+            {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(arr) = val.as_array() {
                         for item in arr {
@@ -15102,7 +15109,9 @@ fn collect_submit_profile_fixture_ids(
             && path.to_string_lossy().contains(".submit-profile.")
         {
             *total_fixtures += 1;
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(content) =
+                frankenterm_core::lock::read_file_to_string_bounded(&path, 4 * 1024 * 1024)
+            {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     let Some(profile_id) = val
                         .get("profile_id")
@@ -43921,6 +43930,114 @@ fn webhook_http_client_constructor_pins_redirects_disabled() {
 
 #[cfg(test)]
 #[test]
+fn production_cli_filesystem_reads_and_writes_use_capability_safe_surfaces_canary() {
+    // Source canary for ft-interactive-systems-performance-4tenz.59 & .60:
+    // Ensure non-test production code in crates/frankenterm/src/main.rs,
+    // config_profiles.rs, and rulesets.rs does not re-introduce unaudited
+    // direct std::fs::write / std::fs::read / std::fs::read_to_string calls.
+    fn strip_cfg_test_items(source: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut pending_test_item = false;
+        let mut skip_brace_depth: Option<i32> = None;
+        let mut brace_depth: i32 = 0;
+
+        for (idx, raw_line) in source.lines().enumerate() {
+            let line_no = idx + 1;
+            let trimmed = raw_line.trim();
+            let code_part = trimmed.split("//").next().unwrap_or("");
+            let opens = code_part.matches('{').count() as i32;
+            let closes = code_part.matches('}').count() as i32;
+
+            if let Some(target_depth) = skip_brace_depth {
+                brace_depth += opens - closes;
+                if brace_depth <= target_depth {
+                    skip_brace_depth = None;
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("#[cfg(test)]") {
+                pending_test_item = true;
+                brace_depth += opens - closes;
+                continue;
+            }
+
+            if pending_test_item {
+                if trimmed.is_empty()
+                    || trimmed.starts_with("//")
+                    || trimmed.starts_with('#')
+                {
+                    brace_depth += opens - closes;
+                    continue;
+                }
+                if opens > 0 {
+                    let target_depth = brace_depth;
+                    brace_depth += opens - closes;
+                    pending_test_item = false;
+                    if brace_depth > target_depth {
+                        skip_brace_depth = Some(target_depth);
+                    }
+                    continue;
+                }
+                if code_part.ends_with(';') {
+                    pending_test_item = false;
+                }
+                brace_depth += opens - closes;
+                continue;
+            }
+
+            out.push((line_no, code_part));
+            brace_depth += opens - closes;
+        }
+        out
+    }
+
+    let write_needle = ["std::fs::", "write("].concat();
+    let read_needle = ["std::fs::", "read("].concat();
+    let read_str_needle = ["std::fs::", "read_to_string("].concat();
+
+    let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("read main.rs for 4tenz.59/.60 canary");
+    let main_violations: Vec<String> = strip_cfg_test_items(&main_src)
+        .into_iter()
+        .filter(|(_, line)| {
+            line.contains(&write_needle)
+                || line.contains(&read_needle)
+                || line.contains(&read_str_needle)
+        })
+        .map(|(line_no, line)| format!("main.rs:{line_no}: {line}"))
+        .collect();
+    assert!(
+        main_violations.is_empty(),
+        "unaudited direct std::fs read/write in production main.rs:\n{}",
+        main_violations.join("\n")
+    );
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    for rel in [
+        "crates/frankenterm-core/src/config_profiles.rs",
+        "crates/frankenterm-core/src/rulesets.rs",
+    ] {
+        let src = std::fs::read_to_string(repo_root.join(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let violations: Vec<String> = strip_cfg_test_items(&src)
+            .into_iter()
+            .filter(|(_, line)| line.contains(&write_needle))
+            .map(|(line_no, line)| format!("{rel}:{line_no}: {line}"))
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "unaudited direct std::fs::write in production {rel}:\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
     use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::webhook::{DeliveryFailureClass, WebhookTransport};
@@ -49443,7 +49560,7 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
         return;
     }
 
-    if let Err(err) = std::fs::write(&marker, b"1\n") {
+    if let Err(err) = frankenterm_core::lock::write_file_atomic(&marker, b"1\n") {
         tracing::warn!(
             marker = %marker.display(),
             error = %err,
@@ -50928,9 +51045,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         std::process::exit(2);
                     }
 
+                    let handoff_io_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
                     let dest_passport = match destination_passport {
                         None => None,
-                        Some(p) => match std::fs::read(&p) {
+                        Some(p) => match frankenterm_core::lock::read_file_bounded_with_cx(
+                            &handoff_io_cx,
+                            p.clone(),
+                            4 * 1024 * 1024,
+                        )
+                        .await
+                        {
                             Ok(bytes) => match serde_json::from_slice::<
                                 frankenterm_core::capability_passport::CapabilityPassport,
                             >(&bytes)
@@ -60793,17 +60918,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 get_config_kv, set_config_kv,
                             };
 
-                            let read_manifest_file = |path: &str| -> Result<
-                                Box<frankenterm_core::connector_registry::ConnectorManifest>,
-                                String,
-                            > {
-                                let raw = std::fs::read_to_string(path).map_err(|e| {
-                                    format!("failed to read manifest file '{path}': {e}")
-                                })?;
-                                serde_json::from_str(&raw).map(Box::new).map_err(|e| {
-                                    format!("failed to parse manifest JSON '{path}': {e}")
-                                })
-                            };
+                            let connector_io_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
 
                             let action: Result<ConnectorAction, String> = match &command {
                                 RobotConnectorCommands::Status { connector_id } => {
@@ -60814,23 +60930,55 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 RobotConnectorCommands::Install {
                                     manifest_file,
                                     dry_run,
-                                } => read_manifest_file(manifest_file).map(|manifest| {
-                                    ConnectorAction::Install {
-                                        manifest,
-                                        dry_run: *dry_run,
-                                    }
-                                }),
+                                } => match frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                                    &connector_io_cx,
+                                    PathBuf::from(manifest_file),
+                                    2 * 1024 * 1024,
+                                )
+                                .await
+                                {
+                                    Ok(raw) => serde_json::from_str(&raw)
+                                        .map(Box::new)
+                                        .map(|manifest| ConnectorAction::Install {
+                                            manifest,
+                                            dry_run: *dry_run,
+                                        })
+                                        .map_err(|e| {
+                                            format!(
+                                                "failed to parse manifest JSON '{manifest_file}': {e}"
+                                            )
+                                        }),
+                                    Err(e) => Err(format!(
+                                        "failed to read manifest file '{manifest_file}': {e}"
+                                    )),
+                                },
                                 RobotConnectorCommands::Update {
                                     connector_id,
                                     manifest_file,
                                     dry_run,
-                                } => read_manifest_file(manifest_file).map(|manifest| {
-                                    ConnectorAction::Update {
-                                        connector_id: connector_id.clone(),
-                                        manifest,
-                                        dry_run: *dry_run,
-                                    }
-                                }),
+                                } => match frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                                    &connector_io_cx,
+                                    PathBuf::from(manifest_file),
+                                    2 * 1024 * 1024,
+                                )
+                                .await
+                                {
+                                    Ok(raw) => serde_json::from_str(&raw)
+                                        .map(Box::new)
+                                        .map(|manifest| ConnectorAction::Update {
+                                            connector_id: connector_id.clone(),
+                                            manifest,
+                                            dry_run: *dry_run,
+                                        })
+                                        .map_err(|e| {
+                                            format!(
+                                                "failed to parse manifest JSON '{manifest_file}': {e}"
+                                            )
+                                        }),
+                                    Err(e) => Err(format!(
+                                        "failed to read manifest file '{manifest_file}': {e}"
+                                    )),
+                                },
                                 RobotConnectorCommands::Enable {
                                     connector_id,
                                     dry_run,
@@ -67097,7 +67245,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             }
 
             let commit_text = if let Some(path) = text_file.as_ref() {
-                match std::fs::read_to_string(path) {
+                let commit_io_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    &commit_io_cx,
+                    path.clone(),
+                    frankenterm_core::lock::DEFAULT_BOUNDED_READ_MAX_BYTES,
+                )
+                .await
+                {
                     Ok(contents) => Some(contents),
                     Err(e) => {
                         eprintln!("Error: Failed to read text file {}: {e}", path.display());
@@ -71723,9 +71879,18 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // Determine report format.
             let _report_format = if robot { "json" } else { &format };
 
+            let replay_io_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+
             // Load budget if provided.
             let regression_budget = if let Some(budget_path) = &budget {
-                let toml_str = std::fs::read_to_string(budget_path).map_err(|e| {
+                let toml_str = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    &replay_io_cx,
+                    budget_path.clone(),
+                    2 * 1024 * 1024,
+                )
+                .await
+                .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to read budget file '{}': {e}",
                         budget_path.display()
@@ -71738,10 +71903,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             };
 
             // For now, read baseline and candidate as JSONL files of DecisionEvents.
-            let baseline_data = std::fs::read_to_string(&baseline).map_err(|e| {
+            let baseline_data = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                &replay_io_cx,
+                baseline.clone(),
+                64 * 1024 * 1024,
+            )
+            .await
+            .map_err(|e| {
                 anyhow::anyhow!("Failed to read baseline '{}': {e}", baseline.display())
             })?;
-            let candidate_data = std::fs::read_to_string(&candidate).map_err(|e| {
+            let candidate_data = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                &replay_io_cx,
+                candidate.clone(),
+                64 * 1024 * 1024,
+            )
+            .await
+            .map_err(|e| {
                 anyhow::anyhow!("Failed to read candidate '{}': {e}", candidate.display())
             })?;
 
@@ -71772,7 +71949,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let report_str = runner.format_result(&result, output_mode, &meta);
 
             if let Some(output_path) = &output {
-                std::fs::write(output_path, &report_str).map_err(|e| {
+                frankenterm_core::lock::write_file_atomic_with_policy(
+                    output_path,
+                    report_str.as_bytes(),
+                    frankenterm_core::lock::AtomicWritePolicy::default()
+                        .with_max_bytes(64 * 1024 * 1024),
+                )
+                .map_err(|e| {
                     anyhow::anyhow!("Failed to write output '{}': {e}", output_path.display())
                 })?;
                 eprintln!("Report written to {}", output_path.display());
@@ -71793,8 +71976,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }) => {
             use frankenterm_core_replay::replay_cli::InspectResult;
 
-            let data = std::fs::read_to_string(&file)
-                .map_err(|e| anyhow::anyhow!("Failed to read trace '{}': {e}", file.display()))?;
+            let inspect_io_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let data = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                &inspect_io_cx,
+                file.clone(),
+                64 * 1024 * 1024,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read trace '{}': {e}", file.display()))?;
 
             let events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
                 serde_json::from_str(&data)
@@ -71886,7 +72076,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let manifest_path = registry_base.join("manifest.toml");
 
             let manifest = if manifest_path.exists() {
-                let toml_str = std::fs::read_to_string(&manifest_path).map_err(|e| {
+                let artifact_io_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let toml_str = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    &artifact_io_cx,
+                    manifest_path.clone(),
+                    4 * 1024 * 1024,
+                )
+                .await
+                .map_err(|e| {
                     anyhow::anyhow!("Failed to read manifest '{}': {e}", manifest_path.display())
                 })?;
                 ArtifactManifest::from_toml(&toml_str)
@@ -73690,7 +73888,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     };
 
                     if let Some(path) = output_path {
-                        std::fs::write(&path, &rendered)?;
+                        frankenterm_core::lock::write_file_atomic_with_policy(
+                            Path::new(&path),
+                            rendered.as_bytes(),
+                            frankenterm_core::lock::AtomicWritePolicy::default()
+                                .with_max_bytes(64 * 1024 * 1024),
+                        )?;
                         eprintln!("Exported {} metrics to {path}", metrics.len());
                     } else {
                         print!("{rendered}");
@@ -74256,8 +74459,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 fn attestation_sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
 
-    let bytes = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let bytes = frankenterm_core::lock::read_file_bounded(
+        path,
+        frankenterm_core::lock::DEFAULT_BOUNDED_READ_MAX_BYTES,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let digest = Sha256::digest(&bytes);
     Ok(digest
         .iter()
@@ -74328,8 +74534,11 @@ fn load_attestation_retractions(
 
     let mut rows = Vec::new();
     for path in files {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+        let bytes = frankenterm_core::lock::read_file_bounded(
+            &path,
+            frankenterm_core::lock::DEFAULT_BOUNDED_READ_MAX_BYTES,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
         let mut value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse {} as JSON: {e}", path.display()))?;
         if let Some(filter_sha) = &filter_sha {
@@ -74514,8 +74723,11 @@ fn handle_attestation_command(
             Ok(())
         }
         AttestationCommands::Show { bundle } => {
-            let bytes = std::fs::read(&bundle)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", bundle.display()))?;
+            let bytes = frankenterm_core::lock::read_file_bounded(
+                &bundle,
+                frankenterm_core::lock::DEFAULT_BOUNDED_READ_MAX_BYTES,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", bundle.display()))?;
             let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
                 anyhow::anyhow!("failed to parse {} as JSON: {e}", bundle.display())
             })?;
@@ -75480,7 +75692,10 @@ fn handle_config_profile_command(
             let source_toml = match from.trim() {
                 "current" => {
                     if config_path.exists() {
-                        std::fs::read_to_string(&config_path)?
+                        frankenterm_core::lock::read_file_to_string_bounded(
+                            &config_path,
+                            4 * 1024 * 1024,
+                        )?
                     } else {
                         generate_default_config_toml()
                     }
@@ -75501,7 +75716,10 @@ fn handle_config_profile_command(
                             source_path.display()
                         );
                     }
-                    std::fs::read_to_string(&source_path)?
+                    frankenterm_core::lock::read_file_to_string_bounded(
+                        &source_path,
+                        4 * 1024 * 1024,
+                    )?
                 }
             };
 
@@ -75553,7 +75771,10 @@ fn handle_config_profile_command(
                     config_path.display(),
                     backup_path.display()
                 );
-                if let Ok(meta) = std::fs::read_to_string(profile_meta_path(&config_path)) {
+                if let Ok(meta) = frankenterm_core::lock::read_file_to_string_bounded(
+                    &profile_meta_path(&config_path),
+                    1024 * 1024,
+                ) {
                     if let Ok(parsed) = serde_json::from_str::<ConfigProfileApplyMeta>(&meta) {
                         println!(
                             "Last applied profile: {} (applied_at {} ms)",
@@ -75567,7 +75788,8 @@ fn handle_config_profile_command(
                 }
             }
 
-            let backup_contents = std::fs::read_to_string(&backup_path)?;
+            let backup_contents =
+                frankenterm_core::lock::read_file_to_string_bounded(&backup_path, 4 * 1024 * 1024)?;
             frankenterm_core::lock::write_file_atomic(&config_path, backup_contents.as_bytes())?;
             println!("Rollback complete: {}", config_path.display());
         }
@@ -75583,7 +75805,7 @@ fn load_and_merge_config_profile(
     use frankenterm_core::config::Config;
 
     let base_toml = if config_path.exists() {
-        std::fs::read_to_string(config_path)?
+        frankenterm_core::lock::read_file_to_string_bounded(config_path, 4 * 1024 * 1024)?
     } else {
         generate_default_config_toml()
     };
@@ -75622,7 +75844,8 @@ fn load_and_merge_config_profile(
         );
     }
 
-    let overlay_toml = std::fs::read_to_string(&profile_path)?;
+    let overlay_toml =
+        frankenterm_core::lock::read_file_to_string_bounded(&profile_path, 4 * 1024 * 1024)?;
     let merged_toml = merge_toml_documents(&base_toml, &overlay_toml)?;
 
     Config::from_toml(&merged_toml)?;
@@ -75713,7 +75936,12 @@ async fn handle_rules_profile_command(
             PatternEngine::from_config_with_root(&resolved_patterns, patterns_root)?;
 
             let content = if config_path.exists() {
-                std::fs::read_to_string(&config_path)?
+                frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    cx,
+                    config_path.clone(),
+                    4 * 1024 * 1024,
+                )
+                .await?
             } else {
                 generate_default_config_toml()
             };
@@ -76383,7 +76611,14 @@ async fn handle_config_command(
 
             // Read existing config
             let content = if config_path.exists() {
-                std::fs::read_to_string(&config_path)?
+                let config_io_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    &config_io_cx,
+                    config_path.clone(),
+                    4 * 1024 * 1024,
+                )
+                .await?
             } else {
                 generate_default_config_toml()
             };
@@ -76478,7 +76713,14 @@ async fn handle_config_command(
             }
 
             // Load and validate the incoming config
-            let source_content = std::fs::read_to_string(&source_path)?;
+            let config_io_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let source_content = frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                &config_io_cx,
+                source_path.clone(),
+                4 * 1024 * 1024,
+            )
+            .await?;
             let incoming: Config = toml::from_str(&source_content)
                 .map_err(|e| anyhow::anyhow!("Invalid config in {source}: {e}"))?;
             incoming.validate()?;
@@ -76499,7 +76741,12 @@ async fn handle_config_command(
 
             // Show what would change
             let existing_toml = if config_path.exists() {
-                std::fs::read_to_string(&config_path)?
+                frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                    &config_io_cx,
+                    config_path.clone(),
+                    4 * 1024 * 1024,
+                )
+                .await?
             } else {
                 generate_default_config_toml()
             };
@@ -76846,7 +77093,7 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
     fn write_output(output: Option<&Path>, bytes: &[u8]) -> anyhow::Result<()> {
         match output {
             Some(path) => {
-                std::fs::write(path, bytes)
+                frankenterm_core::lock::write_file_atomic(path, bytes)
                     .with_context(|| format!("writing {}", path.display()))?;
                 eprintln!("wrote {}", path.display());
             }
@@ -93157,9 +93404,12 @@ fn disagreeing_scrollback_configs(active: &Path, active_lines: u64) -> Vec<(Path
             Err(_) => false,
         })
         .filter_map(|path| {
-            let lines = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| parse_wezterm_scrollback_lines(&content));
+            let lines = frankenterm_core::lock::read_file_to_string_bounded(
+                &path,
+                MAX_CONFIG_BYTES as usize,
+            )
+            .ok()
+            .and_then(|content| parse_wezterm_scrollback_lines(&content));
             (lines != Some(active_lines)).then_some((path, lines))
         })
         .collect()
@@ -93334,13 +93584,22 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
         }
     }
 
+    let setup_io_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+
     // ---- Phase 3: WezTerm patching ----
     match setup::locate_wezterm_config() {
         Ok(path) => {
             if verbose > 0 {
                 println!("\n  WezTerm config: {}", path.display());
             }
-            match std::fs::read_to_string(&path) {
+            match frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                &setup_io_cx,
+                path.clone(),
+                1024 * 1024,
+            )
+            .await
+            {
                 Ok(content) => {
                     if setup::has_ft_block(&content) {
                         println!("\n✓ wezterm.lua already patched (ft-managed block present)");
@@ -93381,7 +93640,13 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
                     println!("  Shell rc: {}", rc_path.display());
                 }
                 let content = if rc_path.exists() {
-                    std::fs::read_to_string(&rc_path).unwrap_or_default()
+                    frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                        &setup_io_cx,
+                        rc_path.clone(),
+                        1024 * 1024,
+                    )
+                    .await
+                    .unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -99526,15 +99791,11 @@ fn live_gui_tuning_facts(dir: &Path, now_unix_ms: u64) -> Option<::config::tunin
 /// The config file the GUI would load and its text, if it exists and is a
 /// regular file of at most 1 MiB.
 fn gui_config_text() -> Option<(PathBuf, String)> {
-    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
     let path = ::config::tuning::gui_config_candidates()
         .into_iter()
         .find(|path| path.exists())?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = frankenterm_core::lock::read_file_to_string_bounded(&path, MAX_CONFIG_BYTES).ok()?;
     Some((path, text))
 }
 
@@ -99557,13 +99818,11 @@ fn installed_gui_plists() -> Vec<PathBuf> {
 /// The app bundle and `CFBundleShortVersionString` of the first readable
 /// plist in `plists`.
 fn installed_gui_version(plists: &[PathBuf]) -> Option<(PathBuf, String)> {
-    const MAX_PLIST_BYTES: u64 = 1024 * 1024;
+    const MAX_PLIST_BYTES: usize = 1024 * 1024;
     plists.iter().find_map(|plist| {
-        let metadata = std::fs::metadata(plist).ok()?;
-        if !metadata.is_file() || metadata.len() > MAX_PLIST_BYTES {
-            return None;
-        }
-        let version = plist_short_version(&std::fs::read_to_string(plist).ok()?)?;
+        let text =
+            frankenterm_core::lock::read_file_to_string_bounded(plist, MAX_PLIST_BYTES).ok()?;
+        let version = plist_short_version(&text)?;
         let bundle = plist.parent()?.parent()?.to_path_buf();
         Some((bundle, version))
     })

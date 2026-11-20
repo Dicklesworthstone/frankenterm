@@ -1712,27 +1712,58 @@ pub fn read_file_to_string_bounded(
 /// filesystem I/O off the async executor thread.
 ///
 /// Cancellation contract: if `cx` is already cancelled, no filesystem call is
-/// started; if `cx` cancels after offload begins, the call returns
-/// [`BoundedReadError::Cancelled`] without claiming that the underlying OS
-/// blocking read syscall was forcibly interrupted.
+/// started; if `cx` cancels or hits its budget deadline after offload begins,
+/// the call returns [`BoundedReadError::Cancelled`] promptly without blocking
+/// the executor and without claiming that an in-flight OS blocking read syscall
+/// was forcibly interrupted.
 pub async fn read_file_bounded_with_cx(
     cx: &crate::cx::Cx,
     path: PathBuf,
     max_bytes: usize,
 ) -> Result<Vec<u8>, BoundedReadError> {
-    if cx.checkpoint().is_err() {
-        return Err(BoundedReadError::Cancelled);
-    }
-    let result = crate::runtime_async::spawn_blocking(move || read_file_bounded(&path, max_bytes))
-        .await
-        .map_err(|_| BoundedReadError::Io {
+    let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        read_file_bounded(&path, max_bytes)
+    })
+    .await;
+    match outcome {
+        Ok(result) => {
+            if cx.checkpoint().is_err() {
+                return Err(BoundedReadError::Cancelled);
+            }
+            result
+        }
+        Err(err) if err.is_cancelled() => Err(BoundedReadError::Cancelled),
+        Err(_) => Err(BoundedReadError::Io {
             phase: "offload",
-            kind: "join_error",
-        })?;
-    if cx.checkpoint().is_err() {
-        return Err(BoundedReadError::Cancelled);
+            kind: "runtime_failure",
+        }),
     }
-    result
+}
+
+#[cfg(test)]
+async fn read_file_bounded_with_cx_hook(
+    cx: &crate::cx::Cx,
+    path: PathBuf,
+    max_bytes: usize,
+    after_open: impl FnOnce() + Send + 'static,
+) -> Result<Vec<u8>, BoundedReadError> {
+    let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        read_file_bounded_impl(&path, max_bytes, after_open)
+    })
+    .await;
+    match outcome {
+        Ok(result) => {
+            if cx.checkpoint().is_err() {
+                return Err(BoundedReadError::Cancelled);
+            }
+            result
+        }
+        Err(err) if err.is_cancelled() => Err(BoundedReadError::Cancelled),
+        Err(_) => Err(BoundedReadError::Io {
+            phase: "offload",
+            kind: "runtime_failure",
+        }),
+    }
 }
 
 /// `Cx`-aware offloaded variant of [`read_file_to_string_bounded`].
@@ -4279,6 +4310,11 @@ mod metadata_admission_tests {
                     }
                 }));
             }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        }
+
         #[test]
         fn bounded_read_enforces_exact_cap_empty_utf8_and_growth_race() {
             let tmp = TempDir::new().unwrap();
@@ -4377,6 +4413,112 @@ mod metadata_admission_tests {
                     phase: "target_before",
                 })
             );
+
+            // Character device (`/dev/null`) must fail admission before read.
+            let dev_null = Path::new("/dev/null");
+            if dev_null.exists() {
+                assert_eq!(
+                    read_file_bounded(dev_null, 1024),
+                    Err(BoundedReadError::NotRegularTarget {
+                        phase: "target_before",
+                    })
+                );
+            }
+
+            // FIFO must fail admission before open (must never block waiting for a writer).
+            let fifo = tmp.path().join("nonreg.fifo");
+            if std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                assert_eq!(
+                    read_file_bounded(&fifo, 1024),
+                    Err(BoundedReadError::NotRegularTarget {
+                        phase: "target_before",
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn bounded_read_with_cx_pre_cancel_and_stalled_reader_keep_executor_responsive() {
+            use crate::runtime_async::{CompatRuntime, RuntimeBuilder, task};
+            use std::sync::mpsc;
+
+            let tmp = TempDir::new().unwrap();
+            let file = tmp.path().join("hello.txt");
+            fs::write(&file, b"hello bounded async").unwrap();
+
+            let rt = RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // 1. Pre-cancelled Cx short-circuits before touching the filesystem.
+                let cancelled = crate::cx::Cx::for_testing();
+                cancelled.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("4tenz.60 pre-cancel"),
+                );
+                let missing = tmp.path().join("does-not-exist.txt");
+                assert_eq!(
+                    read_file_bounded_with_cx(&cancelled, missing, 1024).await,
+                    Err(BoundedReadError::Cancelled)
+                );
+
+                // 2. Live Cx reads cleanly off the executor thread.
+                let live = crate::cx::for_request();
+                assert_eq!(
+                    read_file_to_string_bounded_with_cx(&live, file.clone(), 1024)
+                        .await
+                        .unwrap(),
+                    "hello bounded async"
+                );
+
+                // 3. Stalled blocking reader cancels promptly mid-flight while
+                // a sibling task on the same single-threaded executor finishes immediately.
+                let stall_cx = crate::cx::for_request();
+                let cancel_handle = stall_cx.clone();
+                let (entered_tx, entered_rx) = mpsc::channel::<()>();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                let stalled_file = file.clone();
+
+                let reader = task::spawn(async move {
+                    read_file_bounded_with_cx_hook(&stall_cx, stalled_file, 1024, move || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    })
+                    .await
+                });
+
+                // Wait until the blocking thread has entered the stalled read,
+                // then prove the executor stays responsive before cancelling.
+                let sibling_ran = task::spawn(async { 42usize }).await;
+                assert_eq!(sibling_ran, 42);
+
+                // Poll briefly until the offloaded thread starts, then cancel mid-flight.
+                let start_wait = std::time::Instant::now();
+                while entered_rx.try_recv().is_err()
+                    && start_wait.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    let _ = crate::runtime_async::sleep_with_cx(
+                        &live,
+                        std::time::Duration::from_millis(5),
+                    )
+                    .await;
+                }
+                cancel_handle.cancel_with(
+                    crate::outcome::CancelKind::Timeout,
+                    Some("4tenz.60 stalled reader cancel"),
+                );
+
+                let outcome = reader.await;
+                assert_eq!(outcome, Err(BoundedReadError::Cancelled));
+
+                // Release the abandoned background thread cleanly so test teardown doesn't linger.
+                let _ = release_tx.send(());
+            });
         }
     }
 }
