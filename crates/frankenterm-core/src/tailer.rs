@@ -416,6 +416,9 @@ pub struct CaptureEvent {
     pub segment: CapturedSegment,
     /// Exact runtime-owned pane incarnation and producer source epoch.
     stamp: CaptureStamp,
+    /// Composer evidence from this capture's complete polling snapshot.
+    /// Native/streaming deltas and replay without that snapshot remain unknown.
+    observed_agent_type: Option<crate::patterns::AgentType>,
     /// Drop-safe, inspectable receipt for a provisional generation resync.
     resync_decision: Option<CaptureResyncDecision>,
 }
@@ -437,6 +440,7 @@ impl CaptureEvent {
         Ok(Self {
             segment,
             stamp,
+            observed_agent_type: None,
             resync_decision: None,
         })
     }
@@ -445,6 +449,22 @@ impl CaptureEvent {
     #[must_use]
     pub fn stamp(&self) -> CaptureStamp {
         self.stamp
+    }
+
+    /// Attach identity observed in the same admitted snapshot, never in a
+    /// delta, a later screen read, or cached pane metadata.
+    pub(crate) fn with_snapshot_agent(mut self, snapshot: &str) -> Self {
+        self.observed_agent_type = if self.stamp.source_kind() == CaptureSourceKind::Polling {
+            crate::pane_capability_resolution::agent_type_from_capture_snapshot(snapshot)
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Identity evidence belongs to this event only and is not sticky state.
+    pub(crate) fn observed_agent_type(&self) -> Option<crate::patterns::AgentType> {
+        self.observed_agent_type
     }
 
     /// Attach the durable decision cell for a provisional generation resync.
@@ -2083,7 +2103,7 @@ where
                         });
                     }
                     let event = match CaptureEvent::from_producer(segment, &producer_guard) {
-                        Ok(event) => event,
+                        Ok(event) => event.with_snapshot_agent(&text),
                         Err(error) => {
                             drop(permit);
                             return (pane_id, PollOutcome::AuthorityRejected(error));
@@ -3234,6 +3254,66 @@ mod tests {
     }
 
     #[test]
+    fn polling_attaches_agent_evidence_from_each_snapshot_without_extra_reads() {
+        use crate::patterns::AgentType;
+
+        struct SnapshotSource {
+            calls: AtomicUsize,
+        }
+
+        impl PaneTextSource for SnapshotSource {
+            type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+            fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(match call {
+                        0 => "Quoted Codex output\n────────\n❯ \n────────\n",
+                        1 => "Codex session output\n› Ask Codex to do anything\n",
+                        2 => "shell output\n$ ",
+                        _ => panic!("capture classification must not fetch a second snapshot"),
+                    }
+                    .to_string())
+                })
+            }
+        }
+
+        run_async_test(async {
+            let source = Arc::new(SnapshotSource {
+                calls: AtomicUsize::new(0),
+            });
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(5),
+                max_concurrent: 1,
+                ..Default::default()
+            };
+            let (tx, mut rx) = mpsc::channel(4);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(1, PaneCursor::new(1))])));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, Arc::clone(&source));
+            supervisor.sync_tailers(&HashMap::from([(1, make_pane(1))]));
+
+            for (index, expected) in [Some(AgentType::ClaudeCode), Some(AgentType::Codex), None]
+                .into_iter()
+                .enumerate()
+            {
+                crate::runtime_async::sleep(Duration::from_millis(2)).await;
+                let mut poll_tasks = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut poll_tasks);
+                let (pane_id, outcome) = poll_tasks.join_next().await.expect("one poll");
+                assert!(matches!(outcome, PollOutcome::Changed { .. }));
+                supervisor.handle_poll_result(pane_id, outcome);
+                let event = rx.try_recv().expect("one captured snapshot");
+                assert_eq!(event.observed_agent_type(), expected);
+                assert_eq!(source.calls.load(Ordering::SeqCst), index + 1);
+            }
+        });
+    }
+
+    #[test]
     fn supervisor_respects_concurrency_limit() {
         run_async_test(async {
             let active = Arc::new(AtomicUsize::new(0));
@@ -3536,6 +3616,37 @@ mod tests {
         assert_eq!(event.segment.content, "test content");
         assert!(event.segment.captured_at > 0);
         assert_eq!(event.stamp(), lease.stamp());
+        assert_eq!(event.observed_agent_type(), None);
+    }
+
+    #[test]
+    fn delta_sources_cannot_borrow_snapshot_agent_identity() {
+        let snapshot = "────────\n❯ \n────────\n";
+        for kind in [
+            CaptureSourceKind::NativePush,
+            CaptureSourceKind::VendoredStreaming,
+        ] {
+            let authority = CaptureAuthority::new();
+            let pane = authority.activate_pane(42).expect("pane authority");
+            let lease = authority
+                .issue_source(pane, kind)
+                .expect("source authority");
+            let guard = lease
+                .try_acquire_producer(lease.stamp(), 42)
+                .expect("producer authority");
+            let segment = CapturedSegment {
+                pane_id: 42,
+                seq: 0,
+                seq_correction: 0,
+                content: snapshot.to_string(),
+                kind: crate::ingest::CapturedSegmentKind::Delta,
+                captured_at: 1,
+            };
+            let event = CaptureEvent::from_producer(segment, &guard)
+                .expect("capture event")
+                .with_snapshot_agent(snapshot);
+            assert_eq!(event.observed_agent_type(), None, "{kind:?}");
+        }
     }
 
     #[test]

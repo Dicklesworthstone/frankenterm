@@ -79,6 +79,149 @@ pub enum AgentScreenState {
 /// Rows of the screen tail the agent classifier looks at.
 const AGENT_SCREEN_TAIL_ROWS: usize = 40;
 
+/// Capture already owns the complete snapshot. Inspect only a small suffix
+/// for identity, without allocating in proportion to scrollback size.
+const CAPTURE_AGENT_TAIL_BYTES: usize = 16 * 1024;
+
+fn agent_screen_tail_lines(tail: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = tail
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(AGENT_SCREEN_TAIL_ROWS)
+        .collect();
+    lines.reverse();
+    lines
+}
+
+/// Return the lowest recognized composer, before classifying busy/menu state.
+/// A capture needs composer evidence itself; the on-demand capability reader
+/// also supports old Codex layouts identified by a banner above a bare `›`.
+fn agent_composer(
+    lines: &[&str],
+    lower: &[String],
+    allow_codex_banner: bool,
+) -> Option<(&'static str, usize)> {
+    let codex_composer_row = lines
+        .iter()
+        .rposition(|line| *line == "›" || line.starts_with("› "))
+        .filter(|row| {
+            // Capture identity belongs to this composer. Historical shortcut
+            // prose above a bare arrow cannot supply its missing evidence.
+            let evidence_start = if allow_codex_banner { 0 } else { *row };
+            lower[evidence_start..].iter().any(|line| {
+                [
+                    "? for shortcuts",
+                    "← for agents",
+                    "› ask codex to do anything",
+                ]
+                .iter()
+                .any(|needle| line.contains(needle))
+                    || (allow_codex_banner && line.contains("openai codex"))
+            })
+        });
+    let claude_composer_row = lines
+        .windows(3)
+        .rposition(|window| {
+            window[0].trim_start().starts_with('─')
+                && window[1].starts_with('❯')
+                && window[2].trim_start().starts_with('─')
+        })
+        .map(|row| row + 1);
+    match (codex_composer_row, claude_composer_row) {
+        (Some(codex), Some(claude)) if codex > claude => Some(("codex", codex)),
+        (_, Some(claude)) => Some(("claude_code", claude)),
+        (Some(codex), None) => Some(("codex", codex)),
+        (None, None) => None,
+    }
+}
+
+/// Best-effort identity from the exact snapshot that produced a capture.
+///
+/// This is deliberately narrower than the action-time screen classifier:
+/// banners, rule matches and cached titles never establish identity here.
+/// A recognized composer must be at the bottom, followed only by known
+/// footer shapes. Unknown layouts preserve unfiltered detection. The caller
+/// must attach this result to this capture only, never cache it for later
+/// deltas, a replacement pane, or replay that lacks the original snapshot.
+pub(crate) fn agent_type_from_capture_snapshot(
+    snapshot: &str,
+) -> Option<crate::patterns::AgentType> {
+    use crate::patterns::AgentType;
+
+    let mut start = snapshot.len().saturating_sub(CAPTURE_AGENT_TAIL_BYTES);
+    while !snapshot.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut tail = &snapshot[start..];
+    if start != 0 {
+        // The first row may start outside our byte budget. Discard it rather
+        // than turning a clipped prose row into apparent composer evidence.
+        tail = tail.split_once('\n')?.1;
+    }
+    let lines = agent_screen_tail_lines(tail);
+    if lines
+        .last()
+        .is_some_and(|line| is_pager_or_editor_status_line(line))
+    {
+        return None;
+    }
+    let lower: Vec<String> = lines.iter().map(|line| line.to_lowercase()).collect();
+    let (agent, composer_row) = agent_composer(&lines, &lower, false)?;
+    let footer_start = composer_row + if agent == "claude_code" { 2 } else { 1 };
+    let footer = &lower[footer_start..];
+    if footer.len() > 4
+        || footer.iter().any(|line| {
+            let line = line.trim_start();
+            let recognized = match agent {
+                "codex" => {
+                    matches!(line, "? for shortcuts" | "← for agents")
+                        || line.starts_with("← for agents · ? for shortcuts")
+                        || line.split_once(" · ").is_some_and(|(model, rest)| {
+                            let known_model = model.strip_prefix("gpt-").is_some_and(|name| {
+                                name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                            });
+                            let path = rest.split(" · ").next().unwrap_or_default();
+                            known_model
+                                && (path.starts_with("~/")
+                                    || path.starts_with('/')
+                                    || path.starts_with("./")
+                                    || (path.as_bytes().get(1) == Some(&b':')
+                                        && matches!(path.as_bytes().get(2), Some(b'/' | b'\\'))))
+                        })
+                }
+                "claude_code" => {
+                    matches!(
+                        line,
+                        "? for shortcuts" | "⏎ send" | "not logged in · run /login"
+                    ) || line
+                        .strip_prefix("⏵⏵ bypass permissions on (shift+tab to cycle)")
+                        .is_some_and(|rest| {
+                            rest.is_empty()
+                                || rest.strip_prefix(" · ← ").is_some_and(|agents| {
+                                    agents.split_once(' ').is_some_and(|(count, label)| {
+                                        !count.is_empty()
+                                            && count.bytes().all(|byte| byte.is_ascii_digit())
+                                            && matches!(label, "agent" | "agents")
+                                    })
+                                })
+                        })
+                }
+                _ => false,
+            };
+            !recognized
+        })
+    {
+        return None;
+    }
+    match agent {
+        "codex" => Some(AgentType::Codex),
+        "claude_code" => Some(AgentType::ClaudeCode),
+        _ => None,
+    }
+}
+
 /// The bottom status line of a pager or editor: less's `:` / `(END)` / `-M`
 /// prompt, more's `--More--`, man's footer, a vim mode line, its `~` filler
 /// rows, or its ruler (`12,5  Top`, `1,1  All`, `40,1  37%`).
@@ -127,12 +270,7 @@ fn is_pager_or_editor_status_line(line: &str) -> bool {
 /// ready. Unrecognized screens return `None` and keep their other evidence.
 #[must_use]
 pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenState)> {
-    let lines: Vec<&str> = tail
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let lines = &lines[lines.len().saturating_sub(AGENT_SCREEN_TAIL_ROWS)..];
+    let lines = agent_screen_tail_lines(tail);
     // A pager or editor showing captured agent text (less on a transcript,
     // vim on a doc quoting a composer) paints its own status line last. Such
     // a screen is never an agent at rest: reading it as one would lift the
@@ -173,40 +311,17 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
     // replace the hint with a status line that ends "← for agents" when the
     // pane is wide enough, and a long session scrolls the banner away, so the
     // placeholder identifies it too.
-    let codex_composer_row = lines
-        .iter()
-        .rposition(|line| *line == "›" || line.starts_with("› "))
-        .filter(|_| {
-            any(&[
-                "? for shortcuts",
-                "openai codex",
-                "← for agents",
-                "› ask codex to do anything",
-            ])
-        });
-    // The row of the "❯" line between the composer's two rules.
-    let claude_composer_row = lines
-        .windows(3)
-        .rposition(|window| {
-            window[0].trim_start().starts_with('─')
-                && window[1].starts_with('❯')
-                && window[2].trim_start().starts_with('─')
-        })
-        .map(|row| row + 1);
-    let codex_composer = codex_composer_row.is_some();
-    let claude_composer = claude_composer_row.is_some();
+    let composer = agent_composer(&lines, &lower, true);
     // An agent's composer outranks agent names anywhere in the tail, which
     // its own output quotes freely: a Claude pane reporting what an OpenAI
     // Codex pane printed is still Claude (ft-2ko47y). Its own composer is the
     // lowest one; a composer quoted in its output sits above it.
-    let agent = match (codex_composer_row, claude_composer_row) {
-        (Some(codex), Some(claude)) if codex > claude => "codex",
-        (_, Some(_)) => "claude_code",
-        (Some(_), None) => "codex",
-        (None, None) if any(&["openai codex", "codex can read", "agent command center"]) => "codex",
-        (None, None) if any(&["claude code"]) => "claude_code",
-        (None, None) if any(&["gemini cli", "gemini code assist"]) => "gemini",
-        (None, None) => return None,
+    let agent = match composer {
+        Some((agent, _)) => agent,
+        None if any(&["openai codex", "codex can read", "agent command center"]) => "codex",
+        None if any(&["claude code"]) => "claude_code",
+        None if any(&["gemini cli", "gemini code assist"]) => "gemini",
+        None => return None,
     };
 
     if selected_menu_item
@@ -229,7 +344,7 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
     if any(&["esc to interrupt", "to interrupt)", "ctrl+c to interrupt"]) {
         return Some((agent, AgentScreenState::Busy));
     }
-    if codex_composer || claude_composer {
+    if composer.is_some() {
         return Some((agent, AgentScreenState::Ready));
     }
     None
@@ -1249,6 +1364,118 @@ mod tests {
         assert_eq!(
             classify_agent_screen(&format!("{top}{quoted}{composer}")),
             Some(("codex", AgentScreenState::Ready))
+        );
+    }
+
+    #[test]
+    fn capture_agent_identity_requires_a_current_composer() {
+        use crate::patterns::AgentType;
+
+        for (fixture, expected) in [
+            ("codex_0157_idle.txt", Some(AgentType::Codex)),
+            ("claude_code_2_1_idle.txt", Some(AgentType::ClaudeCode)),
+            // A banner and a bare arrow alone are intentionally insufficient.
+            ("codex_0157_idle_empty_composer.txt", None),
+            ("codex_0157_trust_menu.txt", None),
+            ("claude_code_2_1_trust_menu.txt", None),
+            ("gemini_trust_menu.txt", None),
+        ] {
+            assert_eq!(
+                agent_type_from_capture_snapshot(&agent_screen(fixture)),
+                expected,
+                "{fixture}"
+            );
+        }
+        assert_eq!(
+            agent_type_from_capture_snapshot("OpenAI Codex\nWorking (12s • esc to interrupt)\n"),
+            None
+        );
+        assert_eq!(
+            agent_type_from_capture_snapshot("For Codex use ? for shortcuts\n$ cat log\n›\n"),
+            None
+        );
+        assert_eq!(
+            agent_type_from_capture_snapshot(
+                "Working (12s • esc to interrupt)\n› Ask Codex to do anything\n"
+            ),
+            Some(AgentType::Codex)
+        );
+    }
+
+    #[test]
+    fn capture_agent_identity_prefers_live_composer_over_quoted_agent() {
+        use crate::patterns::AgentType;
+
+        let quote = "All OpenAI Codex panes show \"You've hit your usage limit. \
+                     Try again at Nov 18th, 2026 11:44 AM.\"\n\
+                     › Ask Codex to do anything\n  ? for shortcuts\n";
+        let claude = agent_screen("claude_code_2_1_idle.txt");
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!("{quote}{claude}")),
+            Some(AgentType::ClaudeCode)
+        );
+        let codex = agent_screen("codex_0157_idle.txt");
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!("{claude}{codex}")),
+            Some(AgentType::Codex)
+        );
+    }
+
+    #[test]
+    fn capture_agent_identity_rejects_transcripts_and_bounds_history() {
+        use crate::patterns::AgentType;
+
+        for fixture in ["codex_0157_idle.txt", "claude_code_2_1_idle.txt"] {
+            let screen = agent_screen(fixture);
+            for suffix in [
+                "$ ",
+                "$ codex · project",
+                "(END)",
+                "```",
+                "This was copied from another pane.",
+                "This was copied · from another pane.",
+                "The old footer said ? for shortcuts.",
+            ] {
+                assert_eq!(
+                    agent_type_from_capture_snapshot(&format!("{screen}\n{suffix}\n")),
+                    None,
+                    "{fixture} followed by {suffix:?}"
+                );
+            }
+            let no_current_composer = format!("{screen}{}", "ordinary output\n".repeat(40));
+            assert_eq!(agent_type_from_capture_snapshot(&no_current_composer), None);
+        }
+        let claude = agent_screen("claude_code_2_1_idle.txt");
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!(
+                "{}{claude}",
+                "old transcript\n".repeat(10_000)
+            )),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!(
+                "{}\n{claude}",
+                "x".repeat(CAPTURE_AGENT_TAIL_BYTES)
+            )),
+            Some(AgentType::ClaudeCode)
+        );
+        // Blank padding must consume the byte budget before row filtering.
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!(
+                "{claude}{}",
+                "\n".repeat(CAPTURE_AGENT_TAIL_BYTES + 1)
+            )),
+            None
+        );
+        // A suffix of a long quoted row looks like a border by itself. It
+        // must never become the top edge of a fabricated Claude composer.
+        assert_eq!(
+            agent_type_from_capture_snapshot(&format!(
+                "quoted {}\n❯ \n────────\n",
+                "─".repeat(CAPTURE_AGENT_TAIL_BYTES)
+            )),
+            None
         );
     }
 

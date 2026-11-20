@@ -3919,6 +3919,7 @@ async fn emit_capture_generation_resync(
     };
     let (resync_decision, resync_receipt) = CaptureResyncDecision::channel();
     let event = CaptureEvent::from_producer(segment, &producer_guard)?
+        .with_snapshot_agent(&text)
         .with_resync_decision(resync_decision);
     permit.send(event);
     drop(producer_guard);
@@ -10224,6 +10225,7 @@ impl ObservationRuntime {
                         resync_decision,
                         pane_incarnation,
                         detection_zone,
+                        event.observed_agent_type(),
                     ));
                 }
 
@@ -10273,6 +10275,7 @@ impl ObservationRuntime {
                         mut resync_decision,
                         pane_incarnation,
                         detection_zone,
+                        observed_agent_type,
                     ),
                     result,
                 ) in settled
@@ -10471,16 +10474,11 @@ impl ObservationRuntime {
                                     })
                                 };
 
-                                // If this was a gap/discontinuity, clear the tail buffer because
-                                // previous context is no longer valid or contiguous.
-                                if persisted.gap.is_some() {
-                                    ctx.tail_buffer.clear();
-                                }
-
-                                // Content correlation has no stable zone ID
-                                // or render sequence. It cannot establish that
-                                // two deltas belong to the same semantic region.
-                                ctx.clear_zone_continuity();
+                                prepare_detection_context_for_capture(
+                                    &mut ctx,
+                                    observed_agent_type,
+                                    persisted.gap.is_some(),
+                                );
 
                                 let detections = {
                                     let engine = pattern_engine.read().await;
@@ -14043,6 +14041,25 @@ fn elapsed_since_last_bocpd_segment(
     let elapsed_ms = captured_at.saturating_sub(previous_capture_at).max(1);
     let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
     Duration::from_millis(elapsed_ms)
+}
+
+/// Agent evidence is owned by the admitted capture, not by the pane ID. In
+/// particular, a later delta-only source must not inherit a polling snapshot's
+/// classifier result. A change of evidence also breaks text continuity, so a
+/// partial message from one agent cannot complete as another agent's event.
+fn prepare_detection_context_for_capture(
+    context: &mut DetectionContext,
+    observed_agent_type: Option<AgentType>,
+    has_gap: bool,
+) {
+    if has_gap || context.agent_type != observed_agent_type {
+        context.tail_buffer.clear();
+    }
+    context.agent_type = observed_agent_type;
+
+    // Content correlation has no stable zone ID or render sequence. It cannot
+    // establish that two captures belong to the same semantic region.
+    context.clear_zone_continuity();
 }
 
 fn bocpd_change_point_to_detection(change_point: &crate::bocpd::PaneChangePoint) -> Detection {
@@ -17616,6 +17633,153 @@ mod tests {
             .await
             .expect("prepare immutable test capture");
         capture_uuid
+    }
+
+    #[test]
+    fn polling_composer_evidence_filters_durable_agent_events() {
+        run_async_test_isolated(|| {
+            Box::pin(async {
+                let (_dir, db_path) = temp_db_path();
+                let storage = StorageHandle::new(&db_path).await.expect("test storage");
+                let engine = PatternEngine::from_config(&crate::config::PatternsConfig::default())
+                    .expect("builtin patterns");
+                let runtime = ObservationRuntime::new(
+                    RuntimeConfig::default(),
+                    storage.clone(),
+                    Arc::new(RwLock::new(engine)),
+                )
+                .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+                let revision = DiscoveryRevision(1);
+                let usage = "You've hit your usage limit. Try again at Nov 18th, 2026 11:44 AM.";
+                let mut observed_panes = HashMap::new();
+                let (ingress_tx, ingress_rx) = mpsc::channel(3);
+
+                for (pane_id, composer, expected_agent) in [
+                    (1, "────────\n❯ \n────────\n", Some(AgentType::ClaudeCode)),
+                    (2, "› Ask Codex to do anything\n", Some(AgentType::Codex)),
+                    (3, "$ ", None),
+                ] {
+                    let capture_uuid = prepare_runtime_test_capture(&storage, pane_id).await;
+                    let pane = runtime.capture_authority.activate_pane(pane_id).unwrap();
+                    let lease = runtime
+                        .capture_authority
+                        .issue_source(pane, CaptureSourceKind::Polling)
+                        .unwrap();
+                    runtime.capture_metadata.write().await.insert(
+                        pane.pane_incarnation(),
+                        CapturePaneMetadata {
+                            pane_uuid: capture_uuid.clone(),
+                            discovery_generation: 0,
+                            discovery_revision: revision,
+                        },
+                    );
+                    observed_panes.insert(
+                        pane_id,
+                        ObservedCapturePane {
+                            info: make_pane(pane_id, "snapshot-agent-evidence"),
+                            lifecycle_identity: test_lifecycle_identity(pane_id),
+                            lifecycle_revision: PaneLifecycleRevision::new(0),
+                            pane_uuid: capture_uuid,
+                            revision,
+                            requires_storage_resync: false,
+                        },
+                    );
+                    // The captured delta alone does not contain the composer.
+                    // Identity must travel with it from the original snapshot.
+                    let event = test_capture_event_from_segment_for_lease(
+                        CapturedSegment {
+                            pane_id,
+                            seq: 0,
+                            seq_correction: 0,
+                            content: usage.to_string(),
+                            kind: CapturedSegmentKind::Delta,
+                            captured_at: epoch_ms(),
+                        },
+                        &lease,
+                    )
+                    .with_snapshot_agent(&format!("{usage}\n{composer}"));
+                    assert_eq!(event.observed_agent_type(), expected_agent);
+                    ingress_tx.try_send(event).expect("queue snapshot capture");
+                }
+                drop(ingress_tx);
+                let (_publication_tx, publication_rx) =
+                    watch::channel(DiscoveryCapturePublication {
+                        epoch: 1,
+                        observed_panes: Arc::new(observed_panes),
+                        transitioning_pane_ids: Arc::new(HashSet::new()),
+                        transitions: Arc::new(HashMap::new()),
+                    });
+                let (ring_tx, ring_rx) = spsc_channel(4);
+                let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+                let (retirement_tx, retirement_rx) = spsc_channel(1);
+                drop(retirement_tx);
+                let persistence = runtime.spawn_persistence_task(
+                    ring_rx,
+                    Arc::clone(&runtime.cursors),
+                    publication_rx,
+                    Arc::new(StdMutex::new(LruCache::new(4))),
+                    retirement_rx,
+                    Arc::new(StdMutex::new(())),
+                );
+                relay.await.expect("capture relay");
+                persistence.await.expect("capture persistence");
+                assert_eq!(runtime.metrics.segments_persisted(), 3);
+                assert_eq!(runtime.metrics.capture_authority_rejections(), 0);
+                for (pane_id, expected_count) in [(1, 0), (2, 1), (3, 1)] {
+                    let events = storage
+                        .get_events(crate::storage::EventQuery {
+                            pane_id: Some(pane_id),
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("stored detections");
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.rule_id == "codex.usage.reached")
+                            .count(),
+                        expected_count,
+                        "wrong-agent quote must be suppressed; correct and unknown panes stay enabled: pane {pane_id}"
+                    );
+                }
+                storage.shutdown().await.expect("shutdown test storage");
+            })
+        });
+    }
+
+    #[test]
+    fn capture_agent_changes_and_gaps_cannot_join_unrelated_pattern_fragments() {
+        let engine = PatternEngine::from_config(&crate::config::PatternsConfig::default())
+            .expect("builtin patterns");
+        let prefix = "You've hit your us";
+        let suffix = "age limit. Try again at Nov 18th, 2026 11:44 AM.";
+        for (before, after, has_gap, expected_match) in [
+            (
+                Some(AgentType::ClaudeCode),
+                Some(AgentType::Codex),
+                false,
+                false,
+            ),
+            (Some(AgentType::Codex), None, false, false),
+            (None, Some(AgentType::Codex), false, false),
+            (Some(AgentType::Codex), Some(AgentType::Codex), true, false),
+            (Some(AgentType::Codex), Some(AgentType::Codex), false, true),
+            (None, None, false, true),
+        ] {
+            let mut context = DetectionContext::with_pane(1, None);
+            prepare_detection_context_for_capture(&mut context, before, false);
+            assert!(engine.detect_with_context(prefix, &mut context).is_empty());
+            prepare_detection_context_for_capture(&mut context, after, has_gap);
+            let detections = engine.detect_with_context(suffix, &mut context);
+            assert_eq!(
+                detections
+                    .iter()
+                    .any(|detection| detection.rule_id == "codex.usage.reached"),
+                expected_match,
+                "before={before:?}, after={after:?}, has_gap={has_gap}"
+            );
+            assert_eq!(context.agent_type, after);
+        }
     }
 
     #[test]
