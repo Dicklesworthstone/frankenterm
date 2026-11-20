@@ -1655,7 +1655,7 @@ fn read_file_bounded_core(
         .min(BOUNDED_READ_INITIAL_RESERVE_CAP);
     let mut raw = Vec::with_capacity(initial_cap);
     let read_limit = max_bytes_u64.saturating_add(1);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(read_limit)
         .read_to_end(&mut raw)
         .map_err(|err| BoundedReadError::Io {

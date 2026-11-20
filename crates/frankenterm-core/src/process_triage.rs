@@ -245,6 +245,14 @@ pub struct ProcessTriageEnvelope<T> {
     pub data: T,
 }
 
+/// Whether `name` is one of [`SYSTEM_PROCESSES`], ignoring ASCII case. Such a
+/// process is classified as protected and never acted on.
+fn is_system_process(name: &str) -> bool {
+    SYSTEM_PROCESSES
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(name))
+}
+
 /// Classify a process node and its context into a triage category.
 pub fn classify(
     node: &ProcessNode,
@@ -253,10 +261,7 @@ pub fn classify(
     let lower_name = node.name.to_lowercase();
 
     // Priority 9: System processes — NEVER touch.
-    if SYSTEM_PROCESSES
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(&node.name))
-    {
+    if is_system_process(&node.name) {
         return (
             TriageCategory::SystemProcess,
             TriageAction::Protect,

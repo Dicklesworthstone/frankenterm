@@ -644,22 +644,23 @@ fn contract_gate_criterion(
     note: &str,
 ) -> RehearsalCriterionReceipt {
     let (verdict, evidence_state) = if passed {
-        (RehearsalVerdict::Pass, RehearsalEvidenceState::LiveVerified)
+        (RehearsalVerdict::Pass, RehearsalEvidenceState::Proven)
     } else if degraded_only {
-        (
-            RehearsalVerdict::Degraded,
-            RehearsalEvidenceState::Degraded,
-        )
+        (RehearsalVerdict::Degraded, RehearsalEvidenceState::Degraded)
     } else {
         (RehearsalVerdict::Fail, RehearsalEvidenceState::Blocked)
     };
-    RehearsalCriterionReceipt::new(format!("steer_plan.contract.{id}"), RehearsalCriterionKind::SafetyPolicy, verdict)
-        .with_evidence(RehearsalEvidenceRef::new(
-            "ft.steer.plan",
-            format!("contract.{id}"),
-            evidence_state,
-        ))
-        .with_note(note)
+    RehearsalCriterionReceipt::new(
+        format!("steer_plan.contract.{id}"),
+        RehearsalCriterionKind::SafetyPolicy,
+        verdict,
+    )
+    .with_evidence(RehearsalEvidenceRef::new(
+        "ft.steer.plan",
+        format!("contract.{id}"),
+        evidence_state,
+    ))
+    .with_note(note)
 }
 
 /// Evaluate a bound [`MissionTxContract`] through the exact same prepare gates
