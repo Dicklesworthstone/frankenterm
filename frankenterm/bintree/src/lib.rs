@@ -8,19 +8,205 @@
 use std::cmp::PartialEq;
 use std::fmt::Debug;
 
+/// Error returned when a bounded iterative tree traversal or arena clone exceeds
+/// configured structural limits or cannot reserve working memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeBoundsError {
+    /// Tree depth (1-based for non-empty trees) exceeded `max_depth`.
+    DepthExceeded { depth: usize, max_depth: usize },
+    /// Total node count exceeded `max_nodes`.
+    NodeLimitExceeded { nodes: usize, max_nodes: usize },
+    /// Working buffer allocation failed while reserving capacity.
+    AllocationFailed,
+}
+
+impl std::fmt::Display for TreeBoundsError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DepthExceeded { depth, max_depth } => {
+                write!(fmt, "tree depth {depth} exceeds limit {max_depth}")
+            }
+            Self::NodeLimitExceeded { nodes, max_nodes } => {
+                write!(fmt, "tree node count {nodes} exceeds limit {max_nodes}")
+            }
+            Self::AllocationFailed => write!(fmt, "failed to reserve bounded tree workspace"),
+        }
+    }
+}
+
+impl std::error::Error for TreeBoundsError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArenaEntry<L, N> {
+    Empty,
+    Leaf(L),
+    Node { data: Option<N> },
+}
+
+/// Bounded iterative preorder arena snapshot of a [`Tree`].
+///
+/// Captures a tree without call-stack recursion and reconstructs it iteratively,
+/// preserving leaf and node values (including `Arc` identity on `Clone`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeArena<L, N = ()> {
+    entries: Vec<ArenaEntry<L, N>>,
+    depth: usize,
+    leaf_count: usize,
+}
+
+impl<L, N> TreeArena<L, N> {
+    /// Total number of captured entries (`Empty`, `Leaf`, and `Node`).
+    pub fn node_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Maximum 1-based depth observed when capturing this arena (`0` for empty).
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Number of leaves captured in this arena.
+    pub fn leaf_count(&self) -> usize {
+        self.leaf_count
+    }
+
+    /// Capture a [`Tree`] iteratively into a flat preorder arena while enforcing
+    /// `max_depth`, `max_nodes`, and fallible workspace reservations.
+    pub fn try_from_tree(
+        tree: &Tree<L, N>,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> Result<Self, TreeBoundsError>
+    where
+        L: Clone,
+        N: Clone,
+    {
+        if matches!(tree, Tree::Empty) {
+            return Ok(Self {
+                entries: Vec::new(),
+                depth: 0,
+                leaf_count: 0,
+            });
+        }
+
+        let mut entries = Vec::new();
+        let mut pending = Vec::new();
+        pending
+            .try_reserve(1)
+            .map_err(|_| TreeBoundsError::AllocationFailed)?;
+        pending.push((tree, 1usize));
+
+        let mut observed_depth = 0usize;
+        let mut leaf_count = 0usize;
+
+        while let Some((node, depth)) = pending.pop() {
+            if depth > max_depth {
+                return Err(TreeBoundsError::DepthExceeded { depth, max_depth });
+            }
+            if entries.len() >= max_nodes {
+                return Err(TreeBoundsError::NodeLimitExceeded {
+                    nodes: entries.len().saturating_add(1),
+                    max_nodes,
+                });
+            }
+            if depth > observed_depth {
+                observed_depth = depth;
+            }
+            entries
+                .try_reserve(1)
+                .map_err(|_| TreeBoundsError::AllocationFailed)?;
+            match node {
+                Tree::Empty => entries.push(ArenaEntry::Empty),
+                Tree::Leaf(leaf) => {
+                    leaf_count += 1;
+                    entries.push(ArenaEntry::Leaf(leaf.clone()));
+                }
+                Tree::Node { left, right, data } => {
+                    let next_depth = depth.checked_add(1).ok_or(TreeBoundsError::DepthExceeded {
+                        depth: usize::MAX,
+                        max_depth,
+                    })?;
+                    entries.push(ArenaEntry::Node { data: data.clone() });
+                    pending
+                        .try_reserve(2)
+                        .map_err(|_| TreeBoundsError::AllocationFailed)?;
+                    pending.push((right, next_depth));
+                    pending.push((left, next_depth));
+                }
+            }
+        }
+
+        Ok(Self {
+            entries,
+            depth: observed_depth,
+            leaf_count,
+        })
+    }
+
+    /// Reconstruct a [`Tree`] iteratively from this arena without recursion.
+    pub fn try_into_tree(self) -> Result<Tree<L, N>, TreeBoundsError> {
+        if self.entries.is_empty() {
+            return Ok(Tree::Empty);
+        }
+        let mut stack: Vec<Tree<L, N>> = Vec::new();
+        stack
+            .try_reserve(self.depth.saturating_add(1))
+            .map_err(|_| TreeBoundsError::AllocationFailed)?;
+        for entry in self.entries.into_iter().rev() {
+            match entry {
+                ArenaEntry::Empty => stack.push(Tree::Empty),
+                ArenaEntry::Leaf(leaf) => stack.push(Tree::Leaf(leaf)),
+                ArenaEntry::Node { data } => {
+                    let left = stack.pop().unwrap_or(Tree::Empty);
+                    let right = stack.pop().unwrap_or(Tree::Empty);
+                    stack.push(Tree::Node {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        data,
+                    });
+                }
+            }
+        }
+        Ok(stack.pop().unwrap_or(Tree::Empty))
+    }
+
+    /// Clone a [`Tree`] out of this arena iteratively without recursion.
+    pub fn try_clone_tree(&self) -> Result<Tree<L, N>, TreeBoundsError>
+    where
+        L: Clone,
+        N: Clone,
+    {
+        if self.entries.is_empty() {
+            return Ok(Tree::Empty);
+        }
+        let mut stack: Vec<Tree<L, N>> = Vec::new();
+        stack
+            .try_reserve(self.depth.saturating_add(1))
+            .map_err(|_| TreeBoundsError::AllocationFailed)?;
+        for entry in self.entries.iter().rev() {
+            match entry {
+                ArenaEntry::Empty => stack.push(Tree::Empty),
+                ArenaEntry::Leaf(leaf) => stack.push(Tree::Leaf(leaf.clone())),
+                ArenaEntry::Node { data } => {
+                    let left = stack.pop().unwrap_or(Tree::Empty);
+                    let right = stack.pop().unwrap_or(Tree::Empty);
+                    stack.push(Tree::Node {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        data: data.clone(),
+                    });
+                }
+            }
+        }
+        Ok(stack.pop().unwrap_or(Tree::Empty))
+    }
+}
+
 /// Represents a (mostly) "proper" binary tree; each Node has 0 or 2 children,
 /// but there is a special case where the tree is rooted with a single leaf node.
 /// Non-leaf nodes in the tree can be labelled with an optional node data type `N`,
 /// which defaults to `()`.
 /// Leaf nodes have a required leaf data type `L`.
-// `Clone` is needed so proptest's `Just(Tree::Empty)` and
-// `prop_recursive` generator (see `arb_tree` in the test module) can
-// own + shrink candidate trees. `derive(Clone)` with the standard
-// `L: Clone, N: Clone` bounds is additive — every existing call site
-// in the workspace (legacy_wezterm/mux/src/tab.rs) already satisfies
-// those bounds for its own `Tree<Arc<dyn Pane>, SplitDirectionAndSize>`
-// and `Tree<PaneEntry, SplitDirectionAndSize>` instantiations.
-#[derive(Clone)]
 pub enum Tree<L, N = ()> {
     Empty,
     Node {
@@ -31,29 +217,83 @@ pub enum Tree<L, N = ()> {
     Leaf(L),
 }
 
+impl<L, N> Drop for Tree<L, N> {
+    fn drop(&mut self) {
+        let Self::Node { left, right, .. } = self else {
+            return;
+        };
+        if matches!(&**left, Self::Empty) && matches!(&**right, Self::Empty) {
+            return;
+        }
+        let mut stack = Vec::new();
+        if !matches!(&**left, Self::Empty) {
+            stack.push(std::mem::replace(&mut **left, Self::Empty));
+        }
+        if !matches!(&**right, Self::Empty) {
+            stack.push(std::mem::replace(&mut **right, Self::Empty));
+        }
+        while let Some(mut node) = stack.pop() {
+            if let Self::Node { left, right, .. } = &mut node {
+                if !matches!(&**left, Self::Empty) {
+                    stack.push(std::mem::replace(&mut **left, Self::Empty));
+                }
+                if !matches!(&**right, Self::Empty) {
+                    stack.push(std::mem::replace(&mut **right, Self::Empty));
+                }
+            }
+        }
+    }
+}
+
+impl<L, N> Clone for Tree<L, N>
+where
+    L: Clone,
+    N: Clone,
+{
+    fn clone(&self) -> Self {
+        TreeArena::try_from_tree(self, usize::MAX, usize::MAX)
+            .and_then(TreeArena::try_into_tree)
+            .expect("unbounded Tree::clone allocation")
+    }
+}
+
 impl<L, N> PartialEq for Tree<L, N>
 where
     L: PartialEq,
     N: PartialEq,
 {
     fn eq(&self, rhs: &Self) -> bool {
-        match (self, rhs) {
-            (Self::Empty, Self::Empty) => true,
-            (
-                Self::Node {
-                    left: l_left,
-                    right: l_right,
-                    data: l_data,
-                },
-                Self::Node {
-                    left: r_left,
-                    right: r_right,
-                    data: r_data,
-                },
-            ) => (l_left == r_left) && (l_right == r_right) && (l_data == r_data),
-            (Self::Leaf(l), Self::Leaf(r)) => l == r,
-            _ => false,
+        let mut stack = vec![(self, rhs)];
+        while let Some((left, right)) = stack.pop() {
+            match (left, right) {
+                (Self::Empty, Self::Empty) => {}
+                (
+                    Self::Node {
+                        left: l_left,
+                        right: l_right,
+                        data: l_data,
+                    },
+                    Self::Node {
+                        left: r_left,
+                        right: r_right,
+                        data: r_data,
+                    },
+                ) => {
+                    if l_data != r_data {
+                        return false;
+                    }
+                    stack.push((l_right, r_right));
+                    stack.push((l_left, r_left));
+                }
+                (Self::Leaf(l), Self::Leaf(r)) => {
+                    if l != r {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
         }
+        true
     }
 }
 
@@ -99,6 +339,25 @@ enum Path<L, N> {
         data: Option<N>,
         up: Box<Self>,
     },
+}
+
+impl<L, N> Drop for Path<L, N> {
+    fn drop(&mut self) {
+        let mut cursor = match self {
+            Self::Top => return,
+            Self::Left { up, .. } | Self::Right { up, .. } => {
+                std::mem::replace(&mut **up, Self::Top)
+            }
+        };
+        while !matches!(cursor, Self::Top) {
+            cursor = match &mut cursor {
+                Self::Top => unreachable!(),
+                Self::Left { up, .. } | Self::Right { up, .. } => {
+                    std::mem::replace(&mut **up, Self::Top)
+                }
+            };
+        }
+    }
 }
 
 impl<L, N> Debug for Path<L, N>
@@ -199,11 +458,54 @@ impl<L, N> Tree<L, N> {
     }
 
     pub fn num_leaves(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::Leaf(_) => 1,
-            Self::Node { left, right, .. } => left.num_leaves() + right.num_leaves(),
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Empty => {}
+                Self::Leaf(_) => count += 1,
+                Self::Node { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
         }
+        count
+    }
+
+    /// Maximum 1-based depth of the tree (`0` for [`Tree::Empty`]), computed
+    /// iteratively without call-stack recursion.
+    pub fn depth(&self) -> usize {
+        if matches!(self, Self::Empty) {
+            return 0;
+        }
+        let mut max_depth = 0usize;
+        let mut stack = vec![(self, 1usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            if let Self::Node { left, right, .. } = node {
+                stack.push((right, depth + 1));
+                stack.push((left, depth + 1));
+            }
+        }
+        max_depth
+    }
+
+    /// Iteratively clone this tree through a bounded [`TreeArena`], failing
+    /// closed without stack recursion if depth, node count, or workspace
+    /// reservation limits are exceeded.
+    pub fn try_clone_bounded(
+        &self,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> Result<Self, TreeBoundsError>
+    where
+        L: Clone,
+        N: Clone,
+    {
+        TreeArena::try_from_tree(self, max_depth, max_nodes)?.try_into_tree()
     }
 }
 
@@ -1999,13 +2301,120 @@ mod tests {
         #[test]
         fn cursor_tree_roundtrip_preserves_structure_and_leaf_count(tree in arb_tree()) {
             // `Tree::cursor` takes `self` by value, so we need to clone
-            // before consuming the original. `Tree: Clone` was added
-            // on the enum declaration above to support the proptest
-            // recursive generator.
+            // before consuming the original. `Tree: Clone` is iterative
+            // so arbitrarily deep trees cannot overflow the stack.
             let expected_leaf_count = tree.num_leaves();
             let roundtrip = tree.clone().cursor().tree();
             prop_assert_eq!(roundtrip.num_leaves(), expected_leaf_count);
             prop_assert_eq!(roundtrip, tree);
+        }
+    }
+
+    #[test]
+    fn deeply_skewed_tree_clone_drop_eq_and_num_leaves_do_not_stack_overflow() {
+        // Depth 20,000 on a 256 KiB stack immediately overflows recursive
+        // Clone / Drop / PartialEq / num_leaves implementations.
+        let handle = std::thread::Builder::new()
+            .name("bintree-deep-skew".to_string())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let depth = 20_000usize;
+                let mut tree: Tree<usize, usize> = Tree::Leaf(0);
+                for i in 1..depth {
+                    tree = Tree::Node {
+                        left: Box::new(tree),
+                        right: Box::new(Tree::Leaf(i)),
+                        data: Some(i),
+                    };
+                }
+                assert_eq!(tree.depth(), depth);
+                assert_eq!(tree.num_leaves(), depth);
+
+                let cloned = tree.clone();
+                assert_eq!(cloned, tree);
+
+                let arena = TreeArena::try_from_tree(&tree, depth, depth * 2).unwrap();
+                assert_eq!(arena.depth(), depth);
+                assert_eq!(arena.leaf_count(), depth);
+                assert_eq!(arena.node_count(), depth * 2 - 1);
+                let rebuilt = arena.try_into_tree().unwrap();
+                assert_eq!(rebuilt, tree);
+
+                // Walk a Cursor all the way down the skewed spine and drop it
+                // at maximum Path depth to verify iterative Path::drop.
+                let mut cursor = cloned.cursor();
+                while let Ok(next) = cursor.go_left() {
+                    cursor = next;
+                }
+                drop(cursor);
+                drop(rebuilt);
+                drop(tree);
+            })
+            .expect("spawn bounded-stack test thread");
+        handle.join().expect("deeply skewed tree thread panicked");
+    }
+
+    #[test]
+    fn try_clone_bounded_enforces_limits_and_preserves_arc_identity() {
+        use std::sync::Arc;
+
+        let leaf_a = Arc::new("pane-a");
+        let leaf_b = Arc::new("pane-b");
+        let leaf_c = Arc::new("pane-c");
+        let tree: Tree<Arc<&str>, u8> = Tree::Node {
+            left: Box::new(Tree::Node {
+                left: Box::new(Tree::Leaf(Arc::clone(&leaf_a))),
+                right: Box::new(Tree::Leaf(Arc::clone(&leaf_b))),
+                data: Some(1),
+            }),
+            right: Box::new(Tree::Leaf(Arc::clone(&leaf_c))),
+            data: Some(2),
+        };
+
+        assert_eq!(tree.depth(), 3);
+        assert_eq!(
+            tree.try_clone_bounded(2, 10),
+            Err(TreeBoundsError::DepthExceeded {
+                depth: 3,
+                max_depth: 2,
+            })
+        );
+        assert_eq!(
+            tree.try_clone_bounded(3, 4),
+            Err(TreeBoundsError::NodeLimitExceeded {
+                nodes: 5,
+                max_nodes: 4,
+            })
+        );
+
+        let arena = TreeArena::try_from_tree(&tree, 3, 5).unwrap();
+        let cloned = arena.try_clone_tree().unwrap();
+        let rebuilt = arena.try_into_tree().unwrap();
+        assert_eq!(cloned, tree);
+        assert_eq!(rebuilt, tree);
+
+        for candidate in [cloned, rebuilt] {
+            match candidate {
+                Tree::Node {
+                    left,
+                    right,
+                    data: Some(2),
+                } => {
+                    match *left {
+                        Tree::Node {
+                            left: ll,
+                            right: lr,
+                            data: Some(1),
+                        } => {
+                            assert!(matches!(*ll, Tree::Leaf(ref a) if Arc::ptr_eq(a, &leaf_a)));
+                            assert!(matches!(*lr, Tree::Leaf(ref b) if Arc::ptr_eq(b, &leaf_b)));
+                        }
+                        other => panic!("unexpected left subtree: {other:?}"),
+                    }
+                    assert!(matches!(*right, Tree::Leaf(ref c) if Arc::ptr_eq(c, &leaf_c)));
+                }
+                other => panic!("unexpected root: {other:?}"),
+            }
         }
     }
 }

@@ -1710,9 +1710,12 @@ impl CommittedGuardedMoveToNewTab {
 
 /// The codec crate caps ordered pane trees at this depth, but the dependency-
 /// lower mux crate cannot import that constant. Mirror the wire-authoritative
-/// ceiling here so guarded relocation never enters derived recursive
-/// `Tree::clone` on an adversarially skewed live topology.
+/// ceiling here so guarded relocation clones live topologies through a bounded
+/// iterative arena (`bintree::Tree::try_clone_bounded`).
 const MAX_MOVED_SPLIT_TREE_DEPTH: usize = 64;
+/// Upper bound on total tree nodes admitted into a relocation arena clone
+/// (matching the 16,384 tiled leaf wire ceiling: at most `2 * leaves - 1` nodes).
+const MAX_MOVED_SPLIT_TREE_NODES: usize = 32_768;
 
 #[derive(Default)]
 struct DeferredTabCallbacks {
@@ -2131,31 +2134,55 @@ fn relocation_tree_matches(current: &Tree, baseline: &Tree) -> anyhow::Result<bo
     Ok(true)
 }
 
+fn clone_moved_split_tree_bounded(tree: &Tree) -> anyhow::Result<Tree> {
+    tree.try_clone_bounded(MAX_MOVED_SPLIT_TREE_DEPTH, MAX_MOVED_SPLIT_TREE_NODES)
+        .map_err(|error| match error {
+            bintree::TreeBoundsError::DepthExceeded { depth, max_depth } => {
+                anyhow::anyhow!("moved-split pane tree depth {depth} exceeds limit {max_depth}")
+            }
+            bintree::TreeBoundsError::NodeLimitExceeded { nodes, max_nodes } => {
+                anyhow::anyhow!(
+                    "moved-split pane tree node count {nodes} exceeds limit {max_nodes}"
+                )
+            }
+            bintree::TreeBoundsError::AllocationFailed => {
+                anyhow::anyhow!("reserve moved-split tree arena clone failed")
+            }
+        })
+}
+
+fn clone_tab_inner_bounded(inner: &TabInner) -> anyhow::Result<TabInner> {
+    let pane = match inner.pane.as_ref() {
+        Some(tree) => Some(clone_moved_split_tree_bounded(tree)?),
+        None => None,
+    };
+    Ok(TabInner {
+        id: inner.id,
+        mux_owner: Weak::clone(&inner.mux_owner),
+        mux_owner_bound: inner.mux_owner_bound,
+        mux_owner_active: inner.mux_owner_active,
+        mux_owner_generation: inner.mux_owner_generation,
+        pane,
+        floating_panes: inner.floating_panes.clone(),
+        floating_focus: inner.floating_focus,
+        size: inner.size,
+        size_before_zoom: inner.size_before_zoom,
+        active: inner.active,
+        zoomed: inner.zoomed.as_ref().map(Arc::clone),
+        title: Arc::clone(&inner.title),
+        recency: inner.recency.clone(),
+        collapsed_panes: inner.collapsed_panes.clone(),
+        layout_cycle: inner.layout_cycle.clone(),
+        pane_stacks: inner.pane_stacks.clone(),
+        constraint_overrides: inner.constraint_overrides.clone(),
+    })
+}
+
 fn admit_moved_split_tree_clone(inner: &TabInner) -> anyhow::Result<()> {
     let Some(tree) = inner.pane.as_ref() else {
         return Ok(());
     };
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(MAX_MOVED_SPLIT_TREE_DEPTH.saturating_add(1))
-        .map_err(|error| anyhow::anyhow!("reserve moved-split tree-depth preflight: {error}"))?;
-    pending.push((tree, 1usize));
-    while let Some((tree, depth)) = pending.pop() {
-        anyhow::ensure!(
-            depth <= MAX_MOVED_SPLIT_TREE_DEPTH,
-            "moved-split pane tree depth {depth} exceeds limit {MAX_MOVED_SPLIT_TREE_DEPTH}"
-        );
-        if let Tree::Node { left, right, .. } = tree {
-            let next_depth = depth
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("moved-split pane tree depth overflow"))?;
-            pending
-                .try_reserve(2)
-                .map_err(|error| anyhow::anyhow!("grow moved-split depth preflight: {error}"))?;
-            pending.push((right, next_depth));
-            pending.push((left, next_depth));
-        }
-    }
+    let _ = clone_moved_split_tree_bounded(tree)?;
     Ok(())
 }
 
@@ -2393,40 +2420,57 @@ fn remove_exact_panes_from_tree(
     replacements: &HashMap<PaneIdentity, Arc<dyn Pane>>,
     removed: &mut HashSet<PaneIdentity>,
 ) -> (Tree, bool) {
-    match tree {
-        Tree::Empty => (Tree::Empty, false),
-        Tree::Leaf(pane) => {
-            let identity = pane_identity(&pane);
-            if !removals.contains(&identity) {
-                return (Tree::Leaf(pane), false);
+    enum Frame {
+        Visit(Tree),
+        Combine { data: Option<SplitDirectionAndSize> },
+    }
+
+    let mut work = vec![Frame::Visit(tree)];
+    let mut results: Vec<(Tree, bool)> = Vec::new();
+
+    while let Some(frame) = work.pop() {
+        match frame {
+            Frame::Visit(Tree::Empty) => results.push((Tree::Empty, false)),
+            Frame::Visit(Tree::Leaf(pane)) => {
+                let identity = pane_identity(&pane);
+                if !removals.contains(&identity) {
+                    results.push((Tree::Leaf(pane), false));
+                } else {
+                    removed.insert(identity);
+                    if let Some(replacement) = replacements.get(&identity) {
+                        results.push((Tree::Leaf(Arc::clone(replacement)), true));
+                    } else {
+                        results.push((Tree::Empty, true));
+                    }
+                }
             }
-            removed.insert(identity);
-            if let Some(replacement) = replacements.get(&identity) {
-                (Tree::Leaf(Arc::clone(replacement)), true)
-            } else {
-                (Tree::Empty, true)
+            Frame::Visit(Tree::Node { left, right, data }) => {
+                work.push(Frame::Combine { data });
+                work.push(Frame::Visit(*right));
+                work.push(Frame::Visit(*left));
             }
-        }
-        Tree::Node { left, right, data } => {
-            let (left, left_changed) =
-                remove_exact_panes_from_tree(*left, removals, replacements, removed);
-            let (right, right_changed) =
-                remove_exact_panes_from_tree(*right, removals, replacements, removed);
-            let changed = left_changed || right_changed;
-            match (left, right) {
-                (Tree::Empty, Tree::Empty) => (Tree::Empty, changed),
-                (Tree::Empty, survivor) | (survivor, Tree::Empty) => (survivor, true),
-                (left, right) => (
-                    Tree::Node {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        data,
-                    },
-                    changed,
-                ),
+            Frame::Combine { data } => {
+                let (right, right_changed) = results.pop().unwrap_or((Tree::Empty, false));
+                let (left, left_changed) = results.pop().unwrap_or((Tree::Empty, false));
+                let changed = left_changed || right_changed;
+                let merged = match (left, right) {
+                    (Tree::Empty, Tree::Empty) => (Tree::Empty, changed),
+                    (Tree::Empty, survivor) | (survivor, Tree::Empty) => (survivor, true),
+                    (left, right) => (
+                        Tree::Node {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            data,
+                        },
+                        changed,
+                    ),
+                };
+                results.push(merged);
             }
         }
     }
+
+    results.pop().unwrap_or((Tree::Empty, false))
 }
 
 #[derive(Clone)]
@@ -2623,27 +2667,30 @@ fn floating_pane_vectors_eq(left: &[FloatingPane], right: &[FloatingPane]) -> bo
 }
 
 fn exact_tiled_tree_eq(left: &Tree, right: &Tree) -> bool {
-    match (left, right) {
-        (Tree::Empty, Tree::Empty) => true,
-        (Tree::Leaf(left), Tree::Leaf(right)) => Arc::ptr_eq(left, right),
-        (
-            Tree::Node {
-                left: left_first,
-                right: left_second,
-                data: left_data,
-            },
-            Tree::Node {
-                left: right_first,
-                right: right_second,
-                data: right_data,
-            },
-        ) => {
-            left_data == right_data
-                && exact_tiled_tree_eq(left_first, right_first)
-                && exact_tiled_tree_eq(left_second, right_second)
+    let mut stack = vec![(left, right)];
+    while let Some((left, right)) = stack.pop() {
+        match (left, right) {
+            (Tree::Empty, Tree::Empty) => {}
+            (Tree::Leaf(left), Tree::Leaf(right)) if Arc::ptr_eq(left, right) => {}
+            (
+                Tree::Node {
+                    left: left_first,
+                    right: left_second,
+                    data: left_data,
+                },
+                Tree::Node {
+                    left: right_first,
+                    right: right_second,
+                    data: right_data,
+                },
+            ) if left_data == right_data => {
+                stack.push((left_second, right_second));
+                stack.push((left_first, right_first));
+            }
+            _ => return false,
         }
-        _ => false,
     }
+    true
 }
 
 fn exact_optional_tiled_tree_eq(left: &Option<Tree>, right: &Option<Tree>) -> bool {
@@ -8708,10 +8755,12 @@ impl Tab {
                 "tab {} lost active mux-owner authority",
                 self.tab_id
             );
-            if split.is_some() {
-                admit_moved_split_tree_clone(&inner)?;
-            }
-            inner.clone()
+            let baseline = if split.is_some() {
+                clone_tab_inner_bounded(&inner)?
+            } else {
+                inner.clone()
+            };
+            baseline
         };
         let prior_structural_count = {
             let (tiled, floating) = baseline.snapshot_structural_panes_callback_free_checked()?;
@@ -8720,7 +8769,11 @@ impl Tab {
                 .checked_add(floating.len())
                 .ok_or_else(|| anyhow::anyhow!("tiled publication pane count overflow"))?
         };
-        let mut replacement = baseline.clone();
+        let mut replacement = if split.is_some() {
+            clone_tab_inner_bounded(&baseline)?
+        } else {
+            baseline.clone()
+        };
         let (mut callbacks, target_registration, inserted_index) = match split {
             Some((target_registration, request)) => {
                 anyhow::ensure!(
@@ -9090,14 +9143,13 @@ impl Tab {
                 "tab {} lost active mux-owner authority",
                 self.tab_id
             );
-            admit_moved_split_tree_clone(&inner)?;
-            inner.clone()
+            clone_tab_inner_bounded(&inner)?
         };
         let mut observed_panes = baseline.snapshot_panes_callback_free();
         observed_panes.push(Arc::clone(&pane));
         let observed = Self::observe_panes(observed_panes);
         let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
-        let mut replacement = baseline.clone();
+        let mut replacement = clone_tab_inner_bounded(&baseline)?;
         let (inserted, mut callbacks) = replacement.prepare_split_and_insert(
             pane_index,
             request,
@@ -9248,9 +9300,8 @@ impl Tab {
                 "move source tab {} lost active mux authority",
                 self.tab_id()
             );
-            admit_moved_split_tree_clone(&inner)
-                .context("admit move-to-new-tab source tree clone")?;
-            inner.clone()
+            clone_tab_inner_bounded(&inner)
+                .context("admit move-to-new-tab source tree clone")?
         };
         let pane_ids = observe_relocation_pane_ids(self.tab_id(), &[&source_baseline])?;
         anyhow::ensure!(
@@ -9555,8 +9606,7 @@ impl Mux {
                 "split target tab {} lost active mux authority",
                 target_tab.tab_id()
             );
-            admit_moved_split_tree_clone(&inner)?;
-            (inner.clone(), None)
+            (clone_tab_inner_bounded(&inner)?, None)
         } else {
             let target_first =
                 (Arc::as_ptr(&target_tab) as usize) < (Arc::as_ptr(&source_tab) as usize);
@@ -9571,12 +9621,12 @@ impl Mux {
                 first.is_active_mux_owner(self) && second.is_active_mux_owner(self),
                 "split source or target tab lost active mux authority"
             );
-            admit_moved_split_tree_clone(&first)?;
-            admit_moved_split_tree_clone(&second)?;
+            let first_clone = clone_tab_inner_bounded(&first)?;
+            let second_clone = clone_tab_inner_bounded(&second)?;
             if target_first {
-                (first.clone(), Some(second.clone()))
+                (first_clone, Some(second_clone))
             } else {
-                (second.clone(), Some(first.clone()))
+                (second_clone, Some(first_clone))
             }
         };
 
@@ -9696,8 +9746,7 @@ impl Mux {
                 desired_relocation_structural_state(&source_replacement, &pane_ids)?;
 
             let target_current = exact_relocation_structural_state(&target_baseline, &pane_ids)?;
-            admit_moved_split_tree_clone(&target_baseline)?;
-            let mut target_replacement = target_baseline.clone();
+            let mut target_replacement = clone_tab_inner_bounded(&target_baseline)?;
             let target_index =
                 exact_tiled_relocation_index(&target_replacement, target_guard.pane()).ok_or_else(
                     || {
