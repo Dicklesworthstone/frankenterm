@@ -75,11 +75,9 @@ crates/frankenterm-mux-server-impl/src/lib.rs	use std::os::unix::process::ExitSt
 crates/frankenterm-pty-guardian/src/broker.rs	raw_fd: std::os::fd::RawFd,
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::fd::{AsFd, BorrowedFd};
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
-crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
 # Enrollment subprocess/permission negative controls are inside the function-level
 # #[cfg(unix)] gate; this import is beyond the eight-line lookback.
 crates/frankenterm/tests/cli_golden_artifacts.rs	use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
-crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::prelude::AsRawFd as _;
 crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::ffi::OsStrExt;
 crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{PermissionsExt, symlink};
@@ -108,7 +106,6 @@ frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(
 frankenterm/client/src/discovery.rs	let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind live socket");
 frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&live_path).expect("bind socket");
 frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
-frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
 frankenterm/client/src/discovery.rs	std::os::unix::net::UnixListener::bind(&socket).expect("bind original socket");
 frankenterm/client/src/discovery.rs	use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 frankenterm/escape-parser/Cargo.toml	DEP nix = { workspace=true, optional=true, features=["mman", "fs"] }
@@ -146,3 +143,17 @@ crates/frankenterm/src/mobile_attach.rs	use std::os::fd::{AsFd, AsRawFd, OwnedFd
 crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{FileTypeExt, MetadataExt};
 crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{PermissionsExt, symlink};
 crates/frankenterm/src/mobile_attach.rs	use std::os::unix::net::{UnixListener, UnixStream};
+
+# ft-51fde (2026-11-20): all eight entries below are already inside #[cfg(unix)]
+# scopes beyond the guard's eight-line lookback: durable_catalog_mutations_refuse_
+# non_authoritative_ledger_leaves in tx_idempotency.rs (fn-level #[cfg(unix)]),
+# guardian_proxy (module-level #[cfg(unix)] in frankenterm-mux-server-impl/src/lib.rs),
+# and runtime/transport (module-level #[cfg(unix)] in frankenterm-pty-guardian/src/lib.rs).
+crates/frankenterm-core/src/tx_idempotency.rs	"symlink" => std::os::unix::fs::symlink(&target, &leaf).unwrap(),
+crates/frankenterm-mux-server-impl/src/guardian_proxy.rs	use std::os::unix::fs::PermissionsExt as _;
+crates/frankenterm-mux-server-impl/src/guardian_proxy.rs	use std::os::unix::net::{UnixListener, UnixStream};
+crates/frankenterm-pty-guardian/src/runtime.rs	let (reader, producer) = std::os::unix::net::UnixStream::pair().unwrap();
+crates/frankenterm-pty-guardian/src/runtime.rs	std::os::unix::net::UnixStream,
+crates/frankenterm-pty-guardian/src/transport.rs	let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+crates/frankenterm-pty-guardian/src/transport.rs	let upstream = std::os::unix::net::UnixStream::connect(guardian).unwrap();
+crates/frankenterm-pty-guardian/src/transport.rs	listener: &std::os::unix::net::UnixListener,
