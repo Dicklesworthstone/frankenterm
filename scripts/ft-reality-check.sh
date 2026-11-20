@@ -166,11 +166,15 @@ cmd_silent_close_audit() {
   local phantom_list=""
   for id in $closed_ids; do
     total=$((total + 1))
-    # G55 protocol: a legitimate closure has at least one audit comment
-    # or a 'closed' audit-log event with a non-empty comment.
-    local comment_count
-    comment_count=$(br audit log "$id" --json 2>/dev/null \
-      | jq '[.events[] | select(.event_type == "closed" or .event_type == "commented") | .comment // empty | select(length > 0)] | length' || echo 0)
+    # G55 protocol: a legitimate closure has at least one non-empty bead
+    # comment (stored on the issue via `br comments add` / `br show`) or an
+    # audit-log event with a non-empty comment.
+    local issue_comment_count audit_comment_count comment_count
+    issue_comment_count=$(br comments list "$id" --json 2>/dev/null \
+      | jq '[.[] | (.text // .body // "") | select(length > 0)] | length' 2>/dev/null || echo 0)
+    audit_comment_count=$(br audit log "$id" --json 2>/dev/null \
+      | jq '[.events[] | select(.event_type == "closed" or .event_type == "commented") | .comment // empty | select(length > 0)] | length' 2>/dev/null || echo 0)
+    comment_count=$(( ${issue_comment_count:-0} + ${audit_comment_count:-0} ))
     if [[ "${comment_count:-0}" -eq 0 ]]; then
       phantom_count=$((phantom_count + 1))
       phantom_list="$phantom_list $id"
