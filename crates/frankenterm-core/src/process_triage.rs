@@ -175,6 +175,11 @@ const SYSTEM_PROCESSES: &[&str] = &[
     "mds_stores",
     "mdworker",
     "wezterm-mux-server",
+    "frankenterm-mux-server",
+    "frankenterm-pty-guardian",
+    "frankenterm-gui",
+    "mcp-agent-mail",
+    "rchd",
 ];
 
 /// Test runner process names.
@@ -596,6 +601,292 @@ fn classify_tree(
 
     for child in &node.children {
         classify_tree(child, pane_id, context_fn, classify_fn, out);
+    }
+}
+
+// =============================================================================
+// Versioned `pt` CLI adapter: bounded snapshot, plan, policy-gated apply & verify
+// (ft-xxfwy.57)
+// =============================================================================
+
+/// Hard upper bound on entries admitted from an external `pt` snapshot or plan.
+pub const PT_MAX_SNAPSHOT_ENTRIES: usize = 512;
+/// Hard upper bound on stdout bytes read from a single `pt` invocation (2 MiB).
+pub const PT_MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Exact process identity binding a PID to its observed start time and name so
+/// PID reuse between snapshot/plan and apply cannot target an unrelated process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// Process start timestamp in epoch milliseconds (or boot-relative ticks)
+    /// captured when the process was observed.
+    pub start_time_ms: u64,
+    /// Process executable/command name observed at snapshot time.
+    pub name: String,
+}
+
+/// One process observation from a bounded `pt` snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PtSnapshotEntry {
+    pub identity: ProcessIdentity,
+    pub ppid: u32,
+    pub category: TriageCategory,
+    pub recommended_action: TriageAction,
+    #[serde(default)]
+    pub rss_kb: u64,
+    #[serde(default)]
+    pub cpu_percent: f64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+}
+
+/// Bounded versioned process-triage snapshot returned by [`PtAdapter`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PtSnapshot {
+    pub schema_version: String,
+    pub provider: String,
+    pub session_id: String,
+    pub entries: Vec<PtSnapshotEntry>,
+    pub truncated: bool,
+}
+
+/// Explicit authorization token required before applying a triage action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtApplyAuthorization {
+    /// Target process identity verified against the plan & live observation.
+    pub target: ProcessIdentity,
+    /// Intended triage action to execute.
+    pub action: TriageAction,
+    /// Explicit approval identifier (required for non-auto-safe actions).
+    pub approval_id: Option<String>,
+    /// Policy decision label permitting the action (must be `"allow"`).
+    pub policy_decision: String,
+    /// Whether the caller has explicitly opted into auto-safe execution.
+    pub allow_auto_safe: bool,
+}
+
+/// Observed post-apply verification result returned by [`PtAdapter::apply_and_verify`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtApplyVerification {
+    pub schema_version: String,
+    pub provider: String,
+    pub target: ProcessIdentity,
+    pub action: TriageAction,
+    pub applied: bool,
+    pub verified_state: String,
+    pub detail: String,
+}
+
+/// Typed, content-free error taxonomy for the `pt` provider adapter.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "error", rename_all = "snake_case")]
+pub enum PtProviderError {
+    /// External `pt` binary is not installed or unreachable.
+    #[error("process-triage provider unavailable ({provider})")]
+    Unavailable { provider: String },
+    /// Snapshot or plan exceeded the configured entry ceiling.
+    #[error("process-triage snapshot entry count {observed} exceeds limit {max}")]
+    SnapshotLimitExceeded { observed: usize, max: usize },
+    /// Refused action against a protected category (`SystemProcess` or `ActiveAgent`).
+    #[error("process-triage refused action against protected process category {category}")]
+    ProtectedProcessRefused { category: String },
+    /// Refused because exact process identity did not match live/planned identity
+    /// (protects against PID reuse races).
+    #[error("process-triage identity mismatch for pid {pid}")]
+    IdentityMismatch { pid: u32 },
+    /// Policy denied or did not explicitly allow the requested apply action.
+    #[error("process-triage policy denied action: {reason}")]
+    PolicyDenied { reason: String },
+    /// Action requires an explicit human/operator approval token before execution.
+    #[error("process-triage action requires explicit approval for pid {pid} ({category})")]
+    ApprovalRequired { pid: u32, category: String },
+    /// External `pt` invocation timed out, returned non-zero, or emitted invalid JSON.
+    #[error("process-triage provider invocation failed ({phase})")]
+    InvocationFailed { phase: &'static str },
+}
+
+/// Validate exact process identity, system/agent protection, policy decision,
+/// and approval requirements BEFORE any triage action is applied.
+pub fn authorize_triage_apply(
+    planned: &PtSnapshotEntry,
+    live_identity: Option<&ProcessIdentity>,
+    auth: &PtApplyAuthorization,
+) -> Result<(), PtProviderError> {
+    if is_system_process(&planned.identity.name)
+        || planned.category.is_protected()
+        || matches!(auth.action, TriageAction::Protect)
+    {
+        return Err(PtProviderError::ProtectedProcessRefused {
+            category: planned.category.to_string(),
+        });
+    }
+    if planned.identity != auth.target {
+        return Err(PtProviderError::IdentityMismatch {
+            pid: auth.target.pid,
+        });
+    }
+    match live_identity {
+        Some(live) if live == &planned.identity => {}
+        _ => {
+            return Err(PtProviderError::IdentityMismatch {
+                pid: auth.target.pid,
+            });
+        }
+    }
+    if auth.policy_decision != "allow" {
+        return Err(PtProviderError::PolicyDenied {
+            reason: format!("policy_decision={}", auth.policy_decision),
+        });
+    }
+    let has_approval = auth
+        .approval_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if !(has_approval || (auth.allow_auto_safe && planned.category.is_auto_safe())) {
+        return Err(PtProviderError::ApprovalRequired {
+            pid: planned.identity.pid,
+            category: planned.category.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Versioned `pt` CLI adapter implementing bounded snapshot, plan, policy-gated
+/// apply, and post-apply verification via [`crate::subprocess_bridge::SubprocessBridge`].
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug, Clone)]
+pub struct PtCliAdapter {
+    snapshot_bridge: crate::subprocess_bridge::SubprocessBridge<PtSnapshot>,
+    apply_bridge: crate::subprocess_bridge::SubprocessBridge<PtApplyVerification>,
+    max_entries: usize,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+impl PtCliAdapter {
+    /// Construct a `pt` CLI adapter with bounded timeout and stdout limits.
+    #[must_use]
+    pub fn new(binary: &str) -> Self {
+        Self {
+            snapshot_bridge: crate::subprocess_bridge::SubprocessBridge::new(binary)
+                .with_stdout_limit(PT_MAX_STDOUT_BYTES),
+            apply_bridge: crate::subprocess_bridge::SubprocessBridge::new(binary)
+                .with_stdout_limit(PT_MAX_STDOUT_BYTES),
+            max_entries: PT_MAX_SNAPSHOT_ENTRIES,
+        }
+    }
+
+    /// Construct the default `pt` adapter discovering `pt` on `PATH` / `/dp`.
+    #[must_use]
+    pub fn default_binary() -> Self {
+        Self::new("pt")
+    }
+
+    /// Override the maximum admitted entries in a snapshot response.
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
+    /// Whether the configured `pt` binary is resolvable on this host.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.snapshot_bridge.is_available()
+    }
+
+    /// Capture a bounded process-triage snapshot from `pt agent snapshot --format json`.
+    pub fn snapshot(&self) -> Result<PtSnapshot, PtProviderError> {
+        if !self.is_available() {
+            return Err(PtProviderError::Unavailable {
+                provider: self.snapshot_bridge.binary_name().to_string(),
+            });
+        }
+        let mut snap = self
+            .snapshot_bridge
+            .invoke(&["agent", "snapshot", "--format", "json"])
+            .map_err(|_| PtProviderError::InvocationFailed { phase: "snapshot" })?;
+        if snap.entries.len() > self.max_entries {
+            return Err(PtProviderError::SnapshotLimitExceeded {
+                observed: snap.entries.len(),
+                max: self.max_entries,
+            });
+        }
+        if snap.schema_version.is_empty() {
+            snap.schema_version = PROCESS_TRIAGE_SCHEMA_VERSION_V1.to_string();
+        }
+        Ok(snap)
+    }
+
+    /// Capture a bounded triage plan from `pt agent plan --format json`.
+    pub fn plan(&self) -> Result<PtSnapshot, PtProviderError> {
+        if !self.is_available() {
+            return Err(PtProviderError::Unavailable {
+                provider: self.snapshot_bridge.binary_name().to_string(),
+            });
+        }
+        let mut plan = self
+            .snapshot_bridge
+            .invoke(&["agent", "plan", "--format", "json"])
+            .map_err(|_| PtProviderError::InvocationFailed { phase: "plan" })?;
+        if plan.entries.len() > self.max_entries {
+            return Err(PtProviderError::SnapshotLimitExceeded {
+                observed: plan.entries.len(),
+                max: self.max_entries,
+            });
+        }
+        if plan.schema_version.is_empty() {
+            plan.schema_version = PROCESS_TRIAGE_SCHEMA_VERSION_V1.to_string();
+        }
+        Ok(plan)
+    }
+
+    /// Enforce exact process identity, protection rules, policy decision, and
+    /// approval requirements, then invoke `pt agent apply` and verify the
+    /// returned post-apply observation matches the authorized identity.
+    pub fn apply_and_verify(
+        &self,
+        planned: &PtSnapshotEntry,
+        live_identity: Option<&ProcessIdentity>,
+        auth: &PtApplyAuthorization,
+    ) -> Result<PtApplyVerification, PtProviderError> {
+        authorize_triage_apply(planned, live_identity, auth)?;
+        if !self.is_available() {
+            return Err(PtProviderError::Unavailable {
+                provider: self.apply_bridge.binary_name().to_string(),
+            });
+        }
+        let pid_str = auth.target.pid.to_string();
+        let start_str = auth.target.start_time_ms.to_string();
+        let action_str = auth.action.to_string();
+        let mut args: Vec<&str> = vec![
+            "agent",
+            "apply",
+            "--format",
+            "json",
+            "--pid",
+            &pid_str,
+            "--start-time-ms",
+            &start_str,
+            "--action",
+            &action_str,
+        ];
+        if let Some(approval) = auth.approval_id.as_deref() {
+            args.push("--approval-id");
+            args.push(approval);
+        }
+        let verified = self
+            .apply_bridge
+            .invoke(&args)
+            .map_err(|_| PtProviderError::InvocationFailed { phase: "apply" })?;
+        if verified.target != auth.target {
+            return Err(PtProviderError::IdentityMismatch {
+                pid: auth.target.pid,
+            });
+        }
+        Ok(verified)
     }
 }
 
@@ -1273,5 +1564,158 @@ mod tests {
         assert_eq!(envelope.schema_version, PROCESS_TRIAGE_SCHEMA_VERSION_V1);
         assert_eq!(envelope.provider, "heuristic");
         assert_eq!(envelope.data, expected_plan);
+    }
+
+    #[test]
+    fn frankenterm_daemons_are_protected_system_processes() {
+        for name in [
+            "frankenterm-mux-server",
+            "frankenterm-pty-guardian",
+            "frankenterm-gui",
+            "mcp-agent-mail",
+            "rchd",
+        ] {
+            let node = make_node(42, 1, name, ProcessState::Running);
+            let ctx = make_context(72.0, 5.0, false);
+            let (cat, action, _) = classify(&node, &ctx);
+            assert_eq!(cat, TriageCategory::SystemProcess, "must protect {name}");
+            assert_eq!(action, TriageAction::Protect);
+        }
+    }
+
+    #[test]
+    fn authorize_triage_apply_enforces_protection_identity_policy_and_approval() {
+        let protected = PtSnapshotEntry {
+            identity: ProcessIdentity {
+                pid: 100,
+                start_time_ms: 1_000,
+                name: "frankenterm-mux-server".to_string(),
+            },
+            ppid: 1,
+            category: TriageCategory::SystemProcess,
+            recommended_action: TriageAction::Protect,
+            rss_kb: 50_000,
+            cpu_percent: 2.0,
+            reason: "system".to_string(),
+            pane_id: None,
+        };
+        let auth_protected = PtApplyAuthorization {
+            target: protected.identity.clone(),
+            action: TriageAction::ForceKill,
+            approval_id: Some("appr-1".to_string()),
+            policy_decision: "allow".to_string(),
+            allow_auto_safe: true,
+        };
+        assert!(matches!(
+            authorize_triage_apply(&protected, Some(&protected.identity), &auth_protected),
+            Err(PtProviderError::ProtectedProcessRefused { .. })
+        ));
+
+        let review_entry = PtSnapshotEntry {
+            identity: ProcessIdentity {
+                pid: 200,
+                start_time_ms: 5_000,
+                name: "next".to_string(),
+            },
+            ppid: 10,
+            category: TriageCategory::AbandonedServer,
+            recommended_action: TriageAction::FlagForReview {
+                reason: "idle".to_string(),
+            },
+            rss_kb: 100_000,
+            cpu_percent: 0.0,
+            reason: "idle 30h".to_string(),
+            pane_id: Some(3),
+        };
+        // PID reuse (different start_time_ms on live observation) must fail closed.
+        let reused_live = ProcessIdentity {
+            pid: 200,
+            start_time_ms: 9_999,
+            name: "next".to_string(),
+        };
+        let auth_review = PtApplyAuthorization {
+            target: review_entry.identity.clone(),
+            action: TriageAction::GracefulKill {
+                grace_period: Duration::from_secs(5),
+            },
+            approval_id: None,
+            policy_decision: "allow".to_string(),
+            allow_auto_safe: true,
+        };
+        assert_eq!(
+            authorize_triage_apply(&review_entry, Some(&reused_live), &auth_review),
+            Err(PtProviderError::IdentityMismatch { pid: 200 })
+        );
+        // Missing approval for non-auto-safe category must fail closed.
+        assert!(matches!(
+            authorize_triage_apply(&review_entry, Some(&review_entry.identity), &auth_review),
+            Err(PtProviderError::ApprovalRequired { pid: 200, .. })
+        ));
+        // Policy deny fails closed even with approval.
+        let mut denied = auth_review.clone();
+        denied.approval_id = Some("appr-2".to_string());
+        denied.policy_decision = "deny".to_string();
+        assert!(matches!(
+            authorize_triage_apply(&review_entry, Some(&review_entry.identity), &denied),
+            Err(PtProviderError::PolicyDenied { .. })
+        ));
+        // Matching identity + policy allow + approval succeeds.
+        let mut approved = auth_review;
+        approved.approval_id = Some("appr-2".to_string());
+        assert_eq!(
+            authorize_triage_apply(&review_entry, Some(&review_entry.identity), &approved),
+            Ok(())
+        );
+    }
+
+    #[cfg(all(unix, feature = "subprocess-bridge"))]
+    #[test]
+    fn pt_cli_adapter_roundtrips_snapshot_plan_apply_and_missing_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let missing = PtCliAdapter::new("definitely-missing-pt-binary-xyz");
+        assert!(!missing.is_available());
+        assert!(matches!(
+            missing.snapshot(),
+            Err(PtProviderError::Unavailable { .. })
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("pt");
+        let script = r#"#!/bin/sh
+if [ "$2" = "snapshot" ] || [ "$2" = "plan" ]; then
+  printf '{"schema_version":"ft.process_triage.v1","provider":"pt_cli","session_id":"pt-s1","truncated":false,"entries":[{"identity":{"pid":777,"start_time_ms":12345,"name":"cargo-nextest"},"ppid":1,"category":"stuck_test","recommended_action":{"action":"graceful_kill","grace_period":{"secs":5,"nanos":0}},"rss_kb":4096,"cpu_percent":0.0,"reason":"stuck 14h","pane_id":2}]}'
+elif [ "$2" = "apply" ]; then
+  printf '{"schema_version":"ft.process_triage.v1","provider":"pt_cli","target":{"pid":777,"start_time_ms":12345,"name":"cargo-nextest"},"action":{"action":"graceful_kill","grace_period":{"secs":5,"nanos":0}},"applied":true,"verified_state":"exited","detail":"sigterm exited"}'
+fi
+"#;
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let adapter = PtCliAdapter::new(bin.to_str().unwrap());
+        assert!(adapter.is_available());
+        let snap = adapter.snapshot().unwrap();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].identity.pid, 777);
+
+        let plan = adapter.plan().unwrap();
+        assert_eq!(plan.entries.len(), 1);
+
+        let auth = PtApplyAuthorization {
+            target: plan.entries[0].identity.clone(),
+            action: TriageAction::GracefulKill {
+                grace_period: Duration::from_secs(5),
+            },
+            approval_id: None,
+            policy_decision: "allow".to_string(),
+            allow_auto_safe: true,
+        };
+        let verified = adapter
+            .apply_and_verify(&plan.entries[0], Some(&plan.entries[0].identity), &auth)
+            .unwrap();
+        assert!(verified.applied);
+        assert_eq!(verified.verified_state, "exited");
     }
 }

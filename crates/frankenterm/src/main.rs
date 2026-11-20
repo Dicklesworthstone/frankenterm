@@ -2265,6 +2265,26 @@ SEE ALSO:
         format: String,
     },
 
+    /// Render terminal-native Mermaid diagrams and pane topology trees
+    #[command(after_help = r#"EXAMPLES:
+    ft diagram render --mermaid "flowchart TD\nA[Start] --> B[End]"
+    ft diagram render --file arch.mmd --style double
+    ft diagram topology"#)]
+    Diagram {
+        #[command(subcommand)]
+        command: DiagramCommands,
+    },
+
+    /// Bounded process-triage snapshot, plan, and policy-gated apply via `pt`
+    #[cfg(feature = "subprocess-bridge")]
+    #[command(after_help = r#"EXAMPLES:
+    ft process-triage snapshot --format json
+    ft process-triage plan --format json"#)]
+    ProcessTriage {
+        #[command(subcommand)]
+        command: ProcessTriageCommands,
+    },
+
     /// Simulation mode: run ft with a mock WezTerm driven by YAML scenarios
     #[command(after_help = r#"EXAMPLES:
     ft simulate run scenario.yaml        Run a scenario file
@@ -2663,6 +2683,106 @@ enum AnalyticsCommands {
         /// Output file path (defaults to stdout)
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+    /// Cursor-based, redacted event export for vibe_cockpit collectors
+    #[cfg(feature = "vc-export")]
+    VcExport {
+        /// Resume cursor token returned by the previous export page
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum number of events per page (1..=500)
+        #[arg(long, default_value_t = frankenterm_core::vc_export::VC_EXPORT_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Optional pane ID filter
+        #[arg(long)]
+        pane: Option<u64>,
+        /// Optional exact rule ID filter
+        #[arg(long)]
+        rule: Option<String>,
+        /// Optional exact event type filter
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Include secret-redacted matched_text excerpts
+        #[arg(long)]
+        include_text: bool,
+        /// Output format: json (envelope with cursor/gap metadata) or jsonl (records stream)
+        #[arg(long, short = 'f', default_value = "json")]
+        format: String,
+        /// Output file path (defaults to stdout; persisted atomically)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagramCommands {
+    /// Parse and render a Mermaid diagram (flowchart, graph, or sequenceDiagram)
+    Render {
+        /// Path to a Mermaid (.mmd) file to render (bounded capability-safe read)
+        #[arg(long, short = 'f')]
+        file: Option<PathBuf>,
+        /// Inline Mermaid source text (mutually exclusive with --file)
+        #[arg(long, short = 'm')]
+        mermaid: Option<String>,
+        /// Box border style: single, double, or ascii
+        #[arg(long, default_value = "single")]
+        style: String,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Render stored pane topology as a Unicode tree
+    Topology {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Subcommand)]
+enum ProcessTriageCommands {
+    /// Capture a bounded process-triage snapshot via the `pt` adapter
+    Snapshot {
+        /// Output format: json or plain
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Optional override path/name for the `pt` binary
+        #[arg(long, default_value = "pt")]
+        binary: String,
+    },
+    /// Generate a bounded process-triage remediation plan via the `pt` adapter
+    Plan {
+        /// Output format: json or plain
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Optional override path/name for the `pt` binary
+        #[arg(long, default_value = "pt")]
+        binary: String,
+    },
+    /// Apply one authorized process-triage action after verifying exact live process identity
+    Apply {
+        /// Exact target PID from the triage plan
+        #[arg(long)]
+        pid: u32,
+        /// Exact target start timestamp (ms) observed in the triage plan (prevents PID reuse)
+        #[arg(long)]
+        start_time_ms: u64,
+        /// Exact target executable name observed in the triage plan
+        #[arg(long)]
+        name: String,
+        /// Explicit operator approval token (required for non-auto-safe actions)
+        #[arg(long)]
+        approval_id: Option<String>,
+        /// Allow execution without an approval token ONLY for auto-safe categories
+        #[arg(long)]
+        allow_auto_safe: bool,
+        /// Output format: json or plain
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Optional override path/name for the `pt` binary
+        #[arg(long, default_value = "pt")]
+        binary: String,
     },
 }
 
@@ -43956,7 +44076,11 @@ fn production_cli_filesystem_reads_and_writes_use_capability_safe_surfaces_canar
                 continue;
             }
 
-            if trimmed.starts_with("#[cfg(test)]") {
+            if trimmed.starts_with("#[cfg(")
+                && (trimmed.contains("(test)")
+                    || trimmed.contains(", test)")
+                    || trimmed.contains("(test,"))
+            {
                 pending_test_item = true;
                 brace_depth += opens - closes;
                 continue;
@@ -73899,6 +74023,62 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         print!("{rendered}");
                     }
                 }
+                #[cfg(feature = "vc-export")]
+                Some(AnalyticsCommands::VcExport {
+                    cursor,
+                    limit,
+                    pane,
+                    rule,
+                    event_type,
+                    include_text,
+                    format: export_format,
+                    output: output_path,
+                }) => {
+                    use frankenterm_core::vc_export::{
+                        VcExportCursor, VcExportRequest, export_events_page_with_cx,
+                    };
+
+                    let parsed_cursor = match cursor.as_deref() {
+                        Some(raw) => Some(VcExportCursor::parse(raw)?),
+                        None => None,
+                    };
+                    let req = VcExportRequest {
+                        cursor: parsed_cursor,
+                        limit,
+                        pane_id: pane,
+                        rule_id: rule,
+                        event_type,
+                        since: None,
+                        until: None,
+                        include_matched_text: include_text,
+                    };
+                    let page =
+                        export_events_page_with_cx(&analytics_cx, &storage, &req).await?;
+                    let rendered = match export_format.to_lowercase().as_str() {
+                        "jsonl" => page.to_jsonl()?,
+                        "json" => serde_json::to_string_pretty(&page)?,
+                        other => {
+                            anyhow::bail!(
+                                "Unsupported vc-export format '{other}'; expected 'json' or 'jsonl'"
+                            );
+                        }
+                    };
+                    if let Some(path) = output_path {
+                        frankenterm_core::lock::write_file_atomic_with_policy(
+                            Path::new(&path),
+                            rendered.as_bytes(),
+                            frankenterm_core::lock::AtomicWritePolicy::default()
+                                .with_max_bytes(64 * 1024 * 1024),
+                        )?;
+                        eprintln!(
+                            "Exported {} vc-export records (next_cursor={}) to {path}",
+                            page.records.len(),
+                            page.next_cursor_token
+                        );
+                    } else {
+                        println!("{rendered}");
+                    }
+                }
                 None => {
                     // Default: summary view
                     let query_tokens = MetricQuery {
@@ -73955,6 +74135,330 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
             }
         }
+
+        Some(Commands::Diagram { command }) => match command {
+            DiagramCommands::Render {
+                file,
+                mermaid,
+                style,
+                format,
+            } => {
+                use frankenterm_core::diagram_render::{
+                    BoxStyle, MERMAID_MAX_INPUT_BYTES, MermaidRenderOptions, render_mermaid,
+                };
+
+                let box_style = match style.to_lowercase().as_str() {
+                    "single" => BoxStyle::Single,
+                    "double" => BoxStyle::Double,
+                    "ascii" => BoxStyle::Ascii,
+                    other => {
+                        anyhow::bail!(
+                            "Unsupported diagram style '{other}'; expected single, double, or ascii"
+                        );
+                    }
+                };
+                let diagram_io_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let source = match (file, mermaid) {
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("Provide only one of --file or --mermaid");
+                    }
+                    (Some(path), None) => {
+                        frankenterm_core::lock::read_file_to_string_bounded_with_cx(
+                            &diagram_io_cx,
+                            path,
+                            MERMAID_MAX_INPUT_BYTES,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to read mermaid file: {e}"))?
+                    }
+                    (None, Some(inline)) => inline.replace("\\n", "\n"),
+                    (None, None) => {
+                        anyhow::bail!("Provide either --file <PATH> or --mermaid <SOURCE>");
+                    }
+                };
+                let opts = MermaidRenderOptions {
+                    style: box_style,
+                    ..MermaidRenderOptions::default()
+                };
+                match render_mermaid(&source, &opts) {
+                    Ok(rendered) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "kind": rendered.kind,
+                                    "direction": rendered.direction,
+                                    "node_count": rendered.node_count,
+                                    "edge_count": rendered.edge_count,
+                                    "rendered": rendered.rendered,
+                                }))?
+                            );
+                        } else {
+                            print!("{}", rendered.rendered);
+                        }
+                    }
+                    Err(err) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": err,
+                                    "message": err.to_string(),
+                                }))?
+                            );
+                            std::process::exit(1);
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+            DiagramCommands::Topology { format } => {
+                let diagram_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let db_path = layout.db_path.to_string_lossy();
+                let storage =
+                    frankenterm_core::storage::StorageHandle::new_with_cx(&diagram_cx, &db_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to open storage: {e}"))?;
+                let panes = storage.get_panes_with_cx(&diagram_cx).await?;
+                let entries: Vec<(u64, Option<u64>, String)> = panes
+                    .iter()
+                    .map(|p| {
+                        let label = p
+                            .title
+                            .as_deref()
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or(&p.domain);
+                        (p.pane_id, None, format!("{} ({})", label, p.domain))
+                    })
+                    .collect();
+                let rendered = frankenterm_core::diagram_render::render_topology(&entries);
+                if format.eq_ignore_ascii_case("json") {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "pane_count": entries.len(),
+                            "rendered": rendered,
+                        }))?
+                    );
+                } else {
+                    print!("{rendered}");
+                }
+            }
+        },
+
+        #[cfg(feature = "subprocess-bridge")]
+        Some(Commands::ProcessTriage { command }) => match command {
+            ProcessTriageCommands::Snapshot { format, binary } => {
+                let adapter = frankenterm_core::process_triage::PtCliAdapter::new(&binary);
+                match adapter.snapshot() {
+                    Ok(snap) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "snapshot": snap,
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Process triage snapshot (provider={}, entries={}, truncated={}):",
+                                snap.provider,
+                                snap.entries.len(),
+                                snap.truncated
+                            );
+                            for entry in &snap.entries {
+                                println!(
+                                    "  pid={} name={} category={} action={} reason={}",
+                                    entry.identity.pid,
+                                    entry.identity.name,
+                                    entry.category,
+                                    entry.recommended_action,
+                                    entry.reason
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": err,
+                                    "message": err.to_string(),
+                                }))?
+                            );
+                            std::process::exit(1);
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+            ProcessTriageCommands::Plan { format, binary } => {
+                let adapter = frankenterm_core::process_triage::PtCliAdapter::new(&binary);
+                match adapter.plan() {
+                    Ok(plan) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "plan": plan,
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Process triage plan (provider={}, entries={}, truncated={}):",
+                                plan.provider,
+                                plan.entries.len(),
+                                plan.truncated
+                            );
+                            for entry in &plan.entries {
+                                println!(
+                                    "  pid={} name={} category={} action={} reason={}",
+                                    entry.identity.pid,
+                                    entry.identity.name,
+                                    entry.category,
+                                    entry.recommended_action,
+                                    entry.reason
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": err,
+                                    "message": err.to_string(),
+                                }))?
+                            );
+                            std::process::exit(1);
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+            ProcessTriageCommands::Apply {
+                pid,
+                start_time_ms,
+                name,
+                approval_id,
+                allow_auto_safe,
+                format,
+                binary,
+            } => {
+                use frankenterm_core::process_triage::{
+                    ProcessIdentity, PtApplyAuthorization, PtCliAdapter, PtProviderError,
+                };
+
+                let adapter = PtCliAdapter::new(&binary);
+                let requested_identity = ProcessIdentity {
+                    pid,
+                    start_time_ms,
+                    name,
+                };
+                let triage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let policy_decision = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                    &triage_cx,
+                    &layout.db_path.to_string_lossy(),
+                )
+                .await
+                {
+                    Ok(storage) => {
+                        let base_engine = frankenterm_core::policy::PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            config.safety.require_prompt_active,
+                        )
+                        .with_tuning(&config.tuning)
+                        .with_command_gate_config(config.safety.command_gate.clone())
+                        .with_policy_rules(config.safety.rules.clone());
+                        let engine =
+                            with_persisted_kill_switch(base_engine, &storage, "process triage apply")
+                                .await;
+                        match engine.kill_switch_state().level {
+                            frankenterm_core::policy_quarantine::KillSwitchLevel::Disarmed => {
+                                "allow"
+                            }
+                            _ => "deny_kill_switch",
+                        }
+                    }
+                    Err(_) => "deny_storage_unavailable",
+                };
+
+                // Re-query a fresh bounded snapshot from the provider so exact live
+                // process identity and classification are verified before apply.
+                let apply_result: Result<_, PtProviderError> = match adapter.snapshot() {
+                    Ok(snap) => {
+                        let planned = snap
+                            .entries
+                            .iter()
+                            .find(|entry| entry.identity.pid == pid)
+                            .ok_or(PtProviderError::IdentityMismatch { pid });
+                        match planned {
+                            Ok(entry) => {
+                                let auth = PtApplyAuthorization {
+                                    target: requested_identity.clone(),
+                                    action: entry.recommended_action.clone(),
+                                    approval_id,
+                                    policy_decision: policy_decision.to_string(),
+                                    allow_auto_safe,
+                                };
+                                adapter.apply_and_verify(entry, Some(&entry.identity), &auth)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                match apply_result {
+                    Ok(verified) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "verification": verified,
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Applied {} to pid={} ({}): verified_state={} ({})",
+                                verified.action,
+                                verified.target.pid,
+                                verified.target.name,
+                                verified.verified_state,
+                                verified.detail
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if format.eq_ignore_ascii_case("json") {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": err,
+                                    "message": err.to_string(),
+                                }))?
+                            );
+                            std::process::exit(1);
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+        },
 
         Some(Commands::Simulate { command }) => match command {
             SimulateCommands::Run {
@@ -145174,6 +145678,112 @@ A  docs/new-proof.md\n";
             }
             _ => panic!("expected Analytics command"),
         }
+    }
+
+    #[cfg(feature = "vc-export")]
+    #[test]
+    fn cli_analytics_vc_export_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "analytics",
+            "vc-export",
+            "--cursor",
+            "v1:epoch1:10:0",
+            "--limit",
+            "50",
+            "--include-text",
+            "--format",
+            "jsonl",
+        ])
+        .expect("analytics vc-export should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Analytics {
+                command:
+                    Some(AnalyticsCommands::VcExport {
+                        cursor,
+                        limit,
+                        include_text,
+                        format,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(cursor.as_deref(), Some("v1:epoch1:10:0"));
+                assert_eq!(limit, 50);
+                assert!(include_text);
+                assert_eq!(format, "jsonl");
+            }
+            _ => panic!("expected Analytics VcExport subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_diagram_render_and_topology_parse() {
+        let render_cli = Cli::try_parse_from([
+            "ft",
+            "diagram",
+            "render",
+            "--mermaid",
+            "flowchart TD\nA --> B",
+            "--style",
+            "ascii",
+            "--format",
+            "json",
+        ])
+        .expect("diagram render should parse");
+        assert!(matches!(
+            render_cli.command.map(|b| *b),
+            Some(Commands::Diagram {
+                command: DiagramCommands::Render { .. }
+            })
+        ));
+
+        let topo_cli = Cli::try_parse_from(["ft", "diagram", "topology", "--format", "json"])
+            .expect("diagram topology should parse");
+        assert!(matches!(
+            topo_cli.command.map(|b| *b),
+            Some(Commands::Diagram {
+                command: DiagramCommands::Topology { .. }
+            })
+        ));
+    }
+
+    #[cfg(feature = "subprocess-bridge")]
+    #[test]
+    fn cli_process_triage_subcommands_parse() {
+        let snap = Cli::try_parse_from(["ft", "process-triage", "snapshot", "--format", "json"])
+            .expect("process-triage snapshot should parse");
+        assert!(matches!(
+            snap.command.map(|b| *b),
+            Some(Commands::ProcessTriage {
+                command: ProcessTriageCommands::Snapshot { .. }
+            })
+        ));
+
+        let apply = Cli::try_parse_from([
+            "ft",
+            "process-triage",
+            "apply",
+            "--pid",
+            "1234",
+            "--start-time-ms",
+            "5678",
+            "--name",
+            "cargo-nextest",
+            "--approval-id",
+            "appr-1",
+        ])
+        .expect("process-triage apply should parse");
+        assert!(matches!(
+            apply.command.map(|b| *b),
+            Some(Commands::ProcessTriage {
+                command: ProcessTriageCommands::Apply {
+                    pid: 1234,
+                    start_time_ms: 5678,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]
