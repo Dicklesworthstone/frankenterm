@@ -51,7 +51,7 @@ function eventLabels(f) {
     .filter((frame) => frame.kind === "event").map((frame) => frame.data.event.label);
 }
 
-function fixture({ reject = () => false, throwConstruct = false, resync = () => {} } = {}) {
+function fixture({ reject = () => false, throwConstruct = false, resync = () => {}, readyTimeoutMs = 10_000 } = {}) {
   const sources = [];
   const timers = new Map();
   const allCallbacks = [];
@@ -101,6 +101,7 @@ function fixture({ reject = () => false, throwConstruct = false, resync = () => 
     },
     clearTimer(id) { timers.delete(id); },
     onResync() { resyncs += 1; return resync(); },
+    readyTimeoutMs,
   });
   return {
     feed, sources, timers, allCallbacks, delays, frames, errors, states,
@@ -143,6 +144,87 @@ test("start is idempotent and waits for the server's fresh durable checkpoint", 
   assert.equal(f.sources[0].url.searchParams.get("cursor"), null);
   assert.equal(f.sources[0].url.searchParams.get("channel"), "all");
   assert.deepEqual(f.states, [1]);
+});
+
+test("a stream that opens but never supplies ready is replaced without inventing a cursor", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  f.feed.start();
+  const first = f.sources[0];
+  first.emit("open");
+  assert.deepEqual(f.delays, [25]);
+  f.runTimer();
+  assert.equal(first.closeCalls, 1);
+  assert.equal(f.states.at(-1), 0);
+  assert.match(f.errors.at(-1), /ready checkpoint timed out/);
+  assert.deepEqual(f.delays, [25, 1000]);
+  ready(first, "99");
+  assert.equal(f.frames.length, 0, "late ready cannot become an accepted checkpoint");
+  f.runTimer();
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.sources[1].url.searchParams.has("cursor"), false);
+  ready(f.sources[1], "5");
+  event(f.sources[1], "6", "recovered");
+  assert.deepEqual(eventLabels(f), ["recovered"]);
+  assert.equal(f.timers.size, 0, "quiet admitted streams have no idle deadline");
+});
+
+test("repeated native errors cannot postpone recovery past the original ready deadline", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  const first = startReady(f, "9007199254740993");
+  event(first, "9007199254740994", "before");
+  first.emit("error");
+  const deadline = f.timers.values().next().value;
+  for (let i = 0; i < 20; i += 1) { first.emit("open"); first.emit("error"); }
+  assert.equal(f.timers.size, 1);
+  assert.equal(f.timers.values().next().value, deadline);
+  assert.deepEqual(f.delays, [25, 25], "transport errors never renew the handshake budget");
+  f.runTimer();
+  assert.equal(first.closeCalls, 1);
+  f.runTimer();
+  const second = f.sources[1];
+  assert.equal(second.url.searchParams.get("cursor"), cursor("9007199254740994"));
+  ready(first, "9007199254740994");
+  event(first, "9007199254740995", "late");
+  ready(second, "9007199254740994");
+  event(second, "9007199254740995", "after");
+  assert.deepEqual(eventLabels(f), ["before", "after"]);
+});
+
+test("accepted ready and stop fence already queued watchdog callbacks on the same source", () => {
+  const f = fixture({ readyTimeoutMs: 25 });
+  f.feed.start();
+  const first = f.sources[0];
+  const initialDeadline = f.timers.values().next().value;
+  ready(first, "3");
+  initialDeadline();
+  assert.equal(first.closeCalls, 0);
+  assert.equal(f.timers.size, 0);
+  first.emit("error");
+  const retryDeadline = f.timers.values().next().value;
+  initialDeadline();
+  assert.equal(f.timers.values().next().value, retryDeadline);
+  ready(first, "3");
+  retryDeadline();
+  assert.equal(first.closeCalls, 0);
+  assert.equal(f.timers.size, 0);
+  first.emit("error");
+  const stoppedDeadline = f.timers.values().next().value;
+  f.feed.stop();
+  stoppedDeadline();
+  assert.equal(f.timers.size, 0);
+  assert.equal(first.closeCalls, 1);
+  f.feed.start();
+  stoppedDeadline();
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.sources[1].closeCalls, 0);
+  assert.equal(f.timers.size, 1, "only the new generation's handshake remains");
+  f.feed.stop();
+});
+
+test("readiness deadlines reject invalid bounds before opening a stream", () => {
+  for (const readyTimeoutMs of [0, -1, 0.5, 60_001, Infinity, NaN]) {
+    assert.throws(() => fixture({ readyTimeoutMs }), /invalid stream readiness deadline/);
+  }
 });
 
 test("closed-source replacement resumes with the complete accepted epoch and i64 token", () => {
@@ -226,16 +308,17 @@ test("duplicate and older page checkpoints do not rewind the accepted prefix", (
   assert.equal(f.frames.filter((frame) => JSON.parse(frame).kind === "checkpoint").length, 1);
 });
 
-test("native transient reconnect retains one source and creates no replacement timer", () => {
+test("native transient reconnect retains one source within a bounded ready grace period", () => {
   const f = fixture();
   startReady(f);
   event(f.sources[0], "71");
   f.sources[0].emit("error");
   assert.equal(f.sources.length, 1);
-  assert.equal(f.timers.size, 0);
+  assert.equal(f.timers.size, 1, "the native retry has a readiness deadline, not a replacement owner");
   assert.equal(f.sources[0].closeCalls, 0);
   assert.equal(f.states.at(-1), 1);
   ready(f.sources[0], "71");
+  assert.equal(f.timers.size, 0);
   event(f.sources[0], "72");
   assert.equal(eventLabels(f).length, 2);
 });
@@ -331,7 +414,8 @@ test("failed reconnects back off to a cap instead of resetting on TCP open or re
     closed(current);
     f.runTimer();
   }
-  assert.deepEqual(f.delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+  assert.deepEqual(f.delays, [10000, 1000, 10000, 2000, 10000, 4000, 10000, 8000,
+    10000, 16000, 10000, 30000, 10000, 30000, 10000]);
   ready(f.sources.at(-1));
   event(f.sources.at(-1), "50");
   closed(f.sources.at(-1));
@@ -343,7 +427,7 @@ test("stop cancels retries and stale queued timer callbacks cannot revive an old
   startReady(f);
   event(f.sources[0], "81");
   closed(f.sources[0]);
-  const lateTimer = f.allCallbacks[0];
+  const lateTimer = f.allCallbacks.at(-1);
   f.feed.stop();
   assert.equal(f.timers.size, 0);
   lateTimer();
@@ -893,7 +977,8 @@ test("body size exactly at the cap remains readable", async () => {
 test("integrated stream and refresh owners retain live data and its acknowledged reconnect cursor", async () => {
   const f = refreshFixture();
   const sources = [];
-  const retryCallbacks = [];
+  const callbacks = new Map();
+  let nextTimer = 0;
   class Source {
     static CLOSED = 2;
     constructor(url) { this.url = new URL(url); this.listeners = new Map(); sources.push(this); }
@@ -903,8 +988,8 @@ test("integrated stream and refresh owners retain live data and its acknowledged
   }
   const stream = createFleetStream(f.snapshots, {
     apiRoot: new URL("https://example.test/ft/"), EventSourceImpl: Source,
-    setTimer(callback) { retryCallbacks.push(callback); return retryCallbacks.length; },
-    clearTimer() {}, onResync: f.snapshots.refresh,
+    setTimer(callback) { const id = ++nextTimer; callbacks.set(id, callback); return id; },
+    clearTimer(id) { callbacks.delete(id); }, onResync: f.snapshots.refresh,
   });
   stream.start();
   const pending = f.snapshots.refresh();
@@ -921,8 +1006,10 @@ test("integrated stream and refresh owners retain live data and its acknowledged
   assert.deepEqual(f.viewer.events.map((row) => row.id), [2, 1]);
   assert.match(f.viewer.lastError, /event_replay_storage_error/);
   assert.equal(f.viewer.state, 0);
-  assert.equal(retryCallbacks.length, 1);
-  retryCallbacks[0]();
+  assert.equal(callbacks.size, 1);
+  const [timer, retry] = callbacks.entries().next().value;
+  callbacks.delete(timer);
+  retry();
   assert.equal(sources[1].url.searchParams.get("cursor"), cursor("2"));
   stream.stop();
   f.snapshots.stop();

@@ -66,14 +66,39 @@ export function createFleetStream(viewer, {
   setTimer = globalThis.setTimeout,
   clearTimer = globalThis.clearTimeout,
   onResync = () => {},
+  readyTimeoutMs = 10_000,
 } = {}) {
+  if (!Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 60_000) {
+    throw new Error("invalid stream readiness deadline");
+  }
   let source = null;
   let retryTimer = null;
+  let readyTimer = null;
+  let readyGeneration = 0;
   let retryMs = 1_000;
   let cursor = null;
   let terminalError = null;
   let stopped = true;
   let generation = 0;
+
+  function clearReadyDeadline() {
+    readyGeneration += 1;
+    if (readyTimer !== null) clearTimer(readyTimer);
+    readyTimer = null;
+  }
+
+  function awaitReady(current) {
+    // Native EventSource retries are allowed a finite grace period. Repeated
+    // errors or TCP opens cannot renew it without an admitted ready frame.
+    // SSE keepalives are comments, so this is never an idle-stream timeout.
+    if (readyTimer !== null) return;
+    const expected = ++readyGeneration;
+    readyTimer = setTimer(() => {
+      if (!current() || readyGeneration !== expected) return;
+      readyTimer = null;
+      reconnect("stream: ready checkpoint timed out; reconnecting");
+    }, readyTimeoutMs);
+  }
 
   function resync() {
     const expectedGeneration = generation;
@@ -90,6 +115,7 @@ export function createFleetStream(viewer, {
 
   function retire() {
     generation += 1;
+    clearReadyDeadline();
     if (retryTimer !== null) clearTimer(retryTimer);
     retryTimer = null;
     const previous = source;
@@ -144,6 +170,7 @@ export function createFleetStream(viewer, {
     source = candidate;
     let ready = false;
     const current = () => !stopped && source === candidate;
+    awaitReady(current);
     const onFrame = (message) => {
       if (!current()) return;
       let frame;
@@ -221,6 +248,7 @@ export function createFleetStream(viewer, {
       if (message.type === "ready") {
         if (cursor === null) cursor = nextCursor;
         ready = true;
+        clearReadyDeadline();
       } else if (nextCursor !== null) {
         cursor = nextCursor;
         // A TCP open/ready followed by a replay failure is not recovery.
@@ -257,6 +285,7 @@ export function createFleetStream(viewer, {
       } else {
         ready = false;
         viewer.setStreamState(STREAM.CONNECTING);
+        awaitReady(current);
       }
     });
   }
