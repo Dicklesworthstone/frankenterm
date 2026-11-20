@@ -713,20 +713,40 @@ pub struct WebGpuState {
 /// the layer's window-size drawables (ft-34at5).
 const PARKED_EXTENT: (u32, u32) = (1, 1);
 
-const EVERY_BACKEND: [wgpu::Backends; 1] = [wgpu::Backends::all()];
-const DIRECT3D_12_FIRST: [wgpu::Backends; 2] = [wgpu::Backends::DX12, wgpu::Backends::all()];
+/// One adapter search: the backends to look in, and whether a software
+/// adapter is refused so that the next attempt can still find a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackendAttempt {
+    backends: wgpu::Backends,
+    hardware_only: bool,
+}
 
-/// The backend sets WebGpu tries, in order. Windows starts with Direct3D 12:
-/// it presents through DXGI, which the compositor owns, and DXGI ranks a
-/// hybrid laptop's discrete GPU first. Among adapters of one type wgpu
-/// ranks Vulkan ahead of Direct3D 12, and on SurfaceBookJE the Intel UHD 620
-/// Vulkan driver (30.0.101.1339) crashed the GUI with an access violation
-/// right after adapter selection, while the same GPU renders on Direct3D 12.
-/// Every backend stays as the fallback when no Direct3D 12 adapter can
-/// drive the window. A configured `webgpu_preferred_adapter` is looked up
-/// among every backend, so an explicit choice (Vulkan, say) still holds.
-fn backend_attempts(preferred_adapter: bool) -> &'static [wgpu::Backends] {
-    if cfg!(windows) && !preferred_adapter {
+const EVERY_BACKEND: [BackendAttempt; 1] = [BackendAttempt {
+    backends: wgpu::Backends::all(),
+    hardware_only: false,
+}];
+const DIRECT3D_12_FIRST: [BackendAttempt; 2] = [
+    BackendAttempt {
+        backends: wgpu::Backends::DX12,
+        hardware_only: true,
+    },
+    EVERY_BACKEND[0],
+];
+
+/// The adapter searches WebGpu makes, in order. Windows starts with
+/// Direct3D 12, its native API. Among adapters of one type wgpu ranks Vulkan
+/// ahead of Direct3D 12, and on SurfaceBookJE the Intel UHD 620 Vulkan driver
+/// (30.0.101.1339) crashed the GUI with an access violation right after
+/// adapter selection, while the same GPU renders on Direct3D 12.
+///
+/// The Direct3D 12 search refuses the software adapter (WARP): wgpu's
+/// Direct3D 12 backend lists it, and skips some GPUs (Haswell) entirely, so
+/// on such a machine the search across every backend must still run and
+/// find the GPU there. A configured `webgpu_preferred_adapter` is looked up
+/// among every backend, so an explicit choice (Vulkan, say) still holds, and
+/// `webgpu_force_fallback_adapter` asks for software rendering on purpose.
+fn backend_attempts(preferred_adapter: bool, force_fallback: bool) -> &'static [BackendAttempt] {
+    if cfg!(windows) && !preferred_adapter && !force_fallback {
         &DIRECT3D_12_FIRST
     } else {
         &EVERY_BACKEND
@@ -1324,12 +1344,19 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let attempts = backend_attempts(config.webgpu_preferred_adapter.is_some());
-        for (index, backends) in attempts.iter().copied().enumerate() {
-            match Self::new_with_backends(handle, dimensions, config, backends).await {
+        let attempts = backend_attempts(
+            config.webgpu_preferred_adapter.is_some(),
+            config.webgpu_force_fallback_adapter,
+        );
+        for (index, attempt) in attempts.iter().copied().enumerate() {
+            match Self::new_with_backends(handle, dimensions, config, attempt).await {
                 Ok(state) => return Ok(state),
                 Err(err) if index + 1 < attempts.len() => {
-                    log::warn!("webgpu on {backends:?} unavailable: {err:#}; trying every backend");
+                    log::warn!(
+                        "webgpu on {:?} unavailable: {err:#}; trying {:?}",
+                        attempt.backends,
+                        attempts[index + 1].backends
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -1341,8 +1368,9 @@ impl WebGpuState {
         handle: RawHandlePair,
         dimensions: Dimensions,
         config: &ConfigHandle,
-        backends: wgpu::Backends,
+        attempt: BackendAttempt,
     ) -> anyhow::Result<Self> {
+        let backends = attempt.backends;
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends;
         let instance = wgpu::Instance::new(descriptor);
@@ -1438,6 +1466,12 @@ impl WebGpuState {
 
         let adapter_info = adapter.get_info();
         log::trace!("Using adapter: {adapter_info:?}");
+        if attempt.hardware_only && adapter_info.device_type == wgpu::DeviceType::Cpu {
+            return Err(anyhow!(
+                "{backends:?} offers only the software adapter {}",
+                adapter_info.name
+            ));
+        }
         let pipeline_cache_probe = build_webgpu_pipeline_cache_probe(&adapter_info, 0);
         let sparse_atlas_probe = build_sparse_atlas_startup_probe(
             &adapter_info,
@@ -2049,17 +2083,31 @@ impl WebGpuState {
 
 #[cfg(test)]
 mod backend_attempt_tests {
-    use super::backend_attempts;
+    use super::{BackendAttempt, backend_attempts};
+
+    const EVERY: BackendAttempt = BackendAttempt {
+        backends: wgpu::Backends::all(),
+        hardware_only: false,
+    };
 
     #[test]
     fn windows_tries_direct3d_12_before_every_backend() {
         for preferred in [false, true] {
-            let attempts = backend_attempts(preferred);
-            assert_eq!(attempts.last(), Some(&wgpu::Backends::all()));
-            if cfg!(windows) && !preferred {
-                assert_eq!(attempts, [wgpu::Backends::DX12, wgpu::Backends::all()]);
-            } else {
-                assert_eq!(attempts, [wgpu::Backends::all()]);
+            for force_fallback in [false, true] {
+                let attempts = backend_attempts(preferred, force_fallback);
+                // The last search always takes any adapter on any backend.
+                assert_eq!(attempts.last(), Some(&EVERY));
+                if cfg!(windows) && !preferred && !force_fallback {
+                    // Direct3D 12 first, refusing WARP so a GPU that only
+                    // another backend lists is still found.
+                    let direct3d_12 = BackendAttempt {
+                        backends: wgpu::Backends::DX12,
+                        hardware_only: true,
+                    };
+                    assert_eq!(attempts, [direct3d_12, EVERY]);
+                } else {
+                    assert_eq!(attempts, [EVERY]);
+                }
             }
         }
     }
