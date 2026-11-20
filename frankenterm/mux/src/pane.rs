@@ -860,7 +860,9 @@ pub trait GuardianLiveCheckpointPublisher: Send + Sync {
 /// without the terminal mutex. Every field describes the terminal at `seqno`;
 /// a reader may see at most the publication before the batch being applied,
 /// so paint that also reads rows must accept one batch of skew (or compare
-/// `seqno` with its row snapshot).
+/// `seqno` with its row snapshot). A read that installs a new line layout
+/// advances the terminal's sequence without publishing;
+/// [`Pane::coherent_render_facts`] republishes when the terminal is free.
 #[derive(Clone, Debug)]
 pub struct PaneRenderFacts {
     /// Terminal sequence number at capture.

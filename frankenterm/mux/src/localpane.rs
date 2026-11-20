@@ -2307,9 +2307,21 @@ impl Pane for LocalPane {
     fn coherent_render_facts(&self) -> Option<Arc<crate::pane::PaneRenderFacts>> {
         // A tmux control pane delegates its visible source. Its native
         // terminal publication must not be presented as that other source.
-        let tmux = self.tmux_domain.try_lock()?;
-        if tmux.is_some() {
+        // The guard is released before publishing, which takes the terminal
+        // first and the tmux binding after it (the DCS parser's lock order).
+        if self.tmux_domain.try_lock()?.is_some() {
             return None;
+        }
+        // A read that installs a new line layout, or a layout refresh,
+        // advances the terminal's sequence without output, and on an idle
+        // pane nothing publishes after it. Republish while the terminal is
+        // free, so these facts carry the sequence a fenced read of the same
+        // pane reports; a phone that checks one against the other otherwise
+        // never draws the pane (ft-jh8jen). A busy terminal is not waited
+        // for: the facts may then lag by that one change, and a later read
+        // that finds the terminal free brings them up to date.
+        if let Some(mut terminal) = self.terminal.try_lock() {
+            self.render_facts.publish(&mut terminal);
         }
         Some(self.render_facts.load())
     }
@@ -12749,6 +12761,66 @@ mod tests {
             pane.selection_source_snapshot(),
             Some((floor, sequence, dimensions))
         );
+    }
+
+    /// The first read of spilled rows installs the pane's line layout, which
+    /// advances the terminal's sequence without output, and an idle pane
+    /// publishes nothing after it. The coherent facts a fenced reader checks
+    /// must still carry the sequence that read reports: a phone that compares
+    /// the two otherwise never draws the pane (ft-jh8jen).
+    #[test]
+    fn coherent_render_facts_carry_the_sequence_a_layout_installing_read_leaves() {
+        let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission.store(true, Ordering::Relaxed);
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "layout-installing-read",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\n");
+        let pane = LocalPane::new(
+            722,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x82; 16],
+            "layout-installing-read".to_string(),
+        );
+        let first = *sink.rows.lock().1.first_key_value().unwrap().0;
+        let read = pane
+            .capture_line_read(first..first + 1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(pane
+            .terminal
+            .lock()
+            .screen()
+            .line_read_changes_layout(&read));
+        let published = pane.render_facts().seqno;
+        assert_eq!(published, pane.get_current_seqno());
+
+        assert!(pane
+            .publish_line_reads(std::slice::from_ref(&read), &mut || {})
+            .unwrap());
+        let installed = pane.get_current_seqno();
+        assert!(installed > published, "the install advanced the sequence");
+        assert_eq!(
+            pane.render_facts().seqno,
+            published,
+            "and nothing published it"
+        );
+        let coherent = pane.coherent_render_facts().unwrap();
+        assert_eq!(coherent.seqno, installed);
+        assert!(Arc::ptr_eq(&pane.render_facts(), &coherent));
     }
 
     #[test]
