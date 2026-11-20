@@ -117,20 +117,10 @@ pub fn load_manifest(profiles_dir: &Path) -> crate::Result<Option<ConfigProfileM
 
 pub fn write_manifest(profiles_dir: &Path, manifest: &ConfigProfileManifest) -> crate::Result<()> {
     let path = profiles_dir.join("manifest.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            crate::error::ConfigError::ReadFailed(parent.display().to_string(), e.to_string())
-        })?;
-    }
-
     let content = serde_json::to_string_pretty(manifest)
         .map_err(|e| crate::error::ConfigError::SerializeFailed(e.to_string()))?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, content).map_err(|e| {
-        crate::error::ConfigError::ReadFailed(tmp_path.display().to_string(), e.to_string())
-    })?;
-    std::fs::rename(&tmp_path, &path).map_err(|e| {
+    crate::lock::write_file_atomic(&path, content.as_bytes()).map_err(|e| {
         crate::error::ConfigError::ReadFailed(path.display().to_string(), e.to_string())
     })?;
 

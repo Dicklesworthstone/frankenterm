@@ -929,6 +929,822 @@ fn write_lock_sidecar_atomically(
     Ok(())
 }
 
+/// Maximum admitted size of a single capability-safe atomic file write by default (16 MiB).
+pub const DEFAULT_ATOMIC_WRITE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const ATOMIC_WRITE_CREATE_ATTEMPTS: usize = 64;
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Policy controlling capability-safe atomic persistence via
+/// [`write_file_atomic_with_policy`] (ft-interactive-systems-performance-4tenz.59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicWritePolicy {
+    /// Hard upper bound on accepted payload size in bytes.
+    pub max_bytes: usize,
+    /// Create missing parent directories before pinning the parent `CapDir`.
+    pub create_parent: bool,
+    /// Refuse to overwrite an already-existing regular target file.
+    pub require_absent: bool,
+    /// Unix file mode applied to newly created temp files when no prior target
+    /// permissions exist (ignored on non-Unix platforms).
+    pub unix_mode: u32,
+}
+
+impl Default for AtomicWritePolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_ATOMIC_WRITE_MAX_BYTES,
+            create_parent: true,
+            require_absent: false,
+            unix_mode: 0o600,
+        }
+    }
+}
+
+impl AtomicWritePolicy {
+    /// Override the maximum payload size bound in bytes.
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Control whether missing parent directories are created automatically.
+    #[must_use]
+    pub const fn with_create_parent(mut self, create_parent: bool) -> Self {
+        self.create_parent = create_parent;
+        self
+    }
+
+    /// Require that the destination file does not yet exist.
+    #[must_use]
+    pub const fn with_require_absent(mut self, require_absent: bool) -> Self {
+        self.require_absent = require_absent;
+        self
+    }
+
+    /// Set the Unix permission mode used for newly created files.
+    #[must_use]
+    pub const fn with_unix_mode(mut self, unix_mode: u32) -> Self {
+        self.unix_mode = unix_mode;
+        self
+    }
+}
+
+/// Content-free receipt returned after a durable capability-safe atomic write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicWriteReceipt {
+    /// Exact number of bytes written and synchronized to disk.
+    pub bytes_written: usize,
+    /// Whether an existing regular target file was atomically replaced.
+    pub replaced_existing: bool,
+    /// Whether the parent directory entry was synchronized after rename.
+    pub dir_synced: bool,
+}
+
+/// Typed, content-free error returned by [`write_file_atomic`] and
+/// [`write_file_atomic_with_policy`]. Deliberately excludes raw file contents
+/// and ambient path strings from error diagnostics.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum AtomicWriteError {
+    /// Target path did not identify a valid single leaf inside a parent directory.
+    #[error("atomic write rejected invalid target path ({reason})")]
+    InvalidPath { reason: &'static str },
+    /// Payload exceeded the configured hard byte ceiling.
+    #[error("atomic write payload size {bytes} exceeds limit {max_bytes}")]
+    Oversized { bytes: usize, max_bytes: usize },
+    /// A symlink was encountered at the parent or destination leaf.
+    #[error("atomic write refused symlink at {phase}")]
+    SymlinkTarget { phase: &'static str },
+    /// Destination leaf exists and is not a regular file (e.g. directory, FIFO, socket).
+    #[error("atomic write refused non-regular target at {phase}")]
+    NotRegularTarget { phase: &'static str },
+    /// Destination already exists while `require_absent` was requested.
+    #[error("atomic write refused existing target under require_absent policy")]
+    AlreadyExists,
+    /// Destination identity changed between initial admission and pre-rename verification.
+    #[error("atomic write aborted: target was concurrently replaced before rename")]
+    ConcurrentReplacement,
+    /// Exhausted unique create-new temp filename attempts in the target directory.
+    #[error("atomic write exhausted unique temporary file creation attempts")]
+    TempCreateExhausted,
+    /// Pre-rename I/O failure; destination file was NOT replaced.
+    #[error("atomic write failed at {phase} ({kind})")]
+    Io {
+        phase: &'static str,
+        kind: &'static str,
+    },
+    /// Rename succeeded (or was attempted) and a subsequent durability/verification
+    /// step failed; the published destination state is indeterminate and must not
+    /// be treated as cleanly rolled back.
+    #[error("atomic write outcome indeterminate after rename at {phase} ({kind})")]
+    IndeterminateAfterRename {
+        phase: &'static str,
+        kind: &'static str,
+    },
+}
+
+/// Fault-injection hook points for deterministic crash/ENOSPC/race testing.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteFaultPoint {
+    BeforeOpenTemp,
+    BeforeWrite,
+    BeforeFileSync,
+    BeforePreRenameCheck,
+    BeforeRename,
+    BeforeDirSync,
+    AfterRenameBeforeVerify,
+}
+
+fn atomic_io_kind_label(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::StorageFull => "storage_full",
+        io::ErrorKind::InvalidInput => "invalid_input",
+        io::ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+        io::ErrorKind::NotADirectory => "not_a_directory",
+        io::ErrorKind::IsADirectory => "is_a_directory",
+        io::ErrorKind::CrossesDevices => "crosses_devices",
+        io::ErrorKind::Interrupted => "interrupted",
+        _ => "io_error",
+    }
+}
+
+fn split_atomic_target_path(path: &Path) -> Result<(&Path, &OsStr), AtomicWriteError> {
+    if path.as_os_str().is_empty() {
+        return Err(AtomicWriteError::InvalidPath {
+            reason: "empty_path",
+        });
+    }
+    let name = path
+        .file_name()
+        .ok_or(AtomicWriteError::InvalidPath {
+            reason: "missing_file_name",
+        })?;
+    if name == OsStr::new(".") || name == OsStr::new("..") {
+        return Err(AtomicWriteError::InvalidPath {
+            reason: "dot_component",
+        });
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    Ok((parent, name))
+}
+
+/// Atomically persist `bytes` to `path` using [`AtomicWritePolicy::default`]:
+/// no-follow leaf/parent admission, unique create-new same-directory temporary
+/// file, `sync_all` on file, pre-rename target identity revalidation, atomic
+/// `rename`, and parent directory `sync_all`.
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<AtomicWriteReceipt, AtomicWriteError> {
+    write_file_atomic_with_policy(path, bytes, AtomicWritePolicy::default())
+}
+
+/// Atomically persist `bytes` to `path` under an explicit [`AtomicWritePolicy`].
+pub fn write_file_atomic_with_policy(
+    path: &Path,
+    bytes: &[u8],
+    policy: AtomicWritePolicy,
+) -> Result<AtomicWriteReceipt, AtomicWriteError> {
+    #[cfg(test)]
+    {
+        write_file_atomic_impl(path, bytes, policy, |_| Ok(()))
+    }
+    #[cfg(not(test))]
+    {
+        write_file_atomic_impl(path, bytes, policy)
+    }
+}
+
+#[cfg(test)]
+fn write_file_atomic_impl<F>(
+    path: &Path,
+    bytes: &[u8],
+    policy: AtomicWritePolicy,
+    mut fault: F,
+) -> Result<AtomicWriteReceipt, AtomicWriteError>
+where
+    F: FnMut(AtomicWriteFaultPoint) -> io::Result<()>,
+{
+    write_file_atomic_core(path, bytes, policy, &mut fault)
+}
+
+#[cfg(not(test))]
+fn write_file_atomic_impl(
+    path: &Path,
+    bytes: &[u8],
+    policy: AtomicWritePolicy,
+) -> Result<AtomicWriteReceipt, AtomicWriteError> {
+    write_file_atomic_core(path, bytes, policy)
+}
+
+fn write_file_atomic_core(
+    path: &Path,
+    bytes: &[u8],
+    policy: AtomicWritePolicy,
+    #[cfg(test)] fault: &mut impl FnMut(AtomicWriteFaultPoint) -> io::Result<()>,
+) -> Result<AtomicWriteReceipt, AtomicWriteError> {
+    if bytes.len() > policy.max_bytes {
+        return Err(AtomicWriteError::Oversized {
+            bytes: bytes.len(),
+            max_bytes: policy.max_bytes,
+        });
+    }
+    let (parent, name) = split_atomic_target_path(path)?;
+
+    match fs::symlink_metadata(parent) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(AtomicWriteError::SymlinkTarget { phase: "parent" });
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(AtomicWriteError::NotRegularTarget { phase: "parent" });
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound && policy.create_parent => {
+            fs::create_dir_all(parent).map_err(|err| AtomicWriteError::Io {
+                phase: "create_parent",
+                kind: atomic_io_kind_label(&err),
+            })?;
+            let created_meta =
+                fs::symlink_metadata(parent).map_err(|err| AtomicWriteError::Io {
+                    phase: "verify_parent",
+                    kind: atomic_io_kind_label(&err),
+                })?;
+            if created_meta.file_type().is_symlink() {
+                return Err(AtomicWriteError::SymlinkTarget { phase: "parent" });
+            }
+            if !created_meta.is_dir() {
+                return Err(AtomicWriteError::NotRegularTarget { phase: "parent" });
+            }
+        }
+        Err(err) => {
+            return Err(AtomicWriteError::Io {
+                phase: "parent_stat",
+                kind: atomic_io_kind_label(&err),
+            });
+        }
+    }
+
+    let directory =
+        CapDir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(|err| {
+            AtomicWriteError::Io {
+                phase: "parent_open",
+                kind: atomic_io_kind_label(&err),
+            }
+        })?;
+
+    let existing_before = match directory.symlink_metadata(name) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(AtomicWriteError::SymlinkTarget {
+                    phase: "target_before",
+                });
+            }
+            if !meta.is_file() {
+                return Err(AtomicWriteError::NotRegularTarget {
+                    phase: "target_before",
+                });
+            }
+            if policy.require_absent {
+                return Err(AtomicWriteError::AlreadyExists);
+            }
+            Some(meta)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(AtomicWriteError::Io {
+                phase: "target_before",
+                kind: atomic_io_kind_label(&err),
+            });
+        }
+    };
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforeOpenTemp) {
+        return Err(AtomicWriteError::Io {
+            phase: "open_temp",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    let mut opened_temp: Option<(String, cap_std::fs::File)> = None;
+    for _ in 0..ATOMIC_WRITE_CREATE_ATTEMPTS {
+        let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let epoch_nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let temp_name = format!(
+            ".frankenterm-atomic-{}-{epoch_nanos}-{nonce}.tmp",
+            std::process::id()
+        );
+        let mut options = CapOpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            let mode = existing_before
+                .as_ref()
+                .map_or(policy.unix_mode, |m| {
+                    CapPlatformMetadataExt::mode(m) & 0o777
+                });
+            CapOpenOptionsPlatformExt::mode(&mut options, mode);
+        }
+        match directory.open_with(&temp_name, &options) {
+            Ok(file) => {
+                opened_temp = Some((temp_name, file));
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(AtomicWriteError::Io {
+                    phase: "open_temp",
+                    kind: atomic_io_kind_label(&err),
+                });
+            }
+        }
+    }
+
+    let (temp_name, mut temp_file) = opened_temp.ok_or(AtomicWriteError::TempCreateExhausted)?;
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforeWrite) {
+        return Err(AtomicWriteError::Io {
+            phase: "write_temp",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+    if let Err(err) = temp_file.write_all(bytes) {
+        return Err(AtomicWriteError::Io {
+            phase: "write_temp",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforeFileSync) {
+        return Err(AtomicWriteError::Io {
+            phase: "sync_temp",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+    if let Err(err) = temp_file.sync_all() {
+        return Err(AtomicWriteError::Io {
+            phase: "sync_temp",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    let temp_std_file = temp_file.into_std();
+    let temp_handle_meta = CapMetadata::from_file(&temp_std_file).map_err(|err| {
+        AtomicWriteError::Io {
+            phase: "temp_stat",
+            kind: atomic_io_kind_label(&err),
+        }
+    })?;
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforePreRenameCheck) {
+        return Err(AtomicWriteError::Io {
+            phase: "pre_rename_check",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    // Revalidate target leaf immediately before rename so a concurrent symlink
+    // swap or inode replacement is rejected instead of silently clobbered.
+    match (existing_before.as_ref(), directory.symlink_metadata(name)) {
+        (None, Err(err)) if err.kind() == io::ErrorKind::NotFound => {}
+        (None, Ok(meta)) => {
+            if meta.file_type().is_symlink() {
+                return Err(AtomicWriteError::SymlinkTarget {
+                    phase: "target_pre_rename",
+                });
+            }
+            if !meta.is_file() {
+                return Err(AtomicWriteError::NotRegularTarget {
+                    phase: "target_pre_rename",
+                });
+            }
+            if policy.require_absent {
+                return Err(AtomicWriteError::AlreadyExists);
+            }
+            return Err(AtomicWriteError::ConcurrentReplacement);
+        }
+        (Some(_), Err(err)) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(AtomicWriteError::ConcurrentReplacement);
+        }
+        (Some(before), Ok(current)) => {
+            if current.file_type().is_symlink() {
+                return Err(AtomicWriteError::SymlinkTarget {
+                    phase: "target_pre_rename",
+                });
+            }
+            if !current.is_file() {
+                return Err(AtomicWriteError::NotRegularTarget {
+                    phase: "target_pre_rename",
+                });
+            }
+            if require_same_metadata_identity(before, &current, "atomic_write_pre_rename").is_err()
+            {
+                return Err(AtomicWriteError::ConcurrentReplacement);
+            }
+        }
+        (_, Err(err)) => {
+            return Err(AtomicWriteError::Io {
+                phase: "target_pre_rename",
+                kind: atomic_io_kind_label(&err),
+            });
+        }
+    }
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforeRename) {
+        return Err(AtomicWriteError::Io {
+            phase: "rename",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    // Drop the open handle before rename on Windows so rename cannot fail with
+    // sharing violations; keep `temp_handle_meta` for post-rename identity check.
+    #[cfg(windows)]
+    drop(temp_std_file);
+
+    directory
+        .rename(&temp_name, &directory, name)
+        .map_err(|err| AtomicWriteError::Io {
+            phase: "rename",
+            kind: atomic_io_kind_label(&err),
+        })?;
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::BeforeDirSync) {
+        return Err(AtomicWriteError::IndeterminateAfterRename {
+            phase: "dir_sync",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    let dir_synced = {
+        #[cfg(unix)]
+        {
+            directory
+                .open(".")
+                .and_then(|dir_file| dir_file.sync_all())
+                .map_err(|err| AtomicWriteError::IndeterminateAfterRename {
+                    phase: "dir_sync",
+                    kind: atomic_io_kind_label(&err),
+                })?;
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    };
+
+    #[cfg(test)]
+    if let Err(err) = fault(AtomicWriteFaultPoint::AfterRenameBeforeVerify) {
+        return Err(AtomicWriteError::IndeterminateAfterRename {
+            phase: "post_rename_verify",
+            kind: atomic_io_kind_label(&err),
+        });
+    }
+
+    let published_meta = directory.symlink_metadata(name).map_err(|err| {
+        AtomicWriteError::IndeterminateAfterRename {
+            phase: "post_rename_verify",
+            kind: atomic_io_kind_label(&err),
+        }
+    })?;
+    if published_meta.file_type().is_symlink() || !published_meta.is_file() {
+        return Err(AtomicWriteError::IndeterminateAfterRename {
+            phase: "post_rename_verify",
+            kind: "target_replaced_after_rename",
+        });
+    }
+    if require_same_metadata_identity(&temp_handle_meta, &published_meta, "atomic_write_post_rename")
+        .is_err()
+    {
+        return Err(AtomicWriteError::IndeterminateAfterRename {
+            phase: "post_rename_verify",
+            kind: "target_replaced_after_rename",
+        });
+    }
+
+    #[cfg(not(windows))]
+    drop(temp_std_file);
+
+    Ok(AtomicWriteReceipt {
+        bytes_written: bytes.len(),
+        replaced_existing: existing_before.is_some(),
+        dir_synced,
+    })
+}
+
+/// Maximum admitted size of a single capability-safe bounded file read by default (16 MiB).
+pub const DEFAULT_BOUNDED_READ_MAX_BYTES: usize = 16 * 1024 * 1024;
+const BOUNDED_READ_INITIAL_RESERVE_CAP: usize = 64 * 1024;
+
+/// Typed, content-free error returned by [`read_file_bounded`],
+/// [`read_file_to_string_bounded`], and their `Cx`-aware async counterparts
+/// (ft-interactive-systems-performance-4tenz.60).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum BoundedReadError {
+    /// Path did not identify a valid single leaf inside a parent directory.
+    #[error("bounded read rejected invalid path ({reason})")]
+    InvalidPath { reason: &'static str },
+    /// Target file or parent directory does not exist.
+    #[error("bounded read target not found ({phase})")]
+    NotFound { phase: &'static str },
+    /// A symlink was encountered at the parent or leaf.
+    #[error("bounded read refused symlink at {phase}")]
+    SymlinkTarget { phase: &'static str },
+    /// Target is not a regular file (e.g. FIFO, device, socket, directory).
+    #[error("bounded read refused non-regular target at {phase}")]
+    NotRegularTarget { phase: &'static str },
+    /// File exceeded the hard byte limit either at metadata check or while streaming.
+    #[error("bounded read size {observed_bytes} exceeds limit {max_bytes}")]
+    Oversized {
+        observed_bytes: u64,
+        max_bytes: usize,
+    },
+    /// File was replaced or modified concurrently while being read.
+    #[error("bounded read aborted: target changed during read")]
+    ChangedDuringRead,
+    /// Bytes were read cleanly but were not valid UTF-8.
+    #[error("bounded read bytes are not valid UTF-8")]
+    InvalidUtf8,
+    /// Caller `Cx` was cancelled before the bounded read settled.
+    #[error("bounded read cancelled")]
+    Cancelled,
+    /// Content-free I/O failure.
+    #[error("bounded read failed at {phase} ({kind})")]
+    Io {
+        phase: &'static str,
+        kind: &'static str,
+    },
+}
+
+/// Capability-safe, no-follow, streaming-capped regular-file read.
+///
+/// Rejects symlinks (parent and leaf), non-regular files (FIFOs, devices,
+/// sockets, directories), files exceeding `max_bytes` (checked before opening
+/// and enforced via `Read::take(max_bytes + 1)` while streaming so growing
+/// files cannot cause unbounded allocation), and concurrent replacements
+/// detected between open and post-read metadata verification.
+pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
+    #[cfg(test)]
+    {
+        read_file_bounded_impl(path, max_bytes, || {})
+    }
+    #[cfg(not(test))]
+    {
+        read_file_bounded_impl(path, max_bytes)
+    }
+}
+
+#[cfg(test)]
+fn read_file_bounded_impl(
+    path: &Path,
+    max_bytes: usize,
+    after_open: impl FnOnce(),
+) -> Result<Vec<u8>, BoundedReadError> {
+    read_file_bounded_core(path, max_bytes, after_open)
+}
+
+#[cfg(not(test))]
+fn read_file_bounded_impl(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
+    read_file_bounded_core(path, max_bytes)
+}
+
+fn read_file_bounded_core(
+    path: &Path,
+    max_bytes: usize,
+    #[cfg(test)] after_open: impl FnOnce(),
+) -> Result<Vec<u8>, BoundedReadError> {
+    let (parent, name) = split_atomic_target_path(path).map_err(|err| match err {
+        AtomicWriteError::InvalidPath { reason } => BoundedReadError::InvalidPath { reason },
+        _ => BoundedReadError::InvalidPath {
+            reason: "invalid_target",
+        },
+    })?;
+
+    match fs::symlink_metadata(parent) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(BoundedReadError::SymlinkTarget { phase: "parent" });
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(BoundedReadError::NotRegularTarget { phase: "parent" });
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(BoundedReadError::NotFound { phase: "parent" });
+        }
+        Err(err) => {
+            return Err(BoundedReadError::Io {
+                phase: "parent_stat",
+                kind: atomic_io_kind_label(&err),
+            });
+        }
+    }
+
+    let directory =
+        CapDir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                BoundedReadError::NotFound {
+                    phase: "parent_open",
+                }
+            } else {
+                BoundedReadError::Io {
+                    phase: "parent_open",
+                    kind: atomic_io_kind_label(&err),
+                }
+            }
+        })?;
+
+    // Check symlink_metadata BEFORE open so FIFOs, sockets, devices, directories,
+    // and symlinks fail immediately without blocking in `open()`.
+    let named_before = directory.symlink_metadata(name).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::NotFound {
+                phase: "target_before",
+            }
+        } else {
+            BoundedReadError::Io {
+                phase: "target_before",
+                kind: atomic_io_kind_label(&err),
+            }
+        }
+    })?;
+    if named_before.file_type().is_symlink() {
+        return Err(BoundedReadError::SymlinkTarget {
+            phase: "target_before",
+        });
+    }
+    if !named_before.is_file() {
+        return Err(BoundedReadError::NotRegularTarget {
+            phase: "target_before",
+        });
+    }
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if named_before.len() > max_bytes_u64 {
+        return Err(BoundedReadError::Oversized {
+            observed_bytes: named_before.len(),
+            max_bytes,
+        });
+    }
+
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let cap_file = directory.open_with(name, &options).map_err(|err| {
+        if let Ok(current) = directory.symlink_metadata(name) {
+            if current.file_type().is_symlink() {
+                return BoundedReadError::SymlinkTarget { phase: "open" };
+            }
+            if !current.is_file() {
+                return BoundedReadError::NotRegularTarget { phase: "open" };
+            }
+        }
+        if err.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::NotFound { phase: "open" }
+        } else {
+            BoundedReadError::Io {
+                phase: "open",
+                kind: atomic_io_kind_label(&err),
+            }
+        }
+    })?;
+
+    let handle_before = cap_file.metadata().map_err(|err| BoundedReadError::Io {
+        phase: "handle_before",
+        kind: atomic_io_kind_label(&err),
+    })?;
+    if handle_before.file_type().is_symlink() {
+        return Err(BoundedReadError::SymlinkTarget {
+            phase: "handle_before",
+        });
+    }
+    if !handle_before.is_file() {
+        return Err(BoundedReadError::NotRegularTarget {
+            phase: "handle_before",
+        });
+    }
+    if handle_before.len() > max_bytes_u64 {
+        return Err(BoundedReadError::Oversized {
+            observed_bytes: handle_before.len(),
+            max_bytes,
+        });
+    }
+    if require_same_metadata_identity(&named_before, &handle_before, "bounded_read_open").is_err() {
+        return Err(BoundedReadError::ChangedDuringRead);
+    }
+
+    #[cfg(test)]
+    after_open();
+
+    let mut file = cap_file.into_std();
+    let initial_cap = usize::try_from(handle_before.len())
+        .unwrap_or(BOUNDED_READ_INITIAL_RESERVE_CAP)
+        .min(max_bytes)
+        .min(BOUNDED_READ_INITIAL_RESERVE_CAP);
+    let mut raw = Vec::with_capacity(initial_cap);
+    let read_limit = max_bytes_u64.saturating_add(1);
+    file.by_ref()
+        .take(read_limit)
+        .read_to_end(&mut raw)
+        .map_err(|err| BoundedReadError::Io {
+            phase: "read",
+            kind: atomic_io_kind_label(&err),
+        })?;
+    if raw.len() > max_bytes {
+        return Err(BoundedReadError::Oversized {
+            observed_bytes: u64::try_from(raw.len()).unwrap_or(u64::MAX),
+            max_bytes,
+        });
+    }
+
+    let handle_after = CapMetadata::from_file(&file).map_err(|err| BoundedReadError::Io {
+        phase: "handle_after",
+        kind: atomic_io_kind_label(&err),
+    })?;
+    let named_after = directory.symlink_metadata(name).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::ChangedDuringRead
+        } else {
+            BoundedReadError::Io {
+                phase: "target_after",
+                kind: atomic_io_kind_label(&err),
+            }
+        }
+    })?;
+    if named_after.file_type().is_symlink() || !named_after.is_file() {
+        return Err(BoundedReadError::ChangedDuringRead);
+    }
+    if require_same_metadata_identity(&handle_after, &named_after, "bounded_read_after").is_err()
+        || require_same_metadata_observation(&handle_before, &handle_after, "bounded_read_after")
+            .is_err()
+        || require_same_metadata_observation(&handle_after, &named_after, "bounded_read_after")
+            .is_err()
+    {
+        return Err(BoundedReadError::ChangedDuringRead);
+    }
+
+    Ok(raw)
+}
+
+/// Capability-safe bounded UTF-8 file read, separating UTF-8 validation errors
+/// from I/O, policy, and downstream parser errors.
+pub fn read_file_to_string_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<String, BoundedReadError> {
+    let bytes = read_file_bounded(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| BoundedReadError::InvalidUtf8)
+}
+
+/// `Cx`-aware offloaded variant of [`read_file_bounded`] that keeps blocking
+/// filesystem I/O off the async executor thread.
+///
+/// Cancellation contract: if `cx` is already cancelled, no filesystem call is
+/// started; if `cx` cancels after offload begins, the call returns
+/// [`BoundedReadError::Cancelled`] without claiming that the underlying OS
+/// blocking read syscall was forcibly interrupted.
+pub async fn read_file_bounded_with_cx(
+    cx: &crate::cx::Cx,
+    path: PathBuf,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if cx.checkpoint().is_err() {
+        return Err(BoundedReadError::Cancelled);
+    }
+    let result = crate::runtime_async::spawn_blocking(move || read_file_bounded(&path, max_bytes))
+        .await
+        .map_err(|_| BoundedReadError::Io {
+            phase: "offload",
+            kind: "join_error",
+        })?;
+    if cx.checkpoint().is_err() {
+        return Err(BoundedReadError::Cancelled);
+    }
+    result
+}
+
+/// `Cx`-aware offloaded variant of [`read_file_to_string_bounded`].
+pub async fn read_file_to_string_bounded_with_cx(
+    cx: &crate::cx::Cx,
+    path: PathBuf,
+    max_bytes: usize,
+) -> Result<String, BoundedReadError> {
+    let bytes = read_file_bounded_with_cx(cx, path, max_bytes).await?;
+    String::from_utf8(bytes).map_err(|_| BoundedReadError::InvalidUtf8)
+}
+
 /// Errors that can occur during lock operations.
 #[derive(Error, Debug)]
 pub enum LockError {
@@ -3256,6 +4072,311 @@ mod metadata_admission_tests {
             let meta = read_lock_metadata(&path);
             proptest::prop_assert!(meta.is_err());
             proptest::prop_assert_eq!(lock_metadata_admission_failure_count(), 1);
+        }
+    }
+
+    mod atomic_write_tests {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        #[test]
+        fn exact_limit_succeeds_and_one_over_limit_fails_without_touching_target() {
+            let tmp = TempDir::new().unwrap();
+            let target = tmp.path().join("ft.toml");
+            let policy = AtomicWritePolicy::default().with_max_bytes(16);
+
+            let receipt = write_file_atomic_with_policy(&target, b"0123456789abcdef", policy)
+                .expect("exact max_bytes succeeds");
+            assert_eq!(receipt.bytes_written, 16);
+            assert!(!receipt.replaced_existing);
+            assert_eq!(fs::read(&target).unwrap(), b"0123456789abcdef");
+
+            let err = write_file_atomic_with_policy(&target, b"0123456789abcdefX", policy)
+                .expect_err("max_bytes + 1 must fail");
+            assert_eq!(
+                err,
+                AtomicWriteError::Oversized {
+                    bytes: 17,
+                    max_bytes: 16,
+                }
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"0123456789abcdef");
+        }
+
+        #[test]
+        fn refuses_directory_and_require_absent_conflicts() {
+            let tmp = TempDir::new().unwrap();
+            let dir_target = tmp.path().join("subdir");
+            fs::create_dir(&dir_target).unwrap();
+            assert_eq!(
+                write_file_atomic(&dir_target, b"data"),
+                Err(AtomicWriteError::NotRegularTarget {
+                    phase: "target_before",
+                })
+            );
+
+            let file_target = tmp.path().join("once.toml");
+            let absent_policy = AtomicWritePolicy::default().with_require_absent(true);
+            write_file_atomic_with_policy(&file_target, b"first", absent_policy).unwrap();
+            assert_eq!(
+                write_file_atomic_with_policy(&file_target, b"second", absent_policy),
+                Err(AtomicWriteError::AlreadyExists)
+            );
+            assert_eq!(fs::read(&file_target).unwrap(), b"first");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn refuses_symlink_target_and_symlink_parent() {
+            use std::os::unix::fs::symlink;
+
+            let tmp = TempDir::new().unwrap();
+            let victim = tmp.path().join("victim.toml");
+            fs::write(&victim, b"untouched").unwrap();
+            let link_target = tmp.path().join("link.toml");
+            symlink(&victim, &link_target).unwrap();
+
+            assert_eq!(
+                write_file_atomic(&link_target, b"overwrite"),
+                Err(AtomicWriteError::SymlinkTarget {
+                    phase: "target_before",
+                })
+            );
+            assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
+            let real_dir = tmp.path().join("real_dir");
+            fs::create_dir(&real_dir).unwrap();
+            let link_dir = tmp.path().join("link_dir");
+            symlink(&real_dir, &link_dir).unwrap();
+            assert_eq!(
+                write_file_atomic(&link_dir.join("cfg.toml"), b"payload"),
+                Err(AtomicWriteError::SymlinkTarget { phase: "parent" })
+            );
+            assert!(!real_dir.join("cfg.toml").exists());
+        }
+
+        #[test]
+        fn injected_faults_at_every_phase_preserve_target_and_classify_indeterminate() {
+            let tmp = TempDir::new().unwrap();
+            let target = tmp.path().join("config.toml");
+            write_file_atomic(&target, b"original-authoritative").unwrap();
+
+            for (fault_point, expected_phase) in [
+                (AtomicWriteFaultPoint::BeforeOpenTemp, "open_temp"),
+                (AtomicWriteFaultPoint::BeforeWrite, "write_temp"),
+                (AtomicWriteFaultPoint::BeforeFileSync, "sync_temp"),
+                (AtomicWriteFaultPoint::BeforePreRenameCheck, "pre_rename_check"),
+                (AtomicWriteFaultPoint::BeforeRename, "rename"),
+            ] {
+                let err = write_file_atomic_impl(
+                    &target,
+                    b"corrupted-partial",
+                    AtomicWritePolicy::default(),
+                    |point| {
+                        if point == fault_point {
+                            Err(io::Error::from(io::ErrorKind::StorageFull))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .expect_err("injected pre-rename fault must fail");
+                assert_eq!(
+                    err,
+                    AtomicWriteError::Io {
+                        phase: expected_phase,
+                        kind: "storage_full",
+                    }
+                );
+                assert_eq!(
+                    fs::read(&target).unwrap(),
+                    b"original-authoritative",
+                    "pre-rename fault at {expected_phase} must not perturb live target"
+                );
+            }
+
+            // Post-rename dir_sync failure must report IndeterminateAfterRename.
+            let err = write_file_atomic_impl(
+                &target,
+                b"published-after-rename",
+                AtomicWritePolicy::default(),
+                |point| {
+                    if point == AtomicWriteFaultPoint::BeforeDirSync {
+                        Err(io::Error::from(io::ErrorKind::StorageFull))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("dir_sync failure after rename must report indeterminate");
+            assert_eq!(
+                err,
+                AtomicWriteError::IndeterminateAfterRename {
+                    phase: "dir_sync",
+                    kind: "storage_full",
+                }
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"published-after-rename");
+        }
+
+        #[test]
+        fn concurrent_target_replacement_before_rename_aborts_without_clobbering() {
+            let tmp = TempDir::new().unwrap();
+            let target = tmp.path().join("raced.toml");
+            write_file_atomic(&target, b"v1").unwrap();
+
+            let raced_target = target.clone();
+            let err = write_file_atomic_impl(
+                &target,
+                b"stale-writer",
+                AtomicWritePolicy::default(),
+                |point| {
+                    if point == AtomicWriteFaultPoint::BeforePreRenameCheck {
+                        // A concurrent writer atomically replaces `target` with a new inode.
+                        let fresh = raced_target.with_file_name("replacement.tmp");
+                        fs::write(&fresh, b"v2-concurrent-winner").unwrap();
+                        fs::rename(&fresh, &raced_target).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("replacement race must abort");
+            assert_eq!(err, AtomicWriteError::ConcurrentReplacement);
+            assert_eq!(fs::read(&target).unwrap(), b"v2-concurrent-winner");
+        }
+
+        #[test]
+        fn concurrent_writers_never_expose_torn_content() {
+            let tmp = TempDir::new().unwrap();
+            let target = Arc::new(tmp.path().join("shared.toml"));
+            write_file_atomic(&target, b"init").unwrap();
+
+            let barrier = Arc::new(Barrier::new(4));
+            let mut handles = Vec::new();
+            for tid in 0..4usize {
+                let target = Arc::clone(&target);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let payload = format!("writer-{tid}:{}", "x".repeat(4096));
+                    barrier.wait();
+                    for _ in 0..16 {
+                        match write_file_atomic(&target, payload.as_bytes()) {
+                            Ok(_) | Err(AtomicWriteError::ConcurrentReplacement) => {}
+                            Err(AtomicWriteError::IndeterminateAfterRename {
+                                kind: "target_replaced_after_rename",
+                                ..
+                            }) => {}
+                            Err(other) => panic!("unexpected atomic write error: {other:?}"),
+                        }
+                        let observed = fs::read_to_string(&*target).unwrap();
+                        assert!(
+                            observed == "init"
+                                || (observed.starts_with("writer-")
+                                    && observed.ends_with(&"x".repeat(4096))),
+                            "observed torn content of len {}",
+                            observed.len()
+                        );
+                    }
+                }));
+            }
+        #[test]
+        fn bounded_read_enforces_exact_cap_empty_utf8_and_growth_race() {
+            let tmp = TempDir::new().unwrap();
+            let exact = tmp.path().join("exact.txt");
+            fs::write(&exact, b"0123456789abcdef").unwrap();
+            assert_eq!(
+                read_file_to_string_bounded(&exact, 16).unwrap(),
+                "0123456789abcdef"
+            );
+            assert_eq!(
+                read_file_bounded(&exact, 15),
+                Err(BoundedReadError::Oversized {
+                    observed_bytes: 16,
+                    max_bytes: 15,
+                })
+            );
+
+            let empty = tmp.path().join("empty.txt");
+            fs::write(&empty, b"").unwrap();
+            assert_eq!(read_file_to_string_bounded(&empty, 16).unwrap(), "");
+
+            let bad_utf8 = tmp.path().join("bad.bin");
+            fs::write(&bad_utf8, [0xffu8, 0xfe, 0xfd]).unwrap();
+            assert_eq!(
+                read_file_to_string_bounded(&bad_utf8, 16),
+                Err(BoundedReadError::InvalidUtf8)
+            );
+            assert_eq!(read_file_bounded(&bad_utf8, 16).unwrap(), vec![0xff, 0xfe, 0xfd]);
+
+            // File grows past cap after initial metadata admission: streaming
+            // take(max_bytes + 1) must catch it without unbounded allocation.
+            let growing = tmp.path().join("growing.txt");
+            fs::write(&growing, b"short").unwrap();
+            let growing_clone = growing.clone();
+            let err = read_file_bounded_impl(&growing, 8, move || {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&growing_clone)
+                    .unwrap();
+                f.write_all(b"-now-too-long").unwrap();
+            })
+            .expect_err("file growth past cap must fail");
+            assert_eq!(
+                err,
+                BoundedReadError::Oversized {
+                    observed_bytes: 9,
+                    max_bytes: 8,
+                }
+            );
+
+            // Replacement race during read must return ChangedDuringRead.
+            let replaced = tmp.path().join("replaced.txt");
+            fs::write(&replaced, b"v1").unwrap();
+            let replaced_clone = replaced.clone();
+            let err = read_file_bounded_impl(&replaced, 16, move || {
+                let fresh = replaced_clone.with_file_name("fresh.tmp");
+                fs::write(&fresh, b"v2").unwrap();
+                fs::rename(&fresh, &replaced_clone).unwrap();
+            })
+            .expect_err("replacement during read must fail");
+            assert_eq!(err, BoundedReadError::ChangedDuringRead);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn bounded_read_refuses_symlinks_directories_and_sockets() {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path().join("dir");
+            fs::create_dir(&dir).unwrap();
+            assert_eq!(
+                read_file_bounded(&dir, 1024),
+                Err(BoundedReadError::NotRegularTarget {
+                    phase: "target_before",
+                })
+            );
+
+            let real = tmp.path().join("real.txt");
+            fs::write(&real, b"secret").unwrap();
+            let link = tmp.path().join("link.txt");
+            symlink(&real, &link).unwrap();
+            assert_eq!(
+                read_file_bounded(&link, 1024),
+                Err(BoundedReadError::SymlinkTarget {
+                    phase: "target_before",
+                })
+            );
+
+            let sock = tmp.path().join("nonreg.sock");
+            let _listener = UnixListener::bind(&sock).unwrap();
+            assert_eq!(
+                read_file_bounded(&sock, 1024),
+                Err(BoundedReadError::NotRegularTarget {
+                    phase: "target_before",
+                })
+            );
         }
     }
 }
