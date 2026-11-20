@@ -580,8 +580,8 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var panes: [TerminalMuxPane] = []
         public var shown: Int?
         public var visible = false
-        /// A visible companion can keep receiving output while the focused
-        /// view alone uses this connection's optional size permission.
+        /// A visible companion keeps receiving output while the focused view
+        /// alone fits the pane to the phone's grid.
         public var sizeControlEnabled = true
         public var search: Search?
         public var context: Context?
@@ -729,9 +729,12 @@ public final class TerminalMuxControl: @unchecked Sendable {
         state.shellCreation?.outcome = .failed(reason: "The connection is no longer active.", uncertain: false)
     }
 
-    /// Releasing local size control restores an outstanding override while
-    /// keeping the pane subscribed. This changes neither input permission nor
-    /// the exact selected pane, and grants no server-side exclusive lease.
+    /// Releasing local size control stops the view following the phone's
+    /// grid and keeps the pane subscribed. A size this connection already
+    /// gave the pane stays until the pane leaves the screen, and a companion
+    /// gives the phone's size only to a pane too large to draw at its own.
+    /// This changes neither input permission nor the exact selected pane, and
+    /// grants no server-side exclusive lease.
     public func setSizeControlEnabled(_ enabled: Bool) {
         let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
             guard !queriesEnded, state.sizeControlEnabled != enabled else { return (nil, nil, state) }

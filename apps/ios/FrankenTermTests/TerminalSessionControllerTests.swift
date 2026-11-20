@@ -198,9 +198,10 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     /// With `muxCommand`, each machine's route is a mux route; with
     /// `directAfterMux` too, a direct route (`creation`) follows it, as the
-    /// Mac's export orders them.
+    /// Mac's export orders them. `muxCommands` gives a machine its own.
     private func document(identity: SSHPublicIdentity, host: SSHPublicIdentity, port: UInt16, user: String,
                           creation: TerminalSessionCreation = .onSelect, muxCommand: String? = nil,
+                          muxCommands: [String: String] = [:],
                           directAfterMux: Bool = false, machineIDs: [String] = ["alpha", "beta"]) throws -> WorkspaceDocument {
         let theme: [String: Any] = ["id": "theme", "name": "Live", "foreground": "#E6E6E6", "background": "#10223C",
             "accent": "#3B82F6", "ansi": Array(repeating: "#808080", count: 16), "cursor_foreground": "#000000",
@@ -211,6 +212,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let workspace: [String: Any] = [
             "id": "workspace", "name": "Scene", "groups": [["id": "group", "name": "Local", "machine_order": machineIDs]],
             "machines": machineIDs.map { machine -> [String: Any] in
+                let muxCommand = muxCommands[machine] ?? muxCommand
                 let refs = muxCommand != nil && directAfterMux ? ["route-\(machine)-mux", "route-\(machine)"] : ["route-\(machine)"]
                 return ["id": machine, "name": machine.capitalized, "theme_ref": "theme", "route_refs": refs,
                         "preferred_route_ref": refs[0], "auto_connect": false]
@@ -222,7 +224,7 @@ final class TerminalSessionControllerTests: XCTestCase {
                 }
                 var direct = route("route-\(machine)")
                 direct["mode"] = "direct_ssh"; direct["session_creation"] = creation.rawValue
-                guard let muxCommand else { return [direct] }
+                guard let muxCommand = muxCommands[machine] ?? muxCommand else { return [direct] }
                 var mux = route(directAfterMux ? "route-\(machine)-mux" : "route-\(machine)")
                 mux["mode"] = "frankenterm_mux"; mux["attach_policy"] = "existing_only"
                 mux["remote_command"] = muxCommand
@@ -251,8 +253,8 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// the app's View Only default separately.
     private func liveScene(liveness: WorkspaceSSHLiveness = .standard,
                            creation: TerminalSessionCreation = .onSelect,
-                           muxCommand: String? = nil, directAfterMux: Bool = false,
-                           machineIDs: [String] = ["alpha", "beta"],
+                           muxCommand: String? = nil, muxCommands: [String: String] = [:],
+                           directAfterMux: Bool = false, machineIDs: [String] = ["alpha", "beta"],
                            autoConnect: Bool = false, relayPort: UInt16? = nil,
                            initialMuxAccessMode: TerminalMuxAccessMode = .interactive) async throws -> LiveScene {
         let environment = ProcessInfo.processInfo.environment
@@ -268,6 +270,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let identity = try SSHPublicIdentity(blob: key.publicBlob), host = try SSHPublicIdentity(blob: hostBlob)
         let archive = try AirGapArchive(workspace: document(identity: identity, host: host, port: port, user: user,
                                                             creation: creation, muxCommand: muxCommand,
+                                                            muxCommands: muxCommands,
                                                             directAfterMux: directAfterMux, machineIDs: machineIDs),
                                         keys: [key], using: crypto)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scene-" + UUID().uuidString)
@@ -282,7 +285,7 @@ final class TerminalSessionControllerTests: XCTestCase {
                                               sessionCreation: creation)
             let mux = TerminalSessionRoute(id: directAfterMux ? "route-\(id)-mux" : "route-\(id)", credentialIDs: ["key"],
                                            host: "127.0.0.1", port: port, mux: true, sessionCreation: .existingOnly)
-            let routes = muxCommand == nil ? [direct] : directAfterMux ? [mux, direct] : [mux]
+            let routes = (muxCommands[id] ?? muxCommand) == nil ? [direct] : directAfterMux ? [mux, direct] : [mux]
             return SceneMachine(id: id, name: id.capitalized, target: .init(workspaceID: installed.id, revision: installed.revision,
                 machineID: id, machineName: id.capitalized, routes: routes), unavailable: "", theme: nil)
         }
@@ -1590,6 +1593,124 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(scene.displayedMachineIDs, ["alpha"])
         XCTAssertNil(beta.window)
         XCTAssertEqual(second.phase, .live, "closing the split does not close its shell")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    /// An interactive split companion whose desktop pane is too large for the
+    /// phone to draw at its own size (ft-kspql1). Alpha attaches to a two-pane
+    /// mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND), Beta to one whose pane is
+    /// 300 x 120 (TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND). Moving focus between
+    /// the halves neither ends Beta nor resizes its pane back and forth.
+    /// Hiding Beta gives the desktop its size back; shown again without focus,
+    /// Beta takes the phone's size instead of ending.
+    func testIPadSplitCompanionKeepsDrawingAPaneTooLargeForItsOwnSize() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let small = environment["FT_LIVE_MUX_COMMAND"], let large = environment["FT_LIVE_LARGE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND and TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND to reach two disposable muxes")
+        }
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+        let window = try XCTUnwrap(windows.first { $0.isKeyWindow } ?? windows.first)
+        guard window.bounds.width >= 720 else { throw XCTSkip("Run the split workflow on a wide iPad window") }
+        let live = try await liveScene(muxCommands: ["alpha": small, "beta": large]), scene = live.scene
+        let first = try await connect(scene, "alpha"), alpha = try XCTUnwrap(first.terminal)
+        let canvas = WorkspaceCanvasView(scene: scene)
+        canvas.frame = CGRect(x: 0, y: 0, width: window.bounds.width, height: min(500, window.bounds.height))
+        window.addSubview(canvas)
+        defer { canvas.retireNavigation(); canvas.removeFromSuperview() }
+        func show() {
+            canvas.show(scene.displayedMachineIDs.map {
+                WorkspaceCanvasPane(machineID: $0, terminal: scene.sessions[$0]?.terminal)
+            })
+            canvas.setNeedsLayout(); canvas.layoutIfNeeded()
+        }
+        scene.setSplitViewport(width: Double(canvas.bounds.width), isPad: true)
+        show()
+        let second = try await connect(scene, "beta")
+        scene.split(with: "beta")
+        for _ in 0..<400 where scene.openingSplit || second.terminal == nil || scene.navigation.phase != .ready {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"])
+        XCTAssertEqual(scene.selectedMachineID, "beta")
+        let beta = try XCTUnwrap(second.terminal)
+        show()
+
+        // Focused, Beta fits its pane to its half. The pane may still be
+        // moving to that grid when the shell reads its size; read it again
+        // until the two agree, then trap later size changes.
+        let token = UUID().uuidString, base = "\(live.outPath).companion-\(token)"
+        let sizes = base + ".size", winch = base + ".winch", back = base + ".back"
+        let gate = base + ".gate", again = base + ".again"
+        var size = "", grid = ""
+        for attempt in 0..<5 where size.isEmpty || size != grid {
+            if attempt > 0 { try await Task.sleep(for: .milliseconds(200)) }
+            try await type("stty size > \(sizes); echo SIZE-\(attempt)-$((6*7)) >> \(sizes)", into: beta)
+            let text = try await hostFile(sizes, containing: "SIZE-\(attempt)-42")
+            size = text.split(separator: "\n").first.map(String.init) ?? ""
+            grid = beta.renderer.admittedFrame.map { "\($0.rows) \($0.columns)" } ?? ""
+        }
+        XCTAssertEqual(size, grid, "Beta's pane has the grid its half draws")
+        try await type(": > \(winch); trap 'stty size >> \(winch)' WINCH; "
+            + "(while [ ! -f \(gate) ]; do sleep 0.05; done; echo LIVE-B-$((40+2)); "
+            + "while [ ! -f \(again) ]; do sleep 0.05; done; echo AGAIN-B-$((40+2))) & echo ARMED-B-$((40+2))", into: beta)
+        let armed = try await rows(of: beta) { self.shows($0, "ARMED-B-42") }
+        XCTAssertTrue(shows(armed, "ARMED-B-42"), "Beta's shell installed its resize trap and output gates")
+
+        // Focus moves to Alpha: Beta keeps its size and keeps drawing.
+        try await select(scene, "alpha"); show()
+        try await type("touch \(gate)", into: alpha)
+        let companion = try await rows(of: beta) { self.shows($0, "LIVE-B-42") }
+        XCTAssertTrue(shows(companion, "LIVE-B-42"), "the unfocused half draws its pane's new output")
+        XCTAssertEqual(second.phase, .live); XCTAssertFalse(second.paneTooLargeToView)
+        XCTAssertTrue(scene.sessions["beta"] === second, "Beta was neither ended nor replaced")
+        XCTAssertEqual(beta.renderer.admittedFrame.map { "\($0.rows) \($0.columns)" }, grid)
+
+        // And back to Beta: still no resize either way.
+        try await select(scene, "beta"); show()
+        try await type("echo BACK-$((40+2)) > \(back)", into: beta)
+        _ = try await hostFile(back, containing: "BACK-42")
+        XCTAssertEqual(try String(contentsOfFile: winch, encoding: .utf8), "",
+            "moving focus between the halves does not resize Beta's pane")
+
+        // Hidden by a narrow window, Beta gives the desktop its size back.
+        try await select(scene, "alpha")
+        scene.setSplitViewport(width: 400, isPad: true)
+        canvas.frame.size.width = 400; show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha"])
+        let restored = try await hostFile(winch, containing: "120 300")
+        XCTAssertEqual(restored, "120 300\n", "hiding Beta gave the pane its desktop size")
+        XCTAssertEqual(second.phase, .live, "a hidden half keeps its session")
+
+        // Shown again without focus, at a size it cannot draw: it takes the
+        // phone's size rather than ending.
+        scene.setSplitViewport(width: Double(window.bounds.width), isPad: true)
+        canvas.frame.size.width = window.bounds.width; show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"])
+        XCTAssertEqual(scene.selectedMachineID, "alpha")
+        try await type("touch \(again)", into: alpha)
+        let shownAgain = try XCTUnwrap(second.terminal)
+        let redrawn = try await rows(of: shownAgain) { self.shows($0, "AGAIN-B-42") }
+        XCTAssertTrue(shows(redrawn, "AGAIN-B-42"), "the companion draws the pane it could not draw at the desktop's size")
+        XCTAssertEqual(second.phase, .live); XCTAssertFalse(second.paneTooLargeToView)
+        XCTAssertTrue(scene.sessions["beta"] === second)
+        var resized = ""
+        for _ in 0..<200 where resized.split(separator: "\n").count < 2 {
+            try await Task.sleep(for: .milliseconds(50))
+            resized = (try? String(contentsOfFile: winch, encoding: .utf8)) ?? ""
+        }
+        let lines = resized.split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 2, "one restore on hiding and one fit on showing (\(resized))")
+        let taken = lines.last?.split(separator: " ").compactMap { Int($0) } ?? []
+        XCTAssertEqual(taken.count, 2)
+        if taken.count == 2 {
+            XCTAssertLessThanOrEqual(taken[0] * taken[1], TerminalSessionGeometry.maximumShownCells,
+                "the companion gave the pane a size the phone draws")
+        }
+        // The pane outlives this test: leave its shell without the trap.
+        try await select(scene, "beta"); show()
+        try await type("trap - WINCH; echo UNTRAP-$((40+2)) > \(back)", into: shownAgain)
+        _ = try await hostFile(back, containing: "UNTRAP-42")
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }

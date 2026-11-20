@@ -1074,16 +1074,19 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // The phone draws its own size (at most maximumShownCells), and
                 // a size someone else gave the pane while 256 history rows
                 // still fit beside both screens. A pane someone else made
-                // larger is asked back to the phone's size.
+                // larger is asked back to the phone's size: by the focused
+                // view, and by an interactive companion when the phone could
+                // not draw it at all.
                 let own = rows == Int(state.geometry.rows) && columns == Int(state.geometry.columns)
                 guard (1...512).contains(rows), (1...512).contains(columns),
                       rows * columns <= TerminalSessionGeometry.maximumShownCells,
                       !state.control.controlsSize || own || (rows * 2 + 256) * columns <= 65536 else {
-                    guard state.control.controlsSize else {
+                    // A real pane bigger than the phone can be taken at the
+                    // phone's size; a grid no pane can have cannot.
+                    let real = rows > 0 && columns > 0
+                    guard state.control.controlsSize || (real && state.control.accessMode.controlsSize) else {
                         let reason = "This shared pane is too large to view on this phone. Its size was not changed."
-                        // A real pane bigger than the phone can be taken at the
-                        // phone's size; a grid no pane can have cannot.
-                        if rows > 0, columns > 0 { state.control.recordPaneTooLargeToView(reason) }
+                        if real { state.control.recordPaneTooLargeToView(reason) }
                         else { state.control.recordFailure(reason) }
                         throw TerminalMuxError.failed(reason)
                     }
@@ -1180,9 +1183,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         return false
     }
 
-    /// Visibility subscribes to output; focused presentation separately owns
-    /// any permitted phone-size override. A companion keeps drawing at the
-    /// shared size after focus relinquishes that override.
+    /// Visibility subscribes to output; focused presentation fits the pane to
+    /// the phone when this connection may size it. The desktop gets its size
+    /// back when the pane leaves the screen, not when focus moves to the
+    /// other half of a split.
     private func reconcileMux() throws {
         guard let state = mux else { return }
         func switchTo(_ pane: Int) throws {
@@ -1243,23 +1247,34 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         let visible = state.control.current.visible
         guard !visible || state.identifiedPanes.contains(pane) else { return }
-        // Inventory already carries the authenticated shared geometry. Reject
-        // an oversized View Only pane while its mirror is starting: waiting
-        // for render bytes can leave the session live without a usable view.
-        if visible, state.showing, !state.control.controlsSize,
-           let size = state.panes.first(where: { $0.paneId == pane })?.size,
-           size.rows > 0, size.cols > 0,
-           (size.rows > 512 || size.cols > 512
-            || size.rows > TerminalSessionGeometry.maximumShownCells / size.cols) {
+        // Inventory already carries the authenticated shared geometry.
+        let tooLarge = state.panes.first(where: { $0.paneId == pane }).map { listed in
+            let size = listed.size
+            return size.rows > 0 && size.cols > 0
+                && (size.rows > 512 || size.cols > 512 || size.rows > TerminalSessionGeometry.maximumShownCells / size.cols)
+        } ?? false
+        // Reject an oversized pane this connection may not size while its
+        // mirror is starting: waiting for render bytes can leave the session
+        // live without a usable view.
+        if visible, state.showing, !state.control.accessMode.controlsSize, tooLarge {
             let reason = "This shared pane is too large to view on this phone. Its size was not changed."
             state.control.recordPaneTooLargeToView(reason)
             throw TerminalMuxError.failed(reason)
         }
-        let controlsSize = visible && state.control.controlsSize
-        if controlsSize, !state.controllingSize || !state.showing {
+        // Only the focused view fits the pane to the phone's grid. An
+        // interactive connection keeps a size it took for as long as the pane
+        // is on screen, focused or not, so focus moving between split halves
+        // never resizes the pane back and forth. An unfocused companion takes
+        // the phone's size only for a pane too large to draw at its own.
+        let focused = visible && state.control.controlsSize
+        let holdsSize = visible && state.control.accessMode.controlsSize
+        if focused, !state.controllingSize || !state.showing {
             try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
             state.controllingSize = true
-        } else if !controlsSize, state.controllingSize {
+        } else if holdsSize, !state.controllingSize, tooLarge {
+            try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
+            state.controllingSize = true
+        } else if !holdsSize, state.controllingSize {
             try state.client.restoreSize(pane: pane)
             state.controllingSize = false
         }

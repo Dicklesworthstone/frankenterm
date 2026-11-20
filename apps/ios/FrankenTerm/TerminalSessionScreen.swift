@@ -1637,9 +1637,10 @@ final class TerminalSessionController {
         if !focused, target.requiresAuthenticationPrompt, phase == .connecting { requestStop() }
         if observing { unseenShellOutput = false }
         muxObservation?.setActive(visible)
-        // A visible split companion receives output but has no local input,
-        // clipboard or size authority. Existing navigation retires its old
-        // keyboard through the acknowledged source-bound handoff first.
+        // A visible split companion receives output but has no local input or
+        // clipboard, and does not fit the pane to its tile. Existing navigation
+        // retires its old keyboard through the acknowledged source-bound
+        // handoff first.
         connection?.muxControl?.setSizeControlEnabled(focused)
         connection?.muxControl?.setVisible(observing)
         if !focused {

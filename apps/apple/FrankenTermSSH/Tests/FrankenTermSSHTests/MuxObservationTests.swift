@@ -42,7 +42,7 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
 
     init(mode: String) {
         self.mode = mode
-        let dimensions = mode == "oversize" || mode == "input-only-oversize"
+        let dimensions = mode == "oversize" || mode == "input-only-oversize" || mode == "companion-oversize"
             ? (100, 512) : mode == "invalid-grid" ? (-1, 80) : (100, 256)
         panes = (1...2).map { id in
             TerminalMuxPane(paneId: id, tabId: mode == "identity-moved" ? id + 10 : id,
@@ -443,8 +443,11 @@ final class MuxObservationTests: XCTestCase {
             throw XCTSkip("Requires the independent mux observation SSH fixture")
         }
         let controlsSize = mode == "interactive"
+        // An interactive split companion that never had focus.
+        let companion = mode == "companion-oversize"
         let permitsInput = controlsSize || mode == "input-only" || mode == "input-only-oversize" || mode == "input-refused"
-        let accessMode: TerminalMuxAccessMode = controlsSize ? .interactive : (permitsInput ? .inputOnly : .viewOnly)
+        let accessMode: TerminalMuxAccessMode = controlsSize || companion ? .interactive
+            : (permitsInput ? .inputOnly : .viewOnly)
         let client = ObservationMuxClient(mode: mode)
         let fixture = try await SSHWorkspaceTestFixture.make(hostname: "127.0.0.1", port: port,
             hostBlob: host, routeMode: "frankenterm_mux") { workspace in
@@ -469,6 +472,7 @@ final class MuxObservationTests: XCTestCase {
         }
         let control = try XCTUnwrap(owner.muxControl)
         control.setVisible(true)
+        if companion { control.setSizeControlEnabled(false) }
         let coordinator = try TerminalInputCoordinator(), consumer = try ObservationConsumer(identity: owner.identity)
         do {
             if mode == "no-panes" {
@@ -489,7 +493,20 @@ final class MuxObservationTests: XCTestCase {
             let run = Task { try await pump.run(consumer: consumer) }
             let watchdog = Task { try await Task.sleep(for: .seconds(8)); pump.requestStop() }
             defer { watchdog.cancel(); pump.requestStop() }
-            if mode == "oversize" || mode == "input-only-oversize" || mode == "invalid-grid" {
+            if companion {
+                // It cannot draw the pane at its own size, so it gives the
+                // pane the phone's size instead of ending the session.
+                try await waitUntil {
+                    let summary = await consumer.summary()
+                    return summary.geometry.columns == 80 && summary.geometry.rows == 24 && summary.bytes > 0
+                }
+                XCTAssertNil(control.current.failure)
+                XCTAssertFalse(control.current.paneTooLargeToView)
+                XCTAssertEqual(client.geometryEffects.map(\.name), ["resize"],
+                    "an unfocused companion neither adopts an earlier phone size nor restores one")
+                pump.requestStop()
+                _ = try await run.value
+            } else if mode == "oversize" || mode == "input-only-oversize" || mode == "invalid-grid" {
                 _ = try await run.value
                 XCTAssertNotNil(control.current.failure)
                 XCTAssertEqual(control.current.paneTooLargeToView, mode != "invalid-grid",
@@ -557,24 +574,33 @@ final class MuxObservationTests: XCTestCase {
                     let effects = client.geometryEffects.count
                     let shows = client.recorded.filter { $0.name == "show" }.count
                     control.setSizeControlEnabled(false)
-                    try await waitUntil {
-                        let summary = await consumer.summary()
-                        return client.geometryEffects.count == effects + 1 && summary.geometry.columns == 256
-                    }
-                    XCTAssertEqual(client.geometryEffects.last?.name, "restore")
+                    // The service turn that sends this search has seen the
+                    // focus change; its answer arrives on a later turn.
+                    _ = control.search(.init(text: "companion", caseSensitive: false, regex: false), panes: [1])
+                    try await waitUntil { control.current.search?.pending.isEmpty == true }
+                    XCTAssertEqual(client.geometryEffects.count, effects,
+                        "a companion keeps the size it took while the pane is on screen")
+                    let held = await consumer.summary()
+                    XCTAssertEqual(held.geometry.columns, 80); XCTAssertEqual(held.geometry.rows, 24)
                     XCTAssertEqual(client.recorded.filter { $0.name == "show" }.count, shows,
-                        "a companion relinquishes size without resubscribing or losing its output visit")
+                        "a companion keeps its subscription and output visit")
                     XCTAssertTrue(control.current.visible)
                     XCTAssertEqual(control.inputRouting.current.destination, first)
                     try await owner.requestResize(.init(columns: 54, rows: 40))
-                    XCTAssertEqual(client.geometryEffects.count, effects + 1,
+                    XCTAssertEqual(client.geometryEffects.count, effects,
                         "a late viewport cannot resize the unfocused companion")
                     control.setVisible(false)
-                    try await waitUntil { client.recorded.contains(.init(name: "hide", pane: 1)) }
+                    try await waitUntil {
+                        client.recorded.contains(.init(name: "hide", pane: 1)) && client.geometryEffects.count == effects + 1
+                    }
+                    XCTAssertEqual(client.geometryEffects.last?.name, "restore", "a hidden pane gets its own size back")
                     control.setVisible(true)
-                    try await waitUntil { client.recorded.filter { $0.name == "show" }.count == shows + 1 }
+                    try await waitUntil {
+                        let summary = await consumer.summary()
+                        return client.recorded.filter { $0.name == "show" }.count == shows + 1 && summary.geometry.columns == 256
+                    }
                     XCTAssertEqual(client.geometryEffects.count, effects + 1,
-                        "a narrow window restoring its companion does not reacquire size")
+                        "a companion shown again does not take a size back from a pane it can draw")
                     control.setSizeControlEnabled(true)
                     try await waitUntil { client.geometryEffects.count == effects + 2 }
                     XCTAssertEqual(client.geometryEffects.last?.name, "resize")
@@ -601,7 +627,7 @@ final class MuxObservationTests: XCTestCase {
                 try await waitUntil { control.current.shown == 2 && control.inputRouting.current.ready }
                 _ = control.search(.init(text: "read only search", caseSensitive: false, regex: false), panes: [1, 2])
                 try await waitUntil { control.current.search?.pending.isEmpty == true }
-                XCTAssertEqual(client.recorded.filter { $0.name == "search" }.map(\.pane), [1, 2])
+                XCTAssertEqual(client.recorded.filter { $0.name == "search" }.map(\.pane), controlsSize ? [1, 1, 2] : [1, 2])
                 if !controlsSize {
                     XCTAssertTrue(client.geometryEffects.isEmpty, "Input permission cannot resize, adopt or restore a shared pane")
                     let summary = await consumer.summary()
@@ -630,6 +656,9 @@ final class MuxObservationTests: XCTestCase {
                 XCTAssertTrue(client.effects.contains { $0.name == "adopt" })
                 XCTAssertTrue(client.effects.contains { $0.name == "resize" })
                 XCTAssertTrue(client.effects.contains { $0.name == "restore" })
+            } else if companion {
+                XCTAssertEqual(client.effects.map(\.name), ["resize", "restore"],
+                    "closing gives back the size the companion gave, and nothing was typed")
             } else {
                 XCTAssertTrue(client.geometryEffects.isEmpty, "Closing cannot restore someone else's size")
             }
@@ -637,7 +666,9 @@ final class MuxObservationTests: XCTestCase {
                 XCTAssertTrue(client.effects.contains { $0.name == "write" })
                 XCTAssertEqual(client.effects.contains { $0.name == "click" }, mode != "input-refused")
                 XCTAssertEqual(client.effects.contains { $0.name == "wheel" }, mode != "input-refused")
-            } else { XCTAssertTrue(client.effects.isEmpty, "An observer or unsupported grid cannot cause input or geometry effects") }
+            } else if !companion {
+                XCTAssertTrue(client.effects.isEmpty, "An observer or unsupported grid cannot cause input or geometry effects")
+            }
             let accounting = await coordinator.accounting()
             XCTAssertEqual(accounting.connections, 0); XCTAssertEqual(accounting.streams, 0)
             let offline = try activity.beginOfflineRestore()
