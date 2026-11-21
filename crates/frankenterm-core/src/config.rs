@@ -668,14 +668,33 @@ impl KittyGraphicsConfig {
 // Search Config
 // =============================================================================
 
+/// Default retrieval mode for search requests that do not specify one.
+///
+/// `fts5` selects the same lexical lane as `lexical`. Keeping this distinction
+/// in the config parser leaves the CLI and MCP query contracts limited to
+/// their advertised `lexical`, `semantic`, and `hybrid` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredSearchMode {
+    /// Retrieve exact terms through SQLite FTS5.
+    #[default]
+    #[serde(rename = "fts5", alias = "lexical")]
+    Lexical,
+    /// Retrieve similar captured output through the embedding lane.
+    Semantic,
+    /// Fuse lexical and embedding results.
+    Hybrid,
+}
+
 /// Configuration for 2-tier semantic search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
     /// Enable semantic search features.
     pub enabled: bool,
-    /// Search mode: "fts5", "lexical", "semantic", "hybrid", "two-tier".
-    pub mode: String,
+    /// Default query mode: "lexical" (or "fts5"), "semantic", or "hybrid".
+    /// An explicit CLI or MCP mode overrides this setting.
+    pub mode: ConfiguredSearchMode,
     /// Directory for downloaded model files.
     pub models_dir: String,
     /// RRF fusion K parameter.
@@ -700,7 +719,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            mode: "fts5".into(),
+            mode: ConfiguredSearchMode::Lexical,
             models_dir: "~/.ft/models".into(),
             rrf_k: 60,
             quality_weight: 0.7,
@@ -739,12 +758,6 @@ impl SearchConfig {
 
     fn validate_key_wiring(&self) -> Result<(), String> {
         let defaults = Self::default();
-        if self.mode != defaults.mode {
-            return Err(parsed_but_unconsumed_config_key_message(
-                "search.mode",
-                "Config carries SearchConfig::mode, but production search dispatch reads the concrete tuning fields (rrf_k, quality_weight, quality_timeout_ms, fast_only, fusion_backend) and never consults mode",
-            ));
-        }
         // ft-vyg9y: search.reranker_enabled has no production reranking consumer.
         // Its only reader, `advertised_embedder_tiers`, just appends a
         // "cross-encoder" string to the status-tier list. No production search
@@ -755,7 +768,7 @@ impl SearchConfig {
         // whose `rerank` returns candidates unchanged). Toggling it on therefore
         // reranks nothing. Fail closed so the operator gets a clear error instead
         // of a silent no-op (and a false sense that results are being reranked),
-        // mirroring the search.mode / search.daemon honesty gates. Wiring a real
+        // mirroring the search.daemon honesty gates. Wiring a real
         // cross-encoder (ONNX runtime) is a separate feature; until it lands, leave
         // this at its default.
         if self.reranker_enabled != defaults.reranker_enabled {
@@ -814,11 +827,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "search.mode",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
-        tracking_bead: "ft-7h5da.5.7",
-        validation: "Config::validate rejects non-default values as parsed but no-effect",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::query_contract::SearchQueryDefaults::from_search_config",
+        evidence: "human CLI, robot search, and wa.search use the configured retrieval mode when the request omits mode; explicit request modes take precedence",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "typed config accepts lexical/fts5, semantic, and hybrid; unknown or unsupported modes fail deserialization",
     },
     ConfigKeyWiringRecord {
         key: "search.daemon.enabled",
@@ -1091,7 +1104,7 @@ impl SearchDaemonConfig {
     /// exercised only by tests; the frankensearch batch path uses its own
     /// independently-defaulted batch config.
     ///
-    /// Mirroring the `search.mode` honesty gate (ft-7h5da.5.7), reject any
+    /// Mirroring the `search.reranker_enabled` honesty gate, reject any
     /// non-default value for these dead keys so a malformed or operator-supplied
     /// config fails closed instead of being silently ignored. Wiring an actual
     /// daemon service (UDS bind, auto-spawn, scan loop) is a separate feature;
@@ -7052,24 +7065,24 @@ quality_weight = 1.5
     }
 
     #[test]
-    fn config_validate_rejects_non_default_dead_search_mode() {
-        let err = Config::from_toml(
-            r#"
-[search]
-mode = "semantic"
-"#,
-        )
-        .err()
-        .map_or_else(String::new, |err| err.to_string());
+    fn config_accepts_supported_search_modes_and_rejects_unknown_modes() {
+        for (value, expected) in [
+            ("fts5", ConfiguredSearchMode::Lexical),
+            ("lexical", ConfiguredSearchMode::Lexical),
+            ("semantic", ConfiguredSearchMode::Semantic),
+            ("hybrid", ConfiguredSearchMode::Hybrid),
+        ] {
+            let config = Config::from_toml(&format!("[search]\nmode = {value:?}\n"))
+                .expect("implemented search mode must validate");
+            assert_eq!(config.search.mode, expected);
+        }
 
-        assert!(
-            err.contains("search.mode"),
-            "dead-key diagnostic must name search.mode, got: {err}",
-        );
-        assert!(
-            err.contains("parsed but has no effect"),
-            "dead-key diagnostic must explain no-effect config, got: {err}",
-        );
+        for value in ["", "sematic", "two-tier", "HYBRID"] {
+            let err = Config::from_toml(&format!("[search]\nmode = {value:?}\n"))
+                .expect_err("unknown search modes must not silently become lexical")
+                .to_string();
+            assert!(err.contains("mode"), "mode diagnostic missing: {err}");
+        }
     }
 
     #[test]
@@ -7092,7 +7105,7 @@ models_dir = "/tmp/ft-jl09u-operator-models"
     }
 
     #[test]
-    fn config_key_wiring_inventory_records_models_dir_and_dead_mode() {
+    fn config_key_wiring_inventory_records_models_dir_and_consumed_mode() {
         assert_eq!(CONFIG_KEY_WIRING_STATUS_SCHEMA_VERSION, 1);
 
         let models_dir = config_key_wiring_inventory()
@@ -7121,10 +7134,10 @@ models_dir = "/tmp/ft-jl09u-operator-models"
         let Some(mode) = mode else {
             return;
         };
-        assert_eq!(mode.status, ConfigKeyWiringStatus::ParsedButUnconsumed);
+        assert_eq!(mode.status, ConfigKeyWiringStatus::Consumed);
         assert_eq!(
-            mode.validation,
-            "Config::validate rejects non-default values as parsed but no-effect"
+            mode.consumer,
+            "crate::query_contract::SearchQueryDefaults::from_search_config"
         );
     }
 

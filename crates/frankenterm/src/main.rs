@@ -688,9 +688,9 @@ SEE ALSO:
         #[arg(long, short = 'u')]
         until: Option<i64>,
 
-        /// Search mode: lexical, semantic, or hybrid
-        #[arg(long, value_enum, default_value = "lexical")]
-        mode: SearchModeArg,
+        /// Search mode; defaults to search.mode in configuration (lexical)
+        #[arg(long, value_enum)]
+        mode: Option<SearchModeArg>,
 
         /// Return query completion suggestions instead of running the search
         #[arg(long)]
@@ -4266,9 +4266,9 @@ enum RobotCommands {
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         snippets: Option<bool>,
 
-        /// Search mode: lexical, semantic, or hybrid
-        #[arg(long, value_enum, default_value = "lexical")]
-        mode: SearchModeArg,
+        /// Search mode; defaults to search.mode in configuration (lexical)
+        #[arg(long, value_enum)]
+        mode: Option<SearchModeArg>,
     },
 
     /// Explain why search results may be missing or incomplete
@@ -53376,10 +53376,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         since,
                                         until,
                                         snippets,
-                                        mode: Some(mode.into()),
+                                        mode: mode.map(Into::into),
                                         explain: None,
                                     },
-                                    frankenterm_core::query_contract::SearchQueryDefaults::default(
+                                    frankenterm_core::query_contract::SearchQueryDefaults::from_search_config(
+                                        &config.search,
                                     ),
                                 ) {
                                     Ok(parsed) => parsed,
@@ -59005,6 +59006,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 targets,
                                                 prepare_context,
                                             )
+                                            .with_policy_storage(&storage)
                                             .with_storage_adapter(tx_storage);
                                         execute_tx_run_with_executor(
                                             executor,
@@ -59259,6 +59261,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 targets,
                                                 prepare_context,
                                             )
+                                            .with_policy_storage(&storage)
                                             .with_storage_adapter(tx_storage);
                                         execute_tx_rollback_with_executor(
                                             executor,
@@ -62543,10 +62546,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             since,
                             until,
                             snippets: Some(true),
-                            mode: Some(mode.into()),
+                            mode: mode.map(Into::into),
                             explain: None,
                         },
-                        frankenterm_core::query_contract::SearchQueryDefaults::default(),
+                        frankenterm_core::query_contract::SearchQueryDefaults::from_search_config(
+                            &config.search,
+                        ),
                     ) {
                         Ok(parsed) => parsed,
                         Err(err) => {
@@ -66192,6 +66197,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         targets,
                         prepare_context,
                     )
+                    .with_policy_storage(&storage)
                     .with_storage_adapter(tx_storage);
                     execute_tx_run_with_executor(
                         SteeringReceiptRevalidatingExecutor::new(
@@ -81867,6 +81873,7 @@ async fn handle_tx_command(
                     targets,
                     prepare_context,
                 )
+                .with_policy_storage(&storage)
                 .with_storage_adapter(tx_storage);
                 execute_tx_run_with_executor(
                     executor,
@@ -82078,6 +82085,7 @@ async fn handle_tx_command(
                     targets,
                     prepare_context,
                 )
+                .with_policy_storage(&storage)
                 .with_storage_adapter(tx_storage);
                 execute_tx_rollback_with_executor(
                     executor,
@@ -139354,7 +139362,7 @@ printf x > "$MINISIGN_MARKER"
                 assert_eq!(zone.as_deref(), Some("output"));
                 assert_eq!(since, Some(100));
                 assert_eq!(until, Some(200));
-                assert_eq!(mode, SearchModeArg::Hybrid);
+                assert_eq!(mode, Some(SearchModeArg::Hybrid));
             }
             _ => panic!("expected Search command"),
         }
@@ -139392,7 +139400,7 @@ printf x > "$MINISIGN_MARKER"
                     assert_eq!(zone.as_deref(), Some("input"));
                     assert_eq!(until, Some(200));
                     assert_eq!(snippets, Some(false));
-                    assert_eq!(mode, SearchModeArg::Semantic);
+                    assert_eq!(mode, Some(SearchModeArg::Semantic));
                 }
                 _ => panic!("expected RobotCommands::Search"),
             },
@@ -144305,7 +144313,7 @@ A  docs/new-proof.md\n";
                 }) => {
                     assert_eq!(query, "error");
                     assert_eq!(limit, 3);
-                    assert_eq!(mode, SearchModeArg::Hybrid);
+                    assert_eq!(mode, Some(SearchModeArg::Hybrid));
                 }
                 _ => panic!("expected RobotCommands::Search"),
             },

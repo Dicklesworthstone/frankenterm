@@ -2860,6 +2860,44 @@ impl TxStorageAdapter for FileTxStorageAdapter {
 
 // ── Pane Step Executor ──────────────────────────────────────────────────────
 
+/// Persisted policy authority for the interval between prepare and each effect.
+/// A transaction may wait for minutes after prepare; its startup policy engine
+/// cannot authorize a later send after another process has acknowledged a stop.
+struct TxPolicyStorage {
+    db_path: String,
+    freshness: Mutex<crate::policy_kill_switch_state::KillSwitchFreshness>,
+}
+
+enum TxStepAdmissionError {
+    Unbound,
+    Cancelled,
+    State(crate::policy_kill_switch_state::KillSwitchStateError),
+    Stopped(crate::policy_quarantine::KillSwitchLevel),
+}
+
+impl TxStepAdmissionError {
+    fn into_outcome(self) -> StepDispatchOutcome<(bool, String, Option<String>)> {
+        let (reason, code) = match self {
+            Self::Unbound => (
+                "tx_policy_storage_unbound",
+                "FTX_POLICY_STORAGE_UNBOUND".to_string(),
+            ),
+            Self::Cancelled => ("tx_step_cancelled", "FTX_STEP_CANCELLED".to_string()),
+            Self::State(error) => (
+                "tx_kill_switch_unavailable",
+                format!("FTX_KILL_SWITCH_UNAVAILABLE: {}", error.code()),
+            ),
+            Self::Stopped(level) => (
+                "tx_kill_switch_active",
+                format!("FTX_KILL_SWITCH_ACTIVE: {level}"),
+            ),
+        };
+        // Admission precedes all backend I/O: a refusal proves no effect and
+        // must not be confused with an ambiguous transport failure/Pending.
+        StepDispatchOutcome::Settled((false, reason.to_string(), Some(code)))
+    }
+}
+
 /// Configuration for `PaneStepExecutor` timeout and backpressure behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneStepExecutorConfig {
@@ -2906,10 +2944,17 @@ pub struct PaneStepExecutor<P, A, T> {
     /// Without one, StoreData returns an explicit unsupported error (`store_data_unwired`)
     /// and fails closed.
     storage_adapter: Option<std::sync::Arc<dyn TxStorageAdapter>>,
+    /// Required for action dispatch, including compensation. An unbound
+    /// executor may evaluate prepare gates but cannot touch the backend.
+    policy_storage: Option<TxPolicyStorage>,
+    /// Retain the real temporary policy database owned by unit fixtures.
+    #[cfg(test)]
+    _policy_test_directory: Option<tempfile::TempDir>,
 }
 
 impl<P, A, T> PaneStepExecutor<P, A, T> {
-    /// Create a new pane step executor.
+    /// Create a new pane step executor. Bind the workspace with
+    /// [`Self::with_policy_storage`] before dispatch; unbound actions fail closed.
     #[must_use]
     pub fn new(
         handle: crate::wezterm::WeztermHandle,
@@ -2930,7 +2975,118 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
             fleet_controller: None,
             external_signals: None,
             storage_adapter: None,
+            policy_storage: None,
+            #[cfg(test)]
+            _policy_test_directory: None,
         }
+    }
+
+    /// Bind every commit and compensation action to the workspace's durable
+    /// kill switch. Without this binding dispatch fails closed. The canonical
+    /// effect fence remains held through settlement of each mutating action;
+    /// read-only waits release it so an operator can stop the next mutation.
+    #[must_use]
+    pub fn with_policy_storage(mut self, storage: &crate::storage::StorageHandle) -> Self {
+        self.policy_storage = Some(TxPolicyStorage {
+            db_path: storage.db_path().to_string(),
+            freshness: Default::default(),
+        });
+        self
+    }
+
+    fn admit_step_action(
+        &self,
+        action: &StepAction,
+    ) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>, TxStepAdmissionError> {
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_FENCE_WAIT, KillSwitchStateError, acquire_kill_switch_fence,
+            decode_kill_switch_state, load_kill_switch_state_from_path_with_cx,
+        };
+
+        let storage = self
+            .policy_storage
+            .as_ref()
+            .ok_or(TxStepAdmissionError::Unbound)?;
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        // Match the canonical async injector's admission budget and 2-50ms
+        // backoff. This driver is synchronous; short sleeps remain bounded
+        // and checkpointed. Only lock acquisition is retried, never an effect.
+        // Brief ordinary sender contention must not permanently fail a tx.
+        let started = std::time::Instant::now();
+        let mut delay = std::time::Duration::from_millis(2);
+        let fence = loop {
+            cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+            match acquire_kill_switch_fence(Path::new(&storage.db_path)) {
+                Ok(fence) => break fence,
+                Err(KillSwitchStateError::FencePending) => {
+                    let remaining = KILL_SWITCH_FENCE_WAIT.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(TxStepAdmissionError::State(
+                            KillSwitchStateError::FencePending,
+                        ));
+                    }
+                    std::thread::sleep(delay.min(remaining));
+                    cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(TxStepAdmissionError::State(error)),
+            }
+        };
+        let raw = {
+            let mut freshness = storage.freshness.lock().map_err(|_| {
+                TxStepAdmissionError::State(
+                    crate::policy_kill_switch_state::KillSwitchStateError::LoadFailed(
+                        "transaction kill-switch freshness lock poisoned".to_string(),
+                    ),
+                )
+            })?;
+            freshness.bind(&fence).map_err(TxStepAdmissionError::State)?;
+            freshness
+                .validate(load_kill_switch_state_from_path_with_cx(&cx, &storage.db_path))
+                .map_err(TxStepAdmissionError::State)?
+        };
+        let mut switch = raw
+            .as_deref()
+            .map(decode_kill_switch_state)
+            .transpose()
+            .map_err(TxStepAdmissionError::State)?
+            .unwrap_or_else(crate::policy_quarantine::KillSwitch::disarmed);
+        switch.tick(u64::try_from(crate::storage::now_ms()).unwrap_or_default());
+        let read_only = matches!(action, StepAction::WaitFor { .. });
+        let workflow_launch = matches!(action, StepAction::RunWorkflow { .. });
+        if switch.is_emergency()
+            || (!switch.allows_inflight() && !read_only)
+            || (!switch.allows_new_workflows() && workflow_launch)
+        {
+            return Err(TxStepAdmissionError::Stopped(switch.level));
+        }
+        cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+        if read_only {
+            // Do not prevent a stop transition for the lifetime of a long
+            // observation. The next effect re-admits under its own fence.
+            drop(fence);
+            Ok(None)
+        } else {
+            Ok(Some(fence))
+        }
+    }
+
+    fn execute_admitted_action(
+        &self,
+        action: &StepAction,
+        timeout_ms: Option<u64>,
+    ) -> StepDispatchOutcome<(bool, String, Option<String>)> {
+        let _effect_fence = match self.admit_step_action(action) {
+            Ok(fence) => fence,
+            Err(error) => return error.into_outcome(),
+        };
+        execute_step_action(
+            &self.handle,
+            action,
+            timeout_ms,
+            self.external_signals.as_deref(),
+            self.storage_adapter.as_deref(),
+        )
     }
 
     /// Set custom timeout/backpressure configuration.
@@ -3515,13 +3671,7 @@ where
                 "executing pane step"
             );
 
-            let outcome = execute_step_action(
-                &self.handle,
-                &step.action,
-                step_timeout,
-                self.external_signals.as_deref(),
-                self.storage_adapter.as_deref(),
-            );
+            let outcome = self.execute_admitted_action(&step.action, step_timeout);
 
             tracing::info!(
                 step_id = %step.step_id.0,
@@ -3607,22 +3757,14 @@ where
                 };
 
                 let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
-                execute_step_action(
-                    &self.handle,
-                    action,
-                    step_timeout,
-                    self.external_signals.as_deref(),
-                    self.storage_adapter.as_deref(),
-                )
-                .map(|(success, reason_code, error_code)| {
-                    TxCompensationStepInput {
+                self.execute_admitted_action(action, step_timeout)
+                    .map(|(success, reason_code, error_code)| TxCompensationStepInput {
                         for_step_id: result.step_id.clone(),
                         success,
                         reason_code,
                         error_code,
                         completed_at_ms: now_ms,
-                    }
-                })
+                    })
             };
             let success = input.input().success;
             inputs.push(input);
@@ -13085,13 +13227,27 @@ mod tests {
     fn make_pane_executor(
         handle: WeztermHandle,
     ) -> PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets> {
-        PaneStepExecutor::new(
+        use crate::storage_backend_trait::{RusqliteBackend, StorageBackend};
+
+        let directory = tempfile::tempdir().expect("policy fixture directory");
+        let path = directory.path().join("policy.db");
+        let backend =
+            RusqliteBackend::open_path(&path, &Default::default()).expect("policy fixture database");
+        backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+            .expect("policy fixture config table");
+        let mut executor = PaneStepExecutor::new(
             handle,
             TestAllowAllPolicy,
             TestAllowAllApprovals,
             TestAllLiveTargets,
             TxPrepareEvaluationContext::new("test-workspace"),
-        )
+        );
+        executor.policy_storage = Some(TxPolicyStorage {
+            db_path: path.to_string_lossy().into_owned(),
+            freshness: Default::default(),
+        });
+        executor._policy_test_directory = Some(directory);
+        executor
     }
 
     /// Create a PaneStepExecutor with custom config.
@@ -13099,14 +13255,7 @@ mod tests {
         handle: WeztermHandle,
         config: PaneStepExecutorConfig,
     ) -> PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets> {
-        PaneStepExecutor::new(
-            handle,
-            TestAllowAllPolicy,
-            TestAllowAllApprovals,
-            TestAllLiveTargets,
-            TxPrepareEvaluationContext::new("test-workspace"),
-        )
-        .with_config(config)
+        make_pane_executor(handle).with_config(config)
     }
 
     /// Create a PaneStepExecutor with a fleet memory controller.
@@ -13114,14 +13263,430 @@ mod tests {
         handle: WeztermHandle,
         controller: std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>,
     ) -> PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets> {
-        PaneStepExecutor::new(
-            handle,
+        make_pane_executor(handle).with_fleet_controller(controller)
+    }
+
+    fn trip_pane_executor_switch(
+        executor: &PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets>,
+        level: crate::policy_quarantine::KillSwitchLevel,
+    ) -> Result<
+        crate::policy_kill_switch_state::KillSwitchTransitionReceipt,
+        crate::policy_kill_switch_state::KillSwitchStateError,
+    > {
+        use crate::policy_kill_switch_state::{
+            KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+        let path = &executor
+            .policy_storage
+            .as_ref()
+            .expect("bound fixture")
+            .db_path;
+        let backend = crate::storage_backend_trait::RusqliteBackend::open_path(
+            Path::new(path),
+            &Default::default(),
+        )
+        .expect("independent operator connection");
+        transition_kill_switch_from_backend(
+            &backend,
+            KillSwitchTransition::Trip {
+                level,
+                by: "test-operator",
+                reason: "stop between transaction effects",
+            },
+            5_001,
+        )
+    }
+
+    #[test]
+    fn pane_executor_refuses_dispatch_without_policy_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let effects = directory.path().join("effects.log");
+        let executor = PaneStepExecutor::new(
+            FileEffectBackend::handle(&effects, "unused", FileEffectFault::None),
             TestAllowAllPolicy,
             TestAllowAllApprovals,
             TestAllLiveTargets,
             TxPrepareEvaluationContext::new("test-workspace"),
+        );
+        let contract = make_pane_contract(vec![(
+            "s1".into(),
+            StepAction::SendText {
+                pane_id: 0,
+                text: "must-not-send".into(),
+                paste_mode: None,
+            },
+        )]);
+        let results = executor.execute_steps_with_outcome(&contract, None, 5_000);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], StepDispatchOutcome::Settled(_)));
+        assert!(!results[0].input().success);
+        assert_eq!(results[0].input().reason_code, "tx_policy_storage_unbound");
+        assert!(!effects.exists());
+    }
+
+    #[test]
+    fn pane_executor_live_stop_blocks_next_effect_and_compensation() {
+        struct StopAfterFirstStep {
+            inner: PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets>,
+            tripped: std::cell::Cell<bool>,
+        }
+
+        impl StepExecutor for StopAfterFirstStep {
+            fn evaluate_gates(
+                &self,
+                contract: &MissionTxContract,
+                now_ms: i64,
+            ) -> Vec<TxPrepareGateInput> {
+                self.inner.evaluate_gates(contract, now_ms)
+            }
+
+            fn execute_steps(
+                &self,
+                contract: &MissionTxContract,
+                fail_step: Option<&str>,
+                now_ms: i64,
+            ) -> Vec<TxCommitStepInput> {
+                self.execute_steps_with_outcome(contract, fail_step, now_ms)
+                    .into_iter()
+                    .map(StepDispatchOutcome::into_input)
+                    .collect()
+            }
+
+            fn execute_steps_with_outcome(
+                &self,
+                contract: &MissionTxContract,
+                fail_step: Option<&str>,
+                now_ms: i64,
+            ) -> Vec<StepDispatchOutcome<TxCommitStepInput>> {
+                let result = self
+                    .inner
+                    .execute_steps_with_outcome(contract, fail_step, now_ms);
+                if !self.tripped.replace(true) {
+                    assert_eq!(
+                        result.len(),
+                        1,
+                        "durable engine dispatches one effect at a time"
+                    );
+                    assert!(result[0].input().success);
+                    let receipt = trip_pane_executor_switch(
+                        &self.inner,
+                        crate::policy_quarantine::KillSwitchLevel::HardStop,
+                    )
+                    .expect("completed first effect releases the fence before the stop");
+                    assert_eq!(receipt.revision, 1);
+                }
+                result
+            }
+
+            fn execute_compensations(
+                &self,
+                contract: &MissionTxContract,
+                report: &TxCommitReport,
+                fail_for_step: Option<&str>,
+                now_ms: i64,
+            ) -> Vec<TxCompensationStepInput> {
+                self.inner
+                    .execute_compensations(contract, report, fail_for_step, now_ms)
+            }
+
+            fn execute_compensations_with_outcome(
+                &self,
+                contract: &MissionTxContract,
+                report: &TxCommitReport,
+                fail_for_step: Option<&str>,
+                now_ms: i64,
+            ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
+                self.inner
+                    .execute_compensations_with_outcome(contract, report, fail_for_step, now_ms)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let effects = directory.path().join("effects.log");
+        let executor = StopAfterFirstStep {
+            inner: make_pane_executor(FileEffectBackend::handle(
+                &effects,
+                "unused",
+                FileEffectFault::None,
+            )),
+            tripped: std::cell::Cell::new(false),
+        };
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut contract = make_pane_contract(
+            ["first", "second", "third"]
+                .into_iter()
+                .map(|text| {
+                    (
+                        text.to_string(),
+                        StepAction::SendText {
+                            pane_id: 0,
+                            text: text.to_string(),
+                            paste_mode: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        contract.plan.compensations.push(TxCompensation {
+            for_step_id: TxStepId("first".into()),
+            action: StepAction::SendText {
+                pane_id: 0,
+                text: "undo-first".into(),
+                paste_mode: None,
+            },
+        });
+        let (_spool, mut store) = durable_store();
+        let result = engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        let commit = result.commit_report.expect("commit report");
+        assert_eq!(commit.committed_count, 1);
+        assert_eq!(commit.failed_count, 1);
+        assert_eq!(commit.skipped_count, 1);
+        let compensation = result.compensation_report.expect("compensation report");
+        assert_eq!(compensation.failed_count, 1);
+        assert!(compensation.receipts.iter().any(|receipt| {
+            receipt["reason_code"] == "tx_kill_switch_active"
+                && receipt["error_code"] == "FTX_KILL_SWITCH_ACTIVE: hard_stop"
+        }));
+        assert_eq!(std::fs::read_to_string(&effects).unwrap(), "first\n");
+        assert!(matches!(
+            store.peek_cached_outcome(&test_commit_key(&contract, "second"), 5_000),
+            Some(StepOutcome::Failed { error_code, .. }) if error_code == "tx_kill_switch_active"
+        ));
+        assert!(
+            store
+                .peek_cached_outcome(&test_commit_key(&contract, "third"), 5_000)
+                .is_none()
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&contract, "first"), 5_000),
+            Some(StepOutcome::Failed { compensated: false, .. })
+        ));
+        assert_eq!(result.final_state, MissionTxState::Failed);
+    }
+
+    #[test]
+    fn pane_executor_stop_tiers_preserve_drain_and_observation() {
+        use crate::policy_quarantine::KillSwitchLevel;
+
+        for (level, send_allowed, read_allowed) in [
+            (KillSwitchLevel::SoftStop, true, true),
+            (KillSwitchLevel::HardStop, false, true),
+            (KillSwitchLevel::EmergencyHalt, false, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let effects = directory.path().join("effects.log");
+            let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
+            registry.signal("ready");
+            let executor = make_pane_executor(FileEffectBackend::handle(
+                &effects,
+                "unused",
+                FileEffectFault::None,
+            ))
+            .with_external_signals(registry);
+            trip_pane_executor_switch(&executor, level).unwrap();
+            let send = StepAction::SendText {
+                pane_id: 0,
+                text: "drain".into(),
+                paste_mode: None,
+            };
+            let read = StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "ready".into(),
+                },
+                timeout_ms: 1_000,
+            };
+            let sent = executor.execute_admitted_action(&send, Some(1_000));
+            assert_eq!(sent.input().0, send_allowed, "{level}");
+            assert_eq!(effects.exists(), send_allowed, "{level}");
+            let observed = executor.execute_admitted_action(&read, Some(1_000));
+            assert_eq!(observed.input().0, read_allowed, "{level}");
+            if read_allowed {
+                let admission = executor
+                    .admit_step_action(&read)
+                    .ok()
+                    .expect("read admission");
+                assert!(admission.is_none(), "a read must not pin the workspace fence");
+                let path = &executor.policy_storage.as_ref().unwrap().db_path;
+                let _operator_fence =
+                    crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
+                        .expect("operator can stop during an admitted observation");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_executor_waits_out_brief_fence_contention_and_dispatches_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let effects = directory.path().join("effects.log");
+        let executor = make_pane_executor(FileEffectBackend::handle(
+            &effects,
+            "unused",
+            FileEffectFault::None,
+        ));
+        let path = &executor.policy_storage.as_ref().unwrap().db_path;
+        let held = crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        let outcome = executor.execute_admitted_action(
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "once".to_string(),
+                paste_mode: None,
+            },
+            Some(1_000),
+        );
+        release.join().expect("brief fence holder joined");
+        assert!(matches!(&outcome, StepDispatchOutcome::Settled(_)));
+        assert!(outcome.input().0, "{:?}", outcome.input());
+        assert_eq!(std::fs::read_to_string(&effects).unwrap(), "once\n");
+    }
+
+    #[test]
+    fn pane_executor_cancellation_interrupts_fence_wait_without_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let effects = directory.path().join("effects.log");
+        let executor = make_pane_executor(FileEffectBackend::handle(
+            &effects,
+            "unused",
+            FileEffectFault::None,
+        ));
+        let path = &executor.policy_storage.as_ref().unwrap().db_path;
+        let _held = crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
+            .unwrap();
+        let cx = crate::cx::for_testing();
+        let _context = crate::cx::Cx::set_current(Some(cx.clone()));
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel transaction waiting for policy admission"),
+            );
+        });
+        let started = std::time::Instant::now();
+        let outcome = executor.execute_admitted_action(
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "must-not-send".to_string(),
+                paste_mode: None,
+            },
+            Some(1_000),
+        );
+        cancel.join().expect("cancellation source joined");
+        assert!(matches!(&outcome, StepDispatchOutcome::Settled(_)));
+        assert!(!outcome.input().0);
+        assert_eq!(outcome.input().1, "tx_step_cancelled");
+        assert_eq!(outcome.input().2.as_deref(), Some("FTX_STEP_CANCELLED"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!effects.exists());
+    }
+
+    #[test]
+    fn pane_executor_corrupt_switch_and_exhausted_fence_wait_refuse_before_effect() {
+        use crate::policy_kill_switch_state::acquire_kill_switch_fence;
+        use crate::storage_backend_trait::{RusqliteBackend, StorageBackend};
+
+        let directory = tempfile::tempdir().unwrap();
+        let effects = directory.path().join("effects.log");
+        let executor = make_pane_executor(FileEffectBackend::handle(
+            &effects,
+            "unused",
+            FileEffectFault::None,
+        ));
+        let path = &executor.policy_storage.as_ref().unwrap().db_path;
+        let send = StepAction::SendText {
+            pane_id: 0,
+            text: "blocked".into(),
+            paste_mode: None,
+        };
+        let held = acquire_kill_switch_fence(Path::new(path)).unwrap();
+        let started = std::time::Instant::now();
+        let refused = executor.execute_admitted_action(&send, Some(1_000));
+        assert!(started.elapsed() >= crate::policy_kill_switch_state::KILL_SWITCH_FENCE_WAIT);
+        assert!(matches!(&refused, StepDispatchOutcome::Settled(_)));
+        assert!(!refused.input().0);
+        assert_eq!(refused.input().1, "tx_kill_switch_unavailable");
+        assert!(refused.input().2.as_deref().unwrap().contains("fence_pending"));
+        assert!(!effects.exists());
+        drop(held);
+        let backend = RusqliteBackend::open_path(Path::new(path), &Default::default()).unwrap();
+        backend.execute_batch("INSERT INTO config (key, value, updated_at) VALUES ('policy.kill_switch_v1', '{broken', 1)").unwrap();
+        let corrupt = executor.execute_admitted_action(&send, Some(1_000));
+        assert!(matches!(&corrupt, StepDispatchOutcome::Settled(_)));
+        assert_eq!(corrupt.input().1, "tx_kill_switch_unavailable");
+        assert!(corrupt.input().2.as_deref().unwrap().contains("state_corrupt"));
+        assert!(!effects.exists());
+    }
+
+    #[test]
+    fn pane_executor_holds_stop_fence_until_storage_effect_settles() {
+        use crate::policy_kill_switch_state::{
+            KillSwitchStateError, KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+
+        struct FencedStorage {
+            policy_db: PathBuf,
+            data: FileTxStorageAdapter,
+        }
+
+        impl TxStorageAdapter for FencedStorage {
+            fn store_data(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+                let operator = crate::storage_backend_trait::RusqliteBackend::open_path(
+                    &self.policy_db,
+                    &Default::default(),
+                )
+                .expect("independent operator connection during effect");
+                assert!(matches!(
+                    transition_kill_switch_from_backend(
+                        &operator,
+                        KillSwitchTransition::Trip {
+                            level: crate::policy_quarantine::KillSwitchLevel::HardStop,
+                            by: "operator",
+                            reason: "try to stop before admitted effect settles",
+                        },
+                        5_001,
+                    ),
+                    Err(KillSwitchStateError::FencePending)
+                ));
+                self.data.store_data(key, value)
+            }
+
+            fn get_data(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+                self.data.get_data(key)
+            }
+
+            fn delete_data(&self, key: &str) -> Result<bool, String> {
+                self.data.delete_data(key)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let executor = make_pane_executor(mock_wezterm_handle());
+        let storage = Arc::new(FencedStorage {
+            policy_db: PathBuf::from(&executor.policy_storage.as_ref().unwrap().db_path),
+            data: FileTxStorageAdapter::new(directory.path().join("data")).unwrap(),
+        });
+        let executor = executor.with_storage_adapter(storage.clone());
+        let value = serde_json::json!({"completed": true});
+        let outcome = executor.execute_admitted_action(
+            &StepAction::StoreData {
+                key: "record".to_string(),
+                value: value.clone(),
+            },
+            None,
+        );
+        assert!(outcome.input().0);
+        assert_eq!(storage.get_data("record").unwrap(), Some(value));
+        trip_pane_executor_switch(
+            &executor,
+            crate::policy_quarantine::KillSwitchLevel::HardStop,
         )
-        .with_fleet_controller(controller)
+        .expect("operator can acknowledge stop after effect settles");
     }
 
     /// ft-3lqyu / ft-0rlfq.8: the real effect executor must be unable to
@@ -13992,15 +14557,9 @@ mod tests {
             phase_timeout_buffer_ms: 30_000,
             backpressure_enabled: false, // Disabled!
         };
-        let executor = PaneStepExecutor::new(
-            mock.clone() as WeztermHandle,
-            TestAllowAllPolicy,
-            TestAllowAllApprovals,
-            TestAllLiveTargets,
-            TxPrepareEvaluationContext::new("test-workspace"),
-        )
-        .with_config(config)
-        .with_fleet_controller(std::sync::Arc::new(controller));
+        let executor = make_pane_executor(mock.clone() as WeztermHandle)
+            .with_config(config)
+            .with_fleet_controller(std::sync::Arc::new(controller));
 
         let contract = make_pane_contract(vec![(
             "s1".to_string(),

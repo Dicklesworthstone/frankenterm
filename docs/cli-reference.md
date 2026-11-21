@@ -59,6 +59,7 @@ Command-truth note:
 - `ft query` is not advertised as a first-class root command; when accepted, it resolves to the `ft search` help surface.
 
 Mode notes:
+- Omitted `--mode` uses `[search].mode` from configuration for both human and robot search; the unconfigured default is `lexical` (`fts5` is also accepted in config). An explicit `--mode` always takes precedence.
 - `lexical` uses FTS5/BM25 ranking.
 - `semantic` uses embedding-backed retrieval with fused ranking score output.
 - `hybrid` fuses lexical + semantic lanes with deterministic rank fusion.

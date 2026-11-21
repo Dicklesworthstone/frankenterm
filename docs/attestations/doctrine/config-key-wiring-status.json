@@ -16,11 +16,11 @@
     },
     {
       "key": "search.mode",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
-      "tracking_bead": "ft-7h5da.5.7",
-      "validation": "Config::validate rejects non-default values as parsed but no-effect"
+      "status": "consumed",
+      "consumer": "crate::query_contract::SearchQueryDefaults::from_search_config",
+      "evidence": "human CLI, robot search, and wa.search use the configured retrieval mode when the request omits mode; explicit request modes take precedence",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "typed config accepts lexical/fts5, semantic, and hybrid; unknown or unsupported modes fail deserialization"
     },
     {
       "key": "search.daemon.enabled",

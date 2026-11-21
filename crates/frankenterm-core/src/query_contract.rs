@@ -65,6 +65,24 @@ impl Default for SearchQueryDefaults {
     }
 }
 
+impl SearchQueryDefaults {
+    /// Apply the workspace's retrieval default without overriding an explicit
+    /// request mode. All public search surfaces use this same handoff.
+    #[must_use]
+    pub fn from_search_config(config: &crate::config::SearchConfig) -> Self {
+        use crate::config::ConfiguredSearchMode;
+
+        Self {
+            mode: match config.mode {
+                ConfiguredSearchMode::Lexical => UnifiedSearchMode::Lexical,
+                ConfiguredSearchMode::Semantic => UnifiedSearchMode::Semantic,
+                ConfiguredSearchMode::Hybrid => UnifiedSearchMode::Hybrid,
+            },
+            ..Self::default()
+        }
+    }
+}
+
 /// Raw query input from a caller surface.
 #[derive(Debug, Clone, Default)]
 pub struct SearchQueryInput {
@@ -393,6 +411,45 @@ mod tests {
         assert!(!parsed.query.snippets);
         assert_eq!(parsed.query.mode, UnifiedSearchMode::Hybrid);
         assert!(parsed.query.explain);
+    }
+
+    #[test]
+    fn configured_search_mode_is_used_only_when_the_request_omits_it() {
+        for (configured, expected) in [
+            ("fts5", UnifiedSearchMode::Lexical),
+            ("lexical", UnifiedSearchMode::Lexical),
+            ("semantic", UnifiedSearchMode::Semantic),
+            ("hybrid", UnifiedSearchMode::Hybrid),
+        ] {
+            let config = crate::config::Config::from_toml(&format!(
+                "[search]\nmode = {configured:?}\n"
+            ))
+            .expect("valid configured search mode");
+            let defaults = SearchQueryDefaults::from_search_config(&config.search);
+            for requested in [
+                None,
+                Some(UnifiedSearchMode::Lexical),
+                Some(UnifiedSearchMode::Semantic),
+                Some(UnifiedSearchMode::Hybrid),
+            ] {
+                let parsed = parse_unified_search_query(
+                    SearchQueryInput {
+                        query: "error".to_string(),
+                        mode: requested,
+                        ..SearchQueryInput::default()
+                    },
+                    defaults,
+                )
+                .expect("parse configured search query");
+                assert_eq!(
+                    parsed.query.mode,
+                    requested.unwrap_or(expected),
+                    "configured={configured}, requested={requested:?}"
+                );
+                assert_eq!(parsed.query.limit, SEARCH_LIMIT_DEFAULT);
+                assert!(parsed.query.snippets);
+            }
+        }
     }
 
     #[test]

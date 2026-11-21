@@ -6709,6 +6709,95 @@ fn contract_ft_workspace_config_toml_is_discovered() {
     );
 }
 
+#[test]
+fn contract_search_configured_mode_controls_human_and_robot_retrieval() {
+    use frankenterm_core::runtime_async::CompatRuntime as _;
+
+    let (dir, workspace) = setup_populated_workspace();
+    let db_path = dir.path().join(".ft/ft.db");
+    let config_path = dir.path().join(".ft/config.toml");
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .build()
+        .expect("search fixture runtime");
+    let segment_id = runtime.block_on(async {
+        let storage = frankenterm_core::storage::StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("open search fixture storage");
+        let segment = storage
+            .append_segment(1, "orbit cobalt", None)
+            .await
+            .expect("append segment through the real embedding path");
+        storage.shutdown().await.expect("settle search seed writer");
+        segment.id
+    });
+
+    for (configured, explicit, expected_hits) in [
+        ("fts5", None, 0),
+        ("semantic", None, 1),
+        ("hybrid", None, 1),
+        ("hybrid", Some("lexical"), 0),
+        ("lexical", Some("semantic"), 1),
+    ] {
+        std::fs::write(
+            &config_path,
+            format!("[search]\nmode = {configured:?}\nquality_timeout_ms = 10000\n"),
+        )
+        .expect("write configured search mode");
+        for robot in [false, true] {
+            let mut command = wa_cmd_for(&workspace);
+            command
+                .env_clear()
+                .env("FT_WORKSPACE", &workspace)
+                .env("FT_WEZTERM_CLI", "/nonexistent/wezterm")
+                .env("FT_RUNTIME_WORKER_THREADS", "2")
+                .env("FT_OUTPUT_FORMAT", "json")
+                .env("HOME", dir.path().join("isolated-home"))
+                .current_dir(dir.path())
+                .arg("--config")
+                .arg(&config_path)
+                .timeout(std::time::Duration::from_secs(30));
+            if robot {
+                command.args(["robot", "--format", "json", "search", "orbit absentterm"]);
+            } else {
+                command.args(["search", "orbit absentterm", "--format", "json"]);
+            }
+            if let Some(explicit) = explicit {
+                command.args(["--mode", explicit]);
+            }
+            let output = command.output().expect("execute actual search command");
+            assert!(
+                output.status.success(),
+                "configured={configured}, explicit={explicit:?}, robot={robot}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let response: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("search JSON response");
+            let results = if robot {
+                assert_eq!(response["ok"], true, "{response}");
+                response["data"]["results"].as_array()
+            } else {
+                response.as_array()
+            }
+            .expect("search result array");
+            // The absent FTS term prevents lexical matches. A returned segment
+            // therefore demonstrates actual vector retrieval, not a mode label.
+            assert_eq!(
+                results.len(),
+                expected_hits,
+                "configured={configured}, explicit={explicit:?}, robot={robot}: {response}"
+            );
+            if expected_hits > 0 {
+                let actual_id = if robot {
+                    &results[0]["segment_id"]
+                } else {
+                    &results[0]["segment"]["id"]
+                };
+                assert_eq!(actual_id.as_i64(), Some(segment_id), "{response}");
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Feature Contract: Startup session restore detection (wa-2l27x.5)
 // =============================================================================

@@ -2112,11 +2112,22 @@ A "rule pack" is a versioned, named collection of detection rules. The default p
 
 ## Deep Dive: Search Modes — Lexical, Semantic, Hybrid
 
-`ft search` and `ft robot search` support three modes, selected via `--mode`:
+`ft search`, `ft robot search`, and MCP `wa.search` share three retrieval modes.
+Set the workspace default in `ft.toml`:
+
+```toml
+[search]
+mode = "hybrid"
+```
+
+An explicit `--mode` (or MCP `mode` argument) overrides this setting, including
+`--mode lexical` when the configured default is hybrid. Without a configured
+mode, search uses lexical retrieval. The config value `fts5` also selects
+lexical retrieval; unsupported values such as `two-tier` are rejected.
 
 | Mode | Backend | Best for | Latency target |
 |---|---|---|---|
-| `lexical` (default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
+| `lexical` (unconfigured default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
 | `semantic` | FNV-1a hash embeddings (`fnv1a-hash-128`) | Token-overlap similarity on reworded queries; not true paraphrase understanding | vector scan over stored embeddings |
 | `hybrid` | RRF fusion of lexical + semantic | Best of both; recommended when in doubt | lexical + semantic + fusion overhead |
 

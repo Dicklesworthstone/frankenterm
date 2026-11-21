@@ -4082,6 +4082,7 @@ impl WaSearchTool {
 
 impl ToolHandler for WaSearchTool {
     fn definition(&self) -> Tool {
+        let defaults = SearchQueryDefaults::from_search_config(&self.config.search);
         Tool {
             name: "wa.search".to_string(),
             description: Some(
@@ -4098,7 +4099,7 @@ impl ToolHandler for WaSearchTool {
                     "until": { "type": "integer", "description": "Filter by upper bound time (epoch ms, inclusive)" },
                     "snippets": { "type": "boolean", "default": true, "description": "Include snippets in results" }
                     ,
-                    "mode": { "type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical", "description": "Search mode (lexical, semantic, or hybrid)" }
+                    "mode": { "type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": defaults.mode.as_str(), "description": "Search mode (lexical, semantic, or hybrid)" }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -4140,7 +4141,7 @@ impl ToolHandler for WaSearchTool {
                 mode: params.mode,
                 explain: None,
             },
-            SearchQueryDefaults::default(),
+            SearchQueryDefaults::from_search_config(&self.config.search),
         ) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -11964,7 +11965,8 @@ impl ToolHandler for WaTxRunTool {
             approvals,
             targets,
             prepare_context,
-        );
+        )
+        .with_policy_storage(&storage);
         let execution_engine = crate::tx_execution::TxExecutionEngine::new(
             executor,
             crate::tx_execution::TxExecutionConfig {
@@ -12293,7 +12295,8 @@ impl ToolHandler for WaTxRollbackTool {
             approvals,
             targets,
             prepare_context,
-        );
+        )
+        .with_policy_storage(&storage);
         let execution_engine = crate::tx_execution::TxExecutionEngine::new(
             executor,
             crate::tx_execution::TxExecutionConfig {
@@ -16227,7 +16230,8 @@ mod tests {
             approvals,
             targets,
             prepare_context,
-        );
+        )
+        .with_policy_storage(&storage);
         let engine = crate::tx_execution::TxExecutionEngine::new(
             executor,
             crate::tx_execution::TxExecutionConfig {
@@ -28829,6 +28833,67 @@ exit 17",
             def.input_schema["properties"]["query"]["maxLength"].as_u64(),
             Some(MAX_MCP_SEARCH_QUERY_BYTES as u64)
         );
+    }
+
+    #[test]
+    fn search_configured_mode_changes_retrieval_and_explicit_mode_takes_precedence() {
+        let (_dir, db) = temp_db_path();
+        let pane_id = 9_242;
+        seed_distributed_remote_pane(&db, pane_id, "distributed:search-config");
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let segment_id = runtime.block_on(async {
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("open search fixture storage");
+            let segment = storage
+                .append_segment(pane_id, "orbit cobalt", None)
+                .await
+                .expect("append a real segment and its hash embedding");
+            storage.shutdown().await.expect("settle search seed writer");
+            segment.id
+        });
+
+        // FTS requires both terms, so lexical retrieval has no match. The
+        // shared `orbit` token still produces a semantic hit. This catches a
+        // handler that only changes the reported mode, not the retrieval lane.
+        for (configured, explicit, expected_mode, expected_hits) in [
+            ("fts5", None, "lexical", 0),
+            ("semantic", None, "semantic", 1),
+            ("hybrid", None, "hybrid", 1),
+            ("hybrid", Some("lexical"), "lexical", 0),
+            ("lexical", Some("semantic"), "semantic", 1),
+        ] {
+            let cfg = Config::from_toml(&format!(
+                "[search]\nmode = {configured:?}\nquality_timeout_ms = 10000\n"
+            ))
+            .expect("valid search configuration");
+            let tool = WaSearchTool::new(Arc::new(cfg), Arc::clone(&db));
+            let advertised = if configured == "fts5" {
+                "lexical"
+            } else {
+                configured
+            };
+            assert_eq!(
+                tool.definition().input_schema["properties"]["mode"]["default"],
+                advertised
+            );
+            let mut arguments = serde_json::json!({"query": "orbit absentterm"});
+            if let Some(explicit) = explicit {
+                arguments["mode"] = serde_json::json!(explicit);
+            }
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments)
+                    .expect("search returns a typed response"),
+            );
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            assert_eq!(envelope["data"]["mode"], expected_mode, "{envelope}");
+            assert_eq!(envelope["data"]["total_hits"], expected_hits, "{envelope}");
+            if expected_hits > 0 {
+                let hit = &envelope["data"]["results"][0];
+                assert_eq!(hit["segment_id"], segment_id, "{envelope}");
+                assert!(hit["semantic_score"].is_number(), "{envelope}");
+            }
+        }
     }
 
     #[test]

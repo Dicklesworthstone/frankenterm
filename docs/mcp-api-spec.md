@@ -113,7 +113,8 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
   - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`
 
 - `wa.search`
-  - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, until?: i64, snippets?: bool=true, mode?: "lexical"|"semantic"|"hybrid"="lexical" }`
+  - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, until?: i64, snippets?: bool=true, mode?: "lexical"|"semantic"|"hybrid" }`
+  - Omitted `mode` uses `[search].mode` from the loaded configuration (lexical by default); an explicit request mode overrides it. Tool discovery advertises the configured default.
   - Response notes: `data.mode` reports effective mode and `data.metrics` may include fusion/cache/budget telemetry for semantic/hybrid runs.
   - Redaction/policy: response `query`/`snippet`/`content` fields are redacted; denied/approval-required outcomes return `FT-MCP-0006` (approval-required includes a hint command).
 
