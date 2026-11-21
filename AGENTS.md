@@ -528,7 +528,8 @@ Current architecture reality:
 │                     frankenterm-core                       │
 │  Pattern Engine │ Capture │ Workflows │ Policy │ Search    │
 ├────────────────────────────────────────────────────────────┤
-│   Current mux interop boundary (WezTerm-backed today)      │
+│   In-tree FrankenTerm mux/codec/term/renderer + companion  │
+│   surfaces (Desktop GUI, Native iOS/QR, Browser WASM)      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -577,11 +578,36 @@ frankenterm/
 │   ├── frankenterm-core-cass-types/       # cass schema/error/types (ft-8cg6y, leaf, ~870 LOC)
 │   ├── frankenterm-core-caut-types/       # caut envelope/error types (ft-2z15d, leaf, ~458 LOC)
 │   ├── frankenterm-core-connector-types/  # connector telemetry types (ft-dfd16, leaf, ~273 LOC)
+│   ├── frankenterm-core-atlas-pack-types/ # atlas packing types (leaf)
+│   ├── frankenterm-core-audit-types/      # audit log/chain types (leaf)
+│   ├── frankenterm-core-connectors/       # connector boundary sub-crate
+│   ├── frankenterm-core-mcp/              # MCP tool/resource sub-crate
+│   ├── frankenterm-core-test-macros/      # proc-macro test helpers
+│   ├── frankenterm-core-x11-resize-types/ # X11 resize protocol types (leaf)
 │   │
-│   ├── frankenterm-gui/              # GUI binary crate
-│   ├── frankenterm-mux-server/       # Headless mux server binary crate
-│   ├── frankenterm-mux-server-impl/  # Shared mux-server implementation
-│   └── frankenterm-alloc/            # Allocator/telemetry support crate
+│   ├── frankenterm-gui/                   # Desktop GUI binary crate (OpenGL default, opt-in Native Metal)
+│   ├── frankenterm-renderer-metal/        # Native Apple Silicon Metal renderer (`front_end = "Metal"`)
+│   ├── frankenterm-mux-server/            # Headless mux server binary crate
+│   ├── frankenterm-mux-server-impl/       # Shared mux-server implementation
+│   ├── frankenterm-pty-guardian/          # Crash-resilient PTY guardian daemon & lease owner
+│   ├── frankenterm-browser-ui/            # Browser FrankenTerm WASM viewer/terminal frontend
+│   ├── frankenterm-terminal-wire/         # Binary wire protocol for browser/remote terminal streaming
+│   ├── frankenterm-machines/              # Machine inventory & air-gapped workspace schema
+│   ├── frankenterm-mobile-attach/         # Native iOS / mobile SSH+mux attach substrate
+│   ├── frankenterm-mobile-mux/            # Mobile mux bridge backing `ft mobile`
+│   ├── frankenterm-redactor/              # Shared secret redactor library
+│   ├── frankenterm-sigpipe/               # Recoverable panic & SIGPIPE quarantine contract
+│   ├── frankenterm-build-identity/        # Build/commit/generation provenance identity
+│   ├── frankenterm-flight-recorder/       # Bounded cross-layer flight-recorder tracing
+│   ├── frankenterm-alloc/                 # Allocator/telemetry support crate
+│   ├── frankenterm-topo/                  # Workspace topology & cycle detection
+│   ├── ft-perf-gate/                      # Statistical performance regression gate
+│   └── ft-test-log/                       # Structured test-logging convention
+├── apps/                                  # Native Apple Swift/Xcode surfaces (macOS/iOS)
+│   ├── ios/                               # Native iOS FrankenTerm app (SwiftUI)
+│   ├── apple/                             # Shared Swift package `FrankenTermKit` (`FTAG`/`FTQR1` QR + HPKE)
+│   └── macos/FrankenTermExport/           # Notarized Mac exporter companion app
+├── lints/                                 # Custom lints (`cx_propagation/`, `cache_gpu_handle/`)
 ├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm; for live count run: find frankenterm -maxdepth 2 -name Cargo.toml | wc -l)
 │   ├── async_ossl/                   # Async OpenSSL
 │   ├── codec/                        # Wire codec

@@ -488,7 +488,7 @@ Terminology used throughout this document and the codebase. Reading these once s
 ### Trust & Attestation
 
 <!-- reality-check-drumbeat:auto -->
-_Latest reality-check drumbeat: [`docs/reports/reality-check-2026-09-01.md`](docs/reports/reality-check-2026-09-01.md) (2026-09-01). Third full pass: [`docs/reality-check-bridge-plan-2026-09-01.md`](docs/reality-check-bridge-plan-2026-09-01.md), epic `ft-xxfwy` (entry-ramp truth: signed install, GUI attach, live-loop proof, real attestation bundle). Predecessors: 2026-04-30 plan and 2026-05-12 plan (`ft-tf6g3`)._
+_Latest reality-check drumbeat: [`docs/reports/reality-check-2026-11-20.md`](docs/reports/reality-check-2026-11-20.md) (2026-11-20). Fourth full pass (RC4): [`docs/reality-check-bridge-plan-2026-11-20.md`](docs/reality-check-bridge-plan-2026-11-20.md), epic `ft-mgy5t2` (four-surface truth, cross-platform release-channel split, attestation `--strict-deferred` unblock, and proof-closeout convergence). Predecessors: 2026-04-30 (RC1), 2026-05-12 (`ft-tf6g3`, RC2), and 2026-09-01 (`ft-xxfwy`, RC3)._
 <!-- reality-check-drumbeat:auto:end -->
 
 The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json); each slot maps a claim category to its producing-bead artifact, and the per-release bundle signs those slot hashes.
@@ -1724,15 +1724,29 @@ frankenterm/                              # <!--count:workspace_members-->97<!--
 │   ├── frankenterm-core-x11-resize-types/
 │   │
 │   ├── frankenterm-flight-recorder/      # Bounded cross-layer interaction tracing
-│   ├── frankenterm-gui/                  # GUI binary crate (FrankenTerm.app)
+│   ├── frankenterm-gui/                  # GUI binary crate (FrankenTerm.app; OpenGL default, opt-in Native Metal)
+│   ├── frankenterm-renderer-metal/       # Native Apple Silicon Metal renderer (opt-in: `front_end = "Metal"`)
 │   ├── frankenterm-mux-server/           # Headless mux server binary
 │   ├── frankenterm-mux-server-impl/      # Shared mux-server implementation
+│   ├── frankenterm-pty-guardian/         # Crash-resilient PTY guardian & lease holder
+│   ├── frankenterm-browser-ui/           # Browser FrankenTerm WASM fleet viewer/terminal UI
+│   ├── frankenterm-terminal-wire/        # Binary wire protocol for browser/remote terminal streaming
+│   ├── frankenterm-machines/             # Host/machine inventory & air-gapped workspace model
+│   ├── frankenterm-mobile-attach/        # Native iOS / mobile SSH+mux attach substrate
+│   ├── frankenterm-mobile-mux/           # Mobile mux client bridge (`ft mobile`)
+│   ├── frankenterm-redactor/             # Shared secret redactor library
+│   ├── frankenterm-sigpipe/              # Recoverable panic & SIGPIPE quarantine contract
+│   ├── frankenterm-build-identity/       # Build/commit/generation provenance stamps
 │   ├── frankenterm-alloc/                # Allocator + telemetry support (jemalloc)
 │   ├── frankenterm-topo/                 # Workspace topology + cycle detection
-│   ├── ft-perf-gate/                     # SPRT + conformal + KL-divergence gating
+│   ├── ft-perf-gate/                     # Statistical regression gating (SPRT, conformal, KL)
 │   └── ft-test-log/                      # Centralized test-logging convention
-├── lints/cx_propagation/                 # Custom Cx-propagation lint
-├── frankenterm/                          # In-tree vendored crates (42 dirs, 47 members)
+├── apps/                                 # Native Apple companion surfaces
+│   ├── ios/                              # Native iOS FrankenTerm app (SwiftUI, App Store approved 1.0)
+│   ├── apple/                            # Shared Swift `FrankenTermKit` (`FTAG`/`FTQR1` encrypted QR + HPKE)
+│   └── macos/FrankenTermExport/          # Notarized Mac companion exporter (`FrankenTerm-Exporter.dmg`)
+├── lints/                                # Custom compiler lints (`cx_propagation/`, `cache_gpu_handle/`)
+├── frankenterm/                          # In-tree vendored FrankenTerm crates (ex-WezTerm; see `Cargo.toml` workspace members)
 │   ├── codec/  config/  mux/  pty/  term/  termwiz/  ssh/  scripting/
 │   ├── font/  window/  client/  surface/  …
 │   ├── deps-freetype/  deps-harfbuzz/  deps-fontconfig/
@@ -3925,15 +3939,26 @@ The workspace sets `unsafe_code = "forbid"` in `[workspace.lints.rust]` for crat
 
 ### Reality-check discipline
 
-Reality-check is a quarterly / full-run discipline that produces a bridge plan, a substrate of proof slots, and a per-release bundle. The current round (ft-tf6g3, opened 2026-05-12) is closing final-mile gaps:
+Reality-check is a quarterly / full-run discipline that produces a date-stamped bridge plan, a substrate of proof slots, and a per-release bundle. The current round (**RC4**, `ft-mgy5t2`, opened 2026-11-20, documented in [`docs/reality-check-bridge-plan-2026-11-20.md`](docs/reality-check-bridge-plan-2026-11-20.md) with drumbeat report [`docs/reports/reality-check-2026-11-20.md`](docs/reports/reality-check-2026-11-20.md); cross-linked to RC3 `ft-xxfwy`, RC2 `ft-tf6g3`, and RC1 `docs/reality-check-bridge-plan.md`) is closing four-surface convergence gaps:
 
-- Attestation graph completeness (every headline claim → signed slot)
-- Renderer SLO attestation suite (resize FPS, input-to-photon, SSIM parity, atlas stability, idle GPU power)
-- Round-3 statistical elevations (Lindley, Fano, SPRT, conformal bands, Mazurkiewicz cancel-traces, TLA+ TX-killswitch, Stateright work-family atomicity)
-- `scripts/ft-reality-check.sh status` / `next` / `silent-close-audit` / `structure-audit` operator verbs (a shell script, not an `ft` subcommand)
-- Verify-the-verifier self-test for `ft attestation verify`
+- Release-channel split (`stable` cross-platform signed releases vs `companion-appstore` prerelease tags) and Linux `GLIBC_2.35` ABI floor gating
+- Codec-75 workspace test greenness, `PROVENANCE.json` gate, and atomic-redeploy skew diagnostics
+- Attestation `--strict-deferred` unblock (closing `ft-7h5da.10.2`, `ft-7h5da.1.5`, `ft-7h5da.13.7`), live-proof receipt wiring, and first signed release bundle
+- Four-surface truth sync (Desktop Metal/`PageGrid` + Swarm Control Plane + Native iOS/Air-Gapped QR/Mac Exporter + Browser WASM), unified multi-client controller lease (TLA+), and proof-backed bead closeout discipline
+- `scripts/ft-reality-check.sh status` / `next` / `silent-close-audit` / `structure-audit` operator verbs (a shell script, not an `ft` subcommand) and mass-restore-immune `scripts/check-reality-check-due.sh`
 
 See [`docs/process/reality-check-discipline.md`](docs/process/reality-check-discipline.md) for trigger rules; `scripts/check-reality-check-due.sh` reports when another full pass is due.
+
+### Four-Surface Platform & Companion CLI Matrix
+
+FrankenTerm spans four surfaces on one shared terminal/mux/codec substrate (honestly distinguishing shipped capabilities from opt-in/preview surfaces):
+
+| Surface | Primary Code Location | Current State (2026-11-20) | Key Commands / Entrypoints |
+|---|---|---|---|
+| **Desktop Terminal** | `crates/frankenterm-gui/`, `crates/frankenterm-renderer-metal/`, `frankenterm/` | **Shipped (macOS arm64); Preview (Linux/Windows)**. `OpenGL` is still default; Native Apple Silicon Metal (`front_end = "Metal"`) and `PageGrid` (`FT_GRID_ENGINE=page`) are opt-in while tab-bar/overlay parity finishes (`ft-yccm0`). | `FrankenTerm.app`, `frankenterm-gui`, `frankenterm-mux-server`, `frankenterm-pty-guardian` |
+| **Swarm Control Plane (`ft`)** | `crates/frankenterm/`, `crates/frankenterm-core/` | **Working on matching codec generation**. Live 77-pane CLI↔GUI attach, Robot Mode, MCP, Web SSE, Policy/Kill-Switch, Tx, `ft mobile`, `ft mermaid`, `ft process-triage`, `ft analytics vc-export`. | `ft watch`, `ft status`, `ft doctor`, `ft robot ...`, `ft mcp serve`, `ft mobile`, `ft mermaid`, `ft process-triage`, `ft analytics vc-export` |
+| **Native iOS + Mac Exporter + Air-Gapped QR** | `apps/ios/`, `apps/apple/`, `apps/macos/FrankenTermExport/`, `crates/frankenterm-mobile-*`, `crates/frankenterm-machines/` | **iOS 1.0 approved on App Store Connect; notarized `FrankenTerm-Exporter.dmg` live on `companion-appstore` channel**. Encrypted animated QR (`FTAG`/`FTQR1` + RFC 9180 HPKE) implemented; unified multi-client lease (`ft-mgy5t2.21`) & fountain adversarial qualification (`ft-mgy5t2.23`) tracked in RC4. | `FrankenTerm.app` (iOS), `FrankenTermExport.app`, `ft mobile` |
+| **Browser FrankenTerm (WASM)** | `crates/frankenterm-browser-ui/`, `crates/frankenterm-terminal-wire/` | **Loopback read-only preview**. Authenticated Tailscale Serve mode, interactive WebSocket pane attach with unified controller lease, live OpenAPI discovery, and DSR WASM packaging are tracked in `ft-browser-frankenterm-7z4il` / `ft-mgy5t2.27`. | `ft web` |
 
 ### Substrate audit discipline (extended)
 
@@ -4206,10 +4231,10 @@ For continuous monitoring, prefer Prometheus + SSE. For incident response, prefe
 
 ## Secure Distributed Mode
 
-Secure distributed mode is available as an optional feature-gated build and is off by default.
+Secure distributed mode is compiled into default builds (`distributed` is in the default Cargo feature set of `crates/frankenterm/Cargo.toml`) and activated at runtime via `[distributed].enabled = true`. To build a trimmed binary explicitly enabling only distributed mode:
 
 ```bash
-cargo build -p frankenterm --profile release-interactive --features distributed
+cargo build -p frankenterm --profile release-interactive --no-default-features --features distributed
 ```
 
 The distributed wire protocol provides:
@@ -4444,7 +4469,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 | MCP server integration | Feature-gated (stdio) |
 | Web server + SSE | Feature-gated, shipped |
 | Multi-host federation | Distributed mode shipped with explicit limitations |
-| Semantic search | Feature-gated (requires ML embeddings) |
+| Semantic & hybrid search | Shipped with FTS5 lexical + zero-dependency `fnv1a-hash-128` hash-embedding semantic lane + RRF fusion (ML FastEmbed/Tantivy/reranker are not on the production search path) |
 | Target-class memory envelope claims | Held back pending non-skipped target-class artifact |
 | `ft restart` / non-dry `ft snapshot restore` | Execution unavailable on every platform; both fail closed before process or mux mutation |
 | Render-differential OSC 8 hyperlink + resize-control | Outstanding follow-ups (ft-tf6g3.54 / .55) |

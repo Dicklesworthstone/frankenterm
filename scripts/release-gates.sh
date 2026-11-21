@@ -95,6 +95,7 @@ gate "generated artifacts"                       "scripts/check_generated_artifa
 gate "renderer corpus drift"                     "scripts/check-renderer-corpus-drift.sh"
 gate "codec version release notes"               "scripts/check_codec_version_release_notes.sh"
 gate "readme counts"                             "bash scripts/stamp-readme-counts.sh --check"
+gate "readme consistency"                        "bash scripts/check-readme-consistency.sh"
 gate "vendored provenance"                       "bash scripts/check-provenance.sh"
 cargo_gate "ftui guardrails"                     "scripts/check_ftui_guardrails.sh"
 cargo_gate "ftui tests"                          "scripts/check_ftui_tests.sh"

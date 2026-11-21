@@ -5,7 +5,7 @@
   "claims": [
     {
       "id": "capture_latency_p99",
-      "readme_sentence": "<50ms capture latency (4KB overlap matching) — target/benchmark lane rather than always-on guarantee",
+      "readme_sentence": "<50ms capture latency (bounded 1 MiB overlap matching) — target/benchmark lane rather than always-on guarantee",
       "metric": {
         "kind": "latency",
         "unit": "ns",
@@ -14,10 +14,10 @@
         "comparison_direction": "lower_is_better"
       },
       "workload": {
-        "description": "4KB overlap window, single-pane delta extraction, repetitive + heterogeneous fixtures",
+        "description": "Bounded 1 MiB overlap window, single-pane delta extraction, repetitive + heterogeneous fixtures",
         "panes": 1,
         "throughput_target": "n/a",
-        "input_size_bytes": 4096
+        "input_size_bytes": 1048576
       },
       "bench": {
         "file": "crates/frankenterm-core/benches/delta_extraction.rs",
