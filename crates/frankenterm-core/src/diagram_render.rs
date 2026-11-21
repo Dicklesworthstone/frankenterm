@@ -1375,13 +1375,13 @@ mod tests {
 
     #[test]
     fn mermaid_flowchart_td_and_lr_render_labels_and_chains() {
-        let src = r#"
+        let src = r"
             ```mermaid
             %% sample workflow
             flowchart TD
                 A[Watcher] -->|captures| B(Storage) --> C{Policy}
             ```
-        "#;
+        ";
         let res = render_mermaid(src, &MermaidRenderOptions::default()).unwrap();
         assert_eq!(res.kind, MermaidDiagramKind::Flowchart);
         assert_eq!(res.direction.as_deref(), Some("TD"));
@@ -1408,13 +1408,13 @@ mod tests {
 
     #[test]
     fn mermaid_sequence_diagram_renders_participants_and_messages() {
-        let src = r#"
+        let src = r"
             sequenceDiagram
                 participant CLI as ft CLI
                 participant Mux as Mux Server
                 CLI->>Mux: ListPanesWithDomainsV1
                 Mux-->>CLI: 12 panes
-        "#;
+        ";
         let res = render_mermaid(src, &MermaidRenderOptions::default()).unwrap();
         assert_eq!(res.kind, MermaidDiagramKind::Sequence);
         assert_eq!(res.node_count, 2);
