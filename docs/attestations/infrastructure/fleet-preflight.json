@@ -1,0 +1,86 @@
+{
+  "disk_alerts": [
+    {
+      "free_gb": 1.8,
+      "min_disk_gb": 10.0,
+      "worker": "Worker"
+    },
+    {
+      "free_gb": 1.1,
+      "min_disk_gb": 10.0,
+      "worker": "Worker"
+    },
+    {
+      "free_gb": null,
+      "min_disk_gb": 10.0,
+      "reason": "disk_free_below_critical_gb",
+      "worker": "mminiold"
+    },
+    {
+      "free_gb": null,
+      "min_disk_gb": 10.0,
+      "reason": "disk_free_below_critical_gb",
+      "worker": "hz1"
+    }
+  ],
+  "generated_at": "2026-11-21T01:39:42Z",
+  "min_rch_success_pct": 85,
+  "missing_platforms": [
+    "darwin/arm64",
+    "linux/amd64",
+    "linux/arm64",
+    "windows/amd64"
+  ],
+  "platform_healthy_hosts": {
+    "darwin/arm64": [],
+    "linux/amd64": [],
+    "linux/arm64": [],
+    "windows/amd64": []
+  },
+  "playbook": "docs/ops/fleet-remediation-playbook-2026-11-20.md",
+  "rch_healthy": false,
+  "rch_success_pct": 28,
+  "read_only": true,
+  "release_ready": false,
+  "remediations": [
+    {
+      "action": "Reconcile /dp vs /data/projects vs /Users/jemanuel/projects physical mapping on trj after active owners settle, then run `rch workers capabilities --refresh` (see docs/ops/fleet-remediation-playbook-2026-11-20.md).",
+      "code": "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE",
+      "target": "trj"
+    },
+    {
+      "action": "Restore >=1 healthy DSR build host for: darwin/arm64, linux/amd64, linux/arm64, windows/amd64 and verify via `dsr health all`.",
+      "code": "MISSING_HEALTHY_DSR_PLATFORM",
+      "target": "darwin/arm64,linux/amd64,linux/arm64,windows/amd64"
+    },
+    {
+      "action": "Investigate RCH failures (observed=28%, floor=85%) via `rch status --remediation` and `rch doctor`; never substitute local Cargo builds.",
+      "code": "RCH_SUCCESS_RATE_BELOW_FLOOR",
+      "target": "rch-fleet"
+    },
+    {
+      "action": "Reclaim build caches/ballast on Worker via `rch gc --dry-run --workers Worker` / `sbh` to restore >= 10 GiB free.",
+      "code": "WORKER_DISK_CRITICAL",
+      "target": "Worker"
+    },
+    {
+      "action": "Reclaim build caches/ballast on Worker via `rch gc --dry-run --workers Worker` / `sbh` to restore >= 10 GiB free.",
+      "code": "WORKER_DISK_CRITICAL",
+      "target": "Worker"
+    },
+    {
+      "action": "Reclaim build caches/ballast on mminiold via `rch gc --dry-run --workers mminiold` / `sbh` to restore >= 10 GiB free.",
+      "code": "WORKER_DISK_CRITICAL",
+      "target": "mminiold"
+    },
+    {
+      "action": "Reclaim build caches/ballast on hz1 via `rch gc --dry-run --workers hz1` / `sbh` to restore >= 10 GiB free.",
+      "code": "WORKER_DISK_CRITICAL",
+      "target": "hz1"
+    }
+  ],
+  "schema_version": "frankenterm.fleet_preflight.v1",
+  "target_class_ready": false,
+  "trj_topology_error": true,
+  "unhealthy_dsr_hosts": []
+}

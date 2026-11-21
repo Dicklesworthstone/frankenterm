@@ -1,0 +1,42 @@
+# .rchignore — exclude non-Rust build artifacts, Swift caches, SQLite dumps,
+# and untracked local telemetry from remote Cargo offload transfers.
+# Keeps all Rust sources, Cargo manifests, docs, fixtures, scripts, and test
+# sources intact while preventing multi-GB rsync payloads (ft-mgy5t2.11).
+
+# SwiftPM / Xcode build artifacts (4.5+ GiB; never compiled by Linux RCH workers)
+apps/**/.build/
+apps/**/.swiftpm/
+apps/**/Artifacts/
+apps/**/DerivedData/
+apps/**/build/
+apps/**/*.xcframework/
+apps/**/*.xcarchive/
+apps/**/*.dmg
+
+# Beads SQLite databases, backups, recovery dumps, and temp files (4.4+ GiB)
+.beads/recovery_*/
+.beads/backups/
+.beads/*.db
+.beads/*.db-*
+.beads/*.tmp
+.beads/*.base.jsonl
+.beads/sync_base.jsonl
+
+# Local E2E / benchmark / doctor / scratch outputs (2.5+ GiB)
+tests/e2e/artifacts/
+tests/e2e/logs/
+tests/e2e/output/
+tests/e2e/__pycache__/
+gui-throughput-runs/
+.doctor/
+dist-app/
+dist-app-moonshots/
+FrankenTerm.app/
+.tmp-tests/
+.ft/
+.bv/
+.ee/
+artifacts/
+rp-contam.ru-aside/
+.synccost-probe.bin
+*.ru-aside
