@@ -53,7 +53,10 @@ impl VcExportCursor {
     /// Encode into a compact, deterministic cursor token (`v1:<epoch>:<after_id>:<generation>`).
     #[must_use]
     pub fn encode(&self) -> String {
-        format!("v1:{}:{}:{}", self.cursor_epoch, self.after_id, self.generation)
+        format!(
+            "v1:{}:{}:{}",
+            self.cursor_epoch, self.after_id, self.generation
+        )
     }
 
     /// Parse a previously encoded cursor token.
@@ -96,9 +99,11 @@ impl VcExportCursor {
                 reason: "cursor epoch contains invalid characters",
             });
         }
-        let after_id: i64 = after_id_raw.parse().map_err(|_| VcExportError::InvalidCursor {
-            reason: "cursor after_id is not a valid integer",
-        })?;
+        let after_id: i64 = after_id_raw
+            .parse()
+            .map_err(|_| VcExportError::InvalidCursor {
+                reason: "cursor after_id is not a valid integer",
+            })?;
         let generation: i64 = generation_raw
             .parse()
             .map_err(|_| VcExportError::InvalidCursor {
@@ -302,9 +307,7 @@ fn stored_event_to_vc_record(
     } else {
         None
     };
-    let extracted = event
-        .extracted
-        .map(|val| redact_json_value(redactor, val));
+    let extracted = event.extracted.map(|val| redact_json_value(redactor, val));
 
     VcExportRecord {
         record_id: format!("ft-evt:{cursor_epoch}:{}", event.id),
@@ -1087,7 +1090,10 @@ mod tests {
             "v1:epoch:1:0:extra",
         ] {
             assert!(
-                matches!(VcExportCursor::parse(bad), Err(VcExportError::InvalidCursor { .. })),
+                matches!(
+                    VcExportCursor::parse(bad),
+                    Err(VcExportError::InvalidCursor { .. })
+                ),
                 "expected InvalidCursor for {bad:?}"
             );
         }

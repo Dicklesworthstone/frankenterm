@@ -2003,9 +2003,10 @@ impl ToolHandler for WaSteerPlanTool {
         // approvals, and target capabilities (failing closed if storage is
         // unavailable) instead of trusting the scenario label alone.
         let result = if let Some(contract) = bound_contract.as_ref() {
-            let eval_workspace = layout_result
-                .as_ref()
-                .map_or_else(|_| workspace_id.clone(), |l| l.root.to_string_lossy().to_string());
+            let eval_workspace = layout_result.as_ref().map_or_else(
+                |_| workspace_id.clone(),
+                |l| l.root.to_string_lossy().to_string(),
+            );
             let prepare_context = crate::plan::TxPrepareEvaluationContext::new(eval_workspace)
                 .with_surface(PolicySurface::Mcp)
                 .with_actor(crate::policy::ActorKind::Mcp);
@@ -2055,8 +2056,9 @@ impl ToolHandler for WaSteerPlanTool {
                     &storage,
                     contract,
                 ));
-                let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
-                    .with_resolved_capabilities(resolved_capabilities);
+                let targets =
+                    crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+                        .with_resolved_capabilities(resolved_capabilities);
                 let planned = crate::steer_plan::steer_plan_for_contract(
                     scenario,
                     &params.objective,

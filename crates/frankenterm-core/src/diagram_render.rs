@@ -564,7 +564,9 @@ pub enum MermaidRenderError {
     EmptyInput,
     #[error("mermaid input size {bytes} exceeds limit {max_bytes}")]
     InputTooLarge { bytes: usize, max_bytes: usize },
-    #[error("unsupported mermaid diagram header '{header}' (supported: flowchart, graph, sequenceDiagram)")]
+    #[error(
+        "unsupported mermaid diagram header '{header}' (supported: flowchart, graph, sequenceDiagram)"
+    )]
     UnsupportedDiagramType { header: String },
     #[error("mermaid node count {nodes} exceeds limit {max_nodes}")]
     NodeLimitExceeded { nodes: usize, max_nodes: usize },
@@ -678,7 +680,11 @@ fn render_flowchart_styled(
                             || (direction == "RL" && e.from == next.id && e.to == node.id)
                     })
                     .and_then(|e| e.label.as_deref());
-                let arrow = if direction == "RL" { "◀──" } else { "──▶" };
+                let arrow = if direction == "RL" {
+                    "◀──"
+                } else {
+                    "──▶"
+                };
                 if let Some(lbl) = edge_label {
                     parts.push(format!("─({lbl})─{arrow}"));
                 } else {
@@ -799,21 +805,23 @@ pub fn render_mermaid(
                         }
                         return Ok(id);
                     }
-                if nodes.len() >= options.max_nodes {
-                    return Err(MermaidRenderError::NodeLimitExceeded {
-                        nodes: nodes.len() + 1,
-                        max_nodes: options.max_nodes,
+                    if nodes.len() >= options.max_nodes {
+                        return Err(MermaidRenderError::NodeLimitExceeded {
+                            nodes: nodes.len() + 1,
+                            max_nodes: options.max_nodes,
+                        });
+                    }
+                    let display = label
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    let idx = nodes.len();
+                    nodes.push(FlowNode {
+                        id: id.clone(),
+                        label: display,
                     });
-                }
-                let display = label.filter(|l| !l.is_empty()).unwrap_or_else(|| id.clone());
-                let idx = nodes.len();
-                nodes.push(FlowNode {
-                    id: id.clone(),
-                    label: display,
-                });
-                node_indices.insert(id.clone(), idx);
-                Ok(id)
-            };
+                    node_indices.insert(id.clone(), idx);
+                    Ok(id)
+                };
 
             for &(line_no, stmt) in &lines[1..] {
                 if stmt.starts_with("subgraph ")
@@ -829,22 +837,22 @@ pub fn render_mermaid(
                 let mut parsed_edge = false;
                 while let Some((lhs, label, rhs)) = split_mermaid_edge_once(rest) {
                     parsed_edge = true;
-                    let (from_id, from_label) = parse_mermaid_node_token(lhs).map_err(|reason| {
-                        MermaidRenderError::SyntaxError {
-                            line: line_no,
-                            reason: reason.to_string(),
-                        }
-                    })?;
+                    let (from_id, from_label) =
+                        parse_mermaid_node_token(lhs).map_err(|reason| {
+                            MermaidRenderError::SyntaxError {
+                                line: line_no,
+                                reason: reason.to_string(),
+                            }
+                        })?;
                     let from_key = ensure_node(from_id, from_label)?;
 
                     // Support chained edges like `A --> B --> C`.
-                    let (rhs_head, next_rest) = if let Some((next_lhs, _, _)) =
-                        split_mermaid_edge_once(rhs)
-                    {
-                        (next_lhs, Some(rhs))
-                    } else {
-                        (rhs, None)
-                    };
+                    let (rhs_head, next_rest) =
+                        if let Some((next_lhs, _, _)) = split_mermaid_edge_once(rhs) {
+                            (next_lhs, Some(rhs))
+                        } else {
+                            (rhs, None)
+                        };
                     let (to_id, to_label) =
                         parse_mermaid_node_token(rhs_head).map_err(|reason| {
                             MermaidRenderError::SyntaxError {
@@ -929,12 +937,8 @@ pub fn render_mermaid(
                 if stmt.starts_with("Note ") || stmt.starts_with("note ") {
                     continue;
                 }
-                let seq_ops: &[(&str, bool)] = &[
-                    ("-->>", true),
-                    ("->>", false),
-                    ("-->", true),
-                    ("->", false),
-                ];
+                let seq_ops: &[(&str, bool)] =
+                    &[("-->>", true), ("->>", false), ("-->", true), ("->", false)];
                 let mut matched = None;
                 for &(op, dashed) in seq_ops {
                     if let Some(idx) = stmt.find(op) {

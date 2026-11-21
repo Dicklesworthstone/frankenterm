@@ -9299,8 +9299,7 @@ impl Tab {
                 "move source tab {} lost active mux authority",
                 self.tab_id()
             );
-            clone_tab_inner_bounded(&inner)
-                .context("admit move-to-new-tab source tree clone")?
+            clone_tab_inner_bounded(&inner).context("admit move-to-new-tab source tree clone")?
         };
         let pane_ids = observe_relocation_pane_ids(self.tab_id(), &[&source_baseline])?;
         anyhow::ensure!(

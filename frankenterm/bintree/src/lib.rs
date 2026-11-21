@@ -122,10 +122,11 @@ impl<L, N> TreeArena<L, N> {
                     entries.push(ArenaEntry::Leaf(leaf.clone()));
                 }
                 Tree::Node { left, right, data } => {
-                    let next_depth = depth.checked_add(1).ok_or(TreeBoundsError::DepthExceeded {
-                        depth: usize::MAX,
-                        max_depth,
-                    })?;
+                    let next_depth =
+                        depth.checked_add(1).ok_or(TreeBoundsError::DepthExceeded {
+                            depth: usize::MAX,
+                            max_depth,
+                        })?;
                     entries.push(ArenaEntry::Node { data: data.clone() });
                     pending
                         .try_reserve(2)

@@ -1078,11 +1078,9 @@ fn split_atomic_target_path(path: &Path) -> Result<(&Path, &OsStr), AtomicWriteE
             reason: "empty_path",
         });
     }
-    let name = path
-        .file_name()
-        .ok_or(AtomicWriteError::InvalidPath {
-            reason: "missing_file_name",
-        })?;
+    let name = path.file_name().ok_or(AtomicWriteError::InvalidPath {
+        reason: "missing_file_name",
+    })?;
     if name == OsStr::new(".") || name == OsStr::new("..") {
         return Err(AtomicWriteError::InvalidPath {
             reason: "dot_component",
@@ -1099,7 +1097,10 @@ fn split_atomic_target_path(path: &Path) -> Result<(&Path, &OsStr), AtomicWriteE
 /// no-follow leaf/parent admission, unique create-new same-directory temporary
 /// file, `sync_all` on file, pre-rename target identity revalidation, atomic
 /// `rename`, and parent directory `sync_all`.
-pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<AtomicWriteReceipt, AtomicWriteError> {
+pub fn write_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<AtomicWriteReceipt, AtomicWriteError> {
     write_file_atomic_with_policy(path, bytes, AtomicWritePolicy::default())
 }
 
@@ -1247,11 +1248,9 @@ fn write_file_atomic_core(
             .follow(FollowSymlinks::No);
         #[cfg(unix)]
         {
-            let mode = existing_before
-                .as_ref()
-                .map_or(policy.unix_mode, |m| {
-                    CapPlatformMetadataExt::mode(m) & 0o777
-                });
+            let mode = existing_before.as_ref().map_or(policy.unix_mode, |m| {
+                CapPlatformMetadataExt::mode(m) & 0o777
+            });
             CapOpenOptionsPlatformExt::mode(&mut options, mode);
         }
         match directory.open_with(&temp_name, &options) {
@@ -1300,12 +1299,11 @@ fn write_file_atomic_core(
     }
 
     let temp_std_file = temp_file.into_std();
-    let temp_handle_meta = CapMetadata::from_file(&temp_std_file).map_err(|err| {
-        AtomicWriteError::Io {
+    let temp_handle_meta =
+        CapMetadata::from_file(&temp_std_file).map_err(|err| AtomicWriteError::Io {
             phase: "temp_stat",
             kind: atomic_io_kind_label(&err),
-        }
-    })?;
+        })?;
 
     #[cfg(test)]
     if let Err(err) = fault(AtomicWriteFaultPoint::BeforePreRenameCheck) {
@@ -1428,8 +1426,12 @@ fn write_file_atomic_core(
             kind: "target_replaced_after_rename",
         });
     }
-    if require_same_metadata_identity(&temp_handle_meta, &published_meta, "atomic_write_post_rename")
-        .is_err()
+    if require_same_metadata_identity(
+        &temp_handle_meta,
+        &published_meta,
+        "atomic_write_post_rename",
+    )
+    .is_err()
     {
         return Err(AtomicWriteError::IndeterminateAfterRename {
             phase: "post_rename_verify",
@@ -4196,7 +4198,10 @@ mod metadata_admission_tests {
                 (AtomicWriteFaultPoint::BeforeOpenTemp, "open_temp"),
                 (AtomicWriteFaultPoint::BeforeWrite, "write_temp"),
                 (AtomicWriteFaultPoint::BeforeFileSync, "sync_temp"),
-                (AtomicWriteFaultPoint::BeforePreRenameCheck, "pre_rename_check"),
+                (
+                    AtomicWriteFaultPoint::BeforePreRenameCheck,
+                    "pre_rename_check",
+                ),
                 (AtomicWriteFaultPoint::BeforeRename, "rename"),
             ] {
                 let err = write_file_atomic_impl(
@@ -4342,7 +4347,10 @@ mod metadata_admission_tests {
                 read_file_to_string_bounded(&bad_utf8, 16),
                 Err(BoundedReadError::InvalidUtf8)
             );
-            assert_eq!(read_file_bounded(&bad_utf8, 16).unwrap(), vec![0xff, 0xfe, 0xfd]);
+            assert_eq!(
+                read_file_bounded(&bad_utf8, 16).unwrap(),
+                vec![0xff, 0xfe, 0xfd]
+            );
 
             // File grows past cap after initial metadata admission: streaming
             // take(max_bytes + 1) must catch it without unbounded allocation.
