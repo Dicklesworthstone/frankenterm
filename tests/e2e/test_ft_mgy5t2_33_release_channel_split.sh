@@ -341,6 +341,158 @@ shutil.copyfile(source, target)
     )
     record("neg_install_refuses_appstore_only", "stable", "negative", 2, p, {"selected_tag": p.stdout.strip()})
 
+    # Exercise the complete resolver, including HTTP failure, pagination and
+    # redirect fallback. Only curl is stubbed; production selection runs with
+    # errexit/nounset/pipefail, and every requested URL is checked below.
+    install_source = install_sh.read_text()
+
+    def install_function(name):
+        start = install_source.index(name + "() {")
+        end = install_source.index("\n}\n", start) + 3
+        return install_source[start:end]
+
+    resolver_script = "\n".join(install_function(name) for name in
+                                ("release_tag_with_assets", "resolve_version")) + r'''
+set -euo pipefail
+PROXY_ARGS=()
+info() { printf '%s\n' "$*" >&2; }
+err() { printf '%s\n' "$*" >&2; }
+if resolve_version; then
+  printf '%s\n' "$VERSION"
+else
+  exit 1
+fi
+'''
+    resolver_bin = td_path / "resolver_bin"
+    resolver_bin.mkdir()
+    (resolver_bin / "curl").write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FT_TEST_RESOLVER_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+with open(os.environ["FT_TEST_RESOLVER_RESPONSES"]) as source:
+    responses = json.load(source)
+response = responses.get(args[-1], {"status": 99})
+body = response.get("body", "")
+sys.stdout.write(json.dumps(body) if isinstance(body, (dict, list)) else body)
+sys.exit(response.get("status", 0))
+''')
+    (resolver_bin / "curl").chmod(0o755)
+    resolver_responses = td_path / "resolver_responses.json"
+    resolver_log = td_path / "resolver_requests.jsonl"
+    api = "https://api.github.com/repos/fixture/frankenterm/releases"
+    latest_url = api + "/latest"
+    redirect_url = "https://github.com/fixture/frankenterm/releases/latest"
+    stable_tag = releases_fixture[1]["tag_name"]
+    asset_name = "ft-linux-amd64.tar.xz"
+    asset_base = f"https://github.com/fixture/frankenterm/releases/download/{stable_tag}/"
+
+    def page_url(number):
+        return api + f"?per_page=100&page={number}"
+
+    def resolver_case(case_id, responses, requested_urls, *, version=None,
+                      error=None, overrides=None):
+        resolver_responses.write_text(json.dumps(responses))
+        resolver_log.write_text("")
+        env = dict(os.environ, PATH=str(resolver_bin) + os.pathsep + os.environ["PATH"],
+                   FT_TEST_RESOLVER_RESPONSES=str(resolver_responses),
+                   FT_TEST_RESOLVER_LOG=str(resolver_log), VERSION="", FROM_SOURCE="0",
+                   ARTIFACT_URL="", ASSET=asset_name, CHECKSUM="", CHECKSUM_URL="",
+                   MINISIGN_SIGNATURE_URL="", NO_MINISIGN="0", OWNER="fixture",
+                   REPO="frankenterm", OS="linux", ARCH="x86_64")
+        env.update(overrides or {})
+        p = subprocess.run(["bash", "-c", resolver_script], env=env,
+                           capture_output=True, text=True, timeout=15)
+        requests = [json.loads(line) for line in resolver_log.read_text().splitlines()]
+        assert [args[-1] for args in requests] == requested_urls, (case_id, requests, p.stderr)
+        for args in requests:
+            assert "--max-time" in args, (case_id, args)
+            assert 0 < int(args[args.index("--max-time") + 1]) <= 15, (case_id, args)
+        assert p.stdout.strip() == (version or ""), (case_id, p.stdout, p.stderr)
+        if error:
+            assert error in p.stderr, (case_id, p.stderr)
+        if error and "No published stable" not in error:
+            assert "No published stable" not in p.stderr, (case_id, p.stderr)
+        record(case_id, "stable", "positive" if version else "negative",
+               0 if version else 1, p,
+               {"selected_tag": p.stdout.strip(), "request_count": len(requests)})
+
+    resolver_case("pos_resolver_latest_signed", {latest_url: {"body": releases_fixture[1]}},
+                  [latest_url], version=stable_tag)
+    for case_id, latest_response in [
+        ("pos_resolver_missing_latest_uses_list", {"status": 22}),
+        ("pos_resolver_malformed_latest_uses_list", {"body": "{broken"}),
+    ]:
+        resolver_case(case_id, {latest_url: latest_response,
+                               page_url(1): {"body": [releases_fixture[1]]}},
+                      [latest_url, page_url(1)], version=stable_tag)
+
+    companion_page = [dict(releases_fixture[0], tag_name=f"v0.15.22-appstore.{i}")
+                      for i in range(100)]
+    resolver_case("pos_resolver_finds_stable_on_page_two", {
+        latest_url: {"body": releases_fixture[0]},
+        page_url(1): {"body": companion_page},
+        page_url(2): {"body": [releases_fixture[1]]},
+    }, [latest_url, page_url(1), page_url(2)], version=stable_tag)
+    resolver_case("neg_resolver_page_limit_is_not_exhaustion", {
+        latest_url: {"status": 22},
+        **{page_url(i): {"body": companion_page} for i in range(1, 11)},
+    }, [latest_url] + [page_url(i) for i in range(1, 11)], error="limit of 10 pages")
+
+    for suffix, releases in [("empty", []), ("companion_only", [releases_fixture[0]])]:
+        resolver_case("neg_resolver_exhausted_" + suffix, {
+            latest_url: {"status": 22}, page_url(1): {"body": releases},
+        }, [latest_url, page_url(1)], error="No published stable release ships a verifiable")
+    for suffix, response, error in [
+        ("transport", {"status": 22}, "could not fetch release-list page 1"),
+        ("api_error_object", {"body": {"message": "rate limited"}}, "invalid release list on page 1"),
+        ("malformed", {"body": "{broken"}, "invalid release list on page 1"),
+    ]:
+        resolver_case("neg_resolver_list_" + suffix, {
+            latest_url: {"status": 22}, page_url(1): response, redirect_url: {"status": 22},
+        }, [latest_url, page_url(1), redirect_url], error=error)
+    resolver_case("neg_resolver_partial_list_failure", {
+        latest_url: {"body": releases_fixture[0]}, page_url(1): {"body": companion_page},
+        page_url(2): {"status": 28}, redirect_url: {"status": 22},
+    }, [latest_url, page_url(1), page_url(2), redirect_url], error="could not fetch release-list page 2")
+
+    fallback = {latest_url: {"status": 22}, page_url(1): {"status": 22},
+                redirect_url: {"body": f"https://github.com/fixture/frankenterm/releases/tag/{stable_tag}"}}
+    fallback_requests = [latest_url, page_url(1), redirect_url]
+    required_files = [asset_name, asset_name + ".sha256", asset_name + ".minisig"]
+    resolver_case("pos_resolver_redirect_requires_all_files", {
+        **fallback, **{asset_base + name: {} for name in required_files},
+    }, fallback_requests + [asset_base + name for name in required_files], version=stable_tag)
+    for missing_index in (1, 2):
+        requested = required_files[:missing_index + 1]
+        resolver_case("neg_resolver_redirect_missing_" + ("checksum" if missing_index == 1 else "signature"), {
+            **fallback, **{asset_base + name: {} for name in requested},
+            asset_base + requested[-1]: {"status": 22},
+        }, fallback_requests + [asset_base + name for name in requested],
+            error="cannot provide required file " + requested[-1])
+    for suffix, overrides, needed_files in [
+        ("checksum", {"CHECKSUM": "a" * 64}, [asset_name, asset_name + ".minisig"]),
+        ("checksum_url_no_verify", {"CHECKSUM_URL": "https://fixture.invalid/checksum", "NO_MINISIGN": "1"}, [asset_name]),
+        ("no_verify", {"NO_MINISIGN": "1"}, [asset_name, asset_name + ".sha256"]),
+        ("signature_url", {"MINISIGN_SIGNATURE_URL": "https://fixture.invalid/signature"}, [asset_name, asset_name + ".sha256"]),
+    ]:
+        resolver_case("pos_resolver_redirect_override_" + suffix, {
+            **fallback, **{asset_base + name: {} for name in needed_files},
+        }, fallback_requests + [asset_base + name for name in needed_files],
+            version=stable_tag, overrides=overrides)
+    for suffix, overrides in [("source", {"FROM_SOURCE": "1"}),
+                              ("custom_artifact", {"ARTIFACT_URL": "https://fixture.invalid/archive.tar.xz"})]:
+        resolver_case("pos_resolver_" + suffix + "_needs_no_release_assets", {
+            latest_url: {"status": 22},
+            page_url(1): {"body": [dict(releases_fixture[1], assets=[])]},
+        }, [latest_url, page_url(1)], version=stable_tag, overrides=overrides)
+    resolver_case("pos_resolver_explicit_version_skips_network", {}, [],
+                  version=releases_fixture[0]["tag_name"],
+                  overrides={"VERSION": releases_fixture[0]["tag_name"]})
+    resolver_case("neg_resolver_redirect_refuses_companion", {
+        **fallback, redirect_url: {"body": "https://github.com/fixture/frankenterm/releases/tag/v0.15.22-appstore.15"},
+    }, fallback_requests, error="non-stable companion/prerelease tag")
+
     # 9. Negative: 1-byte tamper in offline archive fails closed with zero mutation to --dest
     import hashlib, tarfile
     dest_dir = td_path / "dest_bin"

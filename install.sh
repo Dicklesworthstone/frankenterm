@@ -389,7 +389,8 @@ resolve_version() {
   fi
   # A binary install needs this platform's archive, its checksum sidecar
   # (unless --checksum/--checksum-url supplies the digest) and its DSR
-  # signature (unless --no-verify). The newest release need not ship them: a
+  # signature (unless --no-verify or an explicit signature URL). The newest
+  # release need not ship them: a
   # macOS-only or `-appstore.*` companion release can sit at `/releases/latest`
   # while the newest cross-platform stable release sits in the release list.
   local binary_release=0
@@ -398,7 +399,7 @@ resolve_version() {
     binary_release=1
     needed=("$ASSET")
     [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || needed+=("${ASSET}.sha256")
-    [ "$NO_MINISIGN" -eq 1 ] || needed+=("${ASSET}.minisig")
+    [ "$NO_MINISIGN" -eq 1 ] || [ -n "${MINISIGN_SIGNATURE_URL:-}" ] || needed+=("${ASSET}.minisig")
   fi
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases"
   local latest_json latest_tag raw_latest_tag releases_json resolved status
@@ -426,66 +427,110 @@ except Exception:
       return 0
     fi
   fi
-  if [ -n "$latest_tag" ] || [ -n "$raw_latest_tag" ]; then
-    local display_latest="${latest_tag:-$raw_latest_tag}"
-    releases_json=$(curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
-      "$api?per_page=100" 2>/dev/null || true)
-    if [ "$binary_release" -eq 0 ]; then
-      status=0
-      resolved=$(printf '%s' "$releases_json" | release_tag_with_assets) || status=$?
-      if [ "$status" -eq 0 ]; then
-        VERSION="$resolved"
-        info "Skipping non-stable latest tag ($display_latest); using newest stable release $VERSION"
-        return 0
-      fi
-    else
-      status=0
-      resolved=$(printf '%s' "$releases_json" | release_tag_with_assets "${needed[@]}") || status=$?
-      if [ "$status" -eq 0 ]; then
-        VERSION="$resolved"
-        info "Skipping $display_latest (not a verifiable stable release for $ASSET); using $VERSION"
-        return 0
-      fi
-      if [ "$status" -ne 1 ] && [ "$status" -ne 2 ]; then
-        err "The latest release ($display_latest) cannot serve $ASSET, and the GitHub release list"
-        err "could not be read to find a stable release. Retry later, or pass --version vX.Y.Z or --from-source."
-        return 1
-      fi
-      err "No published stable release ships a verifiable $ASSET for ${OS:-this OS}/${ARCH:-this arch} yet"
-      err "(GitHub latest tag $display_latest is not a verifiable stable release for this target). Nothing was installed. Options:"
-      resolved=$(printf '%s' "$releases_json" | release_tag_with_assets "$ASSET") || resolved=""
-      if [ -n "$resolved" ]; then
-        err "  * $resolved ships $ASSET but not every file this installer requires"
-        err "    (${needed[*]}). The installer published with that release can install it:"
-        err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${resolved}/install.sh | bash -s -- --version ${resolved}"
-      fi
-      err "  * build from source:  --from-source"
+  # /latest may be absent even when usable releases exist. Always consult the
+  # list after an unsuitable/missing latest response. Companion releases may
+  # fill several pages, so bound the search to 1,000 releases and at most 100
+  # seconds of list requests. Hitting the bound is not an exhaustive search.
+  local display_latest="${latest_tag:-${raw_latest_tag:-unavailable}}"
+  local page page_count max_pages=10 list_complete=0 list_error="" archive_only_tag=""
+  for ((page = 1; page <= max_pages; page++)); do
+    if ! releases_json=$(curl -fsSL --connect-timeout 5 --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+      "$api?per_page=100&page=$page" 2>/dev/null); then
+      list_error="could not fetch release-list page $page"
+      break
+    fi
+    # Distinguish an exhausted list (including a companion-only list) from an
+    # API error object or malformed response. Validate the fields consumed by
+    # release_tag_with_assets before treating its no-candidate result as final.
+    if ! page_count=$(printf '%s' "$releases_json" | python3 -c '
+import json, sys
+try:
+    releases = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if not isinstance(releases, list) or len(releases) > 100:
+    sys.exit(1)
+for release in releases:
+    if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
+        sys.exit(1)
+    if not isinstance(release.get("draft"), bool) or not isinstance(release.get("prerelease"), bool):
+        sys.exit(1)
+    assets = release.get("assets")
+    if not isinstance(assets, list) or any(
+        not isinstance(asset, dict) or not isinstance(asset.get("name"), str) for asset in assets
+    ):
+        sys.exit(1)
+print(len(releases))
+' 2>/dev/null); then
+      list_error="received an invalid release list on page $page"
+      break
+    fi
+    status=0
+    resolved=$(printf '%s' "$releases_json" | release_tag_with_assets ${needed[@]+"${needed[@]}"}) || status=$?
+    if [ "$status" -eq 0 ]; then
+      VERSION="$resolved"
+      info "Using stable release $VERSION from release-list page $page (latest: $display_latest)"
+      return 0
+    fi
+    if [ "$status" -ne 1 ] && [ "$status" -ne 2 ]; then
+      list_error="could not inspect release-list page $page"
+      break
+    fi
+    if [ "$binary_release" -eq 1 ] && [ -z "$archive_only_tag" ]; then
+      archive_only_tag=$(printf '%s' "$releases_json" | release_tag_with_assets "$ASSET") || archive_only_tag=""
+    fi
+    if [ "$page_count" -lt 100 ]; then
+      list_complete=1
+      break
+    fi
+  done
+  if [ -z "$list_error" ]; then
+    if [ "$list_complete" -eq 0 ]; then
+      err "Stable release search reached its limit of $max_pages pages (1,000 releases) without a compatible release."
+      err "Older releases were not checked. Specify --version vX.Y.Z to select a known release."
       return 1
     fi
+    if [ "$binary_release" -eq 1 ]; then
+      err "No published stable release ships a verifiable $ASSET for ${OS:-this OS}/${ARCH:-this arch} yet"
+      err "(GitHub latest tag $display_latest is not a verifiable stable release for this target). Nothing was installed. Options:"
+      if [ -n "$archive_only_tag" ]; then
+        err "  * $archive_only_tag ships $ASSET but not every file this installer requires"
+        err "    (${needed[*]}). The installer published with that release can install it:"
+        err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${archive_only_tag}/install.sh | bash -s -- --version ${archive_only_tag}"
+      fi
+      err "  * build from source:  --from-source"
+    else
+      err "No published stable release was found. Specify --version <tag> to select an explicit release."
+    fi
+    return 1
   fi
-  # The API is unreachable or rate-limited: the /releases/latest redirect still
-  # names the tag, and a HEAD request shows whether it ships this archive.
+  # Only an unavailable/invalid API response permits the redirect fallback.
+  # Probe every required file, using the same override rules as list selection.
+  info "GitHub $list_error; trying the latest-release redirect"
   resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     -o /dev/null -w '%{url_effective}' \
     "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
     | sed -E 's|.*/tag/||' || true)
   if [ -n "$resolved" ] && [[ "$resolved" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    if [ "$binary_release" -eq 0 ] ||
-        curl -fsSIL --max-time 15 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null \
-          "https://github.com/${OWNER}/${REPO}/releases/download/${resolved}/${ASSET}" 2>/dev/null; then
-      VERSION="$resolved"
-      info "Resolved latest stable version (via redirect): $VERSION"
-      return 0
-    fi
-    err "The latest release ($resolved) ships no $ASSET, and the GitHub API is unreachable"
-    err "to find one that does. Retry later, or pass --version vX.Y.Z or --from-source."
-    return 1
+    local required_asset
+    for required_asset in ${needed[@]+"${needed[@]}"}; do
+      if ! curl -fsSIL --max-time 15 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null \
+          "https://github.com/${OWNER}/${REPO}/releases/download/${resolved}/${required_asset}" 2>/dev/null; then
+        err "The latest release ($resolved) cannot provide required file $required_asset."
+        err "GitHub $list_error; retry later or specify --version vX.Y.Z or --from-source."
+        return 1
+      fi
+    done
+    VERSION="$resolved"
+    info "Resolved latest stable version (via redirect): $VERSION"
+    return 0
   elif [ -n "$resolved" ] && [[ "$resolved" == v* ]]; then
     err "GitHub /releases/latest currently points to non-stable companion/prerelease tag ($resolved),"
-    err "and the GitHub API could not locate a verifiable stable release. Pass --version vX.Y.Z or --from-source."
+    err "and GitHub $list_error. Pass --version vX.Y.Z or --from-source."
     return 1
   fi
-  err "Could not resolve the latest stable release. Retry when GitHub is reachable or specify --version vX.Y.Z."
+  err "GitHub $list_error, and its latest-release redirect could not resolve a stable tag."
+  err "Retry when GitHub is reachable or specify --version vX.Y.Z."
   return 1
 }
 
