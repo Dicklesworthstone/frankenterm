@@ -44,6 +44,7 @@ class Node extends Events {
 
 function fixture(t, options = {}) {
   const doc = new Events();
+  doc.visibilityState = options.hidden ? "hidden" : "visible";
   doc.documentElement = { dataset: {} };
   doc.body = new Node(doc, "body"); doc.activeElement = doc.body;
   doc.fonts = { load: async () => [] };
@@ -109,7 +110,7 @@ function fixture(t, options = {}) {
     setStreamState(state) { this.streamState = state; this.dirty = true; }
     reportError(error) { this.error = error; this.dirty = true; }
   }
-  const rendererGate = deferred(), modelGate = deferred(), initGate = deferred();
+  const rendererGate = deferred(), modelGate = deferred(), initGate = deferred(), searchGate = deferred();
   class Renderer {
     constructor() { this.fits = []; this.patches = 0; this.renders = 0; this.destroyed = 0; renderers.push(this); }
     apiContract() { return options.badContract ? { apiLine: "other", apiVersion: "9" }
@@ -136,6 +137,7 @@ function fixture(t, options = {}) {
   const rendererModule = { default: async () => {}, FrankenTermWeb: Renderer };
   const fetchImpl = async (url, init) => {
     const request = { url: new URL(url), ...init }; requests.push(request);
+    if (request.url.pathname.endsWith("/search") && options.pendingSearch) return searchGate.promise;
     if (request.url.pathname.endsWith("/search")) return new Response(JSON.stringify({ ok: true, data: {
       results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "needle" }], total: 1,
     } }));
@@ -165,6 +167,8 @@ function fixture(t, options = {}) {
   const openPane = (id = "7") => { get("pane-output-id").value = id; get("pane-output-form").requestSubmit(); };
   return { app, doc, host, get, sources, requests, viewers, renderers, frames, timers, intervals, observers,
     selection, frame, openPane,
+    visibility(state) { doc.visibilityState = state; doc.emit("visibilitychange"); },
+    resolveSearch: (response) => searchGate.resolve(response),
     resolveModel: () => modelGate.resolve(viewerModule), rejectModel: () => modelGate.reject(new Error("missing model")),
     resolveRenderer: () => rendererGate.resolve(rendererModule), rejectRenderer: () => rendererGate.reject(new Error("missing renderer")),
     resolveRendererInit: () => initGate.resolve(),
@@ -429,4 +433,121 @@ test("session disposal fences late WASM imports and pending GPU initialization",
   assert.ok(gpu.sources.every((source) => source.closed));
   assert.equal(gpu.get("screen-text").textContent, "");
   assert.equal(gpu.doc.documentElement.dataset.viewerReady, "locked");
+});
+
+test("an initially hidden fleet starts no stream, snapshot, interval or painting loop", async (t) => {
+  const f = fixture(t, { hidden: true }); await f.app.ready;
+  assert.equal(f.sources.length, 0);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.doc.documentElement.dataset.viewerReady, "suspended");
+  assert.ok(f.renderers.every((renderer) => renderer.patches === 0 && renderer.renders === 0));
+  f.host.emit("pageshow"); f.app.resume();
+  assert.equal(f.frames.size, 0, "manual resume cannot override document visibility");
+  f.visibility("visible"); f.visibility("visible"); await flush();
+  assert.equal(f.fleetSources().length, 1);
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.frames.size, 1);
+  assert.equal(f.intervals.size, 1);
+  assert.equal(f.doc.documentElement.dataset.viewerReady, "1");
+  assert.ok(f.renderers[0].patches > 0);
+});
+
+test("hiding aborts snapshots and search, closes output and rejects late results", async (t) => {
+  const f = fixture(t, { pendingSnapshots: true, pendingSearch: true }); await f.app.ready;
+  f.openPane();
+  const output = f.sources.at(-1);
+  output.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
+    pane_id: 7, segment_id: 9, seq: 2, content: "retained before hiding",
+  } }, "delta-v1:pane:7:9");
+  f.frame();
+  f.get("history-search-open").emit("click");
+  f.get("history-query").value = "needle";
+  f.get("history-search-form").requestSubmit(); await flush();
+  assert.equal(f.requests.length, 3);
+  const model = f.viewers[0], paints = f.renderers[0].renders;
+  f.visibility("hidden"); await flush();
+  assert.ok(f.requests.every((request) => request.signal.aborted));
+  assert.ok(f.sources.every((source) => source.closed));
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.doc.documentElement.dataset.viewerReady, "suspended");
+  assert.equal(f.get("history-search").open, false);
+  assert.equal(f.get("history-results").children.length, 0);
+  output.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
+    pane_id: 7, segment_id: 10, seq: 3, content: "late content must not be accepted",
+  } }, "delta-v1:pane:7:10");
+  f.resolveSearch(new Response(JSON.stringify({ ok: true, data: {
+    results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "late needle" }], total: 1,
+  } }))); await flush();
+  assert.equal(f.get("pane-output-text").value, "retained before hiding");
+  assert.equal(f.get("history-results").children.length, 0);
+  assert.equal(f.renderers[0].renders, paints);
+  assert.equal(model.bodies.length, 0);
+  f.visibility("visible"); await flush();
+  assert.equal(f.viewers[0], model);
+  const resumedOutput = f.sources.filter((source) => !source.closed && source.url.pathname.endsWith("/stream/deltas"));
+  assert.equal(resumedOutput.length, 1);
+  assert.equal(resumedOutput[0].url.searchParams.get("since_id"), "9");
+  assert.equal(f.get("pane-output-text").value, "retained before hiding");
+  assert.equal(f.frames.size, 1);
+  assert.equal(f.intervals.size, 1);
+});
+
+test("visibility resume preserves an explicit pane pause and its received cursor", async (t) => {
+  const f = fixture(t); await f.app.ready; await flush();
+  f.openPane();
+  f.sources.at(-1).message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
+    pane_id: 7, segment_id: 9, seq: 2, content: "paused output",
+  } }, "delta-v1:pane:7:9");
+  f.frame();
+  f.get("pane-output-pause").emit("click");
+  f.visibility("hidden"); f.visibility("visible"); await flush();
+  assert.equal(f.sources.filter((source) => !source.closed && source.url.pathname.endsWith("/stream/deltas")).length, 0);
+  assert.equal(f.get("pane-output-pause").textContent, "Resume");
+  assert.equal(f.get("pane-output-text").value, "paused output");
+  f.get("pane-output-pause").emit("click");
+  assert.equal(f.sources.at(-1).url.searchParams.get("since_id"), "9");
+  assert.equal(f.sources.at(-1).closed, false);
+});
+
+test("queued old animation and refresh callbacks cannot create work after hide and show", async (t) => {
+  const f = fixture(t); await f.app.ready; await flush();
+  const staleFrame = [...f.frames.values()][0];
+  const staleRefresh = [...f.intervals.values()][0].fn;
+  f.visibility("hidden");
+  staleFrame(); staleRefresh();
+  assert.equal(f.frames.size, 0);
+  f.visibility("visible"); await flush();
+  const frames = [...f.frames.keys()], requests = f.requests.length;
+  const renders = f.renderers[0].renders;
+  staleFrame(); staleRefresh(); await flush();
+  assert.deepEqual([...f.frames.keys()], frames);
+  assert.equal(f.requests.length, requests);
+  assert.equal(f.renderers[0].renders, renders);
+  assert.equal(f.fleetSources().filter((source) => !source.closed).length, 1);
+  assert.equal(f.intervals.size, 1);
+  f.frame();
+  assert.equal(f.frames.size, 1, "the resumed frame keeps sole scheduling ownership");
+});
+
+test("hidden import completion cannot paint and pagehide wins over a visibility event", async (t) => {
+  const f = fixture(t, { pendingModel: true, pendingRenderer: true });
+  f.visibility("hidden");
+  f.resolveModel(); f.resolveRenderer(); await f.app.ready;
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.sources.length, 0);
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.doc.documentElement.dataset.viewerReady, "suspended");
+  assert.ok(f.renderers.every((renderer) => renderer.patches === 0 && renderer.renders === 0));
+  f.host.emit("pagehide");
+  f.visibility("visible"); await flush();
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.frames.size, 0);
+  f.host.emit("pageshow"); await flush();
+  assert.equal(f.fleetSources().length, 1);
+  assert.equal(f.frames.size, 1);
+  assert.ok(f.renderers[0].patches > 0);
 });

@@ -591,6 +591,8 @@ export function mountFleetApp({
   let rendererFailed = false;
   let preferText = false;
   let active = false;
+  let pagePresent = true;
+  let activityGeneration = 0;
   let disposed = false;
   let networkActive = false;
   let refreshTimer = null;
@@ -620,7 +622,8 @@ export function mountFleetApp({
     setText(textToggle, asText ? "Use canvas view" : "Use text view");
     const mode = viewer ? (asText ? "text" : "canvas") : modelFailed ? "capture-only" : "loading";
     doc.documentElement.dataset.viewerMode = mode;
-    doc.documentElement.dataset.viewerReady = viewer ? "1" : modelFailed ? "capture-only" : "loading";
+    doc.documentElement.dataset.viewerReady = !active ? "suspended"
+      : viewer ? "1" : modelFailed ? "capture-only" : "loading";
     const message = modelFailed
       ? "Fleet inventory is unavailable. Search captured history or open a pane by ID above; both tools remain available."
       : !viewer ? "Loading fleet inventory. Search captured history or open a pane by ID above."
@@ -698,7 +701,10 @@ export function mountFleetApp({
     snapshots.start();
     stream.start();
     refresh();
-    refreshTimer = setRepeating(refresh, REFRESH_MS);
+    const expected = activityGeneration;
+    refreshTimer = setRepeating(() => {
+      if (expected === activityGeneration) refresh();
+    }, REFRESH_MS);
   }
 
   const inspector = mountPaneOutput({
@@ -714,10 +720,14 @@ export function mountFleetApp({
       return viewer?.selectedPaneId();
     },
   });
+  // A directly mounted, initially hidden page must not open manual output
+  // while its model imports are pending. The auth owner also defers mounting.
+  inspector.suspend();
   const historySearch = mountHistorySearch({
     document: doc,
     inspectCapture: (hit) => inspector.openCapture(hit),
-    readBody: (path, signal) => readSnapshot(path, apiRoot, fetchImpl, signal, 8 * 1024 * 1024),
+    readBody: (path, signal) => active ? readSnapshot(path, apiRoot, fetchImpl, signal, 8 * 1024 * 1024)
+      : Promise.reject(new Error("viewer suspended")),
     inspectPane: (paneId) => {
       // Route the exact captured identity through the same validated native
       // form as a manual Open action, never through the mutable fleet row.
@@ -785,8 +795,17 @@ export function mountFleetApp({
   if (resizeObserver) resizeObserver.observe(viewport);
   else host.addEventListener("resize", resize);
 
+  function scheduleFrame() {
+    const expected = activityGeneration;
+    frameHandle = requestFrame(() => {
+      // Cancelling a frame does not revoke a callback already queued by the
+      // browser. Do not let it replace a resumed generation's frame handle.
+      if (!active || activityGeneration !== expected) return;
+      frameHandle = null;
+      frame();
+    });
+  }
   function frame() {
-    frameHandle = null;
     if (!active) return;
     const time = now();
     if (viewer) {
@@ -797,24 +816,28 @@ export function mountFleetApp({
       } catch (_) { failModel(); }
     }
     inspector.render();
-    frameHandle = requestFrame(frame);
+    scheduleFrame();
   }
   function resume() {
-    if (active || disposed) return;
+    if (active || disposed || !pagePresent || doc.visibilityState === "hidden") return;
     active = true;
+    activityGeneration += 1;
     inspector.restore();
+    updateMode();
     resize();
     startFleet();
-    frameHandle = requestFrame(frame);
+    scheduleFrame();
   }
   function suspend() {
     if (!active) return;
     active = false;
+    activityGeneration += 1;
     stopFleet();
     inspector.suspend();
     historySearch.suspend();
     if (frameHandle !== null) cancelFrame(frameHandle);
     frameHandle = null;
+    updateMode();
   }
   // Session retirement is terminal. A new login reloads the page so neither
   // captured data nor an old stream cursor crosses the authentication boundary.
@@ -840,8 +863,12 @@ export function mountFleetApp({
     doc.documentElement.dataset.viewerReady = "locked";
   }
   if (managePageLifecycle) {
-    host.addEventListener("pagehide", suspend);
-    host.addEventListener("pageshow", resume);
+    host.addEventListener("pagehide", () => { pagePresent = false; suspend(); });
+    host.addEventListener("pageshow", () => { pagePresent = true; resume(); });
+    doc.addEventListener("visibilitychange", () => {
+      if (doc.visibilityState === "hidden") suspend();
+      else resume();
+    });
   }
   updateMode();
   resume();
@@ -855,7 +882,7 @@ export function mountFleetApp({
     viewer = new FleetViewer(80, 24);
     viewer.setTime(now());
     viewer.init();
-    present();
+    if (active) present();
     snapshots = createFleetRefresh(viewer, { apiRoot, fetchImpl, setTimer, clearTimer });
     stream = createFleetStream(snapshots, { apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh });
     updateMode();
@@ -918,13 +945,18 @@ export function mountAuthenticatedFleet({
   const logout = element("web-auth-logout");
   const controls = element("web-auth-controls");
   let app = null;
+  let appSuspended = false;
   let mounted = false;
   let retired = false;
-  let active = true;
+  let pagePresent = true;
+  let active = doc.visibilityState !== "hidden";
   let disposed = false;
   let required = false;
   let sessionEpoch = null;
+  let sessionVerified = false;
   let generation = 0;
+  let activityGeneration = 0;
+  let timerGeneration = 0;
   let pollTimer = null;
   let expiryTimer = null;
   let pending = null;
@@ -933,19 +965,13 @@ export function mountAuthenticatedFleet({
   catch (_) { /* server expiry and status polling remain authoritative */ }
 
   function clearTimers() {
+    timerGeneration += 1;
     if (pollTimer !== null) clearTimer(pollTimer);
     if (expiryTimer !== null) clearTimer(expiryTimer);
     pollTimer = expiryTimer = null;
   }
 
-  function lock(message) {
-    generation += 1;
-    clearTimers();
-    pending?.abort();
-    pending = null;
-    app?.dispose();
-    app = null;
-    retired ||= mounted;
+  function showGate(message, state = "locked") {
     token.value = "";
     element("inspect-toolbar").hidden = true;
     element("workspace").hidden = true;
@@ -956,7 +982,20 @@ export function mountAuthenticatedFleet({
     token.disabled = submit.disabled = false;
     form.setAttribute("aria-busy", "false");
     status.textContent = message;
-    doc.documentElement.dataset.viewerReady = "locked";
+    doc.documentElement.dataset.viewerReady = state;
+  }
+
+  function lock(message) {
+    generation += 1;
+    sessionVerified = false;
+    clearTimers();
+    pending?.abort();
+    pending = null;
+    app?.dispose();
+    app = null;
+    appSuspended = false;
+    retired ||= mounted;
+    showGate(message);
   }
 
   // One bounded control request at a time. The body is either bounded status
@@ -1009,20 +1048,28 @@ export function mountAuthenticatedFleet({
   function schedule(session) {
     clearTimers();
     if (!active) return;
+    const expected = timerGeneration;
+    const current = () => active && !disposed && timerGeneration === expected;
     if (session.required) expiryTimer = setTimer(() => {
+      if (!current()) return;
       lock("Your session expired. Sign in again to reconnect.");
     }, Math.min(86_400_000, Math.max(1, session.expires_at_ms - now())));
     // Revalidate revocation from another tab and server restarts. This also
     // detects a server that has newly enabled authentication.
-    pollTimer = setTimer(() => { pollTimer = null; void check(); }, 15_000);
+    pollTimer = setTimer(() => {
+      if (!current()) return;
+      pollTimer = null;
+      void check();
+    }, 15_000);
   }
 
   async function check() {
-    if (!active || pending) return;
+    if (!active || pending || disposed) return;
     const expected = generation;
+    const expectedActivity = activityGeneration;
     try {
       const session = await request("GET");
-      if (!active || generation !== expected) return;
+      if (!active || generation !== expected || activityGeneration !== expectedActivity) return;
       required = session.required;
       if (!session.authenticated) {
         lock("Enter the access token configured by the operator to view this fleet.");
@@ -1039,6 +1086,7 @@ export function mountAuthenticatedFleet({
         return;
       }
       sessionEpoch = nextEpoch;
+      sessionVerified = true;
       panel.hidden = true;
       element("inspect-toolbar").hidden = false;
       element("workspace").hidden = false;
@@ -1047,13 +1095,14 @@ export function mountAuthenticatedFleet({
       if (!app) {
         const appEpoch = sessionEpoch;
         const appGeneration = generation;
-        const current = () => active && generation === appGeneration;
+        const current = () => active && sessionVerified && generation === appGeneration;
         const guardedFetch = async (url, init = {}) => {
           if (!current()) throw new Error("viewer session retired");
+          const requestActivity = activityGeneration;
           const headers = new Headers(init.headers);
           if (appEpoch !== null) headers.set("x-ft-session-epoch", appEpoch);
           const response = await fetchImpl(url, { ...init, headers, redirect: "error" });
-          if (!current()) {
+          if (!current() || activityGeneration !== requestActivity) {
             void response.body?.cancel().catch(() => {});
             throw new Error("viewer session retired");
           }
@@ -1067,11 +1116,12 @@ export function mountAuthenticatedFleet({
         // so the server rejects an old viewer reconnecting under a new grant.
         function SessionEventSource(url, options) {
           if (!current()) throw new Error("viewer session retired");
+          const sourceActivity = activityGeneration;
           const boundUrl = new URL(url, apiRoot);
           if (appEpoch !== null) boundUrl.searchParams.set("session_epoch", appEpoch);
           const source = new EventSourceImpl(boundUrl, options);
           if (appEpoch !== null) source.addEventListener("error", () => {
-            if (current()) void check();
+            if (current() && activityGeneration === sourceActivity) void check();
           });
           return source;
         }
@@ -1079,10 +1129,13 @@ export function mountAuthenticatedFleet({
         app = mountApp({ document: doc, window: host, apiRoot, fetchImpl: guardedFetch,
           EventSourceImpl: SessionEventSource, managePageLifecycle: false });
         mounted = true;
+      } else if (appSuspended) {
+        appSuspended = false;
+        app.resume();
       }
       schedule(session);
     } catch (_) {
-      if (active && generation === expected) {
+      if (active && generation === expected && activityGeneration === expectedActivity) {
         lock("The server's session status could not be verified. Retry when it is available.");
       }
     }
@@ -1098,17 +1151,18 @@ export function mountAuthenticatedFleet({
       return;
     }
     const expected = generation;
+    const expectedActivity = activityGeneration;
     token.disabled = submit.disabled = true;
     form.setAttribute("aria-busy", "true");
     status.textContent = "Signing in…";
     try {
       await request("POST", secret);
-      if (active && generation === expected) {
+      if (active && generation === expected && activityGeneration === expectedActivity) {
         channel?.postMessage({ type: "session-changed" });
         host.location.reload();
       }
     } catch (_) {
-      if (active && generation === expected) {
+      if (active && generation === expected && activityGeneration === expectedActivity) {
         lock("Sign-in was not completed. Check the token and local server address, then retry.");
       }
     }
@@ -1117,13 +1171,14 @@ export function mountAuthenticatedFleet({
     if (!active) return;
     lock("Signing out…");
     const expected = generation;
+    const expectedActivity = activityGeneration;
     try {
       await request("DELETE");
-      if (!active || generation !== expected) return;
+      if (!active || generation !== expected || activityGeneration !== expectedActivity) return;
       channel?.postMessage({ type: "signed-out" });
       status.textContent = "Signed out. Sign in to reconnect.";
     } catch (_) {
-      if (active && generation === expected) {
+      if (active && generation === expected && activityGeneration === expectedActivity) {
         status.textContent = "The viewer is locked, but server sign-out could not be confirmed. Retry sign-out or wait for the session to expire.";
         controls.hidden = false;
       }
@@ -1135,20 +1190,40 @@ export function mountAuthenticatedFleet({
       lock("Your session changed in another tab. Check the connection or sign in to reconnect.");
     }
   });
-  function suspend() {
+  function pause() {
     if (!active) return;
     active = false;
+    activityGeneration += 1;
+    sessionVerified = false;
+    clearTimers();
+    pending?.abort();
+    pending = null;
+    if (app) { app.suspend(); appSuspended = true; }
+    showGate("Checking your session before reconnecting…", "suspended");
+  }
+  function activate() {
+    if (active || disposed || !pagePresent || doc.visibilityState === "hidden") return;
+    active = true;
+    activityGeneration += 1;
+    void check();
+  }
+  // Visibility is a pause, not a new grant: retain the bounded model/cursors,
+  // but let no consumer resume until status verifies the same session epoch.
+  // Navigation/BFCache is a terminal retirement even if the tab was hidden first.
+  function suspend() {
+    pagePresent = false;
+    pause();
     lock("Checking your session before reconnecting…");
   }
   function resume() {
-    if (active || disposed) return;
-    active = true;
-    void check();
+    pagePresent = true;
+    activate();
   }
   host.addEventListener("pagehide", suspend);
   host.addEventListener("pageshow", resume);
   doc.addEventListener("visibilitychange", () => {
-    if (doc.visibilityState === "visible" && active && app) void check();
+    if (doc.visibilityState === "hidden") pause();
+    else activate();
   });
   lock("Checking your session…");
   return { ready: check(), suspend, resume, dispose() { suspend(); disposed = true; channel?.close(); } };

@@ -24,8 +24,9 @@ class Events {
   }
 }
 
-function fixture(t, initial = { required: true, authenticated: false }) {
+function fixture(t, initial = { required: true, authenticated: false }, { hidden = false } = {}) {
   const doc = new Events();
+  doc.visibilityState = hidden ? "hidden" : "visible";
   doc.documentElement = { dataset: {} };
   const nodes = new Map();
   doc.getElementById = (id) => {
@@ -49,10 +50,10 @@ function fixture(t, initial = { required: true, authenticated: false }) {
     close() { this.closed = true; }
   };
   const requests = [], apps = [], sources = [], timers = new Map();
-  let sequence = 0;
+  let sequence = 0, time = 10_000;
   let responder = async (request) => request.method === "GET" ? reply(initial) : new Response("{}");
   const gate = mountAuthenticatedFleet({
-    document: doc, window: host, now: () => 10_000,
+    document: doc, window: host, now: () => time,
     EventSourceImpl: class extends Events {
       static CLOSED = 2;
       constructor(url) { super(); this.url = new URL(url); sources.push(this); }
@@ -63,7 +64,9 @@ function fixture(t, initial = { required: true, authenticated: false }) {
       return responder(request);
     },
     mountApp: (options) => {
-      const app = { options, disposals: 0, dispose() { this.disposals += 1; } };
+      const app = { options, disposals: 0, suspensions: 0, resumptions: 0,
+        dispose() { this.disposals += 1; }, suspend() { this.suspensions += 1; },
+        resume() { this.resumptions += 1; } };
       apps.push(app);
       return app;
     },
@@ -73,6 +76,8 @@ function fixture(t, initial = { required: true, authenticated: false }) {
   t.after(() => gate.dispose());
   return { gate, doc, host, channels, requests, apps, sources, timers, get: doc.getElementById,
     reloads: () => reloads, respond: (fn) => { responder = fn; },
+    setTime: (value) => { time = value; },
+    visibility(state) { doc.visibilityState = state; doc.emit("visibilitychange"); },
     timer(delay) {
       const match = [...timers].find(([, timer]) => timer.delay === delay);
       assert.ok(match, `missing timer ${delay}`);
@@ -249,4 +254,159 @@ test("malformed or oversized session status is refused, never a legacy-mode bypa
   f.get("web-auth-retry").emit("click"); await flush();
   assert.equal(f.apps.length, 0);
   assert.match(f.get("web-auth-status").textContent, /could not be verified/);
+});
+
+test("an initially hidden tab waits for visibility before authentication or viewer startup", async (t) => {
+  const f = fixture(t, authorized(), { hidden: true }); await f.gate.ready;
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.apps.length, 0);
+  assert.equal(f.timers.size, 0);
+  f.host.emit("pageshow"); await flush();
+  assert.equal(f.requests.length, 0, "pageshow alone must not activate a background tab");
+  f.visibility("visible"); f.visibility("visible"); await flush();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.apps.length, 1);
+  assert.equal(f.get("workspace").hidden, false);
+});
+
+test("visibility pauses once and resumes the same viewer only after same-epoch verification", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const app = f.apps[0];
+  const oldTimers = [...f.timers.values()].map((timer) => timer.fn);
+  f.visibility("hidden"); f.visibility("hidden");
+  assert.equal(app.suspensions, 1);
+  assert.equal(app.disposals, 0);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.get("workspace").hidden, true);
+  assert.equal(f.get("inspect-toolbar").hidden, true);
+  const url = new URL("http://127.0.0.1:9999/panes");
+  await assert.rejects(app.options.fetchImpl(url), /retired/);
+  assert.throws(() => new app.options.EventSourceImpl(url), /retired/);
+
+  const status = deferred(); f.respond(() => status.promise);
+  f.visibility("visible"); f.host.emit("pageshow");
+  assert.equal(app.resumptions, 0);
+  assert.equal(f.get("workspace").hidden, true);
+  assert.equal(f.requests.length, 2);
+  await assert.rejects(app.options.fetchImpl(url), /retired/, "visibility is not auth admission");
+  status.resolve(reply(authorized())); await flush();
+  assert.equal(app.resumptions, 1);
+  assert.equal(app.disposals, 0);
+  assert.equal(f.apps.length, 1);
+  assert.equal(f.reloads(), 0);
+  assert.equal(f.get("workspace").hidden, false);
+  for (const callback of oldTimers) callback();
+  await flush();
+  assert.equal(app.disposals, 0, "a queued old expiry cannot retire the resumed session");
+  assert.equal(f.requests.length, 2, "a queued old poll cannot start background work");
+  f.respond(async () => new Response("{}"));
+  await app.options.fetchImpl(url);
+  assert.equal(f.requests.at(-1).headers.get("x-ft-session-epoch"), authorized().session_epoch);
+});
+
+test("rapid hide and show fences an old status response from the new revalidation", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const oldStatus = deferred(), newStatus = deferred();
+  f.respond(() => oldStatus.promise);
+  f.timer(15_000);
+  const oldRequest = f.requests.at(-1);
+  f.visibility("hidden");
+  assert.equal(oldRequest.signal.aborted, true);
+  f.respond(() => newStatus.promise);
+  f.visibility("visible");
+  const newRequest = f.requests.at(-1);
+  oldStatus.resolve(reply({ required: true, authenticated: false })); await flush();
+  assert.equal(f.apps[0].disposals, 0);
+  assert.equal(f.apps[0].resumptions, 0);
+  assert.equal(newRequest.signal.aborted, false);
+  newStatus.resolve(reply(authorized())); await flush();
+  assert.equal(f.apps[0].resumptions, 1);
+  assert.equal(f.get("workspace").hidden, false);
+});
+
+test("old data replies and stream errors cannot relock or recheck a resumed session", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const app = f.apps[0], oldReply = deferred();
+  const source = new app.options.EventSourceImpl(new URL("http://127.0.0.1:9999/stream/events"));
+  f.respond(() => oldReply.promise);
+  const pending = app.options.fetchImpl(new URL("http://127.0.0.1:9999/panes"));
+  const rejected = assert.rejects(pending, /retired/);
+  f.visibility("hidden");
+  f.respond(async () => reply(authorized()));
+  f.visibility("visible"); await flush();
+  const requests = f.requests.length;
+  oldReply.resolve(new Response("old refusal", { status: 401 }));
+  await rejected;
+  source.emit("error"); await flush();
+  assert.equal(app.disposals, 0);
+  assert.equal(app.resumptions, 1);
+  assert.equal(f.requests.length, requests);
+  assert.equal(f.get("workspace").hidden, false);
+});
+
+test("changed, refused, expired or unverifiable grants never resume hidden captured data", async (t) => {
+  for (const outcome of ["changed", "refused", "expired", "unavailable"]) {
+    const f = fixture(t, authorized()); await f.gate.ready;
+    f.visibility("hidden");
+    if (outcome === "expired") f.setTime(authorized().expires_at_ms + 1);
+    f.respond(async () => outcome === "unavailable" ? new Response("private proxy text", { status: 503 })
+      : reply(outcome === "changed" ? { ...authorized(), session_epoch: "abcdef0123456789abcdef0123456789" }
+        : outcome === "refused" ? { required: true, authenticated: false } : authorized()));
+    f.visibility("visible"); await flush();
+    assert.equal(f.apps[0].resumptions, 0, outcome);
+    assert.equal(f.apps[0].disposals, 1, outcome);
+    assert.equal(f.get("workspace").hidden, true, outcome);
+    assert.equal(f.reloads(), outcome === "changed" ? 1 : 0, outcome);
+    assert.doesNotMatch(f.get("web-auth-status").textContent, /private proxy text/);
+  }
+});
+
+test("page retirement wins over visibility and pageshow cannot resume a still-hidden tab", async (t) => {
+  for (const visibleFirst of [true, false]) {
+    const f = fixture(t, authorized()); await f.gate.ready;
+    f.visibility("hidden");
+    f.host.emit("pagehide");
+    assert.equal(f.apps[0].disposals, 1, "pagehide must retire even an already suspended app");
+    const requests = f.requests.length;
+    if (visibleFirst) f.visibility("visible");
+    else f.host.emit("pageshow");
+    await flush();
+    assert.equal(f.requests.length, requests);
+    assert.equal(f.reloads(), 0);
+    if (visibleFirst) f.host.emit("pageshow");
+    else f.visibility("visible");
+    await flush();
+    assert.equal(f.reloads(), 1);
+    assert.equal(f.apps[0].resumptions, 0);
+    assert.equal(f.apps.length, 1);
+  }
+});
+
+test("late sign-in completion cannot overtake visibility revalidation", async (t) => {
+  const f = fixture(t); await f.gate.ready;
+  const login = deferred(); f.respond(() => login.promise);
+  f.get("web-auth-token").value = "synthetic-operator-token-0123456789abcdef";
+  f.get("web-auth-form").emit("submit");
+  const request = f.requests.at(-1);
+  f.visibility("hidden");
+  assert.equal(request.signal.aborted, true);
+  f.respond(async () => reply(authorized()));
+  f.visibility("visible"); await flush();
+  assert.equal(f.apps.length, 1);
+  login.resolve(new Response("{}")); await flush();
+  assert.equal(f.apps[0].disposals, 0);
+  assert.equal(f.reloads(), 0);
+  assert.deepEqual(f.channels[0].messages, []);
+});
+
+test("cross-tab revocation retires a hidden viewer before any visibility resume", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  f.visibility("hidden");
+  const requests = f.requests.length;
+  f.channels[0].emit("message", { data: { type: "signed-out" } });
+  assert.equal(f.apps[0].disposals, 1);
+  assert.equal(f.requests.length, requests);
+  f.visibility("visible"); await flush();
+  assert.equal(f.apps[0].resumptions, 0);
+  assert.equal(f.reloads(), 1);
 });
