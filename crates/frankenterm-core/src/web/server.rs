@@ -213,6 +213,7 @@ pub async fn start_web_server_with_cx(
     let app = build_app(
         config.storage,
         config.event_bus,
+        config.redactor,
         runtime_limits,
         event_source,
         config.ui_assets,

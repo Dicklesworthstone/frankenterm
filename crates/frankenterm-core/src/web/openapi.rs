@@ -29,6 +29,7 @@ mod tests {
         let app = super::super::router::build_app(
             None,
             None,
+            std::sync::Arc::new(crate::policy::Redactor::new()),
             resolve_runtime_limits(None),
             "none",
             None,

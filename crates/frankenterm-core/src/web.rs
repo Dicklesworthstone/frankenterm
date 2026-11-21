@@ -16,6 +16,7 @@
 
 use crate::Result;
 use crate::events::EventBus;
+use crate::policy::Redactor;
 use crate::storage::StorageHandle;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -51,8 +52,6 @@ pub use ui_assets::{UI_PACKAGE_SCHEMA, UiAsset, UiAssetError, UiAssetSet};
 use crate::VERSION;
 #[cfg(test)]
 use crate::events::Event;
-#[cfg(test)]
-use crate::policy::Redactor;
 #[cfg(test)]
 use crate::storage::{PaneRecord, SearchResult};
 #[cfg(test)]
@@ -156,6 +155,8 @@ pub struct WebServerConfig {
     runtime_limits: WebRuntimeLimits,
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
+    /// One compiled redactor shared by HTTP reads and both SSE streams.
+    redactor: Arc<Redactor>,
     /// Records explicit operator intent for public binding.
     ///
     /// This does not currently permit non-localhost binding because the web API
@@ -203,6 +204,7 @@ impl WebServerConfig {
             runtime_limits: resolve_runtime_limits(None),
             storage: None,
             event_bus: None,
+            redactor: Arc::new(Redactor::new()),
             allow_public_bind: false,
             storage_event_tail: true,
             ui_assets: None,
@@ -223,6 +225,45 @@ impl WebServerConfig {
     pub fn with_session_auth(mut self, auth: WebSessionAuth) -> Self {
         self.session_auth = Some(auth);
         self
+    }
+
+    /// Apply `[safety.redaction]` to every browser data read and stream.
+    ///
+    /// Custom patterns supplement the mandatory built-in secret catalog. An
+    /// invalid configuration is rejected before binding a listener; it never
+    /// falls back to a redactor that silently omits the operator's patterns.
+    pub fn with_redaction_config(
+        mut self,
+        config: &crate::config::RedactionConfig,
+    ) -> Result<Self> {
+        use crate::error::ConfigError;
+
+        if !config.enabled || !config.redact_audit || !config.redact_segments {
+            return Err(ConfigError::ValidationError(
+                "safety.redaction enabled/redact_audit/redact_segments cannot be disabled"
+                    .to_string(),
+            )
+            .into());
+        }
+        if config.placeholder.trim().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "safety.redaction.placeholder must be non-empty".to_string(),
+            )
+            .into());
+        }
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &config.patterns,
+            Some(&config.placeholder),
+        )
+        .map_err(|_| {
+            // Regex diagnostics can contain the pattern itself, which may be
+            // a literal secret. Keep configuration failures content-free.
+            ConfigError::ValidationError(
+                "safety.redaction.patterns contains an invalid regex".to_string(),
+            )
+        })?;
+        self.redactor = Arc::new(redactor);
+        Ok(self)
     }
 
     /// Override the port.
@@ -498,6 +539,7 @@ fn handle_stream_deltas(
 fn build_app(
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
+    redactor: Arc<Redactor>,
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
     ui_assets: Option<Arc<UiAssetSet>>,
@@ -506,6 +548,7 @@ fn build_app(
     router::build_app(
         storage,
         event_bus,
+        redactor,
         runtime_limits,
         event_source,
         ui_assets,
@@ -646,6 +689,83 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("storage: false"));
         assert!(dbg.contains("event_bus: false"));
+    }
+
+    #[test]
+    fn config_redaction_preserves_builtin_rules_and_isolates_server_instances() {
+        let loaded = crate::config::Config::from_toml(
+            r#"
+            [safety.redaction]
+            patterns = ['custom-canary-[0-9]+']
+            placeholder = '[PROJECT_PRIVATE]'
+            "#,
+        )
+        .unwrap();
+        let default = WebServerConfig::default();
+        let configured = default
+            .clone()
+            .with_redaction_config(&loaded.safety.redaction)
+            .unwrap();
+        let secret = format!("ghp_{}", "a".repeat(36));
+        let content = format!("keepvisible custom-canary-4829 {secret}");
+        assert_eq!(
+            configured.redactor.redact(&content),
+            "keepvisible [PROJECT_PRIVATE] [PROJECT_PRIVATE]"
+        );
+        assert_eq!(
+            default.redactor.redact(&content),
+            "keepvisible custom-canary-4829 [REDACTED]"
+        );
+        let debug = format!("{configured:?}");
+        assert!(!debug.contains("custom-canary"));
+        assert!(!debug.contains("PROJECT_PRIVATE"));
+    }
+
+    #[test]
+    fn config_redaction_rejects_invalid_patterns_without_disclosing_them() {
+        let config = crate::config::RedactionConfig {
+            patterns: vec![
+                "custom-canary-[0-9]+".to_string(),
+                "private-literal-(".to_string(),
+            ],
+            ..crate::config::RedactionConfig::default()
+        };
+        let error = WebServerConfig::default()
+            .with_redaction_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("safety.redaction.patterns"));
+        assert!(!error.contains("private-literal"));
+    }
+
+    #[test]
+    fn config_redaction_rejects_disabled_protection_and_empty_placeholders() {
+        use crate::config::RedactionConfig;
+
+        for config in [
+            RedactionConfig {
+                enabled: false,
+                ..RedactionConfig::default()
+            },
+            RedactionConfig {
+                redact_audit: false,
+                ..RedactionConfig::default()
+            },
+            RedactionConfig {
+                redact_segments: false,
+                ..RedactionConfig::default()
+            },
+            RedactionConfig {
+                placeholder: " \t\n".to_string(),
+                ..RedactionConfig::default()
+            },
+        ] {
+            assert!(
+                WebServerConfig::default()
+                    .with_redaction_config(&config)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -1732,6 +1732,174 @@ mod web_tests {
     }
 
     #[test]
+    fn web_configured_redaction_covers_reads_and_live_streams() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let loaded = frankenterm_core::config::Config::from_toml(
+                r#"
+                [safety.redaction]
+                patterns = ['custom-canary-[0-9]+']
+                placeholder = '[PROJECT_PRIVATE]'
+                "#,
+            )
+            .expect("normal operator configuration must validate");
+            let config = WebServerConfig::new(0)
+                .with_redaction_config(&loaded.safety.redaction)
+                .expect("configured web redactor");
+            let (storage, _directory) =
+                timeout(Duration::from_secs(5), create_test_storage_with_pane(73))
+                    .await
+                    .expect("database startup deadline")
+                    .expect("owned database starts");
+            let bus = Arc::new(EventBus::new(16));
+            let startup = timeout(
+                Duration::from_secs(5),
+                start_web_server(
+                    config
+                        .with_storage(storage.clone())
+                        .with_event_bus(Arc::clone(&bus))
+                        .with_storage_event_tail(false)
+                        .with_runtime_limits(WebRuntimeLimits {
+                            stream_keepalive_secs: 1,
+                            ..frankenterm_core::web::resolve_runtime_limits(None)
+                        }),
+                ),
+            )
+            .await;
+            if !matches!(&startup, Ok(Ok(_))) {
+                let _ = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            }
+            let server = startup
+                .expect("server startup deadline")
+                .expect("owned server starts");
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(10), async {
+                let custom = "custom-canary-4829";
+                let builtin = format!("ghp_{}", "a".repeat(36));
+                let content = format!("keepvisible {custom} {builtin}");
+                let expected = "keepvisible [PROJECT_PRIVATE] [PROJECT_PRIVATE]";
+                let mut event = durable_stream_fixture(&content, epoch_ms_now());
+                event.pane_id = 73;
+                event.extracted = Some(serde_json::json!({
+                    "custom": custom, "builtin": builtin, "ordinary": "keepvisible",
+                }));
+                let id = storage.record_event(event.clone()).await?;
+                let rows = storage.get_events(EventQuery {
+                    pane_id: Some(73), limit: Some(1), ..EventQuery::default()
+                }).await?;
+                ensure!(rows.len() == 1 && rows[0].id == id, "real stored event");
+                ensure!(rows[0].matched_text.as_deref() == Some(content.as_str()),
+                    "stored precondition must contain both canaries before web redaction");
+
+                let raw = fetch_path(addr, "/events?pane_id=73").await?;
+                ensure!(extract_status(&raw) == 200, "HTTP event read succeeds");
+                ensure!(!raw.contains(custom) && !raw.contains(&builtin), "HTTP canaries hidden");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(body["data"]["total"] == 1, "actual event returned");
+                let read_event = &body["data"]["events"][0];
+                ensure!(read_event["id"] == id && read_event["pane_id"] == 73,
+                    "event identity preserved");
+                ensure!(read_event["matched_text"] == expected, "configured marker applied");
+                ensure!(read_event["extracted"]["custom"] == "[PROJECT_PRIVATE]"
+                    && read_event["extracted"]["builtin"] == "[PROJECT_PRIVATE]"
+                    && read_event["extracted"]["ordinary"] == "keepvisible",
+                    "nested custom and built-in secrets redacted without hiding benign data");
+
+                let segment = storage.append_segment(73, &format!("keepvisible {custom}"), None).await?;
+                ensure!(segment.content.contains(custom), "custom canary reaches the read boundary");
+                let raw = fetch_path(addr, "/search?q=keepvisible&pane_id=73").await?;
+                ensure!(extract_status(&raw) == 200, "HTTP search succeeds");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(body["data"]["total"] == 1
+                    && body["data"]["results"][0]["segment_id"] == segment.id,
+                    "search returns the real captured segment");
+                ensure!(!raw.contains(custom) && raw.contains("[PROJECT_PRIVATE]")
+                    && raw.contains("keepvisible"), "search uses the same configured redactor");
+
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(b"GET /stream/events?channel=all&pane_id=73&max_hz=100 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+                let mut response = Vec::new();
+                let ready = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                ensure!(extract_status(&ready) == 200, "event stream admitted");
+                let durable_id = storage.record_event(event).await?;
+                let delivered = bus.publish(Event::PatternDetected {
+                    pane_id: 73, pane_uuid: None, event_id: None,
+                    detection: Detection {
+                        rule_id: "test.web.custom".to_owned(), agent_type: AgentType::Codex,
+                        event_type: "custom_control".to_owned(), severity: Severity::Info,
+                        confidence: 1.0, extracted: serde_json::json!({ "ordinary": "keepvisible" }),
+                        matched_text: content, span: (0, 0),
+                    },
+                });
+                ensure!(delivered == 1, "one owned event subscriber");
+                let raw = read_event_stream_until(&mut stream, &mut response, "event", 2).await?;
+                ensure!(!raw.contains(custom) && !raw.contains(&builtin), "event stream canaries hidden");
+                ensure!(durable_stream_ids(&raw) == [durable_id], "persisted event replayed");
+                let frames: Vec<serde_json::Value> = raw.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|frame| frame["kind"] == "event")
+                    .collect();
+                ensure!(frames.len() == 2, "both durable and live-only events delivered");
+                for frame in frames {
+                    // Durable replay masks built-in credentials before it
+                    // reaches the web boundary; preserve that earlier marker.
+                    let expected = if frame["data"]["delivery"] == "durable" {
+                        "keepvisible [PROJECT_PRIVATE] [REDACTED]"
+                    } else {
+                        expected
+                    };
+                    ensure!(frame["data"]["event"]["detection"]["matched_text"] == expected,
+                        "each event applies the configured redactor");
+                    ensure!(frame["data"]["event"]["pane_id"] == 73,
+                        "stream pane identity preserved");
+                }
+                drop(stream);
+
+                let mut stream = TcpStream::connect(addr).await?;
+                let request = format!("GET /stream/deltas?pane_id=73&since_id={}&max_hz=100 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", segment.id);
+                stream.write_all(request.as_bytes()).await?;
+                let mut response = Vec::new();
+                let ready = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                ensure!(extract_status(&ready) == 200, "delta stream admitted");
+                let delta = storage.append_segment(73, &format!("delta-visible {custom}"), None).await?;
+                let _ = bus.publish(Event::SegmentCaptured {
+                    pane_id: 73, seq: delta.seq, content_len: delta.content_len,
+                });
+                let raw = read_event_stream_until(&mut stream, &mut response, "delta", 1).await?;
+                ensure!(!raw.contains(custom), "delta stream canary hidden");
+                let frame = raw.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|frame| frame["kind"] == "delta")
+                    .context("actual delta frame")?;
+                ensure!(frame["data"]["content"] == "delta-visible [PROJECT_PRIVATE]",
+                    "capture stream applies configured pattern and placeholder");
+                ensure!(frame["data"]["segment_id"] == delta.id
+                    && frame["data"]["pane_id"] == 73, "delta identity preserved");
+                Ok::<_, anyhow::Error>(())
+            })).await;
+            let shutdown = timeout(Duration::from_secs(5), server.shutdown()).await;
+            let storage_shutdown = timeout(Duration::from_secs(5), storage.shutdown()).await;
+            scenario
+                .expect("configured-redaction scenario deadline")
+                .expect("configured-redaction assertions");
+            shutdown
+                .expect("server teardown deadline")
+                .expect("server teardown");
+            storage_shutdown
+                .expect("storage teardown deadline")
+                .expect("storage teardown");
+            assert_eq!(
+                bus.subscriber_count(),
+                0,
+                "owned stream subscriptions released"
+            );
+        });
+    }
+
+    #[test]
     fn web_redaction_depth_limit_protects_stored_events() {
         use anyhow::{Context, ensure};
 

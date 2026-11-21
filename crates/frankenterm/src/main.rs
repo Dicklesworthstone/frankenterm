@@ -49031,6 +49031,7 @@ async fn run_watcher(
             .port
             .unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
         let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+            .with_redaction_config(&config.safety.redaction)?
             .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
             .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                 web_tuning,
@@ -73763,6 +73764,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let resolved_port =
                 port.unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
             let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+                .with_redaction_config(&config.safety.redaction)?
                 .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
                 .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                     web_tuning,

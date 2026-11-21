@@ -6094,10 +6094,12 @@ impl Config {
         for raw_pattern in &redaction.patterns {
             let trimmed = raw_pattern.trim();
             if !trimmed.is_empty() {
-                if let Err(err) = regex::Regex::new(trimmed) {
-                    return Err(crate::error::ConfigError::ValidationError(format!(
-                        "safety.redaction.patterns contains invalid regex '{trimmed}': {err}"
-                    ))
+                if regex::Regex::new(trimmed).is_err() {
+                    // A custom pattern may itself be a literal secret. Neither
+                    // the pattern nor regex diagnostics may escape validation.
+                    return Err(crate::error::ConfigError::ValidationError(
+                        "safety.redaction.patterns contains an invalid regex".to_string(),
+                    )
                     .into());
                 }
             }
@@ -8060,18 +8062,27 @@ max_sender_id_len = 0
             "valid custom safety.redaction patterns and placeholder must validate"
         );
 
-        // Planted negative 1: invalid regex fails closed at Config::validate
-        let mut bad_regex = Config::default();
-        bad_regex
-            .safety
-            .redaction
-            .patterns
-            .push("[unclosed-group".to_string());
-        let err = bad_regex.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("safety.redaction.patterns") && err.contains("invalid regex"),
-            "{err}"
-        );
+        // Planted negative 1: ordinary CLI loading fails closed without
+        // exposing a private pattern through Display or Debug diagnostics.
+        let error = Config::from_toml(
+            r#"
+            [safety.redaction]
+            patterns = ['custom-secret-[0-9]+', 'private-literal-[unclosed-group']
+            "#,
+        )
+        .unwrap_err();
+        for err in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                err.contains("safety.redaction.patterns") && err.contains("invalid regex"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("private-literal")
+                    && !err.contains("unclosed-group")
+                    && !err.contains("regex parse error"),
+                "redaction validation must not disclose private patterns: {err}"
+            );
+        }
 
         // Planted negative 2: blank placeholder fails closed
         let mut empty_placeholder = Config::default();

@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub(super) fn build_app(
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
+    redactor: Arc<Redactor>,
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
     ui_assets: Option<Arc<UiAssetSet>>,
@@ -33,7 +34,7 @@ pub(super) fn build_app(
     let state = AppState {
         storage,
         event_bus,
-        redactor: Arc::new(Redactor::new()),
+        redactor,
         runtime_limits,
     };
     let public_assets = ui_assets.as_ref().map_or_else(Vec::new, |ui| {
