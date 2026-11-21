@@ -7959,6 +7959,9 @@ impl StorageHandle {
     /// duplicate start must not overwrite a running or terminal execution.
     /// A persisted trigger may admit only one automatic workflow, even when a
     /// replay supplies a different execution ID or workflow selection.
+    /// The executing writer checks the persisted kill switch in the admission
+    /// transaction. A valid trigger refused by a stop is durably declined;
+    /// resetting the switch does not replay it.
     pub async fn create_workflow_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -23209,7 +23212,13 @@ fn validate_workflow_trigger_source_backend(
 }
 
 fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowRecord) -> Result<()> {
-    run_writer_transaction(
+    // Admission itself is a database effect. BEGIN IMMEDIATE serializes its
+    // stop-state read and insertion with the operator's atomic revision write:
+    // admission either commits before the trip or observes it and refuses.
+    // The executing writer owns this boundary even if its caller is cancelled.
+    // Do not acquire the pane-send fence here: a sender holding that fence may
+    // be awaiting this same writer, and no pane effect occurs in this command.
+    let refusal: Option<crate::Error> = run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "create workflow execution",
@@ -23313,9 +23322,61 @@ fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
                     StorageError::Database("workflow_execution_already_exists".into()).into(),
                 );
             }
-            upsert_workflow_backend(backend, workflow)
+
+            // A per-step send gate alone is insufficient: SoftStop permits
+            // in-flight sends, so a newly admitted workflow must be rejected
+            // here before it can be mistaken for in-flight work. Use the same
+            // state/revision validation as every other persisted stop owner.
+            let persisted = crate::policy_kill_switch_state::load_kill_switch_state(backend)
+                .map_err(|error| {
+                    StorageError::Database(format!(
+                        "workflow admission kill-switch read failed: {}",
+                        error.code()
+                    ))
+                })?;
+            let mut switch = persisted
+                .as_deref()
+                .map(crate::policy_kill_switch_state::decode_kill_switch_state)
+                .transpose()
+                .map_err(|error| {
+                    StorageError::Database(format!(
+                        "workflow admission kill-switch decode failed: {}",
+                        error.code()
+                    ))
+                })?
+                .unwrap_or_else(crate::policy_quarantine::KillSwitch::disarmed);
+            switch.tick(u64::try_from(now_ms()).unwrap_or_default());
+            if !switch.allows_new_workflows() {
+                if let Some(event_id) = workflow.trigger_event_id {
+                    // All trigger and execution-identity checks above passed.
+                    // Commit this cancellation without an execution or budget,
+                    // then return the typed refusal after COMMIT. Returning
+                    // Err inside this closure would undo the cancellation and
+                    // let a later reset resurrect the queued detection.
+                    mark_event_handled_backend(backend, event_id, None, "policy_denied")?;
+                    return Ok(Some(
+                        crate::error::WorkflowError::TriggerRejected {
+                            event_id,
+                            reason: crate::error::WorkflowTriggerRejection::KillSwitchActive {
+                                level: switch.level,
+                            },
+                        }
+                        .into(),
+                    ));
+                }
+                return Err(crate::Error::Policy(format!(
+                    "System kill switch ({}) pauses new workflow launches",
+                    switch.level
+                )));
+            }
+            upsert_workflow_backend(backend, workflow)?;
+            Ok(None)
         },
-    )
+    )?;
+    match refusal {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn workflow_budget_storage_error(reason: &'static str) -> crate::Error {
@@ -38050,6 +38111,121 @@ fn workflow_source_bound_trigger_admits_matching_authority_once() {
             ..
         }))));
     assert!(query_workflow_backend(&backend, &duplicate.id).unwrap().is_none());
+}
+
+#[test]
+fn workflow_start_kill_switch_cancels_valid_triggers_without_reset_replay() {
+    use crate::error::{WorkflowError, WorkflowTriggerRejection};
+    use crate::policy_kill_switch_state::{KillSwitchTransition, transition_kill_switch_from_backend};
+    use crate::policy_quarantine::KillSwitchLevel;
+
+    for level in [KillSwitchLevel::SoftStop, KillSwitchLevel::HardStop, KillSwitchLevel::EmergencyHalt] {
+        let (backend, workflow) = source_bound_workflow_fixture();
+        let event_id = workflow.trigger_event_id.unwrap();
+        transition_kill_switch_from_backend(&backend, KillSwitchTransition::Trip {
+            level, by: "operator", reason: "private-operator-reason",
+        }, 1_000).unwrap();
+
+        let error = create_workflow_backend(&backend, &workflow).unwrap_err();
+        assert!(!error.to_string().contains("private-operator-reason"));
+        assert!(matches!(error, crate::Error::Workflow(WorkflowError::TriggerRejected {
+            event_id: rejected_id,
+            reason: WorkflowTriggerRejection::KillSwitchActive { level: rejected_level },
+        }) if rejected_id == event_id && rejected_level == level));
+        assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_none());
+        assert!(query_workflow_budget_backend(&backend, &workflow.id).unwrap().is_none());
+        let handled = backend.query_row_cells(
+            "SELECT handled_at, handled_by_workflow_id, handled_status FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        ).unwrap().unwrap();
+        let handled = CellRowReader::new(&handled);
+        assert!(handled.optional_i64(0).unwrap().is_some());
+        assert!(handled.optional_string(1).unwrap().is_none(), "no execution owns a declined event");
+        assert_eq!(handled.optional_string(2).unwrap().as_deref(), Some("policy_denied"));
+
+        // Manual launches are equally stopped, but have no event to cancel.
+        let mut manual = workflow.clone();
+        manual.id = "stopped-manual".to_string();
+        manual.trigger_event_id = None;
+        assert!(matches!(create_workflow_backend(&backend, &manual), Err(crate::Error::Policy(_))));
+        assert!(query_workflow_backend(&backend, &manual.id).unwrap().is_none());
+
+        transition_kill_switch_from_backend(&backend, KillSwitchTransition::Reset { by: "operator" }, 2_000).unwrap();
+        let mut replay = workflow.clone();
+        replay.id = "after-reset-replay".to_string();
+        assert_source_bound_trigger_rejected(&backend, &replay, WorkflowTriggerRejection::AlreadyHandled);
+        create_workflow_backend(&backend, &manual).unwrap();
+        assert!(query_workflow_backend(&backend, &manual.id).unwrap().is_some());
+    }
+}
+
+#[test]
+fn workflow_start_kill_switch_does_not_consume_invalid_triggers() {
+    use crate::policy_kill_switch_state::{KillSwitchTransition, transition_kill_switch_from_backend};
+
+    let (backend, mut workflow) = source_bound_workflow_fixture();
+    transition_kill_switch_from_backend(&backend, KillSwitchTransition::Trip {
+        level: crate::policy_quarantine::KillSwitchLevel::SoftStop,
+        by: "operator", reason: "stop",
+    }, 1_000).unwrap();
+    workflow.context.as_mut().unwrap()["source_pane_uuid"] = serde_json::json!("different-pane");
+    assert_source_bound_trigger_rejected(
+        &backend, &workflow, crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+    );
+}
+
+#[test]
+fn workflow_start_kill_switch_read_failure_cannot_create_or_cancel_work() {
+    use crate::policy_kill_switch_state::{KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY};
+
+    for case in ["corrupt", "missing-state", "unreadable"] {
+        let (backend, workflow) = source_bound_workflow_fixture();
+        match case {
+            "corrupt" => crate::storage_backend_helpers::set_config_kv(
+                &backend, KILL_SWITCH_STATE_KEY, "{broken", 1_000,
+            ).unwrap(),
+            "missing-state" => crate::storage_backend_helpers::set_config_kv(
+                &backend, KILL_SWITCH_REVISION_KEY, "1", 1_000,
+            ).unwrap(),
+            "unreadable" => backend.execute_batch("DROP TABLE config").unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(matches!(create_workflow_backend(&backend, &workflow), Err(crate::Error::Storage(_))));
+        assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_none());
+        assert!(query_workflow_budget_backend(&backend, &workflow.id).unwrap().is_none());
+        let event = backend.query_row_cells(
+            "SELECT handled_at, handled_status FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(workflow.trigger_event_id.unwrap())],
+        ).unwrap().unwrap();
+        let event = CellRowReader::new(&event);
+        assert!(event.optional_i64(0).unwrap().is_none());
+        assert!(event.optional_string(1).unwrap().is_none());
+    }
+}
+
+#[test]
+fn workflow_start_kill_switch_failed_cancellation_does_not_claim_success() {
+    use crate::policy_kill_switch_state::{KillSwitchTransition, transition_kill_switch_from_backend};
+
+    let (backend, workflow) = source_bound_workflow_fixture();
+    transition_kill_switch_from_backend(&backend, KillSwitchTransition::Trip {
+        level: crate::policy_quarantine::KillSwitchLevel::SoftStop,
+        by: "operator", reason: "stop",
+    }, 1_000).unwrap();
+    backend.execute_batch(
+        "CREATE TRIGGER reject_stop_cancellation BEFORE UPDATE ON events
+         BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+    ).unwrap();
+    assert!(matches!(create_workflow_backend(&backend, &workflow), Err(crate::Error::Storage(_))));
+    assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_none());
+    let row = backend.query_row_cells(
+        "SELECT handled_at FROM events WHERE id = ?1",
+        &[ToSqlValue::Integer(workflow.trigger_event_id.unwrap())],
+    ).unwrap().unwrap();
+    assert!(CellRowReader::new(&row).optional_i64(0).unwrap().is_none());
+    backend.execute_batch("DROP TRIGGER reject_stop_cancellation").unwrap();
+    transition_kill_switch_from_backend(&backend, KillSwitchTransition::Reset { by: "operator" }, 2_000).unwrap();
+    create_workflow_backend(&backend, &workflow).unwrap();
 }
 
 #[test]

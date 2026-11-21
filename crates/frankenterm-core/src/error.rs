@@ -1472,8 +1472,10 @@ impl PatternError {
 
 /// A persisted detection did not authorize a new automatic workflow.
 ///
-/// These are logical admission outcomes, not database failures. No workflow
-/// record, budget, or event-handled marker is written for a rejected trigger.
+/// These are logical admission outcomes, not database failures. A rejected
+/// trigger never creates a workflow record or budget. A valid trigger refused
+/// by the kill switch is durably marked handled so resetting the switch cannot
+/// replay it; invalid or already-owned triggers remain untouched.
 #[derive(Error, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum WorkflowTriggerRejection {
@@ -1493,6 +1495,10 @@ pub enum WorkflowTriggerRejection {
     AlreadyHandled,
     #[error("the stored event already belongs to execution {execution_id}")]
     AlreadyClaimed { execution_id: String },
+    #[error("workflow launch refused by the {level} kill switch")]
+    KillSwitchActive {
+        level: crate::policy_quarantine::KillSwitchLevel,
+    },
 }
 
 /// Workflow-specific errors

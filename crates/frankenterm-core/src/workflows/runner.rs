@@ -6588,6 +6588,136 @@ mod tests {
     }
 
     #[test]
+    fn workflow_runner_observes_later_soft_stop_and_never_replays_cancelled_trigger() {
+        run_async_test(async {
+            use crate::policy_kill_switch_state::{
+                KillSwitchTransition, transition_kill_switch_from_backend,
+            };
+            use crate::policy_quarantine::KillSwitchLevel;
+
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("workflow-stop-admission.db");
+            let (storage, runner, locks) = unlimited_gate_runner(db_path.to_str().unwrap()).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_test_pane(&storage, 78, now_ms()).await;
+            seed_test_pane(&storage, 79, now_ms()).await;
+            let detection = crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            };
+            let cx = crate::cx::for_testing();
+            let admitted = runner
+                .handle_detection_with_cx(&cx, 78, &detection, None)
+                .await;
+            let admitted_id = admitted.execution_id().unwrap().to_string();
+
+            // This independent operator connection trips the durable switch
+            // after the runner and its process-local policy were constructed.
+            let operator = crate::storage_backend_trait::RusqliteBackend::open_path(
+                &db_path,
+                &Default::default(),
+            )
+            .unwrap();
+            transition_kill_switch_from_backend(
+                &operator,
+                KillSwitchTransition::Trip {
+                    level: KillSwitchLevel::SoftStop,
+                    by: "operator",
+                    reason: "pause new launches",
+                },
+                u64::try_from(now_ms()).unwrap(),
+            )
+            .unwrap();
+            let event_id = persist_test_detection(&storage, 79, &detection).await;
+            assert!(matches!(
+                runner
+                    .handle_detection_with_cx(&cx, 79, &detection, Some(event_id))
+                    .await,
+                WorkflowStartResult::TriggerRejected {
+                    event_id: rejected_id,
+                    reason: crate::error::WorkflowTriggerRejection::KillSwitchActive {
+                        level: KillSwitchLevel::SoftStop,
+                    },
+                } if rejected_id == event_id
+            ));
+            assert!(matches!(
+                runner
+                    .run_workflow_manual_with_cx(
+                        &cx,
+                        79,
+                        probe.clone(),
+                        "stopped-manual",
+                        None,
+                    )
+                    .await,
+                ManualWorkflowRunOutcome::StartError { error }
+                    if error.contains("kill switch (soft_stop)")
+            ));
+            assert!(
+                storage
+                    .get_workflow("stopped-manual")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                locks.active_count(),
+                1,
+                "only the pre-stop admission owns a pane"
+            );
+            assert!(probe.executions.lock().unwrap().is_empty());
+            assert_eq!(storage.find_incomplete_workflows().await.unwrap().len(), 1);
+
+            // SoftStop still drains work admitted before the stop.
+            assert!(matches!(
+                runner
+                    .run_workflow_with_cx(&cx, 78, probe.clone(), &admitted_id, 0)
+                    .await,
+                WorkflowExecutionResult::Completed { .. }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+
+            transition_kill_switch_from_backend(
+                &operator,
+                KillSwitchTransition::Reset { by: "operator" },
+                u64::try_from(now_ms()).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                runner
+                    .handle_detection_with_cx(&cx, 79, &detection, Some(event_id))
+                    .await,
+                WorkflowStartResult::TriggerRejected {
+                    reason: crate::error::WorkflowTriggerRejection::AlreadyHandled,
+                    ..
+                }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+
+            // An explicit fresh launch after reset is allowed; the rejected
+            // detection is not converted into a deferred queue by that reset.
+            assert!(matches!(
+                runner
+                    .run_workflow_manual_with_cx(
+                        &cx,
+                        79,
+                        probe.clone(),
+                        "fresh-after-reset",
+                        None,
+                    )
+                    .await,
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed { .. })
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 2);
+            assert_eq!(locks.active_count(), 0);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn persisted_trigger_replay_after_restart_does_not_repeat_completed_workflow() {
         run_async_test(async {
             let directory = tempfile::tempdir().unwrap();

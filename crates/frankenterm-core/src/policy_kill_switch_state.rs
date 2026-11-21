@@ -608,14 +608,18 @@ pub fn transition_kill_switch_from_backend(
     now_ms: u64,
 ) -> Result<KillSwitchTransitionReceipt, KillSwitchStateError> {
     let _fence = backend_fence(backend)?;
-    let loaded = crate::storage_backend_helpers::get_config_kv(backend, KILL_SWITCH_STATE_KEY)
-        .map_err(|_| KillSwitchStateError::LoadFailed("operator switch read failed".into()))?;
-    let decoded = loaded.as_deref().map(decode_kill_switch_state).transpose();
+    // An otherwise valid stale document must not authorize a weaker trip.
+    // Validate the revision anchor as well as the state before interpreting
+    // the operator's transition; only an explicit reset may repair corruption.
+    let decoded = load_kill_switch_state(backend)
+        .and_then(|loaded| loaded.as_deref().map(decode_kill_switch_state).transpose());
     let mut state = match decoded {
         Ok(state) => state.unwrap_or_else(KillSwitch::disarmed),
         // Only the explicit operator reset can repair a corrupt state. The
         // atomic writer still requires a trusted, monotone revision anchor.
-        Err(_) if matches!(transition, KillSwitchTransition::Reset { .. }) => {
+        Err(KillSwitchStateError::Corrupt(_))
+            if matches!(transition, KillSwitchTransition::Reset { .. }) =>
+        {
             KillSwitch::disarmed()
         }
         Err(error) => return Err(error),
@@ -926,6 +930,77 @@ pub(crate) mod tests {
             crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY).unwrap(),
             before,
             "invalid revision authority cannot be papered over by reset"
+        );
+    }
+
+    #[test]
+    fn kill_switch_trip_rejects_stale_document_but_explicit_reset_repairs_it() {
+        let backend =
+            crate::storage_backend_trait::RusqliteBackend::open(":memory:", &Default::default())
+                .unwrap();
+        backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)").unwrap();
+        let receipt = transition_kill_switch_from_backend(
+            &backend,
+            KillSwitchTransition::Trip {
+                level: KillSwitchLevel::HardStop,
+                by: "operator",
+                reason: "stop all new effects",
+            },
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(receipt.revision, 1);
+
+        // The blob is well-formed but predates the separate authority. A
+        // trip must not silently turn this rollback into a newer SoftStop.
+        let stale = encode_kill_switch_state(&KillSwitch::disarmed()).unwrap();
+        crate::storage_backend_helpers::set_config_kv(
+            &backend,
+            KILL_SWITCH_STATE_KEY,
+            &stale,
+            2_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            transition_kill_switch_from_backend(
+                &backend,
+                KillSwitchTransition::Trip {
+                    level: KillSwitchLevel::SoftStop,
+                    by: "operator",
+                    reason: "pause new launches",
+                },
+                3_000,
+            ),
+            Err(KillSwitchStateError::Corrupt(_))
+        ));
+        assert_eq!(
+            crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_STATE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(stale.as_str()),
+            "refused trip cannot rewrite the stale state"
+        );
+        assert_eq!(
+            crate::storage_backend_helpers::get_config_kv(&backend, KILL_SWITCH_REVISION_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "refused trip cannot advance revision authority"
+        );
+
+        let reset = transition_kill_switch_from_backend(
+            &backend,
+            KillSwitchTransition::Reset { by: "operator" },
+            4_000,
+        )
+        .unwrap();
+        assert_eq!(reset.revision, 2);
+        assert_eq!(reset.state.level, KillSwitchLevel::Disarmed);
+        assert_eq!(
+            decode_kill_switch_state(&load_kill_switch_state(&backend).unwrap().unwrap())
+                .unwrap()
+                .level,
+            KillSwitchLevel::Disarmed
         );
     }
 
