@@ -12380,6 +12380,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_engine_wires_safety_redaction_custom_patterns_and_placeholder() {
+        // ft-mgy5t2.17: verify PolicyEngine::from_safety_config wires custom
+        // `[safety.redaction].patterns` and `placeholder` into runtime redaction
+        // while preserving built-in secret detection.
+        let mut safety = crate::config::SafetyConfig::default();
+        safety
+            .redaction
+            .patterns
+            .push(r"ACME_INTERNAL_[A-Z0-9]{10}".to_string());
+        safety.redaction.placeholder = "[CUSTOM_SCRUBBED]".to_string();
+
+        let engine = PolicyEngine::from_safety_config(&safety);
+        assert!(engine.contains_secrets("token=ACME_INTERNAL_9876543210"));
+        let custom_out = engine.redact_secrets("deploy key ACME_INTERNAL_9876543210 ok");
+        assert_eq!(custom_out, "deploy key [CUSTOM_SCRUBBED] ok");
+
+        // Built-in catalog secrets still redact and honor the custom placeholder
+        let builtin_out = engine.redact_secrets(
+            "My API key is sk-abc123456789012345678901234567890123456789012345678901",
+        );
+        assert!(builtin_out.contains("[CUSTOM_SCRUBBED]"), "{builtin_out}");
+        assert!(!builtin_out.contains("sk-abc"), "{builtin_out}");
+    }
+
+    #[test]
     fn redactor_redacts_openai_proj_key() {
         let redactor = Redactor::new();
         let input = "API key: sk-proj-abcdefghijklmnopqrstuvwxyz12345678901234567890";

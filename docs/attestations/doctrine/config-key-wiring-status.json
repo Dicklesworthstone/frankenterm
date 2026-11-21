@@ -104,11 +104,11 @@
     },
     {
       "key": "safety.redaction",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "custom patterns/placeholder/enabled/redact_audit/redact_segments are dropped — the runtime Redactor uses a fixed built-in catalog",
-      "tracking_bead": "ft-1t4o4",
-      "validation": "Config::validate rejects any non-default [safety.redaction] block fail-closed"
+      "status": "consumed",
+      "consumer": "crate::policy::PolicyEngine::from_safety_config -> crate::redactor::Redactor::with_custom_patterns_and_placeholder",
+      "evidence": "PolicyEngine builds an owned Redactor from safety.redaction.patterns and safety.redaction.placeholder; policy_engine_wires_safety_redaction_custom_patterns_and_placeholder verifies runtime effect while enabled/redact_audit/redact_segments remain fail-closed mandatory-true",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate accepts valid custom regex patterns and non-empty placeholders, rejects invalid regexes/empty placeholders, and keeps enabled/redact_audit/redact_segments=false fail-closed"
     },
     {
       "key": "safety.capabilities",

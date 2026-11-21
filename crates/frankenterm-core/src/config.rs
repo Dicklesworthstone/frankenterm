@@ -902,11 +902,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "safety.redaction",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "custom patterns/placeholder/enabled/redact_audit/redact_segments are dropped — the runtime Redactor uses a fixed built-in catalog",
-        tracking_bead: "ft-1t4o4",
-        validation: "Config::validate rejects any non-default [safety.redaction] block fail-closed",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::policy::PolicyEngine::from_safety_config -> crate::redactor::Redactor::with_custom_patterns_and_placeholder",
+        evidence: "PolicyEngine builds an owned Redactor from safety.redaction.patterns and safety.redaction.placeholder; policy_engine_wires_safety_redaction_custom_patterns_and_placeholder verifies runtime effect while enabled/redact_audit/redact_segments remain fail-closed mandatory-true",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate accepts valid custom regex patterns and non-empty placeholders, rejects invalid regexes/empty placeholders, and keeps enabled/redact_audit/redact_segments=false fail-closed",
     },
     ConfigKeyWiringRecord {
         key: "safety.capabilities",
@@ -6068,13 +6068,32 @@ impl Config {
         // instead of a silent no-op. Default values are honored (no rejection)
         // so existing default deployments are unaffected. Compared via
         // serialization to avoid depending on PartialEq for every config type.
+        // [safety.redaction] patterns + placeholder are wired into PolicyEngine's
+        // Redactor (ft-mgy5t2.17). Disabling mandatory secret redaction flags
+        // (`enabled`, `redact_audit`, `redact_segments`) remains fail-closed.
+        let redaction = &self.safety.redaction;
+        if redaction.placeholder.trim().is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(
+                "safety.redaction.placeholder must be non-empty".to_string(),
+            )
+            .into());
+        }
+        for raw_pattern in &redaction.patterns {
+            let trimmed = raw_pattern.trim();
+            if !trimmed.is_empty() {
+                if let Err(err) = regex::Regex::new(trimmed) {
+                    return Err(crate::error::ConfigError::ValidationError(format!(
+                        "safety.redaction.patterns contains invalid regex '{trimmed}': {err}"
+                    ))
+                    .into());
+                }
+            }
+        }
         let mut unhonored_safety: Vec<&'static str> = Vec::new();
-        if serde_json::to_value(&self.safety.redaction).ok()
-            != serde_json::to_value(RedactionConfig::default()).ok()
-        {
+        if !redaction.enabled || !redaction.redact_audit || !redaction.redact_segments {
             unhonored_safety.push(
-                "safety.redaction (custom patterns/placeholder/enabled/redact_audit/redact_segments \
-                 are dropped — the runtime Redactor uses a fixed built-in catalog)",
+                "safety.redaction (enabled/redact_audit/redact_segments cannot be disabled; \
+                 built-in secret redaction is mandatory)",
             );
         }
         if serde_json::to_value(&self.safety.capabilities).ok()
@@ -8013,16 +8032,39 @@ max_sender_id_len = 0
     }
 
     #[test]
-    fn validate_rejects_customized_safety_redaction_patterns() {
+    fn validate_accepts_customized_safety_redaction_patterns_and_rejects_invalid_regex() {
+        // ft-mgy5t2.17: custom patterns and custom placeholders are wired into
+        // PolicyEngine's Redactor and must validate cleanly when well-formed.
         let mut config = Config::default();
         config
             .safety
             .redaction
             .patterns
             .push("custom-secret-[0-9]+".to_string());
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("ft-1t4o4"), "{err}");
-        assert!(err.contains("safety.redaction"), "{err}");
+        config.safety.redaction.placeholder = "[SCRUBBED]".to_string();
+        assert!(
+            config.validate().is_ok(),
+            "valid custom safety.redaction patterns and placeholder must validate"
+        );
+
+        // Planted negative 1: invalid regex fails closed at Config::validate
+        let mut bad_regex = Config::default();
+        bad_regex
+            .safety
+            .redaction
+            .patterns
+            .push("[unclosed-group".to_string());
+        let err = bad_regex.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("safety.redaction.patterns") && err.contains("invalid regex"),
+            "{err}"
+        );
+
+        // Planted negative 2: blank placeholder fails closed
+        let mut empty_placeholder = Config::default();
+        empty_placeholder.safety.redaction.placeholder = "   ".to_string();
+        let err = empty_placeholder.validate().unwrap_err().to_string();
+        assert!(err.contains("safety.redaction.placeholder"), "{err}");
     }
 
     #[test]
