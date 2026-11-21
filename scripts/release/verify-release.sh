@@ -14,15 +14,17 @@
 #       standard local build-manifest path for the version.
 #       With --channel companion-appstore, verify a macOS App Store / Exporter
 #       companion release (`vX.Y.Z-appstore.N`), requiring prerelease=true (never
-#       hijacking GitHub Latest), Exporter DMG + checksum + minisig, and SHA256SUMS.
+#       hijacking GitHub Latest), and downloading and authenticating the Exporter
+#       DMG, optional app ZIP, checksum sidecars, and signed SHA256SUMS.
 #
 #   scripts/release/verify-release.sh [--channel stable] [--json] --manifest <path> --assets-dir <dir>
 #       Offline verification of the same closed asset set. The local manifest
 #       may be in <dir>, but is not counted as a release asset.
 #
 #   scripts/release/verify-release.sh --channel companion-appstore [--json] <version> --release-json <path> [--assets-dir <dir>]
-#       Offline verification of a companion-appstore release against captured
-#       GitHub release JSON (and optional downloaded assets directory).
+#       Offline verification requires both captured GitHub release JSON and
+#       downloaded assets. Metadata alone never establishes artifact integrity.
+#       Native notarization/stapling and install execution are separate checks.
 #
 #   Add --attestation-bundle <path> --release-policy <path> to either mode
 #       to authenticate a separate attestation against an operator-owned
@@ -57,6 +59,7 @@ ASSETS_DIR=""
 RELEASE_JSON_FIXTURE=""
 ATTESTATION_BUNDLE=""
 RELEASE_POLICY="${FT_ATTESTATION_RELEASE_POLICY:-}"
+VERIFICATION_SCOPE="artifact_set"
 
 usage() {
   sed -n '2,42p' "$0"
@@ -175,6 +178,7 @@ emit_json_verdict() {
   jq -n \
     --arg schema "frankenterm.release_verification.v1" \
     --arg channel "$CHANNEL" \
+    --arg verification_scope "$VERIFICATION_SCOPE" \
     --arg tag "$tag_val" \
     --arg commit "$sha_val" \
     --arg fail_code "$code_val" \
@@ -185,6 +189,7 @@ emit_json_verdict() {
       schema_version: $schema,
       ok: $ok,
       channel: $channel,
+      verification_scope: $verification_scope,
       tag: $tag,
       commit: (if $commit == "" then null else $commit end),
       fail_code: (if $fail_code == "" then null else $fail_code end),
@@ -225,7 +230,7 @@ file_size() {
 max_size_for_asset() {
   case "$1" in
     FrankenTerm-darwin-arm64.app.tar.xz) printf '%s\n' 4294967296 ;;
-    *.tar.xz|*.zip) printf '%s\n' 1073741824 ;;
+    *.tar.xz|*.zip|*.dmg) printf '%s\n' 1073741824 ;;
     *.sha256) printf '%s\n' 4096 ;;
     *.minisig) printf '%s\n' 65536 ;;
     SHA256SUMS) printf '%s\n' 65536 ;;
@@ -239,12 +244,23 @@ if ! regular_file "$PUBKEY"; then
 fi
 
 verify_companion_appstore_channel() {
+  VERIFICATION_SCOPE="companion_artifact_integrity"
   if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+-appstore\.[0-9]+$ ]]; then
     FAIL_CODE="channel_mismatch"
     bad "channel_mismatch: companion-appstore requires vX.Y.Z-appstore.N tag (got: $VERSION)"
     finish_failed
   fi
   TAG="v${VERSION#v}"
+  if [[ -n "$MANIFEST" || -n "$ATTESTATION_BUNDLE" || -n "$RELEASE_POLICY" ]]; then
+    FAIL_CODE="unsupported_companion_option"
+    bad "companion-appstore does not implement DSR manifest or attestation verification; requested checks cannot be ignored"
+    finish_failed
+  fi
+  if [[ -n "$RELEASE_JSON_FIXTURE" && -z "$ASSETS_DIR" ]]; then
+    FAIL_CODE="missing_companion_assets"
+    bad "offline companion verification requires --assets-dir; release metadata alone cannot authenticate downloads"
+    finish_failed
+  fi
   local rel_json=""
   local evidence_dir=""
   if [[ -n "$RELEASE_JSON_FIXTURE" ]]; then
@@ -257,7 +273,7 @@ verify_companion_appstore_channel() {
   else
     command -v gh >/dev/null 2>&1 || { echo "gh is required for online companion verification" >&2; exit 2; }
     umask 077
-    evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-companion.XXXXXX")"
+    evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-companion.XXXXXX")" || exit 2
     rel_json="$evidence_dir/release.json"
     note "companion verification evidence retained at: $evidence_dir"
     if ! gh api --method GET "repos/$OWNER_REPO/releases/tags/$TAG" > "$rel_json" 2> "$evidence_dir/gh.err"; then
@@ -267,12 +283,50 @@ verify_companion_appstore_channel() {
     fi
   fi
 
-  if ! jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and (.assets | type == "array")' "$rel_json" >/dev/null 2>&1; then
+  local metadata_size
+  metadata_size="$(file_size "$rel_json")"
+  if [[ ! "$metadata_size" =~ ^[0-9]+$ || "$metadata_size" -le 0 || "$metadata_size" -gt 1048576 ]]; then
     FAIL_CODE="invalid_companion_metadata"
-    bad "companion release metadata is invalid, draft, or tag_name != $TAG"
+    bad "companion release metadata is empty or exceeds the 1 MiB bound"
     finish_failed
   fi
-  MANIFEST_SHA="$(jq -r '.target_commitish // ""' "$rel_json")"
+  if ! python3 - "$rel_json" <<'PY'
+import json
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+try:
+    with open(sys.argv[1], "rb") as source:
+        json.load(source, object_pairs_hook=unique_object)
+except (OSError, ValueError) as error:
+    sys.stderr.write(f"invalid companion metadata: {error}\n")
+    sys.exit(1)
+PY
+  then
+    FAIL_CODE="invalid_companion_metadata"
+    bad "companion release metadata is not duplicate-free JSON"
+    finish_failed
+  fi
+  if ! jq -e --arg tag "$TAG" '
+    .tag_name == $tag and .draft == false and
+    (.assets | type == "array") and
+    all(.assets[];
+      (.name | type == "string") and
+      (.size | type == "number" and floor == . and . > 0 and . <= 4294967296)) and
+    ([.assets[].name] | unique | length) == (.assets | length)
+  ' "$rel_json" >/dev/null 2>&1; then
+    FAIL_CODE="invalid_companion_metadata"
+    bad "companion release metadata has invalid or duplicate assets, is draft, or tag_name != $TAG"
+    finish_failed
+  fi
+  MANIFEST_SHA="$(jq -r '.target_commitish // "" | select(type == "string" and test("^[0-9a-f]{40}$"))' "$rel_json")"
   if ! jq -e '.prerelease == true' "$rel_json" >/dev/null 2>&1; then
     FAIL_CODE="companion_release_not_prerelease"
     bad "companion_release_not_prerelease: $TAG has prerelease=false and can hijack cross-platform GitHub Latest (remediate: gh release edit $TAG --prerelease)"
@@ -280,14 +334,15 @@ verify_companion_appstore_channel() {
     good "$TAG is marked prerelease=true (isolated from cross-platform GitHub Latest)"
   fi
 
-  local required_companion=(
-    "FrankenTerm-Exporter.dmg"
-    "FrankenTerm-Exporter.dmg.sha256"
-    "FrankenTerm-Exporter.dmg.minisig"
-    "SHA256SUMS"
-    "SHA256SUMS.minisig"
-  )
-  local req
+  local companion_artifacts=("FrankenTerm-Exporter.dmg")
+  if jq -e '.assets[] | select(.name == "FrankenTerm-Exporter.app.zip")' "$rel_json" >/dev/null; then
+    companion_artifacts+=("FrankenTerm-Exporter.app.zip")
+  fi
+  local required_companion=("SHA256SUMS" "SHA256SUMS.minisig")
+  local req artifact
+  for artifact in "${companion_artifacts[@]}"; do
+    required_companion+=("$artifact" "$artifact.sha256" "$artifact.minisig")
+  done
   for req in "${required_companion[@]}"; do
     if ! jq -e --arg n "$req" '.assets[] | select(.name == $n and (.size | type == "number" and . > 0))' "$rel_json" >/dev/null 2>&1; then
       FAIL_CODE="${FAIL_CODE:-missing_companion_asset}"
@@ -296,42 +351,110 @@ verify_companion_appstore_channel() {
       good "companion metadata includes $req"
     fi
   done
+  [[ $fail -eq 0 ]] || finish_failed
 
-  if [[ -n "$ASSETS_DIR" ]]; then
-    if [[ ! -d "$ASSETS_DIR" || -L "$ASSETS_DIR" ]]; then
-      FAIL_CODE="${FAIL_CODE:-invalid_assets_dir}"
-      bad "companion assets directory missing or symlink: $ASSETS_DIR"
-      finish_failed
+  if [[ -z "$ASSETS_DIR" ]]; then
+    command -v curl >/dev/null 2>&1 || { echo "curl is required for online companion verification" >&2; exit 2; }
+    if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
+      echo "FT_RELEASE_REPO must be an owner/repository pair" >&2
+      exit 2
     fi
+    ASSETS_DIR="$evidence_dir/assets"
+    mkdir "$ASSETS_DIR" || exit 2
+    local download_url expected_url declared_size max_size
     for req in "${required_companion[@]}"; do
-      if ! regular_file "$ASSETS_DIR/$req"; then
-        FAIL_CODE="${FAIL_CODE:-missing_local_companion_asset}"
-        bad "missing local companion asset: $req"
+      max_size="$(max_size_for_asset "$req")" || exit 2
+      declared_size="$(jq -r --arg n "$req" '.assets[] | select(.name == $n) | .size' "$rel_json")"
+      download_url="$(jq -r --arg n "$req" '.assets[] | select(.name == $n) | .browser_download_url // ""' "$rel_json")"
+      expected_url="https://github.com/$OWNER_REPO/releases/download/$TAG/$req"
+      if [[ "$declared_size" -gt "$max_size" || "$download_url" != "$expected_url" ]]; then
+        FAIL_CODE="${FAIL_CODE:-invalid_companion_asset}"
+        bad "companion asset $req exceeds its size bound or has an unexpected download URL"
+        continue
+      fi
+      if ! curl --fail --location --silent --show-error \
+          --user-agent 'frankenterm-agent (+https://github.com/Dicklesworthstone/frankenterm)' \
+          --connect-timeout 20 --max-time 600 --max-filesize "$max_size" \
+          --proto '=https' --proto-redir '=https' \
+          --output "$ASSETS_DIR/$req" "$download_url"; then
+        FAIL_CODE="${FAIL_CODE:-companion_download_failed}"
+        bad "companion asset $req could not be downloaded within its size/time bounds"
       fi
     done
-    if [[ $fail -eq 0 ]]; then
-      local dmg_sha expected_line
-      dmg_sha="$(sha256_file "$ASSETS_DIR/FrankenTerm-Exporter.dmg")"
-      expected_line="$(printf '%s  %s\n' "$dmg_sha" "FrankenTerm-Exporter.dmg")"
-      if ! cmp -s "$ASSETS_DIR/FrankenTerm-Exporter.dmg.sha256" <(printf '%s' "$expected_line"); then
-        FAIL_CODE="checksum_mismatch"
-        bad "FrankenTerm-Exporter.dmg.sha256 does not match local DMG digest"
-      else
-        good "FrankenTerm-Exporter.dmg.sha256 binds DMG digest"
-      fi
-      if ! minisign -V -H -q -p "$PUBKEY" -m "$ASSETS_DIR/FrankenTerm-Exporter.dmg" -x "$ASSETS_DIR/FrankenTerm-Exporter.dmg.minisig" >/dev/null 2>&1; then
-        FAIL_CODE="minisig_invalid"
-        bad "FrankenTerm-Exporter.dmg.minisig failed verification against release/minisign.pub"
-      else
-        good "FrankenTerm-Exporter.dmg.minisig verified against release/minisign.pub"
-      fi
-      if ! minisign -V -H -q -p "$PUBKEY" -m "$ASSETS_DIR/SHA256SUMS" -x "$ASSETS_DIR/SHA256SUMS.minisig" >/dev/null 2>&1; then
-        FAIL_CODE="minisig_invalid"
-        bad "SHA256SUMS.minisig failed verification against release/minisign.pub"
-      else
-        good "SHA256SUMS.minisig verified against release/minisign.pub"
-      fi
+    [[ $fail -eq 0 ]] || finish_failed
+  fi
+
+  if [[ ! -d "$ASSETS_DIR" || -L "$ASSETS_DIR" ]]; then
+    FAIL_CODE="invalid_assets_dir"
+    bad "companion assets directory missing or symlink: $ASSETS_DIR"
+    finish_failed
+  fi
+  local actual_size expected_size asset_sha asset_digest bound
+  for req in "${required_companion[@]}"; do
+    if ! regular_file "$ASSETS_DIR/$req"; then
+      FAIL_CODE="${FAIL_CODE:-missing_local_companion_asset}"
+      bad "missing or non-regular local companion asset: $req"
+      continue
     fi
+    bound="$(max_size_for_asset "$req")" || exit 2
+    actual_size="$(file_size "$ASSETS_DIR/$req")"
+    expected_size="$(jq -r --arg n "$req" '.assets[] | select(.name == $n) | .size' "$rel_json")"
+    if [[ "$actual_size" -le 0 || "$actual_size" -gt "$bound" || "$actual_size" != "$expected_size" ]]; then
+      FAIL_CODE="${FAIL_CODE:-companion_size_mismatch}"
+      bad "companion asset $req is empty, oversized, or does not match its metadata size"
+    fi
+    asset_digest="$(jq -r --arg n "$req" '.assets[] | select(.name == $n) | .digest // ""' "$rel_json")"
+    if [[ -n "$asset_digest" && "$asset_digest" != "sha256:$(sha256_file "$ASSETS_DIR/$req")" ]]; then
+      FAIL_CODE="${FAIL_CODE:-companion_digest_mismatch}"
+      bad "companion asset $req does not match its metadata digest"
+    fi
+  done
+  [[ $fail -eq 0 ]] || finish_failed
+
+  for artifact in "${companion_artifacts[@]}"; do
+    asset_sha="$(sha256_file "$ASSETS_DIR/$artifact")"
+    if ! cmp -s "$ASSETS_DIR/$artifact.sha256" <(printf '%s  %s\n' "$asset_sha" "$artifact"); then
+      FAIL_CODE="${FAIL_CODE:-checksum_mismatch}"
+      bad "$artifact.sha256 is not the canonical checksum sidecar for the verified bytes"
+    else
+      good "$artifact.sha256 binds the artifact digest"
+    fi
+  done
+  for artifact in "${companion_artifacts[@]}" SHA256SUMS; do
+    if ! minisign -V -H -q -p "$PUBKEY" -m "$ASSETS_DIR/$artifact" -x "$ASSETS_DIR/$artifact.minisig" >/dev/null 2>&1; then
+      FAIL_CODE="${FAIL_CODE:-minisig_invalid}"
+      bad "$artifact.minisig failed verification against release/minisign.pub"
+    else
+      good "$artifact.minisig verified against release/minisign.pub"
+    fi
+  done
+  if ! python3 - "$ASSETS_DIR" "${companion_artifacts[@]}" <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+entries = {}
+for line in (directory / "SHA256SUMS").read_bytes().splitlines(keepends=True):
+    match = re.fullmatch(rb"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)\n", line)
+    if match is None:
+        raise SystemExit("SHA256SUMS contains a malformed or unsafe entry")
+    digest, name = (value.decode("ascii") for value in match.groups())
+    if name in entries:
+        raise SystemExit("SHA256SUMS contains duplicate artifact entries")
+    entries[name] = digest
+for name in sys.argv[2:]:
+    hasher = hashlib.sha256()
+    with (directory / name).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    if entries.get(name) != hasher.hexdigest():
+        raise SystemExit(f"SHA256SUMS does not bind the verified bytes of {name}")
+PY
+  then
+    FAIL_CODE="${FAIL_CODE:-aggregate_checksum_mismatch}"
+    bad "signed SHA256SUMS does not bind every verified companion artifact"
   fi
 
   if [[ $fail -gt 0 ]]; then
@@ -340,7 +463,8 @@ verify_companion_appstore_channel() {
   if [[ "$JSON_OUTPUT" -eq 1 ]]; then
     emit_json_verdict true
   else
-    echo "release verification (companion-appstore): companion checks passed for $TAG"
+    echo "release verification (companion-appstore): artifact integrity checks passed for $TAG"
+    echo "scope: signed companion artifacts; native notarization/stapling and install execution require separate evidence"
   fi
   exit 0
 }
@@ -448,6 +572,7 @@ MANIFEST_SHA="$(jq -r '.source.git_sha' "$MANIFEST")"
 good "local unsigned build manifest binds $TAG to $MANIFEST_SHA and all four targets plus app"
 
 if [[ -n "$ATTESTATION_BUNDLE" ]]; then
+  VERIFICATION_SCOPE="artifact_set_and_attestation"
   # Freeze the exact public inputs before authentication and cross-binding.
   # They are separate evidence, never extra entries in the 17-asset inventory.
   for input in "$ATTESTATION_BUNDLE" "$RELEASE_POLICY"; do

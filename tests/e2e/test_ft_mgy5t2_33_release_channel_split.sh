@@ -10,7 +10,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 python3 - "$ROOT" <<'PY'
 import json
+import copy
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,6 +48,90 @@ def record(case_id: str, channel: str, case_kind: str, expected_rc: int, proc: s
 
 with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     td_path = Path(td)
+    # Exercise the unchanged production verifier with an isolated trust root.
+    # No signer secret or public-key override is added to the production CLI.
+    fixture_root = td_path / "repo"
+    (fixture_root / "scripts/release").mkdir(parents=True)
+    (fixture_root / "release").mkdir()
+    fixture_verify = fixture_root / "scripts/release/verify-release.sh"
+    shutil.copyfile(verify_sh, fixture_verify)
+    secret_key = td_path / "test.key"
+    subprocess.run(
+        ["minisign", "-G", "-W", "-s", str(secret_key),
+         "-p", str(fixture_root / "release/minisign.pub")],
+        check=True, capture_output=True, text=True,
+    )
+    assets = td_path / "assets"
+    assets.mkdir()
+    dmg = assets / "FrankenTerm-Exporter.dmg"
+    app_zip = assets / "FrankenTerm-Exporter.app.zip"
+    dmg.write_bytes(b"synthetic companion DMG for artifact-integrity verification\n")
+    app_zip.write_bytes(b"synthetic companion app ZIP for artifact-integrity verification\n")
+    sums = assets / "SHA256SUMS"
+
+    def sign(path):
+        subprocess.run(
+            ["minisign", "-S", "-s", str(secret_key), "-m", str(path),
+             "-x", str(path) + ".minisig", "-t", "frankenterm test fixture"],
+            check=True, capture_output=True, text=True,
+        )
+
+    checksum_lines = []
+    for artifact in (dmg, app_zip):
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        line = f"{digest}  {artifact.name}\n"
+        (assets / (artifact.name + ".sha256")).write_text(line)
+        checksum_lines.append(line)
+        sign(artifact)
+    sums.write_text("".join(sorted(checksum_lines)))
+    sign(sums)
+    originals = {p.name: p.read_bytes() for p in assets.iterdir()}
+
+    tag = "v0.15.22-appstore.16"
+    good_json = td_path / "companion_good.json"
+    good_companion = {
+        "tag_name": tag,
+        "draft": False,
+        "prerelease": True,
+        "target_commitish": "93d33742e75b063115a7460da9904e5f0d360303",
+        "assets": [],
+    }
+
+    def refresh_metadata():
+        good_companion["assets"] = [
+            {"name": p.name, "size": p.stat().st_size,
+             "digest": "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest(),
+             "browser_download_url": f"https://github.com/Dicklesworthstone/frankenterm/releases/download/{tag}/{p.name}"}
+            for p in sorted(assets.iterdir())
+        ]
+        good_json.write_text(json.dumps(good_companion))
+
+    def restore_assets():
+        for name, data in originals.items():
+            (assets / name).write_bytes(data)
+        refresh_metadata()
+
+    def companion_case(case_id, expected_code=None, *, metadata=good_json,
+                       verifier=fixture_verify, extra_args=(), with_assets=True):
+        before = {p.name: p.read_bytes() for p in assets.iterdir()}
+        args = ["bash", str(verifier), "--channel", "companion-appstore", "--json",
+                tag, "--release-json", str(metadata)]
+        if with_assets:
+            args += ["--assets-dir", str(assets)]
+        p = subprocess.run(args + list(extra_args), capture_output=True, text=True)
+        parsed = json.loads(p.stdout)
+        expected_rc = 0 if expected_code is None else 1
+        assert parsed.get("fail_code") == expected_code, (case_id, parsed, p.stderr)
+        assert parsed.get("ok") == (expected_rc == 0), (case_id, parsed)
+        after = {p.name: p.read_bytes() for p in assets.iterdir()}
+        mutated_paths = sorted(name for name in before.keys() | after.keys()
+                               if before.get(name) != after.get(name))
+        assert not mutated_paths, (case_id, mutated_paths)
+        record(case_id, "companion-appstore", "positive" if expected_rc == 0 else "negative",
+               expected_rc, p, {"fail_code": parsed.get("fail_code"), "mutated_paths": mutated_paths})
+        return parsed
+
+    refresh_metadata()
 
     # 1. Negative: -appstore.* tag rejected on --channel stable with channel_mismatch
     p = subprocess.run(
@@ -64,43 +151,117 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     assert parsed.get("fail_code") == "channel_mismatch", f"expected channel_mismatch, got {parsed}"
     record("neg_stable_on_companion", "companion-appstore", "negative", 1, p, {"fail_code": parsed.get("fail_code")})
 
-    # 3. Positive: compliant companion-appstore fixture (prerelease=true + required exporter assets)
-    good_companion = {
-        "tag_name": "v0.15.22-appstore.16",
-        "draft": False,
-        "prerelease": True,
-        "target_commitish": "93d33742e75b063115a7460da9904e5f0d360303",
-        "assets": [
-            {"name": "FrankenTerm-Exporter.dmg", "size": 9790605},
-            {"name": "FrankenTerm-Exporter.dmg.sha256", "size": 91},
-            {"name": "FrankenTerm-Exporter.dmg.minisig", "size": 371},
-            {"name": "SHA256SUMS", "size": 716},
-            {"name": "SHA256SUMS.minisig", "size": 357},
-        ],
-    }
-    good_json = td_path / "companion_good.json"
-    good_json.write_text(json.dumps(good_companion))
-    p = subprocess.run(
-        ["bash", str(verify_sh), "--channel", "companion-appstore", "--json",
-         "v0.15.22-appstore.16", "--release-json", str(good_json)],
-        capture_output=True, text=True,
-    )
-    parsed = json.loads(p.stdout) if p.stdout.strip().startswith("{") else {}
-    assert parsed.get("ok") is True, f"expected ok=true, got {parsed}"
-    record("pos_companion_prerelease_fixture", "companion-appstore", "positive", 0, p, {"ok": parsed.get("ok")})
+    # 3. Real signatures and canonical newline-terminated checksum sidecars.
+    parsed = companion_case("pos_companion_signed_artifacts")
+    assert parsed["verification_scope"] == "companion_artifact_integrity", parsed
+    companion_case("neg_companion_metadata_only", "missing_companion_assets", with_assets=False)
+    companion_case("neg_companion_untrusted_signer", "minisig_invalid", verifier=verify_sh)
+
+    # A one-byte mutation with refreshed public metadata must still fail the
+    # trusted signature, even if the attacker supplies matching checksums.
+    for artifact in (dmg, app_zip):
+        original = artifact.read_bytes()
+        artifact.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        (assets / (artifact.name + ".sha256")).write_text(f"{digest}  {artifact.name}\n")
+        sums.write_text("".join(sorted(
+            f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in (dmg, app_zip)
+        )))
+        sign(sums)
+        refresh_metadata()
+        companion_case("neg_tampered_" + artifact.suffix[1:], "minisig_invalid")
+        restore_assets()
+
+    signature = assets / "FrankenTerm-Exporter.dmg.minisig"
+    signature.write_bytes(b"invalid signature\n")
+    refresh_metadata()
+    companion_case("neg_invalid_companion_signature", "minisig_invalid")
+    restore_assets()
+
+    # Even a correctly signed aggregate must actually bind both artifacts.
+    for case_id, contents in [
+        ("neg_signed_aggregate_wrong_hash", "0" * 64 + f"  {dmg.name}\n"),
+        ("neg_signed_aggregate_missing_dmg", checksum_lines[1]),
+        ("neg_signed_aggregate_duplicate", "".join(checksum_lines) + checksum_lines[0]),
+        ("neg_signed_aggregate_path_escape", "".join(checksum_lines) + "0" * 64 + "  ../escape\n"),
+    ]:
+        sums.write_text(contents)
+        sign(sums)
+        refresh_metadata()
+        companion_case(case_id, "aggregate_checksum_mismatch")
+        restore_assets()
+
+    malformed_json = td_path / "companion_invalid.json"
+    malformed = copy.deepcopy(good_companion)
+    malformed["assets"].append(copy.deepcopy(malformed["assets"][0]))
+    malformed_json.write_text(json.dumps(malformed))
+    companion_case("neg_duplicate_companion_asset", "invalid_companion_metadata", metadata=malformed_json)
+    malformed_json.write_text(good_json.read_text().replace('"draft": false', '"draft": true, "draft": false'))
+    companion_case("neg_duplicate_companion_json_key", "invalid_companion_metadata", metadata=malformed_json)
+    malformed = copy.deepcopy(good_companion)
+    malformed["assets"] = [a for a in malformed["assets"] if a["name"] != app_zip.name + ".minisig"]
+    malformed_json.write_text(json.dumps(malformed))
+    companion_case("neg_app_zip_missing_signature", "missing_companion_asset", metadata=malformed_json)
+    malformed = copy.deepcopy(good_companion)
+    malformed["assets"][0]["size"] += 1
+    malformed_json.write_text(json.dumps(malformed))
+    companion_case("neg_companion_size_mismatch", "companion_size_mismatch", metadata=malformed_json)
+    malformed["assets"][0]["size"] = 10 ** 100
+    malformed_json.write_text(json.dumps(malformed))
+    companion_case("neg_companion_unbounded_size", "invalid_companion_metadata", metadata=malformed_json)
+    malformed = copy.deepcopy(good_companion)
+    malformed["assets"][0]["digest"] = "sha256:" + "0" * 64
+    malformed_json.write_text(json.dumps(malformed))
+    companion_case("neg_companion_digest_mismatch", "companion_digest_mismatch", metadata=malformed_json)
+    companion_case("neg_companion_ignored_manifest", "unsupported_companion_option",
+                   extra_args=("--manifest", "requested-manifest.json"))
+    companion_case("neg_companion_ignored_attestation", "unsupported_companion_option",
+                   extra_args=("--attestation-bundle", "requested-bundle.json", "--release-policy", "requested-policy.json"))
+
+    # Test the real online download branch with isolated HTTP transports, while
+    # keeping the production digest and Minisign verification fully active.
+    bin_dir = td_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text("#!/bin/sh\ncat \"$FT_TEST_RELEASE_JSON\"\n")
+    (bin_dir / "curl").write_text('''#!/usr/bin/env python3
+import os, pathlib, shutil, sys
+args = sys.argv[1:]
+assert "--max-filesize" in args and "--max-time" in args
+assert args[args.index("--proto") + 1] == "=https"
+target = pathlib.Path(args[args.index("--output") + 1])
+source = pathlib.Path(os.environ["FT_TEST_ASSETS"]) / args[-1].rsplit("/", 1)[1]
+with open(os.environ["FT_TEST_DOWNLOAD_LOG"], "a") as log:
+    log.write(source.name + "\\n")
+shutil.copyfile(source, target)
+''')
+    for tool in bin_dir.iterdir():
+        tool.chmod(0o755)
+    download_log = td_path / "downloads.log"
+    env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+               FT_TEST_RELEASE_JSON=str(good_json), FT_TEST_ASSETS=str(assets),
+               FT_TEST_DOWNLOAD_LOG=str(download_log), TMPDIR=str(td_path))
+    p = subprocess.run(["bash", str(fixture_verify), "--channel", "companion-appstore", "--json", tag],
+                       env=env, capture_output=True, text=True)
+    parsed = json.loads(p.stdout)
+    assert parsed.get("ok") is True, (parsed, p.stderr)
+    assert sorted(download_log.read_text().splitlines()) == sorted(originals)
+    record("pos_online_companion_downloads_and_authenticates", "companion-appstore", "positive", 0, p)
+
+    malformed = copy.deepcopy(good_companion)
+    malformed["assets"][0]["browser_download_url"] = "https://untrusted.invalid/artifact"
+    malformed_json.write_text(json.dumps(malformed))
+    env["FT_TEST_RELEASE_JSON"] = str(malformed_json)
+    p = subprocess.run(["bash", str(fixture_verify), "--channel", "companion-appstore", "--json", tag],
+                       env=env, capture_output=True, text=True)
+    parsed = json.loads(p.stdout)
+    assert parsed.get("fail_code") == "invalid_companion_asset", (parsed, p.stderr)
+    record("neg_online_companion_foreign_download_url", "companion-appstore", "negative", 1, p)
 
     # 4. Negative: companion-appstore fixture with prerelease=false (hijacking GitHub Latest!)
-    bad_companion = dict(good_companion, tag_name="v0.15.22-appstore.15", prerelease=False)
+    bad_companion = dict(good_companion, prerelease=False)
     bad_json = td_path / "companion_not_prerelease.json"
     bad_json.write_text(json.dumps(bad_companion))
-    p = subprocess.run(
-        ["bash", str(verify_sh), "--channel", "companion-appstore", "--json",
-         "v0.15.22-appstore.15", "--release-json", str(bad_json)],
-        capture_output=True, text=True,
-    )
-    parsed = json.loads(p.stdout) if p.stdout.strip().startswith("{") else {}
-    assert parsed.get("fail_code") == "companion_release_not_prerelease", f"got {parsed}"
-    record("neg_companion_hijacks_latest", "companion-appstore", "negative", 1, p, {"fail_code": parsed.get("fail_code")})
+    companion_case("neg_companion_hijacks_latest", "companion_release_not_prerelease", metadata=bad_json)
 
     # 5. Positive: Linux ABI floor check passes for <= GLIBC_2.35 / GLIBCXX_3.4.30 / CXXABI_1.3.13
     clean_syms = td_path / "clean_syms.txt"
