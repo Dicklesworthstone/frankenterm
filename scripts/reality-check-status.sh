@@ -39,12 +39,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_MODE="file"     # file | stdout | json
 DATE_STAMP="$(date -u +%Y-%m-%d)"
 TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+EPIC_FILTER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --stdout) OUTPUT_MODE="stdout"; shift ;;
     --json)   OUTPUT_MODE="json";   shift ;;
     --date)   DATE_STAMP="$2";      shift 2 ;;
+    --epic)   EPIC_FILTER="$2";     shift 2 ;;
     -h|--help)
       sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -76,20 +78,51 @@ CLOSED_COUNT="$(jq '.issues | length' <<<"$CLOSED_JSON")"
 TOTAL_COUNT=$((OPEN_COUNT + IP_COUNT + CLOSED_COUNT))
 
 # ---------------------------------------------------------------------------
-# Bucket issues by epic-prefix. Epic prefix = the first three dot-separated
-# tokens of the BR-RC-* tag in the title (e.g.
-# "BR-RC-FOUNDATION.G3.1" → "BR-RC-FOUNDATION"). Issues without a BR-RC-
-# prefix in their title fall into "uncategorized".
+# Bucket issues by round/epic prefix (RC1 BR-RC-*, RC2 ft-tf6g3, RC3 ft-xxfwy,
+# RC4 ft-mgy5t2, plus explicit [RC<N>.G<M>] title markers). Only beads without
+# any recognized round or BR-RC-* marker fall into "uncategorized" (ft-mgy5t2.9).
 # ---------------------------------------------------------------------------
 
 bucket_issues() {
   # arg 1: status JSON.   prints "<epic>\t<id>\t<title>" lines.
-  jq -r '.issues[] | [.id, .title] | @tsv' <<<"$1" | while IFS=$'\t' read -r id title; do
-    epic="$(printf '%s' "$title" | grep -oE 'BR-RC-[A-Z][A-Z0-9-]*' | head -n1)"
-    [[ -z "$epic" ]] && epic="uncategorized"
+  jq -r --arg filter "$EPIC_FILTER" '
+    (.issues // .)[]
+    | select($filter == "" or .id == $filter or (.id | startswith($filter + ".")))
+    | [.id, .title] | @tsv
+  ' <<<"$1" | while IFS=$'\t' read -r id title; do
+    epic=""
+    case "$id" in
+      ft-mgy5t2|ft-mgy5t2.*) epic="RC4-ft-mgy5t2" ;;
+      ft-xxfwy|ft-xxfwy.*)   epic="RC3-ft-xxfwy" ;;
+      ft-tf6g3|ft-tf6g3.*)   epic="RC2-ft-tf6g3" ;;
+      *)
+        epic="$(printf '%s' "$title" | grep -oE 'BR-RC-[A-Z][A-Z0-9-]*' | head -n1 || true)"
+        if [[ -z "$epic" ]]; then
+          if printf '%s' "$title" | grep -qE '^\[RC4[.\]]|reality-check-2026-11-20'; then
+            epic="RC4-ft-mgy5t2"
+          elif printf '%s' "$title" | grep -qE '^\[RC3[.\]]|reality-check-2026-09-01'; then
+            epic="RC3-ft-xxfwy"
+          elif printf '%s' "$title" | grep -qE 'reality-check-2026-05-12'; then
+            epic="RC2-ft-tf6g3"
+          else
+            epic="uncategorized"
+          fi
+        fi
+        ;;
+    esac
     printf '%s\t%s\t%s\n' "$epic" "$id" "$title"
   done
 }
+
+# Optional closeout-audit hook (owned by ft-mgy5t2.13; degrades gracefully when absent).
+CLOSEOUT_HEALTH_JSON="null"
+if [[ -x "$REPO_ROOT/scripts/beads-closeout-audit.sh" ]]; then
+  if audit_out="$("$REPO_ROOT/scripts/beads-closeout-audit.sh" --json 2>/dev/null)"; then
+    if jq -e . >/dev/null 2>&1 <<<"$audit_out"; then
+      CLOSEOUT_HEALTH_JSON="$audit_out"
+    fi
+  fi
+fi
 
 ALL_TSV="$(
   {
@@ -98,6 +131,11 @@ ALL_TSV="$(
     bucket_issues "$CLOSED_JSON" | awk -F'\t' '{print $1"\tclosed\t"$2"\t"$3}'
   } | sort
 )"
+
+OPEN_COUNT="$(printf '%s\n' "$ALL_TSV" | awk -F'\t' '$2=="open"' | wc -l | tr -d ' ')"
+IP_COUNT="$(printf '%s\n' "$ALL_TSV" | awk -F'\t' '$2=="in_progress"' | wc -l | tr -d ' ')"
+CLOSED_COUNT="$(printf '%s\n' "$ALL_TSV" | awk -F'\t' '$2=="closed"' | wc -l | tr -d ' ')"
+TOTAL_COUNT=$((OPEN_COUNT + IP_COUNT + CLOSED_COUNT))
 
 EPICS="$(printf '%s\n' "$ALL_TSV" | awk -F'\t' '{print $1}' | sort -u | grep -v '^$' || true)"
 
@@ -123,13 +161,17 @@ render_json() {
   jq -n \
     --arg date "$DATE_STAMP" \
     --arg ts "$TIMESTAMP_UTC" \
+    --arg epic_filter "$EPIC_FILTER" \
     --argjson totals "{\"open\":$OPEN_COUNT,\"in_progress\":$IP_COUNT,\"closed\":$CLOSED_COUNT,\"total\":$TOTAL_COUNT}" \
     --arg epics "$EPICS" \
     --arg rows "$ALL_TSV" \
+    --argjson closeout_health "$CLOSEOUT_HEALTH_JSON" \
     '{
       report_date: $date,
       generated_at: $ts,
+      epic_filter: (if $epic_filter == "" then null else $epic_filter end),
       totals: $totals,
+      closeout_health: $closeout_health,
       epics: ($epics | split("\n") | map(select(. != ""))),
       issues_by_epic: (
         $rows | split("\n") | map(select(. != "")) | map(
@@ -201,7 +243,7 @@ EOF
 ## Cross-references
 
 - Bead board (open RC work): \`br list --label reality-check --status=open\`
-- Bridge plan: [\`docs/reality-check-bridge-plan.md\`](../reality-check-bridge-plan.md)
+- Bridge plans: [\`docs/reality-check-bridge-plan-2026-11-20.md\`](../reality-check-bridge-plan-2026-11-20.md) (RC4), [\`docs/reality-check-bridge-plan-2026-09-01.md\`](../reality-check-bridge-plan-2026-09-01.md) (RC3), [\`docs/reality-check-bridge-plan-2026-05-12.md\`](../reality-check-bridge-plan-2026-05-12.md) (RC2), [\`docs/reality-check-bridge-plan.md\`](../reality-check-bridge-plan.md) (RC1)
 - Attestation schema + verifier: [\`docs/attestations/schema.json\`](../attestations/schema.json), [\`scripts/attestation-verify.sh\`](../../scripts/attestation-verify.sh)
 - Cadence: manual, when \`scripts/check-reality-check-due.sh\` reports a due trigger
 EOF

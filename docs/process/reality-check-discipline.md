@@ -70,6 +70,7 @@ ambition and refinement passes.
 Every new plan must include:
 
 - Source date and invocation.
+- `**Baseline commit:** <40-hex-sha>` anchoring `scripts/check-reality-check-due.sh` against later mass-restore/revert commits (ft-mgy5t2.9).
 - Predecessor plan links.
 - Bead epic id and child range.
 - Gap table with proof category or substrate/process classification.

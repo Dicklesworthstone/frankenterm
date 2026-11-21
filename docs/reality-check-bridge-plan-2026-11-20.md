@@ -24,7 +24,7 @@
 - `br dep cycles --json`: **0 active cycles** (`active_count: 0`).
 
 **Baseline commit:** `93d33742e75b063115a7460da9904e5f0d360303`
-**RC4 Epic:** `ft-mgy5t2` (`[reality-check-2026-11-20] Four-Surface Truth, Cross-Platform Release, Attestation Unblock & Proof-Closeout Convergence`, 31 child beads `ft-mgy5t2.1`–`ft-mgy5t2.31`)
+**RC4 Epic:** `ft-mgy5t2` (`[reality-check-2026-11-20] Four-Surface Truth, Cross-Platform Release, Attestation Unblock & Proof-Closeout Convergence`, 33 child beads `ft-mgy5t2.1`–`ft-mgy5t2.33`, 62 causal dependency edges, 0 active cycles)
 
 ---
 
@@ -311,7 +311,64 @@ Every RC4 gap below carries exact source locations, target state, concrete imple
 
 ## 5. Phase 3a & Phase 5: RC4 Bead Graph, Refinement Log & Validation
 
-_Pending Phase 3a bead generation and Phase 5 refinement rounds × 5._
+### 5a. RC4 Bead Graph (`ft-mgy5t2` — 1 Epic + 33 Granular Children, 62 Causal Edges)
+
+Every child bead is 100% self-contained (`Background`, `Why This Matters`, `Acceptance Criteria`, `References`, `Test Companion`, `Operator Surface`, `Degradation Behavior`, `Proof Category`, machine-readable `proof_category:` line from `docs/proof-taxonomy.json`, and strict fail-closed RCH/DSR proof contract — zero GitHub Actions per Rule 0.1). Existing open owners are linked via `br dep add` rather than duplicated.
+
+| Bead ID | Gap | Type | Prio | Wave | Title (Summary) | `proof_category:` | Causal Dependencies |
+|---|---|---|---|---|---|---|---|
+| **`ft-mgy5t2`** | Epic | `epic` | P1 | — | Four-Surface Truth, Cross-Platform Release, Attestation Unblock & Proof-Closeout Convergence | `4 + 5 + 10 + coordination + process` | Parent of `.1`–`.33` |
+| `ft-mgy5t2.32` | **G94a** | `task` | **P0** | **0 (Ready)** | Release-channel split tooling: `verify-release.sh --channel`, `install.sh` prerelease guard & Linux `GLIBC_2.35` pre-publish gate | `4 + 10 + process` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.33` | **G94a.T** | `test` | P1 | 1 | Offline fixture & planted-negative tests for `verify-release.sh --channel`, Linux ABI floor & `install.sh` rollback | `4 + 10` | `.32` |
+| `ft-mgy5t2.1` | **G94b** | `task` | **P0** | 2 | Publish signed cross-platform stable DSR release (macOS + Linux glibc-safe + Windows) as GitHub `Latest` | `10 + 4 + process` | `.33`, `.3`, `.5`, `.11`, `ft-gjsx6`, `ft-xxfwy.1` |
+| `ft-mgy5t2.2` | **G94b.T** | `test` | P1 | 3 | Live clean-host macOS + Linux Quick Install canary E2E against published signed stable release | `4 + 10` | `.1` |
+| `ft-mgy5t2.3` | **G95** | `bug` | **P0** | 1 | Codec-75 workspace greenness (`PROVENANCE.json` gate, `FT-1025` codec-74/75 skew UX & atomic-redeploy runbook) | `4 + 9 + infrastructure` | `ft-wratz`, `ft-kme8ez`, `ft-achoj3` |
+| `ft-mgy5t2.4` | **G95.T** | `test` | P1 | 2 | Codec-75 UTF-8/width differential oracle, legacy-46 pre-alloc rejection & `FT-1025` skew UX tests | `9 + 2 + 4` | `.3` |
+| `ft-mgy5t2.5` | **G96** | `task` | **P0** | 2 | Unblock `--strict-deferred` attestation deadlock, wire codec-75 live-proof receipts into `manifest.json` & publish first signed release bundle | `10 + 8 + 7 + 4` | `.3`, `ft-7h5da.10.2`, `ft-7h5da.1.5`, `ft-7h5da.13.7`, `ft-xxfwy.49` |
+| `ft-mgy5t2.6` | **G96.T** | `test` | P1 | 3 | Attestation `--strict-deferred` external trust-root & MGF Lindley independent `Decimal` oracle adversarial tests | `10 + 8 + 4` | `.5` |
+| `ft-mgy5t2.7` | **G97** | `docs` | P1 | **0 (Ready)** | Unified 4-surface `README.md` + `AGENTS.md` + `headline-claims.json` convergence & `check-readme-consistency.sh` gate | `4 + process` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.8` | **G97.T** | `test` | P1 | 1 | Documentation contradiction-guard unit/fixture tests (5 planted drift & missing-crate negatives) | `4` | `.7` |
+| `ft-mgy5t2.9` | **G98** | `bug` | P1 | **0 (Ready)** | Mass-restore-immune `check-reality-check-due.sh` `Baseline commit:` anchor & multi-epic `reality-check-status.sh` | `4 + process` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.10` | **G98.T** | `test` | P1 | 1 | Synthetic mass-restore git fixture tests for `check-reality-check-due.sh` & `reality-check-status.sh` | `4` | `.9` |
+| `ft-mgy5t2.11` | **G100** | `task` | **P0** | **0 (Ready)** | Read-only `fleet-proof-preflight.sh`, DSR/RCH 7-host remediation playbook & `trj` canonical/alias recovery | `infrastructure + 5` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.12` | **G100.T** | `test` | P1 | 1 | Fleet preflight schema & planted-unhealthy-host fail-closed fixture tests | `4 + infrastructure` | `.11` |
+| `ft-mgy5t2.13` | **G99** | `task` | **P0** | **0 (Ready)** | November proof-attached bead closeout sweep, `scripts/beads-closeout-audit.sh`, stale `in_progress` reclamation & P0≤25 ratchet | `coordination + process` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.14` | **G99.T** | `test` | P1 | 1 | Beads closeout-audit classifier & P0/WIP invariant fixture tests | `4 + process` | `.13` |
+| `ft-mgy5t2.15` | **G101** | `bug` | P1 | **0 (Ready)** | Fix duplicate `ftui` in `ft doctor` (`main.rs:102645`), per-domain tiered-scrollback diagnostics & activate launchd `ft watch` dogfooding | `4 + process` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.16` | **G101.T** | `test` | P1 | 1 | Unit & live-socket E2E tests for `ft doctor` feature dedup, per-domain tiered scrollback & dogfood freshness | `4` | `.15` |
+| `ft-mgy5t2.17` | **G102** | `task` | P1 | **0 (Ready)** | Converge 19 `ParsedButUnconsumed` config keys (wire or remove) + README `ft.toml` static wiring gate | `2 + 4` | _None (Wave 0 ready)_ |
+| `ft-mgy5t2.18` | **G102.T** | `test` | P1 | 1 | Config-wiring README `ft.toml` static gate & live safety/ingest consumption tests | `2 + 4` | `.17` |
+| `ft-mgy5t2.19` | **G103** | `task` | P1 | 2 | Mac Metal default graduation, `PageGrid` observational bisimulation oracle & ONS e-process/e-BH/Wasserstein-1 Ghostty scoreboard | `5 + 9 + 2` | `.3` |
+| `ft-mgy5t2.20` | **G103.T** | `test` | P1 | 3 | `PageGrid` chunk-split bisimulation fuzzing, submodular escape corpus & Ville/e-BH/Wasserstein-1 oracle tests | `2 + 9 + 5` | `.19` |
+| `ft-mgy5t2.21` | **G104** | `feature` | P1 | 2 | Unified Multi-Client Controller Lease & Geometry Arbitration (Multiparty Session Types, HLC, TLA+ & codec/mux CAS; resolves `ft-jh8jen`/`ft-kspql1`) | `6 + 4 + 2` | `.3` |
+| `ft-mgy5t2.22` | **G104.T** | `test` | P1 | 3 | TLC TLA+ model check & 4-client (Desktop/iOS/Browser/Robot) resize-lease preemption E2E suite | `6 + 2 + 4` | `.21` |
+| `ft-mgy5t2.23` | **G105** | `task` | P1 | 2 | Unified Fountain-Coding Adversarial Qualification (`FTQR1` optical QR + RaptorQ rank-deficiency, coprime anti-phase-lock & Rust↔Swift RFC 9180 vectors) | `2 + 7 + 10` | `.3` |
+| `ft-mgy5t2.24` | **G105.T** | `test` | P1 | 3 | Cross-platform Rust↔Swift HPKE/`FTAG`/`FTQR1` vector, phase-lock & adversarial symbol-poisoning fuzz tests | `2 + 7 + 10` | `.23` |
+| `ft-mgy5t2.25` | **G106** | `task` | P2 | 1 | Hard `main.rs` monolith line-count ratchet in `release-gates.sh`, first 3 family extractions (`mobile`/`attestation`/`doctor`) & Rule-1 owner-authorized root cleanup manifest | `4 + 9 + substrate + process` | `.15` |
+| `ft-mgy5t2.26` | **G106.T** | `test` | P2 | 2 | `main.rs` ratchet `+1` negative control, CLI `--help`/robot-envelope bisimulation oracle & root cleanup manifest integrity tests | `4 + 9` | `.25` |
+| `ft-mgy5t2.27` | **G107** | `feature` | P1 | 3 | Browser FrankenTerm authenticated Tailscale Serve + single-pane WebSocket vertical slice & DSR WASM asset bundle | `4 + 3` | `.3`, `.21` |
+| `ft-mgy5t2.28` | **G107.T** | `test` | P1 | 4 | Headless Chrome E2E for Browser FrankenTerm Tailscale auth, WebSocket lease fencing & OpenAPI schema | `4 + 3` | `.27` |
+| `ft-mgy5t2.29` | **G108** | `task` | P1 | 2 | Measured per-release perf pipeline (`docs/perf/releases/`), `trj` 64-core target-class cockpit (unblocking `ft-7h5da.10.4.3`) & first non-`contract_only` product journeys (`q002`/`q020`/`q050`) | `5 + 8` | `.11`, `ft-7h5da.10.3.2`, `ft-7h5da.10.4.4`, `ft-xxfwy.20` |
+| `ft-mgy5t2.30` | **G108.T** | `test` | P1 | 3 | Per-release perf artifact validator, non-synthetic load-rig differential check & product-journey evidence gate | `5 + 4` | `.29` |
+| `ft-mgy5t2.31` | **G109** | `test` | P1 | **Final** | `[RC4.FINAL]` Four-Surface Clean-Host Acceptance Gate (macOS + Linux Quick Install + 10-Min Tour, signed `--strict-deferred` bundle, codec-75 3-agent loop, iOS QR/mux & Browser attach) | `4 + 10 + 5` | All 16 `.T` companions (`.2,.4,.6,.8,.10,.12,.14,.16,.18,.20,.22,.24,.26,.28,.30,.33`), `ft-xxfwy.30`, `ft-xxfwy.42`, `ft-xxfwy.47`, `ft-xxfwy.48`, `ft-xxfwy.62`, `ft-majms` |
+
+**Immediately Ready Wave-0 Parallel Tracks (7 unblocked beads):** `ft-mgy5t2.32` (P0, G94a release-channel tooling), `ft-mgy5t2.11` (P0, G100 fleet preflight/recovery), `ft-mgy5t2.13` (P0, G99 Nov closeout sweep & P0≤25 ratchet), `ft-mgy5t2.7` (P1, G97 4-surface docs & consistency gate), `ft-mgy5t2.9` (P1, G98 mass-restore-immune due-check & multi-epic status), `ft-mgy5t2.15` (P1, G101 `ft doctor` duplicate `ftui` + per-domain scrollback + launchd dogfood), `ft-mgy5t2.17` (P1, G102 19 `ParsedButUnconsumed` config keys wire-or-remove + README `ft.toml` gate).
+
+### 5b. Phase 5 Plan-Space Refinement Log (5 Passes to 0-Change Convergence)
+
+1. **Pass 1 (Structural, Taxonomy, Cycle & Graph Audit):** Verified `check-reality-check-bead-structure.sh --strict-all` (0 errors, 0 warnings), `validate-proof-taxonomy.sh --require-close-comments` (0 violations), `br dep cycles` (0 cycles), and `bv --robot-suggest` (0 RC4 suggestions). Identified 5 substantive defects: (a) RC4 itself added 9 P0s while targeting P0 ≤ 25; (b) `ft-mgy5t2.1` bundled Wave-0 `verify-release.sh --channel` tooling with Wave-2 DSR stable publishing, blocking Day-1 tooling work behind Windows host recovery and Lindley bounds; (c) `ft-mgy5t2.1` lacked causal dependency on `ft-mgy5t2.5` (`--strict-deferred` unblock required by `dsr quality`); (d) G102 control-plane beads (`ft-xxfwy.47/.48/.62`, `ft-majms`) were referenced only in prose rather than graph-enforced; (e) Rust implementation beads and `[RC4.FINAL]` lacked explicit strict-RCH/DSR contracts and live iOS bug linkage (`ft-jh8jen`, `ft-kspql1`, `ft-w9lwkb`, `ft-x5pem6`).
+2. **Pass 2 (Split G94a/G94b, P0 Renormalization, Missing Causal Edges & Contract Enrichment):** Demoted `.2`/`.4`/`.6`/`.31` from P0 → P1 (keeping 6 surgical P0 blockers: `.32`, `.1`, `.3`, `.5`, `.11`, `.13`). Split G94 into Wave-0 `ft-mgy5t2.32`/`ft-mgy5t2.33` (`[RC4.G94a]`/`[RC4.G94a.T]`) and Wave-2 `ft-mgy5t2.1`/`ft-mgy5t2.2` (`[RC4.G94b]`/`[RC4.G94b.T]`). Wired `.1 → .33`, `.1 → .5`, `.33 → .32`, and `.31 → ft-xxfwy.47/.48/.62, ft-majms, .33`. Appended explicit strict fail-closed RCH/DSR proof contracts, iOS `ft-jh8jen`/`ft-kspql1` alignment (`.21`), `ft-7h5da.10.4.3` unblocking (`.29`), and 4 adversarial fail-closed spot checks (`.31`).
+3. **Pass 3 (Coherence, Reference-Integrity & Ambition-Coverage Audit):** Ran automated verification across all 34 issues: confirmed 100% of Ambition Rounds 1–3 mechanisms (47/47 keywords) embedded verbatim in RC4 beads, 0 cycles, 0 structure violations. Caught 4 residual defects: (a) broken shorthand ID `ft-7xqz4.8` in `.21` (real ID `ft-interactive-swarm-product-convergence-7xqz4.8`); (b) stale `first_vertical_slice:` on epic `ft-mgy5t2` predating the G94a/G94b split; (c) residual overlap between `.1`/`.2` and `.32`/`.33` descriptions; (d) overlapping Wave-0 file-edit ownership between `.9`/`.13` (`scripts/reality-check-status.sh`) and `.7`/`.17` (`README.md`).
+4. **Pass 4 (Surgical Reference, Scope & Wave-0 Ownership Fixes):** Fixed `ft-interactive-swarm-product-convergence-7xqz4.8` in `.21`, updated `first_vertical_slice:` on `ft-mgy5t2`, tightened `.1`/`.2` cleanly to live DSR publish + live clean-host canary E2E, and added explicit non-overlapping Wave-0 file ownership boundaries for `.9`/`.13` (`beads.closeout_audit.v1` decoupled schema) and `.7`/`.17`.
+5. **Pass 5 (Convergence Verification — 0 Remaining Changes):** Re-ran full validation suite (`br sync --flush-only`, `check-reality-check-bead-structure.sh --strict-all`, `validate-proof-taxonomy.sh`, `br dep cycles`, reference integrity, Test Companion reciprocity, `bv --robot-triage`, `bv --robot-suggest`). Result: **0 structure errors, 0 structure warnings, 0 taxonomy violations, 0 active cycles, 0 missing refs, 0 broken companion pairs, 0 RC4 BV suggestions — converged.**
+
+### 5c. Final Validation & Hygiene Checkpoints (2026-11-20 / 2026-11-21 UTC)
+
+- `scripts/check-reality-check-bead-structure.sh --epic-id ft-mgy5t2 --strict-all --json`: `ok: true`, `checked_issue_count: 34`, `strict_structure_checked_count: 33`, `error_count: 0`, `warning_count: 0`.
+- `scripts/validate-proof-taxonomy.sh --json --require-close-comments`: `ok: true`, `checked_issue_count: 57`, `violation_count: 0`.
+- `br dep cycles --json`: `count: 0`, `active_count: 0`.
+- `bv --robot-triage` (`generated_at=2026-11-21T01:13:33Z`, `data_hash=8ebc23f8446525b2`): `open_count=1291`, `actionable_count=801`, `blocked_count=490`, `in_progress_count=439`.
+- **BV suggest checkpoint:** `generated_at=2026-11-21T01:15:32Z data_hash=8ebc23f8446525b2 total=50 high_confidence=50 actionable=30 missing_dependency=20 potential_duplicate=20 label_suggestion=10 rc4_suggestions=0` — Triage: `0/50` touch `ft-mgy5t2` (RC4 graph clean); all `50/50` are pre-existing legacy `wa-*`/historical items (top 5: `wa-b0gi`/`wa-upg.15.4`, `wa-7ckb`/`wa-ogc.5`, `wa-vu7z`/`wa-vze5`, `wa-4vx.8.6`/`wa-zwcf`, `wa-upg.6.1`/`wa-vzj8`) deferred to `ft-mgy5t2.13` (G99 bead-graph cleanup).
 
 ---
 

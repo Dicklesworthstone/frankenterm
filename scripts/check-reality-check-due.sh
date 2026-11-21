@@ -13,6 +13,7 @@ OPEN_THRESHOLD=50
 CONTRACT_DIFF_THRESHOLD=50
 CLAIM_GROWTH_THRESHOLD=3
 CALENDAR_DAYS=90
+OVERRIDE_REPO_ROOT=""
 
 usage() {
   cat <<'USAGE'
@@ -21,6 +22,7 @@ Usage: scripts/check-reality-check-due.sh [options]
 Options:
   --json                         Emit machine-readable JSON.
   --strict                       Exit 1 when any trigger fires.
+  --repo-root DIR                Inspect a specific git repository root (for fixture tests).
   --as-of YYYY-MM-DD             Override today's date for reproducible checks.
   --open-threshold N             Open-bead trigger threshold (default: 50).
   --contract-diff-threshold N    Contract-doc churn threshold (default: 50).
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) OUTPUT_MODE="json"; shift ;;
     --strict) STRICT=1; shift ;;
+    --repo-root) require_arg "$1" "${2-}"; OVERRIDE_REPO_ROOT="$2"; shift 2 ;;
     --as-of) require_arg "$1" "${2-}"; AS_OF="$2"; shift 2 ;;
     --open-threshold) require_arg "$1" "${2-}"; OPEN_THRESHOLD="$2"; shift 2 ;;
     --contract-diff-threshold) require_arg "$1" "${2-}"; CONTRACT_DIFF_THRESHOLD="$2"; shift 2 ;;
@@ -62,6 +65,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -n "$OVERRIDE_REPO_ROOT" ]]; then
+  [[ -d "$OVERRIDE_REPO_ROOT" ]] || { echo "error: --repo-root directory not found: $OVERRIDE_REPO_ROOT" >&2; exit 2; }
+  REPO_ROOT="$(cd "$OVERRIDE_REPO_ROOT" && pwd -P)"
+fi
 
 require_non_negative_integer "--open-threshold" "$OPEN_THRESHOLD"
 require_non_negative_integer "--contract-diff-threshold" "$CONTRACT_DIFF_THRESHOLD"
@@ -98,15 +106,17 @@ extract_plan_date() {
     || true
 }
 
-latest_plan_date() {
-  local latest=""
+latest_plan_info() {
+  local latest_date=""
+  local latest_path=""
   local path
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     local d
     d="$(extract_plan_date "$path")"
-    if [[ -n "$d" && ( -z "$latest" || "$d" > "$latest" ) ]]; then
-      latest="$d"
+    if [[ -n "$d" && ( -z "$latest_date" || "$d" > "$latest_date" ) ]]; then
+      latest_date="$d"
+      latest_path="$path"
     fi
   done < <(
     git ls-files -- \
@@ -114,14 +124,48 @@ latest_plan_date() {
       'docs/reality-check-bridge-plan-*.md' \
       | sort
   )
-  printf '%s\n' "$latest"
+  printf '%s\t%s\n' "$latest_date" "$latest_path"
 }
 
-latest_tracked_plan_commit() {
-  git log -1 --format=%H -- \
-    docs/reality-check-bridge-plan.md \
-    'docs/reality-check-bridge-plan-*.md' \
-    2>/dev/null || true
+# Resolve the anchor commit for the newest reality-check bridge plan without
+# letting later mass-delete/restore commits (`git log -1`) blind churn metrics
+# (ft-mgy5t2.9). Priority:
+#   1. Explicit `**Baseline commit:** <40-hex>` (or `Baseline commit: <40-hex>`)
+#      header inside the newest plan file. Fails closed if present but invalid.
+#   2. Earliest addition commit (`git log --diff-filter=A --reverse`) of that
+#      plan file for legacy plans lacking the header.
+resolve_plan_baseline_commit() {
+  local plan_path="$1"
+  local header_line raw_sha
+  header_line="$(
+    grep -Em1 '^\*{0,2}Baseline commit:\*{0,2}[[:space:]]+' "$plan_path" 2>/dev/null || true
+  )"
+  if [[ -n "$header_line" ]]; then
+    raw_sha="$(
+      printf '%s\n' "$header_line" \
+        | sed -E 's/^\*{0,2}Baseline commit:\*{0,2}[[:space:]]+//' \
+        | tr -d '`' \
+        | awk '{print $1}'
+    )"
+    if [[ ! "$raw_sha" =~ ^[0-9a-fA-F]{40}$ ]] || ! git cat-file -e "${raw_sha}^{commit}" 2>/dev/null; then
+      echo "error: invalid_baseline_commit in $plan_path: '$raw_sha' is not a valid 40-hex git commit" >&2
+      exit 2
+    fi
+    printf 'plan_header\t%s\n' "$raw_sha"
+    return
+  fi
+
+  local add_sha
+  add_sha="$(
+    git log --diff-filter=A --reverse --format=%H -- "$plan_path" 2>/dev/null \
+      | head -n 1 || true
+  )"
+  if [[ -n "$add_sha" ]]; then
+    printf 'first_add_commit\t%s\n' "$add_sha"
+    return
+  fi
+
+  printf 'none\t\n'
 }
 
 cargo_minor_version_from_stdin() {
@@ -184,13 +228,16 @@ contract_doc_delta_since() {
     | awk '{ added += $1; deleted += $2 } END { print added + deleted + 0 }'
 }
 
-latest_date="$(latest_plan_date)"
-latest_commit="$(latest_tracked_plan_commit)"
+plan_info="$(latest_plan_info)"
+IFS=$'\t' read -r latest_date latest_plan_file <<<"$plan_info"
 
-if [[ -z "$latest_date" ]]; then
+if [[ -z "$latest_date" || -z "$latest_plan_file" ]]; then
   echo "error: no reality-check bridge plan found" >&2
   exit 2
 fi
+
+baseline_info="$(resolve_plan_baseline_commit "$latest_plan_file")"
+IFS=$'\t' read -r baseline_source latest_commit <<<"$baseline_info"
 
 if ! as_of_epoch="$(epoch_for_date "$AS_OF")"; then
   echo "error: --as-of must be a valid YYYY-MM-DD date (got: $AS_OF)" >&2
@@ -243,6 +290,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   jq -n \
     --arg as_of "$AS_OF" \
     --arg latest_date "$latest_date" \
+    --arg latest_plan_file "$latest_plan_file" \
+    --arg baseline_source "$baseline_source" \
     --arg latest_commit "$latest_commit" \
     --arg current_minor "$current_minor" \
     --arg baseline_minor "$baseline_minor" \
@@ -265,6 +314,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     '{
       as_of: $as_of,
       latest_reality_check_date: $latest_date,
+      latest_plan_file: $latest_plan_file,
+      baseline_source: $baseline_source,
       latest_tracked_plan_commit: $latest_commit,
       due: $due,
       signals: {
@@ -278,8 +329,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
 else
   printf 'Reality-check due check\n'
   printf '  as_of: %s\n' "$AS_OF"
-  printf '  latest_plan_date: %s\n' "$latest_date"
-  printf '  latest_tracked_plan_commit: %s\n' "${latest_commit:-none}"
+  printf '  latest_plan_date: %s (%s)\n' "$latest_date" "$latest_plan_file"
+  printf '  latest_tracked_plan_commit: %s (source=%s)\n' "${latest_commit:-none}" "$baseline_source"
   printf '  days_since_latest: %s / %s\n' "$days_since" "$CALENDAR_DAYS"
   printf '  minor_version: current=%s baseline=%s\n' "$current_minor" "$baseline_minor"
   printf '  open_beads: %s / %s\n' "$open_count" "$OPEN_THRESHOLD"
