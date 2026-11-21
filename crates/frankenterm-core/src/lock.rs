@@ -1258,7 +1258,8 @@ fn write_file_atomic_core(
                 opened_temp = Some((temp_name, file));
                 break;
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            // The name is taken: the next attempt uses a new nonce.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(AtomicWriteError::Io {
                     phase: "open_temp",

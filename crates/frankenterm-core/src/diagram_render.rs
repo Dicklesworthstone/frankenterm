@@ -956,7 +956,7 @@ pub fn render_mermaid(
                 let rhs = stmt[idx + op.len()..].trim();
                 let (to, msg) = rhs
                     .split_once(':')
-                    .map_or((rhs.trim(), ""), |(t, m)| (t.trim(), m.trim()));
+                    .map_or((rhs, ""), |(t, m)| (t.trim(), m.trim()));
                 if from.is_empty() || to.is_empty() {
                     return Err(MermaidRenderError::SyntaxError {
                         line: line_no,

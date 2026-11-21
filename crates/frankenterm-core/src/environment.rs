@@ -219,6 +219,8 @@ impl SystemInfo {
         Self::from_observations(cpu_count, detect_memory_mb(), detect_load_average())
     }
 
+    // Only the macOS probes await; elsewhere this body is synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn detect_with_cx(cx: &crate::cx::Cx) -> Self {
         if cx.checkpoint().is_err() {
             return Self::from_observations(1, None, None);
