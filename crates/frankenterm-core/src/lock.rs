@@ -4495,7 +4495,7 @@ mod metadata_admission_tests {
                 // Wait until the blocking thread has entered the stalled read,
                 // then prove the executor stays responsive before cancelling.
                 let sibling_ran = task::spawn(async { 42usize }).await;
-                assert_eq!(sibling_ran, 42);
+                assert_eq!(sibling_ran, Ok(42));
 
                 // Poll briefly until the offloaded thread starts, then cancel mid-flight.
                 let start_wait = std::time::Instant::now();
@@ -4514,7 +4514,7 @@ mod metadata_admission_tests {
                 );
 
                 let outcome = reader.await;
-                assert_eq!(outcome, Err(BoundedReadError::Cancelled));
+                assert_eq!(outcome, Ok(Err(BoundedReadError::Cancelled)));
 
                 // Release the abandoned background thread cleanly so test teardown doesn't linger.
                 let _ = release_tx.send(());

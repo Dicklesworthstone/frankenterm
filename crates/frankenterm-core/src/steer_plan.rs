@@ -753,9 +753,7 @@ where
             TxPrepareOutcome::RequireApproval => {
                 ("require_approval", "envelope.requires_approval", None)
             }
-            TxPrepareOutcome::Deferred => {
-                ("deferred", "envelope.blocked.prepare_deferred", None)
-            }
+            TxPrepareOutcome::Deferred => ("deferred", "envelope.blocked.prepare_deferred", None),
             TxPrepareOutcome::Denied => {
                 let verdict = if !kill_switch_ok {
                     "envelope.blocked.kill_switch"
@@ -801,12 +799,8 @@ where
         }
     }
 
-    let policy_decision = contract_prepare_policy_decision(
-        outcome_label,
-        kill_switch,
-        &gate_inputs,
-        error_detail,
-    );
+    let policy_decision =
+        contract_prepare_policy_decision(outcome_label, kill_switch, &gate_inputs, error_detail);
 
     let mut criteria = rehearsal_criteria(status, &policy_decision);
     criteria.push(contract_gate_criterion(
@@ -869,12 +863,9 @@ where
             "one or more contract steps require explicit approval"
         },
     ));
-    let rehearsal_score = RehearsalScoringEngine::score_criteria(
-        "ft-hhisq",
-        plan_status_label(status),
-        criteria,
-    )
-    .receipt;
+    let rehearsal_score =
+        RehearsalScoringEngine::score_criteria("ft-hhisq", plan_status_label(status), criteria)
+            .receipt;
 
     let score = u32::from(rehearsal_score.aggregate_score.score_percent) * 10;
     let receipt = SteeringReceipt::new(
@@ -1050,7 +1041,7 @@ mod tests {
             TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrepareTargetSnapshot,
             TxStep, TxStepId,
         };
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
 
         struct StubApprovals {
             approved: bool,
@@ -1113,16 +1104,26 @@ mod tests {
             }
         }
 
+        /// An observed, unreserved local pane last seen at the tests' `now`.
+        fn live_target(pane_id: u64, capabilities: PaneCapabilities) -> TxPrepareTargetSnapshot {
+            TxPrepareTargetSnapshot {
+                pane_id,
+                capabilities,
+                last_seen_at_ms: Some(1_704_000_000_000),
+                observed: true,
+                known_dead: false,
+                domain: Some("local".to_string()),
+                pane_title: Some(format!("pane-{pane_id}")),
+                pane_cwd: Some(format!("/tmp/pane-{pane_id}")),
+                reserved_by: None,
+                reservation_lookup_error: None,
+            }
+        }
+
         fn live_prompt_target(pane_id: u64) -> TxPrepareTargetSnapshot {
             let mut capabilities = PaneCapabilities::prompt();
             capabilities.is_reserved = Some(false);
-            TxPrepareTargetSnapshot {
-                pane_id,
-                is_live: true,
-                capabilities,
-                active_reservation_owners: HashSet::new(),
-                observed_at_ms: 1_704_000_000_000,
-            }
+            live_target(pane_id, capabilities)
         }
 
         #[test]
@@ -1138,16 +1139,7 @@ mod tests {
             let mut unknown_caps = PaneCapabilities::unknown();
             unknown_caps.is_reserved = Some(false);
             let targets = StubTargets {
-                panes: HashMap::from([(
-                    7,
-                    TxPrepareTargetSnapshot {
-                        pane_id: 7,
-                        is_live: true,
-                        capabilities: unknown_caps,
-                        active_reservation_owners: HashSet::new(),
-                        observed_at_ms: 1_704_000_000_000,
-                    },
-                )]),
+                panes: HashMap::from([(7, live_target(7, unknown_caps))]),
             };
             let engine = std::cell::RefCell::new(PolicyEngine::strict());
             let approvals = StubApprovals { approved: false };
@@ -1168,7 +1160,10 @@ mod tests {
                 &ctx,
                 MissionKillSwitchLevel::Off,
             );
-            assert_eq!(result.receipt.envelope_verdict, "envelope.requires_approval");
+            assert_eq!(
+                result.receipt.envelope_verdict,
+                "envelope.requires_approval"
+            );
             assert!(
                 result
                     .receipt
@@ -1182,7 +1177,11 @@ mod tests {
             assert_eq!(summary.outcome, "require_approval");
             assert!(summary.gates_failed.contains(&"approvals".to_string()));
             assert!(summary.gates_passed.contains(&"policy".to_string()));
-            assert!(summary.gates_passed.contains(&"target_liveness".to_string()));
+            assert!(
+                summary
+                    .gates_passed
+                    .contains(&"target_liveness".to_string())
+            );
         }
 
         #[test]
@@ -1246,7 +1245,11 @@ mod tests {
             assert_eq!(missing.receipt.envelope_verdict, "envelope.blocked.policy");
             let missing_summary = missing.contract_prepare.expect("summary");
             assert_eq!(missing_summary.outcome, "denied");
-            assert!(missing_summary.gates_failed.contains(&"target_liveness".to_string()));
+            assert!(
+                missing_summary
+                    .gates_failed
+                    .contains(&"target_liveness".to_string())
+            );
         }
 
         #[test]

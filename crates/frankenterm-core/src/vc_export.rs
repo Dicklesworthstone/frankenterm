@@ -1217,7 +1217,7 @@ mod tests {
             assert_eq!(page1.records[1].event_id, ids[1]);
             let serialized_p1 = serde_json::to_string(&page1).unwrap();
             assert!(
-                !serialized_p1.contains(secret_token),
+                !serialized_p1.contains(secret_token.as_str()),
                 "exported page must redact secrets in matched_text and extracted JSON"
             );
             assert_eq!(page1.to_jsonl().unwrap().lines().count(), 2);
