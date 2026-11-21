@@ -2304,16 +2304,25 @@ install_process_family() {
 #   after-legacy-selector-rollback
 # ───────────────────────────────────────────────────────────────────────────
 probe_activated_process_family() {
+  # Activation probes stable entrypoints; --verify probes the exact published
+  # candidate even when a different generation still owns those entrypoints.
+  # Both paths share the same deadline, output budget, and healthy-JSON gate.
+  local probe_root="${1:-$DEST}"
+  local output_mode="${2:-silent}"
+  case "$output_mode" in
+    silent|report) ;;
+    *) return 2 ;;
+  esac
   if [ "${FT_INSTALL_TEST_LIBRARY_ONLY:-0}" = 1 ] && \
      [ "${FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES:-0}" = 1 ] && \
      [ "${FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL:-0}" = 1 ]; then
     return 1
   fi
-  python3 - "$DEST/ft" "$DEST/frankenterm-mux-server" \
-    "$DEST/frankenterm-pty-guardian" <<'PY'
+  python3 - "$probe_root/ft" "$probe_root/frankenterm-mux-server" \
+    "$probe_root/frankenterm-pty-guardian" "$output_mode" <<'PY'
 import json, os, selectors, signal, subprocess, sys, time
 
-ft, mux, guardian = sys.argv[1:]
+ft, mux, guardian, output_mode = sys.argv[1:]
 timeout_seconds = 10.0
 if (os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
         os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1" and
@@ -2343,7 +2352,8 @@ def run_bounded(arguments, capture_stdout=False):
     output = subprocess.PIPE if capture_stdout else subprocess.DEVNULL
     try:
         process = subprocess.Popen(
-            arguments, stdout=output, stderr=subprocess.DEVNULL,
+            arguments, stdin=subprocess.DEVNULL,
+            stdout=output, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError:
@@ -2402,6 +2412,8 @@ except (UnicodeDecodeError, json.JSONDecodeError):
     raise SystemExit(1)
 if not isinstance(report, dict) or report.get("ok") is not True:
     raise SystemExit(1)
+if output_mode == "report":
+    sys.stdout.buffer.write(payload)
 PY
 }
 
@@ -7160,38 +7172,11 @@ if [ "$VERIFY" -eq 1 ]; then
     info "Running activated \`ft doctor --json\` by immutable generation path"
   fi
   doctor_output="$TMP/ft-doctor.json"
-  doctor_error="$TMP/ft-doctor.stderr"
-  if ! "$self_test_root/ft" doctor --json >"$doctor_output" 2>"$doctor_error"; then
-    if [ "$QUIET" -ne 1 ]; then
-      head -40 "$doctor_output" >&2
-      head -40 "$doctor_error" >&2
-    fi
+  # The probe captures at most 1 MiB in memory and emits only a successful
+  # ok:true report. Hung/noisy candidates cannot hold the installer lock
+  # indefinitely or fill the filesystem before a post-hoc size check runs.
+  if ! probe_activated_process_family "$self_test_root" report >"$doctor_output"; then
     err "Published process-family self-test failed; installation verification did not pass"
-    exit 1
-  fi
-  if ! python3 - "$doctor_output" <<'PY'
-import json, os, stat, sys
-
-path = sys.argv[1]
-before = os.stat(path, follow_symlinks=False)
-if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 16 * 1024 * 1024:
-    raise SystemExit("doctor output is not one bounded regular file")
-with open(path, "rb") as stream:
-    payload = stream.read(16 * 1024 * 1024 + 1)
-if len(payload) > 16 * 1024 * 1024:
-    raise SystemExit("doctor output exceeds its verification bound")
-json.loads(payload)
-after = os.stat(path, follow_symlinks=False)
-if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != \
-   (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-    raise SystemExit("doctor output changed while it was verified")
-PY
-  then
-    if [ "$QUIET" -ne 1 ]; then
-      head -40 "$doctor_output" >&2
-      head -40 "$doctor_error" >&2
-    fi
-    err "Published process-family self-test did not emit one bounded JSON document"
     exit 1
   fi
   if [ "$QUIET" -ne 1 ]; then

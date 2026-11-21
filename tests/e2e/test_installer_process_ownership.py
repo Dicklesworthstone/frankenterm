@@ -126,5 +126,176 @@ class InstallerProcessOwnership(unittest.TestCase):
         self.assertIn("requires sourcing from an isolated test shell", result.stderr)
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX installer process probes")
+class InstallerCandidateVerification(unittest.TestCase):
+    """Exercise the actual --verify block against owned candidate processes.
+
+    ft-xxfwy.4: a pending candidate must pass the same bounded health contract
+    as an activated generation, without accidentally executing the old DEST.
+    These are installer behavior tests, not signed-release qualification.
+    """
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="ft-verify-", dir="/tmp"))
+        self.destination = self.root / "old destination"
+        self.candidate = self.root / "pending candidate"
+        self.destination.mkdir()
+        self.candidate.mkdir()
+        self.log = self.root / "candidate-calls.log"
+        self.child_pid = self.root / "child.pid"
+        self.report = self.root / "ft-doctor.json"
+        source = INSTALLER.read_text()
+        start = source.index('if [ "$VERIFY" -eq 1 ]; then')
+        end = source.index("\n# The candidate manifest came", start)
+        self.verify_block = source[start:end]
+        program = "#!" + sys.executable + "\n" + r'''
+import os, pathlib, subprocess, sys, time
+
+role = pathlib.Path(sys.argv[0]).name
+mode = os.environ["FT_INSTALL_TEST_VERIFY_MODE"]
+with open(os.environ["FT_INSTALL_TEST_VERIFY_LOG"], "a") as log:
+    log.write(role + " " + " ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:] == ["--version"]:
+    if mode == "bad-mux-version" and role == "frankenterm-mux-server":
+        raise SystemExit(7)
+    if mode == "hang-version" and role == "ft":
+        time.sleep(60)
+    print(role + " 0.0.0-test")
+elif role == "ft" and sys.argv[1:] == ["doctor", "--json"]:
+    if mode == "nonzero":
+        print('{"ok":true}')
+        raise SystemExit(9)
+    elif mode == "hang":
+        time.sleep(60)
+    elif mode == "inherited-pipe":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        pathlib.Path(os.environ["FT_INSTALL_TEST_VERIFY_CHILD"]).write_text(str(child.pid))
+    elif mode == "oversized":
+        print('{"ok":true,"detail":"' + "x" * (1024 * 1024) + '"}')
+        raise SystemExit(0)
+    elif mode == "stderr":
+        sys.stderr.write("private candidate diagnostic\n" * 100_000)
+    elif mode == "stdin":
+        if sys.stdin.read():
+            raise SystemExit(10)
+    reports = {
+        "not-ok": '{"ok":false}', "null": 'null', "array": '[]',
+        "missing-ok": '{}', "truthy-ok": '{"ok":1}',
+        "malformed": '{"ok":true', "trailing": '{"ok":true} {"ok":true}',
+    }
+    print(reports.get(mode, '{"ok":true,"candidate":"pending"}'))
+else:
+    raise SystemExit(11)
+'''
+        for name in ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian"):
+            executable = self.candidate / name
+            executable.write_text(program)
+            executable.chmod(0o755)
+            old = self.destination / name
+            old.write_text("#!/bin/sh\necho old-generation-must-not-run >&2\nexit 99\n")
+            old.chmod(0o755)
+
+    def environment(self, mode):
+        env = os.environ.copy()
+        env.pop("FT_INSTALL_TEST_ACTIVATION_READINESS_FAIL", None)
+        env.pop("FT_INSTALL_TEST_PROBE_TIMEOUT_SECONDS", None)
+        env.update(
+            FT_INSTALL_TEST_LIBRARY_ONLY="1",
+            FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES="1",
+            FT_INSTALL_TEST_VERIFY_MODE=mode,
+            FT_INSTALL_TEST_VERIFY_LOG=str(self.log),
+            FT_INSTALL_TEST_VERIFY_CHILD=str(self.child_pid),
+        )
+        return env
+
+    def verify(self, mode="healthy", pending=True):
+        script = '''source "$1"
+DEST="$2"
+PUBLISHED_PROCESS_FAMILY_ROOT="$3"
+TMP="$4"
+PENDING_PROCESS_FAMILY_GENERATION="$5"
+VERIFY=1
+QUIET=1
+HAS_GUM=0
+''' + self.verify_block
+        return subprocess.run(
+            ["bash", "-c", script, "installer-verify-test", str(INSTALLER),
+             str(self.destination), str(self.candidate), str(self.root),
+             "pending-generation" if pending else ""],
+            env=self.environment(mode), input="unconsumed installer input\n",
+            capture_output=True, text=True, timeout=20,
+        )
+
+    def test_healthy_pending_candidate_probes_every_role_by_immutable_path(self):
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.report.read_text(), '{"ok":true,"candidate":"pending"}\n')
+        self.assertEqual(self.log.read_text().splitlines(), [
+            "ft --version", "frankenterm-mux-server --version",
+            "frankenterm-pty-guardian --version", "ft doctor --json",
+        ])
+        self.assertNotIn("old-generation", result.stderr)
+
+    def test_activated_candidate_still_uses_immutable_path(self):
+        result = self.verify(pending=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"candidate":"pending"', self.report.read_text())
+
+    def test_unsuccessful_and_nonobject_health_reports_are_rejected(self):
+        for mode in ("not-ok", "null", "array", "missing-ok", "truthy-ok",
+                     "malformed", "trailing", "nonzero"):
+            with self.subTest(mode=mode):
+                result = self.verify(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("installation verification did not pass", result.stderr)
+                self.assertEqual(self.report.read_bytes(), b"", "failed payload must not be published")
+
+    def test_unhealthy_mux_prevents_the_doctor_probe(self):
+        result = self.verify("bad-mux-version")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("doctor --json", self.log.read_text())
+        self.assertEqual(self.report.read_bytes(), b"")
+
+    def test_silent_and_version_hangs_respect_the_shared_deadline(self):
+        for mode in ("hang", "hang-version"):
+            with self.subTest(mode=mode):
+                # Use the production 10-second budget, with a 20-second outer
+                # watchdog and 60-second fixture. This checks cancellation,
+                # not Python-startup performance on a shared, busy test host.
+                result = self.verify(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.report.read_bytes(), b"")
+
+    def test_child_holding_stdout_cannot_keep_the_installer_waiting(self):
+        result = self.verify("inherited-pipe")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.child_pid.exists(), "the owned descendant must actually start")
+        self.assertEqual(self.report.read_bytes(), b"")
+
+    def test_output_budget_is_enforced_before_any_report_is_written(self):
+        result = self.verify("oversized")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.report.read_bytes(), b"")
+        self.assertLess(len(result.stderr), 1024)
+
+    def test_noisy_stderr_and_inherited_stdin_do_not_escape_probe_ownership(self):
+        for mode in ("stderr", "stdin"):
+            with self.subTest(mode=mode):
+                result = self.verify(mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertLess(self.report.stat().st_size, 1024)
+
+    def test_activation_default_remains_silent_and_probes_dest(self):
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; DEST="$2"; probe_activated_process_family',
+             "installer-probe-test", str(INSTALLER), str(self.candidate)],
+            env=self.environment("healthy"), capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ft doctor --json", self.log.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
