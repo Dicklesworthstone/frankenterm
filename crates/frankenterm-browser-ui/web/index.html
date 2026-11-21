@@ -82,6 +82,31 @@
     <button id="history-close" type="button">Close</button>
   </div>
   <p id="history-help">Search the stored full-text index across panes, not just the loaded transcript. Phrase mode matches tokenized words; choose FTS syntax for operators such as OR. Times below are local.</p>
+  <details class="history-library">
+    <summary>Saved searches and bookmarked panes</summary>
+    <div class="output-toolbar">
+      <button id="history-library-load" type="button">Load saved items</button>
+      <button id="history-library-cancel" type="button" disabled>Cancel loading</button>
+      <label for="history-library-filter">Find saved items
+        <input id="history-library-filter" type="search" maxlength="256" autocomplete="off" placeholder="Name, tag, query or pane ID">
+      </label>
+    </div>
+    <p id="history-library-status" role="status" aria-live="polite"></p>
+    <div class="history-library-columns">
+      <section aria-labelledby="history-saved-title">
+        <h2 id="history-saved-title">Saved searches</h2>
+        <p id="history-saved-status" role="status"></p>
+        <ul id="history-saved-list"></ul>
+      </section>
+      <section aria-labelledby="history-bookmark-title">
+        <h2 id="history-bookmark-title">Bookmarked panes</h2>
+        <p id="history-bookmark-status" role="status"></p>
+        <ul id="history-bookmark-list"></ul>
+      </section>
+    </div>
+    <p class="history-library-note">Configured with ft. Use search fills the form with the saved FTS query and time boundary. Bookmarks open captured output for a saved pane ID; that ID may belong to a newer session. These actions do not control a terminal or change saved settings.</p>
+  </details>
+  <p id="history-loaded-search" role="status" aria-live="polite"></p>
   <form id="history-search-form">
     <label class="history-wide" for="history-query">Query
       <input id="history-query" type="search" maxlength="2048" autocomplete="off" required>
@@ -92,10 +117,10 @@
     <label for="history-pane">Pane ID (blank = all retained panes)
       <input id="history-pane" type="text" inputmode="numeric" maxlength="20" pattern="[0-9]{1,20}" autocomplete="off">
     </label>
-    <label for="history-since">From local time<input id="history-since" type="datetime-local"></label>
-    <label for="history-until">Through local time<input id="history-until" type="datetime-local"></label>
+    <label for="history-since">From local time<input id="history-since" type="datetime-local" step="0.001"></label>
+    <label for="history-until">Through local time<input id="history-until" type="datetime-local" step="0.001"></label>
     <label for="history-limit">Maximum results
-      <select id="history-limit"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select>
+      <input id="history-limit" type="number" min="1" max="200" step="1" value="50" required>
     </label>
     <div class="output-toolbar"><button type="submit">Search</button><button id="history-cancel" type="button" disabled>Cancel request</button></div>
   </form>

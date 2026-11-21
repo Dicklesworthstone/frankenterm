@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHistorySearch } from "../../crates/frankenterm-browser-ui/web/history-search.mjs";
+import { createHistoryLibrary, createHistorySearch } from "../../crates/frankenterm-browser-ui/web/history-search.mjs";
 
 const flush = async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); };
 const deferred = () => {
@@ -186,4 +186,146 @@ test("synchronous reader failure is finite and releases its timer", async () => 
   const search = createHistorySearch({ readBody() { throw new Error("private token must not leak"); } });
   assert.equal(await search.search({ query: "x" }), false);
   assert.equal(search.snapshot().error.includes("private"), false);
+});
+
+const saved = (overrides = {}) => ({ id: "saved-errors", name: "Build failures", query: "error OR panic",
+  pane_id: 7, limit: 37, since_mode: "fixed", since_ms: 1001, enabled: true, ...overrides });
+const bookmark = (overrides = {}) => ({ pane_id: 7, alias: "build", tags: ["prod"], description: "Build host", ...overrides });
+const collection = (key, rows) => JSON.stringify({ ok: true, data: { [key]: rows, total: rows.length } });
+function libraryFixture() {
+  let next = 0;
+  const timers = new Map(), calls = [];
+  const library = createHistoryLibrary({
+    readBody(path, signal) { const reply = deferred(); calls.push({ path, signal, ...reply }); return reply.promise; },
+    setTimer(fn, ms) { const id = ++next; timers.set(id, { fn, ms }); return id; },
+    clearTimer(id) { timers.delete(id); },
+  });
+  return { library, calls, timers };
+}
+async function loadLibrary(savedBody = collection("saved_searches", [saved()]), bookmarkBody = collection("bookmarks", [bookmark()])) {
+  const f = libraryFixture();
+  const pending = f.library.load();
+  await flush();
+  assert.deepEqual(f.calls.map((call) => call.path), ["saved-searches", "bookmarks"]);
+  f.calls[0].resolve(savedBody); f.calls[1].resolve(bookmarkBody);
+  const ok = await pending;
+  assert.equal(f.timers.size, 0);
+  return { ...f, ok };
+}
+
+test("saved items retain exact pane identities and the real fixed or last-run search boundary", async () => {
+  const wire = collection("saved_searches", [saved(), saved({ id: "last", since_mode: "last_run", since_ms: 9999, last_run_at: 2002 }),
+    saved({ id: "never", since_mode: "last_run", pane_id: null, last_run_at: null })])
+    .replace('"pane_id":7', '"pane_id":18446744073709551615');
+  const bookmarks = collection("bookmarks", [bookmark()]).replace('"pane_id":7', '"pane_id":9007199254740993');
+  const f = await loadLibrary(wire, bookmarks);
+  assert.equal(f.ok, true);
+  const state = f.library.snapshot();
+  assert.equal(state.savedSearches.items[0].paneId, "18446744073709551615");
+  assert.equal(state.savedSearches.items[0].limit, "37");
+  assert.equal(state.savedSearches.items[0].sinceMs, "1001");
+  assert.equal(state.savedSearches.items[1].sinceMs, "2002", "last_run takes precedence over since_ms");
+  assert.equal(state.savedSearches.items[2].sinceMs, null);
+  assert.equal(state.savedSearches.items[2].paneId, null);
+  assert.equal(state.bookmarks.items[0].paneId, "9007199254740993");
+  assert.throws(() => { state.bookmarks.items[0].tags.push("changed"); }, TypeError);
+  assert.equal(f.library.savedSearch(0, state.version).query, "error OR panic");
+  assert.equal(f.library.bookmark(-1, state.version), null);
+  assert.equal(f.library.savedSearch(0.5, state.version), null);
+});
+
+test("unsupported saved settings are retained with an explicit refusal instead of broadening scope", async () => {
+  const f = await loadLibrary(collection("saved_searches", [
+    saved({ since_mode: "relative" }), saved({ id: "large", limit: 201 }),
+    saved({ id: "manual", enabled: false }),
+  ]));
+  assert.equal(f.ok, true);
+  assert.match(f.library.snapshot().savedSearches.items[0].unavailable, /time mode/);
+  assert.match(f.library.snapshot().savedSearches.items[1].unavailable, /201/);
+  assert.equal(f.library.snapshot().savedSearches.items[2].unavailable, null, "disabled schedules can still be searched manually");
+});
+
+test("invalid saved-search responses fail as a whole while bookmarks remain usable", async () => {
+  const invalid = ["private upstream diagnostics", "null", collection("bookmarks", []),
+    collection("saved_searches", [saved(), saved()]),
+    collection("saved_searches", [saved({ query: 123 })]),
+    collection("saved_searches", [saved({ query: "x".repeat(2049) })]),
+    collection("saved_searches", [saved({ name: "" })]),
+    collection("saved_searches", [saved({ limit: 0 })]),
+    collection("saved_searches", [saved({ enabled: "true" })]),
+    collection("saved_searches", [saved({ since_ms: -1 })]),
+    collection("saved_searches", [saved({ last_run_at: "1000" })]),
+    collection("saved_searches", [saved()]).replace('"pane_id":7', '"pane_id":7e0'),
+    collection("saved_searches", [saved()]).replace('"pane_id":7', '"pane_id":18446744073709551616'),
+    collection("saved_searches", [saved()]).replace('"total":1', '"total":2'),
+    collection("saved_searches", Array.from({ length: 501 }, (_, n) => saved({ id: String(n) }))),
+    " ".repeat(8 * 1024 * 1024 + 1),
+  ];
+  for (const body of invalid) {
+    const f = await loadLibrary(body);
+    assert.equal(f.ok, false);
+    assert.equal(f.library.snapshot().savedSearches.status, "error");
+    assert.equal(f.library.snapshot().savedSearches.items.length, 0);
+    assert.doesNotMatch(f.library.snapshot().savedSearches.error, /private/);
+    assert.equal(f.library.snapshot().bookmarks.items[0].paneId, "7");
+  }
+});
+
+test("malformed bookmarks cannot become actionable numeric identities or an accepted prefix", async () => {
+  for (const rows of [[bookmark(), bookmark()], [bookmark({ pane_id: "7" })], [bookmark({ pane_id: 1.5 })],
+    [bookmark({ tags: "prod" })], [bookmark({ tags: Array(65).fill("prod") })], [bookmark({ tags: [123] })],
+    [bookmark({ description: 123 })], [bookmark({ description: "x".repeat(4097) })], [bookmark({ alias: "\0bad" })]]) {
+    const f = await loadLibrary(collection("saved_searches", [saved()]), collection("bookmarks", rows));
+    assert.equal(f.ok, false);
+    assert.equal(f.library.snapshot().bookmarks.items.length, 0);
+    assert.equal(f.library.snapshot().bookmarks.status, "error");
+    assert.equal(f.library.snapshot().savedSearches.items.length, 1);
+  }
+});
+
+test("a saved-items deadline preserves the answered endpoint and bounds an uncooperative reader", async () => {
+  const f = libraryFixture();
+  const pending = f.library.load(); await flush();
+  f.calls[0].resolve(collection("saved_searches", [saved()])); await flush();
+  const timer = [...f.timers.values()][0];
+  assert.equal(timer.ms, 10000);
+  timer.fn();
+  assert.equal(await pending, false);
+  assert.equal(f.calls[1].signal.aborted, true);
+  assert.equal(f.library.snapshot().savedSearches.items.length, 1);
+  assert.match(f.library.snapshot().bookmarks.error, /timed out/);
+  assert.equal(f.timers.size, 0);
+});
+
+test("refresh, cancellation and session clearing retire saved actions and late response callbacks", async () => {
+  const f = await loadLibrary();
+  const oldVersion = f.library.snapshot().version;
+  const first = f.library.load(); await flush();
+  const second = f.library.load(); await flush();
+  assert.equal(f.calls[2].signal.aborted, true);
+  assert.equal(await first, false);
+  assert.equal(f.library.savedSearch(0, oldVersion), null);
+  f.calls[4].resolve(collection("saved_searches", [saved({ id: "new" })]));
+  f.calls[5].resolve(collection("bookmarks", []));
+  assert.equal(await second, true);
+  f.calls[2].resolve(collection("saved_searches", [saved({ id: "old" })]));
+  f.calls[3].reject(new Error("late private failure")); await flush();
+  assert.equal(f.library.snapshot().savedSearches.items[0].id, "new");
+  const pending = f.library.load(); await flush();
+  f.library.cancel();
+  assert.equal(await pending, false);
+  assert.equal(f.library.snapshot().status, "cancelled");
+  assert.equal(f.library.snapshot().savedSearches.items.length, 0);
+  f.library.clear();
+  f.calls[6].resolve(collection("saved_searches", [saved()]));
+  f.calls[7].resolve(collection("bookmarks", [bookmark()])); await flush();
+  assert.equal(f.library.snapshot().status, "idle");
+  assert.equal(f.timers.size, 0);
+});
+
+test("synchronous saved-items failures produce finite errors without leaking backend text", async () => {
+  const library = createHistoryLibrary({ readBody() { throw new Error("private credential"); } });
+  assert.equal(await library.load(), false);
+  assert.doesNotMatch(library.snapshot().savedSearches.error, /private|credential/);
+  assert.doesNotMatch(library.snapshot().bookmarks.error, /private|credential/);
 });

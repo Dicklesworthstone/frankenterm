@@ -4,6 +4,7 @@ const U64_MAX = 18_446_744_073_709_551_615n;
 const I64_MAX = 9_223_372_036_854_775_807n;
 const MAX_BODY_CHARS = 8 * 1024 * 1024;
 const MAX_SNIPPET_CHARS = 16 * 1024;
+const MAX_SAVED_ITEMS = 500;
 
 function decimal(value, maximum = I64_MAX) {
   if (typeof value !== "string" || !/^[0-9]{1,20}$/.test(value)) return null;
@@ -43,7 +44,7 @@ function searchPath(criteria) {
   return `search?${params}`;
 }
 
-function decodeResults(body, criteria) {
+function decodedBody(body) {
   if (typeof body !== "string" || body.length > MAX_BODY_CHARS) throw new Error("invalid response");
   const value = JSON.parse(body);
   // Preserve exact integer identities but retain ORIGINAL JSON types for
@@ -52,6 +53,11 @@ function decodeResults(body, criteria) {
     /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
     (token) => /^-?\d+$/.test(token) ? JSON.stringify(token) : token,
   ));
+  return { value, exact };
+}
+
+function decodeResults(body, criteria) {
+  const { value, exact } = decodedBody(body);
   if (value?.ok !== true || !Array.isArray(value.data?.results)
       || value.data.results.length > criteria.limit || value.data.total !== value.data.results.length) {
     throw new Error("invalid response");
@@ -75,6 +81,132 @@ function decodeResults(body, criteria) {
     seen.add(segmentId);
     return Object.freeze({ segmentId, paneId, capturedAt, contentLength, score: row.score, snippet: row.snippet ?? "" });
   }));
+}
+
+function savedCollection(body, key) {
+  const { value, exact } = decodedBody(body);
+  if (value?.ok !== true || !Array.isArray(value.data?.[key])
+      || value.data[key].length > MAX_SAVED_ITEMS || value.data.total !== value.data[key].length) {
+    throw new Error("invalid saved collection");
+  }
+  return { rows: value.data[key], rawRows: exact.data[key] };
+}
+
+function savedText(value, maximum, allowEmpty = false) {
+  if (typeof value !== "string" || value.length > maximum || value.includes("\0")
+      || (!allowEmpty && !value.trim())) throw new Error("invalid saved text");
+  return value;
+}
+
+function savedInteger(row, raw, key, maximum = I64_MAX, optional = false) {
+  if (optional && row?.[key] == null) return null;
+  const value = typeof row?.[key] === "number" ? decimal(raw?.[key], maximum) : null;
+  if (value === null) throw new Error("invalid saved integer");
+  return value;
+}
+
+function decodeSavedSearches(body) {
+  const { rows, rawRows } = savedCollection(body, "saved_searches");
+  const seen = new Set();
+  return Object.freeze(rows.map((row, index) => {
+    const id = savedText(row?.id, 256);
+    const name = savedText(row.name, 1024);
+    const query = savedText(row.query, 2048);
+    const paneId = savedInteger(row, rawRows[index], "pane_id", U64_MAX, true);
+    const limit = savedInteger(row, rawRows[index], "limit");
+    const sinceMode = savedText(row.since_mode, 64);
+    const fixed = savedInteger(row, rawRows[index], "since_ms", I64_MAX, true);
+    const lastRun = savedInteger(row, rawRows[index], "last_run_at", I64_MAX, true);
+    if (limit === "0" || typeof row.enabled !== "boolean" || seen.has(id)) throw new Error("invalid saved search");
+    seen.add(id);
+    // Stored queries use the CLI's FTS semantics. A last_run search uses its
+    // recorded run boundary, not since_ms or the browser's current clock.
+    const sinceMs = sinceMode === "fixed" ? fixed : lastRun;
+    const unavailable = !["fixed", "last_run"].includes(sinceMode)
+      ? "This saved search uses a time mode the viewer does not support. Review it with ft."
+      : BigInt(limit) > 200n
+        ? `The saved result limit is ${limit}; this viewer supports at most 200. Review the saved search with ft.` : null;
+    return Object.freeze({ id, name, query, paneId, limit, sinceMode, sinceMs, enabled: row.enabled, unavailable });
+  }));
+}
+
+function decodeBookmarks(body) {
+  const { rows, rawRows } = savedCollection(body, "bookmarks");
+  const seen = new Set();
+  return Object.freeze(rows.map((row, index) => {
+    const paneId = savedInteger(row, rawRows[index], "pane_id", U64_MAX);
+    const alias = savedText(row.alias, 1024);
+    if (seen.has(alias) || !Array.isArray(row.tags) || row.tags.length > 64) throw new Error("invalid bookmark");
+    seen.add(alias);
+    const tags = Object.freeze(row.tags.map((tag) => savedText(tag, 256)));
+    const description = row.description == null ? "" : savedText(row.description, 4096, true);
+    return Object.freeze({ paneId, alias, tags, description });
+  }));
+}
+
+// The existing GET endpoints expose one local operator's configured items.
+// Loading them grants no input or live-attachment authority, and a browser
+// search does not advance the saved search's scheduler/last-run metadata.
+export function createHistoryLibrary({ readBody, setTimer = globalThis.setTimeout, clearTimer = globalThis.clearTimeout, timeoutMs = 10_000 } = {}) {
+  if (typeof readBody !== "function" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new Error("invalid saved-history dependencies or deadline");
+  }
+  const empty = () => Object.freeze({ status: "idle", items: Object.freeze([]), error: null });
+  let version = 0;
+  let flight = null;
+  let state = Object.freeze({ version, status: "idle", savedSearches: empty(), bookmarks: empty() });
+  function retire(status) {
+    version += 1;
+    const old = flight;
+    flight = null;
+    if (old) { clearTimer(old.timer); old.controller.abort(); }
+    state = Object.freeze({ version, status, savedSearches: empty(), bookmarks: empty() });
+  }
+  function item(key, index, expectedVersion) {
+    return state.status === "ready" && state.version === expectedVersion && Number.isSafeInteger(index)
+      ? state[key].items[index] ?? null : null;
+  }
+  return {
+    async load() {
+      retire("loading");
+      const batch = { controller: new AbortController(), timer: null };
+      flight = batch;
+      let onAbort;
+      const cancelled = new Promise((_, reject) => {
+        onAbort = () => reject(new Error("saved-history deadline"));
+        batch.controller.signal.addEventListener("abort", onAbort, { once: true });
+      });
+      batch.timer = setTimer(() => batch.controller.abort(), timeoutMs);
+      try {
+        const responses = await Promise.allSettled([
+          ["saved-searches", decodeSavedSearches], ["bookmarks", decodeBookmarks],
+        ].map(([path, decode]) => Promise.race([
+          Promise.resolve().then(() => {
+            if (batch.controller.signal.aborted) throw new Error("saved-history cancelled");
+            return readBody(path, batch.controller.signal);
+          }).then(decode), cancelled,
+        ])));
+        if (flight !== batch) return false;
+        const collection = (result, label) => result.status === "fulfilled"
+          ? Object.freeze({ status: "ready", items: result.value, error: null })
+          : Object.freeze({ status: "error", items: Object.freeze([]), error: batch.controller.signal.aborted
+            ? `${label} timed out. Refresh saved items to try again.`
+            : `${label} could not be loaded or exceeded the viewer's bounds. Refresh saved items or review them with ft.` });
+        state = Object.freeze({ version, status: "ready",
+          savedSearches: collection(responses[0], "Saved searches"), bookmarks: collection(responses[1], "Bookmarks") });
+        return responses.every((result) => result.status === "fulfilled");
+      } finally {
+        clearTimer(batch.timer);
+        batch.controller.signal.removeEventListener("abort", onAbort);
+        if (flight === batch) flight = null;
+      }
+    },
+    cancel() { retire("cancelled"); },
+    clear() { retire("idle"); },
+    snapshot() { return state; },
+    savedSearch(index, expectedVersion) { return item("savedSearches", index, expectedVersion); },
+    bookmark(index, expectedVersion) { return item("bookmarks", index, expectedVersion); },
+  };
 }
 
 // readBody is the host's existing bounded, abort-aware HTTP reader. Search

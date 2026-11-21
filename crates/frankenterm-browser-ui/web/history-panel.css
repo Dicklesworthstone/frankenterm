@@ -21,6 +21,16 @@
 #history-results p { overflow-wrap: anywhere; }
 #history-results pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.4 "Pragmasevka NF", ui-monospace, monospace; unicode-bidi: plaintext; }
 #history-help, #history-note { font-size: .85rem; }
+.history-library { border: 1px solid #444; border-radius: 4px; padding: .75rem; }
+.history-library summary { cursor: pointer; font-weight: 600; }
+.history-library > .output-toolbar { margin-top: .75rem; flex-wrap: wrap; }
+.history-library-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.history-library h2 { font-size: 1rem; margin-bottom: .5rem; }
+.history-library ul { max-height: 20rem; overflow: auto; padding-left: 1.25rem; }
+.history-library li { padding: .5rem 0; border-bottom: 1px solid #444; }
+.history-library p, .history-library pre, #history-loaded-search { overflow-wrap: anywhere; }
+.history-library pre { white-space: pre-wrap; unicode-bidi: plaintext; font: inherit; }
+.history-library-note, #history-loaded-search { font-size: .85rem; }
 @media (max-width: 600px) {
-  #history-search-form { grid-template-columns: minmax(0, 1fr); }
+  #history-search-form, .history-library-columns { grid-template-columns: minmax(0, 1fr); }
 }

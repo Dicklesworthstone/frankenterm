@@ -285,3 +285,157 @@ test("queued navigation-close events cannot clear reopened results or a replacem
   assert.match(f.get("history-results").children[0].children[0].textContent, /segment 2/);
   f.panel.close();
 });
+
+const saved = (overrides = {}) => ({ id: "saved-errors", name: "Build failures", query: "error OR panic",
+  pane_id: 7, limit: 37, since_mode: "fixed", since_ms: 1001, enabled: true, ...overrides });
+const bookmark = (overrides = {}) => ({ pane_id: 7, alias: "build", tags: ["prod"], description: "Build host", ...overrides });
+const collection = (key, rows) => JSON.stringify({ ok: true, data: { [key]: rows, total: rows.length } });
+async function loadItems(f, searches = [saved()], bookmarks = [bookmark()]) {
+  const first = f.calls.length;
+  f.get("history-library-load").emit("click"); await flush();
+  assert.deepEqual(f.calls.slice(first).map((call) => call.path), ["saved-searches", "bookmarks"]);
+  f.calls[first].resolve(typeof searches === "string" ? searches : collection("saved_searches", searches));
+  f.calls[first + 1].resolve(typeof bookmarks === "string" ? bookmarks : collection("bookmarks", bookmarks));
+  await flush();
+}
+
+test("configured saved search fills raw FTS, exact pane, precise start and non-preset limit for the real search", async () => {
+  const f = fixture();
+  const start = Date.parse("2026-11-01T06:30:00.123Z");
+  const wire = collection("saved_searches", [saved({ since_ms: start })])
+    .replace('"pane_id":7', '"pane_id":18446744073709551615');
+  await loadItems(f, wire);
+  f.get("history-until").value = "2026-01-01T01:00";
+  f.get("history-saved-list").children[0].children[2].emit("click");
+  assert.equal(f.get("history-query").value, "error OR panic");
+  assert.equal(f.get("history-mode").value, "fts");
+  assert.equal(f.get("history-pane").value, "18446744073709551615");
+  assert.equal(f.get("history-limit").value, "37");
+  assert.equal(f.get("history-until").value, "", "a previous query's end boundary must not narrow the saved search");
+  assert.match(f.get("history-loaded-search").textContent, /fixed start: 2026-11-01T06:30:00.123Z/);
+  assert.match(f.get("history-loaded-search").textContent, /does not update/);
+  f.get("history-search-form").emit("submit"); await flush();
+  const params = new URL(f.calls[2].path, "https://example.test/").searchParams;
+  assert.equal(params.get("q"), "error OR panic");
+  assert.equal(params.get("pane_id"), "18446744073709551615");
+  assert.equal(params.get("since"), String(start));
+  assert.equal(params.get("until"), null);
+  assert.equal(params.get("limit"), "37");
+  f.panel.close();
+});
+
+test("last-run searches use stored scheduler time; editing the date replaces that boundary", async () => {
+  const f = fixture();
+  await loadItems(f, [saved({ since_mode: "last_run", since_ms: 9999, last_run_at: 2002, enabled: false })]);
+  const item = f.get("history-saved-list").children[0];
+  assert.match(item.children[3].textContent, /Schedule disabled/);
+  item.children[2].emit("click");
+  f.get("history-search-form").emit("submit"); await flush();
+  assert.equal(new URL(f.calls[2].path, "https://example.test/").searchParams.get("since"), "2002");
+  f.calls[2].resolve(envelope([])); await flush();
+  f.get("history-since").value = "2026-11-10T12:01:02.003";
+  f.get("history-since").emit("input");
+  f.get("history-search-form").emit("submit"); await flush();
+  assert.equal(new URL(f.calls[3].path, "https://example.test/").searchParams.get("since"), String(new Date("2026-11-10T12:01:02.003").getTime()));
+  f.panel.close();
+});
+
+test("saved settings beyond viewer bounds stay visible without an actionable broadened search", async () => {
+  const f = fixture();
+  await loadItems(f, [saved({ since_mode: "unknown" }), saved({ id: "large", limit: 201 }),
+    saved({ id: "future", since_ms: 9_000_000_000_000_000 })]);
+  assert.equal(f.get("history-saved-list").children.length, 3);
+  for (const item of f.get("history-saved-list").children) {
+    assert.equal(item.children[2].disabled, true);
+    item.children[2].emit("click");
+  }
+  assert.equal(f.get("history-query").value, "");
+  assert.equal(f.calls.length, 2);
+  assert.match(f.get("history-saved-list").children[2].children[3].textContent, /date range/);
+  f.panel.close();
+});
+
+test("saved labels, queries and bookmark descriptions remain inert text and filtering preserves exact actions", async () => {
+  const f = fixture();
+  const markup = '<img src=x onerror=alert(1)>';
+  const wire = collection("bookmarks", [bookmark({ alias: markup, description: "production <b>host</b>" }),
+    bookmark({ alias: "second", tags: ["staging"], pane_id: 8 })])
+    .replace('"pane_id":7', '"pane_id":18446744073709551615');
+  await loadItems(f, [saved({ name: markup, query: "<script>alert(1)</script>" })], wire);
+  assert.match(f.get("history-saved-list").children[0].children[0].textContent, /<img/);
+  assert.equal(f.get("history-saved-list").children[0].children[1].textContent, "<script>alert(1)</script>");
+  const old = f.get("history-bookmark-list").children[0].children[2];
+  f.get("history-library-filter").value = "PROD";
+  f.get("history-library-filter").emit("input");
+  assert.equal(f.get("history-bookmark-list").children.length, 1);
+  assert.equal(f.get("history-saved-list").children.length, 0);
+  old.emit("click"); assert.deepEqual(f.inspected, []);
+  const current = f.get("history-bookmark-list").children[0];
+  assert.match(current.children[1].textContent, /<b>host<\/b>/);
+  assert.equal(current.children[2].textContent, "Open captured output");
+  assert.match(current.children[2].title, /another session/);
+  current.children[2].emit("click");
+  assert.deepEqual(f.inspected, ["18446744073709551615"]);
+  assert.deepEqual(f.captures, []);
+  assert.equal(f.get("history-search").open, false);
+  current.children[2].emit("click"); assert.equal(f.inspected.length, 1);
+  f.panel.open();
+  assert.equal(f.calls.length, 2, "returning does not reload saved items");
+  assert.equal(f.get("history-bookmark-list").children.length, 1);
+  f.panel.close();
+});
+
+test("one saved endpoint can fail while the other remains useful, and empty lists are distinct", async () => {
+  const f = fixture();
+  await loadItems(f, "private backend response", [bookmark()]);
+  assert.match(f.get("history-saved-status").textContent, /could not be loaded/);
+  assert.doesNotMatch(f.get("history-saved-status").textContent, /private/);
+  assert.equal(f.get("history-bookmark-list").children.length, 1);
+  await loadItems(f, [], []);
+  assert.equal(f.get("history-saved-list").children.length, 0);
+  assert.match(f.get("history-saved-status").textContent, /0 of 0/);
+  assert.match(f.get("history-bookmark-status").textContent, /0 of 0/);
+  f.panel.close();
+});
+
+test("refresh and session suspension cannot retarget saved-item buttons or republish late private metadata", async () => {
+  const f = fixture(); await loadItems(f);
+  const oldSearch = f.get("history-saved-list").children[0].children[2];
+  const oldBookmark = f.get("history-bookmark-list").children[0].children[2];
+  f.get("history-library-load").emit("click"); await flush();
+  oldSearch.emit("click"); oldBookmark.emit("click");
+  assert.equal(f.get("history-query").value, "");
+  assert.deepEqual(f.inspected, []);
+  f.get("history-library-filter").value = "private";
+  f.panel.suspend();
+  assert.equal(f.calls[2].signal.aborted, true);
+  assert.equal(f.calls[3].signal.aborted, true);
+  f.panel.open();
+  f.calls[2].resolve(collection("saved_searches", [saved({ name: "private" })]));
+  f.calls[3].resolve(collection("bookmarks", [bookmark({ alias: "private" })])); await flush();
+  assert.equal(f.get("history-saved-list").children.length, 0);
+  assert.equal(f.get("history-bookmark-list").children.length, 0);
+  assert.equal(f.get("history-library-filter").value, "");
+  assert.equal(f.get("history-loaded-search").textContent, "");
+  oldSearch.emit("click"); oldBookmark.emit("click");
+  assert.equal(f.get("history-query").value, "");
+  assert.deepEqual(f.inspected, []);
+  f.panel.close();
+});
+
+test("cancel saved loading and Escape clear outstanding reads without clearing unrelated search through cancellation", async () => {
+  const f = fixture(); await f.submit("manual query");
+  f.calls[0].resolve(envelope()); await flush();
+  f.get("history-library-load").emit("click"); await flush();
+  f.get("history-library-cancel").emit("click");
+  assert.equal(f.calls[1].signal.aborted, true);
+  assert.equal(f.calls[2].signal.aborted, true);
+  assert.match(f.get("history-library-status").textContent, /cancelled/);
+  assert.equal(f.get("history-results").children.length, 1);
+  f.get("history-search").emit("cancel");
+  f.calls[1].resolve(collection("saved_searches", [saved()]));
+  f.calls[2].resolve(collection("bookmarks", [bookmark()])); await flush();
+  assert.equal(f.get("history-query").value, "");
+  assert.equal(f.get("history-results").children.length, 0);
+  assert.equal(f.get("history-bookmark-list").children.length, 0);
+});
