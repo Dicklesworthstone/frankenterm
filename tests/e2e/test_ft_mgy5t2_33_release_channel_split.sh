@@ -180,7 +180,43 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     )
     record("neg_install_refuses_appstore_only", "stable", "negative", 2, p, {"selected_tag": p.stdout.strip()})
 
-    # 9. Syntax check on install.sh & verify-release.sh (bash -n)
+    # 9. Negative: 1-byte tamper in offline archive fails closed with zero mutation to --dest
+    import hashlib, tarfile
+    dest_dir = td_path / "dest_bin"
+    dest_dir.mkdir()
+    sentinel = dest_dir / "existing_marker"
+    sentinel.write_text("unchanged-before-install\n")
+    fake_bin = td_path / "ft"
+    fake_bin.write_text("#!/bin/sh\necho fake\n")
+    good_tar = td_path / "ft-test.tar.xz"
+    with tarfile.open(good_tar, "w:xz") as tf:
+        tf.add(fake_bin, arcname="ft")
+    orig_sha = hashlib.sha256(good_tar.read_bytes()).hexdigest()
+    tampered_bytes = bytearray(good_tar.read_bytes())
+    tampered_bytes[-1] ^= 0x01
+    bad_tar = td_path / "ft-test-tampered.tar.xz"
+    bad_tar.write_bytes(bytes(tampered_bytes))
+    env = dict(os.environ, HOME=str(td_path / "fake_home"))
+    Path(env["HOME"]).mkdir()
+    p = subprocess.run(
+        ["bash", str(install_sh), "--offline", str(bad_tar), "--checksum", orig_sha,
+         "--no-verify", "--no-app", "--dest", str(dest_dir), "--quiet"],
+        capture_output=True, text=True, env=env,
+    )
+    after_files = sorted(f.name for f in dest_dir.iterdir())
+    mutated = (after_files != ["existing_marker"]) or (sentinel.read_text() != "unchanged-before-install\n")
+    ok_tamper = (p.returncode != 0) and (not mutated)
+    results.append({
+        "case_id": "neg_install_1byte_tamper_zero_mutation",
+        "channel": "stable",
+        "case_kind": "negative",
+        "expected_exit": "non-zero",
+        "actual_exit": p.returncode,
+        "mutated_paths": [] if not mutated else after_files,
+        "verdict": "pass" if ok_tamper else "fail",
+    })
+
+    # 10. Syntax check on install.sh & verify-release.sh (bash -n)
     for name, path in [("install_sh_syntax", install_sh), ("verify_release_syntax", verify_sh), ("abi_floor_syntax", abi_sh)]:
         p = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
         record(name, "all", "positive", 0, p)
