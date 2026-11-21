@@ -2997,7 +2997,8 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
     fn admit_step_action(
         &self,
         action: &StepAction,
-    ) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>, TxStepAdmissionError> {
+    ) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>, TxStepAdmissionError>
+    {
         use crate::policy_kill_switch_state::{
             KILL_SWITCH_FENCE_WAIT, KillSwitchStateError, acquire_kill_switch_fence,
             decode_kill_switch_state, load_kill_switch_state_from_path_with_cx,
@@ -3015,7 +3016,8 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         let started = std::time::Instant::now();
         let mut delay = std::time::Duration::from_millis(2);
         let fence = loop {
-            cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+            cx.checkpoint()
+                .map_err(|_| TxStepAdmissionError::Cancelled)?;
             match acquire_kill_switch_fence(Path::new(&storage.db_path)) {
                 Ok(fence) => break fence,
                 Err(KillSwitchStateError::FencePending) => {
@@ -3026,7 +3028,8 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
                         ));
                     }
                     std::thread::sleep(delay.min(remaining));
-                    cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+                    cx.checkpoint()
+                        .map_err(|_| TxStepAdmissionError::Cancelled)?;
                     delay = (delay * 2).min(std::time::Duration::from_millis(50));
                 }
                 Err(error) => return Err(TxStepAdmissionError::State(error)),
@@ -3040,9 +3043,14 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
                     ),
                 )
             })?;
-            freshness.bind(&fence).map_err(TxStepAdmissionError::State)?;
             freshness
-                .validate(load_kill_switch_state_from_path_with_cx(&cx, &storage.db_path))
+                .bind(&fence)
+                .map_err(TxStepAdmissionError::State)?;
+            freshness
+                .validate(load_kill_switch_state_from_path_with_cx(
+                    &cx,
+                    &storage.db_path,
+                ))
                 .map_err(TxStepAdmissionError::State)?
         };
         let mut switch = raw
@@ -3060,7 +3068,8 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         {
             return Err(TxStepAdmissionError::Stopped(switch.level));
         }
-        cx.checkpoint().map_err(|_| TxStepAdmissionError::Cancelled)?;
+        cx.checkpoint()
+            .map_err(|_| TxStepAdmissionError::Cancelled)?;
         if read_only {
             // Do not prevent a stop transition for the lifetime of a long
             // observation. The next effect re-admits under its own fence.
@@ -3757,14 +3766,15 @@ where
                 };
 
                 let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
-                self.execute_admitted_action(action, step_timeout)
-                    .map(|(success, reason_code, error_code)| TxCompensationStepInput {
+                self.execute_admitted_action(action, step_timeout).map(
+                    |(success, reason_code, error_code)| TxCompensationStepInput {
                         for_step_id: result.step_id.clone(),
                         success,
                         reason_code,
                         error_code,
                         completed_at_ms: now_ms,
-                    })
+                    },
+                )
             };
             let success = input.input().success;
             inputs.push(input);
@@ -13231,8 +13241,8 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("policy fixture directory");
         let path = directory.path().join("policy.db");
-        let backend =
-            RusqliteBackend::open_path(&path, &Default::default()).expect("policy fixture database");
+        let backend = RusqliteBackend::open_path(&path, &Default::default())
+            .expect("policy fixture database");
         backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)")
             .expect("policy fixture config table");
         let mut executor = PaneStepExecutor::new(
@@ -13396,8 +13406,12 @@ mod tests {
                 fail_for_step: Option<&str>,
                 now_ms: i64,
             ) -> Vec<StepDispatchOutcome<TxCompensationStepInput>> {
-                self.inner
-                    .execute_compensations_with_outcome(contract, report, fail_for_step, now_ms)
+                self.inner.execute_compensations_with_outcome(
+                    contract,
+                    report,
+                    fail_for_step,
+                    now_ms,
+                )
             }
         }
 
@@ -13461,7 +13475,10 @@ mod tests {
         );
         assert!(matches!(
             store.peek_cached_outcome(&test_compensation_key(&contract, "first"), 5_000),
-            Some(StepOutcome::Failed { compensated: false, .. })
+            Some(StepOutcome::Failed {
+                compensated: false,
+                ..
+            })
         ));
         assert_eq!(result.final_state, MissionTxState::Failed);
     }
@@ -13508,7 +13525,10 @@ mod tests {
                     .admit_step_action(&read)
                     .ok()
                     .expect("read admission");
-                assert!(admission.is_none(), "a read must not pin the workspace fence");
+                assert!(
+                    admission.is_none(),
+                    "a read must not pin the workspace fence"
+                );
                 let path = &executor.policy_storage.as_ref().unwrap().db_path;
                 let _operator_fence =
                     crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
@@ -13527,8 +13547,8 @@ mod tests {
             FileEffectFault::None,
         ));
         let path = &executor.policy_storage.as_ref().unwrap().db_path;
-        let held = crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
-            .unwrap();
+        let held =
+            crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path)).unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(held);
@@ -13557,8 +13577,8 @@ mod tests {
             FileEffectFault::None,
         ));
         let path = &executor.policy_storage.as_ref().unwrap().db_path;
-        let _held = crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path))
-            .unwrap();
+        let _held =
+            crate::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(path)).unwrap();
         let cx = crate::cx::for_testing();
         let _context = crate::cx::Cx::set_current(Some(cx.clone()));
         let cancel = std::thread::spawn(move || {
@@ -13611,7 +13631,14 @@ mod tests {
         assert!(matches!(&refused, StepDispatchOutcome::Settled(_)));
         assert!(!refused.input().0);
         assert_eq!(refused.input().1, "tx_kill_switch_unavailable");
-        assert!(refused.input().2.as_deref().unwrap().contains("fence_pending"));
+        assert!(
+            refused
+                .input()
+                .2
+                .as_deref()
+                .unwrap()
+                .contains("fence_pending")
+        );
         assert!(!effects.exists());
         drop(held);
         let backend = RusqliteBackend::open_path(Path::new(path), &Default::default()).unwrap();
@@ -13619,7 +13646,14 @@ mod tests {
         let corrupt = executor.execute_admitted_action(&send, Some(1_000));
         assert!(matches!(&corrupt, StepDispatchOutcome::Settled(_)));
         assert_eq!(corrupt.input().1, "tx_kill_switch_unavailable");
-        assert!(corrupt.input().2.as_deref().unwrap().contains("state_corrupt"));
+        assert!(
+            corrupt
+                .input()
+                .2
+                .as_deref()
+                .unwrap()
+                .contains("state_corrupt")
+        );
         assert!(!effects.exists());
     }
 

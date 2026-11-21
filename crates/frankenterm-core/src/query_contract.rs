@@ -421,10 +421,9 @@ mod tests {
             ("semantic", UnifiedSearchMode::Semantic),
             ("hybrid", UnifiedSearchMode::Hybrid),
         ] {
-            let config = crate::config::Config::from_toml(&format!(
-                "[search]\nmode = {configured:?}\n"
-            ))
-            .expect("valid configured search mode");
+            let config =
+                crate::config::Config::from_toml(&format!("[search]\nmode = {configured:?}\n"))
+                    .expect("valid configured search mode");
             let defaults = SearchQueryDefaults::from_search_config(&config.search);
             for requested in [
                 None,

@@ -102470,7 +102470,10 @@ fn summarize_mux_scrollback_by_domain(
     }
 
     let total_panes = panes.len();
-    let total_reported: usize = domains.values().map(DomainScrollbackStats::reported_available).sum();
+    let total_reported: usize = domains
+        .values()
+        .map(DomainScrollbackStats::reported_available)
+        .sum();
     let total_tiered: usize = domains.values().map(|s| s.tiered_panes).sum();
     let total_warm_bytes: usize = domains
         .values()
@@ -102525,7 +102528,14 @@ fn summarize_mux_scrollback_by_domain(
     let unhealthy_domains: Vec<String> = domains
         .iter()
         .filter(|(_, s)| s.cause_label() != "healthy")
-        .map(|(name, s)| format!("{name}: {}/{} ({})", s.tiered_panes, s.total_panes, s.cause_label()))
+        .map(|(name, s)| {
+            format!(
+                "{name}: {}/{} ({})",
+                s.tiered_panes,
+                s.total_panes,
+                s.cause_label()
+            )
+        })
         .collect();
 
     if unhealthy_domains.is_empty() {
@@ -148450,7 +148460,11 @@ A  docs/new-proof.md\n";
     fn doctor_compiled_features_deduplicates_and_has_no_duplicates() {
         let compiled = doctor_compiled_features();
         let unique: std::collections::HashSet<&str> = compiled.iter().copied().collect();
-        assert_eq!(compiled.len(), unique.len(), "compiled features had duplicates: {compiled:?}");
+        assert_eq!(
+            compiled.len(),
+            unique.len(),
+            "compiled features had duplicates: {compiled:?}"
+        );
 
         // Planted negative: duplicate enabled flags collapse deterministically
         let deduped = dedup_doctor_features(&[
@@ -148535,18 +148549,36 @@ A  docs/new-proof.md\n";
         let mixed = summarize_mux_scrollback_by_domain(&panes, &outcomes, &HashSet::new());
         assert_eq!(mixed.status, DiagnosticStatus::Warning);
         let mixed_detail = mixed.detail.as_deref().unwrap();
-        assert!(mixed_detail.contains("3/4 panes reported (2 tiered)"), "{mixed_detail}");
-        assert!(mixed_detail.contains("remote_off: 0/1 (config_disabled)"), "{mixed_detail}");
-        assert!(mixed_detail.contains("remote_old: 0/1 (mux_unsupported)"), "{mixed_detail}");
-        assert!(!mixed_detail.contains("local: 2/2"), "healthy domain should not be listed as non-tiered: {mixed_detail}");
+        assert!(
+            mixed_detail.contains("3/4 panes reported (2 tiered)"),
+            "{mixed_detail}"
+        );
+        assert!(
+            mixed_detail.contains("remote_off: 0/1 (config_disabled)"),
+            "{mixed_detail}"
+        );
+        assert!(
+            mixed_detail.contains("remote_old: 0/1 (mux_unsupported)"),
+            "{mixed_detail}"
+        );
+        assert!(
+            !mixed_detail.contains("local: 2/2"),
+            "healthy domain should not be listed as non-tiered: {mixed_detail}"
+        );
 
         // All-RPC-failed multi-domain case
         let failed_ids: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
         let all_failed = summarize_mux_scrollback_by_domain(&panes, &[], &failed_ids);
         assert_eq!(all_failed.status, DiagnosticStatus::Warning);
         let fail_detail = all_failed.detail.as_deref().unwrap();
-        assert!(fail_detail.contains("4 panes across 3 domain(s)"), "{fail_detail}");
-        assert!(fail_detail.contains("local: 0/2 (rpc_unsupported)"), "{fail_detail}");
+        assert!(
+            fail_detail.contains("4 panes across 3 domain(s)"),
+            "{fail_detail}"
+        );
+        assert!(
+            fail_detail.contains("local: 0/2 (rpc_unsupported)"),
+            "{fail_detail}"
+        );
     }
 
     #[test]

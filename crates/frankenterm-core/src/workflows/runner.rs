@@ -6701,13 +6701,7 @@ mod tests {
             // detection is not converted into a deferred queue by that reset.
             assert!(matches!(
                 runner
-                    .run_workflow_manual_with_cx(
-                        &cx,
-                        79,
-                        probe.clone(),
-                        "fresh-after-reset",
-                        None,
-                    )
+                    .run_workflow_manual_with_cx(&cx, 79, probe.clone(), "fresh-after-reset", None)
                     .await,
                 ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed { .. })
             ));
