@@ -13515,8 +13515,8 @@ mod tests {
                 },
                 timeout_ms: 1_000,
             };
-            let sent = executor.execute_admitted_action(&send, Some(1_000));
-            assert_eq!(sent.input().0, send_allowed, "{level}");
+            let send_result = executor.execute_admitted_action(&send, Some(1_000));
+            assert_eq!(send_result.input().0, send_allowed, "{level}");
             assert_eq!(effects.exists(), send_allowed, "{level}");
             let observed = executor.execute_admitted_action(&read, Some(1_000));
             assert_eq!(observed.input().0, read_allowed, "{level}");

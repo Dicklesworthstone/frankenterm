@@ -102373,7 +102373,10 @@ struct DomainScrollbackStats {
 }
 
 impl DomainScrollbackStats {
-    fn new() -> Self {
+    /// A domain with no pane counted yet. Unlike `Default`, `cap_min` starts
+    /// at `usize::MAX`: the first reported cap sets it, and a domain that
+    /// reports none is left out of the cap range.
+    fn unobserved() -> Self {
         Self {
             cap_min: usize::MAX,
             ..Self::default()
@@ -102431,7 +102434,7 @@ fn summarize_mux_scrollback_by_domain(
             .unwrap_or("local");
         let stats = domains
             .entry(domain)
-            .or_insert_with(DomainScrollbackStats::new);
+            .or_insert_with(DomainScrollbackStats::unobserved);
         stats.total_panes += 1;
 
         match outcome_by_pane.get(&pane.pane_id) {

@@ -10402,7 +10402,7 @@ retention_tiers = []
     fn search_config_defaults() {
         let config = SearchConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.mode, "fts5");
+        assert_eq!(config.mode, ConfiguredSearchMode::Lexical);
         assert_eq!(config.rrf_k, 60);
         assert!((config.quality_weight - 0.7).abs() < 0.001);
         assert_eq!(config.quality_timeout_ms, 200);
@@ -11325,7 +11325,7 @@ mode = "periodic"
     fn search_config_default_values() {
         let sc = SearchConfig::default();
         assert!(!sc.enabled);
-        assert_eq!(sc.mode, "fts5");
+        assert_eq!(sc.mode, ConfiguredSearchMode::Lexical);
         assert_eq!(sc.rrf_k, 60);
         assert!((sc.quality_weight - 0.7).abs() < 0.001);
         assert_eq!(sc.quality_timeout_ms, 200);
