@@ -9,13 +9,20 @@
 # manifest.
 #
 # Usage:
-#   scripts/release/verify-release.sh <version> [--manifest <path>]
-#       Verify a published release. Without --manifest, use DSR's standard
-#       local build-manifest path for the version.
+#   scripts/release/verify-release.sh [--channel stable|companion-appstore] [--json] <version> [--manifest <path>]
+#       Verify a published release. Without --manifest (stable channel), use DSR's
+#       standard local build-manifest path for the version.
+#       With --channel companion-appstore, verify a macOS App Store / Exporter
+#       companion release (`vX.Y.Z-appstore.N`), requiring prerelease=true (never
+#       hijacking GitHub Latest), Exporter DMG + checksum + minisig, and SHA256SUMS.
 #
-#   scripts/release/verify-release.sh --manifest <path> --assets-dir <dir>
+#   scripts/release/verify-release.sh [--channel stable] [--json] --manifest <path> --assets-dir <dir>
 #       Offline verification of the same closed asset set. The local manifest
 #       may be in <dir>, but is not counted as a release asset.
+#
+#   scripts/release/verify-release.sh --channel companion-appstore [--json] <version> --release-json <path> [--assets-dir <dir>]
+#       Offline verification of a companion-appstore release against captured
+#       GitHub release JSON (and optional downloaded assets directory).
 #
 #   Add --attestation-bundle <path> --release-policy <path> to either mode
 #       to authenticate a separate attestation against an operator-owned
@@ -42,18 +49,35 @@ PUBKEY="$ROOT/release/minisign.pub"
 OWNER_REPO="${FT_RELEASE_REPO:-Dicklesworthstone/frankenterm}"
 DSR_STATE_ROOT="${DSR_STATE_DIR:-${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}/dsr}"
 
+CHANNEL="stable"
+JSON_OUTPUT=0
 VERSION=""
 MANIFEST=""
 ASSETS_DIR=""
+RELEASE_JSON_FIXTURE=""
 ATTESTATION_BUNDLE=""
 RELEASE_POLICY="${FT_ATTESTATION_RELEASE_POLICY:-}"
 
 usage() {
-  sed -n '2,36p' "$0"
+  sed -n '2,42p' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --channel)
+      [[ $# -ge 2 ]] || { echo "--channel needs stable or companion-appstore" >&2; exit 2; }
+      CHANNEL="$2"
+      shift 2
+      ;;
+    --json)
+      JSON_OUTPUT=1
+      shift
+      ;;
+    --release-json)
+      [[ $# -ge 2 ]] || { echo "--release-json needs a path" >&2; exit 2; }
+      RELEASE_JSON_FIXTURE="$2"
+      shift 2
+      ;;
     --manifest)
       [[ $# -ge 2 ]] || { echo "--manifest needs a path" >&2; exit 2; }
       MANIFEST="$2"
@@ -85,16 +109,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$CHANNEL" in
+  stable|companion-appstore) ;;
+  *)
+    echo "unknown --channel '$CHANNEL' (expected: stable or companion-appstore)" >&2
+    exit 2
+    ;;
+esac
+
 if [[ -n "$ATTESTATION_BUNDLE" && -z "$RELEASE_POLICY" || -z "$ATTESTATION_BUNDLE" && -n "$RELEASE_POLICY" ]]; then
   echo "--attestation-bundle and --release-policy (or FT_ATTESTATION_RELEASE_POLICY) are required together" >&2
   exit 2
 fi
-if [[ -n "$VERSION" && -n "$ASSETS_DIR" ]]; then
-  echo "--assets-dir is only valid for offline --manifest verification" >&2
+if [[ "$CHANNEL" == "stable" && -n "$VERSION" && -n "$ASSETS_DIR" ]]; then
+  echo "--assets-dir is only valid for offline --manifest verification on --channel stable" >&2
   exit 2
 fi
-if [[ -z "$VERSION" && ( -z "$MANIFEST" || -z "$ASSETS_DIR" ) ]]; then
-  echo "usage: $0 <version> [--manifest <path>] | --manifest <path> --assets-dir <dir>" >&2
+if [[ "$CHANNEL" == "stable" && -z "$VERSION" && ( -z "$MANIFEST" || -z "$ASSETS_DIR" ) ]]; then
+  echo "usage: $0 [--channel stable] <version> [--manifest <path>] | --manifest <path> --assets-dir <dir>" >&2
+  exit 2
+fi
+if [[ "$CHANNEL" == "companion-appstore" && -z "$VERSION" ]]; then
+  echo "usage: $0 --channel companion-appstore <vX.Y.Z-appstore.N> [--release-json <path>] [--assets-dir <dir>]" >&2
   exit 2
 fi
 
@@ -115,12 +151,54 @@ else
 fi
 
 fail=0
-note() { printf '%s\n' "$*"; }
-bad() { printf 'FAIL %s\n' "$*"; fail=$((fail + 1)); }
-good() { printf 'ok   %s\n' "$*"; }
+FAIL_REASONS=()
+FAIL_CODE=""
+note() { [[ "$JSON_OUTPUT" -eq 1 ]] || printf '%s\n' "$*"; }
+bad() {
+  FAIL_REASONS+=("$*")
+  [[ "$JSON_OUTPUT" -eq 1 ]] || printf 'FAIL %s\n' "$*"
+  fail=$((fail + 1))
+}
+good() { [[ "$JSON_OUTPUT" -eq 1 ]] || printf 'ok   %s\n' "$*"; }
+
+emit_json_verdict() {
+  local ok_flag="$1"
+  local tag_val="${TAG:-$VERSION}"
+  local sha_val="${MANIFEST_SHA:-}"
+  local code_val="$FAIL_CODE"
+  local reasons_json
+  if [[ ${#FAIL_REASONS[@]} -eq 0 ]]; then
+    reasons_json="[]"
+  else
+    reasons_json="$(printf '%s\n' "${FAIL_REASONS[@]}" | jq -R . | jq -s .)"
+  fi
+  jq -n \
+    --arg schema "frankenterm.release_verification.v1" \
+    --arg channel "$CHANNEL" \
+    --arg tag "$tag_val" \
+    --arg commit "$sha_val" \
+    --arg fail_code "$code_val" \
+    --argjson ok "$ok_flag" \
+    --argjson failure_count "$fail" \
+    --argjson failures "$reasons_json" \
+    '{
+      schema_version: $schema,
+      ok: $ok,
+      channel: $channel,
+      tag: $tag,
+      commit: (if $commit == "" then null else $commit end),
+      fail_code: (if $fail_code == "" then null else $fail_code end),
+      failure_count: $failure_count,
+      failures: $failures
+    }'
+}
 
 finish_failed() {
-  echo "release verification: $fail failure(s) — do not publish or announce"
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    emit_json_verdict false
+  else
+    echo "release verification ($CHANNEL): $fail failure(s) — do not publish or announce"
+  fi
   exit 1
 }
 
@@ -160,11 +238,123 @@ if ! regular_file "$PUBKEY"; then
   exit 2
 fi
 
+verify_companion_appstore_channel() {
+  if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+-appstore\.[0-9]+$ ]]; then
+    FAIL_CODE="channel_mismatch"
+    bad "channel_mismatch: companion-appstore requires vX.Y.Z-appstore.N tag (got: $VERSION)"
+    finish_failed
+  fi
+  TAG="v${VERSION#v}"
+  local rel_json=""
+  local evidence_dir=""
+  if [[ -n "$RELEASE_JSON_FIXTURE" ]]; then
+    if ! regular_file "$RELEASE_JSON_FIXTURE"; then
+      FAIL_CODE="missing_release_json"
+      bad "companion release metadata file missing or not regular: $RELEASE_JSON_FIXTURE"
+      finish_failed
+    fi
+    rel_json="$RELEASE_JSON_FIXTURE"
+  else
+    command -v gh >/dev/null 2>&1 || { echo "gh is required for online companion verification" >&2; exit 2; }
+    umask 077
+    evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-companion.XXXXXX")"
+    rel_json="$evidence_dir/release.json"
+    note "companion verification evidence retained at: $evidence_dir"
+    if ! gh api --method GET "repos/$OWNER_REPO/releases/tags/$TAG" > "$rel_json" 2> "$evidence_dir/gh.err"; then
+      FAIL_CODE="release_not_found"
+      bad "companion release $TAG was not found on $OWNER_REPO"
+      finish_failed
+    fi
+  fi
+
+  if ! jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and (.assets | type == "array")' "$rel_json" >/dev/null 2>&1; then
+    FAIL_CODE="invalid_companion_metadata"
+    bad "companion release metadata is invalid, draft, or tag_name != $TAG"
+    finish_failed
+  fi
+  MANIFEST_SHA="$(jq -r '.target_commitish // ""' "$rel_json")"
+  if ! jq -e '.prerelease == true' "$rel_json" >/dev/null 2>&1; then
+    FAIL_CODE="companion_release_not_prerelease"
+    bad "companion_release_not_prerelease: $TAG has prerelease=false and can hijack cross-platform GitHub Latest (remediate: gh release edit $TAG --prerelease)"
+  else
+    good "$TAG is marked prerelease=true (isolated from cross-platform GitHub Latest)"
+  fi
+
+  local required_companion=(
+    "FrankenTerm-Exporter.dmg"
+    "FrankenTerm-Exporter.dmg.sha256"
+    "FrankenTerm-Exporter.dmg.minisig"
+    "SHA256SUMS"
+    "SHA256SUMS.minisig"
+  )
+  local req
+  for req in "${required_companion[@]}"; do
+    if ! jq -e --arg n "$req" '.assets[] | select(.name == $n and (.size | type == "number" and . > 0))' "$rel_json" >/dev/null 2>&1; then
+      FAIL_CODE="${FAIL_CODE:-missing_companion_asset}"
+      bad "missing required companion-appstore asset: $req"
+    else
+      good "companion metadata includes $req"
+    fi
+  done
+
+  if [[ -n "$ASSETS_DIR" ]]; then
+    if [[ ! -d "$ASSETS_DIR" || -L "$ASSETS_DIR" ]]; then
+      FAIL_CODE="${FAIL_CODE:-invalid_assets_dir}"
+      bad "companion assets directory missing or symlink: $ASSETS_DIR"
+      finish_failed
+    fi
+    for req in "${required_companion[@]}"; do
+      if ! regular_file "$ASSETS_DIR/$req"; then
+        FAIL_CODE="${FAIL_CODE:-missing_local_companion_asset}"
+        bad "missing local companion asset: $req"
+      fi
+    done
+    if [[ $fail -eq 0 ]]; then
+      local dmg_sha expected_line
+      dmg_sha="$(sha256_file "$ASSETS_DIR/FrankenTerm-Exporter.dmg")"
+      expected_line="$(printf '%s  %s\n' "$dmg_sha" "FrankenTerm-Exporter.dmg")"
+      if ! cmp -s "$ASSETS_DIR/FrankenTerm-Exporter.dmg.sha256" <(printf '%s' "$expected_line"); then
+        FAIL_CODE="checksum_mismatch"
+        bad "FrankenTerm-Exporter.dmg.sha256 does not match local DMG digest"
+      else
+        good "FrankenTerm-Exporter.dmg.sha256 binds DMG digest"
+      fi
+      if ! minisign -V -H -q -p "$PUBKEY" -m "$ASSETS_DIR/FrankenTerm-Exporter.dmg" -x "$ASSETS_DIR/FrankenTerm-Exporter.dmg.minisig" >/dev/null 2>&1; then
+        FAIL_CODE="minisig_invalid"
+        bad "FrankenTerm-Exporter.dmg.minisig failed verification against release/minisign.pub"
+      else
+        good "FrankenTerm-Exporter.dmg.minisig verified against release/minisign.pub"
+      fi
+      if ! minisign -V -H -q -p "$PUBKEY" -m "$ASSETS_DIR/SHA256SUMS" -x "$ASSETS_DIR/SHA256SUMS.minisig" >/dev/null 2>&1; then
+        FAIL_CODE="minisig_invalid"
+        bad "SHA256SUMS.minisig failed verification against release/minisign.pub"
+      else
+        good "SHA256SUMS.minisig verified against release/minisign.pub"
+      fi
+    fi
+  fi
+
+  if [[ $fail -gt 0 ]]; then
+    finish_failed
+  fi
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    emit_json_verdict true
+  else
+    echo "release verification (companion-appstore): companion checks passed for $TAG"
+  fi
+  exit 0
+}
+
+if [[ "$CHANNEL" == "companion-appstore" ]]; then
+  verify_companion_appstore_channel
+fi
+
 TAG=""
 if [[ -n "$VERSION" ]]; then
   if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "version must be a stable semantic version such as v0.15.2 or 0.15.2" >&2
-    exit 2
+    FAIL_CODE="channel_mismatch"
+    bad "channel_mismatch: --channel stable requires vX.Y.Z semver (got: $VERSION; use --channel companion-appstore for -appstore.N releases)"
+    finish_failed
   fi
   TAG="v${VERSION#v}"
   if [[ -z "$MANIFEST" ]]; then
@@ -704,7 +894,9 @@ if [[ "$(sha256_file "$MANIFEST")" != "$MANIFEST_FILE_SHA" || \
   bad "local DSR build manifest changed during verification"
   finish_failed
 fi
-if [[ -n "$ATTESTATION_BUNDLE" ]]; then
+if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+  emit_json_verdict true
+elif [[ -n "$ATTESTATION_BUNDLE" ]]; then
   echo "release verification: exact 17-asset strict DSR set and externally authenticated attestation passed for $TAG"
   echo "scope: artifact integrity and attestation policy bindings; target execution and installer/canary outcomes require their own evidence"
 else
