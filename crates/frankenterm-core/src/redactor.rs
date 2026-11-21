@@ -859,6 +859,12 @@ fn catalog_fingerprint<'a>(patterns: impl IntoIterator<Item = (&'a str, &'a str)
 pub struct Redactor {
     /// Whether to include pattern names in redaction markers (for debugging).
     include_pattern_names: bool,
+    /// Optional operator-configured custom regex patterns applied after the
+    /// built-in secret catalog (`[safety.redaction].patterns`, ft-mgy5t2.17).
+    custom_patterns: Vec<Regex>,
+    /// Optional custom redaction marker (`[safety.redaction].placeholder`,
+    /// defaults to [`REDACTED_MARKER`]).
+    placeholder: Option<String>,
 }
 
 impl Redactor {
@@ -867,6 +873,8 @@ impl Redactor {
     pub fn new() -> Self {
         Self {
             include_pattern_names: false,
+            custom_patterns: Vec::new(),
+            placeholder: None,
         }
     }
 
@@ -875,13 +883,50 @@ impl Redactor {
     pub fn with_debug_markers() -> Self {
         Self {
             include_pattern_names: true,
+            custom_patterns: Vec::new(),
+            placeholder: None,
         }
+    }
+
+    /// Create a redactor that retains the full built-in secret catalog and
+    /// additionally applies operator-configured custom regex patterns and/or
+    /// a custom non-empty replacement placeholder (`[safety.redaction]`,
+    /// ft-mgy5t2.17).
+    ///
+    /// Built-in secret detection is never disabled or weakened by custom
+    /// configuration.
+    pub fn with_custom_patterns_and_placeholder(
+        patterns: &[String],
+        placeholder: Option<&str>,
+    ) -> Result<Self, regex::Error> {
+        let mut custom_patterns = Vec::with_capacity(patterns.len());
+        for raw in patterns {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                custom_patterns.push(Regex::new(trimmed)?);
+            }
+        }
+        let placeholder = placeholder
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != REDACTED_MARKER)
+            .map(ToOwned::to_owned);
+        Ok(Self {
+            include_pattern_names: false,
+            custom_patterns,
+            placeholder,
+        })
+    }
+
+    /// Effective replacement marker used when `include_pattern_names` is false.
+    #[must_use]
+    pub fn marker(&self) -> &str {
+        self.placeholder.as_deref().unwrap_or(REDACTED_MARKER)
     }
 
     /// Redact all detected secrets from the input text.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
-        self.redact_observed(text, |_, _, _| {})
+        self.redact_observed(text, |_, _, _, _| {})
     }
 
     /// Retain source-byte provenance from the actual sequential replacement
@@ -889,8 +934,8 @@ impl Redactor {
     /// oracle when an earlier replacement changes a later pattern's input.
     pub(crate) fn redact_with_replacement_spans(&self, text: &str) -> RedactionTrace {
         let mut provenance = RedactionProvenance::new(text.len());
-        let redacted = self.redact_observed(text, |pattern, input, replacement_len| {
-            provenance.record_pass(pattern, input, replacement_len);
+        let redacted = self.redact_observed(text, |name, regex, input, replacement_len| {
+            provenance.record_pass(name, regex, input, replacement_len);
         });
         RedactionTrace {
             redacted,
@@ -902,34 +947,48 @@ impl Redactor {
     fn redact_observed(
         &self,
         text: &str,
-        mut observe: impl FnMut(&SecretPattern, &str, usize),
+        mut observe: impl FnMut(&'static str, &Regex, &str, usize),
     ) -> String {
         // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
         let _hpt = crate::hot_path_metrics::HotPathTimer::start("redactor.redact");
 
-        // Fast path: one combined RegexSet scan. When no secret pattern matches
-        // (the overwhelming common case for captured output), the per-pattern
-        // loop below is a guaranteed no-op — every `replace_all` returns its
-        // input unchanged — so we skip all 32 full-content scans and the
-        // up-to-33 full-content String allocations and return a single owned
-        // copy. Output-identical: with zero matches the loop result is `text`.
-        if !SECRET_PATTERN_SET.is_match(text) {
+        // Fast path: one combined RegexSet scan when no custom patterns are
+        // installed. When no secret pattern matches, skip all full-content
+        // scans and allocations and return a single owned copy.
+        let builtin_matched = SECRET_PATTERN_SET.is_match(text);
+        if !builtin_matched && self.custom_patterns.is_empty() {
             return text.to_string();
         }
 
         let mut result = text.to_string();
+        let default_marker = self.marker();
 
-        for pattern in SECRET_PATTERNS {
+        if builtin_matched {
+            for pattern in SECRET_PATTERNS {
+                let replacement = if self.include_pattern_names {
+                    format!("[REDACTED:{}]", pattern.name)
+                } else {
+                    default_marker.to_string()
+                };
+
+                // The observer sees precisely the input and regex used by this
+                // replace_all, including markers emitted by preceding passes.
+                observe(pattern.name, pattern.regex, &result, replacement.len());
+                result = pattern.regex.replace_all(&result, &replacement).to_string();
+            }
+        }
+
+        for custom in &self.custom_patterns {
+            if !custom.is_match(&result) {
+                continue;
+            }
             let replacement = if self.include_pattern_names {
-                format!("[REDACTED:{}]", pattern.name)
+                "[REDACTED:custom_pattern]".to_string()
             } else {
-                REDACTED_MARKER.to_string()
+                default_marker.to_string()
             };
-
-            // The observer sees precisely the input and regex used by this
-            // replace_all, including markers emitted by preceding passes.
-            observe(pattern, &result, replacement.len());
-            result = pattern.regex.replace_all(&result, &replacement).to_string();
+            observe("custom_pattern", custom, &result, replacement.len());
+            result = custom.replace_all(&result, &replacement).to_string();
         }
 
         result
@@ -941,6 +1000,7 @@ impl Redactor {
         SECRET_PATTERNS
             .iter()
             .any(|pattern| pattern.regex.is_match(text))
+            || self.custom_patterns.iter().any(|regex| regex.is_match(text))
     }
 
     /// Detect all secrets in text and return their locations.
@@ -1045,8 +1105,14 @@ impl RedactionProvenance {
         }
     }
 
-    fn record_pass(&mut self, pattern: &SecretPattern, input: &str, replacement_len: usize) {
-        let mut matches = pattern.regex.find_iter(input).peekable();
+    fn record_pass(
+        &mut self,
+        pattern_name: &'static str,
+        regex: &Regex,
+        input: &str,
+        replacement_len: usize,
+    ) {
+        let mut matches = regex.find_iter(input).peekable();
         if matches.peek().is_none() {
             return;
         }
@@ -1058,11 +1124,11 @@ impl RedactionProvenance {
             self.visit_source_range(
                 input_cursor..matched.start(),
                 Some(output_cursor),
-                pattern.name,
+                pattern_name,
                 &mut retained,
             );
             output_cursor += matched.start() - input_cursor;
-            self.visit_source_range(matched.range(), None, pattern.name, &mut retained);
+            self.visit_source_range(matched.range(), None, pattern_name, &mut retained);
             self.replacement_count = self.replacement_count.saturating_add(1);
             output_cursor += replacement_len;
             input_cursor = matched.end();
@@ -1070,7 +1136,7 @@ impl RedactionProvenance {
         self.visit_source_range(
             input_cursor..input.len(),
             Some(output_cursor),
-            pattern.name,
+            pattern_name,
             &mut retained,
         );
         self.retained = retained;

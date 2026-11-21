@@ -4738,6 +4738,8 @@ pub struct PolicyEngine {
     approval_tracker: ApprovalTracker,
     /// Revocation registry for credential/session/connector access revocation
     revocation_registry: RevocationRegistry,
+    /// Secret redactor configured from `[safety.redaction]` (ft-mgy5t2.17)
+    redactor: Redactor,
 }
 
 impl PolicyEngine {
@@ -4799,6 +4801,7 @@ impl PolicyEngine {
             namespace_isolation_enabled: false,
             approval_tracker: ApprovalTracker::default(),
             revocation_registry: RevocationRegistry::default(),
+            redactor: Redactor::new(),
         }
     }
 
@@ -4823,6 +4826,23 @@ impl PolicyEngine {
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
         engine.audit_chain = AuditChain::from_config(&config.audit_chain);
         engine.compliance_engine = ComplianceEngine::from_config(&config.compliance);
+        engine.redactor = match Redactor::with_custom_patterns_and_placeholder(
+            &config.redaction.patterns,
+            Some(config.redaction.placeholder.as_str()),
+        ) {
+            Ok(redactor) => redactor,
+            Err(err) => {
+                record_policy_engine_config_fallback();
+                tracing::warn!(
+                    target: "ft::policy",
+                    event = "policy_engine_config_fallback",
+                    section = "safety.redaction",
+                    error = %err,
+                    "Operator-supplied [safety.redaction] pattern failed to compile; falling back to built-in Redactor catalog (ft-mgy5t2.17)"
+                );
+                Redactor::new()
+            }
+        };
         engine.credential_broker =
             ConnectorCredentialBroker::from_config(&config.credential_broker);
         engine.credential_broker_config = config.credential_broker.clone();
@@ -7581,15 +7601,13 @@ impl PolicyEngine {
     /// trails, or exported.
     #[must_use]
     pub fn redact_secrets(&self, text: &str) -> String {
-        static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
-        REDACTOR.redact(text)
+        self.redactor.redact(text)
     }
 
     /// Check if text contains secrets that would be redacted
     #[must_use]
     pub fn contains_secrets(&self, text: &str) -> bool {
-        static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
-        REDACTOR.contains_secrets(text)
+        self.redactor.contains_secrets(text)
     }
 
     /// Capture a unified telemetry snapshot from all subsystems.
