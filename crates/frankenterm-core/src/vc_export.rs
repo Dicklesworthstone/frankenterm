@@ -1266,7 +1266,9 @@ mod tests {
                 &storage,
                 &VcExportRequest {
                     cursor: Some(VcExportCursor {
-                        cursor_epoch: "stale-prior-db-epoch".to_string(),
+                        // A well-formed epoch (32 lowercase hex) of another
+                        // database; storage refuses a malformed one outright.
+                        cursor_epoch: "b".repeat(32),
                         after_id: ids[1],
                         generation: 0,
                     }),

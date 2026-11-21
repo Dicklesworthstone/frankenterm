@@ -1186,10 +1186,12 @@ mod tests {
 
         #[test]
         fn clean_ready_scenario_cannot_admit_destructive_or_missing_pane_contract() {
-            // Destructive rm -rf command denied by command gate even on live prompt pane.
+            // The command gate denies rm -rf of the root outright, even on a
+            // live prompt pane with an approval on file. (Other rm -rf lines
+            // only require approval by default, which the stub grants.)
             let destructive = make_contract(StepAction::SendText {
                 pane_id: 7,
-                text: "rm -rf /tmp/important".to_string(),
+                text: "rm -rf /".to_string(),
                 paste_mode: Some(false),
             });
             let targets = StubTargets {
