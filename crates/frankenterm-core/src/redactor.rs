@@ -974,7 +974,13 @@ impl Redactor {
                 // The observer sees precisely the input and regex used by this
                 // replace_all, including markers emitted by preceding passes.
                 observe(pattern.name, pattern.regex, &result, replacement.len());
-                result = pattern.regex.replace_all(&result, &replacement).to_string();
+                // An operator's marker is literal text, never a replacement
+                // template. Expanding `$0` or a capture reference here could
+                // reinsert the secret while evidence claims it was removed.
+                result = pattern
+                    .regex
+                    .replace_all(&result, regex::NoExpand(&replacement))
+                    .to_string();
             }
         }
 
@@ -988,7 +994,9 @@ impl Redactor {
                 default_marker.to_string()
             };
             observe("custom_pattern", custom, &result, replacement.len());
-            result = custom.replace_all(&result, &replacement).to_string();
+            result = custom
+                .replace_all(&result, regex::NoExpand(&replacement))
+                .to_string();
         }
 
         result
@@ -1000,7 +1008,10 @@ impl Redactor {
         SECRET_PATTERNS
             .iter()
             .any(|pattern| pattern.regex.is_match(text))
-            || self.custom_patterns.iter().any(|regex| regex.is_match(text))
+            || self
+                .custom_patterns
+                .iter()
+                .any(|regex| regex.is_match(text))
     }
 
     /// Detect all secrets in text and return their locations.
@@ -1022,16 +1033,24 @@ impl Redactor {
     pub fn detect(&self, text: &str) -> Vec<(&'static str, usize, usize)> {
         let mut detections: Vec<(&'static str, usize, usize)> = Vec::new();
 
-        // Iterate in priority order; the earliest pattern in
-        // SECRET_PATTERNS has the highest priority. By processing
-        // priorities highest-first and skipping overlaps with
-        // already-kept spans, the higher-priority match wins.
-        for pattern in SECRET_PATTERNS {
-            for mat in pattern.regex.find_iter(text) {
+        // Keep the same precedence as redact(): the built-in catalog, then
+        // custom patterns in configuration order. Boundary protection and
+        // inspection callers must see custom secrets too, without counting
+        // a lower-priority overlapping match twice.
+        let patterns = SECRET_PATTERNS
+            .iter()
+            .map(|pattern| (pattern.name, LazyLock::force(pattern.regex)))
+            .chain(
+                self.custom_patterns
+                    .iter()
+                    .map(|regex| ("custom_pattern", regex)),
+            );
+        for (name, regex) in patterns {
+            for mat in regex.find_iter(text) {
                 let (start, end) = (mat.start(), mat.end());
                 let overlaps = detections.iter().any(|&(_, s, e)| start < e && end > s);
                 if !overlaps {
-                    detections.push((pattern.name, start, end));
+                    detections.push((name, start, end));
                 }
             }
         }
@@ -2054,6 +2073,83 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn configured_markers_are_literal_for_builtin_and_custom_secrets() {
+        let builtin = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let custom = "ORG-482901";
+        let patterns = vec![r"ORG-(?P<secret>[0-9]{6})".to_string()];
+        for marker in ["$0", "$1", "${secret}", "$$", "[$0/${secret}/$1/$$]"] {
+            let redactor = Redactor::with_custom_patterns_and_placeholder(&patterns, Some(marker))
+                .expect("valid custom redactor");
+            let input = format!("before {builtin} between {custom} after");
+            let expected = format!("before {marker} between {marker} after");
+            assert_eq!(redactor.redact(&input), expected);
+
+            // Evidence must describe the literal bytes actually emitted,
+            // including markers which look like regex capture references.
+            let result = redactor.redact_bytes_with_evidence(input.as_bytes());
+            assert_eq!(result.bytes, expected.as_bytes());
+            assert_eq!(result.evidence.replacement_count, 2);
+            assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+            assert_eq!(result.evidence.redacted_output_bytes, expected.len() as u64);
+            assert_eq!(
+                result.evidence.secret_input_bytes_replaced,
+                (builtin.len() + custom.len()) as u64
+            );
+            assert!(!expected.contains(builtin));
+            assert!(!expected.contains(custom));
+        }
+    }
+
+    #[test]
+    fn configured_pattern_detection_preserves_precedence_and_utf8_offsets() {
+        let builtin = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let custom = "ORG-482901";
+        let input = format!("\u{03bb} {custom} {builtin} end");
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[
+                r"ORG-[0-9]{6}".to_string(),
+                r"ORG-[0-9]+".to_string(),
+                r"ghp_[A-Z]+".to_string(),
+            ],
+            None,
+        )
+        .expect("valid custom redactor");
+        let custom_start = input.find(custom).expect("custom secret in fixture");
+        let builtin_start = input.find(builtin).expect("builtin secret in fixture");
+        assert!(redactor.contains_secrets(&input));
+        assert_eq!(
+            redactor.detect(&input),
+            vec![
+                ("custom_pattern", custom_start, custom_start + custom.len()),
+                ("github_token", builtin_start, builtin_start + builtin.len()),
+            ]
+        );
+        assert_eq!(
+            redactor.redact(&input),
+            "\u{03bb} [REDACTED] [REDACTED] end"
+        );
+        assert!(redactor.detect("ordinary text").is_empty());
+    }
+
+    #[test]
+    fn streaming_custom_detection_does_not_split_a_complete_match_at_an_anchor() {
+        // The built-in anchor inside a custom match used to hold back only
+        // the suffix, emitting a prefix which neither later chunk could mask.
+        let input = "before ORG-482901-API_KEY-tail after";
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[r"ORG-[0-9]{6}-API_KEY-tail".to_string()],
+            None,
+        )
+        .expect("valid custom redactor");
+        let expected = redactor.redact(input);
+        assert_eq!(expected, "before [REDACTED] after");
+        let mut streaming = StreamingRedactor::with_redactor(redactor);
+        let mut bytes = streaming.redact_chunk(input.as_bytes()).bytes;
+        bytes.extend(streaming.finish().bytes);
+        assert_eq!(bytes, expected.as_bytes());
+    }
 
     #[test]
     fn replacement_provenance_tracks_later_passes_over_prior_markers() {
