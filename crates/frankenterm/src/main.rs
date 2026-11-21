@@ -102349,75 +102349,259 @@ async fn mux_generation_diagnostic(
     Some(check)
 }
 
-/// Aggregate the mux's tiered scrollback across every pane (ft-erfq8): the
-/// per-pane budgets multiply by pane count, so the fleet total is what an
-/// operator has to size. `None` when the mux lists no panes or cannot report.
+/// Per-domain rollup of mux tiered-scrollback health (ft-mgy5t2.15).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DomainScrollbackStats {
+    total_panes: usize,
+    tiered_panes: usize,
+    disabled_panes: usize,
+    unavailable_panes: usize,
+    missing_or_closed_panes: usize,
+    panicked_panes: usize,
+    rpc_failed_panes: usize,
+    warm_resident_bytes: usize,
+    cap_min: usize,
+    cap_max: usize,
+}
+
+impl DomainScrollbackStats {
+    fn new() -> Self {
+        Self {
+            cap_min: usize::MAX,
+            ..Self::default()
+        }
+    }
+
+    fn reported_available(&self) -> usize {
+        self.tiered_panes + self.disabled_panes
+    }
+
+    fn cause_label(&self) -> &'static str {
+        if self.tiered_panes == self.total_panes && self.total_panes > 0 {
+            "healthy"
+        } else if self.rpc_failed_panes > 0 && self.reported_available() == 0 {
+            "rpc_unsupported"
+        } else if self.panicked_panes > 0 {
+            "callback_panicked"
+        } else if self.unavailable_panes > 0 && self.reported_available() == 0 {
+            "mux_unsupported"
+        } else if self.disabled_panes > 0 && self.tiered_panes == 0 {
+            "config_disabled"
+        } else if self.reported_available() == 0 && self.missing_or_closed_panes > 0 {
+            "panes_closed"
+        } else if self.reported_available() < self.total_panes {
+            "partial"
+        } else {
+            "mixed_disabled"
+        }
+    }
+}
+
+/// Pure, unit-testable per-domain summarizer for `ft doctor` mux scrollback
+/// telemetry (ft-mgy5t2.15). Groups panes by domain so operators immediately see
+/// which local or remote mux domains report tiered scrollback and why others do not.
+fn summarize_mux_scrollback_by_domain(
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+    outcomes: &[(
+        u64,
+        frankenterm_core::wezterm::PaneTieredScrollbackBatchOutcome,
+    )],
+    rpc_failed_pane_ids: &std::collections::HashSet<u64>,
+) -> DiagnosticCheck {
+    use frankenterm_core::wezterm::PaneTieredScrollbackBatchOutcome;
+    use std::collections::{BTreeMap, HashMap};
+
+    let outcome_by_pane: HashMap<u64, PaneTieredScrollbackBatchOutcome> =
+        outcomes.iter().copied().collect();
+    let mut domains: BTreeMap<&str, DomainScrollbackStats> = BTreeMap::new();
+
+    for pane in panes {
+        let domain = pane
+            .domain_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("local");
+        let stats = domains
+            .entry(domain)
+            .or_insert_with(DomainScrollbackStats::new);
+        stats.total_panes += 1;
+
+        match outcome_by_pane.get(&pane.pane_id) {
+            Some(PaneTieredScrollbackBatchOutcome::Available(summary)) => {
+                stats.warm_resident_bytes = stats
+                    .warm_resident_bytes
+                    .saturating_add(summary.warm_resident_bytes);
+                if summary.tiering_enabled {
+                    stats.tiered_panes += 1;
+                    stats.cap_min = stats.cap_min.min(summary.configured_warm_max_bytes);
+                    stats.cap_max = stats.cap_max.max(summary.configured_warm_max_bytes);
+                } else {
+                    stats.disabled_panes += 1;
+                }
+            }
+            Some(PaneTieredScrollbackBatchOutcome::Unavailable) => {
+                stats.unavailable_panes += 1;
+            }
+            Some(
+                PaneTieredScrollbackBatchOutcome::Missing
+                | PaneTieredScrollbackBatchOutcome::Closed,
+            ) => {
+                stats.missing_or_closed_panes += 1;
+            }
+            Some(PaneTieredScrollbackBatchOutcome::CallbackPanicked) => {
+                stats.panicked_panes += 1;
+            }
+            None => {
+                if rpc_failed_pane_ids.contains(&pane.pane_id) {
+                    stats.rpc_failed_panes += 1;
+                } else {
+                    stats.unavailable_panes += 1;
+                }
+            }
+        }
+    }
+
+    let total_panes = panes.len();
+    let total_reported: usize = domains.values().map(DomainScrollbackStats::reported_available).sum();
+    let total_tiered: usize = domains.values().map(|s| s.tiered_panes).sum();
+    let total_warm_bytes: usize = domains
+        .values()
+        .fold(0usize, |acc, s| acc.saturating_add(s.warm_resident_bytes));
+    let cap_min = domains
+        .values()
+        .filter(|s| s.cap_min != usize::MAX)
+        .map(|s| s.cap_min)
+        .min()
+        .unwrap_or(usize::MAX);
+    let cap_max = domains.values().map(|s| s.cap_max).max().unwrap_or(0);
+
+    let per_domain_summary = domains
+        .iter()
+        .map(|(name, stats)| {
+            format!(
+                "{name}: {}/{} ({})",
+                stats.tiered_panes,
+                stats.total_panes,
+                stats.cause_label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if total_reported == 0 {
+        let any_rpc_failed = domains.values().any(|s| s.rpc_failed_panes > 0);
+        let hint = if any_rpc_failed {
+            "Upgrade or enable tiered scrollback on domains reporting rpc_unsupported / mux_unsupported"
+        } else {
+            "Enable scrollback tiering on the listed mux domains (or upgrade remote mux servers that report mux_unsupported)"
+        };
+        return DiagnosticCheck::warning(
+            "mux scrollback",
+            format!(
+                "{total_panes} panes across {} domain(s); none reported tiered scrollback [{per_domain_summary}]",
+                domains.len()
+            ),
+            hint,
+        );
+    }
+
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    let caps = if cap_min == usize::MAX {
+        "none (no pane has tiered scrollback enabled)".to_string()
+    } else if cap_min == cap_max {
+        format!("{:.1} MiB", mib(cap_max))
+    } else {
+        format!("{:.1}-{:.1} MiB", mib(cap_min), mib(cap_max))
+    };
+
+    let unhealthy_domains: Vec<String> = domains
+        .iter()
+        .filter(|(_, s)| s.cause_label() != "healthy")
+        .map(|(name, s)| format!("{name}: {}/{} ({})", s.tiered_panes, s.total_panes, s.cause_label()))
+        .collect();
+
+    if unhealthy_domains.is_empty() {
+        DiagnosticCheck::ok_with_detail(
+            "mux scrollback",
+            format!(
+                "{total_reported}/{total_panes} panes ({total_tiered} tiered across {} domain(s)): {:.1} MiB warm resident; warm cap per pane {caps}, up to {:.1} MiB across panes (the mux setting scrollback_warm_fleet_max_mb caps that total) [{per_domain_summary}]",
+                domains.len(),
+                mib(total_warm_bytes),
+                mib(cap_max.saturating_mul(total_tiered.max(total_reported))),
+            ),
+        )
+    } else {
+        DiagnosticCheck::warning(
+            "mux scrollback",
+            format!(
+                "{total_reported}/{total_panes} panes reported ({total_tiered} tiered): {:.1} MiB warm resident; warm cap {caps}; non-tiered domains: [{}]",
+                mib(total_warm_bytes),
+                unhealthy_domains.join(", "),
+            ),
+            "Inspect non-tiered domains above: config_disabled needs scrollback tiering enabled; mux_unsupported/rpc_unsupported needs an upgraded FrankenTerm mux",
+        )
+    }
+}
+
+/// Aggregate the mux's tiered scrollback across every pane (ft-erfq8 / ft-mgy5t2.15):
+/// breaks down coverage per mux domain so fleet sizing and missing-domain causes
+/// are immediately visible. `None` when the mux lists no panes or cannot report.
 async fn mux_scrollback_diagnostic(
     cx: &frankenterm_core::cx::Cx,
     mux: &frankenterm_core::wezterm::UnifiedClient,
 ) -> Option<DiagnosticCheck> {
-    use frankenterm_core::wezterm::{
-        MuxInterface, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneTieredScrollbackBatchOutcome,
-    };
+    use frankenterm_core::wezterm::{MuxInterface, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES};
 
     let panes = mux.list_panes_with_cx(cx).await.ok()?;
     let pane_ids: Vec<u64> = panes.iter().map(|pane| pane.pane_id).collect();
     if pane_ids.is_empty() {
         return None;
     }
-    let mut reported = 0usize;
-    let mut warm_resident_bytes = 0usize;
-    let mut cap_min = usize::MAX;
-    let mut cap_max = 0usize;
+    let mut outcomes = Vec::with_capacity(pane_ids.len());
+    let mut rpc_failed_pane_ids = std::collections::HashSet::new();
     for chunk in pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
-        let Ok(Some(entries)) = mux
+        match mux
             .pane_tiered_scrollback_summaries_bulk_with_cx(cx, chunk)
             .await
-        else {
-            continue;
-        };
-        for entry in entries {
-            if let PaneTieredScrollbackBatchOutcome::Available(summary) = entry.outcome {
-                reported += 1;
-                warm_resident_bytes =
-                    warm_resident_bytes.saturating_add(summary.warm_resident_bytes);
-                // A pane without tiering (e.g. on the alternate screen, which
-                // keeps no scrollback) reports a 0 cap; it has no warm budget.
-                if summary.tiering_enabled {
-                    cap_min = cap_min.min(summary.configured_warm_max_bytes);
-                    cap_max = cap_max.max(summary.configured_warm_max_bytes);
+        {
+            Ok(Some(entries)) => {
+                for entry in entries {
+                    outcomes.push((entry.pane_id, entry.outcome));
                 }
+            }
+            Ok(None) | Err(_) => {
+                rpc_failed_pane_ids.extend(chunk.iter().copied());
             }
         }
     }
-    if reported == 0 {
-        return Some(DiagnosticCheck::warning(
-            "mux scrollback",
-            format!(
-                "{} panes listed; none reported tiered scrollback",
-                pane_ids.len()
-            ),
-            "Check that the mux is a FrankenTerm mux with tiered scrollback enabled",
-        ));
-    }
-    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-    let caps = if cap_min == usize::MAX {
-        "none (no pane has tiered scrollback)".to_string()
-    } else if cap_min == cap_max {
-        format!("{:.1} MiB", mib(cap_max))
-    } else {
-        format!("{:.1}-{:.1} MiB", mib(cap_min), mib(cap_max))
-    };
-    Some(DiagnosticCheck::ok_with_detail(
-        "mux scrollback",
-        format!(
-            "{reported} panes: {:.1} MiB warm resident; warm cap per pane {caps}, up to \
-             {:.1} MiB across panes (the mux setting scrollback_warm_fleet_max_mb caps \
-             that total)",
-            mib(warm_resident_bytes),
-            mib(cap_max.saturating_mul(reported)),
-        ),
+    Some(summarize_mux_scrollback_by_domain(
+        &panes,
+        &outcomes,
+        &rpc_failed_pane_ids,
     ))
+}
+
+/// Collect enabled feature names preserving order with strict deduplication (ft-mgy5t2.15).
+fn dedup_doctor_features(flags: &[(bool, &'static str)]) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    for &(enabled, name) in flags {
+        if enabled && !features.contains(&name) {
+            features.push(name);
+        }
+    }
+    features
+}
+
+/// Compiled optional feature flags surfaced by `ft doctor` (ft-mgy5t2.15).
+fn doctor_compiled_features() -> Vec<&'static str> {
+    dedup_doctor_features(&[
+        (cfg!(feature = "ftui"), "ftui"),
+        (cfg!(feature = "tui"), "tui"),
+        (cfg!(feature = "browser"), "browser"),
+        (cfg!(feature = "mcp"), "mcp"),
+        (cfg!(feature = "web"), "web"),
+        (cfg!(feature = "metrics"), "metrics"),
+    ])
 }
 
 /// Run all diagnostic checks and return results
@@ -102640,19 +102824,8 @@ async fn run_diagnostics_with_mux_client(
         }
     }
 
-    // Check 7: Feature flags
-    let features: Vec<&str> = [
-        (cfg!(feature = "ftui"), "ftui"),
-        (cfg!(feature = "tui"), "tui"),
-        (cfg!(feature = "ftui"), "ftui"),
-        (cfg!(feature = "browser"), "browser"),
-        (cfg!(feature = "mcp"), "mcp"),
-        (cfg!(feature = "web"), "web"),
-        (cfg!(feature = "metrics"), "metrics"),
-    ]
-    .into_iter()
-    .filter_map(|(enabled, name)| enabled.then_some(name))
-    .collect();
+    // Check 7: Feature flags (deduplicated; ft-mgy5t2.15 fixed duplicate `ftui, ftui`)
+    let features = doctor_compiled_features();
 
     if features.is_empty() {
         checks.push(DiagnosticCheck::ok_with_detail(
@@ -148250,9 +148423,122 @@ A  docs/new-proof.md\n";
             // Should not contain secrets
             assert!(!detail.contains("sk-"));
             assert!(!detail.contains("Bearer"));
+            // ft-mgy5t2.15: feature list must never contain duplicates (regression for `ftui, ftui`)
+            if detail != "default (no optional features)" {
+                let items: Vec<&str> = detail.split(", ").collect();
+                let uniq: std::collections::HashSet<&str> = items.iter().copied().collect();
+                assert_eq!(
+                    items.len(),
+                    uniq.len(),
+                    "ft doctor features must not duplicate entries: {detail}"
+                );
+            }
 
             let _ = std::fs::remove_dir_all(&temp);
         });
+    }
+
+    #[test]
+    fn doctor_compiled_features_deduplicates_and_has_no_duplicates() {
+        let compiled = doctor_compiled_features();
+        let unique: std::collections::HashSet<&str> = compiled.iter().copied().collect();
+        assert_eq!(compiled.len(), unique.len(), "compiled features had duplicates: {compiled:?}");
+
+        // Planted negative: duplicate enabled flags collapse deterministically
+        let deduped = dedup_doctor_features(&[
+            (true, "ftui"),
+            (true, "tui"),
+            (true, "ftui"),
+            (false, "browser"),
+            (true, "mcp"),
+            (true, "mcp"),
+        ]);
+        assert_eq!(deduped, vec!["ftui", "tui", "mcp"]);
+    }
+
+    #[test]
+    fn doctor_mux_scrollback_reports_per_domain_breakdown() {
+        use frankenterm_core::wezterm::{
+            PaneInfo, PaneTieredScrollbackBatchOutcome, PaneTieredScrollbackSummary,
+        };
+        use std::collections::HashSet;
+
+        let make_pane = |pane_id: u64, domain: &str| PaneInfo {
+            pane_id,
+            tab_id: 1,
+            window_id: 1,
+            domain_id: Some(1),
+            domain_name: Some(domain.to_string()),
+            workspace: Some("default".to_string()),
+            size: None,
+            rows: Some(24),
+            cols: Some(80),
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let tiered = PaneTieredScrollbackSummary {
+            tiering_enabled: true,
+            configured_scrollback_rows: 10_000,
+            configured_hot_lines: 500,
+            configured_warm_max_bytes: 8 * 1024 * 1024,
+            visible_rows: 24,
+            in_memory_scrollback_rows: 100,
+            warm_resident_lines: 500,
+            warm_resident_bytes: 2 * 1024 * 1024,
+            warm_spill_lines_total: 500,
+            warm_spill_bytes_total: 512 * 1024,
+        };
+        let disabled = PaneTieredScrollbackSummary {
+            tiering_enabled: false,
+            configured_scrollback_rows: 10_000,
+            configured_hot_lines: 0,
+            configured_warm_max_bytes: 0,
+            visible_rows: 24,
+            in_memory_scrollback_rows: 50,
+            warm_resident_lines: 0,
+            warm_resident_bytes: 0,
+            warm_spill_lines_total: 0,
+            warm_spill_bytes_total: 0,
+        };
+
+        // Mixed domains: local healthy, remote_off config_disabled, remote_old mux_unsupported
+        let panes = vec![
+            make_pane(1, "local"),
+            make_pane(2, "local"),
+            make_pane(3, "remote_off"),
+            make_pane(4, "remote_old"),
+        ];
+        let outcomes = vec![
+            (1, PaneTieredScrollbackBatchOutcome::Available(tiered)),
+            (2, PaneTieredScrollbackBatchOutcome::Available(tiered)),
+            (3, PaneTieredScrollbackBatchOutcome::Available(disabled)),
+            (4, PaneTieredScrollbackBatchOutcome::Unavailable),
+        ];
+        let mixed = summarize_mux_scrollback_by_domain(&panes, &outcomes, &HashSet::new());
+        assert_eq!(mixed.status, DiagnosticStatus::Warning);
+        let mixed_detail = mixed.detail.as_deref().unwrap();
+        assert!(mixed_detail.contains("3/4 panes reported (2 tiered)"), "{mixed_detail}");
+        assert!(mixed_detail.contains("remote_off: 0/1 (config_disabled)"), "{mixed_detail}");
+        assert!(mixed_detail.contains("remote_old: 0/1 (mux_unsupported)"), "{mixed_detail}");
+        assert!(!mixed_detail.contains("local: 2/2"), "healthy domain should not be listed as non-tiered: {mixed_detail}");
+
+        // All-RPC-failed multi-domain case
+        let failed_ids: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let all_failed = summarize_mux_scrollback_by_domain(&panes, &[], &failed_ids);
+        assert_eq!(all_failed.status, DiagnosticStatus::Warning);
+        let fail_detail = all_failed.detail.as_deref().unwrap();
+        assert!(fail_detail.contains("4 panes across 3 domain(s)"), "{fail_detail}");
+        assert!(fail_detail.contains("local: 0/2 (rpc_unsupported)"), "{fail_detail}");
     }
 
     #[test]
