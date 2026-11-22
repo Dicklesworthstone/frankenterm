@@ -2336,6 +2336,8 @@ pub struct RuntimeConfig {
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
     pub max_concurrent_captures: u32,
+    /// Operator ceiling for persisted segments, combined with the tuning cap.
+    pub max_segment_bytes: u32,
     /// Data retention period in days
     pub retention_days: u32,
     /// Validated, first-match-preserving event-retention policy compiled from
@@ -2376,6 +2378,7 @@ impl Default for RuntimeConfig {
             patterns_root: None,
             channel_buffer: 1024,
             max_concurrent_captures: 10,
+            max_segment_bytes: crate::config::IngestConfig::default().max_segment_bytes,
             retention_days: 30,
             retention_policy: StorageConfig::default()
                 .compile_retention_policy()
@@ -2397,6 +2400,7 @@ fn initial_hot_reloadable_config(config: &RuntimeConfig) -> HotReloadableConfig 
         poll_interval_ms: duration_ms_u64(config.capture_interval),
         min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
         max_concurrent_captures: config.max_concurrent_captures,
+        max_segment_bytes: config.max_segment_bytes,
         pane_priorities: config.pane_priorities.clone(),
         capture_budgets: config.capture_budgets.clone(),
         retention_days: config.retention_days,
@@ -2412,6 +2416,16 @@ fn initial_hot_reloadable_config(config: &RuntimeConfig) -> HotReloadableConfig 
         // `with_connector_inbound_bridge_config` before the runtime starts.
         data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
     }
+}
+
+/// Keep operator and tuning limits effective together. Zero must never reach
+/// the persistence helper, where it means unbounded, even for an unchecked
+/// programmatic runtime configuration.
+fn effective_persist_segment_bytes(operator_limit: u32, tuning_limit: usize) -> usize {
+    usize::try_from(operator_limit)
+        .unwrap_or(usize::MAX)
+        .max(1)
+        .min(tuning_limit.max(1))
 }
 
 fn capture_concurrency_usize(value: u32) -> usize {
@@ -9962,7 +9976,6 @@ impl ObservationRuntime {
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
-            let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
             let mut incarnation_state = PersistenceIncarnationState::new();
             // ft-ngbfu: the agent each pane's open agent_sessions row belongs
             // to, so storage is only consulted when a pane's agent changes.
@@ -10072,6 +10085,13 @@ impl ObservationRuntime {
                     }
                 };
                 let batch_started = Instant::now();
+                // Snapshot one bound for the whole batch so collection,
+                // detection, recorder delivery and SQLite agree. A reloaded
+                // operator ceiling takes effect on the next batch.
+                let max_persist_segment_bytes = effective_persist_segment_bytes(
+                    config_rx.borrow().max_segment_bytes,
+                    tuning.ingest.max_persist_segment_bytes,
+                );
                 let batch = collect_persistence_batch(
                     &loop_cx,
                     event,
@@ -26294,6 +26314,82 @@ mod tests {
             capture_concurrency_usize(config.max_concurrent_captures),
             usize::try_from(u32::MAX).expect("supported target usize width")
         );
+    }
+
+    #[test]
+    fn runtime_segment_limit_preserves_gap_and_reload_semantics() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            storage.upsert_pane(test_pane_record(1)).await.unwrap();
+            let runtime_config = RuntimeConfig {
+                max_segment_bytes: 1024,
+                ..RuntimeConfig::default()
+            };
+            let (config_tx, config_rx) =
+                watch::channel(initial_hot_reloadable_config(&runtime_config));
+            let mut captured = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                seq_correction: 0,
+                content: "🦀".repeat(384),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 1,
+            };
+
+            let first_limit =
+                effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 4096);
+            let first =
+                crate::ingest::persist_captured_segment(&storage, &captured, first_limit)
+                    .await
+                    .unwrap();
+            assert_eq!(first.segment.content, "🦀".repeat(256));
+            assert_eq!(first.segment.seq, 0);
+            assert!(first.gap.unwrap().reason.contains("max_bytes=1024"));
+
+            let mut reloaded = config_rx.borrow().clone();
+            reloaded.max_segment_bytes = 2048;
+            config_tx.send(reloaded).unwrap();
+            captured.seq = 1;
+            let second_limit =
+                effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 4096);
+            let second =
+                crate::ingest::persist_captured_segment(&storage, &captured, second_limit)
+                    .await
+                    .unwrap();
+            assert_eq!(second.segment.content, captured.content);
+            assert_eq!(second.segment.seq, 1);
+            assert!(second.gap.is_none());
+
+            // Raising the operator limit must not bypass a stricter tuning cap.
+            captured.seq = 2;
+            let third_limit =
+                effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 1024);
+            let third =
+                crate::ingest::persist_captured_segment(&storage, &captured, third_limit)
+                    .await
+                    .unwrap();
+            assert_eq!(third.segment.content, "🦀".repeat(256));
+            assert_eq!(third.segment.seq, 2);
+            assert!(third.gap.unwrap().reason.contains("max_bytes=1024"));
+
+            let stored = storage.get_segments(1, 10).await.unwrap();
+            assert_eq!(stored.len(), 3);
+            assert_eq!(
+                stored.iter().find(|segment| segment.seq == 1).unwrap().content,
+                captured.content
+            );
+            assert_eq!(storage.get_gaps().await.unwrap().len(), 2);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unchecked_zero_segment_limits_never_disable_the_bound() {
+        for (operator, tuning) in [(0, 4096), (4096, 0), (0, 0)] {
+            assert_eq!(effective_persist_segment_bytes(operator, tuning), 1);
+        }
+        assert_eq!(effective_persist_segment_bytes(u32::MAX, 4096), 4096);
     }
 
     #[test]

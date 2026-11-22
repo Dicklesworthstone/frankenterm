@@ -168,11 +168,11 @@
     },
     {
       "key": "ingest.max_segment_bytes",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "the persistence segment ceiling comes from tuning.ingest.max_persist_segment_bytes, not this field",
-      "tracking_bead": "ft-ta5as",
-      "validation": "Config::validate rejects non-default values fail-closed"
+      "status": "consumed",
+      "consumer": "crate::runtime::ObservationRuntime::spawn_persistence_task",
+      "evidence": "each persistence batch samples the operator limit from the hot-reload channel and applies the stricter tuning ceiling; runtime_segment_limit_preserves_gap_and_reload_semantics covers stored UTF-8 tails and explicit gaps",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate accepts limits >= 1024 bytes; updates take effect at the next persistence batch"
     }
   ]
 }

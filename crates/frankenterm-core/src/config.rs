@@ -979,11 +979,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "ingest.max_segment_bytes",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "the persistence segment ceiling comes from tuning.ingest.max_persist_segment_bytes, not this field",
-        tracking_bead: "ft-ta5as",
-        validation: "Config::validate rejects non-default values fail-closed",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::runtime::ObservationRuntime::spawn_persistence_task",
+        evidence: "each persistence batch samples the operator limit from the hot-reload channel and applies the stricter tuning ceiling; runtime_segment_limit_preserves_gap_and_reload_semantics covers stored UTF-8 tails and explicit gaps",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate accepts limits >= 1024 bytes; updates take effect at the next persistence batch",
     },
 ];
 
@@ -1265,7 +1265,11 @@ pub struct IngestConfig {
     /// percentage without overlap, record a gap
     pub gap_detection_threshold_percent: u32,
 
-    /// Maximum segment size in bytes before forced split
+    /// Maximum persisted segment size in bytes, at least 1024.
+    ///
+    /// The stricter of this bound and tuning.ingest.max_persist_segment_bytes
+    /// applies. Oversized captures retain the newest complete UTF-8 suffix and
+    /// record an explicit truncation gap.
     pub max_segment_bytes: u32,
 
     /// Pane filtering rules (include/exclude)
@@ -5092,6 +5096,8 @@ pub struct HotReloadableConfig {
     pub min_poll_interval_ms: u64,
     /// Maximum concurrent captures
     pub max_concurrent_captures: u32,
+    /// Operator ceiling for each persisted capture segment.
+    pub max_segment_bytes: u32,
     /// Pane priority overrides
     pub pane_priorities: PanePriorityConfig,
     /// Capture budgets
@@ -5148,6 +5154,7 @@ impl HotReloadableConfig {
             poll_interval_ms: config.ingest.poll_interval_ms,
             min_poll_interval_ms: config.ingest.min_poll_interval_ms,
             max_concurrent_captures: config.ingest.max_concurrent_captures,
+            max_segment_bytes: config.ingest.max_segment_bytes,
             pane_priorities: config.ingest.priorities.clone(),
             capture_budgets: config.ingest.budgets.clone(),
             retention_days: config.storage.retention_days,
@@ -5337,6 +5344,14 @@ impl Config {
                 name: "ingest.max_concurrent_captures".to_string(),
                 old_value: self.ingest.max_concurrent_captures.to_string(),
                 new_value: new_config.ingest.max_concurrent_captures.to_string(),
+            });
+        }
+
+        if self.ingest.max_segment_bytes != new_config.ingest.max_segment_bytes {
+            changes.push(HotReloadChange {
+                name: "ingest.max_segment_bytes".to_string(),
+                old_value: self.ingest.max_segment_bytes.to_string(),
+                new_value: new_config.ingest.max_segment_bytes.to_string(),
             });
         }
 
@@ -6163,10 +6178,9 @@ impl Config {
         // ingest.rs is UNCONDITIONAL — disabling it would be a fail-open replay-
         // fidelity regression, so it is intentionally not honorable),
         // gap_detection_threshold_percent (no overlap/percentage heuristic reads
-        // it), and max_segment_bytes (the persistence ceiling comes from
-        // tuning.ingest.max_persist_segment_bytes, not this field). Fail closed:
-        // reject a customized value so the operator gets a clear error instead of
-        // silently-ignored ingest tuning. Defaults are honored (no rejection).
+        // it). Fail closed: reject a customized value so the operator gets a
+        // clear error instead of silently-ignored ingest tuning. Segment size is
+        // consumed by the persistence task and validated independently below.
         let ingest_default = IngestConfig::default();
         let mut unhonored_ingest: Vec<&'static str> = Vec::new();
         if self.ingest.backpressure_threshold != ingest_default.backpressure_threshold {
@@ -6189,11 +6203,11 @@ impl Config {
                  consumes it)",
             );
         }
-        if self.ingest.max_segment_bytes != ingest_default.max_segment_bytes {
-            unhonored_ingest.push(
-                "ingest.max_segment_bytes (ignored — the persistence segment ceiling comes from \
-                 tuning.ingest.max_persist_segment_bytes)",
-            );
+        if self.ingest.max_segment_bytes < 1024 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "ingest.max_segment_bytes must be >= 1024".to_string(),
+            )
+            .into());
         }
         if !unhonored_ingest.is_empty() {
             return Err(crate::error::ConfigError::ValidationError(format!(
@@ -8181,13 +8195,37 @@ max_sender_id_len = 0
     }
 
     #[test]
-    fn validate_rejects_customized_ingest_max_segment_bytes() {
-        let mut config = Config::default();
-        config.ingest.max_segment_bytes = config.ingest.max_segment_bytes.wrapping_add(1);
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("ft-ta5as") && err.contains("max_segment_bytes"),
-            "{err}"
+    fn validate_accepts_bounded_ingest_segment_customization() {
+        for max_segment_bytes in [1024, 4096, 65536, u32::MAX] {
+            let mut config = Config::default();
+            config.ingest.max_segment_bytes = max_segment_bytes;
+            config.validate().expect("wired segment bound must be accepted");
+        }
+        for max_segment_bytes in [0, 1, 1023] {
+            let mut config = Config::default();
+            config.ingest.max_segment_bytes = max_segment_bytes;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("ingest.max_segment_bytes must be >= 1024"));
+        }
+    }
+
+    #[test]
+    fn hot_reload_carries_ingest_segment_limit() {
+        let current = Config::default();
+        let mut updated = current.clone();
+        updated.ingest.max_segment_bytes = 4096;
+        let diff = current.diff_for_hot_reload(&updated);
+        assert!(diff.allowed);
+        let change = diff
+            .changes
+            .iter()
+            .find(|change| change.name == "ingest.max_segment_bytes")
+            .expect("segment-only edits must reach the watcher");
+        assert_eq!(change.old_value, "65536");
+        assert_eq!(change.new_value, "4096");
+        assert_eq!(
+            updated.hot_reloadable().expect("hot config").max_segment_bytes,
+            4096
         );
     }
 
