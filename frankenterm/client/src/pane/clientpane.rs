@@ -21,7 +21,10 @@ use mux::pane::{
     PaneSelectionAnchor, PaneSelectionAnchorError, PaneSelectionAnchorSnapshot,
     PaneSelectionAnchorStatus, Pattern, SearchResult, WithPaneLines,
 };
-use mux::renderable::{same_line_layout_geometry, RenderableDimensions, StableCursorPosition};
+use mux::renderable::{
+    same_line_layout_geometry, PaneTieredScrollbackStatus, RenderableDimensions,
+    StableCursorPosition,
+};
 use mux::tab::TabId;
 use mux::{MuxSessionIncarnation, PaneRegistrationHandle, PaneRegistrationSlot};
 use parking_lot::{Condvar, MappedMutexGuard, Mutex, MutexGuard};
@@ -6269,6 +6272,10 @@ impl Pane for ClientPane {
 
     fn get_dimensions(&self) -> RenderableDimensions {
         self.renderable.lock().get_dimensions()
+    }
+
+    fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
+        self.renderable.lock().get_tiered_scrollback_status()
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
@@ -13133,6 +13140,137 @@ mod tests {
         .expect("render delta should apply");
 
         assert!(pane.is_alt_screen_active());
+    }
+
+    #[test]
+    fn render_delta_exposes_tiered_scrollback_status_via_pane_trait() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = Arc::new(
+            ClientPane::new(
+                &inner,
+                32,
+                23,
+                30,
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                "shell",
+                false,
+            )
+            .unwrap(),
+        );
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("tiered-status test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("tiered-status test pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
+
+        // Before any remote render delta arrives, status is None.
+        assert_eq!(pane_for_mux.get_tiered_scrollback_status(), None);
+
+        let expected = PaneTieredScrollbackStatus {
+            tiering_enabled: true,
+            configured_scrollback_rows: 100_000,
+            configured_hot_lines: 1_000,
+            configured_warm_max_bytes: 50 * 1024 * 1024,
+            visible_rows: 24,
+            in_memory_scrollback_rows: 1_500,
+            warm_resident_lines: 500,
+            warm_resident_bytes: 2 * 1024 * 1024,
+            warm_spill_lines_total: 500,
+            warm_spill_bytes_total: 2 * 1024 * 1024,
+            cold_spill_lines_total: 0,
+            cold_spill_bytes_total: 0,
+            cold_sink_retained_lines: 0,
+            cold_sink_retained_bytes: 0,
+            cold_worker_peak_backlog_depth: 0,
+            cold_worker_completion_throughput_lines_per_sec: 0,
+            cold_worker_completed_lines_total: 0,
+            cold_worker_completed_batches_total: 0,
+            cold_worker_cancellation_count: 0,
+        };
+
+        promise::spawn::block_on(async {
+            pane.process_unilateral(
+                &registration,
+                &rpc,
+                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                    pane_id: 30,
+                    mouse_grabbed: false,
+                    alt_screen_active: false,
+                    cursor_position: StableCursorPosition::default(),
+                    dimensions: RenderableDimensions {
+                        cols: 80,
+                        viewport_rows: 24,
+                        scrollback_rows: 1_500,
+                        physical_top: 1_476,
+                        scrollback_top: 0,
+                        dpi: 96,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        reverse_video: false,
+                    },
+                    tiered_scrollback_status: Some(expected),
+                    dirty_lines: Vec::new(),
+                    title: "shell".to_string(),
+                    working_dir: None,
+                    bonus_lines: SerializedLines::default(),
+                    input_serial: None,
+                    seqno: 1,
+                }),
+            )
+            .await
+        })
+        .expect("render delta with tiered status should apply");
+
+        // Regression proof for ft-mgy5t2.15: dyn Pane::get_tiered_scrollback_status
+        // must delegate to RenderableState instead of inheriting Pane's default None.
+        assert_eq!(pane_for_mux.get_tiered_scrollback_status(), Some(expected));
+
+        // Subsequent delta without tiered status clears stale telemetry.
+        promise::spawn::block_on(async {
+            pane.process_unilateral(
+                &registration,
+                &rpc,
+                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                    pane_id: 30,
+                    mouse_grabbed: false,
+                    alt_screen_active: false,
+                    cursor_position: StableCursorPosition::default(),
+                    dimensions: RenderableDimensions {
+                        cols: 80,
+                        viewport_rows: 24,
+                        scrollback_rows: 1_500,
+                        physical_top: 1_476,
+                        scrollback_top: 0,
+                        dpi: 96,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        reverse_video: false,
+                    },
+                    tiered_scrollback_status: None,
+                    dirty_lines: Vec::new(),
+                    title: "shell".to_string(),
+                    working_dir: None,
+                    bonus_lines: SerializedLines::default(),
+                    input_serial: None,
+                    seqno: 2,
+                }),
+            )
+            .await
+        })
+        .expect("render delta clearing tiered status should apply");
+
+        assert_eq!(pane_for_mux.get_tiered_scrollback_status(), None);
     }
 
     #[test]
