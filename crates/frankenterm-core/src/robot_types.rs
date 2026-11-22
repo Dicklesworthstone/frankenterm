@@ -467,7 +467,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
             "WezTerm output didn't match the expected schema — likely a version skew."
         }
         "robot.mux_version_skew" => {
-            "This ft and the running mux are from different releases (their codec windows do not overlap). Install matching generations of ft and FrankenTerm.app; `ft doctor --json` shows which socket was dialed. Retrying cannot help."
+            "This ft and the running mux are from different releases (their codec windows do not overlap). Install matching generations of ft and FrankenTerm.app (see docs/codec-atomic-redeploy.md); `ft doctor --json` shows which socket was dialed. Retrying cannot help."
         }
         "robot.wezterm_output_too_large" => {
             "Inspect backend health and reduce the metadata scope or pane count; retrying the same oversized response cannot succeed."

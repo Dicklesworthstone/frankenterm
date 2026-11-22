@@ -1054,7 +1054,8 @@ impl WeztermError {
             )
             .alternative(
                 "To keep the running app, install the ft that shipped with it (same release tag) instead of upgrading the CLI alone.",
-            ),
+            )
+            .learn_more("docs/codec-atomic-redeploy.md"),
             Self::CommandFailed(_) => {
                 Remediation::new(
                     "Backend bridge CLI command failed. Check WezTerm/backend logs and retry.",

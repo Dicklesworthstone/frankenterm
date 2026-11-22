@@ -343,6 +343,36 @@ pathname replacement is an authorized substitute.
 - `CODEC_VERSION_MIN_SUPPORTED` advances only with a deliberately breaking
   release and its maintenance-window evidence.
 
+### 4a. Codec 74 -> Codec 75 transition (`cf446c2a2` / `ft-mgy5t2.3`)
+
+Commit `cf446c2a2` (2026-11-14) raised both `CODEC_VERSION` and
+`CODEC_VERSION_MIN_SUPPORTED` to `75` so live `Cell` frames carry exact UTF-8
+text plus sender-authoritative cell width (`0`, `1`, or `2`) instead of
+recomputing Unicode widths on the receiver.
+
+- **Disjoint window by design:** a codec-75 `ft` CLI or desktop GUI refuses a
+  codec-74 (or older) mux server during handshake with typed error
+  `robot.mux_version_skew` (`FT-1025`), reporting both peer codec versions and
+  the discovered socket. Retrying cannot clear a breaking floor skew.
+- **Pre-allocation refusal of legacy cell frames:** the explicit legacy 46/47
+  metadata/input path rejects cell-bearing frames (PDUs 23/25/79/84/103) before
+  body decoding/allocation; legacy rendering requires upgrading both peers.
+- **Atomic upgrade order (when upgrading a fleet to codec 75):**
+  1. Confirm the DSR release archive carries matching codec-75 `ft`,
+     `frankenterm-mux-server`, and `FrankenTerm.app` from one commit/build ID
+     (`ft --version --json` reports `codec_version: 75`, `codec_min_supported: 75`).
+  2. Stage remote SSH mux domains first with `ft setup remote --install-ft`
+     (which publishes an immutable generation without disrupting live PTYs).
+  3. Upgrade local and remote mux servers during the scheduled maintenance
+     window (or via guardian-backed activation once qualified), then upgrade
+     `FrankenTerm.app` and mobile clients (`v7gxu` iOS companion).
+  4. Verify `ft doctor --json` and `ft robot state` across every domain report
+     zero `robot.mux_version_skew` (`FT-1025`) diagnostics before closing the
+     maintenance window.
+  5. **Rollback check:** if any remote domain cannot move to codec 75 yet, keep
+     the matching pre-75 client generation active (never mix a codec-75 desktop
+     client against codec-70/74 remote mux servers expecting live rendering).
+
 ## 5. Cross-references
 
 - [`docs/codec-versions.md`](codec-versions.md) — the version-history

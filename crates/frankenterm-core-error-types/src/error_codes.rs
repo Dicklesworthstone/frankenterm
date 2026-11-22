@@ -362,10 +362,11 @@ pub static FT_1025: ErrorCodeDef = ErrorCodeDef {
         RecoveryStep::with_command("Show which socket ft found", "ft doctor --json"),
         RecoveryStep::with_command("Show ft's generation", "ft --version"),
         RecoveryStep::text(
-            "Install the same release of ft and FrankenTerm.app, or point ft at a matching mux",
+            "Follow docs/codec-atomic-redeploy.md to install matching generations of ft, \
+             FrankenTerm.app, and remote mux servers, or point ft at a matching mux",
         ),
     ],
-    doc_link: None,
+    doc_link: Some("docs/codec-atomic-redeploy.md"),
 };
 
 /// FT-1030: WezTerm circuit breaker is open
@@ -2129,6 +2130,18 @@ mod tests {
                 "{code} must prohibit an unconditional retry"
             );
         }
+    }
+
+    #[test]
+    fn ft_1025_links_to_codec_atomic_redeploy_runbook() {
+        let def = get_error_code("FT-1025").expect("version-skew code");
+        assert_eq!(def.category, ErrorCategory::Wezterm);
+        assert_eq!(def.doc_link, Some("docs/codec-atomic-redeploy.md"));
+        assert!(
+            def.recovery_steps
+                .iter()
+                .any(|step| step.description.contains("docs/codec-atomic-redeploy.md"))
+        );
     }
 
     #[test]

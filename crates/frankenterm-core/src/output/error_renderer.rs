@@ -1161,6 +1161,29 @@ mod tests {
     }
 
     #[test]
+    fn codec_75_vs_74_version_skew_surfaces_ft_1025_and_redeploy_runbook() {
+        let error = Error::Wezterm(WeztermError::VersionSkew {
+            local_codec: 75,
+            local_min: 75,
+            remote_codec: 74,
+            remote_min: 61,
+            remote_version: "frankenterm 0.15.21".to_string(),
+        });
+        assert_eq!(ErrorRenderer::error_code(&error), "FT-1025");
+
+        let output = ErrorRenderer::new(OutputFormat::Json).render(&error);
+        let parsed: Value = serde_json::from_str(&output).expect("version skew JSON output");
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["code"], "FT-1025");
+        assert!(output.contains("codec 75"), "{output}");
+        assert!(output.contains("codec 74"), "{output}");
+        assert!(
+            output.contains("docs/codec-atomic-redeploy.md"),
+            "version skew output must point to atomic redeploy runbook: {output}"
+        );
+    }
+
+    #[test]
     fn typed_pane_not_found_renderer_matches_golden() {
         let error = Error::PaneOperation {
             pane_id: 42,
