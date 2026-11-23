@@ -26261,8 +26261,10 @@ mod tests {
         assert_eq!(run["data"]["final_state"], "committed");
         assert_eq!(read_value(), serde_json::json!({ "phase": "committed" }));
 
-        // A fresh tool must replay durable evidence, not execute StoreData
-        // again and overwrite a value observed after the original commit.
+        // A fresh tool must not execute StoreData again and overwrite a value
+        // observed after the original commit. Execution accepts only planned
+        // or recoverable prepared/committing contracts, so it refuses this
+        // committed one before any step dispatches.
         let later_value = serde_json::json!({ "phase": "later_observation" });
         std::fs::write(&value_path, serde_json::to_vec(&later_value).unwrap()).unwrap();
         let replay = parse_json_content(
@@ -26270,12 +26272,23 @@ mod tests {
                 .call(&test_mcp_context(), arguments.clone())
                 .unwrap(),
         );
-        assert_eq!(replay["ok"], true, "{replay}");
-        assert_eq!(replay["data"]["final_state"], "committed");
+        assert_eq!(replay["ok"], false, "{replay}");
+        assert!(
+            replay["error"].as_str().unwrap_or_default().contains(
+                "requires planned or recoverable prepared/committing state; got committed"
+            ),
+            "{replay}"
+        );
         assert_eq!(
             read_value(),
             later_value,
-            "replay must not repeat the write"
+            "a rerun must not repeat the write"
+        );
+        assert_eq!(
+            mcp_load_mission_tx_contract_from_path(&contract_path)
+                .unwrap()
+                .lifecycle_state,
+            MissionTxState::Committed
         );
 
         let rollback = parse_json_content(
