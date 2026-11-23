@@ -194,10 +194,15 @@ def versions_from_reports(header: str, program: str, dynamic: str, versions: str
     if not re.search(r"^\s*LOAD\s", program, re.M):
         raise Refusal("ELF has no loadable segment")
 
-    if dynamic.strip() == "There is no dynamic section in this file.":
+    # GNU readelf reports a missing dynamic section and missing version data in
+    # words; llvm-readelf prints nothing for either. Both are credible only for
+    # a binary with no PT_DYNAMIC segment, the table the loader actually reads.
+    if dynamic.strip() in ("", "There is no dynamic section in this file."):
+        if re.search(r"^\s*DYNAMIC\s", program, re.M):
+            raise Refusal("dynamic segment exists but no dynamic section was reported")
         if re.search(r"^\s*INTERP\s", program, re.M) or "[Requesting program interpreter:" in program:
             raise Refusal("ELF interpreter exists without a dynamic section")
-        if versions.strip() != "No version information found in this file.":
+        if versions.strip() not in ("", "No version information found in this file."):
             raise Refusal("static ELF has unexpected version metadata")
         return []
 

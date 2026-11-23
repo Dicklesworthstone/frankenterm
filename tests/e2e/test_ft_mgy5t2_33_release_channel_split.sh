@@ -501,6 +501,30 @@ shutil.copyfile(source, target)
         if reason is not None:
             assert reason in verdict["inspection_errors"][0]["reason"], (case_id, verdict)
 
+    # Each installed inspector must validate both fixtures on its own. GNU
+    # readelf names a missing dynamic section; llvm-readelf prints nothing.
+    # A readelf that cannot start routes the gate to the llvm-readelf slot.
+    verneed_elf = td_path / "verneed.elf"
+    make_elf(verneed_elf, "GLIBC_2.35")
+    (inspector_bin / "readelf").write_text("#!/nonexistent/ft-abi-test-shell\n")
+    for tool in ("readelf", "llvm-readelf"):
+        real = shutil.which(tool)
+        if real is None:
+            continue
+        (inspector_bin / "llvm-readelf").write_text(f'#!/bin/sh\nexec {shlex.quote(real)} "$@"\n')
+        (inspector_bin / "llvm-readelf").chmod(0o755)
+        suffix = tool.replace("-", "_")
+        abi_case("pos_abi_static_elf_via_" + suffix, [str(static_elf)], 0, env=inspector_env)
+        abi_case("pos_abi_dynamic_elf_via_" + suffix, [str(verneed_elf)], 0, env=inspector_env,
+                 observed="GLIBC_2.35")
+    # Empty dynamic output is only credible without a PT_DYNAMIC segment.
+    (inspector_bin / "llvm-readelf").write_text(
+        f'#!/bin/sh\ncase " $* " in *" --dynamic "*) exit 0;; esac\nexec {real_readelf} "$@"\n'
+    )
+    verdict = abi_case("neg_abi_dynamic_segment_without_reported_section", [str(verneed_elf)], 2,
+                       env=inspector_env)
+    assert "dynamic segment exists" in verdict["inspection_errors"][0]["reason"], verdict
+
     # 7. Positive/Negative: install.sh release_tag_with_assets skips -appstore.* companion tags & selects newest stable
     releases_fixture = [
         {
