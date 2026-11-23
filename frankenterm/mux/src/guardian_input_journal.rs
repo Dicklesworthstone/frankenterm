@@ -1911,8 +1911,7 @@ fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(fixed)
 }
 
-// Unix only: every test in it already is, so off Unix its fixtures were dead.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1920,18 +1919,24 @@ mod tests {
         Uuid::from_bytes([0x41; 16])
     }
 
+    // The journal fixtures below serve only the Unix-gated tests; three
+    // protocol tests in this module also run elsewhere.
+    #[cfg(unix)]
     fn guardian() -> Uuid {
         Uuid::from_bytes([0x31; 16])
     }
 
+    #[cfg(unix)]
     fn cipher() -> GuardianOutputCipher {
         GuardianOutputCipher::try_from_key_slice(&[0x73; 32]).expect("valid fixture key")
     }
 
+    #[cfg(unix)]
     fn identity(sequence: u64, effect_byte: u8, payload_byte: u8) -> GuardianInputEffectIdentity {
         identity_with_input_bytes(sequence, effect_byte, payload_byte, 4)
     }
 
+    #[cfg(unix)]
     fn identity_with_input_bytes(
         sequence: u64,
         effect_byte: u8,
@@ -1950,6 +1955,7 @@ mod tests {
         .expect("valid fixture identity")
     }
 
+    #[cfg(unix)]
     fn assert_reconciled(
         append: GuardianInputJournalAppend,
         expected_receipt: GuardianInputJournalReceipt,

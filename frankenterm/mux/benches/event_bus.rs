@@ -245,6 +245,11 @@ impl Child for BenchChild {
     fn process_id(&self) -> Option<u32> {
         None
     }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
 }
 
 struct BenchMasterPty;

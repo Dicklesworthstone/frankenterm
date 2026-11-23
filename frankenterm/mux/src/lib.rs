@@ -63,10 +63,11 @@ use crate::client::{
 use crate::guardian_checkpoint::{
     capture_and_bind_live_parser_checkpoint, LiveParserCheckpointAck,
 };
-#[cfg(test)]
+// These feed only GuardianOutputReplayPreparation, which is Unix-only.
+#[cfg(all(test, unix))]
 use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
 use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
     GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,

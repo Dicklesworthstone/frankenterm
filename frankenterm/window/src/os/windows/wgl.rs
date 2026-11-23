@@ -1,4 +1,5 @@
 use super::*;
+use std::convert::TryFrom;
 use std::ffi::CStr;
 use std::io::Error as IoError;
 use std::os::raw::c_void;
