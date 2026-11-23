@@ -85,10 +85,10 @@ final class TerminalNavigationCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.navigation.selection?.machineID, "B")
     }
 
-    func testInventoryChangeAbandonsLateFocusInsteadOfRetargeting() async throws {
+    func testInventoryChangeAbandonsRelativeLateFocusInsteadOfRetargeting() async throws {
         let (coordinator, owner) = try setup(); coordinator.resume()
         try await coordinator.activateSelection(); owner.block = true
-        let plan = try XCTUnwrap(coordinator.navigation.plan(machineID: "B"))
+        let plan = try XCTUnwrap(coordinator.navigation.plan(axis: .machine, direction: .next))
         let job = Task { try await coordinator.perform(plan) }
         await owner.waitForPreparation()
         let old = coordinator.navigation.machines
@@ -102,6 +102,50 @@ final class TerminalNavigationCoordinatorTests: XCTestCase {
         XCTAssertEqual(owner.abandoned.count, 1)
         XCTAssertEqual(owner.abandoned.first?.destination.machineID, "B")
         XCTAssertEqual(coordinator.phase, .inactive)
+    }
+
+    func testExactHandoffPublishesItsOriginalPaneDespiteUnrelatedInventoryChanges() async throws {
+        let (coordinator, owner) = try setup(); coordinator.resume()
+        try await coordinator.activateSelection(); owner.block = true
+        let old = coordinator.navigation.machines
+        let plan = try XCTUnwrap(coordinator.navigation.plan(paneID: old[1].panes[0].id))
+        let job = Task { try await coordinator.perform(plan) }
+        await owner.waitForPreparation()
+        let renamed = try TerminalNavigationPane(id: old[1].panes[0].id, title: "new title")
+        let added = try TerminalNavigationPane(id: .init(id: UUID(), incarnation: UUID()), title: "new tab")
+        try coordinator.replaceInventory([
+            old[0], TerminalNavigationMachine(id: "B", name: "renamed host", panes: [added, renamed]), old[2]
+        ])
+        try coordinator.replaceInventory([
+            TerminalNavigationMachine(id: "B", name: "renamed host", panes: [renamed, added]), old[0]
+        ])
+        XCTAssertEqual(coordinator.phase, .switching)
+        XCTAssertEqual(owner.seals, 0, "unrelated changes must not cancel the keyboard handoff")
+        XCTAssertEqual(owner.published.count, 1, "inventory is not permission to publish early")
+        owner.release(); try await job.value
+        XCTAssertEqual(coordinator.phase, .ready)
+        XCTAssertEqual(coordinator.navigation.selection, plan.destination)
+        XCTAssertEqual(owner.currentSelection, plan.destination)
+        XCTAssertEqual(owner.published.count, 2)
+        XCTAssertTrue(owner.abandoned.isEmpty)
+    }
+
+    func testTargetRemovalSealsExactHandoffAndReappearanceCannotReviveIt() async throws {
+        let (coordinator, owner) = try setup(); coordinator.resume()
+        try await coordinator.activateSelection(); owner.block = true
+        let old = coordinator.navigation.machines
+        let plan = try XCTUnwrap(coordinator.navigation.plan(machineID: "B"))
+        let job = Task { try await coordinator.perform(plan) }
+        await owner.waitForPreparation()
+        try coordinator.replaceInventory([old[0], old[2]])
+        XCTAssertGreaterThan(owner.seals, 0)
+        try coordinator.replaceInventory(old)
+        owner.release()
+        do { try await job.value; XCTFail("a removed target's handoff revived") } catch { }
+        await coordinator.joinSuspension()
+        XCTAssertEqual(coordinator.navigation.selection?.machineID, "A")
+        XCTAssertEqual(owner.published.count, 1)
+        XCTAssertEqual(owner.abandoned.first?.destination, plan.destination)
     }
 
     func testSuspendResumeCannotReviveDelayedPreparation() async throws {

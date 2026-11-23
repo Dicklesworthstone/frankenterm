@@ -271,7 +271,7 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(try catalog.validatePane(choice, sessionID: session, routing: routing))
     }
 
-    func testSelectionRoundTripOrReorderingCannotReviveAChoice() throws {
+    func testSelectionRoundTripExpiresAChoiceButUnrelatedReorderingDoesNot() throws {
         let (value, routing, session) = try machine()
         let catalog = try TerminalFleetOverview(machines: [value]), choice = try paneChoice(catalog, 20)
         try routing.select(pane: 30); try routing.select(pane: 10)
@@ -279,7 +279,8 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         let reordered = try machine()
         let other = try TerminalFleetOverview(machines: [reordered.0]), second = try paneChoice(other, 20)
         try reordered.1.replaceInventory([30, 20, 10])
-        XCTAssertThrowsError(try other.validatePane(second, sessionID: reordered.2, routing: reordered.1))
+        XCTAssertNoThrow(try other.validatePane(second, sessionID: reordered.2, routing: reordered.1),
+                         "an overview choice names an exact pane, not a neighbor")
     }
 
     func testUnchangedInventoryAndReadinessDoNotInvalidateChoice() throws {

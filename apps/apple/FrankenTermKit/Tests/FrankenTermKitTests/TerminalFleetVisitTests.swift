@@ -48,14 +48,19 @@ final class TerminalFleetVisitTests: XCTestCase, @unchecked Sendable {
         XCTAssertNoThrow(try fresh.validate(sessionID: session, routing: routing))
     }
 
-    func testSourceVisitABAAndReorderedInventoryRetireAnEarlierShortcut() throws {
+    func testSourceVisitABAExpiresButReorderingPreservesAnExactVisit() throws {
         for reorder in [false, true] {
             let routing = try routing(), session = UUID()
             let target = try TerminalFleetVisit(machineID: "alpha", sessionID: session,
                                                 pane: routing.navigation(pane: 9))
-            if reorder { try routing.replaceInventory([4, 2, 9]) }
-            else { _ = try routing.select(pane: 2); _ = try routing.select(pane: 4) }
-            XCTAssertThrowsError(try target.validate(sessionID: session, routing: routing))
+            if reorder {
+                try routing.replaceInventory([4, 2, 9])
+                XCTAssertNoThrow(try target.validate(sessionID: session, routing: routing),
+                                 "the visit keeps the chosen pane rather than resolving a new neighbor")
+            } else {
+                _ = try routing.select(pane: 2); _ = try routing.select(pane: 4)
+                XCTAssertThrowsError(try target.validate(sessionID: session, routing: routing))
+            }
         }
     }
 

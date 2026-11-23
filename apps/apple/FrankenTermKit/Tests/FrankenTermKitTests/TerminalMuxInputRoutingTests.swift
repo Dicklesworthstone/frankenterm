@@ -58,6 +58,59 @@ final class TerminalMuxInputRoutingTests: XCTestCase {
         XCTAssertThrowsError(try routing.validateDelivery(first))
     }
 
+    func testExactPickerSurvivesUnrelatedChurnWhileRelativeChoiceExpires() throws {
+        let routing = TerminalMuxInputRouting()
+        try routing.replaceInventory([10, 20, 30])
+        let source = try routing.select(pane: 10)
+        routing.didApplyOutput(source)
+        let picker = try routing.navigation(pane: 20)
+        let next = try XCTUnwrap(routing.navigation(forward: true))
+        try routing.replaceInventory([30, 10, 40, 20])
+        XCTAssertNoThrow(try routing.validateNavigation(picker))
+        XCTAssertThrowsError(try routing.validateNavigation(next))
+        routing.remove(pane: 30)
+        try routing.replaceInventory([10, 20])
+        XCTAssertNoThrow(try routing.validateNavigation(picker))
+        XCTAssertThrowsError(try routing.validateNavigation(next), "old order cannot revive a relative choice")
+        XCTAssertEqual(routing.current.destination, source)
+        XCTAssertTrue(routing.current.ready, "a picker is not an early change of input destination")
+    }
+
+    func testExactPickerStillRejectsTargetReuseSourceRoundTripAndReplacementRoute() throws {
+        let routing = TerminalMuxInputRouting(), replacementRoute = TerminalMuxInputRouting()
+        try routing.replaceInventory([10, 20, 30])
+        try replacementRoute.replaceInventory([10, 20, 30])
+        try routing.select(pane: 10); try replacementRoute.select(pane: 10)
+        let removed = try routing.navigation(pane: 20)
+        routing.remove(pane: 20)
+        try routing.replaceInventory([10, 20, 30])
+        XCTAssertThrowsError(try routing.validateNavigation(removed))
+        let beforeVisit = try routing.navigation(pane: 20)
+        try routing.select(pane: 30); try routing.select(pane: 10)
+        XCTAssertThrowsError(try routing.validateNavigation(beforeVisit))
+        let current = try routing.navigation(pane: 20)
+        XCTAssertThrowsError(try replacementRoute.validateNavigation(current))
+        routing.retire()
+        XCTAssertThrowsError(try routing.validateNavigation(current))
+    }
+
+    func testEmptySourceChoiceCannotSurviveAVisitThatEndsAtEmptyAgain() throws {
+        for removeDirectly in [false, true] {
+            let routing = TerminalMuxInputRouting()
+            try routing.replaceInventory([10, 20])
+            let plan = try routing.navigation(pane: 20)
+            _ = try routing.select(pane: 10)
+            if removeDirectly {
+                routing.remove(pane: 10)
+            } else {
+                try routing.replaceInventory([20])
+            }
+            XCTAssertNil(routing.current.destination)
+            XCTAssertThrowsError(try routing.validateNavigation(plan),
+                                 "returning to no source cannot revive a choice from before another visit")
+        }
+    }
+
     func testForeignConnectionAndRetiredConnectionNeverAdmitDelivery() throws {
         let first = TerminalMuxInputRouting(), second = TerminalMuxInputRouting()
         try first.replaceInventory([1]); try second.replaceInventory([1])

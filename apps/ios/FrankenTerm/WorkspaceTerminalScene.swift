@@ -1124,7 +1124,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     }
                     guard let adjacent = try self.navigation.navigation.plan(axis: .machine,
                                                                          direction: forward ? .next : .previous),
-                          let plan = try self.machinePlan(adjacent.destination.machineID) else { return }
+                          let plan = try self.machinePlan(adjacent.destination.machineID, requiringStableInventory: true) else { return }
                     try await self.navigation.perform(plan)
                 }
             } catch { report(error) }
@@ -1141,20 +1141,20 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               !session.paneNavigationBusy, !session.clipboardIsPresenting else { return }
         do {
             if let control = session.muxControl, session.phase == .live {
-                if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
+                if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan) }
             } else if let action = captureCanvasAction(.pane, forward ? .next : .previous) {
                 Task { do { try await action() } catch { report(error) } }
             }
         } catch { report(error) }
     }
 
-    private func machinePlan(_ machineID: String) throws -> TerminalNavigationPlan? {
+    private func machinePlan(_ machineID: String, requiringStableInventory: Bool = false) throws -> TerminalNavigationPlan? {
         if let controller = displayedSession(machineID),
            let paneID = selection(for: controller).paneID,
            navigation.navigation.machines.first(where: { $0.id == machineID })?.panes.contains(where: { $0.id == paneID }) == true {
-            return try navigation.navigation.plan(paneID: paneID)
+            return try navigation.navigation.plan(paneID: paneID, requiringStableInventory: requiringStableInventory)
         }
-        return try navigation.navigation.plan(machineID: machineID)
+        return try navigation.navigation.plan(machineID: machineID, requiringStableInventory: requiringStableInventory)
     }
 
     private func localPanePlan(_ direction: TerminalNavigationDirection) throws -> TerminalNavigationPlan? {
@@ -1163,7 +1163,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard controllers.count > 1, let index = controllers.firstIndex(where: { $0 === selectedSession }) else { return nil }
         let next = (index + (direction == .next ? 1 : controllers.count - 1)) % controllers.count
         guard let paneID = selection(for: controllers[next]).paneID else { return nil }
-        return try navigation.navigation.plan(paneID: paneID)
+        return try navigation.navigation.plan(paneID: paneID, requiringStableInventory: true)
     }
 
     /// A machine or pane other than the one on screen has output the phone
@@ -1357,7 +1357,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         switch axis {
         case .machine:
             guard let adjacent = try? navigation.navigation.plan(axis: .machine, direction: direction),
-                  let plan = try? machinePlan(adjacent.destination.machineID) else { return nil }
+                  let plan = try? machinePlan(adjacent.destination.machineID, requiringStableInventory: true) else { return nil }
             return { [weak self] in
                 guard let self, stillCurrent() else { throw TerminalNavigationError.stale }
                 try await self.navigation.perform(plan)

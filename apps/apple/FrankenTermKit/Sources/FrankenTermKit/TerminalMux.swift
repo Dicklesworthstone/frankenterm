@@ -708,8 +708,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
     /// Whether a pane chosen after the latest New Tab request keeps that
     /// request's tab in the background: the transport took the choice, or it
     /// is still in its handoff and can still be taken. A choice that can no
-    /// longer land, such as one the listing of the new tab made stale, does
-    /// not, so the new tab is shown rather than neither.
+    /// longer land, such as a removed target or a relative move whose ring
+    /// changed, does not, so the new tab is shown rather than neither. An exact
+    /// pane choice remains valid when that new tab is merely added to the list.
     public var paneChosenSinceShellCreation: Bool {
         lock.withLock {
             switch paneChoice {

@@ -90,7 +90,10 @@ public struct TerminalNavigationViewWitness: Equatable, Sendable {
 /// succeeds. A visual preview grants no input, resize, or connection authority.
 public struct TerminalNavigationPlan: Equatable, Sendable {
     fileprivate let owner: UUID
-    fileprivate let topology: UInt64
+    /// Relative movement depends on the captured ring. An explicit destination
+    /// instead survives unrelated inventory updates while its registration does.
+    fileprivate let topology: UInt64?
+    fileprivate let registration: UUID
     fileprivate let focus: UInt64
     public let source: TerminalNavigationSelection?
     public let destination: TerminalNavigationSelection
@@ -102,11 +105,19 @@ public struct TerminalNavigationPlan: Equatable, Sendable {
 
 /// One model per scene and active workspace/group. It has no transport, parser,
 /// input queue, or implicit connection action. Inventory changes invalidate old
-/// previews; they never redirect an ongoing gesture to a new neighboring pane.
+/// relative previews; they never redirect an ongoing gesture to a new neighbor.
+/// Exact picker choices retain their original destination across unrelated edits.
 public struct TerminalNavigation: Sendable {
+    private struct Registration: Sendable {
+        let id: UUID
+        let panes: [TerminalNavigationPaneID: UUID]
+    }
     private let owner = UUID()
     private var topology: UInt64 = 1, focus: UInt64 = 1
     fileprivate var inventory: [TerminalNavigationMachine]
+    /// Retire observed removals even if an identical identifier returns before
+    /// an asynchronous handoff finishes. The map stays bounded by the inventory.
+    private var registrations: [String: Registration] = [:]
     public private(set) var group: TerminalNavigationGroup?
     /// The active ring only. The full inventory remains owned independently so
     /// changing groups does not forget another machine's pane or viewport.
@@ -120,6 +131,7 @@ public struct TerminalNavigation: Sendable {
         try Self.validate(machines)
         try Self.validate(group, in: machines)
         inventory = machines; self.group = group
+        registrations = Self.registrations(for: machines, retaining: [:])
         let ring = self.machines
         if let initialMachineID {
             guard let machine = ring.first(where: { $0.id == initialMachineID }) else {
@@ -155,6 +167,21 @@ public struct TerminalNavigation: Sendable {
         let known = Dictionary(uniqueKeysWithValues: inventory.map { ($0.id, $0) })
         return group.machineIDs.compactMap { known[$0] }
     }
+    private static func registrations(for machines: [TerminalNavigationMachine],
+                                      retaining previous: [String: Registration]) -> [String: Registration] {
+        Dictionary(uniqueKeysWithValues: machines.map { machine in
+            let old = previous[machine.id]
+            return (machine.id, Registration(id: old?.id ?? UUID(), panes:
+                Dictionary(uniqueKeysWithValues: machine.panes.map { pane in
+                    (pane.id, old?.panes[pane.id] ?? UUID())
+                })))
+        })
+    }
+    private func registration(for selection: TerminalNavigationSelection) -> UUID? {
+        guard let machine = registrations[selection.machineID] else { return nil }
+        if let pane = selection.paneID { return machine.panes[pane] }
+        return machine.id
+    }
 
     /// Returns true when the old selected source disappeared. The caller must
     /// seal that source's input immediately. No replacement source is selected:
@@ -176,6 +203,7 @@ public struct TerminalNavigation: Sendable {
         }
         remembered = remembered.filter { machine, pane in map[machine]?.panes.contains(where: { $0.id == pane }) == true }
         viewports = viewports.filter { panes.contains($0.key) }
+        registrations = Self.registrations(for: incoming, retaining: registrations)
         inventory = incoming; topology += 1
         if old != selection { focus += 1 }
         return old != selection
@@ -195,9 +223,10 @@ public struct TerminalNavigation: Sendable {
         return .init(machineID: machine.id, paneID: pane)
     }
     private func plan(_ destination: TerminalNavigationSelection, axis: TerminalNavigationAxis,
-                      wraps: Bool = false) -> TerminalNavigationPlan? {
-        guard destination != selection else { return nil }
-        return .init(owner: owner, topology: topology, focus: focus, source: selection,
+                      wraps: Bool = false, requiringStableInventory: Bool = true) -> TerminalNavigationPlan? {
+        guard destination != selection, let registration = registration(for: destination) else { return nil }
+        return .init(owner: owner, topology: requiringStableInventory ? topology : nil,
+                     registration: registration, focus: focus, source: selection,
                      destination: destination, axis: axis, wraps: wraps, group: group)
     }
 
@@ -215,25 +244,27 @@ public struct TerminalNavigation: Sendable {
         if let selection, selection.machineID == machineID { target = selection }
         else { target = destination(machine) }
         guard self.group != group || target != selection else { return nil }
-        return .init(owner: owner, topology: topology, focus: focus, source: selection,
+        guard let registration = registration(for: target) else { throw TerminalNavigationError.unavailable }
+        return .init(owner: owner, topology: topology, registration: registration, focus: focus, source: selection,
                      destination: target, axis: .machine, wraps: false, group: group)
     }
-    public func plan(machineID: String) throws -> TerminalNavigationPlan? {
+    public func plan(machineID: String, requiringStableInventory: Bool = false) throws -> TerminalNavigationPlan? {
         guard let machine = machines.first(where: { $0.id == machineID }) else { throw TerminalNavigationError.unavailable }
-        return plan(destination(machine), axis: .machine)
+        return plan(destination(machine), axis: .machine, requiringStableInventory: requiringStableInventory)
     }
-    public func plan(paneID: TerminalNavigationPaneID) throws -> TerminalNavigationPlan? {
+    public func plan(paneID: TerminalNavigationPaneID, requiringStableInventory: Bool = false) throws -> TerminalNavigationPlan? {
         guard let machine = machines.first(where: { $0.panes.contains(where: { $0.id == paneID }) }) else {
             throw TerminalNavigationError.unavailable
         }
         return plan(.init(machineID: machine.id, paneID: paneID),
-                    axis: selection?.machineID == machine.id ? .pane : .machine)
+                    axis: selection?.machineID == machine.id ? .pane : .machine,
+                    requiringStableInventory: requiringStableInventory)
     }
     /// Explicitly activate a selected view after suspension or a failed handoff.
     /// This still requires a new source-bound focus barrier; it never reconnects.
     public func activationPlan() -> TerminalNavigationPlan? {
-        guard let selection else { return nil }
-        return .init(owner: owner, topology: topology, focus: focus, source: selection,
+        guard let selection, let registration = registration(for: selection) else { return nil }
+        return .init(owner: owner, topology: nil, registration: registration, focus: focus, source: selection,
                      destination: selection, axis: .pane, wraps: false, group: group)
     }
     public func plan(axis: TerminalNavigationAxis, direction: TerminalNavigationDirection,
@@ -265,7 +296,8 @@ public struct TerminalNavigation: Sendable {
     }
 
     public func validate(_ plan: TerminalNavigationPlan) throws {
-        guard plan.owner == owner, plan.topology == topology, plan.focus == focus,
+        guard plan.owner == owner, plan.topology == nil || plan.topology == topology,
+              plan.registration == registration(for: plan.destination), plan.focus == focus,
               plan.source == selection,
               let machine = machines(in: plan.group).first(where: { $0.id == plan.destination.machineID }),
               plan.destination.paneID == nil || machine.panes.contains(where: { $0.id == plan.destination.paneID }) else {
@@ -418,7 +450,7 @@ public final class TerminalNavigationCoordinator {
     public var onChange: (@MainActor () -> Void)?
     private let focusOwner: any TerminalNavigationFocusOwner
     private var foreground = false
-    private var operation: (id: UUID, task: Task<Void, Error>)?
+    private var operation: (id: UUID, plan: TerminalNavigationPlan, task: Task<Void, Error>)?
     private var cleanup: (id: UUID, task: Task<Void, Never>)?
     private var observers: [UUID: @MainActor () -> Void] = [:]
 
@@ -468,11 +500,12 @@ public final class TerminalNavigationCoordinator {
         // Validate atomically before changing any live input or pending task.
         var replacement = navigation
         let disappeared = try replacement.replaceInventory(machines)
-        // An in-flight group change can target a machine outside the old ring.
-        // Invalidation must compare the complete inventories, not just that ring.
-        let topologyChanged = replacement.inventory != navigation.inventory
+        // Recheck the actual pending choice against the complete inventory.
+        // A picker survives unrelated edits; relative/group plans still carry
+        // their ring witness. Removed sources or destinations always seal input.
+        let invalidated = operation.map { (try? replacement.validate($0.plan)) == nil } ?? false
         navigation = replacement
-        if disappeared || topologyChanged && operation != nil {
+        if disappeared || invalidated {
             operation?.task.cancel(); focusOwner.seal(); startCleanup()
         }
         changed()
@@ -492,7 +525,7 @@ public final class TerminalNavigationCoordinator {
         try Task.checkCancellation()
         let id = UUID()
         let task = Task { try await self.execute(plan) }
-        operation = (id, task); changed()
+        operation = (id, plan, task); changed()
         defer {
             if operation?.id == id { operation = nil; changed() }
         }

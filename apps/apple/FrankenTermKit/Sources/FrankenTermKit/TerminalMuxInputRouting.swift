@@ -14,7 +14,9 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     /// The inventory witness prevents a drag from acquiring a new neighbour.
     public struct NavigationPlan: Equatable, Sendable {
         public let paneID: Int
-        fileprivate let owner: UUID, inventory: UUID, registration: UUID
+        fileprivate let owner: UUID, registration: UUID
+        /// Only relative navigation depends on the pane ring's ordering.
+        fileprivate let inventory: UUID?
         fileprivate let source: Destination?
     }
     public enum PointerAction: Equatable, Sendable {
@@ -192,27 +194,30 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
             guard paneOrder.count > 1, let source = destination,
                   let index = paneOrder.firstIndex(of: source.paneID) else { return nil }
             let next = (index + (forward ? 1 : paneOrder.count - 1)) % paneOrder.count
-            return try navigationLocked(pane: paneOrder[next])
+            return try navigationLocked(pane: paneOrder[next], requiringStableInventory: true)
         }
     }
 
-    /// Capture a picker or gesture's exact target before any async keyboard work.
-    /// Titles, mouse-mode changes and output readiness do not invalidate it.
+    /// Capture a picker's exact target before any async keyboard work. Unrelated
+    /// additions, removals and reordering cannot change that selected identity.
     public func navigation(pane: Int) throws -> NavigationPlan {
-        try lock.withLock { try navigationLocked(pane: pane) }
+        try lock.withLock { try navigationLocked(pane: pane, requiringStableInventory: false) }
     }
-    private func navigationLocked(pane: Int) throws -> NavigationPlan {
+    private func navigationLocked(pane: Int, requiringStableInventory: Bool) throws -> NavigationPlan {
         guard !retired, let registration = registrations[pane] else { throw TerminalInputError.unavailable }
-        return NavigationPlan(paneID: pane, owner: owner, inventory: inventory,
-                              registration: registration, source: destination)
+        // An empty source has no visit UUID. Keep the inventory witness so
+        // nil -> another pane -> removed cannot revive its earlier choice.
+        let keepInventory = requiringStableInventory || destination == nil
+        return NavigationPlan(paneID: pane, owner: owner, registration: registration,
+                              inventory: keepInventory ? inventory : nil, source: destination)
     }
 
     /// Check again after keyboard settlement and when the sole transport takes
-    /// the request. A -> B -> A, reordering, removal/reuse and a new connection
-    /// cannot reinterpret an earlier drag. This grants no input readiness.
+    /// the request. A -> B -> A, removal/reuse and a new connection invalidate
+    /// every choice; reordering also expires relative movement. No input grant.
     public func validateNavigation(_ plan: NavigationPlan) throws {
         try lock.withLock {
-            guard !retired, plan.owner == owner, plan.inventory == inventory,
+            guard !retired, plan.owner == owner, plan.inventory == nil || plan.inventory == inventory,
                   plan.source == destination, registrations[plan.paneID] == plan.registration else {
                 throw TerminalInputError.stale
             }

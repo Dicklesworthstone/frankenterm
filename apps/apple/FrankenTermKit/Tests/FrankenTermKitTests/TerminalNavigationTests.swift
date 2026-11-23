@@ -68,6 +68,78 @@ final class TerminalNavigationTests: XCTestCase {
         XCTAssertEqual(navigation.selection?.machineID, "C")
     }
 
+    func testExplicitMachineAndPaneChoicesSurviveUnrelatedInventoryChanges() throws {
+        let a = try [pane("source"), pane("other")], b = try [pane("first"), pane("chosen")]
+        let inventory = try [machine("A", a), machine("B", b), machine("C")]
+        for choosePane in [false, true] {
+            var navigation = try TerminalNavigation(machines: inventory)
+            let plan = try XCTUnwrap(choosePane ? navigation.plan(paneID: b[1].id) : navigation.plan(machineID: "B"))
+            let renamedSource = try TerminalNavigationPane(id: a[0].id, title: "source now running vim")
+            let renamedTarget = try TerminalNavigationPane(id: b[1].id, title: "build complete")
+            XCTAssertFalse(try navigation.replaceInventory([
+                machine("A", [renamedSource, a[1]]), machine("B", [b[0], renamedTarget]), machine("C")
+            ]))
+            try navigation.validate(plan)
+            let newPane = try pane("new tab")
+            XCTAssertFalse(try navigation.replaceInventory([
+                machine("B", [newPane, renamedTarget, b[0]]), machine("D"), machine("A", [renamedSource])
+            ]))
+            XCTAssertEqual(try navigation.commit(plan), plan.destination)
+            XCTAssertEqual(navigation.selection?.paneID, choosePane ? b[1].id : b[0].id,
+                           "the captured pane survives; the new first pane is never substituted")
+            XCTAssertThrowsError(try navigation.commit(plan), "a completed choice is still single-use")
+        }
+    }
+
+    func testExactChoiceCannotReviveAfterTargetRemovalOrIdentifierReuse() throws {
+        let a = try machine("A", [pane()]), target = try pane("target"), other = try pane()
+        let b = try machine("B", [target, other])
+        var navigation = try TerminalNavigation(machines: [a, b])
+        let plan = try XCTUnwrap(navigation.plan(paneID: target.id))
+        try navigation.replaceInventory([a, machine("B", [other])])
+        XCTAssertThrowsError(try navigation.validate(plan))
+        try navigation.replaceInventory([a, b])
+        XCTAssertThrowsError(try navigation.commit(plan), "an observed removal retires even an identical returning identity")
+
+        let current = try XCTUnwrap(navigation.plan(paneID: target.id))
+        let replacement = try pane("target", id: target.id.id)
+        try navigation.replaceInventory([a, machine("B", [replacement, other])])
+        XCTAssertThrowsError(try navigation.commit(current), "another channel incarnation cannot inherit the tap")
+
+        var offline = try TerminalNavigation(machines: [a, machine("offline")])
+        let empty = try XCTUnwrap(offline.plan(machineID: "offline"))
+        try offline.replaceInventory([a])
+        try offline.replaceInventory([a, machine("offline")])
+        XCTAssertThrowsError(try offline.commit(empty), "a removed machine cannot revive its earlier empty view")
+    }
+
+    func testExactChoiceKeepsConnectionOwnerSourceAndFocusFences() throws {
+        let inventory = try [machine("A", [pane()]), machine("B", [pane()]), machine("C", [pane()])]
+        var navigation = try TerminalNavigation(machines: inventory)
+        var otherConnection = try TerminalNavigation(machines: inventory)
+        let plan = try XCTUnwrap(navigation.plan(machineID: "B"))
+        XCTAssertThrowsError(try otherConnection.commit(plan), "a replacement route has a different owner")
+        try navigation.commit(XCTUnwrap(navigation.plan(machineID: "C")))
+        try navigation.commit(XCTUnwrap(navigation.plan(machineID: "A")))
+        XCTAssertThrowsError(try navigation.commit(plan), "leaving and returning cannot revive an earlier focus")
+        let beforeSuspension = try XCTUnwrap(navigation.plan(machineID: "B"))
+        try navigation.invalidatePlans()
+        XCTAssertThrowsError(try navigation.commit(beforeSuspension))
+    }
+
+    func testRelativeAdaptersCanRequireTheCapturedInventoryForAnExactDestination() throws {
+        let a = try machine("A", [pane()]), b = try machine("B", [pane(), pane()]), c = try machine("C")
+        var navigation = try TerminalNavigation(machines: [a, b, c])
+        let machine = try XCTUnwrap(navigation.plan(machineID: "B", requiringStableInventory: true))
+        let pane = try XCTUnwrap(navigation.plan(paneID: b.panes[1].id, requiringStableInventory: true))
+        try navigation.replaceInventory([a, c, b])
+        XCTAssertThrowsError(try navigation.commit(machine))
+        XCTAssertThrowsError(try navigation.commit(pane))
+        try navigation.replaceInventory([a, b, c])
+        XCTAssertThrowsError(try navigation.commit(machine), "returning to the old ordering cannot revive a swipe")
+        XCTAssertThrowsError(try navigation.commit(pane))
+    }
+
     func testClosedPaneAndReusedTabCannotInheritFocusOrViewport() throws {
         let tab = UUID(), old = try pane("same title", id: tab)
         let replacement = try pane("same title", id: tab), other = try pane()

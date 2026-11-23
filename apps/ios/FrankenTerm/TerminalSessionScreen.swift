@@ -1395,7 +1395,15 @@ final class TerminalSessionController {
     /// its output has reached the canonical model.
     func showPane(_ paneID: Int) {
         guard let control = connection?.muxControl else { return }
-        do { _ = try startPaneHandoff(control.inputRouting.navigation(pane: paneID)) }
+        do { showPane(try control.inputRouting.navigation(pane: paneID)) }
+        catch { if !stopped { interactionProblem = "The pane switch was not completed: \(Self.describe(error))" } }
+    }
+
+    /// Next/previous keys keep the original ring witness through the same
+    /// handoff as swipes; rebuilding from the numeric ID would turn a relative
+    /// choice into an explicit picker request.
+    func showPane(_ plan: TerminalMuxInputRouting.NavigationPlan) {
+        do { _ = try startPaneHandoff(plan) }
         catch { if !stopped { interactionProblem = "The pane switch was not completed: \(Self.describe(error))" } }
     }
 

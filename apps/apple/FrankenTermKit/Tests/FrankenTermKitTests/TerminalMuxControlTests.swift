@@ -963,9 +963,9 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
     }
 
     /// A pane chosen after New Tab keeps that request's tab in the background
-    /// while the choice can still land and after it lands, but a choice the
-    /// new tab's listing made stale gives way to that tab. Each New Tab
-    /// starts afresh.
+    /// while the choice can still land and after it lands. Its new listing
+    /// cannot undo an exact choice; removing that chosen pane can. Each New
+    /// Tab starts afresh.
     func testAPaneChosenAfterNewTabHoldsTheTabBackOnlyWhileItCanLand() throws {
         let control = try fixture()
         control.enableShellCreation(incarnation: Data(repeating: 0x32, count: 16))
@@ -989,7 +989,44 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
         control.notePaneChoice(try control.inputRouting.navigation(pane: 30))
         XCTAssertTrue(control.paneChosenSinceShellCreation)
         try control.inputRouting.replaceInventory([10, 20, 30, 40, 50])
-        XCTAssertFalse(control.paneChosenSinceShellCreation, "a choice the new tab's listing made stale gives way")
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "the new tab's listing cannot override a pending exact choice")
+        control.inputRouting.remove(pane: 30)
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "a removed choice gives way to the new tab")
+        try control.inputRouting.replaceInventory([10, 20, 30, 40, 50])
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "reuse of the removed number does not revive the choice")
+    }
+
+    func testNewTabListingKeepsAnExplicitChoiceThroughoutItsKeyboardHandoff() throws {
+        let control = try fixture()
+        control.enableShellCreation(incarnation: Data(repeating: 0x32, count: 16))
+        try control.requestShellCreation(control.prepareShellCreation(workspace: "default"))
+        let creation = try XCTUnwrap(control.takeShellCreation())
+        control.shellCreationAdmitted(creation.id, request: 7)
+        let choice = try control.inputRouting.navigation(pane: 20)
+        control.notePaneChoice(choice)
+        XCTAssertTrue(control.finishShellCreation(request: 7, outcome: .created(pane: 40, tab: 4, window: 1)))
+        try control.inputRouting.replaceInventory([10, 20, 30, 40])
+        control.publish(panes: [10, 20, 30, 40].map(pane), shown: 10)
+        XCTAssertTrue(control.paneChosenSinceShellCreation)
+        XCTAssertEqual(control.current.shown, 10, "the handoff has not completed")
+        try control.request(choice)
+        XCTAssertEqual(control.takeRequest(), 20)
+        XCTAssertTrue(control.paneChosenSinceShellCreation)
+        XCTAssertNil(control.current.rejectedNavigation)
+    }
+
+    func testExactQueuedChoiceSurvivesOtherPaneRemovalReorderAndRetitle() throws {
+        let control = try fixture()
+        let choice = try control.inputRouting.navigation(pane: 20)
+        try control.request(choice)
+        try control.inputRouting.replaceInventory([30, 20, 10, 40])
+        control.publish(panes: [30, 20, 10, 40].map(pane), shown: 10)
+        control.retitle(pane: 20, title: "finished build")
+        control.inputRouting.remove(pane: 30); control.remove(pane: 30)
+        XCTAssertEqual(control.takeRequest(), 20)
+        XCTAssertNil(control.current.rejectedNavigation)
+        XCTAssertEqual(control.inputRouting.current.destination?.paneID, 10,
+                       "only the transport's later select changes the displayed visit")
     }
 
     func testQueuedRequestKeepsExactCandidateAndDoesNotSelectItEarly() throws {
@@ -1105,7 +1142,7 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
 
     func testReentrantRejectionObserverCanQueueFreshPlanWithoutOldTakeErasingIt() throws {
         let control = try fixture()
-        let old = try control.inputRouting.navigation(pane: 20)
+        let old = try XCTUnwrap(control.inputRouting.navigation(forward: true))
         try control.request(old)
         try control.inputRouting.replaceInventory([10, 30, 20])
         let fresh = try control.inputRouting.navigation(pane: 30)
