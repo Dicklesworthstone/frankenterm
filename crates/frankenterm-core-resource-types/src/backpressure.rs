@@ -212,6 +212,20 @@ impl BackpressureConfig {
                 ));
             }
         }
+        // `classify` enters a tier at `ratio >= threshold`. A zero threshold
+        // matches even an empty queue, so its tier would hold on every tick.
+        for (name, value) in [
+            ("yellow_capture", self.yellow_capture),
+            ("red_capture", self.red_capture),
+            ("yellow_write", self.yellow_write),
+            ("red_write", self.red_write),
+        ] {
+            if value <= 0.0 {
+                return Err(format!(
+                    "backpressure config {name} must be greater than 0, got {value}"
+                ));
+            }
+        }
         if self.yellow_capture > self.red_capture {
             return Err(format!(
                 "backpressure config yellow_capture ({}) must be ≤ red_capture ({})",
@@ -1198,6 +1212,57 @@ mod tests {
         let err = config.validate().expect_err("yellow_write > red_write");
         assert!(err.contains("yellow_write"));
         assert!(err.contains("red_write"));
+    }
+
+    /// A zero tier threshold classified an empty queue as elevated forever.
+    #[test]
+    fn config_validate_rejects_zero_tier_thresholds() {
+        let empty = QueueDepths {
+            capture_depth: 0,
+            capture_capacity: 100,
+            write_depth: 0,
+            write_capacity: 100,
+        };
+        for (name, config) in [
+            (
+                "yellow_capture",
+                BackpressureConfig {
+                    yellow_capture: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "yellow_write",
+                BackpressureConfig {
+                    yellow_write: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "red_capture",
+                BackpressureConfig {
+                    yellow_capture: 0.0,
+                    red_capture: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "red_write",
+                BackpressureConfig {
+                    yellow_write: 0.0,
+                    red_write: 0.0,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_ne!(
+                BackpressureManager::new(config.clone()).classify(&empty),
+                BackpressureTier::Green,
+                "{name}: the hazard this rejects"
+            );
+            let err = config.validate().expect_err("zero threshold");
+            assert!(err.contains("greater than 0"), "{name}: {err}");
+        }
     }
 
     // ── [ft-0e179] per-pane drop attribution ───────────────────────────
