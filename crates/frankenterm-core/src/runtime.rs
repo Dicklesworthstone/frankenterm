@@ -2328,6 +2328,8 @@ pub struct RuntimeConfig {
     pub capture_budgets: CaptureBudgetConfig,
     /// Mux-owned per-pane resident scrollback budget used by fleet pressure.
     pub fleet_scrollback: FleetScrollbackBudgetConfig,
+    /// Startup queue-pressure thresholds and recovery hysteresis.
+    pub backpressure: BackpressureConfig,
     /// Pattern detection configuration
     pub patterns: PatternsConfig,
     /// Optional root for resolving file-based pattern packs
@@ -2374,6 +2376,7 @@ impl Default for RuntimeConfig {
             pane_priorities: PanePriorityConfig::default(),
             capture_budgets: CaptureBudgetConfig::default(),
             fleet_scrollback: FleetScrollbackBudgetConfig::default(),
+            backpressure: BackpressureConfig::default(),
             patterns: PatternsConfig::default(),
             patterns_root: None,
             channel_buffer: 1024,
@@ -4967,6 +4970,9 @@ pub struct ObservationRuntime {
     fleet_poll_pressure_level: Arc<AtomicU8>,
     /// Runtime metrics for health/shutdown
     metrics: Arc<RuntimeMetrics>,
+    /// One queue-pressure authority shared by maintenance and health readers.
+    /// Retaining the manager also retains recovery hysteresis across probes.
+    backpressure_manager: Arc<BackpressureManager>,
     /// Hot-reloadable config sender (for broadcasting updates to tasks)
     config_tx: Arc<watch::Sender<HotReloadableConfig>>,
     /// Hot-reloadable config receiver (for tasks to receive updates)
@@ -5023,6 +5029,7 @@ impl ObservationRuntime {
         // built-in tier defaults during the most important first cleanup.
         let hot_config = initial_hot_reloadable_config(&config);
         let (config_tx, config_rx) = watch::channel(hot_config);
+        let backpressure_manager = Arc::new(BackpressureManager::new(config.backpressure.clone()));
 
         Self {
             config,
@@ -5038,6 +5045,7 @@ impl ObservationRuntime {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fleet_poll_pressure_level: Arc::new(AtomicU8::new(FLEET_POLL_PRESSURE_NONE)),
             metrics,
+            backpressure_manager,
             config_tx: Arc::new(config_tx),
             config_rx,
             event_bus: None,
@@ -5581,6 +5589,7 @@ impl ObservationRuntime {
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: self.storage.clone(),
             metrics: Arc::clone(&self.metrics),
+            backpressure_manager: Arc::clone(&self.backpressure_manager),
             registry: Arc::clone(&self.registry),
             cursors: Arc::clone(&self.cursors),
             pane_activity_tracker: Arc::clone(&self.pane_activity_tracker),
@@ -5952,6 +5961,7 @@ impl ObservationRuntime {
         let metrics = Arc::clone(&self.metrics);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
         let fleet_poll_pressure_level = Arc::clone(&self.fleet_poll_pressure_level);
+        let backpressure_manager = Arc::clone(&self.backpressure_manager);
 
         let initial_retention_days = self.config.retention_days;
         let initial_retention_policy = Arc::clone(&self.config.retention_policy);
@@ -5989,7 +5999,6 @@ impl ObservationRuntime {
             // Preserve it across ticks and finalize that same positive row ID
             // before admitting another age-retention mutation.
             let mut pending_cleanup_receipt = None::<MaintenanceRecord>;
-            let backpressure_manager = BackpressureManager::new(BackpressureConfig::default());
             let memory_pressure_monitor =
                 MemoryPressureMonitor::new(MemoryPressureConfig::default());
             // Per-pane resident-memory budget used to derive the fleet
@@ -6580,7 +6589,8 @@ impl ObservationRuntime {
                             );
                         }
                     }
-                    let backpressure_tier = classify_backpressure_tier(
+                    let backpressure_tier = observe_backpressure_tier(
+                        &backpressure_manager,
                         capture_depth,
                         capture_cap,
                         write_depth,
@@ -11192,6 +11202,8 @@ pub struct RuntimeHandle {
     pub storage: StorageHandle,
     /// Runtime metrics
     pub metrics: Arc<RuntimeMetrics>,
+    /// The same configured, stateful pressure manager used by maintenance.
+    backpressure_manager: Arc<BackpressureManager>,
     /// Pane registry
     pub registry: Arc<RwLock<PaneRegistry>>,
     /// Per-pane cursors
@@ -12583,7 +12595,8 @@ fn fleet_pane_infos_from_registry(
         .collect()
 }
 
-fn classify_backpressure_tier(
+fn observe_backpressure_tier(
+    manager: &BackpressureManager,
     capture_depth: usize,
     capture_capacity: usize,
     write_depth: usize,
@@ -12593,44 +12606,16 @@ fn classify_backpressure_tier(
         return None;
     }
 
-    let config = BackpressureConfig::default();
-    let capture_ratio = if capture_capacity == 0 {
-        0.0
-    } else {
-        capture_depth as f64 / capture_capacity as f64
-    };
-    let write_ratio = if write_capacity == 0 {
-        0.0
-    } else {
-        write_depth as f64 / write_capacity as f64
-    };
-
-    // Match BackpressureManager::classify saturation semantics. The absolute
-    // "within N slots of full" guard is only meaningful once the queue is
-    // already highly filled; otherwise tiny capacities trip `saturating_sub`
-    // (e.g. write_capacity=1 → saturating_sub(100)=0 → write_depth>=0 is always
-    // true) and classify an EMPTY queue as BLACK. Require a high fill ratio
-    // before the absolute margin can escalate to BLACK — this mirrors the
-    // resource-types manager's ft-5 fix that the runtime copy had missed
-    // (regression: classify_backpressure_tier_matches_manager_semantics).
-    let capture_saturated = capture_capacity > 0
-        && (capture_ratio >= 0.995
-            || (capture_ratio >= 0.95 && capture_depth >= capture_capacity.saturating_sub(5)));
-    let write_saturated = write_capacity > 0
-        && (write_ratio >= 0.995
-            || (write_ratio >= 0.95 && write_depth >= write_capacity.saturating_sub(100)));
-
-    let tier = if capture_saturated || write_saturated {
-        "BLACK"
-    } else if capture_ratio >= config.red_capture || write_ratio >= config.red_write {
-        "RED"
-    } else if capture_ratio >= config.yellow_capture || write_ratio >= config.yellow_write {
-        "YELLOW"
-    } else {
-        "GREEN"
-    };
-
-    Some(tier.to_string())
+    // Use the actual controller, including its enablement and hysteresis.
+    // A separate stateless classifier can claim recovery while maintenance
+    // is deliberately retaining an elevated tier, or ignore operator limits.
+    let _ = manager.evaluate(&QueueDepths {
+        capture_depth,
+        capture_capacity,
+        write_depth,
+        write_capacity,
+    });
+    Some(manager.current_tier().to_string())
 }
 
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
@@ -13550,8 +13535,13 @@ impl RuntimeHandle {
                 warnings.push(line);
             }
         }
-        let backpressure_tier =
-            classify_backpressure_tier(capture_depth, capture_cap, write_depth, write_cap);
+        let backpressure_tier = observe_backpressure_tier(
+            &self.backpressure_manager,
+            capture_depth,
+            capture_cap,
+            write_depth,
+            write_cap,
+        );
         // This path evaluates no fleet or admission governor; publish only
         // the advisory it can back with a verdict of its own.
         let governor_advisories: Vec<_> = backpressure_tier
@@ -20907,6 +20897,7 @@ mod tests {
             shutdown_flag: Arc::clone(&runtime.shutdown_flag),
             storage: runtime.storage.clone(),
             metrics: Arc::clone(&runtime.metrics),
+            backpressure_manager: Arc::clone(&runtime.backpressure_manager),
             registry: Arc::clone(&runtime.registry),
             cursors: Arc::clone(&runtime.cursors),
             pane_activity_tracker: Arc::clone(&runtime.pane_activity_tracker),
@@ -21447,6 +21438,63 @@ mod tests {
                 summary.managed_queue_quiescence_proven(),
                 "a fully clean zero-depth shutdown should prove managed-queue quiescence"
             );
+        });
+    }
+
+    #[test]
+    fn runtime_backpressure_policy_is_shared_with_health_and_fleet_control() {
+        run_async_test_isolated(|| async {
+            let operator = crate::config::Config::from_toml(
+                "[backpressure]\nyellow_capture = 0.1\nred_capture = 0.2\nhysteresis_ms = 60000\n",
+            )
+            .expect("valid operator policy");
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let mut runtime = ObservationRuntime::new(
+                RuntimeConfig {
+                    backpressure: operator.backpressure,
+                    ..Default::default()
+                },
+                storage,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+            let controller = Arc::clone(&runtime.backpressure_manager);
+            let handle = runtime.start().await.expect("runtime should start");
+            assert!(Arc::ptr_eq(&controller, &handle.backpressure_manager));
+
+            let depths = QueueDepths {
+                capture_depth: 30,
+                capture_capacity: 100,
+                write_depth: 0,
+                write_capacity: 1_000,
+            };
+            let signals = build_fleet_pressure_signals(
+                &controller,
+                &depths,
+                MemoryPressureTier::Green,
+                BudgetLevel::Normal,
+                1,
+            );
+            assert_eq!(
+                signals.backpressure,
+                crate::backpressure::BackpressureTier::Red
+            );
+            assert_eq!(
+                BackpressureManager::new(BackpressureConfig::default()).classify(&depths),
+                crate::backpressure::BackpressureTier::Green,
+                "the configured policy must change actual pressure classification"
+            );
+
+            // Health readers must not construct a fresh default classifier or
+            // discard the active controller's recovery delay on a quiet sample.
+            assert_eq!(
+                observe_backpressure_tier(&handle.backpressure_manager, 0, 100, 0, 1_000)
+                    .as_deref(),
+                Some("RED")
+            );
+            let summary = handle.shutdown_with_summary().await;
+            assert!(summary.is_clean(), "{:?}", summary.warnings);
         });
     }
 
@@ -23094,38 +23142,103 @@ mod tests {
     }
 
     #[test]
-    fn classify_backpressure_tier_none_when_capacities_unknown() {
-        assert!(classify_backpressure_tier(0, 0, 0, 0).is_none());
+    fn backpressure_reports_respect_disabled_policy_and_other_pressure_sources() {
+        let manager = BackpressureManager::new(BackpressureConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let signals = build_fleet_pressure_signals(
+            &manager,
+            &QueueDepths {
+                capture_depth: 100,
+                capture_capacity: 100,
+                write_depth: 1_000,
+                write_capacity: 1_000,
+            },
+            MemoryPressureTier::Orange,
+            BudgetLevel::OverBudget,
+            8,
+        );
+        assert_eq!(
+            signals.backpressure,
+            crate::backpressure::BackpressureTier::Green
+        );
+        assert_eq!(signals.memory_pressure, MemoryPressureTier::Orange);
+        assert_eq!(signals.worst_budget, BudgetLevel::OverBudget);
+        assert_eq!(
+            observe_backpressure_tier(&manager, 100, 100, 1_000, 1_000).as_deref(),
+            Some("GREEN")
+        );
     }
 
     #[test]
-    fn classify_backpressure_tier_maps_expected_levels() {
-        // Keep write queue far from saturation; otherwise small capacities can
-        // classify as BLACK due to the write-side saturation guardrail.
-        let write_capacity = 10_000;
+    fn backpressure_reports_recover_with_configured_zero_hysteresis() {
+        let manager = BackpressureManager::new(BackpressureConfig {
+            yellow_write: 0.1,
+            red_write: 0.2,
+            hysteresis_ms: 0,
+            ..Default::default()
+        });
         assert_eq!(
-            classify_backpressure_tier(0, 100, 0, write_capacity).as_deref(),
-            Some("GREEN")
-        );
-        assert_eq!(
-            classify_backpressure_tier(50, 100, 0, write_capacity).as_deref(),
-            Some("YELLOW")
-        );
-        assert_eq!(
-            classify_backpressure_tier(75, 100, 0, write_capacity).as_deref(),
+            observe_backpressure_tier(&manager, 0, 100, 250, 1_000).as_deref(),
             Some("RED")
         );
         assert_eq!(
-            classify_backpressure_tier(98, 100, 0, write_capacity).as_deref(),
+            observe_backpressure_tier(&manager, 0, 100, 0, 1_000).as_deref(),
+            Some("GREEN")
+        );
+    }
+
+    #[test]
+    fn backpressure_reports_fail_closed_for_unvalidated_nonfinite_threshold() {
+        let manager = BackpressureManager::new(BackpressureConfig {
+            yellow_capture: f64::NAN,
+            ..Default::default()
+        });
+        assert_eq!(
+            observe_backpressure_tier(&manager, 0, 100, 0, 1_000).as_deref(),
             Some("BLACK")
         );
     }
 
     #[test]
-    fn classify_backpressure_tier_matches_manager_semantics() {
+    fn observe_backpressure_tier_none_when_capacities_unknown() {
+        let manager = BackpressureManager::new(BackpressureConfig::default());
+        assert!(observe_backpressure_tier(&manager, 0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn observe_backpressure_tier_maps_expected_levels() {
+        let manager = BackpressureManager::new(BackpressureConfig::default());
+        // Keep write queue far from saturation; otherwise small capacities can
+        // classify as BLACK due to the write-side saturation guardrail.
+        let write_capacity = 10_000;
+        assert_eq!(
+            observe_backpressure_tier(&manager, 0, 100, 0, write_capacity).as_deref(),
+            Some("GREEN")
+        );
+        assert_eq!(
+            observe_backpressure_tier(&manager, 50, 100, 0, write_capacity).as_deref(),
+            Some("YELLOW")
+        );
+        assert_eq!(
+            observe_backpressure_tier(&manager, 75, 100, 0, write_capacity).as_deref(),
+            Some("RED")
+        );
+        assert_eq!(
+            observe_backpressure_tier(&manager, 98, 100, 0, write_capacity).as_deref(),
+            Some("BLACK")
+        );
+    }
+
+    #[test]
+    fn observe_backpressure_tier_matches_manager_semantics() {
         use crate::backpressure::{BackpressureManager, QueueDepths};
 
-        let manager = BackpressureManager::new(BackpressureConfig::default());
+        let manager = BackpressureManager::new(BackpressureConfig {
+            hysteresis_ms: 0,
+            ..Default::default()
+        });
         let capacities = [0usize, 1, 4, 5, 6, 25, 100, 256];
 
         for &capture_capacity in &capacities {
@@ -23147,7 +23260,8 @@ mod tests {
 
                 for &capture_depth in &capture_depths {
                     for &write_depth in &write_depths {
-                        let actual = classify_backpressure_tier(
+                        let actual = observe_backpressure_tier(
+                            &manager,
                             capture_depth,
                             capture_capacity,
                             write_depth,

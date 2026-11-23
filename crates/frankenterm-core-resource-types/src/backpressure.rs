@@ -106,7 +106,7 @@ impl BackpressureTier {
 ///
 /// All thresholds are expressed as fractions (0.0–1.0) of the respective
 /// queue capacity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackpressureConfig {
     /// Enable the backpressure policy.
@@ -167,8 +167,8 @@ impl Default for BackpressureConfig {
 }
 
 impl BackpressureConfig {
-    /// Validate that every threshold is finite, non-negative, and ordered
-    /// yellow ≤ red. Returns a human-readable error on the first violation.
+    /// Validate finite, non-negative values, queue/action ratios at most one,
+    /// and ordered yellow ≤ red thresholds. Returns the first violation.
     ///
     /// [ft-atcr0] TOML supports `nan`/`inf` float literals, and serde passes
     /// them through to this struct unchanged. If any f64 threshold reaches
@@ -195,6 +195,20 @@ impl BackpressureConfig {
             if value < 0.0 {
                 return Err(format!(
                     "backpressure config {name} must be non-negative, got {value}"
+                ));
+            }
+        }
+        for (name, value) in [
+            ("yellow_capture", self.yellow_capture),
+            ("red_capture", self.red_capture),
+            ("yellow_write", self.yellow_write),
+            ("red_write", self.red_write),
+            ("skip_detection_ratio", self.skip_detection_ratio),
+            ("pause_ratio", self.pause_ratio),
+        ] {
+            if value > 1.0 {
+                return Err(format!(
+                    "backpressure config {name} must be at most 1, got {value}"
                 ));
             }
         }

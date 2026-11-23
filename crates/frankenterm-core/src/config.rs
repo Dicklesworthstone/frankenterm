@@ -138,7 +138,9 @@ pub struct Config {
     /// Outbound MCP client settings (feature-gated consumers)
     pub mcp_client: McpClientConfig,
 
-    /// Backpressure policy settings (tiered queue-depth responses)
+    /// Queue-pressure enablement, thresholds and recovery hysteresis.
+    /// Captured at watcher startup; changing them requires a restart.
+    /// Action/sampling knobs without runtime consumers reject customization.
     pub backpressure: crate::backpressure::BackpressureConfig,
 
     /// Mux-owned per-pane resident scrollback budget used by runtime
@@ -5366,6 +5368,14 @@ impl Config {
             });
         }
 
+        if self.backpressure != new_config.backpressure {
+            forbidden.push(ForbiddenChange {
+                name: "backpressure".to_string(),
+                reason: "Queue-pressure settings are captured by the runtime controller; requires restart"
+                    .to_string(),
+            });
+        }
+
         if self.backup.scheduled != new_config.backup.scheduled {
             forbidden.push(ForbiddenChange {
                 name: "backup.scheduled".to_string(),
@@ -6070,6 +6080,57 @@ impl Config {
         self.fleet_scrollback
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.backpressure
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        // The production controller consumes enablement, queue thresholds
+        // and hysteresis. Sampling follows maintenance and fleet actions use
+        // the fleet coordinator's policy; these older action knobs have no
+        // effect there. Do not silently accept custom values for them.
+        let backpressure_defaults = crate::backpressure::BackpressureConfig::default();
+        for (key, changed) in [
+            (
+                "backpressure.check_interval_ms",
+                self.backpressure.check_interval_ms != backpressure_defaults.check_interval_ms,
+            ),
+            (
+                "backpressure.idle_poll_backoff_factor",
+                self.backpressure.idle_poll_backoff_factor.to_bits()
+                    != backpressure_defaults.idle_poll_backoff_factor.to_bits(),
+            ),
+            (
+                "backpressure.skip_detection_ratio",
+                self.backpressure.skip_detection_ratio.to_bits()
+                    != backpressure_defaults.skip_detection_ratio.to_bits(),
+            ),
+            (
+                "backpressure.pause_ratio",
+                self.backpressure.pause_ratio.to_bits()
+                    != backpressure_defaults.pause_ratio.to_bits(),
+            ),
+            (
+                "backpressure.max_buffered_segments",
+                self.backpressure.max_buffered_segments
+                    != backpressure_defaults.max_buffered_segments,
+            ),
+            (
+                "backpressure.recovery_resume_interval_ms",
+                self.backpressure.recovery_resume_interval_ms
+                    != backpressure_defaults.recovery_resume_interval_ms,
+            ),
+        ] {
+            if changed {
+                return Err(crate::error::ConfigError::ValidationError(
+                    parsed_but_unconsumed_config_key_message(
+                        key,
+                        "the runtime uses maintenance sampling and fleet-coordinator actions",
+                    ),
+                )
+                .into());
+            }
+        }
 
         if self.workflows.max_concurrent == 0 {
             return Err(crate::error::ConfigError::ValidationError(
@@ -7113,6 +7174,58 @@ log_report = false
         assert_eq!(config.gc.interval_seconds, 120);
         assert!((config.gc.vacuum_threshold - 0.35).abs() < f64::EPSILON);
         assert!(!config.gc.log_report);
+    }
+
+    #[test]
+    fn backpressure_policy_toml_accepts_consumed_controls() {
+        for enabled in [false, true] {
+            let config = Config::from_toml(&format!(
+                "[backpressure]\nenabled = {enabled}\nyellow_capture = 0.1\nred_capture = 0.2\nyellow_write = 0.3\nred_write = 0.4\nhysteresis_ms = 60000\n"
+            ))
+            .expect("production queue-pressure controls must be configurable");
+            assert_eq!(config.backpressure.enabled, enabled);
+            assert!((config.backpressure.red_capture - 0.2).abs() < f64::EPSILON);
+            assert_eq!(config.backpressure.hysteresis_ms, 60_000);
+        }
+    }
+
+    #[test]
+    fn backpressure_policy_toml_rejects_invalid_thresholds() {
+        for key in ["yellow_capture", "red_capture", "yellow_write", "red_write"] {
+            for value in ["nan", "inf", "-0.1", "1.01"] {
+                let error = Config::from_toml(&format!("[backpressure]\n{key} = {value}\n"))
+                    .expect_err("invalid pressure thresholds must fail at config load")
+                    .to_string();
+                assert!(error.contains(key), "{key}={value}: {error}");
+            }
+        }
+        for input in [
+            "yellow_capture = 0.8\nred_capture = 0.2",
+            "yellow_write = 0.8\nred_write = 0.2",
+        ] {
+            let error = Config::from_toml(&format!("[backpressure]\n{input}\n"))
+                .expect_err("inverted pressure bands must fail at config load")
+                .to_string();
+            assert!(error.contains("must be ≤"), "{error}");
+        }
+    }
+
+    #[test]
+    fn backpressure_policy_rejects_unconsumed_action_overrides() {
+        for (key, value) in [
+            ("check_interval_ms", "100"),
+            ("idle_poll_backoff_factor", "3.0"),
+            ("skip_detection_ratio", "0.1"),
+            ("pause_ratio", "0.1"),
+            ("max_buffered_segments", "200"),
+            ("recovery_resume_interval_ms", "100"),
+        ] {
+            let error = Config::from_toml(&format!("[backpressure]\n{key} = {value}\n"))
+                .expect_err("unconsumed action settings must not silently succeed")
+                .to_string();
+            assert!(error.contains(&format!("backpressure.{key}")), "{error}");
+            assert!(error.contains("parsed but has no effect"), "{error}");
+        }
     }
 
     #[test]
@@ -9173,6 +9286,27 @@ max_bytes_per_sec = 1048576
 
         assert!(!result.allowed);
         assert!(result.forbidden.iter().any(|f| f.name == "mcp_client"));
+    }
+
+    #[test]
+    fn hot_reload_forbids_backpressure_policy_change() {
+        let original = Config::default();
+        for input in [
+            "enabled = false",
+            "yellow_capture = 0.1",
+            "red_capture = 0.9",
+            "yellow_write = 0.1",
+            "red_write = 0.9",
+            "hysteresis_ms = 60000",
+        ] {
+            let changed = Config::from_toml(&format!("[backpressure]\n{input}\n"))
+                .expect("valid startup pressure policy");
+            let result = original.diff_for_hot_reload(&changed);
+            assert!(!result.allowed, "{input} needs a controller restart");
+            assert!(result.forbidden.iter().any(|change| {
+                change.name == "backpressure" && change.reason.contains("restart")
+            }));
+        }
     }
 
     #[test]
