@@ -981,9 +981,12 @@ mod tests {
         let domain =
             EventClockDomain::new(Uuid::from_u128(2), 7).expect("fixture clock domain is non-nil");
         let clock = EventClock { domain, origin };
+        // A millisecond, not a nanosecond: on Windows, std treats instants
+        // within one performance-counter tick as equal, so 1 ns earlier
+        // measures as zero elapsed time rather than a regression.
         let before_origin = origin
-            .checked_sub(Duration::from_nanos(1))
-            .expect("fixture instant supports a one-nanosecond subtraction");
+            .checked_sub(Duration::from_millis(1))
+            .expect("fixture instant supports a one-millisecond subtraction");
 
         assert_eq!(
             clock.timestamp_at(before_origin, SystemTime::UNIX_EPOCH, 7),
@@ -1028,15 +1031,17 @@ mod tests {
         let before = clock
             .timestamp_from_elapsed(Duration::from_nanos(1), pre_epoch)
             .expect("monotonic fixture is representable");
+        // Microseconds: Windows keeps SystemTime in 100 ns units, so 5 ns
+        // past the epoch would read back as the epoch itself.
         let after = clock
             .timestamp_from_elapsed(
                 Duration::from_nanos(2),
-                SystemTime::UNIX_EPOCH + Duration::from_nanos(5),
+                SystemTime::UNIX_EPOCH + Duration::from_micros(5),
             )
             .expect("monotonic fixture is representable");
 
         assert_eq!(before.wall_time_unix_ns, None);
-        assert_eq!(after.wall_time_unix_ns, Some(5));
+        assert_eq!(after.wall_time_unix_ns, Some(5_000));
         assert_eq!(after.duration_since(before), Ok(Duration::from_nanos(1)));
     }
 
