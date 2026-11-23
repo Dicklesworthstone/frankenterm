@@ -182,7 +182,11 @@ fr-persist = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/f
 dashmap = "6.2.1"
 
 # Semantic search (optional, behind feature)
-tokenizers = { version = "0.23.1", optional = true }
+# Default features minus esaxx_fast. That feature builds esaxx-rs's C++ with the
+# static CRT (/MT), which cannot link on Windows MSVC with ort's prebuilt
+# onnxruntime (/MD): LNK2038. It only speeds up the Unigram trainer, which ft
+# never runs; tokenizers falls back to esaxx-rs's pure-Rust suffix array.
+tokenizers = { version = "0.23.1", optional = true, default-features = false, features = ["onig", "progressbar"] }
 safetensors = { version = "0.8.0", optional = true }
 half = { version = "2.7.1", optional = true, features = ["num-traits"] }
 fastembed = { version = "7.0.1", optional = true }
