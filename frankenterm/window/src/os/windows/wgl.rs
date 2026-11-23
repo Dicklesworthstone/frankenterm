@@ -172,9 +172,11 @@ fn has_extension(extensions: &str, wanted: &str) -> bool {
 }
 
 fn client_rect_dimensions(rect: RECT) -> (u32, u32) {
+    // An inverted rect is empty. A negative i32 span cast with `as u32` would
+    // wrap to about four billion pixels, so clamp it at zero.
     (
-        rect.right.saturating_sub(rect.left) as u32,
-        rect.bottom.saturating_sub(rect.top) as u32,
+        u32::try_from(rect.right.saturating_sub(rect.left)).unwrap_or(0),
+        u32::try_from(rect.bottom.saturating_sub(rect.top)).unwrap_or(0),
     )
 }
 

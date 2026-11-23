@@ -567,6 +567,18 @@ fn poll_timeout_millis(duration: Option<Duration>) -> libc::c_int {
 
 #[doc(hidden)]
 pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {
+    if pfd.is_empty() {
+        // WSAPoll rejects an empty set with WSAEINVAL. POSIX poll, and the
+        // select fallback on macOS, wait out the timeout instead: with nothing
+        // to become ready, None waits forever. Match that here.
+        match duration {
+            Some(duration) => std::thread::sleep(duration),
+            None => loop {
+                std::thread::park();
+            },
+        }
+        return Ok(0);
+    }
     let poll_result = unsafe {
         WSAPoll(
             pfd.as_mut_ptr(),
