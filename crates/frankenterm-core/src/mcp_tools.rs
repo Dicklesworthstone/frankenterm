@@ -12683,7 +12683,7 @@ impl ToolHandler for WaReserveTool {
                         params.reason.as_deref(),
                         params
                             .ttl_ms
-                            .unwrap_or(storage.reservation_config().default_ttl_ms),
+                            .unwrap_or_else(|| storage.reservation_config().default_ttl_ms),
                     )
                     .await
                     .map_err(McpToolError::from_error)?;

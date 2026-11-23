@@ -87,7 +87,7 @@ fn safety_blocks_are_not_silently_ignored() {
         c.safety.redaction.enabled = !c.safety.redaction.enabled;
     });
     assert_rejects("safety", "safety.capabilities.allow_non_agent_panes", |c| {
-        c.safety.capabilities.allow_non_agent_panes = true
+        c.safety.capabilities.allow_non_agent_panes = true;
     });
     assert_rejects(
         "safety",
@@ -129,11 +129,11 @@ fn input_capability_config_changes_production_policy_decisions() {
     };
 
     let mut config = Config::from_toml(
-        r#"
+        r"
         [safety.capabilities]
         allow_control_chars = false
         allow_arbitrary_text = false
-        "#,
+        ",
     )
     .expect("supported capability controls must load from TOML");
     let mut caps = PaneCapabilities::prompt();
