@@ -6013,7 +6013,9 @@ static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV3: zeroize::Zeroi
 static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);
 static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);
 
-#[cfg(test)]
+// Unix only: most of these tests build their checkpoints from a real output
+// journal, and GuardianOutputJournal::create_new_at is unsupported elsewhere.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::guardian_output_journal::{

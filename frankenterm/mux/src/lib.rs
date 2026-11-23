@@ -26315,6 +26315,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn guardian_live_publication_keeps_its_exact_capture_while_later_output_advances() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -26434,6 +26435,7 @@ mod tests {
         assert_eq!(idle.capture.parser_stream_bytes(), second_target);
     }
 
+    #[cfg(unix)]
     #[test]
     fn guardian_live_publication_joins_before_releasing_exact_pane_retirement() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -27396,6 +27398,9 @@ mod tests {
         }
     }
 
+    // Unix only: builds receipts from a real GuardianOutputJournal, whose
+    // create_new_at is unsupported elsewhere. So are the tests that use it.
+    #[cfg(unix)]
     fn live_checkpoint_receipts(
         durable_pane_id: uuid::Uuid,
         payloads: &[&[u8]],
@@ -27411,6 +27416,7 @@ mod tests {
         (segment, receipts)
     }
 
+    #[cfg(unix)]
     fn live_checkpoint_receipts_for_segment(
         segment: GuardianOutputSegmentIdentity,
         payloads: &[&[u8]],
@@ -27584,6 +27590,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_parser_checkpoint_rejects_split_csi_osc_and_utf8_without_forcing_ground() {
         let cases: &[(&[u8], &[u8])] = &[
@@ -27620,6 +27627,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn idle_checkpoint_wake_never_enters_the_terminal_byte_stream() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -27649,6 +27657,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn guardian_delivery_rejects_same_length_payload_splice_and_tracks_rollover_globally() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -27705,6 +27714,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_replay_preparation_authenticates_without_mutating_live_parser() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -27815,6 +27825,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn authorized_receipt_cannot_publish_distinct_same_length_socket_bytes() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -27946,6 +27957,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cursor_matches_source_requires_exact_output_receipt() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -28087,6 +28099,7 @@ mod tests {
         assert!(state.poison.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_parser_checkpoint_fences_post_target_bytes_and_rejects_a_second_waiter() {
         let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -28154,6 +28167,7 @@ mod tests {
             .expect("post-target writer does not panic");
     }
 
+    #[cfg(unix)]
     #[test]
     fn synchronized_output_hold_is_rejected_before_watchdog_reset() {
         let durable_pane_id = uuid::Uuid::new_v4();
@@ -28178,6 +28192,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_generation_after_capture_is_rejected_under_parser_side_lease() {
         let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -28218,6 +28233,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_timeout_and_callback_panic_clear_the_pending_gate() {
         let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -28302,6 +28318,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn parser_hup_before_authorized_target_returns_incomplete_boundary() {
         let durable_pane_id = uuid::Uuid::new_v4();

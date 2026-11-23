@@ -2240,6 +2240,11 @@ mod tests {
         fn process_id(&self) -> Option<u32> {
             Some(4242)
         }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
     }
 
     #[derive(Clone, Default)]
