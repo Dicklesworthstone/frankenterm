@@ -9162,7 +9162,10 @@ impl Screen {
         let cursor_phys = self.phys_row(cursor.y);
         let mut retained = self.lines.len();
         while retained > cursor_phys.saturating_add(1)
-            && self.lines.get(retained - 1).is_some_and(Line::is_whitespace)
+            && self
+                .lines
+                .get(retained - 1)
+                .is_some_and(Line::is_whitespace)
         {
             retained -= 1;
         }
@@ -21292,14 +21295,11 @@ pub(crate) mod tests {
             for screen in [&mut legacy, &mut page] {
                 // This edited history row deliberately exceeds the page width:
                 // preserving its authoritative view is part of resize parity.
-                screen.lines[0] = Line::from_text(
-                    "history edited beyond the page width",
-                    &attrs,
-                    21,
-                    None,
-                );
+                screen.lines[0] =
+                    Line::from_text("history edited beyond the page width", &attrs, 21, None);
                 let visible = screen.phys_row(0);
-                screen.lines[visible] = Line::from_text("A界e\u{301}👩\u{200d}💻", &attrs, 21, None);
+                screen.lines[visible] =
+                    Line::from_text("A界e\u{301}👩\u{200d}💻", &attrs, 21, None);
                 screen.lines[visible].set_bidi_info(true, ParagraphDirectionHint::RightToLeft, 21);
                 let tail = screen.lines.len() - 1;
                 screen.lines[tail] = Line::from_text("  ", &attrs, 21, None);
@@ -21317,8 +21317,10 @@ pub(crate) mod tests {
             let stable_offset = page.stable_row_index_offset;
             let mut cursor = test_cursor(6, 0, 21);
 
-            for (step, (height, dpi)) in [(2, 96), (7, 96), (7, 144), (1, 144), (6, 96), (6, 96)]
-                .into_iter()
+            // .iter(), not .into_iter(): this crate is edition 2018, where an
+            // array's .into_iter() yields references.
+            for (step, &(height, dpi)) in [(2, 96), (7, 96), (7, 144), (1, 144), (6, 96), (6, 96)]
+                .iter()
                 .enumerate()
             {
                 let seqno = 22 + step;
@@ -21365,7 +21367,12 @@ pub(crate) mod tests {
             assert_eq!(page.grid_engine(), GridEngine::Page);
             assert_eq!(page.lines, legacy.lines);
             assert_eq!(page.stable_row_index_offset, legacy.stable_row_index_offset);
-            page.lines.page().unwrap().list().check_invariants().unwrap();
+            page.lines
+                .page()
+                .unwrap()
+                .list()
+                .check_invariants()
+                .unwrap();
         }
     }
 
@@ -21398,7 +21405,13 @@ pub(crate) mod tests {
         screen.set_cell(0, cursor.y, &Cell::new('x', CellAttributes::blank()), 802);
         screen.scroll_up(&(0..8), 1, 803, CellAttributes::blank(), bidi_mode());
         assert_eq!(screen.grid_engine(), GridEngine::Page);
-        screen.lines.page().unwrap().list().check_invariants().unwrap();
+        screen
+            .lines
+            .page()
+            .unwrap()
+            .list()
+            .check_invariants()
+            .unwrap();
     }
 
     #[test]

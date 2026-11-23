@@ -6,9 +6,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::RuntimeOperationSource;
-use crate::storage::{MetricType, StorageHandle};
 #[cfg(test)]
 use crate::storage::UsageMetricRecord;
+use crate::storage::{MetricType, StorageHandle};
 
 fn alert_check_cancelled_error(detail: impl Into<String>) -> crate::Error {
     crate::Error::RuntimeOperation {
@@ -322,7 +322,10 @@ impl WatcherAlertConfig {
                 .flatten()
             {
                 if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-                    return Err(format!("alerts rule {} has an invalid scope filter", rule.id));
+                    return Err(format!(
+                        "alerts rule {} has an invalid scope filter",
+                        rule.id
+                    ));
                 }
             }
             if rule.metric == AlertMetric::AccountBalance {
@@ -623,7 +626,9 @@ impl AlertMonitor {
                     None => return Ok(100.0),
                 };
                 if let Some(account_id) = rule.account_id.as_deref() {
-                    let account = storage.get_account_with_cx(cx, &service, account_id).await?;
+                    let account = storage
+                        .get_account_with_cx(cx, &service, account_id)
+                        .await?;
                     if let Some(account) = account {
                         if pane_id.is_some()
                             && (!account.percent_remaining.is_finite()
@@ -913,7 +918,9 @@ impl WatcherAlertMonitor {
         };
         let outcome = storage.record_event_outcome_with_cx(cx, stored).await?;
         if let Some(event_id) = outcome.inserted_event_id() {
-            event_bus.publish(crate::events::Event::PatternDetected {
+            // The event row is already durable. The bus only feeds live
+            // subscribers, so delivering to none of them is not a failure.
+            let _ = event_bus.publish(crate::events::Event::PatternDetected {
                 pane_id: configured.pane_id,
                 pane_uuid: pane.pane_uuid,
                 detection,
@@ -1369,7 +1376,12 @@ period = "day"
                 .unwrap();
             assert_eq!(events.len(), 1);
             let extracted = events[0].extracted.as_ref().unwrap();
-            assert!(extracted["summary"].as_str().unwrap().contains("[REDACTED]"));
+            assert!(
+                extracted["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[REDACTED]")
+            );
             assert_eq!(
                 extracted["alert_state"]["config_sha256"]
                     .as_array()
@@ -1422,7 +1434,11 @@ period = "day"
                     .aggregate_usage_metric_with_cx(&cx, query, Some(7))
                     .await
                     .unwrap_err();
-                assert!(error.to_string().contains("missing, invalid or overflowing"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("missing, invalid or overflowing")
+                );
             }
             let sweep = monitor
                 .evaluate_at_with_cx(&cx, &storage, &bus, now + 60_000)

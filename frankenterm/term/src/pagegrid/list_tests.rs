@@ -159,7 +159,11 @@ fn resize_truncation_keeps_stable_prefix_and_shared_pages_without_stale_floors()
         list.scroll(1, stable as usize + 1, false, admit_all);
         put(&mut list, stable, stable as u32, stable as usize + 1);
     }
-    assert_eq!(list.first_stable(), 3, "the first page is partially trimmed");
+    assert_eq!(
+        list.first_stable(),
+        3,
+        "the first page is partially trimmed"
+    );
     let boundary = Arc::clone(list.row(8).unwrap().sealed.unwrap());
     let removed = Arc::clone(list.row(12).unwrap().sealed.unwrap());
     list.mark_rows_changed(5..16, 50);
@@ -170,7 +174,11 @@ fn resize_truncation_keeps_stable_prefix_and_shared_pages_without_stale_floors()
     assert_eq!(list.end_stable(), 11);
     assert_eq!(list.retained_rows(), 8);
     assert_ne!(list.row(8).unwrap().page.serial(), boundary.serial());
-    assert_eq!(boundary.used(), 4, "a shared boundary page was not truncated");
+    assert_eq!(
+        boundary.used(),
+        4,
+        "a shared boundary page was not truncated"
+    );
     assert_eq!(boundary.glyph(3, 0), Glyph::Char(glyph(11)));
     assert_eq!(removed.glyph(0, 0), Glyph::Char(glyph(12)));
     for stable in 3..11 {

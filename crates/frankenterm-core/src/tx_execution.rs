@@ -3464,7 +3464,10 @@ fn execute_pane_wait(
         return tx_wait_failed("wait_for_cancelled", "FTX_WAIT_CANCELLED");
     }
     if !caller_cx.capabilities().effective.time {
-        return tx_wait_failed("wait_for_capability_denied", "FTX_WAIT_TIME_CAPABILITY_DENIED");
+        return tx_wait_failed(
+            "wait_for_capability_denied",
+            "FTX_WAIT_TIME_CAPABILITY_DENIED",
+        );
     }
     let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
         return tx_wait_failed("wait_for_timeout_overflow", "FTX_WAIT_TIMEOUT_OVERFLOW");
@@ -3488,34 +3491,31 @@ fn execute_pane_wait(
                 frankenterm_sigpipe::catch_recoverable(
                     frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
                     std::panic::AssertUnwindSafe(move || {
-                        let rt = match crate::runtime_async::RuntimeBuilder::current_thread()
-                            .build()
-                        {
-                            Ok(rt) => rt,
-                            Err(_) => {
-                                return tx_wait_failed(
-                                    "wait_for_runtime_failed",
-                                    "FTX_WAIT_RUNTIME_FAILED",
-                                );
-                            }
-                        };
+                        let rt =
+                            match crate::runtime_async::RuntimeBuilder::current_thread().build() {
+                                Ok(rt) => rt,
+                                Err(_) => {
+                                    return tx_wait_failed(
+                                        "wait_for_runtime_failed",
+                                        "FTX_WAIT_RUNTIME_FAILED",
+                                    );
+                                }
+                            };
                         rt.block_on(async {
                             // This context is only a clock owner. Reads below
                             // are explicitly bound to source.caller_cx.
-                            let clock_cx = crate::cx::Cx::current()
-                                .unwrap_or_else(crate::cx::for_request);
+                            let clock_cx =
+                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             let executor = match pattern_engine {
                                 Some(engine) => WaitConditionExecutor::new_shared(&source, engine),
                                 None => WaitConditionExecutor::new_without_patterns(&source),
                             };
-                            let remaining = deadline
-                                .saturating_duration_since(std::time::Instant::now());
-                            let wait = executor.execute_with_cx(
-                                &clock_cx, &condition, pane_id, remaining,
-                            );
-                            let watchdog = tx_wait_caller_watchdog(
-                                &source.caller_cx, caller_mask, &clock_cx,
-                            );
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            let wait =
+                                executor.execute_with_cx(&clock_cx, &condition, pane_id, remaining);
+                            let watchdog =
+                                tx_wait_caller_watchdog(&source.caller_cx, caller_mask, &clock_cx);
                             let mut wait = std::pin::pin!(wait);
                             let mut watchdog = std::pin::pin!(watchdog);
                             let result = crate::runtime_async::until_cancelled(
@@ -14377,10 +14377,13 @@ mod tests {
         assert!(tx_contract_requires_pattern_engine(&contract));
         contract.plan.steps.clear();
         assert!(!tx_contract_requires_pattern_engine(&contract));
-        contract.plan.compensations.push(crate::plan::TxCompensation {
-            for_step_id: TxStepId("send".to_string()),
-            action: replay.plan.steps[1].action.clone(),
-        });
+        contract
+            .plan
+            .compensations
+            .push(crate::plan::TxCompensation {
+                for_step_id: TxStepId("send".to_string()),
+                action: replay.plan.steps[1].action.clone(),
+            });
         assert!(tx_contract_requires_pattern_engine(&contract));
     }
 
@@ -14510,7 +14513,12 @@ mod tests {
             assert!(!result.input().0);
             assert_eq!(result.input().1, reason);
             assert!(
-                !result.input().2.as_deref().unwrap().contains("PRIVATE_PANE_CONTENT")
+                !result
+                    .input()
+                    .2
+                    .as_deref()
+                    .unwrap()
+                    .contains("PRIVATE_PANE_CONTENT")
             );
             assert_eq!(
                 probe.dropped.load(Ordering::SeqCst),
@@ -14992,8 +15000,8 @@ mod tests {
         ];
 
         for (action, expected_reason, expected_error) in cases {
-            let result = execute_step_action(&mock, &action, None, None, None, None, None)
-                .into_input();
+            let result =
+                execute_step_action(&mock, &action, None, None, None, None, None).into_input();
             assert!(!result.0, "{expected_reason} must fail closed");
             assert_eq!(result.1, expected_reason);
             assert!(
@@ -15493,8 +15501,7 @@ mod tests {
                 let _drop = ReadDrop(&self.dropped);
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 *self.task_id.lock().unwrap() = Some(format!("{:?}", cx.task_id()));
-                *self.capabilities.lock().unwrap() =
-                    Some(crate::cx::effective_capability_bits(cx));
+                *self.capabilities.lock().unwrap() = Some(crate::cx::effective_capability_bits(cx));
                 self.tails.lock().unwrap().push(tail);
                 let text = match self.mode {
                     TxWaitReadMode::Pending => return std::future::pending().await,
@@ -15628,7 +15635,9 @@ mod tests {
         ) -> WeztermFuture<'a, crate::wezterm::MuxPaneText> {
             match &self.wait_probe {
                 Some(probe) => probe.read(cx, tail),
-                None => self.fallback.get_text_tail_with_cx(cx, pane_id, escapes, tail),
+                None => self
+                    .fallback
+                    .get_text_tail_with_cx(cx, pane_id, escapes, tail),
             }
         }
 

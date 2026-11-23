@@ -49237,10 +49237,7 @@ async fn run_watcher(
             )
             .await;
         });
-        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-            task,
-            shutdown_flag,
-        ))
+        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag))
     } else {
         None
     };

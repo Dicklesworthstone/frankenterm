@@ -28688,10 +28688,9 @@ fn aggregate_usage_metric_backend(
         Some(MetricType::TokenUsage) => (MetricType::TokenUsage, "tokens", "0.0", 1),
         Some(MetricType::RateLimitHit) => (MetricType::RateLimitHit, "count", "1.0", 0),
         _ => {
-            return Err(StorageError::Database(
-                "unsupported usage aggregate metric".to_string(),
-            )
-            .into());
+            return Err(
+                StorageError::Database("unsupported usage aggregate metric".to_string()).into(),
+            );
         }
     };
     let pane_id = pane_id.map(|id| u64_to_i64(id, "pane_id")).transpose()?;

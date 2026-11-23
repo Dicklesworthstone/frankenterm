@@ -15672,12 +15672,13 @@ mod tests {
         catch_recoverable, intent_hash_hex, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_load_submit_profile,
         mcp_now_ms_i64, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, now_ms, read_mcp_rehearsal_manifest,
-        redact_mcp_output_secrets, redact_mcp_pane_state_fields,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_tx_pattern_engine,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states, now_ms,
+        read_mcp_rehearsal_manifest, redact_mcp_output_secrets, redact_mcp_pane_state_fields,
         redact_mcp_pane_text_with_escape_contract, redact_mcp_wait_pattern_for_output,
         resolve_mcp_rehearsal_manifest_path, serialize_mcp_audit_decision_context,
         tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
+        with_mcp_tx_cx,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     use crate::mcp_error::{
@@ -26233,13 +26234,15 @@ mod tests {
             },
         }];
         contract.validate().expect("valid storage-only transaction");
-        std::fs::write(&contract_path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&contract).unwrap(),
+        )
+        .unwrap();
         let arguments = serde_json::json!({
             "contract_file": contract_path.display().to_string(),
         });
-        let value_path = workspace
-            .path()
-            .join(".ft/tx_data/mcp-store-data.json");
+        let value_path = workspace.path().join(".ft/tx_data/mcp-store-data.json");
         let read_value = || {
             serde_json::from_slice::<serde_json::Value>(
                 &std::fs::read(&value_path).expect("workspace transaction data"),
@@ -26269,7 +26272,11 @@ mod tests {
         );
         assert_eq!(replay["ok"], true, "{replay}");
         assert_eq!(replay["data"]["final_state"], "committed");
-        assert_eq!(read_value(), later_value, "replay must not repeat the write");
+        assert_eq!(
+            read_value(),
+            later_value,
+            "replay must not repeat the write"
+        );
 
         let rollback = parse_json_content(
             WaTxRollbackTool::new(config)

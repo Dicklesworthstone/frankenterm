@@ -882,7 +882,11 @@ impl PageList {
             return;
         }
         let end = self.next_stable - (self.retained_rows - len) as StableRowIndex;
-        while self.pages.back().is_some_and(|slot| slot.first_stable >= end) {
+        while self
+            .pages
+            .back()
+            .is_some_and(|slot| slot.first_stable >= end)
+        {
             let slot = self.pages.pop_back().expect("the tail was checked above");
             self.sealed = self.sealed.min(self.pages.len());
             self.recycle_page(slot);
