@@ -14,7 +14,9 @@ import copy
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
+import tarfile
 import sys
 import tempfile
 from pathlib import Path
@@ -295,6 +297,178 @@ shutil.copyfile(source, target)
     offending = {v["symbol_version"] for v in parsed.get("violations", [])}
     assert offending == {"GLIBC_2.43", "GLIBCXX_3.4.31"}, parsed
     record("neg_linux_abi_glibc_243", "stable", "negative", 1, p, {"offending": sorted(offending)})
+
+    # Inspect real ELF structures, not magic bytes or incidental version strings.
+    # These ELF fixtures are never executed and do not require a native compiler.
+    def abi_case(case_id, arguments, expected_rc, *, env=None, observed=None):
+        proc = subprocess.run(
+            ["bash", str(abi_sh), "--json", *arguments],
+            env=env, capture_output=True, text=True, timeout=90,
+        )
+        verdict = json.loads(proc.stdout)
+        assert verdict.get("ok") is (expected_rc == 0), (case_id, verdict, proc.stderr)
+        if observed is not None:
+            assert verdict["max_observed"]["GLIBC"] == observed, (case_id, verdict)
+        if expected_rc == 2:
+            assert verdict["inspection_error_count"] > 0, (case_id, verdict)
+        record(case_id, "stable", "positive" if expected_rc == 0 else "negative",
+               expected_rc, proc, {"inspection_errors": verdict.get("inspection_errors", [])})
+        assert proc.returncode == expected_rc, (case_id, verdict, proc.stderr)
+        return verdict
+
+    needs_text = (
+        "Version needs section '.gnu.version_r' contains 1 entry:\n"
+        " Addr: 0x10 Offset: 0x10 Link: 1 (.dynstr)\n"
+        " 000000: Version: 1 File: libc.so.6 Cnt: 1\n"
+        " 0x0010: Name: GLIBC_2.35 Flags: none Version: 2\n"
+    )
+    transcript = td_path / "abi-transcript.txt"
+    for case_id, contents, expected_rc, observed in [
+        ("neg_abi_empty_transcript", "", 2, None),
+        ("neg_abi_incidental_version_string", "GLIBC_2.35\n", 2, None),
+        ("neg_abi_definitions_only", "Version definition section '.gnu.version_d' contains 1 entry:\n"
+         " Name: GLIBC_2.35\n", 2, None),
+        ("pos_abi_needs_ignore_definitions", "Version definition section '.gnu.version_d' contains 1 entry:\n"
+         " Name: GLIBC_999.99\n" + needs_text, 0, "GLIBC_2.35"),
+        ("pos_abi_objdump_ignores_exports",
+         "0000000000000000 g DF .text 0000000000000000 GLIBC_999.99 exported\n"
+         "0000000000000000 DF *UND* 0000000000000000 (GLIBC_2.35) imported\n", 0, "GLIBC_2.35"),
+        ("neg_abi_private_requirement", needs_text.replace("GLIBC_2.35", "GLIBC_PRIVATE"), 2, None),
+        ("neg_abi_unknown_requirement", needs_text.replace("GLIBC_2.35", "VENDOR_1.0"), 2, None),
+        ("neg_abi_truncated_verneed", needs_text.replace("Cnt: 1", "Cnt: 2"), 2, None),
+        ("pos_abi_weak_requirement_is_optional", needs_text.replace("Cnt: 1", "Cnt: 2") +
+         " 0x0020: Name: GLIBC_999.99 Flags: WEAK Version: 3\n", 0, "GLIBC_2.35"),
+    ]:
+        transcript.write_text(contents)
+        abi_case(case_id, ["--symbols-file", str(transcript)], expected_rc, observed=observed)
+    transcript.write_text(needs_text)
+    abi_case("neg_abi_configured_lower_ceiling",
+             ["--max-glibc", "2.34", "--symbols-file", str(transcript)], 1, observed="GLIBC_2.35")
+
+    def make_elf(path, version=None):
+        base = 0x400000
+        ident = b"\x7fELF\x02\x01\x01" + b"\x00" * 9
+        if version is None:
+            # Complete ELF64 executable with one loadable segment and no
+            # interpreter, dynamic section, or imported symbol versions.
+            header = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, base + 120,
+                                         64, 0, 0, 64, 56, 1, 64, 0, 0)
+            segment = struct.pack("<IIQQQQQQ", 1, 5, 0, base, base, 122, 122, 4096)
+            path.write_bytes(header + segment + b"\xeb\xfe")
+            return
+
+        # Construct a complete dynamic ELF with one libc verneed. The parser
+        # must read this structure rather than grepping bytes for GLIBC_*.
+        data = bytearray(64 + 3 * 56)
+
+        def append_blob(blob, alignment=8):
+            data.extend(b"\x00" * (-len(data) % alignment))
+            offset = len(data)
+            data.extend(blob)
+            return offset, len(blob)
+
+        text_offset, text_size = append_blob(b"\xeb\xfe", 1)
+        interp_offset, interp_size = append_blob(b"/lib64/ld-linux-x86-64.so.2\x00", 1)
+        strings = b"\x00libc.so.6\x00" + version.encode("ascii") + b"\x00"
+        strings_offset, strings_size = append_blob(strings, 1)
+        needs = struct.pack("<HHIII", 1, 1, 1, 16, 0) + struct.pack("<IHHII", 0, 0, 2, 11, 0)
+        needs_offset, needs_size = append_blob(needs)
+        dynamic_entries = [
+            (1, 1), (5, base + strings_offset), (10, strings_size),
+            (0x6ffffffe, base + needs_offset), (0x6fffffff, 1), (0, 0),
+        ]
+        dynamic_offset, dynamic_size = append_blob(b"".join(
+            struct.pack("<qQ", tag, value) for tag, value in dynamic_entries
+        ))
+        section_names = [".text", ".interp", ".dynstr", ".gnu.version_r", ".dynamic", ".shstrtab"]
+        name_bytes = b"\x00"
+        name_offsets = {}
+        for name in section_names:
+            name_offsets[name] = len(name_bytes)
+            name_bytes += name.encode("ascii") + b"\x00"
+        names_offset, names_size = append_blob(name_bytes, 1)
+        data.extend(b"\x00" * (-len(data) % 8))
+        section_offset = len(data)
+        data.extend(b"\x00" * 64)
+        sections = [
+            (".text", 1, 6, text_offset, text_size, 0, 0, 1, 0),
+            (".interp", 1, 2, interp_offset, interp_size, 0, 0, 1, 0),
+            (".dynstr", 3, 2, strings_offset, strings_size, 0, 0, 1, 0),
+            (".gnu.version_r", 0x6ffffffe, 2, needs_offset, needs_size, 3, 1, 8, 0),
+            (".dynamic", 6, 2, dynamic_offset, dynamic_size, 3, 0, 8, 16),
+            (".shstrtab", 3, 0, names_offset, names_size, 0, 0, 1, 0),
+        ]
+        for name, kind, flags, offset, size, link, info, alignment, entry_size in sections:
+            data.extend(struct.pack(
+                "<IIQQQQIIQQ", name_offsets[name], kind, flags,
+                base + offset if flags & 2 else 0, offset, size, link, info, alignment, entry_size,
+            ))
+        data[:64] = ident + struct.pack(
+            "<HHIQQQIHHHHHH", 2, 62, 1, base + text_offset, 64, section_offset, 0,
+            64, 56, 3, 64, 7, 6,
+        )
+        programs = [
+            (3, 4, interp_offset, base + interp_offset, base + interp_offset, interp_size, interp_size, 1),
+            (1, 5, 0, base, base, len(data), len(data), 4096),
+            (2, 4, dynamic_offset, base + dynamic_offset, base + dynamic_offset, dynamic_size, dynamic_size, 8),
+        ]
+        data[64:64 + 3 * 56] = b"".join(struct.pack("<IIQQQQQQ", *p) for p in programs)
+        path.write_bytes(data)
+
+    if not any(shutil.which(tool) for tool in ("readelf", "llvm-readelf")):
+        raise SystemExit("readelf or llvm-readelf is required for real ELF ABI regression tests")
+    static_elf = td_path / "static.elf"
+    dynamic_elf = td_path / "dynamic.elf"
+    truncated_elf = td_path / "truncated.elf"
+    make_elf(static_elf)
+    make_elf(dynamic_elf, "GLIBC_2.35")
+    truncated_elf.write_bytes(b"\x7fELF")
+    verdict = abi_case("pos_abi_validated_static_elf", [str(static_elf)], 0)
+    assert verdict["checked_count"] == 1 and all(v is None for v in verdict["max_observed"].values())
+    abi_case("pos_abi_real_dynamic_verneed", [str(dynamic_elf)], 0, observed="GLIBC_2.35")
+    abi_case("neg_abi_truncated_elf", [str(truncated_elf)], 2)
+    unloadable_elf = td_path / "no-load-segment.elf"
+    unloadable_bytes = bytearray(static_elf.read_bytes())
+    unloadable_bytes[64:68] = struct.pack("<I", 0)
+    unloadable_elf.write_bytes(unloadable_bytes)
+    abi_case("neg_abi_missing_load_segment", [str(unloadable_elf)], 2)
+    verdict = abi_case("neg_abi_mixed_valid_and_truncated", [str(static_elf), str(truncated_elf)], 2)
+    assert verdict["checked_count"] == 1
+    for version, expected_rc in [("GLIBC_2.43", 1), ("GLIBC_PRIVATE", 2), ("VENDOR_1.0", 2)]:
+        make_elf(dynamic_elf, version)
+        abi_case("neg_abi_real_import_" + version, [str(dynamic_elf)], expected_rc)
+    make_elf(dynamic_elf, "GLIBC_2.43")
+    abi_case("pos_abi_configured_higher_ceiling", ["--max-glibc", "2.43", str(dynamic_elf)], 0,
+             observed="GLIBC_2.43")
+
+    archive = td_path / "mixed-elf.tar.xz"
+    with tarfile.open(archive, "w:xz") as stream:
+        stream.add(static_elf, arcname="one/ft")
+        stream.add(truncated_elf, arcname="two/ft")
+    abi_case("neg_abi_archive_truncated_member", [str(archive)], 2)
+    with tarfile.open(archive, "w:xz") as stream:
+        stream.add(static_elf, arcname="ft")
+    abi_case("pos_abi_archive_valid_static", [str(archive)], 0)
+    oversized = td_path / "oversized-elf.tar"
+    member = tarfile.TarInfo("ft")
+    member.size = 1024 * 1024 * 1024 + 1
+    # Supply only the header: the size limit must fire before payload access.
+    oversized.write_bytes(member.tobuf(format=tarfile.USTAR_FORMAT) + b"\x00" * 1024)
+    abi_case("neg_abi_archive_expanded_size_bound", [str(oversized)], 2)
+
+    inspector_bin = td_path / "inspectors"
+    inspector_bin.mkdir()
+    inspector_env = dict(os.environ, PATH=str(inspector_bin) + os.pathsep + os.environ["PATH"])
+    for case_id, body in [
+        ("neg_abi_inspector_failure", "printf 'inspection failed\\n' >&2\nexit 1\n"),
+        ("neg_abi_inspector_warning", "printf 'inspection warning\\n' >&2\nexit 0\n"),
+        ("neg_abi_inspector_empty_success", "exit 0\n"),
+    ]:
+        for tool in ("readelf", "llvm-readelf"):
+            inspector = inspector_bin / tool
+            inspector.write_text("#!/bin/sh\n" + body)
+            inspector.chmod(0o755)
+        abi_case(case_id, [str(static_elf)], 2, env=inspector_env)
 
     # 7. Positive/Negative: install.sh release_tag_with_assets skips -appstore.* companion tags & selects newest stable
     releases_fixture = [

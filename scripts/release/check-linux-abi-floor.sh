@@ -59,11 +59,15 @@ fi
 
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 2; }
 
-python3 - "$MAX_GLIBC" "$MAX_GLIBCXX" "$MAX_CXXABI" "$JSON_OUTPUT" \
+# ELF inputs require a successful, bounded readelf inspection. Text fixtures
+# accept readelf --version-info or objdump -T records, never arbitrary strings.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+python3 - "$SCRIPT_DIR/../check-linux-release-abi.py" \
+  "$MAX_GLIBC" "$MAX_GLIBCXX" "$MAX_CXXABI" "$JSON_OUTPUT" \
   "${#SYMBOLS_FILES[@]}" "${SYMBOLS_FILES[@]}" "${TARGETS[@]}" <<'PY'
 import json
-import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -71,28 +75,41 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-max_glibc = sys.argv[1]
-max_glibcxx = sys.argv[2]
-max_cxxabi = sys.argv[3]
-json_output = sys.argv[4] == "1"
-num_sym_files = int(sys.argv[5])
-sym_files = sys.argv[6 : 6 + num_sym_files]
-targets = sys.argv[6 + num_sym_files :]
+# Share the strict, count-checked verneed parser and bounded readelf invocation
+# with the architecture-specific release verifier. Its target/provider policy is
+# intentionally not applied here: this command checks the requested ceilings.
+parser = runpy.run_path(sys.argv[1])
+readelf = parser["readelf"]
+version_needs = parser["version_needs"]
+elf_field = parser["field"]
+supported_name = parser["supported_name"]
+Refusal = parser["Refusal"]
+
+max_glibc = sys.argv[2]
+max_glibcxx = sys.argv[3]
+max_cxxabi = sys.argv[4]
+json_output = sys.argv[5] == "1"
+num_sym_files = int(sys.argv[6])
+sym_files = sys.argv[7 : 7 + num_sym_files]
+targets = sys.argv[7 + num_sym_files :]
 
 FLOORS = {
     "GLIBC": max_glibc,
     "GLIBCXX": max_glibcxx,
     "CXXABI": max_cxxabi,
 }
-
-SYM_RE = re.compile(r"\b(GLIBC|GLIBCXX|CXXABI)_([0-9]+(?:\.[0-9]+)*)\b")
+SYM_RE = re.compile(r"(GLIBC|GLIBCXX|CXXABI)_([0-9]+(?:\.[0-9]+)*)")
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 100_000
+MAX_ARCHIVE_BYTES = 4 * MAX_BINARY_BYTES
+MAX_ARCHIVE_NAME_BYTES = 8 * 1024 * 1024
 
 
 def parse_ver(raw: str) -> tuple[int, ...]:
-    parts = raw.split(".")
-    if not parts or any(not p.isdigit() for p in parts):
+    if len(raw) > 128 or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", raw):
         raise ValueError(f"invalid version string: {raw!r}")
-    return tuple(int(p) for p in parts)
+    return tuple(int(part) for part in raw.split("."))
 
 
 def ver_gt(a: str, b: str) -> bool:
@@ -109,31 +126,148 @@ for fam, raw in FLOORS.items():
         sys.exit(2)
 
 
-def extract_elf_symbols(path: Path) -> str:
-    data = path.read_bytes()
-    if not data.startswith(b"\x7fELF"):
-        raise RuntimeError(f"not a Linux ELF binary: {path}")
-    for tool in ("readelf", "llvm-readelf", "objdump", "llvm-objdump"):
+def required_versions(needs) -> list[str]:
+    result = []
+    for _, _, versions in needs:
+        for name, weak in versions:
+            if not supported_name(name):
+                raise Refusal(f"unsupported ABI requirement: {name}")
+            # Weak verneed entries are optional, not a mandatory ABI floor.
+            if not weak:
+                result.append(name)
+    return result
+
+
+def versions_from_transcript(text: str) -> list[str]:
+    if re.search(r"^Version needs section ", text, re.M):
+        return required_versions(version_needs(text))
+    # objdump -T excerpts are accepted for fixtures. Only undefined symbols
+    # impose requirements; exported definitions and incidental strings do not.
+    requirements = []
+    imports = 0
+    for line in text.splitlines():
+        if "*UND*" not in line:
+            continue
+        match = re.fullmatch(
+            r"\s*[0-9a-fA-F]+\s+[a-zA-Z! \t]*\*UND\*\s+[0-9a-fA-F]+\s+"
+            r"(?:\(([^()\s]+)\)|([^()\s]+))\s+\S+\s*", line
+        )
+        if match is None:
+            raise Refusal("unparsed undefined-symbol record")
+        imports += 1
+        name = match[1] or match[2]
+        if name == "Base":
+            continue
+        if not supported_name(name):
+            raise Refusal(f"unsupported ABI requirement: {name}")
+        requirements.append(name)
+    if imports == 0:
+        raise Refusal("transcript contains no version-needs section or undefined symbols")
+    return requirements
+
+
+def versions_from_reports(header: str, program: str, dynamic: str, versions: str) -> list[str]:
+    if elf_field(header, "Class") not in ("ELF32", "ELF64"):
+        raise Refusal("invalid ELF class")
+    if elf_field(header, "Data") not in (
+        "2's complement, little endian", "2's complement, big endian"
+    ):
+        raise Refusal("invalid ELF byte order")
+    if elf_field(header, "Type").split(" ", 1)[0] not in ("EXEC", "DYN"):
+        raise Refusal("ELF is not an executable or shared object")
+    if not elf_field(header, "Machine") or int(elf_field(header, "Number of program headers")) <= 0:
+        raise Refusal("ELF has no executable program headers")
+    if not re.search(r"^\s*LOAD\s", program, re.M):
+        raise Refusal("ELF has no loadable segment")
+
+    if dynamic.strip() == "There is no dynamic section in this file.":
+        if re.search(r"^\s*INTERP\s", program, re.M) or "[Requesting program interpreter:" in program:
+            raise Refusal("ELF interpreter exists without a dynamic section")
+        if versions.strip() != "No version information found in this file.":
+            raise Refusal("static ELF has unexpected version metadata")
+        return []
+
+    sections = re.findall(
+        r"^Dynamic section .* contains (\d+) entries:\n(.*)\Z", dynamic, re.M | re.S
+    )
+    if len(sections) != 1:
+        raise Refusal("missing or duplicate dynamic section")
+    count, body = sections[0]
+    entries = [
+        line for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("Tag ")
+    ]
+    if len(entries) != int(count) or not all(
+        re.fullmatch(r"\s*0x[0-9a-fA-F]+\s+\([^)]+\)\s+.+", line) for line in entries
+    ):
+        raise Refusal("unparsed or truncated dynamic section")
+    if not re.search(r"\(NULL\)\s+0x0\s*$", dynamic, re.M):
+        raise Refusal("unterminated dynamic section")
+    needed = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", dynamic)
+    if len(needed) != len(re.findall(r"\(NEEDED\)", dynamic)) or len(needed) != len(set(needed)):
+        raise Refusal("unparsed or duplicate dynamic dependency")
+
+    if not re.search(r"^Version needs section ", versions, re.M):
+        if re.search(r"\(VERNEED(?:NUM)?\)", dynamic):
+            raise Refusal("dynamic version-needs metadata has no matching section")
+        if versions.strip() != "No version information found in this file." and not re.search(
+            r"^Version (?:definition|symbols) section ", versions, re.M
+        ):
+            raise Refusal("unrecognized version information")
+        # A fully inspected static PIE or unversioned binary has no versioned
+        # imports. Definitions alone do not impose a libc requirement.
+        return []
+
+    needs = version_needs(versions)
+    if re.findall(r"\(VERNEEDNUM\)\s+(\d+)\s*$", dynamic, re.M) != [str(len(needs))]:
+        raise Refusal("dynamic version provider count mismatch")
+    if len(re.findall(r"\(VERNEED\)", dynamic)) != 1:
+        raise Refusal("missing or duplicate version-needs address")
+    if any(provider not in needed for provider, _, _ in needs):
+        raise Refusal("version provider is absent from dynamic dependencies")
+    return required_versions(needs)
+
+
+def extract_elf_versions(path: Path) -> list[str]:
+    size = path.stat().st_size
+    if size < 4 or size > MAX_BINARY_BYTES:
+        raise Refusal("ELF input is empty, truncated, or exceeds the 1 GiB bound")
+    with path.open("rb") as source:
+        if source.read(4) != b"\x7fELF":
+            raise Refusal(f"not a Linux ELF binary: {path}")
+    failures = []
+    for tool in ("readelf", "llvm-readelf"):
         exe = shutil.which(tool)
         if not exe:
             continue
-        args = [exe, "-V", str(path)] if "readelf" in tool else [exe, "-T", str(path)]
-        res = subprocess.run(args, capture_output=True, text=True)
-        if res.returncode == 0:
-            return res.stdout + "\n" + res.stderr
-    # Fallback: scan dynamic version-needed ASCII strings inside ELF binary
-    # (verneed/dynstr store exact GLIBC_X.Y / GLIBCXX_X.Y.Z / CXXABI_X.Y.Z tokens).
-    return data.decode("latin-1")
+        try:
+            reports = [
+                readelf(exe, option, path) for option in
+                ("--file-header", "--program-headers", "--dynamic", "--version-info")
+            ]
+            return versions_from_reports(*reports)
+        except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+            failures.append(f"{tool}: {error}")
+    if failures:
+        raise Refusal("ELF inspection failed: " + "; ".join(failures))
+    raise Refusal("readelf or llvm-readelf is required; raw-byte scanning is not ABI evidence")
 
 
 checked = []
 violations = []
+inspection_errors = []
 max_observed: dict[str, str | None] = {k: None for k in FLOORS}
 
 
-def audit_text(label: str, text: str) -> None:
+def audit_versions(label: str, versions: list[str], inspection: str) -> None:
     seen: dict[str, set[str]] = {k: set() for k in FLOORS}
-    for fam, ver in SYM_RE.findall(text):
+    for name in versions:
+        match = SYM_RE.fullmatch(name)
+        if match is None:
+            # required_versions already checked the shared explicit namespace
+            # allowlist (including GCC/ZLIB and the named CXXABI exceptions).
+            continue
+        fam, ver = match.groups()
         seen[fam].add(ver)
         cur = max_observed[fam]
         if cur is None or ver_gt(ver, cur):
@@ -143,13 +277,14 @@ def audit_text(label: str, text: str) -> None:
                 {
                     "target": label,
                     "family": fam,
-                    "symbol_version": f"{fam}_{ver}",
+                    "symbol_version": name,
                     "floor": f"{fam}_{FLOORS[fam]}",
                 }
             )
     checked.append(
         {
             "target": label,
+            "inspection": inspection,
             "max_by_family": {
                 fam: (max(vers, key=parse_ver) if vers else None)
                 for fam, vers in seen.items()
@@ -159,49 +294,73 @@ def audit_text(label: str, text: str) -> None:
 
 
 for sf in sym_files:
-    p = Path(sf)
-    if not p.is_file():
-        sys.stderr.write(f"error: symbols file not found: {sf}\n")
-        sys.exit(2)
-    audit_text(f"symbols-file:{sf}", p.read_text(encoding="utf-8", errors="replace"))
+    try:
+        p = Path(sf)
+        if not p.is_file() or not 0 < p.stat().st_size <= MAX_TRANSCRIPT_BYTES:
+            raise Refusal("symbols transcript is missing, empty, or exceeds the 16 MiB bound")
+        audit_versions(
+            f"symbols-file:{sf}",
+            versions_from_transcript(p.read_text(encoding="utf-8")),
+            "symbol_transcript",
+        )
+    except (Refusal, OSError, ValueError) as error:
+        inspection_errors.append({"target": sf, "reason": str(error)})
 
 for raw_target in targets:
-    p = Path(raw_target)
-    if not p.is_file():
-        sys.stderr.write(f"error: target not found: {raw_target}\n")
-        sys.exit(2)
-    if p.name.endswith((".tar.xz", ".tar.gz", ".tar")):
-        with tempfile.TemporaryDirectory(prefix="ft-abi-floor-") as td:
-            with tarfile.open(p, mode="r:*") as tf:
-                elf_count = 0
-                for member in tf.getmembers():
-                    if not member.isfile():
-                        continue
-                    extracted = tf.extractfile(member)
-                    if extracted is None:
-                        continue
-                    head = extracted.read(4)
-                    if head != b"\x7fELF":
-                        continue
-                    elf_count += 1
-                    out = Path(td) / os.path.basename(member.name)
-                    out.write_bytes(head + extracted.read())
-                    audit_text(f"{raw_target}::{member.name}", extract_elf_symbols(out))
-                if elf_count == 0:
-                    violations.append(
-                        {
-                            "target": raw_target,
-                            "family": "ELF",
-                            "symbol_version": "none",
-                            "floor": "at_least_one_elf_binary",
-                        }
-                    )
-    else:
-        try:
-            audit_text(raw_target, extract_elf_symbols(p))
-        except RuntimeError as exc:
-            sys.stderr.write(f"error: {exc}\n")
-            sys.exit(2)
+    try:
+        p = Path(raw_target)
+        if not p.is_file():
+            raise Refusal("target is not a regular file")
+        if p.name.endswith((".tar.xz", ".tar.gz", ".tar")):
+            if p.stat().st_size > MAX_BINARY_BYTES:
+                raise Refusal("archive exceeds the 1 GiB input bound")
+            with tempfile.TemporaryDirectory(prefix="ft-abi-floor-") as td:
+                with tarfile.open(p, mode="r:*") as tf:
+                    elf_count = 0
+                    payload_bytes = 0
+                    name_bytes = 0
+                    for index, member in enumerate(tf):
+                        name_bytes += len(member.name.encode("utf-8", errors="surrogateescape"))
+                        payload_bytes += member.size
+                        if (index >= MAX_ARCHIVE_ENTRIES or
+                                name_bytes > MAX_ARCHIVE_NAME_BYTES or
+                                member.size < 0 or member.size > MAX_BINARY_BYTES or
+                                payload_bytes > MAX_ARCHIVE_BYTES):
+                            raise Refusal("archive exceeds its member, name, or expanded-size bound")
+                        if not member.isfile():
+                            continue
+                        extracted = tf.extractfile(member)
+                        if extracted is None:
+                            raise Refusal("regular archive member could not be read")
+                        with extracted:
+                            head = extracted.read(4)
+                            if head != b"\x7fELF":
+                                continue
+                            elf_count += 1
+                            # Never use archive member paths as filesystem paths,
+                            # including duplicate basenames or traversal names.
+                            out = Path(td) / f"member-{index}.elf"
+                            with out.open("xb") as destination:
+                                destination.write(head)
+                                shutil.copyfileobj(extracted, destination, 1024 * 1024)
+                            audit_versions(
+                                f"{raw_target}::{member.name}",
+                                extract_elf_versions(out),
+                                "elf_version_needs",
+                            )
+                    if elf_count == 0:
+                        violations.append(
+                            {
+                                "target": raw_target,
+                                "family": "ELF",
+                                "symbol_version": "none",
+                                "floor": "at_least_one_elf_binary",
+                            }
+                        )
+        else:
+            audit_versions(raw_target, extract_elf_versions(p), "elf_version_needs")
+    except (Refusal, OSError, ValueError, tarfile.TarError, EOFError) as error:
+        inspection_errors.append({"target": raw_target, "reason": str(error)})
 
 # Deduplicate violations deterministically
 uniq_violations = []
@@ -212,7 +371,7 @@ for v in violations:
         seen_keys.add(key)
         uniq_violations.append(v)
 
-ok = len(uniq_violations) == 0
+ok = not uniq_violations and not inspection_errors
 payload = {
     "schema_version": "frankenterm.linux_abi_floor.v1",
     "ok": ok,
@@ -224,6 +383,8 @@ payload = {
     "checked": checked,
     "violation_count": len(uniq_violations),
     "violations": uniq_violations,
+    "inspection_error_count": len(inspection_errors),
+    "inspection_errors": inspection_errors,
 }
 
 if json_output:
@@ -237,9 +398,14 @@ else:
             f"max_cxxabi={payload['max_observed']['CXXABI'] or 'none'}"
         )
     else:
-        print(f"linux ABI floor check FAILED: {len(uniq_violations)} violation(s)")
+        print(
+            f"linux ABI floor check FAILED: {len(uniq_violations)} violation(s), "
+            f"{len(inspection_errors)} inspection error(s)"
+        )
         for v in uniq_violations:
             print(f"  FAIL {v['target']}: requires {v['symbol_version']} > floor {v['floor']}")
+        for error in inspection_errors:
+            print(f"  ERROR {error['target']}: {error['reason']}")
 
-sys.exit(0 if ok else 1)
+sys.exit(2 if inspection_errors else (0 if ok else 1))
 PY
