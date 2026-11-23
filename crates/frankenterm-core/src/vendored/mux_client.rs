@@ -14584,11 +14584,9 @@ mod tests {
                     .await
                     .expect("connect");
                     client
-                        .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
-                            11,
-                            1,
-                            "retained before abandonment",
-                        )))
+                        .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
+                            test_render_change(11, 1, "retained before abandonment"),
+                        ))
                         .expect("retain unrelated render state");
                     let mut operation = Box::pin(async {
                         match family {
@@ -14639,7 +14637,10 @@ mod tests {
                     }
                     drop(operation);
 
-                    assert!(client.connection_poisoned, "{family:?}, explicit={explicit_cx}");
+                    assert!(
+                        client.connection_poisoned,
+                        "{family:?}, explicit={explicit_cx}"
+                    );
                     assert_eq!(client.poison_transition_count, 1);
                     assert!(client.outstanding_requests.is_empty());
                     assert!(client.pending_responses.is_empty());
@@ -14700,7 +14701,12 @@ mod tests {
                 )
                 .await;
                 let mut first_byte = [0; 1];
-                assert_eq!(unix_stream_read(&mut stream, &mut first_byte).await.unwrap(), 1);
+                assert_eq!(
+                    unix_stream_read(&mut stream, &mut first_byte)
+                        .await
+                        .unwrap(),
+                    1
+                );
                 observed_tx.send(()).expect("signal partial frame");
                 crate::runtime_async::oneshot_recv(drain_rx)
                     .await
@@ -14796,7 +14802,7 @@ mod tests {
             );
             assert_cancelled_mux_error(
                 &client
-                    .get_lines_with_cx(&cancelled, 7, vec![0..1])
+                    .get_lines_with_cx(&cancelled, 7, std::iter::once(0..1).collect())
                     .await
                     .unwrap_err(),
             );
@@ -14804,19 +14810,38 @@ mod tests {
             client.config.max_outstanding_requests = 0;
             let error = client.list_panes_with_cx(&cx).await.unwrap_err();
             assert!(error.is_proven_pre_write_rejection());
-            let error = client.get_pane_render_changes_with_cx(&cx, 7).await.unwrap_err();
+            let error = client
+                .get_pane_render_changes_with_cx(&cx, 7)
+                .await
+                .unwrap_err();
             assert!(error.is_proven_pre_write_rejection());
             client.config.max_outstanding_requests = capacity;
             assert_eq!(client.serial, serial);
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);
             assert!(client.outstanding_requests.is_empty());
-            assert_eq!(client.pending_render_changes.retained_bytes(), retained_bytes);
-            assert_eq!(client.render_change_snapshots.retained_bytes(), snapshot_bytes);
-            assert!(client.list_panes_with_cx(&cx).await.unwrap().tabs.is_empty());
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                retained_bytes
+            );
+            assert_eq!(
+                client.render_change_snapshots.retained_bytes(),
+                snapshot_bytes
+            );
+            assert!(
+                client
+                    .list_panes_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .tabs
+                    .is_empty()
+            );
             assert_eq!(client.serial, serial + 1);
             drop(client);
-            timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+            timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
         });
     }
 
