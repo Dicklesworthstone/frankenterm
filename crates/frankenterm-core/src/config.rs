@@ -3800,6 +3800,39 @@ pub struct RedactionConfig {
     pub redact_segments: bool,
 }
 
+impl RedactionConfig {
+    /// Build the shared secret policy for persistence and outbound reads.
+    ///
+    /// Validate here as well as at configuration load: storage and embedded
+    /// MCP callers can construct a config directly. A regex may itself contain
+    /// a literal secret, so neither it nor the regex diagnostic may escape.
+    pub fn build_redactor(&self) -> crate::Result<crate::redactor::Redactor> {
+        if !self.enabled || !self.redact_audit || !self.redact_segments {
+            return Err(crate::error::ConfigError::ValidationError(
+                "safety.redaction enabled/redact_audit/redact_segments cannot be disabled; built-in secret redaction is mandatory"
+                    .to_string(),
+            )
+            .into());
+        }
+        if self.placeholder.trim().is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(
+                "safety.redaction.placeholder must be non-empty".to_string(),
+            )
+            .into());
+        }
+        crate::redactor::Redactor::with_custom_patterns_and_placeholder(
+            &self.patterns,
+            Some(&self.placeholder),
+        )
+        .map_err(|_| {
+            crate::error::ConfigError::ValidationError(
+                "safety.redaction.patterns contains an invalid regex".to_string(),
+            )
+            .into()
+        })
+    }
+}
+
 impl Default for RedactionConfig {
     fn default() -> Self {
         Self {

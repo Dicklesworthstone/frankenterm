@@ -12,6 +12,50 @@ pub trait AuditFieldRedactor {
     fn redact(&self, value: &str) -> String;
 }
 
+/// JSON fields must be redacted after decoding: a pattern containing a newline
+/// cannot match its serialized escape, and a quoted marker must be re-escaped.
+fn redact_json_field<R: AuditFieldRedactor>(value: &str, redactor: &R) -> String {
+    fn redact_strings<R: AuditFieldRedactor>(value: &mut serde_json::Value, redactor: &R) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                let redacted = redactor.redact(text);
+                if redacted == *text {
+                    false
+                } else {
+                    *text = redacted;
+                    true
+                }
+            }
+            serde_json::Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= redact_strings(value, redactor);
+                }
+                changed
+            }
+            serde_json::Value::Object(values) => {
+                let mut changed = false;
+                for value in values.values_mut() {
+                    changed |= redact_strings(value, redactor);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(mut parsed) => {
+            if redact_strings(&mut parsed, redactor) {
+                parsed.to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        Err(_) => redactor.redact(value),
+    }
+}
+
 /// Workflow step log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStepLogRecord {
@@ -101,7 +145,7 @@ impl AuditActionRecord {
         self.decision_context = self
             .decision_context
             .as_ref()
-            .map(|value| redactor.redact(value));
+            .map(|value| redact_json_field(value, redactor));
     }
 }
 
@@ -238,7 +282,7 @@ impl ActionUndoRecord {
         self.undo_payload = self
             .undo_payload
             .as_ref()
-            .map(|value| redactor.redact(value));
+            .map(|value| redact_json_field(value, redactor));
     }
 }
 
@@ -393,4 +437,76 @@ pub struct ActionHistoryQuery {
     pub since: Option<i64>,
     /// Filter by time range end, in epoch milliseconds.
     pub until: Option<i64>,
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    const MARKER: &str = "\"PRIVATE\"\n$0";
+
+    struct MultilineRedactor;
+
+    impl AuditFieldRedactor for MultilineRedactor {
+        fn redact(&self, value: &str) -> String {
+            value.replace("CANARY\nVALUE", MARKER)
+        }
+    }
+
+    #[test]
+    fn structured_audit_fields_decode_secrets_and_escape_literal_markers() {
+        let input = serde_json::json!({
+            "nested": [{"value": "CANARY\nVALUE"}, 42, false, null],
+            "safe": "keep",
+        })
+        .to_string();
+        let mut action = AuditActionRecord {
+            id: 1,
+            ts: 1,
+            actor_kind: "robot".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: Some(input.clone()),
+            result: "success".to_string(),
+        };
+        let mut undo = ActionUndoRecord {
+            audit_action_id: 1,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: Some("CANARY\nVALUE".to_string()),
+            undo_payload: Some(input),
+            undone_at: None,
+            undone_by: None,
+        };
+        action.redact_fields(&MultilineRedactor);
+        undo.redact_fields(&MultilineRedactor);
+        for field in [action.decision_context, undo.undo_payload] {
+            let parsed: serde_json::Value = serde_json::from_str(&field.unwrap())
+                .expect("quoted and multiline markers must remain valid JSON");
+            assert_eq!(parsed["nested"][0]["value"], MARKER);
+            assert_eq!(parsed["nested"][1], 42);
+            assert_eq!(parsed["nested"][2], false);
+            assert!(parsed["nested"][3].is_null());
+            assert_eq!(parsed["safe"], "keep");
+        }
+        assert_eq!(undo.undo_hint.as_deref(), Some(MARKER));
+    }
+
+    #[test]
+    fn structured_audit_redaction_preserves_clean_json_and_handles_opaque_text() {
+        let clean = " { \"safe\": [42, false, null] } ";
+        assert_eq!(redact_json_field(clean, &MultilineRedactor), clean);
+        assert_eq!(
+            redact_json_field("{opaque: CANARY\nVALUE", &MultilineRedactor),
+            format!("{{opaque: {MARKER}")
+        );
+    }
 }

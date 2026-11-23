@@ -10414,10 +10414,23 @@ impl ObservationRuntime {
                             if let Some(decision) = resync_decision.as_mut() {
                                 decision.finish(Ok(persisted.segment.seq));
                             }
-                            if let Some(ref adapter) = replay_capture {
+                            let recorded_segment =
+                                (replay_capture.is_some() || recording.is_some()).then(|| {
+                                    CapturedSegment {
+                                        pane_id,
+                                        seq: persisted.segment.seq,
+                                        seq_correction: bounded_segment.seq_correction,
+                                        content: persisted.segment.content.clone(),
+                                        kind: bounded_segment.kind.clone(),
+                                        captured_at,
+                                    }
+                                });
+                            if let (Some(adapter), Some(recorded_segment)) =
+                                (replay_capture.as_ref(), recorded_segment.as_ref())
+                            {
                                 if let Err(error) = record_authorized_replay_egress(
                                     adapter,
-                                    &bounded_segment,
+                                    recorded_segment,
                                     persisted.segment.seq,
                                     &persistence_guard,
                                 ) {
@@ -10442,10 +10455,12 @@ impl ObservationRuntime {
                                 "Persisted segment"
                             );
 
-                            if let Some(ref manager) = recording {
+                            if let (Some(manager), Some(recorded_segment)) =
+                                (recording.as_ref(), recorded_segment.as_ref())
+                            {
                                 // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
                                 if let Err(err) = manager
-                                    .record_segment_with_cx(&loop_cx, &bounded_segment)
+                                    .record_segment_with_cx(&loop_cx, recorded_segment)
                                     .await
                                 {
                                     warn!(
@@ -10548,12 +10563,16 @@ impl ObservationRuntime {
                                 // Persist each detection as an event
                                 // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
                                 for detection in detections {
+                                    // Every egress uses the writer's operator policy,
+                                    // including the recorder and live subscribers.
+                                    let redacted_detection =
+                                        redact_detection_with(&detection, storage.redactor());
                                     if let Some(ref manager) = recording {
                                         if let Err(err) = manager
                                             .record_event_with_cx(
                                                 &loop_cx,
                                                 pane_id,
-                                                &detection,
+                                                &redacted_detection,
                                                 captured_at,
                                             )
                                             .await
@@ -10571,6 +10590,7 @@ impl ObservationRuntime {
                                         pane_uuid.as_deref(),
                                         &detection,
                                         Some(persisted.segment.id),
+                                        storage.redactor(),
                                     );
 
                                     // ft-xbnl0.2.3 tick 251: cx-first event record.
@@ -10644,7 +10664,7 @@ impl ObservationRuntime {
                                                         crate::events::Event::PatternDetected {
                                                             pane_id,
                                                             pane_uuid: pane_uuid.clone(),
-                                                            detection: redact_detection(&detection),
+                                                            detection: redacted_detection,
                                                             event_id: Some(event_id),
                                                         };
                                                     let delivered = bus.publish(event);
@@ -14136,10 +14156,15 @@ fn redact_json_leaves(value: &mut serde_json::Value, redactor: &Redactor) {
 /// `EventBus` subscribers (SSE), distributed aggregators — ever sees a raw match.
 /// Redaction is idempotent. (gauntlet FND-010 / INV-RED-1.)
 pub fn redact_detection(detection: &Detection) -> Detection {
-    let redactor = Redactor::new();
+    redact_detection_with(detection, &Redactor::new())
+}
+
+/// Redact a detection with the same configured policy used by persistence.
+/// Stable event identity and routing fields remain unchanged.
+pub fn redact_detection_with(detection: &Detection, redactor: &Redactor) -> Detection {
     let mut redacted = detection.clone();
     redacted.matched_text = redactor.redact(&detection.matched_text);
-    redact_json_leaves(&mut redacted.extracted, &redactor);
+    redact_json_leaves(&mut redacted.extracted, redactor);
     redacted
 }
 
@@ -14154,6 +14179,7 @@ fn detection_to_stored_event(
     pane_uuid: Option<&str>,
     detection: &Detection,
     segment_id: Option<i64>,
+    redactor: &Redactor,
 ) -> StoredEvent {
     const EVENT_DEDUPE_BUCKET_MS: i64 = 5 * 60 * 1000;
     let detected_at = epoch_ms();
@@ -14179,7 +14205,7 @@ fn detection_to_stored_event(
             Some(format!("{identity_key}:{bucket}"))
         };
 
-    let redacted = redact_detection(detection);
+    let redacted = redact_detection_with(detection, redactor);
 
     StoredEvent {
         id: 0, // Will be assigned by storage
@@ -21053,7 +21079,13 @@ mod tests {
             span: (0, 0),
         };
 
-        let event = detection_to_stored_event(42, Some("pane-uuid"), &detection, Some(123));
+        let event = detection_to_stored_event(
+            42,
+            Some("pane-uuid"),
+            &detection,
+            Some(123),
+            &Redactor::new(),
+        );
 
         assert_eq!(event.pane_id, 42);
         assert_eq!(event.rule_id, "test.rule");
@@ -21095,7 +21127,13 @@ mod tests {
             span: (0, 1),
         };
 
-        let event = detection_to_stored_event(7, Some("pane-redaction"), &detection, Some(11));
+        let event = detection_to_stored_event(
+            7,
+            Some("pane-redaction"),
+            &detection,
+            Some(11),
+            &Redactor::new(),
+        );
 
         let matched_text = event
             .matched_text
@@ -21111,6 +21149,59 @@ mod tests {
         assert_eq!(extracted["nested"]["safe"], "ordinary");
         assert_eq!(extracted["array"][1].as_i64(), Some(42));
         assert_eq!(extracted["array"][2].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn configured_detection_redaction_preserves_identity_and_masks_every_payload() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec![r"ACME_[A-Z]{12}".to_string()];
+        config.placeholder = "[PRIVATE]".to_string();
+        let redactor = config.build_redactor().unwrap();
+        let builtin = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let detection = Detection {
+            rule_id: "test.configured_redaction".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "command.failed".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.99,
+            extracted: serde_json::json!({
+                "nested": {"value": "ACME_ABCDEFGHIJKL", "ordinary": "keep"},
+                "array": [builtin, "ACME_ABCDEFGHIJKL", 42, false],
+            }),
+            matched_text: format!("ACME_ABCDEFGHIJKL {builtin}"),
+            span: (11, 91),
+        };
+
+        let live = redact_detection_with(&detection, &redactor);
+        assert_eq!(live.matched_text, "[PRIVATE] [PRIVATE]");
+        assert_eq!(live.extracted["nested"]["value"], "[PRIVATE]");
+        assert_eq!(live.extracted["nested"]["ordinary"], "keep");
+        assert_eq!(live.extracted["array"][0], "[PRIVATE]");
+        assert_eq!(live.extracted["array"][1], "[PRIVATE]");
+        assert_eq!(live.extracted["array"][2], 42);
+        assert_eq!(live.extracted["array"][3], false);
+        assert_eq!(live.rule_id, detection.rule_id);
+        assert_eq!(live.span, detection.span);
+        assert_eq!(live.agent_type, detection.agent_type);
+
+        let stored = detection_to_stored_event(
+            1,
+            Some("pane-a"),
+            &detection,
+            Some(100),
+            &redactor,
+        );
+        let builtin_only = detection_to_stored_event(
+            1,
+            Some("pane-a"),
+            &detection,
+            Some(100),
+            &Redactor::new(),
+        );
+        assert_eq!(stored.matched_text.as_ref(), Some(&live.matched_text));
+        assert_eq!(stored.extracted.as_ref(), Some(&live.extracted));
+        assert_eq!(stored.dedupe_key, builtin_only.dedupe_key);
+        assert!(detection.matched_text.contains("ACME_ABCDEFGHIJKL"));
     }
 
     fn test_detection(event_type: &str, severity: Severity) -> Detection {
@@ -26167,7 +26258,7 @@ mod tests {
             span: (10, 20),
         };
 
-        let event = detection_to_stored_event(99, None, &detection, None);
+        let event = detection_to_stored_event(99, None, &detection, None, &Redactor::new());
         assert_eq!(event.pane_id, 99);
         assert_eq!(event.severity, "warning");
         assert_eq!(event.segment_id, None);
@@ -26187,7 +26278,13 @@ mod tests {
             span: (0, 13),
         };
 
-        let event = detection_to_stored_event(1, Some("uuid-abc"), &detection, Some(42));
+        let event = detection_to_stored_event(
+            1,
+            Some("uuid-abc"),
+            &detection,
+            Some(42),
+            &Redactor::new(),
+        );
         assert_eq!(event.severity, "critical");
         assert_eq!(event.segment_id, Some(42));
         assert_eq!(event.matched_text.as_deref(), Some("out of memory"));
@@ -26197,7 +26294,7 @@ mod tests {
     #[test]
     fn detection_to_stored_event_dedupe_key_contains_bucket() {
         let detection = test_detection("test.event", Severity::Info);
-        let event = detection_to_stored_event(1, None, &detection, None);
+        let event = detection_to_stored_event(1, None, &detection, None, &Redactor::new());
         let key = event.dedupe_key.as_ref().unwrap();
         // Dedupe key should contain a colon separating identity key from bucket
         assert!(key.contains(':'));
@@ -26205,27 +26302,32 @@ mod tests {
 
     #[test]
     fn command_failure_storage_identity_preserves_occurrences_and_exact_replays() {
+        let redactor = Redactor::new();
         for event_type in ["command.failed", "build.failed", "test.failed"] {
             let mut detection = test_detection(event_type, Severity::Warning);
             detection.span = (10, 80);
-            let first = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
-            let replay = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
-            let next = detection_to_stored_event(1, Some("pane-a"), &detection, Some(101));
+            let first =
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &redactor);
+            let replay =
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &redactor);
+            let next =
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(101), &redactor);
             assert_eq!(first.dedupe_key, replay.dedupe_key);
             assert_ne!(first.dedupe_key, next.dedupe_key);
 
             detection.span = (90, 160);
             let second_in_segment =
-                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &redactor);
             assert_ne!(first.dedupe_key, second_in_segment.dedupe_key);
             assert!(
-                detection_to_stored_event(1, Some("pane-a"), &detection, None)
+                detection_to_stored_event(1, Some("pane-a"), &detection, None, &redactor)
                     .dedupe_key
                     .is_none()
             );
 
             detection.severity = Severity::Info;
-            let informational = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+            let informational =
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &redactor);
             assert_eq!(
                 informational.dedupe_key,
                 Some(format!(
@@ -26252,8 +26354,13 @@ mod tests {
                 let segment = storage.append_segment(1, output, None).await.unwrap();
                 let detections = engine.detect_with_context(output, &mut context);
                 assert_eq!(detections.len(), 1);
-                let event =
-                    detection_to_stored_event(1, Some("pane-a"), &detections[0], Some(segment.id));
+                let event = detection_to_stored_event(
+                    1,
+                    Some("pane-a"),
+                    &detections[0],
+                    Some(segment.id),
+                    storage.redactor(),
+                );
                 let inserted = storage.record_event_outcome(event.clone()).await.unwrap();
                 assert!(inserted.was_inserted());
                 event_ids.push(inserted.event_id());

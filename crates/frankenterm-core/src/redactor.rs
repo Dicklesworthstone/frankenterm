@@ -944,6 +944,80 @@ impl Redactor {
         }
     }
 
+    /// Apply additional matches proved in a larger source context without
+    /// changing the context seen by the ordinary whole-text redaction pass.
+    /// Spans are UTF-8 byte ranges in `text`, not offsets in redacted output.
+    #[allow(
+        dead_code,
+        reason = "shared source is also compiled by frankenterm-redactor without the storage writer"
+    )]
+    pub(crate) fn redact_with_source_spans(
+        &self,
+        text: &str,
+        source_spans: &[(usize, usize)],
+    ) -> String {
+        if source_spans.is_empty() {
+            return self.redact(text);
+        }
+        let mut provenance = RedactionProvenance::new(text.len());
+        let redacted = self.redact_observed(text, |name, regex, input, replacement_len| {
+            provenance.record_pass(name, regex, input, replacement_len);
+        });
+
+        // Project every still-retained source byte onto the final output. An
+        // earlier replacement may shorten the text or remove part/all of an
+        // additional match; applying original offsets to that output is unsafe.
+        let mut output_spans = Vec::new();
+        for &(start, end) in source_spans {
+            debug_assert!(start <= end && end <= text.len());
+            debug_assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
+            let mut projected: Option<(usize, usize)> = None;
+            for span in &provenance.retained {
+                let source_end = span.source_start + span.output_end - span.output_start;
+                let overlap_start = start.max(span.source_start);
+                let overlap_end = end.min(source_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                let output_start = span.output_start + overlap_start - span.source_start;
+                let output_end = span.output_start + overlap_end - span.source_start;
+                projected = Some(match projected {
+                    Some((first, _)) => (first, output_end),
+                    None => (output_start, output_end),
+                });
+            }
+            if let Some(span) = projected {
+                output_spans.push(span);
+            }
+        }
+        if output_spans.is_empty() {
+            return redacted;
+        }
+
+        // All coordinates refer to the same final-output snapshot. Merge
+        // overlapping envelopes before constructing the result in one pass.
+        output_spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in output_spans {
+            if let Some(previous) = merged.last_mut()
+                && start < previous.1
+            {
+                previous.1 = previous.1.max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        let mut result = String::with_capacity(redacted.len());
+        let mut cursor = 0;
+        for (start, end) in merged {
+            result.push_str(&redacted[cursor..start]);
+            result.push_str(self.marker());
+            cursor = end;
+        }
+        result.push_str(&redacted[cursor..]);
+        result
+    }
+
     fn redact_observed(
         &self,
         text: &str,
@@ -2073,6 +2147,41 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn contextual_source_spans_follow_replacements_and_preserve_suffix_context() {
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[r"\BSECRET\B".to_string(), r"\BTOKEN\B".to_string()],
+            Some("$0"),
+        )
+        .unwrap();
+        // SECRET starts in the previous chunk; TOKEN is adjacent and must be
+        // redacted with the original whole-chunk context, before the overlay.
+        assert_eq!(
+            redactor.redact_with_source_spans("CRETTOKENz", &[(0, 4)]),
+            "$0$0z"
+        );
+
+        let input = "sk-abcdefghijklmnopqrstuvwxyz012345 café CANARY end";
+        let start = input.find("CANARY").unwrap();
+        assert_eq!(
+            redactor.redact_with_source_spans(input, &[(start, start + 6)]),
+            "$0 café $0 end"
+        );
+        // Both inputs use source coordinates, including overlaps; already
+        // removed bytes must not produce additional markers or stale offsets.
+        assert_eq!(
+            redactor.redact_with_source_spans(
+                input,
+                &[(start, start + 4), (start + 2, start + 6)],
+            ),
+            "$0 café $0 end"
+        );
+        assert_eq!(
+            redactor.redact_with_source_spans("xSECRETz", &[(1, 7)]),
+            "x$0z"
+        );
+    }
 
     #[test]
     fn configured_markers_are_literal_for_builtin_and_custom_secrets() {

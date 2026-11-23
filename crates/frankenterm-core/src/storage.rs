@@ -1654,6 +1654,9 @@ pub struct StorageConfig {
     pub read_pool_size: usize,
     /// Reservation TTL policy applied by the writer to every new lease.
     pub reservation_config: PaneReservationConfig,
+    /// Mandatory built-in and operator-defined redaction for durable content.
+    /// Compiled before the database is opened; invalid patterns fail closed.
+    pub redaction_config: crate::config::RedactionConfig,
     /// [ft-wk5fo] Opt out of the synchronous FTS5 triggers.
     ///
     /// When `true`, the three `output_segments_a[iud]` triggers at
@@ -1703,6 +1706,7 @@ impl Default for StorageConfig {
             write_queue_size: 1024,
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             reservation_config: PaneReservationConfig::default(),
+            redaction_config: crate::config::RedactionConfig::default(),
             defer_fts_triggers: false,
             group_commit_events: false,
             group_commit_adaptive: false,
@@ -1731,10 +1735,11 @@ impl From<&crate::config::StorageConfig> for StorageConfig {
 }
 
 impl From<&crate::config::Config> for StorageConfig {
-    /// Include safety settings whenever opening a production reservation writer.
+    /// Include safety settings whenever opening a production storage writer.
     fn from(app: &crate::config::Config) -> Self {
         Self {
             reservation_config: PaneReservationConfig::from(&app.safety.reservations),
+            redaction_config: app.safety.redaction.clone(),
             ..Self::from(&app.storage)
         }
     }
@@ -3238,6 +3243,8 @@ pub struct StorageHandle {
     read_pool_size: usize,
     /// Immutable reservation policy shared by every clone of this handle.
     reservation_config: PaneReservationConfig,
+    /// The same immutable redactor used by the writer and outbound readers.
+    redactor: Arc<Redactor>,
     /// Optional mmap mirror directory for segment fast-path reads.
     mmap_mirror_dir: Option<Arc<PathBuf>>,
     /// Durable writer join authority and terminal receipt, shared by clones.
@@ -3481,6 +3488,13 @@ impl StorageHandle {
     #[must_use]
     pub fn db_path(&self) -> &str {
         self.db_path.as_str()
+    }
+
+    /// Configured redaction shared with the durable writer. Read/export paths
+    /// also apply it to historical rows captured before these rules existed.
+    #[must_use]
+    pub fn redactor(&self) -> &Redactor {
+        self.redactor.as_ref()
     }
 
     /// Update semantic latency/cost budget configuration.
@@ -4030,6 +4044,7 @@ impl StorageHandle {
         backend_provider: Arc<dyn StorageBackendProvider>,
     ) -> Result<Self> {
         config.reservation_config.validate()?;
+        let redactor = Arc::new(config.redaction_config.build_redactor()?);
         if let Some(cx) = cx {
             Self::checkpoint_storage_open(cx, "before parent directory setup")?;
         }
@@ -4086,6 +4101,7 @@ impl StorageHandle {
         let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
         let io_summary_for_writer = Arc::clone(&write_tx.io_summary);
         let mmap_runtime_for_writer = mmap_runtime.clone();
+        let redactor_for_writer = Arc::clone(&redactor);
         #[cfg(test)]
         let receive_gate = Arc::clone(&write_tx.receive_gate);
 
@@ -4120,6 +4136,7 @@ impl StorageHandle {
                     &writer_wakeup_for_writer,
                     group_commit_adaptive,
                     Some(&io_summary_for_writer),
+                    redactor_for_writer,
                 );
             })
             .map_err(|e| {
@@ -4133,6 +4150,7 @@ impl StorageHandle {
             backend_provider,
             read_pool_size: config.read_pool_size.max(1),
             reservation_config: config.reservation_config,
+            redactor,
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
             writer_join_state: Arc::new(WriterJoinAuthority::new(writer_handle)),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
@@ -4581,6 +4599,7 @@ impl StorageHandle {
         capture_hold: Option<CapturePersistenceHold>,
     ) -> Result<EventRecordOutcome> {
         Self::checkpoint_storage_operation(cx, "record_event")?;
+        let event = crate::export::redact_event(event, self.redactor());
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5143,9 +5162,10 @@ impl StorageHandle {
     pub async fn record_audit_action_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        action: AuditActionRecord,
+        mut action: AuditActionRecord,
     ) -> Result<i64> {
         Self::checkpoint_storage_operation(cx, "record_audit_action")?;
+        action.redact_fields(self.redactor());
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5186,6 +5206,7 @@ impl StorageHandle {
         verification_summary: String,
     ) -> Result<bool> {
         Self::checkpoint_storage_operation(cx, "update_audit_action_submit_receipt")?;
+        let verification_summary = self.redactor().redact(&verification_summary);
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5213,8 +5234,8 @@ impl StorageHandle {
     /// ft-h90rh: persist a policy-denied audit row (Deny / RequireApproval
     /// from the MCP mutation gate). Complements
     /// `record_audit_action_redacted` but writes to the dedicated
-    /// `policy_denied_audit` table. `reason` is expected to already be
-    /// policy-engine-redacted; this method does not re-redact.
+    /// `policy_denied_audit` table. The configured storage policy also redacts
+    /// the reason, including when a caller has already applied built-in rules.
     pub async fn record_policy_denial_audit(&self, record: PolicyDeniedAuditRecord) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.record_policy_denial_audit_with_cx(&cx, record).await
@@ -5224,9 +5245,10 @@ impl StorageHandle {
     pub async fn record_policy_denial_audit_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        record: PolicyDeniedAuditRecord,
+        mut record: PolicyDeniedAuditRecord,
     ) -> Result<i64> {
         Self::checkpoint_storage_operation(cx, "record_policy_denial_audit")?;
+        record.reason = self.redactor().redact(&record.reason);
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5243,15 +5265,13 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
     ///
-    /// Redacts in-process (synchronous), then routes through the
-    /// cx-first record_audit_action path. 11+ callsites.
+    /// Routes through the mandatory configured redaction at the cx-first
+    /// record_audit_action boundary. 11+ callsites.
     pub async fn record_audit_action_redacted_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        mut action: AuditActionRecord,
+        action: AuditActionRecord,
     ) -> Result<i64> {
-        let redactor = Redactor::new();
-        action.redact_fields(&redactor);
         self.record_audit_action_with_cx(cx, action).await
     }
 
@@ -5266,9 +5286,10 @@ impl StorageHandle {
     pub async fn upsert_action_undo_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        record: ActionUndoRecord,
+        mut record: ActionUndoRecord,
     ) -> Result<()> {
         Self::checkpoint_storage_operation(cx, "upsert_action_undo")?;
+        record.redact_fields(self.redactor());
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -5291,17 +5312,13 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo_redacted`].
     ///
-    /// Routes the post-redaction persistence through
-    /// `upsert_action_undo_with_cx` so the full composite honours
-    /// cancellation.
+    /// Routes through `upsert_action_undo_with_cx` so mandatory configured
+    /// redaction and cancellation apply to every caller.
     pub async fn upsert_action_undo_redacted_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        mut record: ActionUndoRecord,
+        record: ActionUndoRecord,
     ) -> Result<()> {
-        Self::checkpoint_storage_operation(cx, "upsert_action_undo_redacted")?;
-        let redactor = Redactor::new();
-        record.redact_fields(&redactor);
         self.upsert_action_undo_with_cx(cx, record).await
     }
 
@@ -8071,7 +8088,7 @@ impl StorageHandle {
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<bool> {
         Self::checkpoint_storage_operation(cx, "abort_workflow")?;
-        action.redact_fields(&Redactor::new());
+        action.redact_fields(self.redactor());
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -13057,7 +13074,7 @@ fn dispatch_write_command_batch(
     mut batch: VecDeque<WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     io_gate: &mut StorageIoWriterGate,
     group_commit_events: bool,
 ) -> Option<WriterDispatchInterruption> {
@@ -13175,7 +13192,7 @@ fn flush_storage_io_pending_commands(
     pending_io: &mut HashMap<u64, WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     io_gate: &mut StorageIoWriterGate,
     group_commit_events: bool,
 ) -> Option<WriterDispatchInterruption> {
@@ -13477,7 +13494,7 @@ fn flush_event_gap_group_recovering(
     backend: &dyn StorageBackend,
     pending_event_gap: &mut Vec<PendingEventOrGap>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Option<WriterDispatchInterruption> {
     if pending_event_gap.is_empty() {
         return None;
@@ -13550,7 +13567,7 @@ fn event_gap_group_commit_backend(
     backend: &dyn StorageBackend,
     group: &[PendingEventOrGap],
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<Vec<EventGapCommitResult>> {
     if group.is_empty() {
         return Ok(Vec::new());
@@ -13561,7 +13578,7 @@ fn event_gap_group_commit_backend(
         if let PendingEventOrGap::Gap { pane_id, .. } = pending {
             gap_redactor_snapshots
                 .entry(*pane_id)
-                .or_insert_with(|| segment_redactors.get(pane_id).cloned());
+                .or_insert_with(|| segment_redactors.panes.get(pane_id).cloned());
         }
     }
 
@@ -13589,7 +13606,7 @@ fn event_gap_group_commit_inner(
     backend: &dyn StorageBackend,
     group: &[PendingEventOrGap],
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<Vec<EventGapCommitResult>> {
     let mut results = Vec::with_capacity(group.len());
     for pending in group {
@@ -13796,7 +13813,7 @@ fn flush_append_segment_group_recovering(
     backend: &dyn StorageBackend,
     pending_append_segments: &mut Vec<PendingAppendSegmentWrite>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Option<WriterDispatchInterruption> {
     if pending_append_segments.is_empty() {
         return None;
@@ -14162,7 +14179,7 @@ fn dispatch_write_command_raw_recovering(
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Option<WriterDispatchInterruption> {
     let _writer_authority = WriterDispatchAuthority::enter();
     let _ = take_writer_backend_epoch_poisoned_signal();
@@ -14491,8 +14508,12 @@ fn writer_loop(
     writer_wakeup: &WriterWakeup,
     group_commit_adaptive: bool,
     io_summary: Option<&Arc<Mutex<Option<StorageIoOperatorSummary>>>>,
+    redactor: Arc<Redactor>,
 ) {
-    let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+    let mut segment_redactors = SegmentRedactionState {
+        redactor,
+        panes: HashMap::new(),
+    };
     let mut io_gate = StorageIoWriterGate::default();
     io_gate.summary_slot = io_summary.cloned();
 
@@ -14626,7 +14647,7 @@ fn writer_loop(
                     // and clear in-memory redaction state without issuing even
                     // one more backend call on this connection.
                     *mmap_mirror = None;
-                    segment_redactors.clear();
+                    segment_redactors.panes.clear();
                     close_and_drain_writer_queue(
                         rx,
                         queued_depth,
@@ -15642,6 +15663,7 @@ mod writer_epoch_transaction_tests {
                 &WriterWakeup::new(),
                 true,
                 None,
+                Arc::new(Redactor::new()),
             );
 
             let first = crate::runtime_async::oneshot_recv(first_rx)
@@ -15731,6 +15753,7 @@ mod writer_epoch_transaction_tests {
                 &WriterWakeup::new(),
                 false,
                 None,
+                Arc::new(Redactor::new()),
             );
 
             crate::runtime_async::oneshot_recv(shutdown_rx)
@@ -16513,7 +16536,7 @@ mod writer_io_scheduler_tests {
                 .expect("release writer lock");
             early
         });
-        let mut redactors = HashMap::new();
+        let mut redactors = SegmentRedactionState::default();
         let result = append_segment_commit_backend(
             backend.as_ref(),
             71,
@@ -16556,7 +16579,7 @@ mod writer_io_scheduler_tests {
             })
             .expect("open production capture writer");
         seed_writer_test_panes(backend.as_ref(), &[71]);
-        let mut redactors = HashMap::new();
+        let mut redactors = SegmentRedactionState::default();
         append_segment_commit_backend(
             backend.as_ref(),
             71,
@@ -16595,7 +16618,7 @@ mod writer_io_scheduler_tests {
             crate::Error::Storage(StorageError::WriterBusyNotCommitted)
         ));
         assert!(!is_backend_epoch_poisoned(&error));
-        assert_eq!(redactors, before);
+        assert_eq!(redactors.panes, before.panes);
         assert_eq!(
             backend.transaction_state().unwrap(),
             BackendTransactionState::Autocommit
@@ -16662,7 +16685,7 @@ mod writer_io_scheduler_tests {
                 });
                 receivers.push(receive);
             }
-            let mut redactors = HashMap::new();
+            let mut redactors = SegmentRedactionState::default();
             let result =
                 append_segment_group_commit_backend(backend.as_ref(), &group, &mut redactors);
             assert!(matches!(
@@ -16670,7 +16693,7 @@ mod writer_io_scheduler_tests {
                 Err(crate::Error::Storage(StorageError::WriterBusyNotCommitted))
             ));
             assert!(
-                redactors.is_empty(),
+                redactors.panes.is_empty(),
                 "BEGIN refusal cannot change redactor state"
             );
             assert_eq!(
@@ -16713,7 +16736,7 @@ mod writer_io_scheduler_tests {
     #[test]
     fn singleton_append_failure_after_retroactive_mask_restores_database_and_redactor() {
         let backend = real_writer_backend_with_panes(&[71]);
-        let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        let mut redactors = SegmentRedactionState::default();
         append_segment_commit_backend(&backend, 71, "prefix sk-", None, None, None, &mut redactors)
             .expect("seed split-secret prefix");
         let redactors_before = redactors.clone();
@@ -16742,7 +16765,7 @@ mod writer_io_scheduler_tests {
             "ROLLBACK must restore the prior row rewritten by retroactive masking and remove the new row"
         );
         assert_eq!(
-            redactors, redactors_before,
+            redactors.panes, redactors_before.panes,
             "ordinary rollback must restore the exact pre-transaction lookback"
         );
 
@@ -16764,7 +16787,7 @@ mod writer_io_scheduler_tests {
     #[test]
     fn grouped_second_append_failure_restores_all_unique_redactors_and_rows() {
         let backend = real_writer_backend_with_panes(&[81, 82]);
-        let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        let mut redactors = SegmentRedactionState::default();
         for pane_id in [81, 82] {
             append_segment_commit_backend(
                 &backend,
@@ -16821,7 +16844,7 @@ mod writer_io_scheduler_tests {
             );
         }
         assert_eq!(
-            redactors, redactors_before,
+            redactors.panes, redactors_before.panes,
             "group rollback must restore one exact snapshot per uniquely touched pane"
         );
     }
@@ -16872,7 +16895,7 @@ mod writer_io_scheduler_tests {
         let subscriber = append_trace_subscriber(&buffer);
         tracing::subscriber::with_default(subscriber, || {
             let backend = real_writer_backend_with_panes(&[71]);
-            let mut redactors = HashMap::new();
+            let mut redactors = SegmentRedactionState::default();
             let single = append_segment_commit_backend(
                 &backend,
                 71,
@@ -17117,7 +17140,7 @@ mod writer_io_scheduler_tests {
             let mut gate = StorageIoWriterGate::default();
             let mut should_break = false;
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
             let mut batch = VecDeque::new();
@@ -17492,7 +17515,7 @@ mod writer_io_scheduler_tests {
             let mut gate = StorageIoWriterGate::default();
             let mut should_break = false;
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
             let (routed_tail_tx, routed_tail_rx) = oneshot::channel();
@@ -17621,7 +17644,7 @@ mod writer_io_scheduler_tests {
             let mut gate = tiny_writer_gate();
             let mut should_break = false;
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
             let (panic_tx, panic_rx) = oneshot::channel();
             let (tail_tx, tail_rx) = oneshot::channel();
             let (reserve_tx, reserve_rx) = oneshot::channel();
@@ -17780,6 +17803,7 @@ mod writer_io_scheduler_tests {
                 &WriterWakeup::new(),
                 true,
                 None,
+                Arc::new(Redactor::new()),
             );
 
             let mutation = crate::runtime_async::oneshot_recv(mutation_rx)
@@ -17888,7 +17912,7 @@ mod writer_io_scheduler_tests {
                 },
             ];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let result = event_gap_group_commit_backend(
                 &backend,
@@ -17975,7 +17999,7 @@ mod writer_io_scheduler_tests {
                 },
             ];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let result = event_gap_group_commit_backend(
                 &backend,
@@ -18042,7 +18066,7 @@ mod writer_io_scheduler_tests {
                 },
             ];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let result = event_gap_group_commit_backend(
                 &backend,
@@ -18104,7 +18128,7 @@ mod writer_io_scheduler_tests {
                 },
             ];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let result = event_gap_group_commit_backend(
                 &backend,
@@ -18162,7 +18186,10 @@ mod writer_io_scheduler_tests {
         let expected_redactor = SegmentPersistRedactor {
             lookback: "pre-gap raw lookback sk-".to_string(),
         };
-        let mut segment_redactors = HashMap::from([(7, expected_redactor.clone())]);
+        let mut segment_redactors = SegmentRedactionState {
+            panes: HashMap::from([(7, expected_redactor.clone())]),
+            ..SegmentRedactionState::default()
+        };
 
         let result = event_gap_group_commit_backend(
             &backend,
@@ -18181,7 +18208,7 @@ mod writer_io_scheduler_tests {
             "the gap SQL and later mutation share one proven ordinary rollback"
         );
         assert_eq!(
-            segment_redactors.get(&7),
+            segment_redactors.panes.get(&7),
             Some(&expected_redactor),
             "an ordinary group rollback must restore the exact pre-gap lookback"
         );
@@ -18305,7 +18332,7 @@ mod writer_io_scheduler_tests {
                 },
             ];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let result = event_gap_group_commit_backend(
                 &backend,
@@ -18352,7 +18379,7 @@ mod writer_io_scheduler_tests {
                 respond: WriterResultResponder::new(tx),
             }];
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
 
             let message = flush_event_gap_group_recovering(
                 &backend,
@@ -18384,7 +18411,7 @@ mod writer_io_scheduler_tests {
             let mut gate = StorageIoWriterGate::default();
             let mut should_break = false;
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let mut segment_redactors = SegmentRedactionState::default();
             let (tx1, rx1) = oneshot::channel();
             let (tx2, rx2) = oneshot::channel();
             let (tx3, rx3) = oneshot::channel();
@@ -19296,7 +19323,7 @@ fn dispatch_write_command_raw(
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) {
     frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
         "storage::dispatch_write_command_raw",
@@ -20244,6 +20271,15 @@ struct SegmentPersistRedactor {
     lookback: String,
 }
 
+/// A writer owns one compiled policy and independent per-pane lookbacks.
+/// Transaction rollback restores only the affected lookbacks; gaps clear pane
+/// history without discarding the writer's immutable operator configuration.
+#[derive(Debug, Default, Clone)]
+struct SegmentRedactionState {
+    redactor: Arc<Redactor>,
+    panes: HashMap<u64, SegmentPersistRedactor>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendCommitFaultForTest {
@@ -20372,20 +20408,18 @@ fn segment_scan_accounting() -> (usize, usize) {
 /// whether a prior segment was retroactively edited (which invalidates the mmap
 /// mirror). See [`SegmentPersistRedactor`] for the design.
 ///
-/// Security invariant: a secret is never *complete* in persisted storage. A
-/// secret fully inside `content` is redacted by [`Redactor::redact`]; a secret
-/// straddling the prior↔current append boundary has its completing bytes (the
-/// portion living in `content`) masked here, so even if the retroactive strip
-/// of the prior raw prefix is skipped (lookback drift / pruning) no usable
-/// credential survives.
+/// Secrets recognized inside `content` are redacted by [`Redactor::redact`].
+/// Within the bounded lookback, a secret split across appends has its current
+/// bytes masked and its retained prior bytes removed. Context-only assertions
+/// at either edge are evaluated against the original combined text as well.
 fn redact_segment_for_persistence(
     backend: &dyn StorageBackend,
     pane_id: u64,
     content: &str,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<(String, bool)> {
-    let redactor = Redactor::new();
-    let state = segment_redactors.entry(pane_id).or_default();
+    let redactor = &segment_redactors.redactor;
+    let state = segment_redactors.panes.entry(pane_id).or_default();
     let boundary = state.lookback.len();
 
     // Fast path: an empty lookback means there is no append boundary, so no
@@ -20427,37 +20461,43 @@ fn redact_segment_for_persistence(
     window.push_str(&state.lookback);
     window.push_str(&content[..fwd]);
 
-    let persisted;
     let mut edited_prior = false;
-    // At most one detected secret can contain the single boundary point, so the
-    // first crossing span is the only straddle.
+    let mut prior_marker = false;
+    let mut current_spans = Vec::new();
+    // Boundary assertions can depend on a neighbouring chunk without consuming
+    // any of its bytes. Include both edges, and handle adjacent matches ending
+    // and starting at the boundary independently.
     record_segment_detect_scan(window.len());
-    let straddle = redactor
+    for (_, start, end) in redactor
         .detect(&window)
         .into_iter()
-        .find(|&(_, start, end)| start < boundary && boundary < end);
-
-    if let Some((_, start, end)) = straddle {
-        // Bytes of the straddling secret that live in `content`
-        // (`window[boundary..] == content[..fwd]`, and `end` is char-aligned).
-        let head_len = end - boundary;
-        // One canonical marker for the whole straddled secret, then the
-        // remainder of the segment redacted normally.
-        record_segment_redact_scan((end - start) + (content.len() - head_len));
-        let marker = redactor.redact(&window[start..end]);
-        persisted = format!("{marker}{}", redactor.redact(&content[head_len..]));
-        // Strip the secret's raw prior-segment bytes from already-persisted
-        // segments. They are an incomplete prefix that only completes with
-        // `content`, so removing them loses no non-secret content.
-        edited_prior = mask_split_secret_in_prior_segments_backend(
-            backend,
-            pane_id,
-            &window[start..boundary],
-        )?;
-    } else {
-        record_segment_redact_scan(content.len());
-        persisted = redactor.redact(content);
+        .filter(|&(_, start, end)| start < end && start <= boundary && boundary <= end)
+    {
+        if start < boundary {
+            let removed = mask_split_secret_in_prior_segments_backend(
+                backend,
+                pane_id,
+                &window[start..boundary],
+            )?;
+            edited_prior |= removed;
+            // An ordinary complete secret may already have been replaced in
+            // the previous append. Emit no duplicate marker unless raw bytes
+            // were actually removed by this newly available right context.
+            prior_marker |= end == boundary && removed;
+        }
+        if end > boundary {
+            current_spans.push((start.saturating_sub(boundary), end - boundary));
+        }
     }
+    // Redact the whole chunk before overlaying contextual matches. Redacting
+    // the suffix in isolation loses word-boundary context for adjacent secrets.
+    record_segment_redact_scan(content.len());
+    let redacted = redactor.redact_with_source_spans(content, &current_spans);
+    let persisted = if prior_marker {
+        format!("{}{redacted}", redactor.marker())
+    } else {
+        redacted
+    };
 
     // Advance the raw lookback to the last `SEGMENT_REDACTION_LOOKBACK_BYTES` of
     // the full `lookback ++ content` stream, derived from slices so the chunk
@@ -20495,10 +20535,10 @@ fn redact_segment_for_persistence(
 fn flush_segment_redactor_for_pane(
     _backend: &dyn StorageBackend,
     _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     pane_id: u64,
 ) -> Result<()> {
-    segment_redactors.remove(&pane_id);
+    segment_redactors.panes.remove(&pane_id);
     Ok(())
 }
 
@@ -20563,6 +20603,9 @@ fn mask_split_secret_in_prior_segments_backend(
             .string(1)
             .map_err(|err| storage_backend_error("Failed to parse prior segment content", err))?;
         cursor = Some(segment_id);
+        if content.is_empty() {
+            continue;
+        }
 
         let new_content = if content.len() >= remaining.len() {
             // The straddle tail ends inside this segment.
@@ -20629,9 +20672,9 @@ fn disable_mmap_mirror_after_retained_tail_move(
 fn flush_segment_redactors(
     _backend: &dyn StorageBackend,
     _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) {
-    segment_redactors.clear();
+    segment_redactors.panes.clear();
 }
 
 // =============================================================================
@@ -21265,39 +21308,39 @@ type SegmentRedactorSnapshots = HashMap<u64, Option<SegmentPersistRedactor>>;
 
 fn snapshot_segment_redactors_for_appends(
     writes: &[PendingAppendSegmentWrite],
-    segment_redactors: &HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &SegmentRedactionState,
 ) -> SegmentRedactorSnapshots {
     let mut snapshots = HashMap::new();
     for write in writes {
         snapshots
             .entry(write.pane_id)
-            .or_insert_with(|| segment_redactors.get(&write.pane_id).cloned());
+            .or_insert_with(|| segment_redactors.panes.get(&write.pane_id).cloned());
     }
     snapshots
 }
 
 fn restore_segment_redactor_snapshots(
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     snapshots: SegmentRedactorSnapshots,
 ) {
     for (pane_id, snapshot) in snapshots {
         if let Some(snapshot) = snapshot {
-            segment_redactors.insert(pane_id, snapshot);
+            segment_redactors.panes.insert(pane_id, snapshot);
         } else {
-            segment_redactors.remove(&pane_id);
+            segment_redactors.panes.remove(&pane_id);
         }
     }
 }
 
 fn restore_segment_redactor_for_pane(
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     pane_id: u64,
     snapshot: Option<SegmentPersistRedactor>,
 ) {
     if let Some(snapshot) = snapshot {
-        segment_redactors.insert(pane_id, snapshot);
+        segment_redactors.panes.insert(pane_id, snapshot);
     } else {
-        segment_redactors.remove(&pane_id);
+        segment_redactors.panes.remove(&pane_id);
     }
 }
 
@@ -21309,7 +21352,7 @@ fn append_segment_commit_backend(
     content_hash: Option<&str>,
     zone_type: Option<&str>,
     recorder_delivery: Option<&RecorderDeliverySeed>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<CommittedAppendSegment> {
     append_segment_commit_with_capture_backend(
         backend,
@@ -21330,10 +21373,10 @@ fn append_segment_commit_with_capture_backend(
     content_hash: Option<&str>,
     zone_type: Option<&str>,
     recorder_delivery: Option<&RecorderDeliverySeed>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
     capture_uuid: Option<&str>,
 ) -> Result<CommittedAppendSegment> {
-    let snapshot = segment_redactors.get(&pane_id).cloned();
+    let snapshot = segment_redactors.panes.get(&pane_id).cloned();
     let transaction_trace = AppendTransactionTrace::start(1);
     let result = run_writer_transaction(
         backend,
@@ -21388,7 +21431,7 @@ fn append_segment_commit_with_capture_backend(
 fn append_segment_group_commit_backend(
     backend: &dyn StorageBackend,
     writes: &[PendingAppendSegmentWrite],
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<Vec<CommittedAppendSegment>> {
     if writes.is_empty() {
         return Ok(Vec::new());
@@ -21431,7 +21474,7 @@ fn append_segment_group_commit_backend(
 fn append_segment_group_commit_inner(
     backend: &dyn StorageBackend,
     writes: &[PendingAppendSegmentWrite],
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    segment_redactors: &mut SegmentRedactionState,
 ) -> Result<Vec<CommittedAppendSegment>> {
     let mut next_seq_by_pane = HashMap::new();
     let now = now_ms();
@@ -46977,6 +47020,7 @@ fn storage_handle_writer_queue_processes_all() {
             group_commit_events: false,
             group_commit_adaptive: false,
             reservation_config: PaneReservationConfig::default(),
+            redaction_config: crate::config::RedactionConfig::default(),
         };
         let storage = StorageHandle::with_config(&db_path_str, config)
             .await
@@ -47096,6 +47140,243 @@ async fn e8hd7_persisted_concat(storage: &StorageHandle, pane_id: u64) -> String
         .iter()
         .map(|segment| segment.content.as_str())
         .collect::<String>()
+}
+
+#[test]
+fn configured_redaction_protects_full_and_split_tokens_in_actual_writer() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("configured.db").to_string_lossy().to_string();
+        let mut app = crate::config::Config::default();
+        app.safety.redaction.patterns = vec![
+            r"ACME_[A-Z]{12}".to_string(),
+            // The match needs unconsumed word characters on both sides. It
+            // cannot be re-detected after slicing out the matched substring.
+            r"\BCANARY[0-9]{8}\B".to_string(),
+        ];
+        app.safety.redaction.placeholder = "$0".to_string();
+        let storage = StorageHandle::with_config(&db, StorageConfig::from(&app))
+            .await
+            .unwrap();
+        let cloned = storage.clone();
+        for pane_id in 1..=4 {
+            storage.upsert_pane(e8hd7_pane(pane_id)).await.unwrap();
+        }
+
+        let full = storage
+            .append_segment(
+                1,
+                "plain ACME_ABCDEFGHIJKL builtin sk-abcdefghijklmnopqrstuvwxyz012345 end",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.content, "plain $0 builtin $0 end");
+        assert_eq!(e8hd7_persisted_concat(&storage, 1).await, full.content);
+        assert!(storage.search("ACME_ABCDEFGHIJKL").await.unwrap().is_empty());
+        assert_eq!(storage.search("plain").await.unwrap().len(), 1);
+
+        for chunk in ["xCANA", "RY1234", "5678z"] {
+            cloned.append_segment(2, chunk, None).await.unwrap();
+        }
+        assert_eq!(e8hd7_persisted_concat(&storage, 2).await, "x$0z");
+        storage
+            .append_segment(3, "xCANARY12345678z", None)
+            .await
+            .unwrap();
+        assert_eq!(e8hd7_persisted_concat(&storage, 3).await, "x$0z");
+        assert_eq!(cloned.redactor().marker(), "$0");
+
+        storage.append_segment(4, "xCANA", None).await.unwrap();
+        storage.record_gap(4, "stream discontinuity").await.unwrap();
+        let after_gap = storage
+            .append_segment(4, "RY12345678z", None)
+            .await
+            .unwrap();
+        assert_eq!(after_gap.content, "RY12345678z");
+        let still_configured = storage
+            .append_segment(4, " ACME_ABCDEFGHIJKL", None)
+            .await
+            .unwrap();
+        assert_eq!(still_configured.content, " $0");
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn configured_redaction_preserves_context_at_both_append_edges() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("boundaries.db").to_string_lossy().to_string();
+        let mut app = crate::config::Config::default();
+        app.safety.redaction.patterns = vec![
+            r"\BCANARY[0-9]{8}\B".to_string(),
+            r"\BSECRET\B".to_string(),
+            r"\BTOKEN\B".to_string(),
+        ];
+        app.safety.redaction.placeholder = "$0".to_string();
+        let storage = StorageHandle::with_config(&db, StorageConfig::from(&app))
+            .await
+            .unwrap();
+        let cases: &[(&[&str], &str)] = &[
+            (&["x", "CANARY12345678z"], "x$0z"),
+            (&["xCANARY12345678", "z"], "x$0z"),
+            (&["xSE", "CRETTOKENz"], "x$0$0z"),
+            (&["xSECRET", "TOKENz"], "x$0$0z"),
+            (&["sk-abcdefghijklmnopqrstuvwxyz012345", " tail"], "$0 tail"),
+        ];
+        for (index, (chunks, expected)) in cases.iter().enumerate() {
+            let pane_id = index as u64 + 1;
+            storage.upsert_pane(e8hd7_pane(pane_id)).await.unwrap();
+            for chunk in *chunks {
+                storage.append_segment(pane_id, chunk, None).await.unwrap();
+            }
+            assert_eq!(e8hd7_persisted_concat(&storage, pane_id).await, *expected);
+        }
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn configured_redaction_covers_event_audit_and_undo_admission() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("egress.db").to_string_lossy().to_string();
+        let secret = "ACME_ABCDEFGHIJKL";
+        let mut app = crate::config::Config::default();
+        app.safety.redaction.patterns = vec![r"ACME_[A-Z]{12}".to_string()];
+        app.safety.redaction.placeholder = "[PRIVATE]".to_string();
+        let storage = StorageHandle::with_config(&db, StorageConfig::from(&app))
+            .await
+            .unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        let event = StoredEvent {
+            id: 0,
+            pane_id: 1,
+            rule_id: "test.custom_redaction".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "test.detected".to_string(),
+            severity: "warning".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!({
+                "nested": {"value": secret},
+                "array": [secret, 42, true],
+            })),
+            matched_text: Some(format!("matched {secret}")),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: Some("stable-event-key".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let event_id = storage.record_event(event.clone()).await.unwrap();
+        assert_eq!(storage.record_event(event).await.unwrap(), event_id);
+        let events = storage.get_events(EventQuery::default()).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].matched_text.as_deref(), Some("matched [PRIVATE]"));
+        assert_eq!(events[0].dedupe_key.as_deref(), Some("stable-event-key"));
+        let extracted = events[0].extracted.as_ref().unwrap();
+        assert_eq!(extracted["nested"]["value"], "[PRIVATE]");
+        assert_eq!(extracted["array"][0], "[PRIVATE]");
+        assert_eq!(extracted["array"][1], 42);
+        assert_eq!(extracted["array"][2], true);
+
+        // These are the ordinary APIs: choosing the older unsuffixed method
+        // must not bypass mandatory audit redaction.
+        let audit_id = storage
+            .record_audit_action(AuditActionRecord {
+                id: 0,
+                ts: 1_700_000_000_000,
+                actor_kind: "robot".to_string(),
+                actor_id: None,
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "send_text".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: Some(secret.to_string()),
+                rule_id: None,
+                input_summary: Some(secret.to_string()),
+                verification_summary: Some(secret.to_string()),
+                decision_context: Some(format!(r#"{{"value":"{secret}"}}"#)),
+                result: "success".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .update_audit_action_submit_receipt(
+                    audit_id,
+                    "stable-correlation".to_string(),
+                    format!("verified {secret}"),
+                )
+                .await
+                .unwrap()
+        );
+        let audits = storage
+            .get_audit_actions(AuditQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].decision_reason.as_deref(), Some("[PRIVATE]"));
+        assert_eq!(audits[0].input_summary.as_deref(), Some("[PRIVATE]"));
+        assert_eq!(
+            audits[0].verification_summary.as_deref(),
+            Some("verified [PRIVATE]")
+        );
+        assert_eq!(
+            audits[0].decision_context.as_deref(),
+            Some(r#"{"value":"[PRIVATE]"}"#)
+        );
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: audit_id,
+                undoable: true,
+                undo_strategy: "manual".to_string(),
+                undo_hint: Some(format!("restore {secret}")),
+                undo_payload: Some(format!(r#"{{"value":"{secret}"}}"#)),
+                undone_at: None,
+                undone_by: None,
+            })
+            .await
+            .unwrap();
+        let undo = storage.get_action_undo(audit_id).await.unwrap().unwrap();
+        assert_eq!(undo.undo_hint.as_deref(), Some("restore [PRIVATE]"));
+        assert_eq!(
+            undo.undo_payload.as_deref(),
+            Some(r#"{"value":"[PRIVATE]"}"#)
+        );
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn invalid_redaction_policy_fails_before_storage_side_effects() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().unwrap();
+        for case in 0..5 {
+            let mut app = crate::config::Config::default();
+            match case {
+                0 => app.safety.redaction.patterns = vec!["PRIVATE_CANARY[".to_string()],
+                1 => app.safety.redaction.placeholder = "  ".to_string(),
+                2 => app.safety.redaction.enabled = false,
+                3 => app.safety.redaction.redact_audit = false,
+                _ => app.safety.redaction.redact_segments = false,
+            }
+            let parent = temp.path().join(format!("case-{case}"));
+            let db = parent.join("store.db").to_string_lossy().to_string();
+            let error = StorageHandle::with_config(&db, StorageConfig::from(&app))
+                .await
+                .err()
+                .expect("invalid policy must fail closed");
+            assert!(error.to_string().contains("safety.redaction"));
+            assert!(!error.to_string().contains("PRIVATE_CANARY"));
+            assert!(!parent.exists(), "validation must precede filesystem setup");
+        }
+    });
 }
 
 #[test]
@@ -47368,7 +47649,7 @@ fn gkh4p_fresh_pane_scans_chunk_exactly_once() {
     // secret can straddle one. The straddle detector must not run at all: the
     // chunk is fed to the catalog exactly once, by `redact(content)`.
     let backend = crate::storage_backend_trait::MockBackend::new();
-    let mut redactors: HashMap<u64, SegmentPersistRedactor> = HashMap::new();
+    let mut redactors = SegmentRedactionState::default();
     let content = "plain terminal output with no secrets, scanned exactly once";
 
     reset_segment_scan_accounting();
@@ -47409,11 +47690,11 @@ fn gkh4p_straddle_scan_never_rereads_chunk_past_span_budget() {
         budget + 4_096,
         budget * 3,
     ] {
-        let mut redactors: HashMap<u64, SegmentPersistRedactor> = HashMap::new();
+        let mut redactors = SegmentRedactionState::default();
         // Seed a full (anchor-free, benign) lookback so a real boundary exists.
         let seed = "x".repeat(budget + 1_000);
         redact_segment_for_persistence(&backend, 7, &seed, &mut redactors).unwrap();
-        let lookback_len = redactors.get(&7).unwrap().lookback.len();
+        let lookback_len = redactors.panes.get(&7).unwrap().lookback.len();
         assert_eq!(lookback_len, budget, "lookback fills to the span budget");
 
         let chunk = "y".repeat(chunk_len);

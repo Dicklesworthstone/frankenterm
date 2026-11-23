@@ -16,12 +16,14 @@ secret-free persistence, and redacted machine-facing output.
   Cargo, rustc, rustfmt and UBS are also absent. Source review is not proof.
 - [x] Identify configured-redaction gaps in storage, runtime events, historical
   export, MCP event tools/resources and semantic-pane output.
-- [ ] Share one validated custom redactor across persistence and runtime
+- [x] Share one validated custom redactor across persistence and runtime
   fanout, including split-segment secret handling and audit writes.
 - [ ] Apply the current policy to historical exports and MCP event reads while
   preserving explicit export opt-out and event/cursor authority.
-- [ ] Add custom-pattern/placeholder, legacy-data and invalid-config controls;
-  execute them through RCH before any proof-dependent Bead closure.
+- [x] Add custom-pattern/placeholder, contextual chunk-boundary, structured
+  audit JSON, legacy-data and invalid-config regression controls.
+- [ ] Execute the configured-redaction regressions through strict RCH before
+  any proof-dependent Bead closure. The same missing-toolchain blocker applies.
 - [ ] Commit reviewed implementation chunks directly to main and record the
   exact remaining validation obligations in the related Beads.
 

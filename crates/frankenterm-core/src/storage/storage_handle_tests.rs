@@ -2107,6 +2107,7 @@ fn storage_handle_with_small_queue_handles_burst() {
             group_commit_events: false,
             group_commit_adaptive: false,
             reservation_config: PaneReservationConfig::default(),
+            redaction_config: crate::config::RedactionConfig::default(),
         };
         let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
@@ -2139,6 +2140,7 @@ fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
             group_commit_events: false,
             group_commit_adaptive: false,
             reservation_config: PaneReservationConfig::default(),
+            redaction_config: crate::config::RedactionConfig::default(),
         };
         let fts_trigger_count = |conn: &Connection| -> i64 {
             conn.query_row(

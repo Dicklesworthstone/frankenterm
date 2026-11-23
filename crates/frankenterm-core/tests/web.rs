@@ -302,6 +302,49 @@ mod web_tests {
         Ok((storage, tempdir))
     }
 
+    /// Seed an event captured before mandatory writer redaction existed while
+    /// preserving its admitted identity and timestamps. Only read-boundary
+    /// fixtures use this independent database connection.
+    fn restore_legacy_event_payload(
+        storage: &StorageHandle,
+        event_id: i64,
+        event: &StoredEvent,
+    ) -> anyhow::Result<()> {
+        use frankenterm_core::storage_backend_helpers::execute_typed;
+        use frankenterm_core::storage_backend_trait::{
+            OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+        };
+
+        let database = RusqliteBackend::open(
+            storage.db_path(),
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )?;
+        database.set_busy_timeout(Duration::from_secs(1))?;
+        let extracted = event
+            .extracted
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        execute_typed(
+            &database,
+            "UPDATE events SET matched_text = ?1, extracted = ?2 WHERE id = ?3",
+            &[
+                event
+                    .matched_text
+                    .as_deref()
+                    .map_or(ToSqlValue::Null, ToSqlValue::Text),
+                extracted
+                    .as_deref()
+                    .map_or(ToSqlValue::Null, ToSqlValue::Text),
+                ToSqlValue::Integer(event_id),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn web_health_ephemeral_port() {
         run_async_test(async {
@@ -1785,6 +1828,7 @@ mod web_tests {
                     "custom": custom, "builtin": builtin, "ordinary": "keepvisible",
                 }));
                 let id = storage.record_event(event.clone()).await?;
+                restore_legacy_event_payload(&storage, id, &event)?;
                 let rows = storage.get_events(EventQuery {
                     pane_id: Some(73), limit: Some(1), ..EventQuery::default()
                 }).await?;
@@ -1934,7 +1978,7 @@ mod web_tests {
                 }
                 // Seed a real legacy/unredacted row. This deliberately tests
                 // read-side protection, independently of capture redaction.
-                let event_id = storage.record_event(StoredEvent {
+                let legacy_event = StoredEvent {
                     id: 0, pane_id: 71,
                     rule_id: "test.web.depth".to_owned(),
                     agent_type: "codex".to_owned(),
@@ -1944,7 +1988,11 @@ mod web_tests {
                     matched_text: Some("ordinary event".to_owned()),
                     segment_id: None, detected_at: epoch_ms_now(), dedupe_key: None,
                     handled_at: None, handled_by_workflow_id: None, handled_status: None,
-                }).await.context("seed legacy event")?;
+                };
+                let event_id = storage.record_event(legacy_event.clone())
+                    .await.context("admit legacy event identity")?;
+                restore_legacy_event_payload(&storage, event_id, &legacy_event)
+                    .context("seed legacy event payload")?;
                 let rows = storage.get_events(EventQuery {
                     pane_id: Some(71), limit: Some(1), ..EventQuery::default()
                 }).await.context("verify real stored precondition")?;

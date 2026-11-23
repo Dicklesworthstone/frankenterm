@@ -4835,10 +4835,7 @@ impl PolicyEngine {
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
         engine.audit_chain = AuditChain::from_config(&config.audit_chain);
         engine.compliance_engine = ComplianceEngine::from_config(&config.compliance);
-        engine.redactor = match Redactor::with_custom_patterns_and_placeholder(
-            &config.redaction.patterns,
-            Some(config.redaction.placeholder.as_str()),
-        ) {
+        engine.redactor = match config.redaction.build_redactor() {
             Ok(redactor) => redactor,
             Err(err) => {
                 record_policy_engine_config_fallback();

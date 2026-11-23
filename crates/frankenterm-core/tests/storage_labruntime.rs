@@ -1441,6 +1441,7 @@ fn storage_handle_with_small_queue_handles_burst() {
             group_commit_events: false,
             group_commit_adaptive: false,
             reservation_config: Default::default(),
+            redaction_config: Default::default(),
         };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
