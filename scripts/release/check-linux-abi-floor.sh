@@ -62,9 +62,12 @@ command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; e
 # ELF inputs require a successful, bounded readelf inspection. Text fixtures
 # accept readelf --version-info or objdump -T records, never arbitrary strings.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The ${arr[@]+...} form keeps an empty array legal under `set -u` in the
+# macOS system bash 3.2, which otherwise aborts as "unbound variable".
 python3 - "$SCRIPT_DIR/../check-linux-release-abi.py" \
   "$MAX_GLIBC" "$MAX_GLIBCXX" "$MAX_CXXABI" "$JSON_OUTPUT" \
-  "${#SYMBOLS_FILES[@]}" "${SYMBOLS_FILES[@]}" "${TARGETS[@]}" <<'PY'
+  "${#SYMBOLS_FILES[@]}" ${SYMBOLS_FILES[@]+"${SYMBOLS_FILES[@]}"} \
+  ${TARGETS[@]+"${TARGETS[@]}"} <<'PY'
 import json
 import re
 import runpy
@@ -73,7 +76,18 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 from pathlib import Path
+
+# A corrupt compressed stream raises the codec's own error while member data is
+# read, which is neither OSError nor TarError. Without lzma, .tar.xz fails to
+# open with tarfile's CompressionError instead.
+try:
+    import lzma
+
+    ARCHIVE_DECODE_ERRORS = (zlib.error, lzma.LZMAError)
+except ImportError:
+    ARCHIVE_DECODE_ERRORS = (zlib.error,)
 
 # Share the strict, count-checked verneed parser and bounded readelf invocation
 # with the architecture-specific release verifier. Its target/provider policy is
@@ -359,7 +373,9 @@ for raw_target in targets:
                         )
         else:
             audit_versions(raw_target, extract_elf_versions(p), "elf_version_needs")
-    except (Refusal, OSError, ValueError, tarfile.TarError, EOFError) as error:
+    except (
+        Refusal, OSError, ValueError, tarfile.TarError, EOFError, *ARCHIVE_DECODE_ERRORS
+    ) as error:
         inspection_errors.append({"target": raw_target, "reason": str(error)})
 
 # Deduplicate violations deterministically

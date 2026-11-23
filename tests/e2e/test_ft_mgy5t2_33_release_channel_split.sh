@@ -449,12 +449,28 @@ shutil.copyfile(source, target)
     with tarfile.open(archive, "w:xz") as stream:
         stream.add(static_elf, arcname="ft")
     abi_case("pos_abi_archive_valid_static", [str(archive)], 0)
+    # Damage inside an xz stream surfaces as the codec's own error while member
+    # data is read. It must be an inspection error with a JSON verdict, not a
+    # decoder traceback that exits 1 as if it were an ABI violation.
+    noise = td_path / "noise-elf"
+    noise.write_bytes(b"\x7fELF" + os.urandom(2 * 1024 * 1024))
+    corrupt = td_path / "corrupt-stream.tar.xz"
+    with tarfile.open(corrupt, "w:xz") as stream:
+        stream.add(noise, arcname="ft")
+    damaged = bytearray(corrupt.read_bytes())
+    middle = len(damaged) * 6 // 10
+    damaged[middle:middle + 64] = bytes(byte ^ 0xFF for byte in damaged[middle:middle + 64])
+    corrupt.write_bytes(bytes(damaged))
+    abi_case("neg_abi_archive_corrupt_stream", [str(corrupt)], 2)
     oversized = td_path / "oversized-elf.tar"
     member = tarfile.TarInfo("ft")
     member.size = 1024 * 1024 * 1024 + 1
     # Supply only the header: the size limit must fire before payload access.
     oversized.write_bytes(member.tobuf(format=tarfile.USTAR_FORMAT) + b"\x00" * 1024)
-    abi_case("neg_abi_archive_expanded_size_bound", [str(oversized)], 2)
+    verdict = abi_case("neg_abi_archive_expanded_size_bound", [str(oversized)], 2)
+    # The header-only archive also fails to read on, so only the reason shows
+    # that the bound, not the truncation, refused it.
+    assert "expanded-size bound" in verdict["inspection_errors"][0]["reason"], verdict
 
     inspector_bin = td_path / "inspectors"
     inspector_bin.mkdir()
