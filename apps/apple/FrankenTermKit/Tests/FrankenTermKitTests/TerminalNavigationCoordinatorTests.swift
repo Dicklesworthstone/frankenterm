@@ -11,6 +11,7 @@ private final class ControlledNavigationFocus: TerminalNavigationFocusOwner {
     private var pending: TerminalNavigationPreparation?
     private var waiter: CheckedContinuation<Void, Never>?
     private var entered: CheckedContinuation<Void, Never>?
+    private var publication: CheckedContinuation<Void, Never>?
     func prepare(_ destination: TerminalNavigationSelection) async throws -> TerminalNavigationPreparation {
         if failBeforeBarrier { throw TerminalNavigationError.unavailable }
         currentSelection = nil
@@ -27,9 +28,13 @@ private final class ControlledNavigationFocus: TerminalNavigationFocusOwner {
         await withCheckedContinuation { entered = $0 }
     }
     func release() { let waiter = waiter; self.waiter = nil; waiter?.resume() }
+    /// Resumes the caller after the next publication, ahead of the coordinator's
+    /// own continuation that retires the finished operation.
+    func waitForPublication() async { await withCheckedContinuation { publication = $0 } }
     func publish(_ preparation: TerminalNavigationPreparation) throws {
         guard !failPublication, preparation == pending else { throw TerminalNavigationError.stale }
         published.append(preparation); currentSelection = preparation.destination; pending = nil
+        publication?.resume(); publication = nil
     }
     func abandon(_ preparation: TerminalNavigationPreparation) async {
         abandoned.append(preparation)
@@ -128,6 +133,28 @@ final class TerminalNavigationCoordinatorTests: XCTestCase {
         XCTAssertEqual(owner.currentSelection, plan.destination)
         XCTAssertEqual(owner.published.count, 2)
         XCTAssertTrue(owner.abandoned.isEmpty)
+    }
+
+    func testInventoryUpdateRightAfterCommitKeepsThePublishedKeyboard() async throws {
+        let (coordinator, owner) = try setup(); coordinator.resume()
+        try await coordinator.activateSelection()
+        let old = coordinator.navigation.machines
+        let plan = try XCTUnwrap(coordinator.navigation.plan(paneID: old[1].panes[0].id))
+        let job = Task { try await coordinator.perform(plan) }
+        await owner.waitForPublication()
+        // Committed and published, but perform has not yet retired the
+        // operation. A binding republish can land here.
+        XCTAssertEqual(coordinator.phase, .switching, "the test must run inside the window")
+        XCTAssertEqual(coordinator.navigation.selection, plan.destination)
+        try coordinator.replaceInventory(coordinator.navigation.machines)
+        try coordinator.replaceInventory([
+            old[0], old[1], TerminalNavigationMachine(id: "C", name: "renamed host", panes: old[2].panes)
+        ])
+        XCTAssertEqual(owner.seals, 0, "a finished switch is not invalidated by a later inventory")
+        try await job.value
+        XCTAssertEqual(coordinator.phase, .ready)
+        XCTAssertEqual(owner.currentSelection, plan.destination)
+        XCTAssertEqual(owner.published.count, 2)
     }
 
     func testTargetRemovalSealsExactHandoffAndReappearanceCannotReviveIt() async throws {

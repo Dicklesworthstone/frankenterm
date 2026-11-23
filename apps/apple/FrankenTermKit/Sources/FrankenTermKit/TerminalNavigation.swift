@@ -503,7 +503,14 @@ public final class TerminalNavigationCoordinator {
         // Recheck the actual pending choice against the complete inventory.
         // A picker survives unrelated edits; relative/group plans still carry
         // their ring witness. Removed sources or destinations always seal input.
-        let invalidated = operation.map { (try? replacement.validate($0.plan)) == nil } ?? false
+        // Only a plan this replacement turns stale counts: once execute commits,
+        // the operation lingers until perform resumes and its plan validates
+        // against neither model, and sealing then would retire the keyboard the
+        // switch just published. A plan stale beforehand is refused by
+        // execute's own check before it can publish.
+        let invalidated = operation.map {
+            (try? navigation.validate($0.plan)) != nil && (try? replacement.validate($0.plan)) == nil
+        } ?? false
         navigation = replacement
         if disappeared || invalidated {
             operation?.task.cancel(); focusOwner.seal(); startCleanup()
