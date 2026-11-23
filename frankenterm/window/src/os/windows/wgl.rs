@@ -8,9 +8,21 @@ use winapi::um::libloaderapi::{GetModuleHandleW, *};
 use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
+// gl_generator output keeps the WGL names, transmutes loaded pointers and
+// mirrors the WGL entry points' argument lists, as egl.rs's bindings do.
+#[allow(
+    clippy::upper_case_acronyms,
+    clippy::missing_transmute_annotations,
+    clippy::too_many_arguments
+)]
 pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/wgl_bindings.rs"));
 }
+#[allow(
+    clippy::upper_case_acronyms,
+    clippy::missing_transmute_annotations,
+    clippy::too_many_arguments
+)]
 pub mod ffiextra {
     include!(concat!(env!("OUT_DIR"), "/wgl_extra_bindings.rs"));
 }

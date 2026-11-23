@@ -96,7 +96,7 @@ impl Snapshot {
 
     pub fn iter(&self) -> ProcIter<'_> {
         ProcIter {
-            snapshot: &self,
+            snapshot: self,
             first: true,
         }
     }
@@ -518,7 +518,7 @@ impl LocalProcessInfo {
         let provider = u32::from_be_bytes(*b"RSMB");
         let required = unsafe { GetSystemFirmwareTable(provider, 0, std::ptr::null_mut(), 0) };
         let required = usize::try_from(required).ok()?;
-        if required < RAW_SMBIOS_HEADER_BYTES || required > MAX_FIRMWARE_TABLE_BYTES {
+        if !(RAW_SMBIOS_HEADER_BYTES..=MAX_FIRMWARE_TABLE_BYTES).contains(&required) {
             return None;
         }
         let mut raw = vec![0_u8; required];

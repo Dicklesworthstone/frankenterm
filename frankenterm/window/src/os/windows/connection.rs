@@ -86,7 +86,7 @@ impl ConnectionOps for Connection {
                     // We don't want to call TranslateMessage here
                     // unconditionally.  Instead, we perform translation
                     // in a handful of special cases in window.rs.
-                    DispatchMessageW(&mut msg);
+                    DispatchMessageW(&msg);
                 }
             } else {
                 self.wait_message();
@@ -265,12 +265,16 @@ impl ScreenInfoHelper {
             data: LPARAM,
         ) -> i32 {
             let info: &mut ScreenInfoHelper = &mut *(data as *mut ScreenInfoHelper);
-            let mut mi = MONITORINFOEXW::default();
-            mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let mut mi = MONITORINFOEXW {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            };
             GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
 
-            let mut devmode = DEVMODEW::default();
-            devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            let mut devmode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
             let max_fps =
                 if EnumDisplaySettingsW(mi.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut devmode)
                     != 0
@@ -344,8 +348,10 @@ impl ScreenInfoHelper {
                 None => {
                     // Fall back to EnumDisplayDevicesW.
                     // It likely has a terribly generic name like "Generic PnP Monitor".
-                    let mut display_device = DISPLAY_DEVICEW::default();
-                    display_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                    let mut display_device = DISPLAY_DEVICEW {
+                        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                        ..Default::default()
+                    };
 
                     if EnumDisplayDevicesW(mi.szDevice.as_ptr(), 0, &mut display_device, 0) != 0 {
                         wstr(&display_device.DeviceString)
@@ -387,8 +393,10 @@ fn wstr(slice: &[u16]) -> String {
 fn gdi_display_name_to_adapter_names() -> HashMap<String, String> {
     let mut map = HashMap::new();
 
-    let mut display_device = DISPLAY_DEVICEW::default();
-    display_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    let mut display_device = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
 
     for n in 0.. {
         if unsafe { EnumDisplayDevicesW(std::ptr::null(), n, &mut display_device, 0) } == 0 {

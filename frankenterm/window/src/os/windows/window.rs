@@ -386,8 +386,10 @@ impl WindowInner {
         }
 
         unsafe {
-            let mut mi = MONITORINFOEXW::default();
-            mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let mut mi = MONITORINFOEXW {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            };
             let mon = MonitorFromWindow(self.hwnd.0, MONITOR_DEFAULTTONEAREST);
             GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
 
@@ -523,15 +525,12 @@ fn apply_decoration_immediate(
 }
 
 fn decorations_to_style(decorations: WindowDecorations) -> u32 {
-    if decorations == WindowDecorations::RESIZE {
-        WS_OVERLAPPEDWINDOW
-    } else if decorations == WindowDecorations::TITLE {
+    if decorations == WindowDecorations::TITLE {
         WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
     } else if decorations == WindowDecorations::NONE {
         WS_POPUP
-    } else if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
-        WS_OVERLAPPEDWINDOW
     } else {
+        // RESIZE, TITLE | RESIZE and every other combination.
         WS_OVERLAPPEDWINDOW
     }
 }
@@ -597,8 +596,10 @@ impl Window {
                     // We pick the middle of the primary monitor
 
                     unsafe {
-                        let mut mi = MONITORINFO::default();
-                        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                        let mut mi = MONITORINFO {
+                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                            ..Default::default()
+                        };
                         GetMonitorInfoW(
                             MonitorFromWindow(std::ptr::null_mut(), MONITOR_DEFAULTTOPRIMARY),
                             &mut mi,
@@ -895,13 +896,17 @@ fn apply_fullscreen_toggle(window: HWindow, owner: &Rc<RefCell<WindowInner>>) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
             );
         } else {
-            let mut placement = WINDOWPLACEMENT::default();
-            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as _;
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as _,
+                ..Default::default()
+            };
             if GetWindowPlacement(hwnd, &mut placement) == 0 {
                 return;
             }
-            let mut monitor = MONITORINFO::default();
-            monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            let mut monitor = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
             if GetMonitorInfoW(
                 MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
                 &mut monitor,
@@ -1626,8 +1631,10 @@ fn get_window_state(hwnd: HWND) -> WindowState {
             let mut rect = RECT::default();
             GetWindowRect(hwnd, &mut rect);
 
-            let mut mi = MONITORINFO::default();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
             GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
 
             if mi.rcMonitor.left == rect.left
@@ -1676,11 +1683,12 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
     use winapi::um::dwmapi::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute};
     use winapi::um::uxtheme::MARGINS;
 
-    #[allow(non_snake_case)]
+    // These two mirror undocumented user32 names, so they keep the SDK spelling.
+    #[allow(clippy::upper_case_acronyms)]
     type WINDOWCOMPOSITIONATTRIB = u32;
     const WCA_USEDARKMODECOLORS: WINDOWCOMPOSITIONATTRIB = 26;
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
     #[repr(C)]
     pub struct WINDOWCOMPOSITIONATTRIBDATA {
         Attrib: WINDOWCOMPOSITIONATTRIB,
@@ -1988,7 +1996,7 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let _ = BeginPaint(hwnd, &mut ps);
     // Validate the region even when throttled. Otherwise Windows repeatedly
     // sends WM_PAINT for the same region while the Render timer is pending.
-    EndPaint(hwnd, &mut ps);
+    EndPaint(hwnd, &ps);
 
     let (window, state, max_fps) = {
         let inner = owner.borrow();
@@ -2835,7 +2843,7 @@ impl KeyboardLayoutInfo {
                 if let Some(c) = dead
                     .map
                     .get(&(Self::fixup_mods(key.0), key.1 as u8))
-                    .map(|&c| c)
+                    .copied()
                 {
                     ResolvedDeadKey::Combined(c)
                 } else {

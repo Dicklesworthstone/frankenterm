@@ -448,6 +448,23 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::Duration;
 
+    /// A live descriptor: a non-negative fd on Unix; on Windows, a handle
+    /// that is neither null nor INVALID_HANDLE_VALUE.
+    fn is_live(raw: RawFileDescriptor) -> bool {
+        #[cfg(unix)]
+        {
+            raw >= 0
+        }
+        #[cfg(windows)]
+        {
+            !raw.is_null()
+                && !std::ptr::eq(
+                    raw,
+                    winapi::um::handleapi::INVALID_HANDLE_VALUE.cast::<std::ffi::c_void>(),
+                )
+        }
+    }
+
     // ── Error Display ─────────────────────────────────────────
 
     #[test]
@@ -589,7 +606,7 @@ mod tests {
         let stdout = std::io::stdout();
         let handle = stdout.lock();
         let fd = FileDescriptor::dup(&handle).unwrap();
-        assert!(fd.as_raw_file_descriptor() >= 0);
+        assert!(is_live(fd.as_raw_file_descriptor()));
     }
 
     #[test]
@@ -683,8 +700,8 @@ mod tests {
             cloned.as_raw_file_descriptor()
         );
         // Both should be valid (not the original fd necessarily)
-        assert!(handle.as_raw_file_descriptor() >= 0);
-        assert!(cloned.as_raw_file_descriptor() >= 0);
+        assert!(is_live(handle.as_raw_file_descriptor()));
+        assert!(is_live(cloned.as_raw_file_descriptor()));
         let _ = fd;
     }
 
@@ -801,7 +818,7 @@ mod tests {
     fn into_and_from_raw_fd_roundtrip() {
         let pipe = Pipe::new().unwrap();
         let raw = pipe.read.into_raw_file_descriptor();
-        assert!(raw >= 0);
+        assert!(is_live(raw));
         // Re-wrap to ensure cleanup
         let _fd = unsafe { FileDescriptor::from_raw_file_descriptor(raw) };
     }
@@ -812,14 +829,18 @@ mod tests {
     fn as_raw_file_descriptor_trait() {
         let pipe = Pipe::new().unwrap();
         let raw = pipe.read.as_raw_file_descriptor();
-        assert!(raw >= 0);
+        assert!(is_live(raw));
     }
 
     #[test]
     fn as_socket_descriptor_trait() {
         let (a, _b) = socketpair().unwrap();
         let sd = a.as_socket_descriptor();
+        #[cfg(unix)]
         assert!(sd >= 0);
+        // SOCKET is unsigned; INVALID_SOCKET is its failure value.
+        #[cfg(windows)]
+        assert_ne!(sd, winapi::um::winsock2::INVALID_SOCKET);
     }
 
     // ── Additional Error variant tests ───────────────────────
@@ -990,7 +1011,7 @@ mod tests {
         let stderr = std::io::stderr();
         let handle = stderr.lock();
         let fd = FileDescriptor::dup(&handle).unwrap();
-        assert!(fd.as_raw_file_descriptor() >= 0);
+        assert!(is_live(fd.as_raw_file_descriptor()));
     }
 
     #[test]
@@ -1090,7 +1111,7 @@ mod tests {
     fn owned_handle_dup_from_pipe() {
         let pipe = Pipe::new().unwrap();
         let handle = OwnedHandle::dup(&pipe.read).unwrap();
-        assert!(handle.as_raw_file_descriptor() >= 0);
+        assert!(is_live(handle.as_raw_file_descriptor()));
         assert_ne!(
             handle.as_raw_file_descriptor(),
             pipe.read.as_raw_file_descriptor()
@@ -1179,7 +1200,7 @@ mod tests {
         let pipe = Pipe::new().unwrap();
         let raw = pipe.write.into_raw_file_descriptor();
         let fd = FileDescriptor::new(unsafe { FileDescriptor::from_raw_file_descriptor(raw) });
-        assert!(fd.as_raw_file_descriptor() >= 0);
+        assert!(is_live(fd.as_raw_file_descriptor()));
     }
 
     // ── as_stdio and as_file for write end ───────────────────
@@ -1320,14 +1341,14 @@ mod tests {
         let stdin = std::io::stdin();
         let handle = stdin.lock();
         let fd = FileDescriptor::dup(&handle).unwrap();
-        assert!(fd.as_raw_file_descriptor() >= 0);
+        assert!(is_live(fd.as_raw_file_descriptor()));
     }
 
     #[test]
     fn owned_handle_dup_from_socket() {
         let (a, _b) = socketpair().unwrap();
         let handle = OwnedHandle::dup(&a).unwrap();
-        assert!(handle.as_raw_file_descriptor() >= 0);
+        assert!(is_live(handle.as_raw_file_descriptor()));
     }
 
     // ── Error source chain tests ────────────────────────────
@@ -1420,7 +1441,7 @@ mod tests {
     fn socketpair_into_raw_roundtrip() {
         let (a, _b) = socketpair().unwrap();
         let raw = a.into_raw_file_descriptor();
-        assert!(raw >= 0);
+        assert!(is_live(raw));
         let _fd = unsafe { FileDescriptor::from_raw_file_descriptor(raw) };
     }
 
