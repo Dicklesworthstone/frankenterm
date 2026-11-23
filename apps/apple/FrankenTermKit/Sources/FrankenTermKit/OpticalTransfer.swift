@@ -474,6 +474,73 @@ public struct OpticalSender: Sendable {
     }
 }
 
+/// Recovery advice for one actively visible camera and receive generation.
+/// Time comes from a monotonic clock supplied by the owner; camera callbacks
+/// and repeated/dependent equations are never themselves recovery progress.
+/// This retains only counters and instants, not a history of observed symbols.
+public struct OpticalScanStallMonitor: Sendable {
+    public enum Guidance: Equatable, Sendable {
+        case noRecentFrames
+        case noNewInformation
+    }
+
+    public let identity: OpticalFrame.Identity
+    public let generation: UUID
+    private let requiredParts: Int
+    private let started: ContinuousClock.Instant
+    private var lastSample: ContinuousClock.Instant
+    private var lastProgress: ContinuousClock.Instant
+    private var lastMatchingFrame: ContinuousClock.Instant?
+    private var recoveredParts: Int
+    static let frameSilenceThreshold: Duration = .seconds(8)
+    static let progressSilenceThreshold: Duration = .seconds(15)
+
+    /// Already recovered pieces are the baseline after opening/resuming a
+    /// camera. Paused time and progress retained from an older camera do not
+    /// cause an immediate warning. A complete receiver needs no stall monitor.
+    public init?(identity: OpticalFrame.Identity, generation: UUID, receivedParts: Int,
+                 at now: ContinuousClock.Instant) {
+        let requiredParts = identity.sourcePartCount
+        guard (0..<requiredParts).contains(receivedParts) else { return nil }
+        self.identity = identity; self.generation = generation
+        self.requiredParts = requiredParts
+        started = now; lastSample = now; lastProgress = now
+        recoveredParts = receivedParts
+    }
+
+    /// Only a successfully parsed/admitted frame for this selected transfer may
+    /// set `matchingFrame`. An exact duplicate of that previously admitted text
+    /// may refresh visibility without running the fountain solver again.
+    /// Foreign/retired callbacks and reversed clock samples have no effect.
+    @discardableResult
+    public mutating func record(identity: OpticalFrame.Identity, generation: UUID,
+                                receivedParts: Int, matchingFrame: Bool,
+                                at now: ContinuousClock.Instant) -> Bool {
+        guard self.identity == identity, self.generation == generation,
+              (0...requiredParts).contains(receivedParts), now >= lastSample else { return false }
+        lastSample = now
+        if matchingFrame { lastMatchingFrame = now }
+        if receivedParts > recoveredParts {
+            recoveredParts = receivedParts
+            lastProgress = now
+        }
+        return true
+    }
+
+    /// This is advice, not a timeout, completion claim or diagnosis of a
+    /// particular camera/display fault. Never discard ciphertext automatically.
+    public func guidance(at now: ContinuousClock.Instant) -> Guidance? {
+        guard recoveredParts < requiredParts, now >= lastSample else { return nil }
+        if (lastMatchingFrame ?? started).duration(to: now) >= Self.frameSilenceThreshold {
+            return .noRecentFrames
+        }
+        if lastProgress.duration(to: now) >= Self.progressSilenceThreshold {
+            return .noNewInformation
+        }
+        return nil
+    }
+}
+
 /// Caller explicitly selects one identity before construction. No receive call
 /// can switch sources. Value ownership permits an actor to serialize mutations.
 public struct OpticalReceiver: Sendable {

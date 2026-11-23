@@ -126,6 +126,113 @@ final class OpticalTests: XCTestCase {
         }
         XCTAssertTrue(receiver.isComplete)
     }
+    func testScanStallDistinguishesLostVisibilityFromDependentFountainFrames() throws {
+        let envelope = try makeEnvelope(size: 100), sender = try OpticalSender(envelope: envelope, using: crypto)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        var receiver = OpticalReceiver(selecting: first)
+        let count = try sender.sourcePartCount(page: 0)
+        for sequence in 1..<count {
+            try receiver.receive(OpticalFrame(text: sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)), using: crypto)
+        }
+        let start = ContinuousClock.now, generation = UUID()
+        var monitor = try XCTUnwrap(OpticalScanStallMonitor(identity: receiver.identity,
+            generation: generation, receivedParts: receiver.receivedParts, at: start))
+        XCTAssertNil(monitor.guidance(at: start.advanced(by: .seconds(7))))
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(8))), .noRecentFrames)
+
+        // These are different, well-formed repair symbols, but each equation is
+        // dependent on pieces already held. Counting callbacks or distinct texts
+        // as progress would hide the stalled last piece indefinitely.
+        let message = URPageEncoder(page: envelope)
+        let degree = URDegree(count: count)
+        var sequence = UInt32(count)
+        for second in 1...20 {
+            let dependent = try ((sequence + 1)...(sequence + 512)).first { candidate in
+                try !degree.indexes(sequence: candidate, checksum: message.checksum, using: crypto).contains(count - 1)
+            }
+            sequence = try XCTUnwrap(dependent)
+            let frame = try OpticalFrame(text: sender.frame(page: 0, sequence: sequence, using: crypto))
+            try receiver.receive(frame, using: crypto)
+            XCTAssertEqual(receiver.receivedParts, count - 1)
+            XCTAssertTrue(monitor.record(identity: frame.identity, generation: generation,
+                receivedParts: receiver.receivedParts, matchingFrame: true, at: start.advanced(by: .seconds(second))))
+            if second < 15 { XCTAssertNil(monitor.guidance(at: start.advanced(by: .seconds(second)))) }
+            else { XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(second))), .noNewInformation) }
+        }
+        // A held duplicate is still visible, but still does not recover a piece.
+        try receiver.receive(first, using: crypto)
+        monitor.record(identity: first.identity, generation: generation, receivedParts: receiver.receivedParts,
+                       matchingFrame: true, at: start.advanced(by: .seconds(21)))
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(21))), .noNewInformation)
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(29))), .noRecentFrames)
+
+        // Guidance never times out or discards the decoder. A fresh independent
+        // source symbol finishes the same immutable encrypted transfer.
+        try receiver.receive(OpticalFrame(text: sender.frame(page: 0, sequence: UInt32(count), using: crypto)), using: crypto)
+        monitor.record(identity: receiver.identity, generation: generation, receivedParts: receiver.receivedParts,
+                       matchingFrame: true, at: start.advanced(by: .seconds(30)))
+        XCTAssertEqual(try receiver.envelope(using: crypto), envelope)
+        XCTAssertNil(monitor.guidance(at: start.advanced(by: .seconds(300))))
+    }
+
+    func testScanStallIgnoresForeignRetiredAndReversedClockSamples() throws {
+        let sender = try OpticalSender(envelope: makeEnvelope(size: 100), using: crypto)
+        let text = try sender.frame(page: 0, sequence: 1, using: crypto)
+        let frame = try OpticalFrame(text: text)
+        let foreign = try OpticalFrame(text: text.replacingOccurrences(of: frame.identity.transferID.ftHex,
+                                                                       with: String(repeating: "A", count: 32)))
+        let start = ContinuousClock.now, generation = UUID()
+        var monitor = try XCTUnwrap(OpticalScanStallMonitor(identity: frame.identity, generation: generation,
+                                                           receivedParts: 1, at: start))
+        XCTAssertFalse(monitor.record(identity: foreign.identity, generation: generation, receivedParts: 2,
+                                      matchingFrame: true, at: start.advanced(by: .seconds(100))))
+        XCTAssertFalse(monitor.record(identity: frame.identity, generation: UUID(), receivedParts: 2,
+                                      matchingFrame: true, at: start.advanced(by: .seconds(100))))
+        XCTAssertFalse(monitor.record(identity: frame.identity, generation: generation, receivedParts: Int.max,
+                                      matchingFrame: true, at: start.advanced(by: .seconds(100))))
+        XCTAssertFalse(monitor.record(identity: frame.identity, generation: generation, receivedParts: -1,
+                                      matchingFrame: true, at: start.advanced(by: .seconds(100))))
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(8))), .noRecentFrames)
+        XCTAssertTrue(monitor.record(identity: frame.identity, generation: generation, receivedParts: 1,
+                                     matchingFrame: true, at: start.advanced(by: .seconds(15))))
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(15))), .noNewInformation)
+        XCTAssertFalse(monitor.record(identity: frame.identity, generation: generation, receivedParts: 2,
+                                      matchingFrame: true, at: start.advanced(by: .seconds(14))))
+        XCTAssertNil(monitor.guidance(at: start.advanced(by: .seconds(14))))
+        XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(16))), .noNewInformation)
+        XCTAssertTrue(monitor.record(identity: frame.identity, generation: generation, receivedParts: 2,
+                                     matchingFrame: true, at: start.advanced(by: .seconds(17))))
+        XCTAssertNil(monitor.guidance(at: start.advanced(by: .seconds(17))))
+    }
+
+    func testScanStallResetsOnlyForAnExplicitNewGenerationOrCameraBaseline() throws {
+        let sender = try OpticalSender(envelope: makeEnvelope(size: 100), using: crypto)
+        let identity = sender.identity, start = ContinuousClock.now, generation = UUID()
+        var monitor = try XCTUnwrap(OpticalScanStallMonitor(identity: identity, generation: generation,
+                                                           receivedParts: 3, at: start))
+        // A damaged page may lose equations. Regaining its old rank is not new
+        // recovery and must not keep a repeated poisoning/reset cycle healthy.
+        for (second, count) in [(15, 0), (16, 1), (17, 2), (18, 3)] {
+            monitor.record(identity: identity, generation: generation, receivedParts: count,
+                           matchingFrame: true, at: start.advanced(by: .seconds(second)))
+            XCTAssertEqual(monitor.guidance(at: start.advanced(by: .seconds(second))), .noNewInformation)
+        }
+        let repairedGeneration = UUID(), resumed = start.advanced(by: .seconds(1000))
+        var repaired = try XCTUnwrap(OpticalScanStallMonitor(identity: identity, generation: repairedGeneration,
+                                                            receivedParts: 0, at: resumed))
+        XCTAssertFalse(repaired.record(identity: identity, generation: generation, receivedParts: 3,
+                                       matchingFrame: true, at: resumed.advanced(by: .seconds(100))))
+        XCTAssertNil(repaired.guidance(at: resumed))
+        XCTAssertNil(repaired.guidance(at: resumed.advanced(by: .seconds(7))))
+        XCTAssertEqual(repaired.guidance(at: resumed.advanced(by: .seconds(8))), .noRecentFrames)
+        XCTAssertTrue(repaired.record(identity: identity, generation: repairedGeneration, receivedParts: 1,
+                                      matchingFrame: true, at: resumed.advanced(by: .seconds(9))))
+        XCTAssertNil(repaired.guidance(at: resumed.advanced(by: .seconds(9))))
+        XCTAssertNil(OpticalScanStallMonitor(identity: identity, generation: generation,
+                                           receivedParts: identity.sourcePartCount, at: start))
+        XCTAssertNil(OpticalScanStallMonitor(identity: identity, generation: generation, receivedParts: -1, at: start))
+    }
+
     func testSenderSchedulingAndBounds() throws {
         var sender = try OpticalSender(envelope: makeEnvelope(size: 40000), using: crypto)
         let expectedPages = Array(repeating: 0, count: 8) + Array(repeating: 1, count: 16)

@@ -303,26 +303,29 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var pendingDocumentURL: URL?
     private var documentRetryURL: URL?
     private var documentInspection: (id: UUID, task: Task<Void, Never>)?
-    var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
+    var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving(); reconcileOpticalScanMonitoring() } }
     var message: String?
     var showRestore = false {
         didSet {
             // Retire remembered launch intent before any actor hop. Existing
             // live sessions still require the explicit disconnection choice.
             if showRestore && !oldValue { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
-            updateIdleTimer()
+            updateIdleTimer(); reconcileOpticalScanMonitoring()
         }
     }
     var cameraRequested = false {
         didSet {
             // A restarted camera is a new callback owner, even when the same
             // encrypted transfer remains selected throughout the interruption.
-            if cameraRequested != oldValue { cameraGeneration = UUID() }
-            updateIdleTimer()
+            if cameraRequested != oldValue {
+                cameraGeneration = UUID(); lastObservation = nil
+                retireOpticalScanMonitoring()
+            }
+            updateIdleTimer(); reconcileOpticalScanMonitoring()
         }
     }
     private(set) var cameraGeneration = UUID()
-    var active = false { didSet { updateIdleTimer() } }
+    var active = false { didSet { updateIdleTimer(); reconcileOpticalScanMonitoring() } }
     /// Not in the background (see setScenePhase): live connections may run.
     @ObservationIgnored private var connectionsForeground = false
     private var operationBusy = false
@@ -380,7 +383,15 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var lastObservation: String?
     @ObservationIgnored private var lastObservationTime = ContinuousClock.now
     @ObservationIgnored private var previousIdleTimerSetting: Bool?
-    private struct CameraObservation: Sendable { let text: String, generation: UUID, epoch: UUID }
+    private(set) var opticalScanGuidance: OpticalScanStallMonitor.Guidance?
+    @ObservationIgnored private var opticalScanMonitor: OpticalScanStallMonitor?
+    @ObservationIgnored private var opticalScanTimer: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var validatedScanObservation: (text: String, identity: OpticalFrame.Identity,
+        generation: UUID, cameraGeneration: UUID)?
+    private let opticalScanNow: () -> ContinuousClock.Instant
+    private struct CameraObservation: Sendable {
+        let text: String, generation: UUID, epoch: UUID, cameraGeneration: UUID
+    }
     private struct PendingFileImport: Sendable {
         let id = UUID()
         let url: URL
@@ -390,8 +401,9 @@ final class MobileWorkspaceModel {
     var hasPendingImport: Bool { pendingImport != nil }
     var pendingImportNeedsRetry: Bool { pendingImport?.needsExplicitRetry == true }
 
-    init(restore: OfflineRestore<AppleCryptography>? = nil) {
-        self.restore = restore
+    init(restore: OfflineRestore<AppleCryptography>? = nil,
+         opticalScanNow: @escaping () -> ContinuousClock.Instant = { ContinuousClock.now }) {
+        self.restore = restore; self.opticalScanNow = opticalScanNow
     }
 
     private func updateIdleTimer() {
@@ -406,6 +418,80 @@ final class MobileWorkspaceModel {
             UIApplication.shared.isIdleTimerDisabled = previousIdleTimerSetting
             self.previousIdleTimerSetting = nil
         }
+    }
+
+    /// One timer belongs to one visible camera and selected receive generation.
+    /// Pausing, repair, source replacement and scene teardown retire it. Neither
+    /// its wakeups nor repeated decoder snapshots count as recovered data.
+    private func reconcileOpticalScanMonitoring() {
+        guard active, showRestore, cameraRequested, let state, !state.isSuspended,
+              state.phase == .collecting, state.source == .optical, let identity = state.identity else {
+            retireOpticalScanMonitoring()
+            return
+        }
+        let now = opticalScanNow()
+        if opticalScanMonitor?.identity != identity || opticalScanMonitor?.generation != state.generation {
+            opticalScanTimer?.task.cancel(); opticalScanTimer = nil
+            opticalScanMonitor = .init(identity: identity, generation: state.generation,
+                                       receivedParts: state.receivedParts, at: now)
+            if validatedScanObservation?.identity != identity
+                || validatedScanObservation?.generation != state.generation
+                || validatedScanObservation?.cameraGeneration != cameraGeneration {
+                validatedScanObservation = nil
+            }
+        }
+        guard opticalScanMonitor != nil else { retireOpticalScanMonitoring(); return }
+        opticalScanMonitor?.record(identity: identity, generation: state.generation,
+                                   receivedParts: state.receivedParts, matchingFrame: false, at: now)
+        refreshOpticalScanGuidance()
+        guard opticalScanTimer == nil else { return }
+        let id = UUID()
+        let task = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { return }
+                guard let self, self.opticalScanTimer?.id == id else { return }
+                self.refreshOpticalScanGuidance()
+            }
+        }
+        opticalScanTimer = (id, task)
+    }
+
+    private func retireOpticalScanMonitoring() {
+        opticalScanTimer?.task.cancel(); opticalScanTimer = nil
+        opticalScanMonitor = nil; validatedScanObservation = nil
+        if opticalScanGuidance != nil { opticalScanGuidance = nil }
+    }
+
+    private func refreshOpticalScanGuidance() {
+        let advice = opticalScanMonitor?.guidance(at: opticalScanNow())
+        if opticalScanGuidance != advice { opticalScanGuidance = advice }
+    }
+
+    private func acceptsCameraObservation(_ observation: CameraObservation) -> Bool {
+        !Task.isCancelled && active && showRestore && cameraRequested
+            && epoch == observation.epoch && cameraGeneration == observation.cameraGeneration
+    }
+
+    /// Cache at most one successfully admitted text. The camera can then report
+    /// that a held duplicate remains visible without reparsing it on MainActor,
+    /// enqueueing it again, or allowing unrelated QR text to mask a stalled scan.
+    private func recordAcceptedOpticalObservation(_ observation: CameraObservation,
+                                                   status: OfflineRestoreStatus) {
+        guard acceptsCameraObservation(observation), status.generation == observation.generation,
+              [.candidate, .collecting].contains(status.phase), let identity = status.identity else { return }
+        validatedScanObservation = (observation.text, identity, status.generation, observation.cameraGeneration)
+        recordVisibleOpticalDuplicate(observation.text)
+    }
+
+    private func recordVisibleOpticalDuplicate(_ text: String) {
+        guard let state, state.phase == .collecting, let identity = state.identity,
+              let accepted = validatedScanObservation, accepted.text == text,
+              accepted.identity == identity, accepted.generation == state.generation,
+              accepted.cameraGeneration == cameraGeneration else { return }
+        opticalScanMonitor?.record(identity: identity, generation: state.generation,
+                                   receivedParts: state.receivedParts, matchingFrame: true, at: opticalScanNow())
+        refreshOpticalScanGuidance()
     }
 
     func requestCamera() {
@@ -2474,25 +2560,26 @@ final class MobileWorkspaceModel {
         observationTask = Task { [weak self] in
             for await observation in channel.stream {
                 guard !Task.isCancelled, let self else { break }
-                guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
+                guard self.acceptsCameraObservation(observation) else { continue }
                 let before = await restore.status()
-                guard self.active, self.showRestore, self.epoch == observation.epoch else { continue }
+                guard self.acceptsCameraObservation(observation) else { continue }
                 do {
                     let next = try await restore.observe(observation.text, generation: observation.generation)
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     await self.saveScanSnapshot(next, restore: restore, epoch: observation.epoch)
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     let latest = await restore.status()
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     if latest.generation != next.generation { self.lastObservation = nil }
                     self.state = latest
+                    self.recordAcceptedOpticalObservation(observation, status: latest)
                     if !self.keepsCamera(latest) { self.cameraRequested = false }
                     self.advanceAutomatically()
                 } catch FTError.stale { continue }
                 catch is CancellationError { break }
                 catch {
                     var latest = await restore.status()
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     // Only receiver resets need an immediate write. Malformed
                     // framing/checksums leave it unchanged and use the normal
                     // cadence. Join even a manual writer so a reset cannot be
@@ -2500,9 +2587,9 @@ final class MobileWorkspaceModel {
                     let repaired = before.generation == latest.generation
                         && (latest.receivedParts < before.receivedParts || latest.verifiedPages < before.verifiedPages)
                     await self.saveScanSnapshot(latest, restore: restore, epoch: observation.epoch, force: repaired)
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     latest = await restore.status()
-                    guard self.active, self.epoch == observation.epoch else { continue }
+                    guard self.acceptsCameraObservation(observation) else { continue }
                     if self.state?.generation != latest.generation { self.lastObservation = nil }
                     self.state = latest
                     if ![.idle, .candidate, .collecting].contains(latest.phase) { self.cameraRequested = false }
@@ -2578,11 +2665,14 @@ final class MobileWorkspaceModel {
         }
         guard active, showRestore, cameraRequested, !busy, let state, !state.isSuspended,
               [.idle, .candidate, .collecting].contains(state.phase), text.hasPrefix("FTQR1/"),
-              text.utf8.count <= FTLimit.qrText, text != lastObservation else { return }
+              text.utf8.count <= FTLimit.qrText else { return }
+        recordVisibleOpticalDuplicate(text)
+        guard text != lastObservation else { return }
         let now = ContinuousClock.now
-        guard lastObservationTime.duration(to: now) >= .milliseconds(35) else { return }
+        guard lastObservation == nil || lastObservationTime.duration(to: now) >= .milliseconds(35) else { return }
         lastObservation = text; lastObservationTime = now
-        observations?.yield(.init(text: text, generation: state.generation, epoch: epoch))
+        observations?.yield(.init(text: text, generation: state.generation, epoch: epoch,
+                                  cameraGeneration: cameraGeneration))
     }
     func run(_ action: @escaping @Sendable (OfflineRestore<AppleCryptography>, OfflineRestoreStatus) async throws -> OfflineRestoreStatus) {
         guard !busy, active, let restore else { return }
@@ -3099,6 +3189,7 @@ struct OfflineRestoreSheet: View {
     @Bindable var model: MobileWorkspaceModel
     @State private var code = ""
     @State private var repairPage = 0
+    @State private var showPageRepair = false
     @State private var chooseFile = false
     private enum RestoreDecision {
         case save(generation: UUID, identity: OpticalFrame.Identity, replacing: OpticalDecoderRecoveryReview?)
@@ -3440,14 +3531,40 @@ struct OfflineRestoreSheet: View {
             Text("\(Int((Double(received) / Double(total) * 100).rounded(.down)))%").monospacedDigit()
                 .contentTransition(.numericText())
         }.animation(.smooth, value: received)
+        Text("\(state.verifiedPages) of \(state.identity?.pageCount ?? 0) encrypted pages verified")
+            .font(.caption).foregroundStyle(.secondary)
+        if let guidance = model.opticalScanGuidance {
+            VStack(alignment: .leading, spacing: 8) {
+                switch guidance {
+                case .noRecentFrames:
+                    Label("Waiting for readable frames", systemImage: "viewfinder")
+                        .font(.headline)
+                    Text("No recent frames from this transfer have reached the decoder. Keep the animation playing and the whole QR square in view. Try slower playback, a different distance, or less glare. Recovered pieces are kept.")
+                case .noNewInformation:
+                    Label("Recovery has paused", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.headline)
+                    Text("Recent frames have not added a new piece. Change playback speed or seek to another point in the recording. A live Repair Page on your Mac can send fresh pieces; replaying the same recording cannot create them.")
+                    if let page = state.incompletePageIndices.first {
+                        Button("Show Repair Steps for Page \(page + 1)") {
+                            repairPage = page; showPageRepair = true
+                        }
+                    }
+                }
+            }
+            .font(.footnote)
+            .padding()
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("restore.scan_guidance")
+        }
         if !model.cameraRequested {
             Button("Resume Camera") { model.requestCamera() }
                 .buttonStyle(.borderedProminent).disabled(model.requestingCameraAccess)
         }
         Button("Read Another QR Recording") { chooseFile = true }
         if !state.incompletePageIndices.isEmpty {
-            DisclosureGroup("Stuck? Repair a page") {
-                Text("Select the same page in Repair Page on your Mac. Reset only if this page has stopped recovering; verified pages are kept.")
+            DisclosureGroup("Repair a page", isExpanded: $showPageRepair) {
+                Text("Select the same page in Repair Page on your Mac to send fresh pieces. Keep scanning first; reset this unfinished page only if it still cannot recover. Verified pages are kept.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Page", selection: $repairPage) {
                     ForEach(state.incompletePageIndices, id: \.self) { index in
