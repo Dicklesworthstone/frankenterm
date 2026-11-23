@@ -169,6 +169,15 @@ different names are independent.
    side effects.
 6. `apply_dry_run_no_side_effects` (Custom) — `dry_run: true`
    never mutates `agent_profiles` and never spawns panes.
+7. Both apply paths validate stored launch metadata before reporting a usable
+   plan. Malformed `bootstrap_commands` returns
+   `robot.profile.validation_failed`; it is never replaced with an empty
+   startup sequence. `validate` reports the same issue and `show` refuses to
+   misrepresent the stored commands.
+8. The merged profile environment and request overrides must fit the
+   256-variable limit. Replacing an existing variable does not consume another
+   slot; adding a variable beyond the limit returns `robot.profile.bad_params`
+   before any spawn or receipt mutation.
 
 Specific failure envelopes:
 

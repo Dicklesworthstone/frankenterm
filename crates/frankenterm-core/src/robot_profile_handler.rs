@@ -45,12 +45,10 @@ use crate::fleet_mutation::{
 use crate::setup::ShellType;
 
 // br-ft-iwg7x: bootstrap-commands metadata can hold malformed JSON.
-// `parse_bootstrap_commands` silently substituted Vec::new() on
-// serde failure, indistinguishable from a profile that simply
-// declared no bootstrap_commands. Operators saw "agent started but
-// did not run my pre-flight setup" with no signal pointing at the
-// dropped parse. This counter bumps on every malformed parse so a
-// single observability scrape surfaces the misconfiguration.
+// `parse_bootstrap_commands` used to substitute Vec::new() on serde
+// failure, allowing a launch without its declared pre-flight setup.
+// Malformed metadata now refuses the operation before any spawn. Keep
+// the existing counter as the number of rejected bootstrap decodes.
 //
 // Same observability defect family as ft-zkthg
 // (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
@@ -59,10 +57,9 @@ use crate::setup::ShellType;
 static ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// br-ft-iwg7x: cumulative count of `bootstrap_commands` metadata
-/// fields dropped because the persisted JSON failed to parse as
-/// `Vec<String>`. Each increment represents one profile-apply
-/// where the operator's intended bootstrap commands were silently
-/// replaced with the empty list. > 0 means investigate profile
+/// fields rejected because the persisted JSON failed to parse as
+/// `Vec<String>`. Invalid metadata is never replaced with an empty
+/// startup sequence. > 0 means investigate profile
 /// metadata authoring (likely hand-edited JSON with a stray
 /// comma, unquoted entry, or wrong-shape value).
 #[must_use]
@@ -337,6 +334,7 @@ fn handle_create(
     profile
         .validate()
         .map_err(|err| ProfileHandlerError::Storage(AgentProfileSqlError::Invalid(err)))?;
+    validated_bootstrap_commands(&profile)?;
 
     if get_agent_profile(backend, name)
         .map_err(ProfileHandlerError::Storage)?
@@ -439,7 +437,7 @@ fn handle_show(params: &Value, backend: &dyn StorageBackend) -> Result<Value, Pr
         description: profile.metadata.get("description").cloned(),
         working_directory: profile.metadata.get("working_directory").cloned(),
         layout_template: profile.metadata.get("layout_template").cloned(),
-        bootstrap_commands: parse_bootstrap_commands(&profile.metadata),
+        bootstrap_commands: validated_bootstrap_commands(&profile)?,
         name: profile.name,
         role: profile.role,
         spawn_command: profile.command,
@@ -465,9 +463,10 @@ fn handle_validate(
             false,
             vec![format!("profile `{name}` not found in agent_profiles")],
         ),
-        Some(profile) => match profile.validate() {
-            Ok(()) => (true, Vec::new()),
-            Err(err) => (false, vec![format_validation_error(&err)]),
+        Some(profile) => match validated_bootstrap_commands(&profile) {
+            Ok(_) => (true, Vec::new()),
+            Err(ProfileHandlerError::ValidationFailed { issues, .. }) => (false, issues),
+            Err(err) => return Err(err),
         },
     };
     to_value(&ProfileValidateData {
@@ -484,13 +483,16 @@ fn handle_apply(
     let name = require_str(params, "name")?;
     let count = validate_profile_apply_count(opt_u32(params, "count")?.unwrap_or(1))?;
     let dry_run = opt_bool(params, "dry_run")?.unwrap_or(false);
+    let env_overrides = parse_env_overrides(params)?;
 
-    // Verify the row exists before reporting any "would spawn" plan.
-    let _profile = get_agent_profile(backend, name)
+    // Preview and live execution reject the same invalid launch input.
+    let profile = get_agent_profile(backend, name)
         .map_err(ProfileHandlerError::Storage)?
         .ok_or_else(|| ProfileHandlerError::NotFound {
             name: name.to_string(),
         })?;
+    validated_bootstrap_commands(&profile)?;
+    profile_apply_environment(&profile, &env_overrides)?;
 
     if dry_run {
         return to_value(&ProfileApplyData {
@@ -746,12 +748,9 @@ pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
             name: name.to_string(),
         })?;
 
-    if let Err(err) = profile.validate() {
-        return Err(ProfileHandlerError::ValidationFailed {
-            name: name.to_string(),
-            issues: vec![format_validation_error(&err)],
-        });
-    }
+    // Validate all launch data before replay lookup or any external effect.
+    let bootstrap_commands = validated_bootstrap_commands(&profile)?;
+    let env = profile_apply_environment(&profile, &env_overrides)?;
 
     let content_hash =
         compute_apply_content_hash(&profile.name, profile.updated_at_ms, count, &env_overrides);
@@ -761,7 +760,7 @@ pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
         }
     }
 
-    let specs = profile_apply_spawn_specs(&profile, count, &env_overrides);
+    let specs = profile_apply_spawn_specs(&profile, count, env, bootstrap_commands);
     let plan = profile_apply_plan(&content_hash, dry_run, &specs, executor);
     let mut ledger = FleetMutationLedger::new();
     let mut fleet_executor = ProfileFleetMutationExecutor::new(executor, &specs);
@@ -911,11 +910,10 @@ fn env_override_key_preview(key: &str) -> String {
     preview
 }
 
-fn profile_apply_spawn_specs<S: BuildHasher>(
+fn profile_apply_environment<S: BuildHasher>(
     profile: &AgentProfile,
-    count: u32,
     env_overrides: &HashMap<String, String, S>,
-) -> Vec<ProfileApplySpawnSpec> {
+) -> Result<BTreeMap<String, String>, ProfileHandlerError> {
     let mut env: BTreeMap<String, String> = profile
         .env
         .iter()
@@ -924,8 +922,22 @@ fn profile_apply_spawn_specs<S: BuildHasher>(
     for (key, value) in env_overrides {
         env.insert(key.clone(), value.clone());
     }
+    if env.len() > ENV_MAX_COUNT {
+        return Err(ProfileHandlerError::BadParams(format!(
+            "merged profile environment has {} entries; maximum is {ENV_MAX_COUNT}",
+            env.len()
+        )));
+    }
+    Ok(env)
+}
+
+fn profile_apply_spawn_specs(
+    profile: &AgentProfile,
+    count: u32,
+    env: BTreeMap<String, String>,
+    bootstrap_commands: Vec<String>,
+) -> Vec<ProfileApplySpawnSpec> {
     let setup_preamble_commands = profile_apply_setup_preamble_commands(&profile.shell);
-    let bootstrap_commands = parse_bootstrap_commands(&profile.metadata);
     let working_directory = profile.metadata.get("working_directory").cloned();
     let domain = profile.metadata.get("domain").cloned();
 
@@ -1177,26 +1189,39 @@ fn strip_null_fields(value: Value) -> Value {
     }
 }
 
-fn parse_bootstrap_commands(metadata: &HashMap<String, String>) -> Vec<String> {
+fn validated_bootstrap_commands(profile: &AgentProfile) -> Result<Vec<String>, ProfileHandlerError> {
+    profile
+        .validate()
+        .map_err(|err| ProfileHandlerError::ValidationFailed {
+            name: profile.name.clone(),
+            issues: vec![format_validation_error(&err)],
+        })?;
+    parse_bootstrap_commands(&profile.metadata).map_err(|_| ProfileHandlerError::ValidationFailed {
+        name: profile.name.clone(),
+        // Startup commands may contain credentials. Report the field and
+        // expected shape without echoing their content or decoder errors.
+        issues: vec!["bootstrap_commands must be a JSON array of strings".to_string()],
+    })
+}
+
+fn parse_bootstrap_commands(
+    metadata: &HashMap<String, String>,
+) -> Result<Vec<String>, serde_json::Error> {
     let Some(raw) = metadata.get("bootstrap_commands") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     match serde_json::from_str::<Vec<String>>(raw) {
-        Ok(commands) => commands,
+        Ok(commands) => Ok(commands),
         Err(err) => {
-            // br-ft-iwg7x: bump audit-fidelity counter and emit a
-            // structured warn so operators can spot the silent drop
-            // via metrics scrape AND log search.
             record_robot_profile_bootstrap_serde_drop();
             tracing::warn!(
                 target: "frankenterm::robot_profile_handler",
                 event = "br-ft-iwg7x",
-                error = %err,
                 raw_len = raw.len(),
                 "robot profile bootstrap_commands metadata failed to parse as Vec<String>; \
-                 falling back to empty list"
+                 refusing the operation"
             );
-            Vec::new()
+            Err(err)
         }
     }
 }
@@ -1660,6 +1685,19 @@ mod tests {
         assert_eq!(planned["dry_run"], json!(true));
     }
 
+    fn validated_spawn_specs(
+        profile: &AgentProfile,
+        count: u32,
+        env_overrides: &HashMap<String, String>,
+    ) -> Vec<ProfileApplySpawnSpec> {
+        profile_apply_spawn_specs(
+            profile,
+            count,
+            profile_apply_environment(profile, env_overrides).unwrap(),
+            validated_bootstrap_commands(profile).unwrap(),
+        )
+    }
+
     fn fresh_conn_with_apply_log() -> RusqliteBackend {
         let backend = fresh_conn();
         backend
@@ -2043,6 +2081,160 @@ mod tests {
     }
 
     #[test]
+    fn malformed_bootstrap_is_rejected_by_preview_validation_and_live_apply() {
+        let _guard = super::bootstrap_serde_drop_tests::lock();
+        for raw in [
+            r#"["required setup""#,
+            r#"{"token":"synthetic-private-value"}"#,
+            r#"["required setup", 1]"#,
+            "null",
+        ] {
+            let conn = fresh_conn_with_apply_log();
+            let mut profile = synth("broken", "r", vec![]);
+            profile
+                .metadata
+                .insert("bootstrap_commands".to_string(), raw.to_string());
+            // Legacy/imported rows can pass the general profile shape checks
+            // even when their launch metadata is not a command array.
+            insert_agent_profile(&conn, &profile).unwrap();
+
+            let validation =
+                handle_profile_command("validate", &json!({ "name": "broken" }), &conn).unwrap();
+            assert_eq!(validation["valid"], json!(false));
+            assert!(
+                validation["issues"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("bootstrap_commands")
+            );
+            assert!(!validation.to_string().contains("synthetic-private-value"));
+
+            for (action, params) in [
+                ("show", json!({ "name": "broken" })),
+                ("apply", json!({ "name": "broken", "dry_run": true })),
+            ] {
+                let error = handle_profile_command(action, &params, &conn).unwrap_err();
+                assert_eq!(error.error_code(), "robot.profile.validation_failed");
+                assert!(!error.to_string().contains("synthetic-private-value"));
+            }
+            for dry_run in [true, false] {
+                let mut executor = FakeApplyExecutor::new();
+                let error = handle_profile_apply_with_executor(
+                    &json!({ "name": "broken", "count": 2, "dry_run": dry_run }),
+                    &conn,
+                    &mut executor,
+                    1_700_000_000_000,
+                )
+                .unwrap_err();
+                assert_eq!(error.error_code(), "robot.profile.validation_failed");
+                assert!(executor.spawned.is_empty());
+                assert!(executor.stopped.is_empty());
+            }
+            let hash =
+                compute_apply_content_hash(&profile.name, profile.updated_at_ms, 2, &HashMap::new());
+            assert!(get_apply_receipt(&conn, &hash).unwrap().is_none());
+            assert_eq!(get_agent_profile(&conn, "broken").unwrap(), Some(profile));
+        }
+    }
+
+    #[test]
+    fn malformed_bootstrap_cannot_reuse_an_old_success_receipt() {
+        let _guard = super::bootstrap_serde_drop_tests::lock();
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let params = json!({ "name": "ready", "count": 1, "dry_run": false });
+        let mut initial = FakeApplyExecutor::new();
+        handle_profile_apply_with_executor(&params, &conn, &mut initial, 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(initial.spawned.len(), 1);
+
+        // Preserve the revision timestamp to reproduce a corrupt imported row
+        // colliding with the persisted receipt's identity.
+        conn.execute_batch(
+            r#"UPDATE agent_profiles
+               SET metadata = '{"bootstrap_commands":"[1]"}'
+               WHERE name = 'ready';"#,
+        )
+        .unwrap();
+        let mut retry = FakeApplyExecutor::new();
+        let error =
+            handle_profile_apply_with_executor(&params, &conn, &mut retry, 1_700_000_000_100)
+                .unwrap_err();
+        assert_eq!(error.error_code(), "robot.profile.validation_failed");
+        assert!(retry.spawned.is_empty());
+        assert!(retry.stopped.is_empty());
+    }
+
+    #[test]
+    fn apply_bounds_the_merged_environment_and_allows_existing_key_overrides() {
+        let conn = fresh_conn_with_apply_log();
+        let mut profile = synth("full", "r", vec![]);
+        profile.env = (0..ENV_MAX_COUNT)
+            .map(|index| (format!("KEY_{index}"), "base".to_string()))
+            .collect();
+        insert_agent_profile(&conn, &profile).unwrap();
+        let params = json!({
+            "name": "full",
+            "count": 1,
+            "dry_run": true,
+            "env_overrides": { "EXTRA": "value" }
+        });
+        let error = handle_profile_command("apply", &params, &conn).unwrap_err();
+        assert_eq!(error.error_code(), "robot.profile.bad_params");
+        assert!(error.to_string().contains("merged profile environment"));
+        for dry_run in [true, false] {
+            let mut request = params.clone();
+            request["dry_run"] = json!(dry_run);
+            let mut executor = FakeApplyExecutor::new();
+            let error =
+                handle_profile_apply_with_executor(&request, &conn, &mut executor, 1_700_000_000_000)
+                    .unwrap_err();
+            assert_eq!(error.error_code(), "robot.profile.bad_params");
+            assert!(executor.spawned.is_empty());
+        }
+
+        let mut executor = FakeApplyExecutor::new();
+        handle_profile_apply_with_executor(
+            &json!({
+                "name": "full",
+                "dry_run": false,
+                "env_overrides": { "KEY_0": "overridden" }
+            }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(executor.spawned.len(), 1);
+        assert_eq!(executor.spawned[0].env.len(), ENV_MAX_COUNT);
+        assert_eq!(executor.spawned[0].env["KEY_0"], "overridden");
+    }
+
+    #[test]
+    fn live_apply_keeps_the_complete_bootstrap_sequence_on_every_pane() {
+        let conn = fresh_conn_with_apply_log();
+        let mut profile = synth("prepared", "r", vec![]);
+        let commands = vec!["printf 'ready\\n'".to_string(), "echo 確認".to_string()];
+        profile.metadata.insert(
+            "bootstrap_commands".to_string(),
+            serde_json::to_string(&commands).unwrap(),
+        );
+        insert_agent_profile(&conn, &profile).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        handle_profile_apply_with_executor(
+            &json!({ "name": "prepared", "count": 2, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(executor.spawned.len(), 2);
+        for spec in &executor.spawned {
+            assert_eq!(spec.bootstrap_commands, commands);
+        }
+    }
+
+    #[test]
     fn live_apply_replays_existing_receipt_without_spawning() {
         let conn = fresh_conn_with_apply_log();
         insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
@@ -2130,7 +2322,7 @@ mod tests {
     fn log_failure_compensation_uses_reverse_spawn_order_for_double_digit_steps() {
         let profile = synth("ready", "r", vec![]);
         let env_overrides = HashMap::new();
-        let specs = profile_apply_spawn_specs(&profile, 12, &env_overrides);
+        let specs = validated_spawn_specs(&profile, 12, &env_overrides);
         let mut executor = FakeApplyExecutor::new();
         let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
 
@@ -2161,7 +2353,7 @@ mod tests {
             "bootstrap_commands".to_string(),
             r#"["echo warmup"]"#.to_string(),
         );
-        let specs = profile_apply_spawn_specs(&profile, 1, &HashMap::new());
+        let specs = validated_spawn_specs(&profile, 1, &HashMap::new());
 
         assert_eq!(specs.len(), 1);
         for spec in &specs {
@@ -2182,7 +2374,7 @@ mod tests {
     fn spawn_specs_do_not_guess_shell_integration_for_unknown_shells() {
         let mut profile = synth("ready", "r", vec![]);
         profile.shell = "/opt/custom-shell".to_string();
-        let specs = profile_apply_spawn_specs(&profile, 1, &HashMap::new());
+        let specs = validated_spawn_specs(&profile, 1, &HashMap::new());
 
         assert_eq!(specs.len(), 1);
         for spec in &specs {
@@ -2197,7 +2389,7 @@ mod tests {
         let mut profile = synth("ready", "r", vec![]);
         profile.shell = "/bin/bash".to_string();
         let env_overrides = HashMap::new();
-        let specs = profile_apply_spawn_specs(&profile, 1, &env_overrides);
+        let specs = validated_spawn_specs(&profile, 1, &env_overrides);
         let mut executor = FakeApplyExecutor::new();
         let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
 
@@ -2220,7 +2412,7 @@ mod tests {
     fn log_failure_compensation_keeps_pending_state_when_stop_fails() {
         let profile = synth("ready", "r", vec![]);
         let env_overrides = HashMap::new();
-        let specs = profile_apply_spawn_specs(&profile, 3, &env_overrides);
+        let specs = validated_spawn_specs(&profile, 3, &env_overrides);
         let mut executor = FakeApplyExecutor::new();
         executor.fail_stop = true;
         let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
@@ -2353,7 +2545,7 @@ mod bootstrap_serde_drop_tests {
 
     static SERDE_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock() -> MutexGuard<'static, ()> {
+    pub(super) fn lock() -> MutexGuard<'static, ()> {
         SERDE_DROP_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2364,7 +2556,7 @@ mod bootstrap_serde_drop_tests {
         let _g = lock();
         reset_robot_profile_bootstrap_serde_drop_count_for_test();
         let metadata: HashMap<String, String> = HashMap::new();
-        let result = parse_bootstrap_commands(&metadata);
+        let result = parse_bootstrap_commands(&metadata).unwrap();
         assert_eq!(result, [] as [std::string::String; 0]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
     }
@@ -2378,7 +2570,7 @@ mod bootstrap_serde_drop_tests {
             "bootstrap_commands".to_string(),
             r#"["echo hi","ls -la"]"#.to_string(),
         );
-        let result = parse_bootstrap_commands(&metadata);
+        let result = parse_bootstrap_commands(&metadata).unwrap();
         assert_eq!(result, vec!["echo hi".to_string(), "ls -la".to_string()]);
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
     }
@@ -2394,7 +2586,7 @@ mod bootstrap_serde_drop_tests {
             r#"["echo hi""#.to_string(),
         );
         let result = parse_bootstrap_commands(&metadata);
-        assert_eq!(result, [] as [std::string::String; 0]);
+        assert!(result.is_err());
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 
@@ -2409,7 +2601,7 @@ mod bootstrap_serde_drop_tests {
             r#"{"a": "b"}"#.to_string(),
         );
         let result = parse_bootstrap_commands(&metadata);
-        assert_eq!(result, [] as [std::string::String; 0]);
+        assert!(result.is_err());
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 
@@ -2421,7 +2613,7 @@ mod bootstrap_serde_drop_tests {
         // Vec<i32>, not Vec<String>
         metadata.insert("bootstrap_commands".to_string(), r"[1, 2, 3]".to_string());
         let result = parse_bootstrap_commands(&metadata);
-        assert_eq!(result, [] as [std::string::String; 0]);
+        assert!(result.is_err());
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
     }
 
@@ -2444,7 +2636,7 @@ mod bootstrap_serde_drop_tests {
         #![proptest_config(proptest::test_runner::Config::with_cases(64))]
 
         // br-ft-iwg7x: any non-Vec<String> JSON document must bump
-        // the counter exactly once and yield an empty Vec.
+        // the counter exactly once and refuse a launch sequence.
         #[test]
         fn arbitrary_non_array_json_always_bumps(
             shape in proptest::sample::select(vec![
@@ -2467,7 +2659,7 @@ mod bootstrap_serde_drop_tests {
             let mut metadata = HashMap::new();
             metadata.insert("bootstrap_commands".to_string(), shape);
             let result = parse_bootstrap_commands(&metadata);
-            proptest::prop_assert!(result.is_empty());
+            proptest::prop_assert!(result.is_err());
             proptest::prop_assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
         }
 
@@ -2482,7 +2674,7 @@ mod bootstrap_serde_drop_tests {
             let raw = serde_json::to_string(&commands).unwrap();
             let mut metadata = HashMap::new();
             metadata.insert("bootstrap_commands".to_string(), raw);
-            let result = parse_bootstrap_commands(&metadata);
+            let result = parse_bootstrap_commands(&metadata).unwrap();
             proptest::prop_assert_eq!(&result, &commands);
             proptest::prop_assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
         }
