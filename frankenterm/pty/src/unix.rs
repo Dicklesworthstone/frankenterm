@@ -782,6 +782,10 @@ mod tests {
             broker_master.send_terminal_eof().is_err(),
             "terminal EOF authority was reusable"
         );
+        // Read the shell's last line before waiting, as the ordinary-writer
+        // test does. On macOS an exiting process blocks until its terminal
+        // output is read, so waiting with "third:" still queued never returned.
+        let _ = read_until(broker_reader.as_mut(), b"third:");
         assert!(child.wait().expect("wait after explicit EOF").success());
     }
 
