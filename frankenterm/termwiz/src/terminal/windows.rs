@@ -12,7 +12,6 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{mem, ptr};
-use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::consoleapi;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects};
@@ -105,7 +104,7 @@ fn received_input_event_count(num_events: u32, capacity: usize) -> Result<usize>
 fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
     current_len
         .checked_add(incoming_len)
-        .map_or(true, |total| total > capacity)
+        .is_none_or(|total| total > capacity)
 }
 
 fn visible_span(start: i16, end: i16) -> i16 {
@@ -143,6 +142,8 @@ pub trait ConsoleOutputHandle {
     fn get_buffer_contents(&mut self) -> Result<Vec<CHAR_INFO>>;
     fn set_buffer_contents(&mut self, buffer: &[CHAR_INFO]) -> Result<()>;
     fn set_viewport(&mut self, left: i16, top: i16, right: i16, bottom: i16) -> Result<()>;
+    // ScrollConsoleScreenBuffer's rectangle, shift and fill attribute.
+    #[allow(clippy::too_many_arguments)]
     fn scroll_region(
         &mut self,
         left: i16,
@@ -1080,7 +1081,7 @@ impl Terminal for WindowsTerminal {
                 let result = unsafe {
                     WaitForMultipleObjects(2, handles.as_mut_ptr(), 0, wait_timeout_millis(wait))
                 };
-                if result == WAIT_OBJECT_0 + 0 {
+                if result == WAIT_OBJECT_0 {
                     pending = self.input_handle.get_number_of_input_events()?;
                 } else if result == WAIT_OBJECT_0 + 1 {
                     return Ok(Some(InputEvent::Wake));
@@ -1089,9 +1090,8 @@ impl Terminal for WindowsTerminal {
                         "failed to WaitForMultipleObjects: {}",
                         IoError::last_os_error()
                     );
-                } else if result == WAIT_TIMEOUT {
-                    return Ok(None);
                 } else {
+                    // WAIT_TIMEOUT, or any other result.
                     return Ok(None);
                 }
             }

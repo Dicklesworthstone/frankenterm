@@ -38,10 +38,6 @@ impl HandleCloneError {
             IoError::new(self.kind, "failed to clone Windows process handle")
         }
     }
-
-    fn to_io_error(&self) -> IoError {
-        (*self).into_io_error()
-    }
 }
 
 impl From<IoError> for HandleCloneError {
@@ -124,7 +120,7 @@ pub struct WinChildKiller {
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        let proc = self.proc.as_ref().map_err(HandleCloneError::to_io_error)?;
+        let proc = self.proc.as_ref().map_err(|error| error.into_io_error())?;
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         // TerminateProcess returns non-zero (TRUE) on success
         if res == 0 {

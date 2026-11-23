@@ -353,42 +353,6 @@ impl ScreenBuffer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coordinate_helpers_handle_extreme_relative_offsets() {
-        assert_eq!(relative_coordinate(5, 3), 8);
-        assert_eq!(relative_coordinate(5, -3), 2);
-        assert_eq!(relative_coordinate(5, isize::MIN), 0);
-        assert_eq!(end_relative_coordinate(10, 0), 9);
-        assert_eq!(end_relative_coordinate(10, usize::MAX), 0);
-    }
-
-    #[test]
-    fn negative_scroll_count_saturates_extreme_values() {
-        assert_eq!(negative_scroll_count(3), -3);
-        assert_eq!(negative_scroll_count(isize::MAX as usize + 1), isize::MIN);
-    }
-
-    #[test]
-    fn screen_cell_count_saturates_extreme_dimensions() {
-        assert_eq!(screen_cell_count(80, 24), 1_920);
-        assert_eq!(screen_cell_count(usize::MAX, 2), usize::MAX);
-    }
-
-    #[test]
-    fn windows_coord_helpers_do_not_wrap_negative_values() {
-        assert_eq!(coord_extent_to_usize(120), 120);
-        assert_eq!(coord_extent_to_usize(-1), 0);
-        assert_eq!(visible_window_rows(3, 5), 3);
-        assert_eq!(visible_window_rows(5, 3), 0);
-        assert_eq!(relative_window_coord(10, 3), 7);
-        assert_eq!(relative_window_coord(-1, 3), 0);
-    }
-}
-
 impl WindowsConsoleRenderer {
     pub fn render_to<B: ConsoleOutputHandle + Write>(
         &mut self,
@@ -414,9 +378,7 @@ impl WindowsConsoleRenderer {
         for change in changes {
             match change {
                 Change::ClearScreen(color) => {
-                    let attr = CellAttributes::default()
-                        .set_background(color.clone())
-                        .clone();
+                    let attr = CellAttributes::default().set_background(*color).clone();
 
                     buffer.fill(
                         ' ',
@@ -428,9 +390,7 @@ impl WindowsConsoleRenderer {
                     buffer.set_cursor(0, 0, out)?;
                 }
                 Change::ClearToEndOfLine(color) => {
-                    let attr = CellAttributes::default()
-                        .set_background(color.clone())
-                        .clone();
+                    let attr = CellAttributes::default().set_background(*color).clone();
 
                     buffer.fill(
                         ' ',
@@ -441,9 +401,7 @@ impl WindowsConsoleRenderer {
                     );
                 }
                 Change::ClearToEndOfScreen(color) => {
-                    let attr = CellAttributes::default()
-                        .set_background(color.clone())
-                        .clone();
+                    let attr = CellAttributes::default().set_background(*color).clone();
 
                     buffer.fill(
                         ' ',
@@ -578,5 +536,41 @@ impl WindowsConsoleRenderer {
 
         buffer.flush(out)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinate_helpers_handle_extreme_relative_offsets() {
+        assert_eq!(relative_coordinate(5, 3), 8);
+        assert_eq!(relative_coordinate(5, -3), 2);
+        assert_eq!(relative_coordinate(5, isize::MIN), 0);
+        assert_eq!(end_relative_coordinate(10, 0), 9);
+        assert_eq!(end_relative_coordinate(10, usize::MAX), 0);
+    }
+
+    #[test]
+    fn negative_scroll_count_saturates_extreme_values() {
+        assert_eq!(negative_scroll_count(3), -3);
+        assert_eq!(negative_scroll_count(isize::MAX as usize + 1), isize::MIN);
+    }
+
+    #[test]
+    fn screen_cell_count_saturates_extreme_dimensions() {
+        assert_eq!(screen_cell_count(80, 24), 1_920);
+        assert_eq!(screen_cell_count(usize::MAX, 2), usize::MAX);
+    }
+
+    #[test]
+    fn windows_coord_helpers_do_not_wrap_negative_values() {
+        assert_eq!(coord_extent_to_usize(120), 120);
+        assert_eq!(coord_extent_to_usize(-1), 0);
+        assert_eq!(visible_window_rows(3, 5), 3);
+        assert_eq!(visible_window_rows(5, 3), 0);
+        assert_eq!(relative_window_coord(10, 3), 7);
+        assert_eq!(relative_window_coord(-1, 3), 0);
     }
 }
