@@ -1021,6 +1021,69 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
     input
 }
 
+/// Revision authority belongs to the long-lived handler, not its fresh
+/// per-request policy engine. Restore only under the effect owner's fence.
+#[derive(Default)]
+struct McpKillSwitchGate {
+    freshness: std::sync::Mutex<crate::policy_kill_switch_state::KillSwitchFreshness>,
+}
+
+impl McpKillSwitchGate {
+    fn restore(
+        &self,
+        fence: &crate::policy_kill_switch_state::KillSwitchFence,
+        engine: &mut PolicyEngine,
+        loaded: std::result::Result<
+            Option<String>,
+            crate::policy_kill_switch_state::KillSwitchStateError,
+        >,
+    ) -> crate::policy_kill_switch_state::KillSwitchRestore {
+        use crate::policy_kill_switch_state::{KillSwitchStateError, apply_persisted_kill_switch};
+
+        let checked = match self.freshness.lock() {
+            Ok(mut freshness) => freshness.bind(fence).and_then(|()| freshness.validate(loaded)),
+            Err(_) => Err(KillSwitchStateError::LoadFailed("MCP freshness unavailable".into())),
+        };
+        apply_persisted_kill_switch(engine, checked, now_ms())
+    }
+
+    async fn refresh(
+        &self,
+        cx: &crate::cx::Cx,
+        db_path: &Path,
+        engine: &mut PolicyEngine,
+    ) -> std::result::Result<crate::policy_kill_switch_state::KillSwitchFence, McpToolError> {
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_FENCE_WAIT, KillSwitchRestore,
+            acquire_kill_switch_fence_within_with_cx, load_kill_switch_state_from_path_with_cx,
+        };
+
+        let authority_error = |code: &str| {
+            McpToolError::new(
+                MCP_ERR_POLICY,
+                format!("MCP effect refused: kill-switch authority unavailable ({code})"),
+                Some("Inspect the workspace kill-switch state before retrying.".to_string()),
+            )
+        };
+        let fence = acquire_kill_switch_fence_within_with_cx(cx, db_path, KILL_SWITCH_FENCE_WAIT)
+            .await
+            .map_err(|error| authority_error(error.code()))?;
+        let path = db_path
+            .to_str()
+            .ok_or_else(|| authority_error("invalid_workspace_path"))?;
+        if let KillSwitchRestore::FailedClosed { error } = self.restore(
+            &fence,
+            engine,
+            load_kill_switch_state_from_path_with_cx(cx, path),
+        ) {
+            // An unreadable/regressed state must not downgrade a previously
+            // observed EmergencyHalt into permission to read pane contents.
+            return Err(authority_error(error.code()));
+        }
+        Ok(fence)
+    }
+}
+
 /// ft-x86z2: security gate for mutating MCP tools that don't live on a pane
 /// surface (tx / mission control). Runs `PolicyEngine.authorize` against a
 /// `PolicySurface::Mcp` + `ActionKind::ExecCommand` input carrying the tool
@@ -1053,6 +1116,7 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// follow-up; this fix removes the misleading dead end.
 fn mcp_authorize_mcp_mutation(
     cx: &crate::cx::Cx,
+    kill_switch_gate: &McpKillSwitchGate,
     config: &Config,
     audit_db_path: Option<&std::path::Path>,
     policy_rate_limiter: &SharedRateLimiter,
@@ -1105,7 +1169,14 @@ fn mcp_authorize_mcp_mutation(
             (Err(error), _) => Err(error.clone()),
             (_, Err(error)) => Err(error.clone()),
         };
-        apply_persisted_kill_switch(&mut engine, loaded, now_ms());
+        match &fence {
+            Ok(fence) => {
+                kill_switch_gate.restore(fence, &mut engine, loaded);
+            }
+            Err(_) => {
+                apply_persisted_kill_switch(&mut engine, loaded, now_ms());
+            }
+        }
         effect_fence = fence.ok();
         decision = engine.authorize(&input);
     }
@@ -3201,6 +3272,7 @@ pub(super) struct WaGetTextTool {
     #[cfg(test)]
     wezterm_override: Option<crate::wezterm::WeztermHandle>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaGetTextTool {
@@ -3221,6 +3293,7 @@ impl WaGetTextTool {
             #[cfg(test)]
             wezterm_override: None,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 
@@ -3246,6 +3319,7 @@ impl WaGetTextTool {
             db_path,
             wezterm_override: Some(wezterm),
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -3323,6 +3397,26 @@ impl ToolHandler for WaGetTextTool {
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP get-text storage open.
                 let open_cx = ctx.cx().clone();
+                let authority_path = match db_path.as_ref() {
+                    Some(path) => path.as_ref().clone(),
+                    // Degraded registration must still observe durable stops.
+                    None => {
+                        config.workspace_layout(None)
+                            .map_err(McpToolError::from_error)?
+                            .db_path
+                    }
+                };
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    false,
+                    Arc::clone(&policy_rate_limiter),
+                );
+                // Require existing authority before storage initialization can
+                // create a missing database. Retain it through the actual read.
+                let _read_fence = self
+                    .kill_switch_gate
+                    .refresh(&open_cx, &authority_path, &mut engine)
+                    .await?;
                 let storage = if let Some(path) = db_path.as_ref() {
                     Some(
                         StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
@@ -3365,11 +3459,6 @@ impl ToolHandler for WaGetTextTool {
                     resolve_pane_capabilities(&wezterm_cx, &config, storage.as_ref(), params.pane_id).await;
                 let capabilities = resolution.capabilities;
 
-                let mut engine = build_policy_engine_with_shared_rate_limiter(
-                    &config,
-                    false,
-                    Arc::clone(&policy_rate_limiter),
-                );
                 let summary = format!("wa.get_text pane_id={}", params.pane_id);
                 let mut input =
                     mcp_get_text_policy_input(params.pane_id, domain.clone(), capabilities, &summary);
@@ -11819,6 +11908,7 @@ impl ToolHandler for WaTxShowTool {
 pub(super) struct WaTxRunTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaTxRunTool {
@@ -11835,6 +11925,7 @@ impl WaTxRunTool {
         Self {
             config,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -11890,6 +11981,7 @@ impl ToolHandler for WaTxRunTool {
         // ft-x86z2: policy gate before any side effect (contract load, tx execute).
         let admission_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -12137,6 +12229,7 @@ impl ToolHandler for WaTxRunTool {
 pub(super) struct WaTxRollbackTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 fn mcp_tx_rollback_proof_error(
@@ -12168,6 +12261,7 @@ impl WaTxRollbackTool {
         Self {
             config,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -12220,6 +12314,7 @@ impl ToolHandler for WaTxRollbackTool {
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
         let admission_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -12595,6 +12690,7 @@ pub(super) struct WaReserveTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaReserveTool {
@@ -12613,6 +12709,7 @@ impl WaReserveTool {
             config,
             db_path,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -12648,7 +12745,7 @@ impl ToolHandler for WaReserveTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: ReserveParams = match serde_json::from_value(arguments) {
@@ -12677,7 +12774,16 @@ impl ToolHandler for WaReserveTool {
         let result: std::result::Result<McpReserveData, McpToolError> =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP reserve storage open.
-                let reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let reserve_cx = ctx.cx().clone();
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
+                let admission_fence = self
+                    .kill_switch_gate
+                    .refresh(&reserve_cx, &db_path, &mut engine)
+                    .await?;
                 let storage = StorageHandle::with_config_with_cx(
                     &reserve_cx,
                     &db_path.to_string_lossy(),
@@ -12686,11 +12792,6 @@ impl ToolHandler for WaReserveTool {
                 .await
                 .map_err(McpToolError::from_error)?;
 
-                let mut engine = build_policy_engine_with_shared_rate_limiter(
-                    &config,
-                    config.safety.require_prompt_active,
-                    Arc::clone(&policy_rate_limiter),
-                );
                 let summary = format!("reserve pane {}", params.pane_id);
                 let input = mcp_reserve_pane_policy_input(params.pane_id, &summary);
 
@@ -12743,8 +12844,12 @@ impl ToolHandler for WaReserveTool {
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
+                // Hand off to the executing writer's own stop check and fence;
+                // cancellation after enqueue cannot release its effect authority.
+                drop(admission_fence);
                 let reservation = storage
-                    .create_reservation(
+                    .create_reservation_with_cx(
+                        &reserve_cx,
                         params.pane_id,
                         &params.owner_kind,
                         &params.owner_id,
@@ -12779,6 +12884,7 @@ pub(super) struct WaReleaseTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaReleaseTool {
@@ -12797,6 +12903,7 @@ impl WaReleaseTool {
             config,
             db_path,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -12826,7 +12933,7 @@ impl ToolHandler for WaReleaseTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: ReleaseParams = match serde_json::from_value(arguments) {
@@ -12852,13 +12959,22 @@ impl ToolHandler for WaReleaseTool {
         let result: std::result::Result<McpReleaseData, McpToolError> =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP release storage open.
-                let release_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let release_cx = ctx.cx().clone();
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
+                let admission_fence = self
+                    .kill_switch_gate
+                    .refresh(&release_cx, &db_path, &mut engine)
+                    .await?;
                 let storage = StorageHandle::new_with_cx(&release_cx, &db_path.to_string_lossy())
                     .await
                     .map_err(McpToolError::from_error)?;
 
                 let active = storage
-                    .list_active_reservations()
+                    .list_active_reservations_with_cx(&release_cx)
                     .await
                     .map_err(McpToolError::from_error)?;
                 let pane_id = active
@@ -12866,11 +12982,6 @@ impl ToolHandler for WaReleaseTool {
                     .find(|r| r.id == params.reservation_id)
                     .map(|r| r.pane_id);
 
-                let mut engine = build_policy_engine_with_shared_rate_limiter(
-                    &config,
-                    config.safety.require_prompt_active,
-                    Arc::clone(&policy_rate_limiter),
-                );
                 let summary = format!("release reservation {}", params.reservation_id);
                 let input = mcp_release_pane_policy_input(&summary, pane_id);
 
@@ -12923,8 +13034,9 @@ impl ToolHandler for WaReleaseTool {
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
+                drop(admission_fence);
                 let released = storage
-                    .release_reservation(params.reservation_id)
+                    .release_reservation_with_cx(&release_cx, params.reservation_id)
                     .await
                     .map_err(McpToolError::from_error)?;
                 Ok(McpReleaseData {
@@ -14097,6 +14209,7 @@ impl ToolHandler for WaMissionExplainTool {
 pub(super) struct WaMissionPauseTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaMissionPauseTool {
@@ -14113,6 +14226,7 @@ impl WaMissionPauseTool {
         Self {
             config,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -14174,6 +14288,7 @@ impl ToolHandler for WaMissionPauseTool {
         // ft-x86z2: policy gate before mission load + state transition.
         let _effect_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14261,6 +14376,7 @@ impl ToolHandler for WaMissionPauseTool {
 pub(super) struct WaMissionResumeTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaMissionResumeTool {
@@ -14277,6 +14393,7 @@ impl WaMissionResumeTool {
         Self {
             config,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -14331,6 +14448,7 @@ impl ToolHandler for WaMissionResumeTool {
         // ft-x86z2: policy gate before mission load + state transition.
         let _effect_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14419,6 +14537,7 @@ impl ToolHandler for WaMissionResumeTool {
 pub(super) struct WaMissionAbortTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaMissionAbortTool {
@@ -14435,6 +14554,7 @@ impl WaMissionAbortTool {
         Self {
             config,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -14498,6 +14618,7 @@ impl ToolHandler for WaMissionAbortTool {
         // ft-x86z2: policy gate before mission load + abort decision.
         let _effect_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14591,6 +14712,7 @@ pub(super) struct WaEventsAnnotateTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaEventsAnnotateTool {
@@ -14609,6 +14731,7 @@ impl WaEventsAnnotateTool {
             config,
             db_path,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -14697,6 +14820,7 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         let admission_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
@@ -14831,6 +14955,7 @@ pub(super) struct WaEventsTriageTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaEventsTriageTool {
@@ -14849,6 +14974,7 @@ impl WaEventsTriageTool {
             config,
             db_path,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -14937,6 +15063,7 @@ impl ToolHandler for WaEventsTriageTool {
 
         let admission_fence = match mcp_authorize_mcp_mutation(
             ctx.cx(),
+            &self.kill_switch_gate,
             self.config.as_ref(),
             Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
@@ -15058,6 +15185,7 @@ pub(super) struct WaEventsLabelTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     policy_rate_limiter: SharedRateLimiter,
+    kill_switch_gate: McpKillSwitchGate,
 }
 
 impl WaEventsLabelTool {
@@ -15076,6 +15204,7 @@ impl WaEventsLabelTool {
             config,
             db_path,
             policy_rate_limiter,
+            kill_switch_gate: McpKillSwitchGate::default(),
         }
     }
 }
@@ -15188,6 +15317,7 @@ impl ToolHandler for WaEventsLabelTool {
         if is_mutation {
             let admission_fence = match mcp_authorize_mcp_mutation(
                 ctx.cx(),
+                &self.kill_switch_gate,
                 self.config.as_ref(),
                 Some(self.db_path.as_ref().as_path()),
                 &self.policy_rate_limiter,
@@ -15486,6 +15616,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
         (dir, Arc::new(path))
+    }
+
+    fn kill_switch_test_db_path() -> (TempDir, Arc<PathBuf>) {
+        let (directory, path) = temp_db_path();
+        seed_event(&path);
+        (directory, path)
+    }
+
+    fn transition_mcp_test_kill_switch(
+        path: &Path,
+        level: Option<crate::policy_quarantine::KillSwitchLevel>,
+    ) -> crate::policy_kill_switch_state::PersistedKillSwitch {
+        use crate::policy_kill_switch_state::{
+            KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+        let backend = crate::storage_backend_trait::RusqliteBackend::open_path(
+            path,
+            &crate::storage_backend_trait::OpenConfig {
+                wal_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let transition = match level {
+            Some(level) => KillSwitchTransition::Trip {
+                level,
+                by: "test-operator",
+                reason: "private operator reason",
+            },
+            None => KillSwitchTransition::Reset { by: "test-operator" },
+        };
+        let receipt = transition_kill_switch_from_backend(
+            &backend,
+            transition,
+            u64::try_from(mcp_now_ms_i64()).unwrap(),
+        )
+        .unwrap();
+        let mut persisted = crate::policy_kill_switch_state::PersistedKillSwitch::from(&receipt.state);
+        persisted.revision = receipt.revision;
+        persisted
     }
 
     fn wait_for_completion_stats(
@@ -27515,6 +27685,7 @@ exit 17",
         response: crate::wezterm::MuxPaneText,
         requests: std::sync::Mutex<Vec<(u64, bool, Option<usize>)>>,
         cancel_on_read: bool,
+        fence_path: Option<PathBuf>,
     }
 
     impl TailOnlyMux {
@@ -27530,6 +27701,7 @@ exit 17",
                 response,
                 requests: std::sync::Mutex::new(Vec::new()),
                 cancel_on_read: false,
+                fence_path: None,
             }
         }
 
@@ -27576,6 +27748,12 @@ exit 17",
             tail: Option<usize>,
         ) -> crate::wezterm::WeztermFuture<'a, crate::wezterm::MuxPaneText> {
             Box::pin(async move {
+                if let Some(path) = &self.fence_path {
+                    assert!(matches!(
+                        crate::policy_kill_switch_state::acquire_kill_switch_fence(path),
+                        Err(crate::policy_kill_switch_state::KillSwitchStateError::FencePending)
+                    ), "the real read must retain workspace effect authority");
+                }
                 self.requests.lock().unwrap().push((pane_id, escapes, tail));
                 if self.cancel_on_read {
                     cx.set_cancel_requested(true);
@@ -27679,7 +27857,9 @@ exit 17",
             original_bytes: None,
             truncated: true,
         }));
-        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        let (_db_dir, path) = kill_switch_test_db_path();
+        let cfg = config_with_db_path(&path);
+        let tool = WaGetTextTool::with_wezterm_handle(cfg, None, mux.clone());
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -27710,7 +27890,9 @@ exit 17",
             original_bytes: Some(6),
             truncated: false,
         }));
-        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        let (_db_dir, path) = kill_switch_test_db_path();
+        let cfg = config_with_db_path(&path);
+        let tool = WaGetTextTool::with_wezterm_handle(cfg, None, mux.clone());
         for arguments in [
             serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID}),
             serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID, "tail": 10_000}),
@@ -27751,11 +27933,10 @@ exit 17",
             original_bytes: None,
             truncated: true,
         }));
-        let tool = WaGetTextTool::with_wezterm_handle(
-            deny_mcp_read_output_config("local", "pane read blocked"),
-            None,
-            mux.clone(),
-        );
+        let mut cfg = deny_mcp_read_output_config("local", "pane read blocked");
+        let (_db_dir, path) = kill_switch_test_db_path();
+        Arc::make_mut(&mut cfg).storage.db_path = path.to_string_lossy().into_owned();
+        let tool = WaGetTextTool::with_wezterm_handle(cfg, None, mux.clone());
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -27769,6 +27950,119 @@ exit 17",
     }
 
     #[test]
+    fn get_text_observes_stop_tiers_and_rejects_corrupt_missing_or_regressed_authority() {
+        use crate::policy_kill_switch_state::{KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY};
+        use crate::policy_quarantine::KillSwitchLevel;
+
+        // Both normal and degraded registration must use the workspace stop.
+        for explicit_database in [true, false] {
+            let (_db_dir, path) = kill_switch_test_db_path();
+            let initial = transition_mcp_test_kill_switch(&path, None);
+            let mut source = TailOnlyMux::new(crate::wezterm::MuxPaneText {
+                text: "operator-visible output".to_string(),
+                original_lines: 1,
+                original_bytes: None,
+                truncated: false,
+            });
+            source.fence_path = Some(path.as_ref().clone());
+            let mux = Arc::new(source);
+            let tool = WaGetTextTool::with_wezterm_handle(
+                config_with_db_path(&path),
+                explicit_database.then(|| Arc::clone(&path)),
+                mux.clone(),
+            );
+            let arguments = serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID});
+            let call = || parse_json_content(tool.call(&test_mcp_context(), arguments.clone()).unwrap());
+
+            transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::HardStop));
+            let readable = call();
+            assert_eq!(readable["ok"], true, "valid HardStop permits reads: {readable}");
+            assert_eq!(mux.requests.lock().unwrap().len(), 1);
+            let emergency = transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::EmergencyHalt));
+            let denied = call();
+            assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
+            assert_eq!(mux.requests.lock().unwrap().len(), 1);
+
+            let connection = rusqlite::Connection::open(path.as_path()).unwrap();
+            for corruption in ["malformed", "rollback", "missing"] {
+                match corruption {
+                    "malformed" => {
+                        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2",
+                            ["private corrupt stop state", KILL_SWITCH_STATE_KEY]).unwrap();
+                    }
+                    "rollback" => {
+                        connection.execute(
+                            "UPDATE config SET value = ?1 WHERE key = ?2",
+                            [
+                                serde_json::to_string(&initial).unwrap(),
+                                KILL_SWITCH_STATE_KEY.to_string(),
+                            ],
+                        ).unwrap();
+                        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2",
+                            [initial.revision.to_string(), KILL_SWITCH_REVISION_KEY.to_string()]).unwrap();
+                    }
+                    "missing" => {
+                        connection.execute("DELETE FROM config WHERE key IN (?1, ?2)",
+                            [KILL_SWITCH_STATE_KEY, KILL_SWITCH_REVISION_KEY]).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let refused = call();
+                assert_eq!(refused["ok"], false, "{corruption}: {refused}");
+                assert_eq!(refused["error_code"], MCP_ERR_POLICY, "{refused}");
+                assert!(!refused.to_string().contains("private corrupt stop state"));
+                assert_eq!(mux.requests.lock().unwrap().len(), 1,
+                    "invalid authority must never downgrade an observed emergency to a read");
+            }
+
+            // Restore the last acknowledged authority, then use the real reset
+            // API to advance it. Invalid reads must not permanently latch denial.
+            for (key, value) in [
+                (KILL_SWITCH_STATE_KEY, serde_json::to_string(&emergency).unwrap()),
+                (KILL_SWITCH_REVISION_KEY, emergency.revision.to_string()),
+            ] {
+                connection.execute("INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                    [key, value.as_str()]).unwrap();
+            }
+            transition_mcp_test_kill_switch(&path, None);
+            let readable = call();
+            assert_eq!(readable["ok"], true, "{readable}");
+            assert_eq!(mux.requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn get_text_and_reservations_do_not_create_missing_stop_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Arc::new(directory.path().join("missing-authority.db"));
+        let cfg = config_with_db_path(&path);
+        let mux = Arc::new(TailOnlyMux::new(crate::wezterm::MuxPaneText {
+            text: "must not be read".to_string(),
+            original_lines: 1,
+            original_bytes: None,
+            truncated: false,
+        }));
+        for db_path in [None, Some(Arc::clone(&path))] {
+            let tool = WaGetTextTool::with_wezterm_handle(Arc::clone(&cfg), db_path, mux.clone());
+            let response = parse_json_content(tool.call(&test_mcp_context(),
+                serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID})).unwrap());
+            assert_eq!(response["error_code"], MCP_ERR_POLICY, "{response}");
+            assert!(!path.exists());
+        }
+        for response in [
+            WaReserveTool::new(Arc::clone(&cfg), Arc::clone(&path)).call(&test_mcp_context(),
+                serde_json::json!({"pane_id": 7, "owner_kind": "mcp", "owner_id": "blocked"})),
+            WaReleaseTool::new(cfg, Arc::clone(&path)).call(&test_mcp_context(),
+                serde_json::json!({"reservation_id": 1})),
+        ] {
+            let response = parse_json_content(response.unwrap());
+            assert_eq!(response["error_code"], MCP_ERR_POLICY, "{response}");
+            assert!(!path.exists());
+        }
+        assert!(mux.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn get_text_tool_bounded_read_preserves_request_cancellation() {
         let mut mux = TailOnlyMux::new(crate::wezterm::MuxPaneText {
             text: "must not be returned".to_string(),
@@ -27778,7 +28072,9 @@ exit 17",
         });
         mux.cancel_on_read = true;
         let mux = Arc::new(mux);
-        let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+        let (_db_dir, path) = kill_switch_test_db_path();
+        let cfg = config_with_db_path(&path);
+        let tool = WaGetTextTool::with_wezterm_handle(cfg, None, mux.clone());
         let ctx = test_mcp_context();
         let envelope = parse_json_content(
             tool.call(
@@ -27814,7 +28110,9 @@ exit 17",
                 original_bytes: None,
                 truncated: true,
             }));
-            let tool = WaGetTextTool::with_wezterm_handle(config(), None, mux.clone());
+            let (_db_dir, path) = kill_switch_test_db_path();
+            let cfg = config_with_db_path(&path);
+            let tool = WaGetTextTool::with_wezterm_handle(cfg, None, mux.clone());
             let envelope = parse_json_content(
                 tool.call(
                     &test_mcp_context(),
@@ -29210,6 +29508,64 @@ exit 17",
         }
     }
 
+    #[test]
+    fn reservation_tools_observe_stop_tiers_reset_and_request_cancellation() {
+        use crate::policy_quarantine::KillSwitchLevel;
+
+        let (_db_dir, path) = kill_switch_test_db_path();
+        let cfg = config_with_db_path(&path);
+        let reserve = WaReserveTool::new(Arc::clone(&cfg), Arc::clone(&path));
+        let release = WaReleaseTool::new(cfg, Arc::clone(&path));
+        let context = test_mcp_context();
+        let args = serde_json::json!({
+            "pane_id": 7, "owner_kind": "mcp", "owner_id": "stop-regression",
+        });
+        transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::SoftStop));
+        let created = parse_json_content(reserve.call(&context, args.clone()).unwrap());
+        assert_eq!(created["ok"], true, "SoftStop permits administrative mutations: {created}");
+        let reservation_id = created["data"]["reservation"]["id"].as_i64().unwrap();
+        let release_args = serde_json::json!({"reservation_id": reservation_id});
+        let connection = rusqlite::Connection::open(path.as_path()).unwrap();
+        let reservation_status = || connection.query_row(
+            "SELECT status FROM pane_reservations WHERE id = ?1",
+            [reservation_id],
+            |row| row.get::<_, String>(0),
+        ).unwrap();
+
+        for level in [KillSwitchLevel::HardStop, KillSwitchLevel::EmergencyHalt] {
+            transition_mcp_test_kill_switch(&path, Some(level));
+            for response in [
+                reserve.call(&context, args.clone()),
+                release.call(&context, release_args.clone()),
+            ] {
+                let denied = parse_json_content(response.unwrap());
+                assert_eq!(denied["ok"], false, "{level}: {denied}");
+                assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
+                assert!(!denied.to_string().contains("private operator reason"));
+            }
+            assert_eq!(reservation_status(), "active");
+        }
+
+        transition_mcp_test_kill_switch(&path, None);
+        assert_eq!(reservation_status(), "active", "reset cannot replay a denied release");
+        let cancelled_cx = crate::cx::Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let cancelled = parse_json_content(release.call(
+            &McpContext::new(cancelled_cx, 2), release_args.clone(),
+        ).unwrap());
+        assert_eq!(cancelled["ok"], false, "{cancelled}");
+        assert_eq!(reservation_status(), "active", "request Cx must reach admission");
+
+        // A normal request hands authority to the storage writer without
+        // retaining a second fence that would make its mutation self-contend.
+        let released = parse_json_content(release.call(&context, release_args).unwrap());
+        assert_eq!(released["ok"], true, "{released}");
+        assert_eq!(released["data"]["released"], true);
+        assert_eq!(reservation_status(), "released");
+        let created = parse_json_content(reserve.call(&context, args).unwrap());
+        assert_eq!(created["ok"], true, "{created}");
+    }
+
     // ========================================================================
     // Policy input helpers — send, workflow, reserve, release
     // ========================================================================
@@ -29514,6 +29870,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             test_mcp_context().cx(),
+            &super::McpKillSwitchGate::default(),
             cfg.as_ref(),
             None,
             &rate_limiter,
@@ -29573,6 +29930,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
             test_mcp_context().cx(),
+            &super::McpKillSwitchGate::default(),
             cfg.as_ref(),
             None,
             &rate_limiter,
@@ -29608,6 +29966,7 @@ exit 17",
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let fence = super::mcp_authorize_mcp_mutation(
             test_mcp_context().cx(),
+            &super::McpKillSwitchGate::default(),
             cfg.as_ref(),
             None,
             &rate_limiter,
@@ -29675,6 +30034,47 @@ exit 17",
             super::mcp_load_mission_from_path(&path).unwrap().lifecycle_state,
             MissionLifecycleState::Paused
         );
+    }
+
+    #[test]
+    fn mission_mutation_rejects_self_consistent_revision_rollback() {
+        use crate::policy_kill_switch_state::{KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY};
+        use crate::policy_quarantine::KillSwitchLevel;
+
+        let dir = workspace_tempdir();
+        let mission_path = write_mission_file(&dir, MissionLifecycleState::Running);
+        let (_db_dir, db_path) = kill_switch_test_db_path();
+        let cfg = config_with_db_path(&db_path);
+        let query = WaMissionStateTool::new(Arc::clone(&cfg));
+        let pause = WaMissionPauseTool::new(cfg);
+        let context = test_mcp_context();
+        let state = parse_json_content(query.call(&context,
+            serde_json::json!({"mission_file": mission_path})).unwrap());
+        assert_eq!(state["ok"], true, "{state}");
+        let args = serde_json::json!({
+            "mission_file": mission_path,
+            "reason": "must remain fenced",
+            "expected_token": state["data"]["revision_token"],
+        });
+        let original = std::fs::read(&mission_path).unwrap();
+        let disarmed = transition_mcp_test_kill_switch(&db_path, None);
+        transition_mcp_test_kill_switch(&db_path, Some(KillSwitchLevel::HardStop));
+        let denied = parse_json_content(pause.call(&context, args.clone()).unwrap());
+        assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
+
+        // Rewind both rows consistently; only the handler's retained watermark
+        // distinguishes this old disarmed document from an authorized reset.
+        let connection = rusqlite::Connection::open(db_path.as_path()).unwrap();
+        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2", [
+            serde_json::to_string(&disarmed).unwrap(), KILL_SWITCH_STATE_KEY.to_string(),
+        ]).unwrap();
+        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2", [
+            disarmed.revision.to_string(), KILL_SWITCH_REVISION_KEY.to_string(),
+        ]).unwrap();
+        let refused = parse_json_content(pause.call(&context, args).unwrap());
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error_code"], MCP_ERR_POLICY, "{refused}");
+        assert_eq!(std::fs::read(&mission_path).unwrap(), original);
     }
 
     #[test]
