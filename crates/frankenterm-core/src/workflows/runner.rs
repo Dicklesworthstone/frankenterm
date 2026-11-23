@@ -5077,9 +5077,38 @@ impl WorkflowRunner {
             created_at: now,
         };
 
-        self.storage
-            .settle_workflow_terminal_with_cx(cx, record, "completed")
-            .await?;
+        // Releasing this execution's own reservation shares workspace effect
+        // authority with sends, and the writer never waits for it: contention
+        // rolls the whole settlement back. Retry out here, off the writer, for
+        // as long as a send waits for the same fence, so a completion that
+        // overlaps a send to another pane is not left running.
+        let fence_wait = crate::policy_kill_switch_state::KILL_SWITCH_FENCE_WAIT;
+        let started = std::time::Instant::now();
+        let mut delay = std::time::Duration::from_millis(2);
+        loop {
+            match self
+                .storage
+                .settle_workflow_terminal_with_cx(cx, record.clone(), "completed")
+                .await
+            {
+                Err(crate::Error::Storage(crate::error::StorageError::Database(code)))
+                    if code == "reservation_mutation_fence_pending"
+                        && started.elapsed() < fence_wait =>
+                {
+                    let remaining = fence_wait.saturating_sub(started.elapsed());
+                    if crate::runtime_async::sleep_with_cx(cx, delay.min(remaining))
+                        .await
+                        .is_err()
+                    {
+                        return Err(crate::Error::Storage(crate::error::StorageError::Database(
+                            code,
+                        )));
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                result => break result?,
+            }
+        }
         self.storage
             .record_usage_metric_with_cx(cx, metric)
             .await
@@ -6030,6 +6059,134 @@ mod tests {
                 }
                 storage.shutdown().await.unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn workflow_completion_waits_out_a_send_fence_but_never_skips_cleanup() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("completion_fence_wait.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let cx = crate::cx::for_testing();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fence_path = std::path::PathBuf::from(&db_path);
+
+            // A send that holds the workspace fence past the wait budget: the
+            // completion is refused whole, never settled without its cleanup.
+            seed_test_pane(&storage, 78, now_ms()).await;
+            let held_out = storage
+                .create_reservation_with_cx(&cx, 78, "workflow", "fence-held", None, 60_000)
+                .await
+                .unwrap();
+            let fence =
+                crate::policy_kill_switch_state::acquire_kill_switch_fence(&fence_path).unwrap();
+            let result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    78,
+                    Arc::new(CompletionPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    "fence-held",
+                    None,
+                )
+                .await;
+            drop(fence);
+            match result {
+                ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                }) => {
+                    assert_eq!(id, "fence-held");
+                    assert!(
+                        error.contains("reservation_mutation_fence_pending"),
+                        "{error}"
+                    );
+                }
+                other => panic!("contention past the budget must not complete: {other:?}"),
+            }
+            let record = storage
+                .get_workflow_with_cx(&cx, "fence-held")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, "running");
+            let retained = storage
+                .get_active_reservation_with_cx(&cx, 78)
+                .await
+                .unwrap()
+                .expect("refused completion must retain its reservation");
+            assert_eq!(retained.id, held_out.id);
+
+            // A send that releases the fence well inside the budget: the
+            // completion waits it out and releases its own reservation.
+            seed_test_pane(&storage, 77, now_ms()).await;
+            storage
+                .create_reservation_with_cx(&cx, 77, "workflow", "fence-brief", None, 60_000)
+                .await
+                .unwrap();
+            let fence =
+                crate::policy_kill_switch_state::acquire_kill_switch_fence(&fence_path).unwrap();
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                drop(fence);
+            });
+            let result = runner
+                .run_workflow_manual_with_cx(
+                    &cx,
+                    77,
+                    Arc::new(CompletionPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    "fence-brief",
+                    None,
+                )
+                .await;
+            holder.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed {
+                        ref execution_id,
+                        ..
+                    }) if execution_id == "fence-brief"
+                ),
+                "a briefly held fence must not fail completion: {result:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let record = storage
+                .get_workflow_with_cx(&cx, "fence-brief")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, "completed");
+            assert!(
+                storage
+                    .get_active_reservation_with_cx(&cx, 77)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            storage.shutdown().await.unwrap();
         });
     }
 
