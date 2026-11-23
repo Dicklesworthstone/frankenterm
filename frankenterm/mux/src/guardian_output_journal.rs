@@ -2523,7 +2523,7 @@ impl GuardianRecoveredOutputRecord {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {
         self.plaintext.as_slice()
@@ -3062,7 +3062,7 @@ impl GuardianOutputRecoveryCursor {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     fn verified_record_count(&self) -> u64 {
         self.verified_record_count

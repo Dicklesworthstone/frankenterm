@@ -46,7 +46,7 @@ const FILE_HEADER_BYTES_U32: u32 = 128;
 const FILE_HEADER_BYTES_U64: u64 = 128;
 const RECORD_HEADER_BYTES: usize = 96;
 const RECORD_HEADER_BYTES_U32: u32 = 96;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const RECORD_HEADER_BYTES_U64: u64 = 96;
 const RECORD_PLAINTEXT_BYTES: usize = 136;
 const RECORD_PLAINTEXT_BYTES_U32: u32 = 136;
@@ -409,13 +409,13 @@ impl GuardianInputJournalAppend {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn receipt(&self) -> GuardianInputJournalReceipt {
         self.receipt
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn is_newly_committed(&self) -> bool {
         self.newly_committed
@@ -426,7 +426,7 @@ impl GuardianInputJournalAppend {
         self.receipt.disposition()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn identity(&self) -> GuardianInputEffectIdentity {
         self.identity
@@ -762,19 +762,19 @@ pub fn replay_guardian_input_without_writer(
 }
 
 impl GuardianInputTerminalPermit {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn identity(&self) -> GuardianInputEffectIdentity {
         self.identity
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn receipt(&self) -> GuardianInputJournalReceipt {
         self.receipt
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) const fn protocol_state(&self) -> InputEffectState {
         self.receipt.disposition.recovery_protocol_state()
@@ -1202,7 +1202,7 @@ impl GuardianInputJournal {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn inject_append_fault(&mut self, fault: InjectedAppendFault) {
         self.injected_append_fault = Some(fault);
     }
@@ -1911,7 +1911,8 @@ fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(fixed)
 }
 
-#[cfg(test)]
+// Unix only: every test in it already is, so off Unix its fixtures were dead.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

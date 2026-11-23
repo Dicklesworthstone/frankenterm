@@ -950,7 +950,10 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
         self.identity
     }
 
+    // A separate cfg(unix): the authority audit below matches cfg(test) exactly.
+    // Only the Unix-gated tests call it.
     #[cfg(test)]
+    #[cfg(unix)]
     fn issue_for_test(
         spawn_effect_id: Uuid,
         terminal_checkpoint: &RecoveryTerminalCheckpointV3,
@@ -1270,7 +1273,10 @@ pub struct GuardianCheckpointValidatedStageAssemblyV1 {
 }
 
 impl GuardianCheckpointValidatedStageAssemblyV1 {
+    // A separate cfg(unix): the authority audit below matches cfg(test) exactly.
+    // Only the Unix-gated tests call it.
     #[cfg(test)]
+    #[cfg(unix)]
     fn issue_for_test(
         seal_request: GuardianCheckpointStageRequestV1,
         publication_id: Uuid,
@@ -6015,7 +6021,10 @@ static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::Ze
 
 // Unix only: most of these tests build their checkpoints from a real output
 // journal, and GuardianOutputJournal::create_new_at is unsupported elsewhere.
-#[cfg(all(test, unix))]
+// A separate cfg(unix), not cfg(all(test, unix)): the authority-surface audit
+// in this module skips a module only when its cfg is exactly cfg(test).
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::guardian_output_journal::{

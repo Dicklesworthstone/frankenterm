@@ -2023,7 +2023,10 @@ impl GuardianCheckpointCatalogAdoptionEvidenceSeedV1 {
         self.identity.intent.output_boundary_identity().into_bytes()
     }
 
+    // Only the Unix-gated tests call it. A separate cfg(unix) keeps the
+    // guardian_checkpoint authority audits reading this as test-only.
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn issue_for_test(
         pane_id: Uuid,
         mux_incarnation: Uuid,
@@ -2177,7 +2180,10 @@ impl GuardianCheckpointReceipt {
         }
     }
 
+    // Only the Unix-gated tests call it. A separate cfg(unix) keeps the
+    // guardian_checkpoint authority audits reading this as test-only.
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn issue_committed_for_test(
         pane_id: Uuid,
         generation: u64,
@@ -2305,7 +2311,10 @@ pub struct GuardianCheckpointPolicyExpiryReceiptV1 {
 }
 
 impl GuardianCheckpointPolicyExpiryReceiptV1 {
+    // Only the Unix-gated tests call it. A separate cfg(unix) keeps the
+    // guardian_checkpoint authority audits reading this as test-only.
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn issue_for_test(
         pane_id: Uuid,
         generation: u64,

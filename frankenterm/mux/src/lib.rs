@@ -2822,13 +2822,15 @@ pub enum LiveParserCheckpointError {
 /// terminal, replay the private suffix there, verify the resulting model, and
 /// only then consume a separate typed model-installed authority while the pane
 /// reader start gate remains held.
-#[cfg(test)]
+// This type, its error and the methods that build it are Unix only, like the
+// tests that use them.
+#[cfg(all(test, unix))]
 struct GuardianOutputReplayPreparation {
     batch: GuardianOutputRecoveryBatch,
     checkpoint_receipt: GuardianOutputAppendReceipt,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl GuardianOutputReplayPreparation {
     #[must_use]
     fn segment_identity(&self) -> GuardianOutputSegmentIdentity {
@@ -2881,7 +2883,7 @@ impl GuardianOutputReplayPreparation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl std::fmt::Debug for GuardianOutputReplayPreparation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2912,7 +2914,7 @@ impl std::fmt::Debug for GuardianOutputReplayPreparation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug, Error)]
 enum GuardianOutputReplayPreparationError {
     #[error("authenticated guardian output journal recovery failed")]
@@ -5695,7 +5697,7 @@ mod pane_registration_handle {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         fn validate_guardian_replay_page(
             segment: GuardianOutputSegmentIdentity,
             batch: &GuardianOutputRecoveryBatch,
@@ -5811,7 +5813,7 @@ mod pane_registration_handle {
         /// an inert terminal, replay the private suffix off topology, verify
         /// the result, and mint a typed model-installed authority before any
         /// live parser can be activated.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(crate) fn prepare_guardian_output_replay_from_checkpoint(
             &self,
             journal: &GuardianOutputJournal,
@@ -6801,7 +6803,7 @@ mod pane_registration_handle {
             Arc::clone(&self.generation)
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(super) fn authorize_guardian_output_delivery(
             &self,
             segment: GuardianOutputSegmentIdentity,
@@ -6818,7 +6820,7 @@ mod pane_registration_handle {
                 .authorize_guardian_output_delivery(segment, output, payload)
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(super) fn capture_live_parser_checkpoint(
             &self,
             segment: GuardianOutputSegmentIdentity,
@@ -26086,6 +26088,7 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
         GuardianOutputRecoveryLimits,
@@ -26101,10 +26104,12 @@ mod tests {
     use parking_lot::{MappedMutexGuard, MutexGuard};
     use proptest::prelude::*;
     use rangeset::RangeSet;
+    #[cfg(unix)]
     use std::fs::File;
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    #[cfg(unix)]
     use tempfile::tempdir;
     use termwiz::surface::{Line, SequenceNo};
 
@@ -27511,6 +27516,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn authorize(
             &self,
             segment: GuardianOutputSegmentIdentity,
@@ -27532,6 +27538,7 @@ mod tests {
                 .write_delivered_bytes(payload)
         }
 
+        #[cfg(unix)]
         fn capture(
             &self,
             segment: GuardianOutputSegmentIdentity,
@@ -29407,9 +29414,12 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     type CellGridRow = (Vec<(String, usize, frankenterm_term::CellAttributes)>, bool);
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     type CellGridSnapshot = (Vec<CellGridRow>, (usize, i64));
 
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     fn cell_grid_row(line: &Line) -> CellGridRow {
         (
             line.visible_cells()
@@ -30297,6 +30307,7 @@ mod tests {
     }
 
     /// The session incarnation that "captured" the recovered fixtures.
+    #[cfg(unix)]
     const RECOVERED_FIXTURE_PREDECESSOR: MuxSessionIncarnation =
         MuxSessionIncarnation::from_bytes([0x5e; 16]);
 
