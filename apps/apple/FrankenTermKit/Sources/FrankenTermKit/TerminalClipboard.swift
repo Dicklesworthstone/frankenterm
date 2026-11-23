@@ -9,7 +9,7 @@ public enum TerminalClipboardError: Error, Equatable, Sendable, LocalizedError {
         case .invalidRange: "The selected text range is no longer valid."
         case .emptySelection: "Select some output to copy."
         case .pendingInput: "Finish text composition or resolve the terminal's pending input before selecting output."
-        case .unavailable: "The terminal is updating. Try copying again after its update finishes."
+        case .unavailable: "The terminal is updating. Try again after its update finishes."
         }
     }
 }

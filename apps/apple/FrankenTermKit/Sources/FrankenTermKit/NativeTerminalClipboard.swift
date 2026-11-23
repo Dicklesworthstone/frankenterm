@@ -144,7 +144,7 @@ public final class NativeTerminalClipboardController: NSObject {
     /// output callback ever invokes this path or reads the system pasteboard.
     public func requestPaste() {
         guard canPresent, !isPresenting, let terminal else { return }
-        guard terminal.input.isEditable, terminal.input.session.acceptsPaste else {
+        guard terminal.input.canRequestPaste else {
             onFailure?(TerminalClipboardError.unavailable); return
         }
         terminal.input.paste(nil)
@@ -155,8 +155,7 @@ public final class NativeTerminalClipboardController: NSObject {
     /// person chose to paste it, so it goes to this terminal at once.
     public func paste(text: String) {
         guard canPresent, !isPresenting, let terminal else { return }
-        guard terminal.input.canReviewPaste else { onFailure?(TerminalClipboardError.unavailable); return }
-        terminal.input.requestPasteReview(text: text)
+        terminal.input.requestPaste(text: text)
     }
 
     /// A local multiline editor, opened only by the user's Compose action.
@@ -515,6 +514,7 @@ public final class NativeTerminalClipboardController: NSObject {
     }
     private func dismiss() {
         generation = UUID(); copyTask?.cancel()
+        terminal?.input.cancelDeferredPaste()
         commandTask?.cancel(); commandDraft?.retire(); commandDraft = nil
         diagnosticExcerpt?.retire(); diagnosticExcerpt = nil
         // A handed-off service may already own its copy. Retiring prevents any

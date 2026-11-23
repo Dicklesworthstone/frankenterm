@@ -64,6 +64,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// screen is still the one shown, only being redrawn (a resize or new
     /// text size), so typing still reaches it.
     public var onInputWithoutProjection: (@MainActor () -> Bool)?
+    /// A pure check for the same live, foreground terminal awaiting a redraw.
+    /// User paste may wait for its caret, but never for first attachment,
+    /// history, another pane, or a replacement keyboard to become interactive.
+    public var onPasteAwaitingProjection: (@MainActor () -> Bool)?
     public private(set) var accessoryModifiers = TerminalAccessoryModifiers()
     public private(set) var pendingPaste: TerminalPasteReview?
 
@@ -80,6 +84,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// Only confirmPaste may use this separate admission while a panel covers
     /// the terminal; a new source/geometry still invalidates the candidate.
     public var canReviewPaste: Bool { !isReadOnly && session.acceptsPaste && hasGeometry && !retiring }
+    public var canRequestPaste: Bool {
+        !isReadOnly && session.acceptsPaste && !retiring && !ordinaryInputBlocked && onPasteReview != nil
+            && (hasGeometry || (geometryRevision > 0 && onPasteAwaitingProjection?() == true))
+    }
     public var autocapitalizationType: UITextAutocapitalizationType = .none
     public var autocorrectionType: UITextAutocorrectionType = .no
     public var spellCheckingType: UITextSpellCheckingType = .no
@@ -106,6 +114,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var stateObservation: UUID?
     private var observedPhase: TerminalKeyboardPhase = .active
     private let hardwarePreferences: TerminalHardwarePreferencesStore
+    private let pasteboard: UIPasteboard
+    private let pasteProjectionWait: Duration
+    private struct DeferredPaste {
+        let review: TerminalPasteReview
+        let expires: ContinuousClock.Instant
+    }
+    private var deferredPaste: DeferredPaste?
+    private var pasteExpiry: Task<Void, Never>?
     private var physicalKeys: [UInt16: TerminalHardwareKey] = [:]
     /// Native-layout presses keep native ownership through repeats and release,
     /// even if settings change while an Option/dead key is still held. Only
@@ -124,7 +140,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var enteredWindow = false
     private var keyboardRequested = false
     private var reviewingPaste = false
-    private var ordinaryInputBlocked: Bool { reviewingPaste || pendingPaste != nil }
+    private var ordinaryInputBlocked: Bool { reviewingPaste || pendingPaste != nil || deferredPaste != nil }
     private var controlButton: UIButton?
     private var altButton: UIButton?
     private var terminalButtons: [UIButton] = []
@@ -138,9 +154,14 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var copySelection: (@MainActor () -> Void)?
 
     public init(session: TerminalKeyboardSession, readOnly: Bool = false,
-                hardwarePreferences: TerminalHardwarePreferencesStore = .shared) throws {
+                hardwarePreferences: TerminalHardwarePreferencesStore = .shared,
+                pasteboard: UIPasteboard? = nil, pasteProjectionWait: Duration = .seconds(5)) throws {
+        guard pasteProjectionWait > .zero, pasteProjectionWait <= .seconds(5) else {
+            throw TerminalKeyboardError.invalidRange
+        }
         self.session = session; isReadOnly = readOnly
         self.hardwarePreferences = hardwarePreferences
+        self.pasteboard = pasteboard ?? .general; self.pasteProjectionWait = pasteProjectionWait
         super.init(frame: .zero)
         isOpaque = false; backgroundColor = .clear
         accessibilityLabel = "Terminal keyboard"
@@ -170,7 +191,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// the panel's hold cannot revive a candidate cleared by source retirement.
     public func setReviewingPaste(_ reviewing: Bool) {
         reviewingPaste = reviewing
-        if reviewing { accessoryModifiers.clear() }
+        if reviewing { cancelDeferredPaste(); accessoryModifiers.clear() }
         updateAccessory()
     }
 
@@ -189,6 +210,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         caret = r; geometryRevision = value.revision; hasGeometry = true
         updateAccessory(); setNeedsLayout(); setNeedsDisplay()
         if changed { inputDelegate?.selectionDidChange(self) }
+        deliverDeferredPaste()
     }
     /// A resize, font change or viewport without the live cursor invalidates
     /// the displayed projection. Preserve uncommitted composition, but stop
@@ -198,6 +220,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// history does not change what the next key should send.
     public func invalidateRenderedCaret(source: TerminalSource) throws {
         guard source == session.originalFocus.source else { throw TerminalInputError.stale }
+        if deferredPaste != nil, onPasteAwaitingProjection?() != true { cancelDeferredPaste() }
         guard hasGeometry else { return }
         inputDelegate?.selectionWillChange(self)
         hasGeometry = false; pendingPaste = nil
@@ -225,6 +248,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         guard !retiring else { return }
         retiring = true
         keyboardRequested = false
+        cancelDeferredPaste()
         inputDelegate?.textWillChange(self); inputDelegate?.selectionWillChange(self)
         accessoryModifiers.clear(); pendingPaste = nil; physicalKeys.removeAll(); textSystemKeys.removeAll(); stopRepeating()
         session.suspend()
@@ -261,6 +285,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         let changed = observedPhase != session.phase
         observedPhase = session.phase
         if session.phase == .retired || session.phase == .suspending { retire(); return }
+        if !session.acceptsPaste { cancelDeferredPaste() }
         refreshComposition()
         if changed, let failure = session.lastFailure { onFailure?(failure) }
     }
@@ -631,7 +656,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
 
     public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) {
-            return canReviewPaste && !ordinaryInputBlocked && onPasteReview != nil && UIPasteboard.general.hasStrings
+            return canRequestPaste && pasteboard.hasStrings
         }
         // Terminal transcript selection/copy belongs to the semantic renderer,
         // not this deliberately empty local text document.
@@ -640,18 +665,59 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     }
     public override func copy(_ sender: Any?) { copySelection?() }
     public override func paste(_ sender: Any?) {
-        guard canReviewPaste, !ordinaryInputBlocked, onPasteReview != nil,
-              UIPasteboard.general.numberOfItems == 1, UIPasteboard.general.hasStrings else { return }
+        guard canRequestPaste, pasteboard.numberOfItems == 1, pasteboard.hasStrings else { return }
         // UIPasteboard has no length-only text read. Inspect immediately after
         // this deliberate read; never copy/retain an oversized value locally.
-        guard let text = UIPasteboard.general.string else { return }
-        requestPasteReview(text: text)
+        guard let text = pasteboard.string else { return }
+        requestPaste(text: text)
     }
-    public func requestPasteReview(text: String) {
-        guard canReviewPaste, let onPasteReview, pendingPaste == nil else { return }
+    /// A deliberate user paste owns at most one bounded value while its live
+    /// screen is redrawn. Capture text once, keep later keys behind it, and
+    /// leave review/encoding to this exact keyboard after its caret returns.
+    public func requestPaste(text: String) {
+        guard !ordinaryInputBlocked else { return }
+        guard canRequestPaste else { onFailure?(TerminalKeyboardError.unavailable); return }
         do {
             let review = try TerminalPasteReview(text: text, keyboardID: session.id, focus: session.originalFocus)
-            pendingPaste = review; updateAccessory(); onPasteReview(review)
+            if hasGeometry { offerPaste(review); return }
+            let id = review.id, wait = pasteProjectionWait
+            deferredPaste = DeferredPaste(review: review, expires: ContinuousClock.now.advanced(by: wait))
+            updateAccessory()
+            pasteExpiry = Task { [weak self] in
+                do { try await Task.sleep(for: wait) } catch { return }
+                guard let self, self.deferredPaste?.review.id == id else { return }
+                self.cancelDeferredPaste()
+                self.onFailure?(TerminalKeyboardError.unavailable)
+            }
+        } catch { onFailure?(error) }
+    }
+    /// No timer reads the clipboard or sends text. Only a newly admitted caret
+    /// can finish the explicit request, still under its original focus owner.
+    private func deliverDeferredPaste() {
+        guard let waiting = deferredPaste else { return }
+        guard ContinuousClock.now < waiting.expires else {
+            cancelDeferredPaste(); onFailure?(TerminalKeyboardError.unavailable); return
+        }
+        guard canReviewPaste, !reviewingPaste, pendingPaste == nil,
+              waiting.review.keyboardID == session.id, waiting.review.focus == session.originalFocus,
+              onPasteAwaitingProjection?() == true, onPasteReview != nil else {
+            cancelDeferredPaste(); return
+        }
+        cancelDeferredPaste()
+        offerPaste(waiting.review)
+    }
+    func cancelDeferredPaste() {
+        deferredPaste = nil; pasteExpiry?.cancel(); pasteExpiry = nil
+        updateAccessory()
+    }
+    private func offerPaste(_ review: TerminalPasteReview) {
+        pendingPaste = review; updateAccessory(); onPasteReview?(review)
+    }
+    public func requestPasteReview(text: String) {
+        guard canReviewPaste, onPasteReview != nil, pendingPaste == nil, deferredPaste == nil else { return }
+        do {
+            let review = try TerminalPasteReview(text: text, keyboardID: session.id, focus: session.originalFocus)
+            offerPaste(review)
         } catch { onFailure?(error) }
     }
     public func confirmPaste(id: UUID) throws {
@@ -1235,6 +1301,11 @@ public final class NativeTerminalView: UIView {
             self.returnToLiveOutput()
             return false
         }
+        input.onPasteAwaitingProjection = { [weak self] in
+            guard let self, !self.retired, self.sceneActive, !self.renderer.isDisplayStalled,
+                  let frame = self.renderer.admittedFrame else { return false }
+            return frame.source == self.source && frame.isLive
+        }
     }
 
     /// Moves the shown rows by `rows` (negative is older history), within the
@@ -1733,6 +1804,7 @@ public final class NativeTerminalView: UIView {
     /// Each admitted frame recolors the chrome when the palette changed, and
     /// moves a selection with its rows as output or scrolling shifts them.
     private func frameAdmitted(_ frame: TerminalRenderFrame) {
+        if !frame.isLive { input.cancelDeferredPaste() }
         if let localPan, localPan.geometry != frame.geometryRevision || localPan.font != frame.fontRevision
             || localPan.alternate != frame.alternateScreen { self.localPan = nil }
         if themedPalette != frame.paletteRevision || theme == nil, let next = TerminalChromeTheme(frame: frame) {
@@ -1758,6 +1830,7 @@ public final class NativeTerminalView: UIView {
     private func bindPasteReview() {
         guard !retired, onPasteReview != nil else {
             input.onPasteReview = nil
+            input.cancelDeferredPaste()
             if let pending = input.pendingPaste { input.cancelPaste(id: pending.id) }
             return
         }
@@ -1830,6 +1903,7 @@ public final class NativeTerminalView: UIView {
         replacement.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         replacement.frame = bounds; replacement.keyboardHolder = keyboardHolder
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
+        input.onPasteAwaitingProjection = nil
         input.onKeyboardDismissed = nil
         input.removeFromSuperview(); input = replacement
         bindInput(); insertSubview(replacement, aboveSubview: renderer)
@@ -1851,6 +1925,7 @@ public final class NativeTerminalView: UIView {
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
+        input.onPasteAwaitingProjection = nil
         input.onKeyboardDismissed = nil
         onHistoryViewportRequest = nil; liveButton.isHidden = true
         renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil

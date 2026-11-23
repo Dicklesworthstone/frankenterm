@@ -76,7 +76,9 @@ private final class NativeInputDelegate: NSObject, UITextInputDelegate {
 /// portable coordination tests are not a substitute for this native boundary.
 @MainActor
 final class NativeTerminalInputTests: XCTestCase {
-    private func setup(preferences: TerminalHardwarePreferencesStore? = nil, recordsModifiers: Bool = false) async throws
+    private func setup(preferences: TerminalHardwarePreferencesStore? = nil, recordsModifiers: Bool = false,
+                       pasteboard: UIPasteboard? = nil, hasCaret: Bool = true,
+                       pasteProjectionWait: Duration = .seconds(5)) async throws
         -> (TerminalInputCoordinator, UIKitInputTransport, TerminalSource, NativeTerminalInputView) {
         let coordinator = try TerminalInputCoordinator()
         let transport = try UIKitInputTransport()
@@ -91,9 +93,12 @@ final class NativeTerminalInputTests: XCTestCase {
             store = TerminalHardwarePreferencesStore(
                 defaults: try XCTUnwrap(UserDefaults(suiteName: "NativeTerminalInputTests.\(UUID())")))
         }
-        let view = try NativeTerminalInputView(session: session, hardwarePreferences: store)
+        let view = try NativeTerminalInputView(session: session, hardwarePreferences: store,
+                                              pasteboard: pasteboard, pasteProjectionWait: pasteProjectionWait)
         view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
-        try view.updateCaret(NativeTerminalCaret(source: source, revision: 1, rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        if hasCaret {
+            try view.updateCaret(NativeTerminalCaret(source: source, revision: 1, rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        }
         return (coordinator, transport, source, view)
     }
     private func drain(_ coordinator: TerminalInputCoordinator, _ source: TerminalSource) async throws {
@@ -419,6 +424,167 @@ final class NativeTerminalInputTests: XCTestCase {
         view.requestPasteReview(text: String(repeating: "x", count: 32_769))
         XCTAssertEqual(reviews, 0); XCTAssertEqual(failures, 2); XCTAssertNil(view.pendingPaste)
         view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testEditMenuPasteDuringRedrawCapturesOnceAndWaitsForTheSameCaret() async throws {
+        let pasteboard = UIPasteboard.withUniqueName()
+        pasteboard.string = "echo one\necho two"
+        let (coordinator, transport, source, view) = try await setup(pasteboard: pasteboard)
+        let foreign = try await coordinator.attach(UIKitInputTransport())
+        var offered: [TerminalPasteReview] = []
+        view.onPasteReview = { offered.append($0) }
+        view.onPasteAwaitingProjection = { true }
+        try view.invalidateRenderedCaret(source: source)
+        XCTAssertFalse(view.canReviewPaste)
+        XCTAssertTrue(view.canPerformAction(#selector(NativeTerminalInputView.paste(_:)), withSender: nil))
+
+        view.paste(nil)
+        pasteboard.string = "a later clipboard value"
+        view.paste(nil)
+        view.requestPaste(text: "another tap cannot replace the first paste")
+        view.insertText("\n")
+        XCTAssertFalse(view.canRequestPaste, "one retained value bounds repeated paste actions")
+        XCTAssertTrue(offered.isEmpty)
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let before = await transport.bytes(); XCTAssertTrue(before.isEmpty)
+
+        XCTAssertThrowsError(try view.updateCaret(.init(source: source, revision: 1,
+                                                       rect: CGRect(x: 20, y: 20, width: 2, height: 20))))
+        XCTAssertThrowsError(try view.updateCaret(.init(source: foreign, revision: 2,
+                                                       rect: CGRect(x: 20, y: 20, width: 2, height: 20))))
+        XCTAssertTrue(offered.isEmpty, "an invalidated caret cannot authorize the paste")
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 30, y: 40, width: 2, height: 20)))
+        let review = try XCTUnwrap(offered.first)
+        XCTAssertEqual(review.text, "echo one\necho two", "the clipboard is not reread after waiting")
+        XCTAssertEqual(review.focus, view.session.originalFocus)
+        XCTAssertEqual(review.keyboardID, view.session.id)
+        try view.confirmPaste(id: review.id)
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 30, y: 40, width: 2, height: 20)))
+        XCTAssertEqual(offered.count, 1)
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let sent = await transport.bytes()
+        XCTAssertEqual(sent, Data("\u{1B}[200~echo one\necho two\u{1B}[201~".utf8),
+                       "one exact paste, with no later Return overtaking it and no added Return")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testDeferredPasteDoesNotBypassFirstFrameOrRetainUnsafeText() async throws {
+        let (_, _, source, view) = try await setup(hasCaret: false)
+        var offered = 0, failures = 0
+        view.onPasteReview = { _ in offered += 1 }
+        view.onFailure = { _ in failures += 1 }
+        view.onPasteAwaitingProjection = { true }
+        XCTAssertFalse(view.canRequestPaste, "a redraw allowance is not first-frame authority")
+        view.requestPaste(text: "before the first frame")
+        try view.updateCaret(.init(source: source, revision: 1,
+                                   rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        XCTAssertEqual(offered, 0)
+
+        try view.invalidateRenderedCaret(source: source)
+        view.requestPaste(text: "\u{1B}[201~execute\n")
+        view.requestPaste(text: String(repeating: "x", count: 32_769))
+        XCTAssertTrue(view.canRequestPaste, "rejected text occupies no deferred slot")
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        XCTAssertEqual(failures, 3)
+        XCTAssertEqual(offered, 0)
+        XCTAssertNil(view.pendingPaste)
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testDeferredPasteIsDiscardedWhenTheViewLeavesLiveOutput() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        var live = true, offered = 0
+        view.onPasteAwaitingProjection = { live }
+        view.onPasteReview = { _ in offered += 1 }
+        try view.invalidateRenderedCaret(source: source)
+        view.requestPaste(text: "must not follow a history visit")
+        live = false
+        try view.invalidateRenderedCaret(source: source)
+        live = true
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        XCTAssertEqual(offered, 0)
+        XCTAssertNil(view.pendingPaste)
+        XCTAssertTrue(view.canRequestPaste)
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let sent = await transport.bytes(); XCTAssertTrue(sent.isEmpty)
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testDeferredPasteCannotFollowFocusToAnotherKeyboardOrTransport() async throws {
+        for changesTransport in [false, true] {
+            let (coordinator, transport, source, view) = try await setup()
+            let otherTransport = try UIKitInputTransport()
+            let destination: TerminalSource
+            if changesTransport { destination = try await coordinator.attach(otherTransport) }
+            else { destination = source }
+            var offered = 0
+            view.onPasteAwaitingProjection = { true }
+            view.onPasteReview = { _ in offered += 1 }
+            try view.invalidateRenderedCaret(source: source)
+            view.requestPaste(text: "belongs only to the old keyboard")
+            let focus = try await view.session.handoff(to: destination)
+            let session = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: UIKitInputEncoder())
+            let replacement = try NativeTerminalInputView(session: session)
+            replacement.onPasteReview = { _ in offered += 1 }
+            try replacement.updateCaret(.init(source: destination, revision: 1,
+                                               rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+            try view.updateCaret(.init(source: source, revision: 2,
+                                       rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+            XCTAssertEqual(offered, 0)
+            XCTAssertNil(view.pendingPaste); XCTAssertNil(replacement.pendingPaste)
+            try await drain(coordinator, source)
+            if changesTransport { try await drain(coordinator, destination) }
+            let originalBytes = await transport.bytes(), replacementBytes = await otherTransport.bytes()
+            XCTAssertTrue(originalBytes.isEmpty); XCTAssertTrue(replacementBytes.isEmpty)
+            replacement.retire(); await session.waitUntilSuspended()
+        }
+    }
+
+    func testDeferredPasteExpiresWithoutSendingAndAllowsAFreshUserRequest() async throws {
+        let (coordinator, transport, source, view) = try await setup(pasteProjectionWait: .milliseconds(5))
+        var offered: [TerminalPasteReview] = [], failures = 0
+        view.onPasteAwaitingProjection = { true }
+        view.onPasteReview = { offered.append($0) }
+        view.onFailure = {
+            XCTAssertEqual($0 as? TerminalKeyboardError, .unavailable, "a local wait never reports a transport failure")
+            failures += 1
+        }
+        try view.invalidateRenderedCaret(source: source)
+        view.requestPaste(text: "expired")
+        for _ in 0..<100 where failures == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(failures, 1)
+        XCTAssertTrue(view.canRequestPaste)
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        XCTAssertTrue(offered.isEmpty, "a later frame never revives an expired request")
+        view.requestPaste(text: "fresh")
+        let review = try XCTUnwrap(offered.first)
+        try view.confirmPaste(id: review.id)
+        await view.session.waitUntilSettled(); try await drain(coordinator, source)
+        let sent = await transport.bytes()
+        XCTAssertEqual(sent, Data("\u{1B}[200~fresh\u{1B}[201~".utf8))
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testApplicationDeactivationDiscardsDeferredPasteBeforeTheNextCaret() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        var offered = 0
+        view.onPasteAwaitingProjection = { true }
+        view.onPasteReview = { _ in offered += 1 }
+        try view.invalidateRenderedCaret(source: source)
+        view.requestPaste(text: "do not send after backgrounding")
+        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+        await view.session.waitUntilSuspended()
+        try view.updateCaret(.init(source: source, revision: 2,
+                                   rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
+        XCTAssertEqual(offered, 0)
+        XCTAssertFalse(view.canRequestPaste)
+        try await drain(coordinator, source)
+        let sent = await transport.bytes(); XCTAssertTrue(sent.isEmpty)
     }
 
     /// One window holding the terminal that has the keyboard and a holder.
