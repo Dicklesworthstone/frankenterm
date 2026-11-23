@@ -504,6 +504,19 @@ impl Rows {
         }
     }
 
+    /// Inspect damage without materializing a page row's `Line` view.
+    /// Edited views remain authoritative, and page/list sequence floors are
+    /// applied before interpreting zero as "always changed", just as a
+    /// materialized view would do.
+    pub fn row_changed_since(&self, index: usize, seqno: SequenceNo) -> Option<bool> {
+        match self {
+            Rows::Legacy(lines) => lines.get(index).map(|line| line.changed_since(seqno)),
+            Rows::Page(rows) => rows
+                .effective_seqno(index)
+                .map(|current| current == 0 || current > seqno),
+        }
+    }
+
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Line> {
         match self {
             Rows::Legacy(lines) => lines.get_mut(index),
@@ -725,6 +738,24 @@ impl<'a> Iterator for RowsIter<'a> {
         }
     }
 
+    fn nth(&mut self, n: usize) -> Option<&'a Line> {
+        match self {
+            RowsIter::Legacy(iter) => iter.nth(n),
+            RowsIter::Page { rows, range } => {
+                let rows: &'a PageRows = rows;
+                range.nth(n).map(|index| rows.line(index))
+            }
+        }
+    }
+
+    fn last(mut self) -> Option<&'a Line> {
+        self.next_back()
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             RowsIter::Legacy(iter) => iter.size_hint(),
@@ -740,6 +771,16 @@ impl<'a> DoubleEndedIterator for RowsIter<'a> {
             RowsIter::Page { rows, range } => {
                 let rows: &'a PageRows = rows;
                 range.next_back().map(|index| rows.line(index))
+            }
+        }
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<&'a Line> {
+        match self {
+            RowsIter::Legacy(iter) => iter.nth_back(n),
+            RowsIter::Page { rows, range } => {
+                let rows: &'a PageRows = rows;
+                range.nth_back(n).map(|index| rows.line(index))
             }
         }
     }
@@ -784,12 +825,116 @@ impl<'a> ExactSizeIterator for RowsIterMut<'a> {}
 
 #[cfg(test)]
 mod tests {
+    use super::{PageRows, Rows};
     use crate::color::ColorPalette;
     use crate::config::GridEngine;
     use crate::{Terminal, TerminalConfiguration, TerminalSize};
     use frankenterm_bidi::ParagraphDirectionHint;
     use frankenterm_cell::CellAttributes;
+    use frankenterm_surface::{Line, SequenceNo};
     use std::sync::Arc;
+
+    fn packed_rows(sequences: &[SequenceNo]) -> Rows {
+        let mut rows = PageRows::new(8, 3, sequences.len());
+        for &sequence in sequences {
+            rows.scroll(1, sequence, false, 0);
+        }
+        Rows::Page(Box::new(rows))
+    }
+
+    #[test]
+    // Exercise these iterator methods themselves, including lazy view creation.
+    #[allow(
+        clippy::iter_count,
+        clippy::double_ended_iterator_last,
+        clippy::reversed_empty_ranges
+    )]
+    fn page_row_iterators_materialize_only_yielded_rows() {
+        let rows = packed_rows(&(0..128).collect::<Vec<_>>());
+        assert_eq!(rows.iter().count(), 128);
+        assert_eq!(rows.page().unwrap().cached_view_count(), 0);
+
+        let viewport: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .skip(120)
+            .take(3)
+            .map(|(index, line)| (index, line.current_seqno()))
+            .collect();
+        assert_eq!(viewport, [(120, 120), (121, 121), (122, 122)]);
+        assert_eq!(rows.page().unwrap().cached_view_count(), 3);
+        assert_eq!(rows.range(8..40).last().map(Line::current_seqno), Some(39));
+        assert_eq!(rows.page().unwrap().cached_view_count(), 4);
+
+        let mut iter = rows.range(8..40);
+        assert_eq!(iter.nth(4).map(Line::current_seqno), Some(12));
+        assert_eq!(iter.nth_back(3).map(Line::current_seqno), Some(36));
+        assert_eq!(iter.next().map(Line::current_seqno), Some(13));
+        assert_eq!(iter.next_back().map(Line::current_seqno), Some(35));
+        assert_eq!(iter.len(), 21);
+        assert_eq!(iter.clone().count(), 21);
+        assert_eq!(rows.page().unwrap().cached_view_count(), 8);
+
+        let mut beyond_end = iter.clone();
+        assert!(beyond_end.nth(21).is_none());
+        assert_eq!(beyond_end.len(), 0);
+        assert!(beyond_end.next_back().is_none());
+        let mut from_back = iter.clone();
+        assert!(from_back.nth_back(usize::MAX).is_none());
+        assert_eq!(from_back.len(), 0);
+        assert!(from_back.next().is_none());
+        assert!(iter.nth(usize::MAX).is_none());
+        assert_eq!(iter.len(), 0);
+        assert!(iter.next().is_none());
+        assert!(rows.range(8..8).last().is_none());
+        assert_eq!(rows.page().unwrap().cached_view_count(), 8);
+    }
+
+    #[test]
+    fn page_damage_metadata_honors_zero_edits_and_floors_without_new_views() {
+        let sequences = [0, 1, 7, SequenceNo::MAX];
+        let mut page = packed_rows(&sequences);
+        let mut legacy = Rows::Legacy(sequences.iter().copied().map(Line::new).collect());
+        for index in 0..sequences.len() {
+            for since in [0, 1, 6, 7, SequenceNo::MAX] {
+                assert_eq!(
+                    page.row_changed_since(index, since),
+                    legacy.row_changed_since(index, since)
+                );
+            }
+        }
+        assert_eq!(page.row_changed_since(0, SequenceNo::MAX), Some(true));
+        assert_eq!(page.page().unwrap().cached_view_count(), 0);
+        for index in [sequences.len(), usize::MAX] {
+            assert_eq!(page.row_changed_since(index, 0), None);
+            assert_eq!(legacy.row_changed_since(index, 0), None);
+        }
+
+        // A read-only cached view is disposable; an edited view owns content
+        // and must supply the sequence even while its packed row is stale.
+        let _ = page.get(1).unwrap();
+        page.get_mut(2).unwrap().update_last_change_seqno(11);
+        legacy.get_mut(2).unwrap().update_last_change_seqno(11);
+        assert_eq!(page.row_changed_since(2, 7), Some(true));
+        assert_eq!(page.row_changed_since(2, 11), Some(false));
+        assert_eq!(page.page().unwrap().cached_view_count(), 2);
+
+        page.page_mut().unwrap().mark_all_changed(13);
+        for line in legacy.iter_mut() {
+            line.update_last_change_seqno(13);
+        }
+        assert_eq!(page.page().unwrap().cached_view_count(), 1);
+        assert_eq!(page.row_changed_since(0, 13), Some(false));
+        for index in 0..sequences.len() {
+            for since in [0, 7, 11, 12, 13, SequenceNo::MAX] {
+                assert_eq!(
+                    page.row_changed_since(index, since),
+                    legacy.row_changed_since(index, since)
+                );
+            }
+        }
+        assert_eq!(page.page().unwrap().cached_view_count(), 1);
+    }
 
     #[derive(Debug)]
     struct Config(GridEngine);

@@ -5750,9 +5750,9 @@ impl Screen {
             let last = entry.points.iter().flatten().map(|point| point.row).max();
             return last.is_none_or(|last| {
                 self.stable_row_to_phys(last).is_some_and(|last| {
-                    self.lines
-                        .range(..=last)
-                        .all(|line| !line.changed_since(entry.source_sequence))
+                    (0..=last).all(|row| {
+                        self.lines.row_changed_since(row, entry.source_sequence) == Some(false)
+                    })
                 })
             });
         }
@@ -5802,9 +5802,7 @@ impl Screen {
         let Some(last) = self.stable_row_to_phys(last) else {
             return false;
         };
-        self.lines
-            .range(first..=last)
-            .all(|line| !line.changed_since(sequence))
+        (first..=last).all(|row| self.lines.row_changed_since(row, sequence) == Some(false))
     }
 
     #[cfg(feature = "use_serde")]
@@ -5982,12 +5980,10 @@ impl Screen {
         else {
             return false;
         };
-        // Validate directly across both deque slices. Materializing a pointer
-        // vector here allocates for the entire selection on every observation,
-        // including each clipboard chunk and resize preparation.
-        self.lines
-            .range(start..end)
-            .all(|line| !line.changed_since(sequence))
+        // Validate sequence metadata without materializing page rows. A large
+        // selection is rechecked for every clipboard chunk and resize
+        // preparation; those observations must not pin a second row store.
+        (start..end).all(|row| self.lines.row_changed_since(row, sequence) == Some(false))
     }
 
     /// LocalPane finalizes its layout floor after the terminal resize. Only
@@ -11523,14 +11519,11 @@ impl Screen {
                 );
             }
         }
-        for (idx, line) in self
-            .lines
-            .iter()
-            .enumerate()
-            .skip(phys.start)
-            .take(phys.end - phys.start)
-        {
-            if line.changed_since(seqno) {
+        // Damage queries are frequent, including for viewport-only mux
+        // updates. Inspect packed metadata directly: iterating legacy views
+        // here would allocate and retain every requested PageGrid row.
+        for idx in phys {
+            if self.lines.row_changed_since(idx, seqno) == Some(true) {
                 set.push(self.phys_to_stable_row_index(idx))
             }
         }
@@ -11905,11 +11898,83 @@ pub(crate) mod tests {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
     }
 
+    fn test_screen_with_history(engine: GridEngine) -> Screen {
+        let mut screen = test_screen_with_config(
+            4,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 8,
+                grid_engine: Some(engine),
+                ..TestTermConfig::default()
+            },
+        );
+        for seqno in 1..=20 {
+            screen.scroll_up(&(0..4), 1, seqno, CellAttributes::blank(), bidi_mode());
+        }
+        screen.touch_all_rows(20);
+        assert_eq!(screen.grid_engine(), engine);
+        assert!(screen.stable_row_index_offset > 0);
+        assert_eq!(screen.lines.len(), 12);
+        assert_eq!(screen.cached_page_views(), 0);
+        screen
+    }
+
     fn anchor_point(column: usize, row: StableRowIndex) -> Option<SelectionAnchorCoordinate> {
         Some(SelectionAnchorCoordinate {
             column: Some(column),
             row,
         })
+    }
+
+    #[test]
+    fn page_selection_checks_inspect_history_without_materializing_views() {
+        for engine in [GridEngine::Legacy, GridEngine::Page] {
+            let mut screen = test_screen_with_history(engine);
+            let first = screen.phys_to_stable_row_index(0);
+            let last = screen.phys_to_stable_row_index(screen.lines.len() - 1);
+            let points = [
+                anchor_point(0, first),
+                anchor_point(0, first),
+                anchor_point(2, last),
+            ];
+            assert!(screen.selection_anchor_rows_unchanged_since(&points, 20));
+            #[cfg(feature = "use_serde")]
+            let mixed = [
+                anchor_point(0, first - 1),
+                anchor_point(0, first - 1),
+                points[2],
+            ];
+            #[cfg(feature = "use_serde")]
+            assert!(screen.selection_points_resident_span_unchanged_since(&mixed, 20));
+            assert_eq!(screen.cached_page_views(), 0);
+
+            // A resident interior mutation invalidates the complete selection,
+            // including one whose endpoints begin in cold history.
+            screen.touch_phys_row(5, 21);
+            assert!(!screen.selection_anchor_rows_unchanged_since(&points, 20));
+            assert!(screen.selection_anchor_rows_unchanged_since(&points, 21));
+            assert!(screen.selection_anchor_rows_unchanged_since(&[points[0]; 3], 20));
+            assert!(!screen.selection_anchor_rows_unchanged_since(&[None; 3], 20));
+            assert!(!screen.selection_anchor_rows_unchanged_since(
+                &[anchor_point(0, first - 1); 3],
+                20
+            ));
+            #[cfg(feature = "use_serde")]
+            {
+                assert!(!screen.selection_points_resident_span_unchanged_since(&mixed, 20));
+                assert!(screen.selection_points_resident_span_unchanged_since(&mixed, 21));
+                assert!(screen.selection_points_resident_span_unchanged_since(
+                    &[anchor_point(0, first - 1); 3],
+                    20
+                ));
+                assert!(!screen.selection_points_resident_span_unchanged_since(
+                    &[anchor_point(0, last + 1); 3],
+                    20
+                ));
+            }
+            assert_eq!(screen.cached_page_views(), 0);
+        }
     }
 
     #[test]
@@ -15420,6 +15485,51 @@ pub(crate) mod tests {
                 "{range:?}"
             );
             assert!(screen.get_changed_stable_rows(range, 7).is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn page_dirty_queries_preserve_bounds_without_materializing_history() {
+        for engine in [GridEngine::Legacy, GridEngine::Page] {
+            let mut screen = test_screen_with_history(engine);
+            let first = screen.phys_to_stable_row_index(0);
+            let visible = screen.phys_row(0);
+            let start = screen.phys_to_stable_row_index(visible);
+            let end = screen.phys_to_stable_row_index(screen.lines.len());
+            assert_eq!(
+                screen.get_changed_stable_rows(start..end, 19),
+                (start..end).collect::<Vec<_>>()
+            );
+            assert!(screen.get_changed_stable_rows(start..end, 20).is_empty());
+            for range in [first - 2..first, end..end + 2, start..start, start + 1..start] {
+                assert!(screen.get_changed_stable_rows(range, 19).is_empty());
+            }
+            assert_eq!(screen.cached_page_views(), 0);
+
+            screen.touch_phys_row(visible + 1, 21);
+            assert_eq!(screen.get_changed_stable_rows(start..end, 20), [start + 1]);
+            assert_eq!(screen.cached_page_views(), 0);
+            screen.lines[visible + 2].update_last_change_seqno(22);
+            screen.touch_phys_row(0, 23);
+            assert_eq!(
+                screen.get_changed_stable_rows(start..end, 20),
+                [start + 1, start + 2]
+            );
+            assert_eq!(
+                screen.get_changed_stable_rows(StableRowIndex::MIN..StableRowIndex::MAX, 20),
+                [first, start + 1, start + 2]
+            );
+            let edited_views = usize::from(engine == GridEngine::Page);
+            assert_eq!(screen.cached_page_views(), edited_views);
+
+            screen.touch_all_rows(24);
+            assert_eq!(
+                screen.get_changed_stable_rows(start..end, 23),
+                (start..end).collect::<Vec<_>>()
+            );
+            assert!(screen.get_changed_stable_rows(start..end, 24).is_empty());
+            assert_eq!(screen.cached_page_views(), edited_views);
         }
     }
 
