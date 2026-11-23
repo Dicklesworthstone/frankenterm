@@ -1216,13 +1216,10 @@ mod tests {
                 &ctx,
                 MissionKillSwitchLevel::Off,
             );
-            assert_ne!(denied.receipt.envelope_verdict, "envelope.admit");
+            assert_eq!(denied.receipt.envelope_verdict, "envelope.blocked.policy");
             let summary = denied.contract_prepare.expect("summary");
-            assert!(
-                summary.outcome == "denied" || summary.outcome == "require_approval",
-                "destructive command must never be all_ready: {}",
-                summary.outcome
-            );
+            assert_eq!(summary.outcome, "denied");
+            assert!(summary.gates_failed.contains(&"policy".to_string()));
 
             // Missing target pane must fail target_liveness and block admission.
             let benign_missing = make_contract(StepAction::SendText {
