@@ -6353,6 +6353,32 @@ impl StorageHandle {
         .await
     }
 
+    /// Aggregate one bounded usage window without materializing metric rows.
+    ///
+    /// The existing type/time index bounds the source to the newest 100,001
+    /// rows in a window of at most 30 days. More than 100,000 source rows is an
+    /// explicit evaluation failure, never a partial total. Pane/account/agent
+    /// filters are applied inside that bounded source; query limits are refused.
+    pub async fn aggregate_usage_metric_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: MetricQuery,
+        pane_id: Option<u64>,
+    ) -> Result<f64> {
+        Self::checkpoint_storage_operation(cx, "aggregate_usage_metric")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "aggregate_usage_metric",
+            move || {
+                pooled_backend(db_path.as_str(), |backend| {
+                    aggregate_usage_metric_backend(backend, &query, pane_id)
+                })
+            },
+        )
+        .await
+    }
+
     /// Get daily aggregated metric summaries since a given timestamp.
     pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -28628,6 +28654,108 @@ fn query_usage_metrics_backend(
         results.push(usage_metric_record_from_backend_row(&row)?);
     }
     Ok(results)
+}
+
+fn aggregate_usage_metric_backend(
+    backend: &dyn StorageBackend,
+    query: &MetricQuery,
+    pane_id: Option<u64>,
+) -> Result<f64> {
+    const MAX_SOURCE_ROWS: i64 = 100_000;
+    const MAX_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000 + 1;
+
+    let (Some(since), Some(until)) = (query.since, query.until) else {
+        return Err(StorageError::Database(
+            "usage aggregate requires a finite time window".to_string(),
+        )
+        .into());
+    };
+    if since < 0
+        || until
+            .checked_sub(since)
+            .is_none_or(|span| !(1..=MAX_WINDOW_MS).contains(&span))
+        || query.limit.is_some()
+    {
+        return Err(StorageError::Database(
+            "usage aggregate window or row limit is invalid".to_string(),
+        )
+        .into());
+    }
+    // A rate-limit record can represent one occurrence without an explicit
+    // count. Missing cost/token evidence cannot safely be treated as zero.
+    let (metric_type, column, default_value, require_value) = match query.metric_type {
+        Some(MetricType::ApiCost) => (MetricType::ApiCost, "amount", "0.0", 1),
+        Some(MetricType::TokenUsage) => (MetricType::TokenUsage, "tokens", "0.0", 1),
+        Some(MetricType::RateLimitHit) => (MetricType::RateLimitHit, "count", "1.0", 0),
+        _ => {
+            return Err(StorageError::Database(
+                "unsupported usage aggregate metric".to_string(),
+            )
+            .into());
+        }
+    };
+    let pane_id = pane_id.map(|id| u64_to_i64(id, "pane_id")).transpose()?;
+    let scope = "(?4 IS NULL OR pane_id = ?4)
+                 AND (?5 IS NULL OR agent_type = ?5)
+                 AND (?6 IS NULL OR account_id = ?6)";
+    // The LIMIT belongs to the indexed source, before optional scope filters:
+    // a busy unrelated pane cannot turn a sparse filtered query into an
+    // unbounded history walk. A busy window is unavailable rather than low.
+    let sql = format!(
+        "SELECT COUNT(*),
+                TOTAL(CASE WHEN {scope} THEN COALESCE({column}, {default_value}) ELSE 0.0 END),
+                SUM(CASE WHEN ({scope})
+                         AND (({require_value} AND {column} IS NULL)
+                              OR ({column} IS NOT NULL
+                                  AND (typeof({column}) NOT IN ('integer', 'real') OR {column} < 0)))
+                         THEN 1 ELSE 0 END)
+         FROM (
+             SELECT pane_id, agent_type, account_id, amount, tokens, count
+             FROM usage_metrics INDEXED BY idx_usage_metrics_type_ts
+             WHERE metric_type = ?1 AND timestamp >= ?2 AND timestamp < ?3
+             ORDER BY timestamp DESC, id DESC
+             LIMIT {max_rows}
+         )",
+        max_rows = MAX_SOURCE_ROWS + 1,
+    );
+    let row = backend
+        .query_row_typed(
+            &sql,
+            &[
+                ToSqlValue::Text(metric_type.as_str()),
+                ToSqlValue::Integer(since),
+                ToSqlValue::Integer(until),
+                ToSqlValue::optional_i64(pane_id),
+                ToSqlValue::optional_text(query.agent_type.as_deref()),
+                ToSqlValue::optional_text(query.account_id.as_deref()),
+            ],
+        )
+        .map_err(|error| storage_backend_error("Usage aggregate", error))?
+        .ok_or_else(|| StorageError::Database("usage aggregate returned no row".to_string()))?;
+    let row = RowReader::new(&row);
+    let count = row
+        .i64(0)
+        .map_err(|error| storage_backend_error("Usage aggregate count", error))?;
+    if count > MAX_SOURCE_ROWS {
+        return Err(StorageError::Database(
+            "usage aggregate source exceeds 100000 rows; evaluation unavailable".to_string(),
+        )
+        .into());
+    }
+    let value = optional_backend_f64(&row, 1)
+        .map_err(|error| storage_backend_error("Usage aggregate value", error))?
+        .ok_or_else(|| StorageError::Database("usage aggregate has no value".to_string()))?;
+    let invalid = row
+        .optional_i64(2)
+        .map_err(|error| storage_backend_error("Usage aggregate validity", error))?
+        .unwrap_or(0);
+    if invalid != 0 || !value.is_finite() || value < 0.0 {
+        return Err(StorageError::Database(
+            "usage aggregate contains missing, invalid or overflowing values".to_string(),
+        )
+        .into());
+    }
+    Ok(value)
 }
 
 fn daily_metric_summary_from_backend_row(row: &[String]) -> Result<DailyMetricSummary> {

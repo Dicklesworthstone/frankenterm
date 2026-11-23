@@ -135,6 +135,10 @@ pub struct Config {
     /// Notification filtering and throttling settings
     pub notifications: NotificationConfig,
 
+    /// Pane-scoped usage and account-budget alerts emitted by the watcher.
+    /// Changes require a watcher restart.
+    pub alerts: crate::alerts::WatcherAlertConfig,
+
     /// Outbound MCP client settings (feature-gated consumers)
     pub mcp_client: McpClientConfig,
 
@@ -5315,6 +5319,13 @@ impl Config {
             });
         }
 
+        if self.alerts != new_config.alerts {
+            forbidden.push(ForbiddenChange {
+                name: "alerts".to_string(),
+                reason: "Usage alert rules and cadence require a watcher restart".to_string(),
+            });
+        }
+
         if self.general.data_dir != new_config.general.data_dir {
             forbidden.push(ForbiddenChange {
                 name: "general.data_dir".to_string(),
@@ -6028,6 +6039,10 @@ impl Config {
     pub fn validate(&self) -> crate::Result<()> {
         self.recorder_backend_selection()
             .map_err(crate::error::ConfigError::RecorderBackendSelection)?;
+
+        self.alerts
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
 
         if let Some(transport) = &self.safety.connector_transport {
             transport

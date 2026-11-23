@@ -3047,11 +3047,36 @@ When detections fire, `ft watch` can notify operators through desktop notificati
 
 ### Alert manager (`alerts.rs`)
 
-Planned: an alert manager that routes detections to channels by rule (severity, rule_id pattern, pane, time-of-day). `alerts.rs` currently evaluates usage/cost thresholds only and is not connected to the notification pipeline. The intended rule shape:
-- Severity threshold
-- Channel list (one or more backends)
-- Throttling window (suppress duplicates)
-- Mute list (operator can `ft mute add <identity_key> --for 1h`; find the identity_key via `ft events --format json`)
+`ft watch` can monitor recorded API costs, token usage, rate-limit counts, and an explicitly selected account's remaining balance. Alerts are opt-in and require an observed pane ID. Cost, token and rate-limit rules total that pane's recorded metrics over a rolling `day`, `week`, or 30-day `month`; optional `agent_type` and `account_id` filters narrow the total.
+
+```toml
+[alerts]
+enabled = true
+check_interval_secs = 60
+repeat_after_secs = 1800
+
+[[alerts.rules]]
+id = "agent-token-budget"
+pane_id = 7
+metric = "token_usage"
+threshold = 1000000
+period = "day"
+
+[[alerts.rules]]
+id = "account-balance"
+pane_id = 7
+metric = "account_balance"
+threshold = 20.0
+period = "day"
+service = "anthropic"
+account_id = "my-account"
+```
+
+Use `cost`, `token_usage`, or `rate_limit_frequency` for upper limits: levels start at 50%, 75%, 90%, and 100% of the configured threshold. `account_balance` monitors a minimum percentage, requires both `service` and `account_id`, and uses the selected pane as its notification target. Missing account data, data older than 15 minutes, unobserved panes, and oversized metric windows are reported as unavailable; they never generate a false recovery. At most 64 rules are accepted, checks run every 5–3600 seconds, and an indexed evaluation refuses windows containing more than 100,000 rows of the selected metric type rather than returning a partial total.
+
+Transitions are recorded as `usage.alert` and `usage.recovered` events. A restart retains the reminder deadline; a recorded recovery lets an identical later threshold breach notify again. Changes to severity emit immediately, while an unchanged alert repeats after `repeat_after_secs` (up to one day). Rule or cadence changes require a watcher restart.
+
+Desktop and webhook delivery use the existing `[notifications]` configuration, filters, redaction, deduplication, and mutes. With notifications disabled, the events remain available through ordinary event history, web/SSE, and MCP. An event being recorded does not guarantee external notification delivery across a process crash.
 
 ### Redaction before emission
 

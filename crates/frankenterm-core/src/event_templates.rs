@@ -224,6 +224,32 @@ fn build_registry() -> TemplateRegistry {
         )]),
     );
 
+    for event_type in ["usage.alert", "usage.recovered"] {
+        templates.insert(
+            event_type.to_string(),
+            EventTemplate::new(
+                event_type,
+                "Usage alert {alert_name}: {summary}",
+                "Pane {pane_id}. {summary}",
+                Severity::Info,
+            )
+            .with_context_keys({
+                let mut keys = default_context_keys();
+                keys.push(ContextKey::new(
+                    "alert_name",
+                    "Configured usage alert",
+                    "agent-budget",
+                ));
+                keys.push(ContextKey::new(
+                    "summary",
+                    "Usage threshold or recovery",
+                    "daily tokens 750000 / 1000000",
+                ));
+                keys
+            }),
+        );
+    }
+
     let fallback = EventTemplate::new(
         "unknown",
         "Unknown event {event_type}",

@@ -48391,6 +48391,10 @@ async fn run_watcher(
             anyhow::bail!("Invalid notification configuration: {err}");
         }
     }
+    config
+        .alerts
+        .validate()
+        .map_err(|error| anyhow::anyhow!("Invalid usage alert configuration: {error}"))?;
     if config.notifications.enabled && config.notifications.email.enabled {
         tracing::warn!(
             "Email notifications are enabled but not implemented; no email will be sent (ft-9b41l). Use desktop or webhook notifications."
@@ -49061,6 +49065,31 @@ async fn run_watcher(
         None
     };
 
+    let usage_alert_monitor_handle = if config.alerts.enabled {
+        let alert_config = config.alerts.clone();
+        let storage = scheduler_storage.clone();
+        let event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let alert_cx = cx.clone();
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
+            run_usage_alert_monitor(
+                &alert_cx,
+                alert_config,
+                storage,
+                event_bus,
+                task_shutdown_flag,
+            )
+            .await;
+        });
+        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+            task,
+            shutdown_flag,
+        ))
+    } else {
+        None
+    };
+
     // Background scheduler for saved searches (scheduled alerts).
     //
     // Runs inside the watcher process and publishes synthetic PatternDetected
@@ -49495,6 +49524,17 @@ async fn run_watcher(
     tracing::info!("Shutting down observation runtime...");
     handle.signal_shutdown();
 
+    if let Some(alert_monitor) = usage_alert_monitor_handle
+        && let Err(error) = settle_watcher_background_task(
+            "usage_alert_monitor",
+            alert_monitor,
+            &background_shutdown_cx,
+            false,
+        )
+        .await
+    {
+        shutdown_failures.push(error);
+    }
     if let Some(notification_handle) = notification_handle
         && let Err(error) = settle_watcher_background_task(
             "notification_pipeline",
@@ -49696,6 +49736,57 @@ fn retain_live_saved_search_state<T>(
     live_search_ids: &HashSet<&str>,
 ) {
     state.retain(|id, _| live_search_ids.contains(id.as_str()));
+}
+
+/// Optional usage monitoring shares the watcher's storage, event bus and
+/// shutdown predicate. Every turn is bounded by the configured rule count and
+/// the storage aggregate's finite source budget; shutdown also interrupts an
+/// in-progress sweep instead of waiting for another interval.
+async fn run_usage_alert_monitor(
+    cx: &frankenterm_core::cx::Cx,
+    config: frankenterm_core::alerts::WatcherAlertConfig,
+    storage: frankenterm_core::storage::StorageHandle,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let interval = Duration::from_secs(config.check_interval_secs);
+    let monitor = match frankenterm_core::alerts::WatcherAlertMonitor::new(config) {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            tracing::error!(%error, "Usage alert monitor configuration rejected");
+            return;
+        }
+    };
+    while !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok() {
+        frankenterm_core::runtime_async::select! {
+            result = monitor.evaluate_with_cx(cx, &storage, &event_bus) => {
+                match result {
+                    Ok(sweep) => tracing::debug!(
+                        emitted = sweep.emitted,
+                        unavailable = sweep.unavailable,
+                        "Usage alert sweep completed"
+                    ),
+                    Err(error) => {
+                        if cx.checkpoint().is_err() {
+                            break;
+                        }
+                        tracing::warn!(%error, "Usage alert sweep failed");
+                    }
+                }
+            }
+            () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+        }
+        frankenterm_core::runtime_async::select! {
+            result = frankenterm_core::runtime_async::sleep_with_cx(cx, interval) => {
+                if result.is_err() {
+                    break;
+                }
+            }
+            () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+        }
+    }
 }
 
 #[cfg(test)]
