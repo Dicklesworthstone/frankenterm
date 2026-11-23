@@ -256,8 +256,28 @@ enum Request {
     Action,
 }
 
+impl Request {
+    /// These replies establish the connection or unblock its authoritative
+    /// inventory/display. Passive lookups and effect receipts have separate
+    /// completion policies; they must not acquire a generic retry path.
+    fn required_reply(&self) -> Option<&'static str> {
+        match self {
+            Self::Version => Some("protocol check"),
+            Self::RegisterClient { .. } => Some("client registration"),
+            Self::ListPanes { .. } | Self::CoherentPanes => Some("pane inventory"),
+            Self::PaneIdentity { .. } | Self::PaneAuthority { .. } => Some("pane authority"),
+            Self::Subscribe { .. } | Self::Poll { .. } => Some("pane observation"),
+            Self::Lines { .. } => Some("pane rows"),
+            _ => None,
+        }
+    }
+}
+
 /// The most wheel notches one [`Session::wheel`] call sends.
 pub const MAX_WHEEL_STEPS: u32 = 64;
+/// Every essential mux reply has one admission budget. Unrelated traffic,
+/// including transport keepalives, cannot extend an unanswered request.
+pub const REQUIRED_REPLY_DEADLINE_NS: u64 = 15_000_000_000;
 /// Reliable input retains one admission budget across retries and suffixes.
 pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
 /// Shell creation has one admission deadline and no automatic retry path.
@@ -448,6 +468,10 @@ pub struct Session {
     topology: Option<TopologyFence>,
     failed: bool,
     requests: HashMap<u64, Request>,
+    /// Keyed by the original RPC serial, never by the connection's most
+    /// recent activity. Requests admitted before the first clock sample are
+    /// armed exactly once when the owner supplies its monotonic origin.
+    reply_deadlines: HashMap<u64, Option<u64>>,
     panes: Vec<PaneInfo>,
     /// Where each pane's screen and cursor were at the last list: the only
     /// sign of output from a pane this session never showed (no pushes).
@@ -523,6 +547,48 @@ impl Session {
             return false;
         }
         self.monotonic_ns = Some(now_ns);
+        // A newer observation or a hidden/reopened pane may have retired a
+        // render request before its reply arrived. That old serial must not
+        // close the current visit, nor can its late reply reopen the gate.
+        let retired: Vec<_> = self
+            .reply_deadlines
+            .keys()
+            .copied()
+            .filter(|serial| !self.required_reply_pending(*serial))
+            .collect();
+        for serial in retired {
+            self.reply_deadlines.remove(&serial);
+            self.requests.remove(&serial);
+        }
+        if self.reply_deadlines.values().any(Option::is_none) {
+            let Some(deadline) = now_ns.checked_add(REQUIRED_REPLY_DEADLINE_NS) else {
+                self.fail("the mux reply deadline overflowed; input was not replayed".to_owned());
+                return false;
+            };
+            for pending in self.reply_deadlines.values_mut() {
+                pending.get_or_insert(deadline);
+            }
+        }
+        let expired = self
+            .reply_deadlines
+            .iter()
+            .filter_map(|(serial, deadline)| {
+                deadline
+                    .filter(|deadline| now_ns >= *deadline)
+                    .map(|_| *serial)
+            })
+            .min();
+        if let Some(serial) = expired {
+            let operation = self
+                .requests
+                .get(&serial)
+                .and_then(Request::required_reply)
+                .unwrap_or("state read");
+            self.fail(format!(
+                "the mux {operation} was not answered before its deadline; input was not replayed"
+            ));
+            return false;
+        }
         if self
             .pending_shell_creation
             .is_some_and(|pending| now_ns >= pending.deadline_ns)
@@ -603,7 +669,7 @@ impl Session {
     /// Earliest absolute wake in the same clock domain supplied to
     /// [`Session::advance_time`]. Includes every admitted operation's expiry,
     /// including a lone paste or mouse RPC, a passive identity query's expiry,
-    /// and a refused render read's repeat.
+    /// an essential handshake/state reply, and a refused render read's repeat.
     /// A preceding RPC cannot hide a queued operation's original deadline.
     /// Only one owner timer is needed; the bounded FIFO remains authoritative.
     pub fn next_input_wake_ns(&self) -> Option<u64> {
@@ -628,6 +694,13 @@ impl Session {
                 | Request::RenderMetadata { deadline_ns, .. } => Some(*deadline_ns),
                 Request::ConditionalResize { intent } => Some(intent.deadline_ns),
                 _ => None,
+            }))
+            .chain(self.reply_deadlines.iter().filter_map(|(serial, deadline)| {
+                if self.required_reply_pending(*serial) {
+                    *deadline
+                } else {
+                    None
+                }
             }))
             .chain(
                 self.resize_successors
@@ -2006,6 +2079,24 @@ impl Session {
         self.send_encoded(pdu, &wire::encode(body), request);
     }
 
+    fn required_reply_pending(&self, serial: u64) -> bool {
+        match self.requests.get(&serial) {
+            Some(Request::Subscribe { pane_id } | Request::Poll { pane_id })
+                if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION =>
+            {
+                self.mirrors
+                    .get(pane_id)
+                    .is_some_and(|mirror| mirror.expects_observation(serial))
+            }
+            // Hiding does not clear a mirror's fetching flag or its pending
+            // input authority. Those replies still gate a later show/input
+            // and keep their original deadline. Older render protocols have
+            // no observation-serial fence that can retire a reply safely.
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     fn send_encoded(&mut self, pdu: u64, body: &[u8], request: Request) {
         if self.failed {
             return;
@@ -2014,6 +2105,21 @@ impl Session {
             self.fail("mux request serial space exhausted".to_owned());
             return;
         };
+        if request.required_reply().is_some() {
+            let deadline = match self.monotonic_ns {
+                Some(now) => {
+                    let Some(deadline) = now.checked_add(REQUIRED_REPLY_DEADLINE_NS) else {
+                        self.fail(
+                            "the mux reply deadline overflowed; input was not replayed".to_owned(),
+                        );
+                        return;
+                    };
+                    Some(deadline)
+                }
+                None => None,
+            };
+            self.reply_deadlines.insert(serial, deadline);
+        }
         self.next_serial = serial;
         self.outgoing
             .extend_from_slice(&frame::encode(pdu, serial, body));
@@ -2030,6 +2136,7 @@ impl Session {
             self.ordered_input.clear();
             self.ordered_input_bytes = 0;
             self.resize_successors.clear();
+            self.reply_deadlines.clear();
             self.outgoing.clear();
             self.input.clear();
             self.events.push_back(Event::Failed { reason });
@@ -2228,6 +2335,7 @@ impl Session {
         let request = if frame.serial == 0 {
             None
         } else {
+            self.reply_deadlines.remove(&frame.serial);
             self.requests.remove(&frame.serial)
         };
         if frame.serial != 0 && request.is_none() {
@@ -3341,6 +3449,8 @@ impl Session {
                 | Request::Poll { pane_id: old } if *old == pane_id
             ) && !matches!(request, Request::ConditionalResize { intent } if intent.request.pane_id == pane_id)
         });
+        self.reply_deadlines
+            .retain(|serial, _| self.requests.contains_key(serial));
         if self.input.in_paste(pane_id) {
             self.interrupted_input.insert(pane_id);
         }

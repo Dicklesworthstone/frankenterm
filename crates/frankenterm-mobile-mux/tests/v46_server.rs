@@ -2362,3 +2362,254 @@ fn stale_inventory_membership_cannot_retire_unanswered_input() {
     assert_eq!(harness.server.written, b"firstsecond");
     assert!(!harness.session.unanswered_input(7));
 }
+
+/// Let the real server decode and answer exactly one request, but keep its
+/// response off the wire so tests can cross the owner's monotonic deadline.
+fn withhold_mux_reply(harness: &mut Harness, expected: u64) -> Vec<u8> {
+    let outgoing = harness.session.take_outgoing();
+    let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+    reader.push(&outgoing);
+    let request = reader.next_frame().unwrap().expect("one pending request");
+    assert_eq!(request.ident, expected);
+    assert!(reader.next_frame().unwrap().is_none());
+    assert!(harness.server.to_phone.is_empty());
+    harness.server.receive(&outgoing);
+    let response = std::mem::take(&mut harness.server.to_phone);
+    assert!(!response.is_empty());
+    response
+}
+
+#[test]
+fn every_initial_handshake_stage_has_its_own_bounded_reply() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+    use frankenterm_mobile_mux::wire::ident;
+
+    let stages = [
+        (ident::GET_CODEC_VERSION, "protocol check"),
+        (ident::SET_CLIENT_ID, "client registration"),
+        (ident::LIST_PANES_COHERENT, "pane inventory"),
+    ];
+    for pending in 0..stages.len() {
+        let mut harness = Harness::new(4, 20);
+        let mut admitted = 0;
+        for (request, _) in stages.iter().take(pending) {
+            let reply = withhold_mux_reply(&mut harness, *request);
+            admitted += 100_000_000;
+            assert!(harness.session.advance_time(admitted));
+            harness.session.receive(&reply);
+        }
+        let late = withhold_mux_reply(&mut harness, stages[pending].0);
+        let deadline = admitted + REQUIRED_REPLY_DEADLINE_NS;
+        assert_eq!(harness.session.next_input_wake_ns(), Some(deadline));
+        assert!(harness.session.advance_time(deadline - 1));
+        while harness.session.next_event().is_some() {}
+        assert!(!harness.session.advance_time(deadline));
+        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains(stages[pending].1)));
+        assert!(harness.session.next_event().is_none());
+        assert_eq!(harness.session.next_input_wake_ns(), None);
+        assert!(harness.session.take_outgoing().is_empty());
+
+        // A response racing after expiry cannot register, publish inventory,
+        // send the next handshake stage, or reopen this connection.
+        harness.session.receive(&late);
+        assert!(!harness.session.is_ready());
+        assert!(harness.session.next_event().is_none());
+        assert!(harness.session.take_outgoing().is_empty());
+    }
+}
+
+#[test]
+fn the_first_clock_sample_arms_negotiation_at_any_monotonic_origin() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+
+    let mut session = frankenterm_mobile_mux::Session::new();
+    assert_eq!(session.next_input_wake_ns(), None);
+    let origin = 100 * REQUIRED_REPLY_DEADLINE_NS;
+    assert!(session.advance_time(origin));
+    assert_eq!(
+        session.next_input_wake_ns(),
+        Some(origin + REQUIRED_REPLY_DEADLINE_NS)
+    );
+    assert!(session.advance_time(origin + REQUIRED_REPLY_DEADLINE_NS - 1));
+    assert!(!session.advance_time(origin + REQUIRED_REPLY_DEADLINE_NS));
+    assert!(session.take_outgoing().is_empty());
+
+    let mut overflow = frankenterm_mobile_mux::Session::new();
+    assert!(!overflow.advance_time(u64::MAX - REQUIRED_REPLY_DEADLINE_NS + 1));
+    assert_eq!(overflow.next_input_wake_ns(), None);
+    assert!(overflow.take_outgoing().is_empty());
+}
+
+#[test]
+fn live_traffic_cannot_extend_a_missing_inventory_or_replay_pending_input() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+    use frankenterm_mobile_mux::wire::ident;
+
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    harness.session.refresh_panes();
+    let late_inventory = withhold_mux_reply(&mut harness, ident::LIST_PANES);
+    let liveness = canonical_frame(
+        ident::LIVENESS_RESPONSE,
+        0,
+        &codec::LivenessResponse {
+            pane_id: 7,
+            is_alive: true,
+        },
+    );
+    for tick in [
+        REQUIRED_REPLY_DEADLINE_NS / 3,
+        REQUIRED_REPLY_DEADLINE_NS * 2 / 3,
+        REQUIRED_REPLY_DEADLINE_NS - 1,
+    ] {
+        assert!(harness.session.advance_time(tick));
+        harness.session.receive(&liveness);
+        harness.session.refresh_panes();
+        assert!(harness.session.is_ready());
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            Some(REQUIRED_REPLY_DEADLINE_NS)
+        );
+        assert!(harness.session.take_outgoing().is_empty());
+    }
+
+    harness.session.write(7, b"once");
+    harness.server.receive(&harness.session.take_outgoing());
+    let late_input = std::mem::take(&mut harness.server.to_phone);
+    assert_eq!(harness.server.written, b"once");
+    assert!(harness.session.unanswered_input(7));
+    assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
+    assert!(harness.session.unanswered_input(7));
+    assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
+        if reason.contains("pane inventory")));
+    harness.session.receive(&late_inventory);
+    harness.session.receive(&late_input);
+    assert!(!harness.session.is_ready());
+    assert!(harness.session.next_event().is_none());
+    assert!(harness.session.take_outgoing().is_empty());
+    assert_eq!(harness.server.written, b"once");
+}
+
+#[test]
+fn pane_authority_observation_and_rows_cannot_wait_forever() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+    use frankenterm_mobile_mux::wire::ident;
+
+    let stages = [
+        (ident::GET_PANE_IDENTITY, "pane authority"),
+        (ident::GET_PANE_RENDER_STATE, "pane observation"),
+        (ident::GET_LINES_AT_LAYOUT, "pane rows"),
+    ];
+    for pending in 0..stages.len() {
+        let mut harness = Harness::new(4, 20);
+        harness.quiet_output(&numbered(0, 20));
+        harness.pump();
+        harness.session.show(7);
+        for (request, _) in stages.iter().take(pending) {
+            let reply = withhold_mux_reply(&mut harness, *request);
+            harness.session.receive(&reply);
+        }
+        let late = withhold_mux_reply(&mut harness, stages[pending].0);
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            Some(REQUIRED_REPLY_DEADLINE_NS)
+        );
+        assert!(harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS - 1));
+        while harness.session.next_event().is_some() {}
+        assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
+        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains(stages[pending].1)));
+        harness.session.receive(&late);
+        assert!(!harness.session.is_ready());
+        assert!(harness.session.next_event().is_none());
+        assert!(harness.session.take_outgoing().is_empty());
+    }
+}
+
+#[test]
+fn hidden_and_superseded_observations_cannot_expire_a_newer_visit() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+    use frankenterm_mobile_mux::wire::ident;
+
+    for reopen in [false, true] {
+        let mut harness = Harness::new(4, 20);
+        harness.attach();
+        harness.session.hide(7);
+        harness.session.show(7);
+        let stale = withhold_mux_reply(&mut harness, ident::GET_PANE_RENDER_STATE);
+        assert!(harness.session.advance_time(1));
+        if reopen {
+            // A newer correlated read owns the presentation gate even when
+            // the previous server reply is still on its way.
+            harness.session.show(7);
+            harness.pump();
+        } else {
+            harness.session.hide(7);
+        }
+        assert_eq!(harness.session.next_input_wake_ns(), None);
+        assert!(harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
+        harness.session.receive(&stale);
+        assert!(harness.session.is_ready());
+        assert!(harness.session.next_event().is_none());
+        assert!(harness.session.take_outgoing().is_empty());
+        harness.session.show(7);
+        harness.pump();
+        assert_mirrored(&mut harness);
+        assert_eq!(harness.session.next_input_wake_ns(), None);
+    }
+}
+
+#[test]
+fn reopening_cannot_extend_the_row_fetch_that_still_blocks_its_mirror() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+    use frankenterm_mobile_mux::wire::ident;
+
+    let mut harness = Harness::new(4, 20);
+    harness.quiet_output(&numbered(0, 20));
+    harness.pump();
+    harness.session.show(7);
+    for request in [ident::GET_PANE_IDENTITY, ident::GET_PANE_RENDER_STATE] {
+        let reply = withhold_mux_reply(&mut harness, request);
+        harness.session.receive(&reply);
+    }
+    let late_rows = withhold_mux_reply(&mut harness, ident::GET_LINES_AT_LAYOUT);
+    assert!(harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS / 2));
+    harness.session.hide(7);
+    harness.session.show(7);
+    harness.pump();
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(REQUIRED_REPLY_DEADLINE_NS)
+    );
+    assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
+    assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
+        if reason.contains("pane rows")));
+    harness.session.receive(&late_rows);
+    assert!(!harness.session.is_ready());
+    assert!(harness.session.next_event().is_none());
+    assert!(harness.session.take_outgoing().is_empty());
+}
+
+#[test]
+fn answered_requests_leave_no_expiry_on_a_healthy_idle_connection() {
+    use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
+
+    let mut harness = Harness::new(4, 20);
+    harness.quiet_output(&numbered(0, 20));
+    harness.attach();
+    assert_mirrored(&mut harness);
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+    assert!(harness.session.advance_time(3 * REQUIRED_REPLY_DEADLINE_NS));
+    harness.session.refresh_panes();
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(4 * REQUIRED_REPLY_DEADLINE_NS)
+    );
+    harness.pump();
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+    assert!(harness.session.advance_time(5 * REQUIRED_REPLY_DEADLINE_NS));
+    harness.output(b"still connected");
+    assert_mirrored(&mut harness);
+    assert!(harness.session.is_ready());
+}
