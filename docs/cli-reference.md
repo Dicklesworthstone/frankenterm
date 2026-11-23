@@ -346,7 +346,8 @@ authorize requests. Only the configured HTTPS origin is accepted in this
 mode. Issued and cleared session cookies use the host-only
 `__Host-ft_viewer_session` name and carry `Secure`, so other hosts under the
 same site cannot plant one. `ft web`'s startup announcement identifies the
-browser URL separately from the HTTP proxy upstream. Direct local HTTP browser access is refused in HTTPS mode.
+browser URL separately from the HTTP proxy upstream; `ft watch --web` logs
+both as `https_origin` and `address`. Direct local HTTP browser access is refused in HTTPS mode.
 
 This authenticates one operator's existing read-only data access; it is not
 per-user or per-pane sharing. Tailnet access rules restrict who can reach the

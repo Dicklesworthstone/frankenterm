@@ -49049,8 +49049,11 @@ async fn run_watcher(
                     "failed to start the in-process web API on port {resolved_port}: {error}"
                 )
             })?;
+        // In HTTPS-proxy mode the bound address is only the proxy upstream;
+        // browsers must use the configured origin, which local HTTP refuses.
         tracing::info!(
             address = %server.bound_addr(),
+            https_origin = server.https_origin().unwrap_or("none"),
             "Watcher web API listening (shared event bus, storage tail disabled)"
         );
         Some(server)
