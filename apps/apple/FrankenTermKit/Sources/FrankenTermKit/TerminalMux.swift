@@ -705,6 +705,17 @@ public final class TerminalMuxControl: @unchecked Sendable {
         lock.withLock { paneChoice = .pending(plan) }
     }
 
+    /// The choice's keyboard handoff failed or was cancelled before the
+    /// transport saw it. An exact choice stays valid while tabs are added, so
+    /// left pending it would keep a New Tab's tab hidden while the phone stays
+    /// on the old pane. Clears only this pending plan, never a newer choice or
+    /// one the transport already took.
+    public func abandonPaneChoice(_ plan: TerminalMuxInputRouting.NavigationPlan) {
+        lock.withLock {
+            if case .pending(let pending) = paneChoice, pending == plan { paneChoice = .none }
+        }
+    }
+
     /// Whether a pane chosen after the latest New Tab request keeps that
     /// request's tab in the background: the transport took the choice, or it
     /// is still in its handoff and can still be taken. A choice that can no

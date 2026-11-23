@@ -86,7 +86,9 @@ final class AppleOpticalVideoTests: XCTestCase {
     }
 
     /// FTAG pads plaintext to 4096-byte multiples, so even a 20-byte archive is a
-    /// multipart page: every systematic part plus ceil(n/2)+16 repair parts.
+    /// multipart page: every systematic part plus ceil(n/2)+16 repair parts,
+    /// then repair parts up to the next prime loop length so a periodic camera
+    /// stride still visits every symbol.
     func testH264MoviesHoldEverySymbolForExactlyTenSixAndThreeFrames() async throws {
         try skipIfSimulatorLacksVisionBarcodeInference()
         let root = try directory(), encrypted = try source(bytes: 20)
@@ -94,10 +96,12 @@ final class AppleOpticalVideoTests: XCTestCase {
         let sender = try OpticalSender(envelope: encrypted.envelope, using: crypto)
         let parts = try sender.sourcePartCount(page: 0)
         XCTAssertGreaterThan(parts, 1, "a padded FTAG envelope never fits one QR part")
+        let unpadded = parts + (parts + 1) / 2 + 16
+        let symbols = try XCTUnwrap(OpticalCadence.primeLength(atLeast: unpadded, atMost: 2 * unpadded))
         for (rate, frames) in [(3, 10), (5, 6), (10, 3)] {
             let url = root.appendingPathComponent("recording-\(rate).mp4")
             let receipt = try await renderer.save(source: encrypted, to: url, symbolsPerSecond: rate)
-            XCTAssertEqual(receipt.symbolCount, parts + (parts + 1) / 2 + 16)
+            XCTAssertEqual(receipt.symbolCount, symbols)
             XCTAssertEqual(receipt.frameCount, receipt.symbolCount * frames)
             XCTAssertEqual(receipt.framesPerSecond, 30)
             XCTAssertEqual(receipt.symbolsPerSecond, rate)

@@ -1015,6 +1015,30 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
         XCTAssertNil(control.current.rejectedNavigation)
     }
 
+    /// A choice whose keyboard handoff failed never reached the transport. It
+    /// must stop holding the New Tab's tab back, but abandoning an older plan
+    /// cannot erase a newer pending choice or one the transport took.
+    func testAbandonedChoiceGivesWayToTheNewTabButNeverClearsANewerOne() throws {
+        let control = try fixture()
+        control.enableShellCreation(incarnation: Data(repeating: 0x32, count: 16))
+        try control.requestShellCreation(control.prepareShellCreation(workspace: "default"))
+        let failed = try control.inputRouting.navigation(pane: 20)
+        control.notePaneChoice(failed)
+        try control.inputRouting.replaceInventory([10, 20, 30, 40])
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "the precondition this guards")
+        control.abandonPaneChoice(failed)
+        XCTAssertFalse(control.paneChosenSinceShellCreation, "a failed switch gives way to the new tab")
+
+        let newer = try control.inputRouting.navigation(pane: 30)
+        control.notePaneChoice(newer)
+        control.abandonPaneChoice(failed)
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "an older failure cannot clear a newer choice")
+        try control.request(newer)
+        XCTAssertEqual(control.takeRequest(), 30)
+        control.abandonPaneChoice(newer)
+        XCTAssertTrue(control.paneChosenSinceShellCreation, "a choice the transport took stays taken")
+    }
+
     func testExactQueuedChoiceSurvivesOtherPaneRemovalReorderAndRetitle() throws {
         let control = try fixture()
         let choice = try control.inputRouting.navigation(pane: 20)

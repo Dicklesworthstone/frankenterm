@@ -1488,6 +1488,9 @@ final class TerminalSessionController {
                 try control.request(plan)
             } catch {
                 self.requestedMuxPane = nil; self.requestedMuxNavigation = nil
+                // A switch that never reached the transport must not keep a
+                // New Tab's tab in the background.
+                control.abandonPaneChoice(plan)
                 // The plan can expire after handoff succeeds but before the
                 // old view is retired. Its responder is already gone; keeping
                 // that drawable would block showView from rebuilding input.
