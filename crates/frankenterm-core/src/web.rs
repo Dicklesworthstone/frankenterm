@@ -694,11 +694,11 @@ mod tests {
     #[test]
     fn config_redaction_preserves_builtin_rules_and_isolates_server_instances() {
         let loaded = crate::config::Config::from_toml(
-            r#"
+            r"
             [safety.redaction]
             patterns = ['custom-canary-[0-9]+']
             placeholder = '[PROJECT_PRIVATE]'
-            "#,
+            ",
         )
         .unwrap();
         let default = WebServerConfig::default();

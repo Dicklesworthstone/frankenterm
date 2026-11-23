@@ -8193,10 +8193,10 @@ max_sender_id_len = 0
         // Planted negative 1: ordinary CLI loading fails closed without
         // exposing a private pattern through Display or Debug diagnostics.
         let error = Config::from_toml(
-            r#"
+            r"
             [safety.redaction]
             patterns = ['custom-secret-[0-9]+', 'private-literal-[unclosed-group']
-            "#,
+            ",
         )
         .unwrap_err();
         for err in [error.to_string(), format!("{error:?}")] {

@@ -1737,11 +1737,11 @@ mod web_tests {
 
         run_async_test(async {
             let loaded = frankenterm_core::config::Config::from_toml(
-                r#"
+                r"
                 [safety.redaction]
                 patterns = ['custom-canary-[0-9]+']
                 placeholder = '[PROJECT_PRIVATE]'
-                "#,
+                ",
             )
             .expect("normal operator configuration must validate");
             let config = WebServerConfig::new(0)

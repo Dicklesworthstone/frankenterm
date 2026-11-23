@@ -26339,10 +26339,9 @@ mod tests {
 
             let first_limit =
                 effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 4096);
-            let first =
-                crate::ingest::persist_captured_segment(&storage, &captured, first_limit)
-                    .await
-                    .unwrap();
+            let first = crate::ingest::persist_captured_segment(&storage, &captured, first_limit)
+                .await
+                .unwrap();
             assert_eq!(first.segment.content, "🦀".repeat(256));
             assert_eq!(first.segment.seq, 0);
             assert!(first.gap.unwrap().reason.contains("max_bytes=1024"));
@@ -26353,10 +26352,9 @@ mod tests {
             captured.seq = 1;
             let second_limit =
                 effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 4096);
-            let second =
-                crate::ingest::persist_captured_segment(&storage, &captured, second_limit)
-                    .await
-                    .unwrap();
+            let second = crate::ingest::persist_captured_segment(&storage, &captured, second_limit)
+                .await
+                .unwrap();
             assert_eq!(second.segment.content, captured.content);
             assert_eq!(second.segment.seq, 1);
             assert!(second.gap.is_none());
@@ -26365,10 +26363,9 @@ mod tests {
             captured.seq = 2;
             let third_limit =
                 effective_persist_segment_bytes(config_rx.borrow().max_segment_bytes, 1024);
-            let third =
-                crate::ingest::persist_captured_segment(&storage, &captured, third_limit)
-                    .await
-                    .unwrap();
+            let third = crate::ingest::persist_captured_segment(&storage, &captured, third_limit)
+                .await
+                .unwrap();
             assert_eq!(third.segment.content, "🦀".repeat(256));
             assert_eq!(third.segment.seq, 2);
             assert!(third.gap.unwrap().reason.contains("max_bytes=1024"));
@@ -26376,7 +26373,11 @@ mod tests {
             let stored = storage.get_segments(1, 10).await.unwrap();
             assert_eq!(stored.len(), 3);
             assert_eq!(
-                stored.iter().find(|segment| segment.seq == 1).unwrap().content,
+                stored
+                    .iter()
+                    .find(|segment| segment.seq == 1)
+                    .unwrap()
+                    .content,
                 captured.content
             );
             assert_eq!(storage.get_gaps().await.unwrap().len(), 2);
