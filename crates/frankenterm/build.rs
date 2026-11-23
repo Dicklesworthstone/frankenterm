@@ -92,6 +92,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     emit_cargo_atomic_component_marker(AtomicComponentRole::Ft)?;
 
+    // Windows reserves 1 MiB for the main thread; Linux and macOS give it 8 MiB.
+    // ft polls its whole command future there (the runtime's block_on), and an
+    // unoptimized Windows build overflowed before printing --version
+    // (STATUS_STACK_OVERFLOW at 1, 2 and 4 MiB; fine at 8). Reserve the Unix size.
+    const FT_MAIN_STACK_BYTES: u32 = 8 * 1024 * 1024;
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bin=ft=/STACK:{FT_MAIN_STACK_BYTES}"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bin=ft=-Wl,--stack,{FT_MAIN_STACK_BYTES}"),
+            _ => {}
+        }
+    }
+
     // Rerun triggers
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
