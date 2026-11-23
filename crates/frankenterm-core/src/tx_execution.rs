@@ -16,6 +16,7 @@
 //! Safety doctrine: no commit before prepare; no prepare bypass of policy gates;
 //! every transition emits observability events with reason codes.
 
+use crate::patterns::PatternEngine;
 use crate::plan::{
     Mission, MissionEconomicAuditRow, MissionEconomicBreakerDecision,
     MissionEconomicHardStopEnvelope, MissionKillSwitchLevel, MissionTxContract, MissionTxState,
@@ -25,7 +26,7 @@ use crate::plan::{
     TxPrepareTargetLookup, evaluate_prepare_phase, execute_commit_phase,
     execute_compensation_phase, mission_tx_rollback_commit_report,
 };
-use crate::runtime_async::CompatRuntime;
+use crate::runtime_async::{CompatRuntime, RwLock};
 use crate::tx_idempotency::{
     DurableKeyLeaseSet, IdempotencyError, IdempotencyKey, IdempotencyPolicy, IdempotencyStore,
     PendingReconciliation, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
@@ -35,6 +36,7 @@ use crate::tx_observability::{
     TxObservabilityPhase,
 };
 use crate::tx_plan_compiler::StepRisk;
+use crate::wezterm::PaneTextSource;
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -53,7 +55,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as StdMetadataExt;
@@ -2868,6 +2870,84 @@ struct TxPolicyStorage {
     freshness: Mutex<crate::policy_kill_switch_state::KillSwitchFreshness>,
 }
 
+impl TxPolicyStorage {
+    fn admit_step_action(
+        &self,
+        action: &StepAction,
+        cx: &crate::cx::Cx,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>, TxStepAdmissionError>
+    {
+        use crate::policy_kill_switch_state::{
+            KillSwitchStateError, acquire_kill_switch_fence, decode_kill_switch_state,
+            load_kill_switch_state_from_path_with_cx,
+        };
+
+        // Match the canonical async injector's admission budget and 2-50ms
+        // backoff. Only lock acquisition is retried, never an effect.
+        let started = std::time::Instant::now();
+        let mut delay = std::time::Duration::from_millis(2);
+        let fence = loop {
+            cx.checkpoint()
+                .map_err(|_| TxStepAdmissionError::Cancelled)?;
+            match acquire_kill_switch_fence(Path::new(&self.db_path)) {
+                Ok(fence) => break fence,
+                Err(KillSwitchStateError::FencePending) => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(TxStepAdmissionError::State(
+                            KillSwitchStateError::FencePending,
+                        ));
+                    }
+                    std::thread::sleep(delay.min(remaining));
+                    cx.checkpoint()
+                        .map_err(|_| TxStepAdmissionError::Cancelled)?;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(TxStepAdmissionError::State(error)),
+            }
+        };
+        let raw = {
+            let mut freshness = self.freshness.lock().map_err(|_| {
+                TxStepAdmissionError::State(KillSwitchStateError::LoadFailed(
+                    "transaction kill-switch freshness lock poisoned".to_string(),
+                ))
+            })?;
+            freshness
+                .bind(&fence)
+                .map_err(TxStepAdmissionError::State)?;
+            freshness
+                .validate(load_kill_switch_state_from_path_with_cx(cx, &self.db_path))
+                .map_err(TxStepAdmissionError::State)?
+        };
+        let mut switch = raw
+            .as_deref()
+            .map(decode_kill_switch_state)
+            .transpose()
+            .map_err(TxStepAdmissionError::State)?
+            .unwrap_or_else(crate::policy_quarantine::KillSwitch::disarmed);
+        switch.tick(u64::try_from(crate::storage::now_ms()).unwrap_or_default());
+        let read_only = matches!(action, StepAction::WaitFor { .. });
+        let workflow_launch = matches!(action, StepAction::RunWorkflow { .. });
+        if switch.is_emergency()
+            || (!switch.allows_inflight() && !read_only)
+            || (!switch.allows_new_workflows() && workflow_launch)
+        {
+            return Err(TxStepAdmissionError::Stopped(switch.level));
+        }
+        cx.checkpoint()
+            .map_err(|_| TxStepAdmissionError::Cancelled)?;
+        if read_only {
+            // Do not prevent a stop transition for a long observation. Every
+            // later observation and effect re-admits under its own fence.
+            drop(fence);
+            Ok(None)
+        } else {
+            Ok(Some(fence))
+        }
+    }
+}
+
 enum TxStepAdmissionError {
     Unbound,
     Cancelled,
@@ -2940,6 +3020,9 @@ pub struct PaneStepExecutor<P, A, T> {
     /// than the legacy pane-text-polling mock that aliased the signal key into
     /// the search pattern.
     external_signals: Option<std::sync::Arc<crate::workflows::ExternalSignalRegistry>>,
+    /// The workspace's configured, live pattern registry. Rule IDs are never
+    /// treated as pane-text literals or evaluated against unrelated defaults.
+    pattern_engine: Option<Arc<RwLock<PatternEngine>>>,
     /// Optional storage adapter for `StepAction::StoreData` (ft-2j3vo).
     /// Without one, StoreData returns an explicit unsupported error (`store_data_unwired`)
     /// and fails closed.
@@ -2974,6 +3057,7 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
             config: PaneStepExecutorConfig::default(),
             fleet_controller: None,
             external_signals: None,
+            pattern_engine: None,
             storage_adapter: None,
             policy_storage: None,
             #[cfg(test)]
@@ -2999,85 +3083,16 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         action: &StepAction,
     ) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>, TxStepAdmissionError>
     {
-        use crate::policy_kill_switch_state::{
-            KILL_SWITCH_FENCE_WAIT, KillSwitchStateError, acquire_kill_switch_fence,
-            decode_kill_switch_state, load_kill_switch_state_from_path_with_cx,
-        };
-
         let storage = self
             .policy_storage
             .as_ref()
             .ok_or(TxStepAdmissionError::Unbound)?;
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        // Match the canonical async injector's admission budget and 2-50ms
-        // backoff. This driver is synchronous; short sleeps remain bounded
-        // and checkpointed. Only lock acquisition is retried, never an effect.
-        // Brief ordinary sender contention must not permanently fail a tx.
-        let started = std::time::Instant::now();
-        let mut delay = std::time::Duration::from_millis(2);
-        let fence = loop {
-            cx.checkpoint()
-                .map_err(|_| TxStepAdmissionError::Cancelled)?;
-            match acquire_kill_switch_fence(Path::new(&storage.db_path)) {
-                Ok(fence) => break fence,
-                Err(KillSwitchStateError::FencePending) => {
-                    let remaining = KILL_SWITCH_FENCE_WAIT.saturating_sub(started.elapsed());
-                    if remaining.is_zero() {
-                        return Err(TxStepAdmissionError::State(
-                            KillSwitchStateError::FencePending,
-                        ));
-                    }
-                    std::thread::sleep(delay.min(remaining));
-                    cx.checkpoint()
-                        .map_err(|_| TxStepAdmissionError::Cancelled)?;
-                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
-                }
-                Err(error) => return Err(TxStepAdmissionError::State(error)),
-            }
-        };
-        let raw = {
-            let mut freshness = storage.freshness.lock().map_err(|_| {
-                TxStepAdmissionError::State(
-                    crate::policy_kill_switch_state::KillSwitchStateError::LoadFailed(
-                        "transaction kill-switch freshness lock poisoned".to_string(),
-                    ),
-                )
-            })?;
-            freshness
-                .bind(&fence)
-                .map_err(TxStepAdmissionError::State)?;
-            freshness
-                .validate(load_kill_switch_state_from_path_with_cx(
-                    &cx,
-                    &storage.db_path,
-                ))
-                .map_err(TxStepAdmissionError::State)?
-        };
-        let mut switch = raw
-            .as_deref()
-            .map(decode_kill_switch_state)
-            .transpose()
-            .map_err(TxStepAdmissionError::State)?
-            .unwrap_or_else(crate::policy_quarantine::KillSwitch::disarmed);
-        switch.tick(u64::try_from(crate::storage::now_ms()).unwrap_or_default());
-        let read_only = matches!(action, StepAction::WaitFor { .. });
-        let workflow_launch = matches!(action, StepAction::RunWorkflow { .. });
-        if switch.is_emergency()
-            || (!switch.allows_inflight() && !read_only)
-            || (!switch.allows_new_workflows() && workflow_launch)
-        {
-            return Err(TxStepAdmissionError::Stopped(switch.level));
-        }
-        cx.checkpoint()
-            .map_err(|_| TxStepAdmissionError::Cancelled)?;
-        if read_only {
-            // Do not prevent a stop transition for the lifetime of a long
-            // observation. The next effect re-admits under its own fence.
-            drop(fence);
-            Ok(None)
-        } else {
-            Ok(Some(fence))
-        }
+        storage.admit_step_action(
+            action,
+            &cx,
+            crate::policy_kill_switch_state::KILL_SWITCH_FENCE_WAIT,
+        )
     }
 
     fn execute_admitted_action(
@@ -3094,7 +3109,9 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
             action,
             timeout_ms,
             self.external_signals.as_deref(),
+            self.pattern_engine.as_ref(),
             self.storage_adapter.as_deref(),
+            self.policy_storage.as_ref(),
         )
     }
 
@@ -3128,12 +3145,46 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         self
     }
 
+    /// Attach the workspace's configured pattern registry for rule-ID waits.
+    /// Idle and stable-tail waits do not require a registry; pattern waits fail
+    /// explicitly when it is unavailable.
+    #[must_use]
+    pub fn with_pattern_engine(
+        mut self,
+        engine: impl Into<Option<Arc<RwLock<PatternEngine>>>>,
+    ) -> Self {
+        self.pattern_engine = engine.into();
+        self
+    }
+
     /// Attach a storage adapter for `StepAction::StoreData` (ft-2j3vo).
     #[must_use]
     pub fn with_storage_adapter(mut self, adapter: std::sync::Arc<dyn TxStorageAdapter>) -> Self {
         self.storage_adapter = Some(adapter);
         self
     }
+}
+
+/// Whether any declared commit or compensation action needs the configured
+/// pattern registry. Callers can skip loading packs for other contracts and
+/// for replays that will not dispatch any actions.
+#[must_use]
+pub fn tx_contract_requires_pattern_engine(contract: &MissionTxContract) -> bool {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| &step.action)
+        .chain(contract.plan.compensations.iter().map(|step| &step.action))
+        .any(|action| {
+            matches!(
+                action,
+                StepAction::WaitFor {
+                    condition: crate::plan::WaitCondition::Pattern { .. },
+                    ..
+                }
+            )
+        })
 }
 
 /// Extract the step-level timeout from a `StepAction`. Returns `None` for non-I/O actions.
@@ -3199,19 +3250,354 @@ fn send_failure_proves_no_effect(error: &crate::Error, pane_id: u64) -> bool {
     }
 }
 
+fn tx_wait_error(code: &str) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(code.to_string()))
+}
+
+fn tx_wait_failed(reason: &str, code: &str) -> (bool, String, Option<String>) {
+    (false, reason.to_string(), Some(code.to_string()))
+}
+
+/// The worker's Cx owns only wait timers. Pane reads retain the caller's exact
+/// context and effective capability mask, including restrictions applied on
+/// the driver thread. Installing both per poll also protects ambient helpers
+/// inside a backend without leaking that context to the timer future.
+struct TxWaitPaneSource<'a> {
+    source: crate::wezterm::WeztermHandleSource,
+    caller_cx: crate::cx::Cx,
+    caller_mask: asupersync::cx::CapMask,
+    action: &'a StepAction,
+    policy_storage: Option<&'a TxPolicyStorage>,
+    deadline: std::time::Instant,
+    admission_failure: Mutex<Option<(bool, String, Option<String>)>>,
+}
+
+impl TxWaitPaneSource<'_> {
+    fn read_text(
+        &self,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> crate::wezterm::WeztermFuture<'_, String> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        Box::pin(async move {
+            let observation = async {
+                if !self.caller_cx.capabilities().effective.io {
+                    return Err(tx_wait_error("FTX_WAIT_IO_CAPABILITY_DENIED"));
+                }
+                if let Some(storage) = self.policy_storage {
+                    let remaining = self
+                        .deadline
+                        .saturating_duration_since(std::time::Instant::now());
+                    if let Err(error) = storage.admit_step_action(
+                        self.action,
+                        &self.caller_cx,
+                        remaining.min(crate::policy_kill_switch_state::KILL_SWITCH_FENCE_WAIT),
+                    ) {
+                        *self
+                            .admission_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(error.into_outcome().into_input());
+                        return Err(tx_wait_error("FTX_WAIT_ADMISSION_FAILED"));
+                    }
+                }
+                // Admission can synchronously wait for a competing sender's
+                // fence. Do not start a native read after it consumes the
+                // remaining observation budget.
+                if std::time::Instant::now() >= self.deadline {
+                    *self
+                        .admission_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(tx_wait_failed("wait_for_timeout", "FTX_WAIT_TIMEOUT"));
+                    return Err(tx_wait_error("FTX_WAIT_TIMEOUT"));
+                }
+                match tail {
+                    Some(lines) => {
+                        self.source
+                            .get_text_tail_with_cx(&self.caller_cx, pane_id, escapes, lines)
+                            .await
+                    }
+                    None => {
+                        self.source
+                            .get_text_with_cx(&self.caller_cx, pane_id, escapes)
+                            .await
+                    }
+                }
+            };
+            let mut observation = std::pin::pin!(observation);
+            std::future::poll_fn(|task_cx| {
+                let _context = crate::cx::Cx::set_current(Some(self.caller_cx.clone()));
+                let _capabilities = crate::cx::Cx::push_restriction(self.caller_mask);
+                if self.caller_cx.checkpoint().is_err() {
+                    return Poll::Ready(Err(tx_wait_error("FTX_WAIT_CANCELLED")));
+                }
+                let result = observation.as_mut().poll(task_cx);
+                if self.caller_cx.checkpoint().is_err() {
+                    return Poll::Ready(Err(tx_wait_error("FTX_WAIT_CANCELLED")));
+                }
+                result
+            })
+            .await
+        })
+    }
+}
+
+impl PaneTextSource for TxWaitPaneSource<'_> {
+    type Fut<'a>
+        = crate::wezterm::WeztermFuture<'a, String>
+    where
+        Self: 'a;
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
+        self.read_text(pane_id, escapes, None)
+    }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        _clock_cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail_lines: usize,
+    ) -> crate::wezterm::WeztermFuture<'a, String>
+    where
+        Self: 'a + Sync,
+    {
+        self.read_text(pane_id, escapes, Some(tail_lines))
+    }
+}
+
+/// Observe the original caller's changing budget even when its current-thread
+/// runtime is parked in this synchronous transaction driver. The independent
+/// worker clock wakes this watchdog; it never authorizes a pane operation.
+async fn tx_wait_caller_watchdog(
+    caller_cx: &crate::cx::Cx,
+    caller_mask: asupersync::cx::CapMask,
+    clock_cx: &crate::cx::Cx,
+) -> crate::Result<crate::workflows::WaitConditionResult> {
+    loop {
+        {
+            let _context = crate::cx::Cx::set_current(Some(caller_cx.clone()));
+            let _capabilities = crate::cx::Cx::push_restriction(caller_mask);
+            if caller_cx.checkpoint().is_err() {
+                return Err(tx_wait_error("FTX_WAIT_CANCELLED"));
+            }
+        }
+        crate::runtime_async::sleep_with_cx(clock_cx, std::time::Duration::from_millis(50))
+            .await
+            .map_err(|_| tx_wait_error("FTX_WAIT_TIMER_FAILED"))?;
+    }
+}
+
+fn execute_pane_wait(
+    handle: &crate::wezterm::WeztermHandle,
+    action: &StepAction,
+    outer_pane_id: Option<u64>,
+    condition: &crate::plan::WaitCondition,
+    timeout: std::time::Duration,
+    pattern_engine: Option<&Arc<RwLock<PatternEngine>>>,
+    policy_storage: Option<&TxPolicyStorage>,
+) -> (bool, String, Option<String>) {
+    use crate::workflows::{
+        WaitCondition as WorkflowWait, WaitConditionExecutor, WaitConditionResult,
+    };
+    use std::future::Future;
+    use std::task::Poll;
+
+    let inner_pane_id = match condition {
+        crate::plan::WaitCondition::Pattern { pane_id, .. }
+        | crate::plan::WaitCondition::PaneIdle { pane_id, .. }
+        | crate::plan::WaitCondition::StableTail { pane_id, .. } => *pane_id,
+        crate::plan::WaitCondition::External { .. } => {
+            unreachable!("external wait is evaluated by its registry")
+        }
+    };
+    if outer_pane_id
+        .zip(inner_pane_id)
+        .is_some_and(|(outer, inner)| outer != inner)
+    {
+        return tx_wait_failed("wait_for_conflicting_panes", "FTX_WAIT_CONFLICTING_PANES");
+    }
+    let Some(pane_id) = outer_pane_id.or(inner_pane_id) else {
+        return tx_wait_failed("wait_for_no_pane", "FTX_WAIT_NO_PANE");
+    };
+    let (condition, satisfied) = match condition {
+        crate::plan::WaitCondition::Pattern { rule_id, .. } => {
+            if pattern_engine.is_none() {
+                return tx_wait_failed(
+                    "wait_for_pattern_registry_unwired",
+                    "FTX_WAIT_PATTERN_REGISTRY_UNWIRED",
+                );
+            }
+            (
+                WorkflowWait::Pattern {
+                    pane_id: Some(pane_id),
+                    rule_id: rule_id.clone(),
+                },
+                "wait_for_pattern_satisfied",
+            )
+        }
+        crate::plan::WaitCondition::PaneIdle {
+            idle_threshold_ms, ..
+        } => (
+            WorkflowWait::PaneIdle {
+                pane_id: Some(pane_id),
+                idle_threshold_ms: *idle_threshold_ms,
+            },
+            "wait_for_pane_idle_satisfied",
+        ),
+        crate::plan::WaitCondition::StableTail { stable_for_ms, .. } => (
+            WorkflowWait::StableTail {
+                pane_id: Some(pane_id),
+                stable_for_ms: *stable_for_ms,
+            },
+            "wait_for_stable_tail_satisfied",
+        ),
+        crate::plan::WaitCondition::External { .. } => unreachable!("external wait handled above"),
+    };
+    let caller_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    let caller_mask = crate::cx::effective_cap_mask(&caller_cx);
+    if caller_cx.checkpoint().is_err() {
+        return tx_wait_failed("wait_for_cancelled", "FTX_WAIT_CANCELLED");
+    }
+    if !caller_cx.capabilities().effective.time {
+        return tx_wait_failed("wait_for_capability_denied", "FTX_WAIT_TIME_CAPABILITY_DENIED");
+    }
+    let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+        return tx_wait_failed("wait_for_timeout_overflow", "FTX_WAIT_TIMEOUT_OVERFLOW");
+    };
+    if u64::try_from(timeout.as_nanos()).is_err() {
+        return tx_wait_failed("wait_for_timeout_overflow", "FTX_WAIT_TIMEOUT_OVERFLOW");
+    }
+    let source = TxWaitPaneSource {
+        source: crate::wezterm::WeztermHandleSource::new(handle.clone()),
+        caller_cx,
+        caller_mask,
+        action,
+        policy_storage,
+        deadline,
+        admission_failure: Mutex::new(None),
+    };
+    let result = std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("ft-tx-wait-step".to_string())
+            .spawn_scoped(scope, move || {
+                frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                    std::panic::AssertUnwindSafe(move || {
+                        let rt = match crate::runtime_async::RuntimeBuilder::current_thread()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(_) => {
+                                return tx_wait_failed(
+                                    "wait_for_runtime_failed",
+                                    "FTX_WAIT_RUNTIME_FAILED",
+                                );
+                            }
+                        };
+                        rt.block_on(async {
+                            // This context is only a clock owner. Reads below
+                            // are explicitly bound to source.caller_cx.
+                            let clock_cx = crate::cx::Cx::current()
+                                .unwrap_or_else(crate::cx::for_request);
+                            let executor = match pattern_engine {
+                                Some(engine) => WaitConditionExecutor::new_shared(&source, engine),
+                                None => WaitConditionExecutor::new_without_patterns(&source),
+                            };
+                            let remaining = deadline
+                                .saturating_duration_since(std::time::Instant::now());
+                            let wait = executor.execute_with_cx(
+                                &clock_cx, &condition, pane_id, remaining,
+                            );
+                            let watchdog = tx_wait_caller_watchdog(
+                                &source.caller_cx, caller_mask, &clock_cx,
+                            );
+                            let mut wait = std::pin::pin!(wait);
+                            let mut watchdog = std::pin::pin!(watchdog);
+                            let result = crate::runtime_async::until_cancelled(
+                                &source.caller_cx,
+                                std::future::poll_fn(|task_cx| {
+                                    if let Poll::Ready(error) = watchdog.as_mut().poll(task_cx) {
+                                        return Poll::Ready(error);
+                                    }
+                                    wait.as_mut().poll(task_cx)
+                                }),
+                            )
+                            .await;
+                            let _caller =
+                                crate::cx::Cx::set_current(Some(source.caller_cx.clone()));
+                            let _capabilities = crate::cx::Cx::push_restriction(caller_mask);
+                            if source.caller_cx.checkpoint().is_err() || result.is_err() {
+                                return tx_wait_failed("wait_for_cancelled", "FTX_WAIT_CANCELLED");
+                            }
+                            if let Some(failure) = source
+                                .admission_failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                return failure;
+                            }
+                            // Receipts contain finite codes, never observed
+                            // pane contents or backend error payloads.
+                            match result {
+                                Ok(Ok(WaitConditionResult::Satisfied { .. }))
+                                    if std::time::Instant::now() >= deadline =>
+                                {
+                                    tx_wait_failed("wait_for_timeout", "FTX_WAIT_TIMEOUT")
+                                }
+                                Ok(Ok(WaitConditionResult::Satisfied { .. })) => {
+                                    (true, satisfied.to_string(), None)
+                                }
+                                Ok(Ok(WaitConditionResult::TimedOut { .. })) => {
+                                    tx_wait_failed("wait_for_timeout", "FTX_WAIT_TIMEOUT")
+                                }
+                                Ok(Ok(WaitConditionResult::Unsupported { .. })) => {
+                                    tx_wait_failed("wait_for_unsupported", "FTX_WAIT_UNSUPPORTED")
+                                }
+                                Ok(Err(_)) => tx_wait_failed(
+                                    "wait_for_observation_failed",
+                                    "FTX_WAIT_OBSERVATION_FAILED",
+                                ),
+                                Err(_) => unreachable!("caller termination handled above"),
+                            }
+                        })
+                    }),
+                )
+            });
+        match worker {
+            Ok(worker) => match worker.join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            Err(_) => Ok(tx_wait_failed(
+                "wait_for_thread_spawn_failed",
+                "FTX_WAIT_THREAD_SPAWN_FAILED",
+            )),
+        }
+    });
+    result.unwrap_or_else(|_| tx_wait_failed("wait_for_thread_panic", "FTX_WAIT_PANIC"))
+}
+
 /// Execute a single step action against the real backend (blocking).
 ///
 /// Spawns a one-shot runtime for sends; the backend owns its send deadline.
-/// External waits use their bounded poll loop. The input contains
+/// Pane waits use the canonical executor on an independently driven clock;
+/// external waits use their bounded poll loop. The input contains
 /// `(success, reason_code, error_code)`; its disposition preserves effect certainty.
 fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
     timeout_ms: Option<u64>,
     external_signals: Option<&crate::workflows::ExternalSignalRegistry>,
+    pattern_engine: Option<&Arc<RwLock<PatternEngine>>>,
     storage_adapter: Option<&(dyn TxStorageAdapter + 'static)>,
+    policy_storage: Option<&TxPolicyStorage>,
 ) -> StepDispatchOutcome<(bool, String, Option<String>)> {
-    let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
 
     // ft-506i5: capture the parent tx `Cx` on THIS (driver) thread, before any
@@ -3318,9 +3704,10 @@ fn execute_step_action(
         crate::plan::StepAction::WaitFor {
             pane_id,
             condition,
-            timeout_ms,
+            timeout_ms: wait_timeout_ms,
         } => {
-            let timeout_val = *timeout_ms;
+            let timeout_val =
+                timeout_ms.map_or(*wait_timeout_ms, |limit| limit.min(*wait_timeout_ms));
             let timeout = std::time::Duration::from_millis(timeout_val);
 
             // ft-wgc1q: route External waits through the registry instead of
@@ -3388,36 +3775,9 @@ fn execute_step_action(
                 }
             }
 
-            let _ = pane_id;
-            match condition {
-                crate::plan::WaitCondition::Pattern { .. } => (
-                    false,
-                    "wait_for_pattern_registry_unwired".to_string(),
-                    Some(
-                        "FTX_WAIT_PATTERN_REGISTRY_UNWIRED: Pattern carries a rule_id and cannot be evaluated as a literal substring; wire the transaction executor to the pattern registry before enabling this action"
-                            .to_string(),
-                    ),
-                ),
-                crate::plan::WaitCondition::PaneIdle { .. } => (
-                    false,
-                    "wait_for_pane_idle_unwired".to_string(),
-                    Some(
-                        "FTX_WAIT_PANE_IDLE_UNWIRED: PaneIdle requires a real pane-activity provider"
-                            .to_string(),
-                    ),
-                ),
-                crate::plan::WaitCondition::StableTail { .. } => (
-                    false,
-                    "wait_for_stable_tail_unwired".to_string(),
-                    Some(
-                        "FTX_WAIT_STABLE_TAIL_UNWIRED: StableTail requires a real tail-stability provider"
-                            .to_string(),
-                    ),
-                ),
-                crate::plan::WaitCondition::External { .. } => {
-                    unreachable!("external wait returns from its registry loop")
-                }
-            }
+            execute_pane_wait(
+                handle, action, *pane_id, condition, timeout, pattern_engine, policy_storage,
+            )
         }
         crate::plan::StepAction::StoreData { key, value } => {
             let Some(storage) = storage_adapter else {
@@ -13870,55 +14230,343 @@ mod tests {
     }
 
     #[test]
-    fn pane_executor_wait_for_pane_idle_fails_closed_until_provider_is_wired() {
-        let executor = make_pane_executor(mock_wezterm_handle());
-        let contract = make_pane_contract(vec![(
-            "w1".to_string(),
-            StepAction::WaitFor {
-                pane_id: Some(0),
-                condition: WaitCondition::PaneIdle {
-                    pane_id: None,
-                    idle_threshold_ms: 500,
-                },
-                timeout_ms: 1_000,
+    fn pane_executor_idle_wait_observes_a_prompt_for_the_full_threshold() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(7).await;
+            mock.inject_output(7, "working on a request").await.unwrap();
+        });
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
+        let action = |timeout_ms| StepAction::WaitFor {
+            pane_id: None,
+            condition: WaitCondition::PaneIdle {
+                pane_id: Some(7),
+                idle_threshold_ms: 20,
             },
-        )]);
-        let results = executor.execute_steps(&contract, None, 5000);
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].success);
-        assert_eq!(results[0].reason_code, "wait_for_pane_idle_unwired");
-        assert!(
-            results[0]
-                .error_code
-                .as_deref()
-                .is_some_and(|error| error.contains("FTX_WAIT_PANE_IDLE_UNWIRED"))
-        );
+            timeout_ms,
+        };
+        let busy = executor
+            .execute_admitted_action(&action(80), None)
+            .into_input();
+        assert_eq!(busy.1, "wait_for_timeout");
+        rt.block_on(async { mock.inject_output(7, "\nuser@host:~$ ").await.unwrap() });
+        let started = std::time::Instant::now();
+        // The caller's current-thread runtime is parked inside this sync call.
+        let idle = rt.block_on(async {
+            executor
+                .execute_admitted_action(&action(1_000), None)
+                .into_input()
+        });
+        assert!(idle.0, "{idle:?}");
+        assert_eq!(idle.1, "wait_for_pane_idle_satisfied");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
     }
 
     #[test]
-    fn pane_executor_wait_for_stable_tail_fails_closed_until_provider_is_wired() {
-        let executor = make_pane_executor(mock_wezterm_handle());
-        let contract = make_pane_contract(vec![(
-            "w1".to_string(),
-            StepAction::WaitFor {
+    fn pane_executor_stable_tail_wait_observes_the_full_window() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "unchanged output").await.unwrap();
+        });
+        let executor = make_pane_executor(mock as WeztermHandle);
+        let action = StepAction::WaitFor {
+            pane_id: Some(0),
+            condition: WaitCondition::StableTail {
                 pane_id: Some(0),
+                stable_for_ms: 30,
+            },
+            timeout_ms: 1_000,
+        };
+        let started = std::time::Instant::now();
+        let stable = executor.execute_admitted_action(&action, None).into_input();
+        assert!(stable.0, "{stable:?}");
+        assert_eq!(stable.1, "wait_for_stable_tail_satisfied");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+        // The effective remaining step budget takes precedence over the
+        // action's larger timeout and may not manufacture a stable tail.
+        let short = executor
+            .execute_admitted_action(&action, Some(10))
+            .into_input();
+        assert!(!short.0);
+        assert_eq!(short.1, "wait_for_timeout");
+    }
+
+    fn tx_wait_test_patterns() -> Arc<RwLock<PatternEngine>> {
+        use crate::patterns::{AgentType, PatternPack, RuleDef, Severity};
+        let rule = RuleDef {
+            id: "codex.tx_ready".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.ready".to_string(),
+            severity: Severity::Info,
+            anchors: vec!["TX_READY".to_string()],
+            regex: None,
+            description: "Transaction test readiness".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
+            zone: None,
+        };
+        Arc::new(RwLock::new(
+            PatternEngine::with_packs(vec![PatternPack::new("tx-test", "1.0.0", vec![rule])])
+                .expect("configured test pattern pack"),
+        ))
+    }
+
+    #[test]
+    fn pane_executor_pattern_wait_commits_send_wait_send_and_replays_without_effects() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async { mock.add_default_pane(7).await });
+        let executor = make_pane_executor(mock.clone() as WeztermHandle)
+            .with_pattern_engine(tx_wait_test_patterns());
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut contract = make_pane_contract(vec![
+            (
+                "send".to_string(),
+                StepAction::SendText {
+                    pane_id: 7,
+                    text: "TX_READY".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "wait".to_string(),
+                StepAction::WaitFor {
+                    pane_id: Some(7),
+                    condition: WaitCondition::Pattern {
+                        pane_id: None,
+                        rule_id: "codex.tx_ready".to_string(),
+                    },
+                    timeout_ms: 1_000,
+                },
+            ),
+            (
+                "continue".to_string(),
+                StepAction::SendText {
+                    pane_id: 7,
+                    text: "AFTER".to_string(),
+                    paste_mode: None,
+                },
+            ),
+        ]);
+        let mut replay = contract.clone();
+        let (_directory, mut store) = durable_store();
+        let result = engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        assert_eq!(result.final_state, MissionTxState::Committed);
+        assert_eq!(result.commit_report.unwrap().committed_count, 3);
+        let replay_result = engine
+            .execute_with_store(&mut replay, &mut store, 6_000)
+            .unwrap();
+        assert_eq!(replay_result.final_state, MissionTxState::Committed);
+        rt.block_on(async {
+            assert_eq!(mock.pane_state(7).await.unwrap().content, "TX_READYAFTER");
+        });
+        assert!(tx_contract_requires_pattern_engine(&contract));
+        contract.plan.steps.clear();
+        assert!(!tx_contract_requires_pattern_engine(&contract));
+        contract.plan.compensations.push(crate::plan::TxCompensation {
+            for_step_id: TxStepId("send".to_string()),
+            action: replay.plan.steps[1].action.clone(),
+        });
+        assert!(tx_contract_requires_pattern_engine(&contract));
+    }
+
+    #[test]
+    fn pane_executor_wait_refuses_missing_conflicting_and_nonexistent_targets() {
+        let executor = make_pane_executor(mock_wezterm_handle());
+        for (outer, inner, reason) in [
+            (None, None, "wait_for_no_pane"),
+            (Some(7), Some(8), "wait_for_conflicting_panes"),
+            (Some(999), None, "wait_for_observation_failed"),
+        ] {
+            let action = StepAction::WaitFor {
+                pane_id: outer,
                 condition: WaitCondition::StableTail {
-                    pane_id: None,
-                    stable_for_ms: 500,
+                    pane_id: inner,
+                    stable_for_ms: 0,
                 },
                 timeout_ms: 1_000,
+            };
+            let result = executor.execute_admitted_action(&action, None);
+            assert!(matches!(&result, StepDispatchOutcome::Settled(_)));
+            assert!(!result.input().0);
+            assert_eq!(result.input().1, reason);
+        }
+    }
+
+    fn tx_probe_wait(timeout_ms: u64, stable_for_ms: u64) -> StepAction {
+        StepAction::WaitFor {
+            pane_id: Some(7),
+            condition: WaitCondition::StableTail {
+                pane_id: None,
+                stable_for_ms,
             },
-        )]);
-        let results = executor.execute_steps(&contract, None, 5000);
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].success);
-        assert_eq!(results[0].reason_code, "wait_for_stable_tail_unwired");
-        assert!(
-            results[0]
-                .error_code
-                .as_deref()
-                .is_some_and(|error| error.contains("FTX_WAIT_STABLE_TAIL_UNWIRED"))
+            timeout_ms,
+        }
+    }
+
+    #[test]
+    fn pane_wait_parked_caller_times_out_and_drops_read_with_original_authority() {
+        use crate::cx::{CapSet, CapSetRuntimeMask};
+        let probe = TxWaitReadProbe::new(TxWaitReadMode::Pending);
+        let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        rt.block_on(async {
+            let caller = crate::cx::Cx::current().unwrap();
+            let expected_task = format!("{:?}", caller.task_id());
+            let _restriction = crate::cx::Cx::push_restriction(
+                <CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK,
+            );
+            let result = executor.execute_admitted_action(&tx_probe_wait(150, 0), None);
+            assert!(matches!(&result, StepDispatchOutcome::Settled(_)));
+            assert_eq!(result.input().1, "wait_for_timeout");
+            assert_eq!(*probe.task_id.lock().unwrap(), Some(expected_task));
+            assert_eq!(
+                *probe.capabilities.lock().unwrap(),
+                Some([true, true, false, true, true])
+            );
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(*probe.tails.lock().unwrap(), vec![Some(200)]);
+    }
+
+    #[test]
+    fn pane_wait_cancellation_and_parent_deadline_drop_pending_reads() {
+        for deadline_bound in [false, true] {
+            let probe = TxWaitReadProbe::new(TxWaitReadMode::Pending);
+            let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
+            let rt = crate::cx::CxRuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let seed = rt.request_cx_with_budget(crate::cx::Budget::INFINITE);
+            let caller = if deadline_bound {
+                rt.request_cx_with_budget(crate::cx::Budget::new().with_deadline(
+                    crate::runtime_async::timer_now_with_cx(&seed)
+                        + std::time::Duration::from_millis(150),
+                ))
+            } else {
+                seed
+            };
+            let cancel = if deadline_bound {
+                None
+            } else {
+                let cancel_cx = caller.clone();
+                let observed = probe.clone();
+                Some(std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    while observed.calls.load(Ordering::SeqCst) == 0
+                        && started.elapsed() < std::time::Duration::from_secs(2)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    cancel_cx.cancel_with(crate::outcome::CancelKind::User, Some("cancel wait"));
+                }))
+            };
+            let started = std::time::Instant::now();
+            let result = rt.block_on(async {
+                let _caller = crate::cx::Cx::set_current(Some(caller.clone()));
+                executor
+                    .execute_admitted_action(&tx_probe_wait(60_000, 0), None)
+                    .into_input()
+            });
+            if let Some(cancel) = cancel {
+                cancel.join().unwrap();
+            }
+            assert!(!result.0);
+            assert_eq!(result.1, "wait_for_cancelled", "deadline={deadline_bound}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn pane_wait_changed_tail_and_source_refusal_never_satisfy() {
+        for (mode, reason) in [
+            (TxWaitReadMode::Changing, "wait_for_timeout"),
+            (TxWaitReadMode::Refused, "wait_for_observation_failed"),
+        ] {
+            let probe = TxWaitReadProbe::new(mode);
+            let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
+            let result = executor.execute_admitted_action(&tx_probe_wait(200, 20), None);
+            assert!(!result.input().0);
+            assert_eq!(result.input().1, reason);
+            assert!(
+                !result.input().2.as_deref().unwrap().contains("PRIVATE_PANE_CONTENT")
+            );
+            assert_eq!(
+                probe.dropped.load(Ordering::SeqCst),
+                probe.calls.load(Ordering::SeqCst)
+            );
+            if matches!(mode, TxWaitReadMode::Changing) {
+                assert!(probe.calls.load(Ordering::SeqCst) >= 2);
+            }
+        }
+        let probe = TxWaitReadProbe::new(TxWaitReadMode::Text("codex.tx_ready"));
+        let executor = make_pane_executor(FileEffectBackend::wait_handle(probe))
+            .with_pattern_engine(tx_wait_test_patterns());
+        let result = executor.execute_admitted_action(
+            &StepAction::WaitFor {
+                pane_id: Some(7),
+                condition: WaitCondition::Pattern {
+                    pane_id: None,
+                    rule_id: "codex.tx_ready".to_string(),
+                },
+                timeout_ms: 80,
+            },
+            None,
         );
+        assert!(
+            !result.input().0,
+            "rule IDs must not be used as literal matchers"
+        );
+        assert_eq!(result.input().1, "wait_for_timeout");
+    }
+
+    #[test]
+    fn pane_wait_releases_stop_fence_and_refuses_next_read_after_emergency() {
+        let probe = TxWaitReadProbe::new(TxWaitReadMode::Text("still running"));
+        let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
+        let result = std::thread::scope(|scope| {
+            let stop = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                while probe.calls.load(Ordering::SeqCst) == 0
+                    && started.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                trip_pane_executor_switch(
+                    &executor,
+                    crate::policy_quarantine::KillSwitchLevel::EmergencyHalt,
+                )
+            });
+            let result = executor.execute_admitted_action(&tx_probe_wait(5_000, 4_000), None);
+            stop.join()
+                .unwrap()
+                .expect("wait must not hold the effect fence");
+            result
+        });
+        assert!(!result.input().0);
+        assert_eq!(result.input().1, "tx_kill_switch_active");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -14344,7 +14992,8 @@ mod tests {
         ];
 
         for (action, expected_reason, expected_error) in cases {
-            let result = execute_step_action(&mock, &action, None, None, None).into_input();
+            let result = execute_step_action(&mock, &action, None, None, None, None, None)
+                .into_input();
             assert!(!result.0, "{expected_reason} must fail closed");
             assert_eq!(result.1, expected_reason);
             assert!(
@@ -14363,9 +15012,8 @@ mod tests {
     fn pane_executor_external_wait_timeout_skips_remaining() {
         let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
 
-        // Keep this as a real timeout-path test: External is the one WaitFor
-        // condition with a wired provider. Pattern, PaneIdle, and StableTail
-        // now fail closed immediately until their respective providers exist.
+        // Keep this focused on the external registry's timeout and the
+        // transaction failure boundary after an unsatisfied wait.
         let config = PaneStepExecutorConfig {
             default_send_timeout_ms: 30_000,
             phase_timeout_buffer_ms: 0,
@@ -14801,6 +15449,71 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum TxWaitReadMode {
+        Pending,
+        Changing,
+        Text(&'static str),
+        Refused,
+    }
+
+    struct TxWaitReadProbe {
+        mode: TxWaitReadMode,
+        calls: AtomicU64,
+        dropped: AtomicU64,
+        task_id: Mutex<Option<String>>,
+        capabilities: Mutex<Option<[bool; 5]>>,
+        tails: Mutex<Vec<Option<usize>>>,
+    }
+
+    impl TxWaitReadProbe {
+        fn new(mode: TxWaitReadMode) -> Arc<Self> {
+            Arc::new(Self {
+                mode,
+                calls: AtomicU64::new(0),
+                dropped: AtomicU64::new(0),
+                task_id: Mutex::new(None),
+                capabilities: Mutex::new(None),
+                tails: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn read<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            tail: Option<usize>,
+        ) -> WeztermFuture<'a, crate::wezterm::MuxPaneText> {
+            struct ReadDrop<'a>(&'a AtomicU64);
+            impl Drop for ReadDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Box::pin(async move {
+                let _drop = ReadDrop(&self.dropped);
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.task_id.lock().unwrap() = Some(format!("{:?}", cx.task_id()));
+                *self.capabilities.lock().unwrap() =
+                    Some(crate::cx::effective_capability_bits(cx));
+                self.tails.lock().unwrap().push(tail);
+                let text = match self.mode {
+                    TxWaitReadMode::Pending => return std::future::pending().await,
+                    TxWaitReadMode::Changing => format!("frame {call}"),
+                    TxWaitReadMode::Text(text) => text.to_string(),
+                    TxWaitReadMode::Refused => {
+                        return Err(tx_wait_error("PRIVATE_PANE_CONTENT_BACKEND_ERROR"));
+                    }
+                };
+                Ok(crate::wezterm::MuxPaneText {
+                    original_lines: text.lines().count(),
+                    original_bytes: Some(text.len()),
+                    text,
+                    truncated: false,
+                })
+            })
+        }
+    }
+
     /// The send path commits an observable file effect before injecting reply
     /// loss. Other mux methods delegate to the existing mock. These tests use
     /// the real pane executor and durable spool, not a synthetic step result.
@@ -14810,6 +15523,7 @@ mod tests {
         fault_text: &'static str,
         fault: FileEffectFault,
         panic_audit: Arc<FileEffectPanicAudit>,
+        wait_probe: Option<Arc<TxWaitReadProbe>>,
     }
 
     impl FileEffectBackend {
@@ -14829,6 +15543,18 @@ mod tests {
                 fault_text,
                 fault,
                 panic_audit,
+                wait_probe: None,
+            })
+        }
+
+        fn wait_handle(probe: Arc<TxWaitReadProbe>) -> WeztermHandle {
+            Arc::new(Self {
+                fallback: mock_wezterm_handle(),
+                effect_path: PathBuf::new(),
+                fault_text: "unused",
+                fault: FileEffectFault::None,
+                panic_audit: Arc::default(),
+                wait_probe: Some(probe),
             })
         }
 
@@ -14891,6 +15617,19 @@ mod tests {
 
         fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
             self.fallback.get_text(pane_id, escapes)
+        }
+
+        fn get_text_tail_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+            escapes: bool,
+            tail: Option<usize>,
+        ) -> WeztermFuture<'a, crate::wezterm::MuxPaneText> {
+            match &self.wait_probe {
+                Some(probe) => probe.read(cx, tail),
+                None => self.fallback.get_text_tail_with_cx(cx, pane_id, escapes, tail),
+            }
         }
 
         fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
@@ -16912,6 +17651,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         let result = result.into_input();
         assert!(!result.0, "external wait must fail without a registry");
@@ -16940,6 +17681,8 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
+            None,
             None,
         );
         let elapsed = start.elapsed();
@@ -16974,6 +17717,8 @@ mod tests {
             None,
             Some(registry.as_ref()),
             None,
+            None,
+            None,
         );
         let elapsed = start.elapsed();
         let result = result.into_input();
@@ -17004,6 +17749,8 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
+            None,
             None,
         );
         let elapsed = start.elapsed();
@@ -17045,6 +17792,8 @@ mod tests {
             },
             None,
             Some(registry.as_ref()),
+            None,
+            None,
             None,
         );
         let result = result.into_input();

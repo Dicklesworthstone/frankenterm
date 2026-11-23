@@ -59014,6 +59014,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                                         &config,
                                         &layout,
+                                        &contract,
+                                        resolved_config_path.as_deref(),
                                         tx_run_probes_terminal_backend(
                                             &contract,
                                             kill_switch,
@@ -59037,8 +59039,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         fail_step = fail_step.as_deref().unwrap_or(""),
                                         "robot tx run starting"
                                     );
-                                    let data = if let Some((storage, wezterm, tx_storage)) =
-                                        real_runtime
+                                    let data = if let Some(RealTxRuntime {
+                                        storage,
+                                        wezterm,
+                                        tx_storage,
+                                        pattern_engine,
+                                    }) = real_runtime
                                     {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
@@ -59088,6 +59094,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 prepare_context,
                                             )
                                             .with_policy_storage(&storage)
+                                            .with_pattern_engine(pattern_engine)
                                             .with_storage_adapter(tx_storage);
                                         execute_tx_run_with_executor(
                                             executor,
@@ -59266,6 +59273,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                                         &config,
                                         &layout,
+                                        &contract,
+                                        resolved_config_path.as_deref(),
                                         tx_rollback_requires_terminal_backend(
                                             &contract,
                                             commit_report.as_ref(),
@@ -59286,8 +59295,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                                         "robot tx rollback starting"
                                     );
-                                    let data = if let Some((storage, wezterm, tx_storage)) =
-                                        real_runtime
+                                    let data = if let Some(RealTxRuntime {
+                                        storage,
+                                        wezterm,
+                                        tx_storage,
+                                        pattern_engine,
+                                    }) = real_runtime
                                     {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
@@ -59337,6 +59350,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 prepare_context,
                                             )
                                             .with_policy_storage(&storage)
+                                            .with_pattern_engine(pattern_engine)
                                             .with_storage_adapter(tx_storage);
                                         execute_tx_rollback_with_executor(
                                             executor,
@@ -64460,7 +64474,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         Some(Commands::Tx { command }) => {
-            handle_tx_command(command, &layout, &config).await?;
+            handle_tx_command(command, &layout, &config, resolved_config_path.as_deref()).await?;
         }
 
         Some(Commands::Status {
@@ -66224,6 +66238,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                     &config,
                     &layout,
+                    &contract,
+                    resolved_config_path.as_deref(),
                     tx_run_probes_terminal_backend(&contract, kill_switch, paused),
                 )
                 .await;
@@ -66232,7 +66248,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 } else {
                     "synthetic_fallback"
                 };
-                let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
+                let data = if let Some(RealTxRuntime {
+                    storage,
+                    wezterm,
+                    tx_storage,
+                    pattern_engine,
+                }) = real_runtime
+                {
                     let policy_engine = std::cell::RefCell::new(
                         with_persisted_kill_switch(
                             frankenterm_core::policy::PolicyEngine::from_safety_config(
@@ -66273,6 +66295,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         prepare_context,
                     )
                     .with_policy_storage(&storage)
+                    .with_pattern_engine(pattern_engine)
                     .with_storage_adapter(tx_storage);
                     execute_tx_run_with_executor(
                         SteeringReceiptRevalidatingExecutor::new(
@@ -79550,12 +79573,14 @@ enum TxRuntimeUnavailable {
     Storage(String),
     /// The terminal backend did not answer a pane listing.
     Terminal(String),
+    /// A pattern registry required by the transaction could not be loaded.
+    Patterns(String),
 }
 
 impl TxRuntimeUnavailable {
     fn reason(&self) -> &str {
         match self {
-            Self::Storage(reason) | Self::Terminal(reason) => reason,
+            Self::Storage(reason) | Self::Terminal(reason) | Self::Patterns(reason) => reason,
         }
     }
 
@@ -79563,6 +79588,7 @@ impl TxRuntimeUnavailable {
         match self {
             Self::Storage(_) => "mission.tx.storage_unavailable",
             Self::Terminal(_) => "mission.tx.terminal_unavailable",
+            Self::Patterns(_) => "mission.tx.patterns_unavailable",
         }
     }
 
@@ -79570,22 +79596,53 @@ impl TxRuntimeUnavailable {
         match self {
             Self::Storage(_) => "robot.tx_storage_unavailable",
             Self::Terminal(_) => "robot.tx_terminal_unavailable",
+            Self::Patterns(_) => "robot.tx_patterns_unavailable",
         }
     }
+}
+
+struct RealTxRuntime {
+    storage: frankenterm_core::storage::StorageHandle,
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    tx_storage: std::sync::Arc<dyn frankenterm_core::tx_execution::TxStorageAdapter>,
+    pattern_engine: Option<
+        std::sync::Arc<
+            frankenterm_core::runtime_async::RwLock<frankenterm_core::patterns::PatternEngine>,
+        >,
+    >,
 }
 
 async fn resolve_real_tx_runtime(
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
+    contract: &frankenterm_core::plan::MissionTxContract,
+    config_path: Option<&Path>,
     require_terminal_backend: bool,
-) -> (
-    Option<(
-        frankenterm_core::storage::StorageHandle,
-        frankenterm_core::wezterm::WeztermHandle,
-        std::sync::Arc<dyn frankenterm_core::tx_execution::TxStorageAdapter>,
-    )>,
-    Option<TxRuntimeUnavailable>,
-) {
+) -> (Option<RealTxRuntime>, Option<TxRuntimeUnavailable>) {
+    // Resolve all declared pattern waits before any transaction effect. Paused
+    // runs and terminal replays do not need a live registry or backend.
+    let needs_patterns = require_terminal_backend
+        && frankenterm_core::tx_execution::tx_contract_requires_pattern_engine(contract);
+    let pattern_engine = if needs_patterns {
+        match frankenterm_core::patterns::PatternEngine::from_config_with_root(
+            &config.patterns,
+            config_path.and_then(Path::parent),
+        ) {
+            Ok(engine) => Some(std::sync::Arc::new(
+                frankenterm_core::runtime_async::RwLock::new(engine),
+            )),
+            Err(error) => {
+                return (
+                    None,
+                    Some(TxRuntimeUnavailable::Patterns(format!(
+                        "transaction pattern registry unavailable: {error}"
+                    ))),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let db_path = layout.db_path.to_string_lossy();
     let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
         &frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request),
@@ -79622,13 +79679,29 @@ async fn resolve_real_tx_runtime(
         }
     };
     if !require_terminal_backend {
-        return (Some((storage, wezterm, tx_storage)), None);
+        return (
+            Some(RealTxRuntime {
+                storage,
+                wezterm,
+                tx_storage,
+                pattern_engine,
+            }),
+            None,
+        );
     }
 
     // ft-xbnl0.2.3 tick 234: cx-first.
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
-        Ok(_) => (Some((storage, wezterm, tx_storage)), None),
+        Ok(_) => (
+            Some(RealTxRuntime {
+                storage,
+                wezterm,
+                tx_storage,
+                pattern_engine,
+            }),
+            None,
+        ),
         Err(err) => (
             None,
             Some(TxRuntimeUnavailable::Terminal(format!(
@@ -80893,6 +80966,13 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
             "Nothing was committed. Start or reconnect the terminal backend (FrankenTerm GUI or mux), check `ft doctor`, then retry; use --dry-run for a preview meanwhile."
                 .to_string(),
         ),
+        TxCommandExecutionError::RuntimeUnavailable {
+            cause: TxRuntimeUnavailable::Patterns(_),
+            ..
+        } => Some(
+            "No transaction step was dispatched. Check the configured pattern packs and their paths before retrying."
+                .to_string(),
+        ),
         TxCommandExecutionError::PendingEffect { step_id, .. } => Some(format!(
             "Step {step_id} stopped between dispatch and its recorded outcome, so it may or may not have taken effect, and no run or rollback will touch it. Check what it did, then have a person settle it with `ft tx reconcile --step {step_id} --outcome success|failed|compensated --evidence <what you saw>`; it has no robot form."
         )),
@@ -81758,6 +81838,7 @@ async fn handle_tx_command(
     command: TxCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     match command {
         TxCommands::Plan {
@@ -81862,6 +81943,8 @@ async fn handle_tx_command(
             let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                 config,
                 layout,
+                &contract,
+                config_path,
                 tx_run_probes_terminal_backend(&contract, kill_switch, paused),
             )
             .await;
@@ -81881,7 +81964,13 @@ async fn handle_tx_command(
                 fail_step = fail_step.as_deref().unwrap_or(""),
                 "tx run starting"
             );
-            let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
+            let data = if let Some(RealTxRuntime {
+                storage,
+                wezterm,
+                tx_storage,
+                pattern_engine,
+            }) = real_runtime
+            {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
                         frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
@@ -81919,6 +82008,7 @@ async fn handle_tx_command(
                     prepare_context,
                 )
                 .with_policy_storage(&storage)
+                .with_pattern_engine(pattern_engine)
                 .with_storage_adapter(tx_storage);
                 execute_tx_run_with_executor(
                     executor,
@@ -82070,6 +82160,8 @@ async fn handle_tx_command(
             let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                 config,
                 layout,
+                &contract,
+                config_path,
                 tx_rollback_requires_terminal_backend(&contract, commit_report.as_ref()),
             )
             .await;
@@ -82087,7 +82179,13 @@ async fn handle_tx_command(
                 fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                 "tx rollback starting"
             );
-            let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
+            let data = if let Some(RealTxRuntime {
+                storage,
+                wezterm,
+                tx_storage,
+                pattern_engine,
+            }) = real_runtime
+            {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
                         frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
@@ -82125,6 +82223,7 @@ async fn handle_tx_command(
                     prepare_context,
                 )
                 .with_policy_storage(&storage)
+                .with_pattern_engine(pattern_engine)
                 .with_storage_adapter(tx_storage);
                 execute_tx_rollback_with_executor(
                     executor,
@@ -107482,6 +107581,16 @@ mod tests {
             mission_tx_command_error(error).error_code,
             "mission.tx.terminal_unavailable"
         );
+
+        let patterns = TxRuntimeUnavailable::Patterns("bad pattern pack".to_string());
+        let error = TxCommandExecutionError::refused_synthetic_commit(Some(&patterns));
+        assert_eq!(
+            robot_tx_command_error_code(&error),
+            "robot.tx_patterns_unavailable"
+        );
+        let mission = mission_tx_command_error(error);
+        assert_eq!(mission.error_code, "mission.tx.patterns_unavailable");
+        assert!(mission.hint.unwrap().contains("pattern packs"));
 
         let unknown = TxCommandExecutionError::refused_synthetic_commit(None);
         assert_eq!(

@@ -931,6 +931,30 @@ fn tx_run_wezterm_handle(config: &Config) -> crate::wezterm::WeztermHandle {
     crate::wezterm::wezterm_handle_from_config(config)
 }
 
+fn mcp_tx_pattern_engine(
+    config: &Config,
+    contract: &crate::plan::MissionTxContract,
+    dispatch_allowed: bool,
+) -> crate::Result<Option<Arc<crate::runtime_async::RwLock<PatternEngine>>>> {
+    if !dispatch_allowed || !crate::tx_execution::tx_contract_requires_pattern_engine(contract) {
+        return Ok(None);
+    }
+    // Use the same configured pack resolution as other MCP pattern consumers.
+    // Load before dispatch so an invalid pack cannot fail after an earlier send.
+    PatternEngine::from_config(&config.patterns)
+        .map(|engine| Some(Arc::new(crate::runtime_async::RwLock::new(engine))))
+}
+
+/// The synchronous transaction executor captures ambient context when it
+/// dispatches. Bind the explicit MCP request for that call, including any
+/// stricter ambient restrictions, and restore the server context afterwards.
+fn with_mcp_tx_cx<T>(cx: &crate::cx::Cx, execute: impl FnOnce() -> T) -> T {
+    let mask = crate::cx::effective_cap_mask(cx);
+    let _context = crate::cx::Cx::set_current(Some(cx.clone()));
+    let _capabilities = crate::cx::Cx::push_restriction(mask);
+    execute()
+}
+
 fn mcp_tx_contract_save_failure_after_effects(
     save_err: McpToolError,
     completion_context: &str,
@@ -12110,6 +12134,42 @@ impl ToolHandler for WaTxRunTool {
             return envelope_to_content(envelope);
         }
 
+        let pattern_engine = match mcp_tx_pattern_engine(
+            self.config.as_ref(),
+            &contract,
+            kill_switch == crate::plan::MissionKillSwitchLevel::Off
+                && !params.paused
+                && !contract.lifecycle_state.is_terminal(),
+        ) {
+            Ok(engine) => engine,
+            Err(error) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to load transaction pattern packs: {error}"),
+                    Some(
+                        "Check the configured pattern packs; no transaction step was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                ));
+            }
+        };
+        let tx_storage = match crate::tx_execution::FileTxStorageAdapter::new(
+            layout.ft_dir.join("tx_data"),
+        ) {
+            Ok(storage) => Arc::new(storage),
+            Err(error) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("Failed to open transaction data storage: {error}"),
+                    Some(
+                        "Fix access to the workspace tx_data directory; no transaction step was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                ));
+            }
+        };
         let now_ms = mcp_now_ms_i64();
         let runtime = match CompatRuntimeBuilder::current_thread().build() {
             Ok(runtime) => runtime,
@@ -12173,7 +12233,9 @@ impl ToolHandler for WaTxRunTool {
             targets,
             prepare_context,
         )
-        .with_policy_storage(&storage);
+        .with_policy_storage(&storage)
+        .with_pattern_engine(pattern_engine)
+        .with_storage_adapter(tx_storage);
         let execution_engine = crate::tx_execution::TxExecutionEngine::new(
             executor,
             crate::tx_execution::TxExecutionConfig {
@@ -12215,8 +12277,9 @@ impl ToolHandler for WaTxRunTool {
         // per-effect fence. Retaining this admission guard would self-contend
         // and would prevent a later operator stop from fencing subsequent steps.
         drop(admission_fence);
-        let execution_result =
-            execution_engine.execute_with_store(&mut persisted_contract, &mut idem_store, now_ms);
+        let execution_result = with_mcp_tx_cx(ctx.cx(), || {
+            execution_engine.execute_with_store(&mut persisted_contract, &mut idem_store, now_ms)
+        });
         let save_result = mcp_save_mission_tx_contract_to_path(
             &contract_lock,
             &authoritative_contract_path,
@@ -12450,6 +12513,43 @@ impl ToolHandler for WaTxRollbackTool {
             );
             return envelope_to_content(envelope);
         }
+        let pattern_engine = match mcp_tx_pattern_engine(
+            self.config.as_ref(),
+            &contract,
+            !matches!(
+                contract.lifecycle_state,
+                crate::plan::MissionTxState::Compensated | crate::plan::MissionTxState::RolledBack
+            ),
+        ) {
+            Ok(engine) => engine,
+            Err(error) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to load transaction pattern packs: {error}"),
+                    Some(
+                        "Check the configured pattern packs; no compensation was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                ));
+            }
+        };
+        let tx_storage = match crate::tx_execution::FileTxStorageAdapter::new(
+            layout.ft_dir.join("tx_data"),
+        ) {
+            Ok(storage) => Arc::new(storage),
+            Err(error) => {
+                return envelope_to_content(McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("Failed to open transaction data storage: {error}"),
+                    Some(
+                        "Fix access to the workspace tx_data directory; no compensation was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                ));
+            }
+        };
         let runtime = match CompatRuntimeBuilder::current_thread().build() {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -12512,7 +12612,9 @@ impl ToolHandler for WaTxRollbackTool {
             targets,
             prepare_context,
         )
-        .with_policy_storage(&storage);
+        .with_policy_storage(&storage)
+        .with_pattern_engine(pattern_engine)
+        .with_storage_adapter(tx_storage);
         let execution_engine = crate::tx_execution::TxExecutionEngine::new(
             executor,
             crate::tx_execution::TxExecutionConfig {
@@ -12549,11 +12651,9 @@ impl ToolHandler for WaTxRollbackTool {
         let mut persisted_contract = contract.clone();
         // Compensation uses the same independently fenced executor as commit.
         drop(admission_fence);
-        let rollback_result = match execution_engine.rollback_with_store(
-            &mut persisted_contract,
-            &mut idem_store,
-            now_ms,
-        ) {
+        let rollback_result = match with_mcp_tx_cx(ctx.cx(), || {
+            execution_engine.rollback_with_store(&mut persisted_contract, &mut idem_store, now_ms)
+        }) {
             Err(
                 rollback_err @ crate::tx_execution::TxExecutionError::RollbackProof { kind, .. },
             ) => {
@@ -25059,6 +25159,90 @@ mod tests {
     }
 
     #[test]
+    fn tx_pattern_registry_is_required_only_for_dispatchable_pattern_waits() {
+        let mut config = Config::default();
+        config.patterns.packs = vec!["builtin:nonexistent".to_string()];
+        config.patterns.user_packs_enabled = false;
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        assert!(
+            mcp_tx_pattern_engine(&config, &contract, true)
+                .unwrap()
+                .is_none()
+        );
+        contract.plan.steps[1].action = StepAction::WaitFor {
+            pane_id: Some(1),
+            condition: crate::plan::WaitCondition::Pattern {
+                pane_id: Some(1),
+                rule_id: "codex.test".to_string(),
+            },
+            timeout_ms: 1_000,
+        };
+        assert!(
+            mcp_tx_pattern_engine(&config, &contract, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(mcp_tx_pattern_engine(&config, &contract, true).is_err());
+        config.patterns.packs = vec!["builtin:codex".to_string()];
+        assert!(
+            mcp_tx_pattern_engine(&config, &contract, true)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tx_dispatch_uses_mcp_request_cancellation_and_restores_server_context() {
+        let server = crate::cx::Cx::for_testing();
+        let request = crate::cx::Cx::for_testing();
+        let _server_context = crate::cx::Cx::set_current(Some(server.clone()));
+        with_mcp_tx_cx(&request, || {
+            request.set_cancel_requested(true);
+            assert!(crate::cx::Cx::current().unwrap().checkpoint().is_err());
+        });
+        assert!(crate::cx::Cx::current().unwrap().checkpoint().is_ok());
+        assert!(server.checkpoint().is_ok());
+        assert!(request.checkpoint().is_err());
+    }
+
+    #[test]
+    fn tx_dispatch_preserves_every_effective_mcp_capability_restriction() {
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let request = {
+                let _context = crate::cx::Cx::set_current(Some(crate::cx::Cx::for_testing()));
+                let _restriction = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().unwrap()
+            };
+            with_mcp_tx_cx(&request, || {
+                let current = crate::cx::Cx::current().unwrap();
+                assert_eq!(crate::cx::effective_capability_bits(&current), expected);
+            });
+        }
+    }
+
+    #[test]
+    fn tx_pattern_registry_preflights_compensation_waits() {
+        let mut config = Config::default();
+        config.patterns.packs = vec!["builtin:nonexistent".to_string()];
+        config.patterns.user_packs_enabled = false;
+        let mut contract = sample_tx_contract(MissionTxState::Committed);
+        contract.plan.compensations[0].action = StepAction::WaitFor {
+            pane_id: Some(1),
+            condition: crate::plan::WaitCondition::Pattern {
+                pane_id: Some(1),
+                rule_id: "codex.test".to_string(),
+            },
+            timeout_ms: 1_000,
+        };
+        assert!(mcp_tx_pattern_engine(&config, &contract, true).is_err());
+        assert!(
+            mcp_tx_pattern_engine(&config, &contract, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tx_contract_save_failure_after_effects_marks_retry_unsafe() {
         for (completion_context, retry_tool, effect_label) in [
             (
@@ -26008,6 +26192,100 @@ mod tests {
         assert_eq!(persisted.lifecycle_state, MissionTxState::Compensated);
         assert_eq!(persisted.outcome, TxOutcome::Compensated);
         assert!(!persisted.receipts.is_empty());
+    }
+
+    #[test]
+    fn tx_tools_store_data_uses_workspace_storage_for_run_replay_and_compensation() {
+        let workspace = workspace_tempdir();
+        let db_path = workspace.path().join("policy.db");
+        seed_event(&db_path);
+        let (_guard, _mock) = install_tx_run_mock_wezterm();
+        let mut config = Config::default();
+        config.storage.db_path = db_path.to_string_lossy().to_string();
+        config.safety.rules.enabled = true;
+        config.safety.rules.rules.push(crate::config::PolicyRule {
+            id: "test.allow.mcp.store_data".to_string(),
+            description: Some("Allow the fixture's durable transaction data".to_string()),
+            priority: 1,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["write_file".to_string()],
+                actors: vec!["mcp".to_string()],
+                surfaces: vec!["mcp".to_string()],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::Allow,
+            message: None,
+        });
+        let config = Arc::new(config);
+        let contract_path = write_tx_contract(&workspace, MissionTxState::Planned);
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.plan.steps.truncate(1);
+        contract.plan.steps[0].action = StepAction::StoreData {
+            key: "mcp-store-data".to_string(),
+            value: serde_json::json!({ "phase": "committed" }),
+        };
+        contract.plan.preconditions.clear();
+        contract.plan.compensations = vec![TxCompensation {
+            for_step_id: contract.plan.steps[0].step_id.clone(),
+            action: StepAction::StoreData {
+                key: "mcp-store-data".to_string(),
+                value: serde_json::json!({ "phase": "rolled_back" }),
+            },
+        }];
+        contract.validate().expect("valid storage-only transaction");
+        std::fs::write(&contract_path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        let arguments = serde_json::json!({
+            "contract_file": contract_path.display().to_string(),
+        });
+        let value_path = workspace
+            .path()
+            .join(".ft/tx_data/mcp-store-data.json");
+        let read_value = || {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(&value_path).expect("workspace transaction data"),
+            )
+            .unwrap()
+        };
+
+        let run = parse_json_content(
+            WaTxRunTool::new(Arc::clone(&config))
+                .call(&test_mcp_context(), arguments.clone())
+                .unwrap(),
+        );
+        assert_eq!(run["ok"], true, "{run}");
+        assert_eq!(run["data"]["prepare_report"]["outcome"], "all_ready");
+        assert_eq!(run["data"]["commit_report"]["committed_count"], 1);
+        assert_eq!(run["data"]["final_state"], "committed");
+        assert_eq!(read_value(), serde_json::json!({ "phase": "committed" }));
+
+        // A fresh tool must replay durable evidence, not execute StoreData
+        // again and overwrite a value observed after the original commit.
+        let later_value = serde_json::json!({ "phase": "later_observation" });
+        std::fs::write(&value_path, serde_json::to_vec(&later_value).unwrap()).unwrap();
+        let replay = parse_json_content(
+            WaTxRunTool::new(Arc::clone(&config))
+                .call(&test_mcp_context(), arguments.clone())
+                .unwrap(),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["data"]["final_state"], "committed");
+        assert_eq!(read_value(), later_value, "replay must not repeat the write");
+
+        let rollback = parse_json_content(
+            WaTxRollbackTool::new(config)
+                .call(&test_mcp_context(), arguments)
+                .unwrap(),
+        );
+        assert_eq!(rollback["ok"], true, "{rollback}");
+        assert_eq!(rollback["data"]["final_state"], "rolled_back");
+        assert_eq!(
+            rollback["data"]["compensation_report"]["compensated_count"],
+            1
+        );
+        assert_eq!(read_value(), serde_json::json!({ "phase": "rolled_back" }));
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(persisted.receipts.len(), 2);
     }
 
     #[test]
