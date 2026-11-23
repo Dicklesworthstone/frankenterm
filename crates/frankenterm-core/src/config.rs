@@ -922,20 +922,68 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         validation: "Config::validate accepts valid custom regex patterns and non-empty placeholders, rejects invalid regexes/empty placeholders, and keeps enabled/redact_audit/redact_segments=false fail-closed",
     },
     ConfigKeyWiringRecord {
-        key: "safety.capabilities",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/confirm_dangerous_patterns are ignored — input gating uses runtime PaneCapabilities",
-        tracking_bead: "ft-1t4o4",
-        validation: "Config::validate rejects any non-default [safety.capabilities] block fail-closed",
+        key: "safety.capabilities.allow_control_chars",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::policy::PolicyEngine::evaluate_authorization",
+        evidence: "configured false denies typed control actions and control characters embedded in SendText before approvable gates; tabs and line endings remain text",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "accepted for true and false; SendText without inspectable raw text fails closed when false; changing a running watcher's input capabilities requires restart",
     },
     ConfigKeyWiringRecord {
-        key: "safety.reservations",
+        key: "safety.capabilities.allow_arbitrary_text",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::policy::PolicyEngine::evaluate_authorization",
+        evidence: "configured false permits SendText only for ActorKind::Workflow carrying a non-empty workflow execution ID; human, Robot and MCP callers cannot bypass it with an ID",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "accepted for true and false; independent command, prompt, reservation and control-character gates remain enforced; changing a running watcher's input capabilities requires restart",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.capabilities.allow_non_agent_panes",
         status: ConfigKeyWiringStatus::ParsedButUnconsumed,
         consumer: "none",
-        evidence: "default_ttl_secs/max_ttl_secs/conflict_behavior/auto_release_on_complete are ignored — TTL clamping uses the storage PaneReservationConfig",
+        evidence: "production send paths do not consistently supply authoritative agent identity; runtime PaneCapabilities describes shell and reservation state only",
         tracking_bead: "ft-1t4o4",
-        validation: "Config::validate rejects any non-default [safety.reservations] block fail-closed",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.capabilities.confirm_dangerous_patterns",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "dangerous command handling is governed independently by safety.command_gate and cannot be bypassed with this flag",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.reservations.default_ttl_secs",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "StorageConfig::from(&Config) -> StorageHandle reservation callers",
+        evidence: "CLI, Robot, and MCP resolve an omitted reservation TTL from the configured storage policy",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate enforces positive, ordered TTLs representable as signed milliseconds",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.reservations.max_ttl_secs",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "StorageConfig::from(&Config) -> create_reservation_backend",
+        evidence: "the database writer clamps every new reservation to the configured maximum before persisting expiry",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate enforces positive, ordered TTLs representable as signed milliseconds",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.reservations.conflict_behavior",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "active reservation conflicts are always denied; queue and force behavior are not implemented",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.reservations.auto_release_on_complete",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "workflow completion does not consume this reservation setting",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects non-default values fail-closed",
     },
     ConfigKeyWiringRecord {
         key: "safety.semantic_shock",
@@ -3675,13 +3723,15 @@ impl PolicyRuleDecision {
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)] // These are independent capability flags
 pub struct CapabilityConfig {
-    /// Allow sending control characters (Ctrl-C, Ctrl-D, etc.)
+    /// Allow typed control actions and control characters in sent text.
+    /// Tabs and line endings are ordinary text and remain permitted.
     pub allow_control_chars: bool,
 
     /// Allow sending to panes without detected agent
     pub allow_non_agent_panes: bool,
 
-    /// Allow sending arbitrary text (vs. only workflow-generated)
+    /// Allow direct text input. When false, only workflow actors carrying a
+    /// non-empty execution ID may send text; all other safety gates still run.
     pub allow_arbitrary_text: bool,
 
     /// Require explicit confirmation for dangerous patterns
@@ -3776,10 +3826,10 @@ impl Default for RedactionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReservationConfig {
-    /// Default reservation TTL in seconds
+    /// Default reservation TTL in seconds when a caller omits its TTL.
     pub default_ttl_secs: u64,
 
-    /// Maximum reservation TTL in seconds
+    /// Maximum reservation TTL in seconds, enforced by the database writer.
     pub max_ttl_secs: u64,
 
     /// Conflict behavior: "deny", "queue", "force" (with warning)
@@ -5314,6 +5364,48 @@ impl Config {
             });
         }
 
+        for (key, previous, next) in [
+            (
+                "safety.capabilities.allow_control_chars",
+                self.safety.capabilities.allow_control_chars,
+                new_config.safety.capabilities.allow_control_chars,
+            ),
+            (
+                "safety.capabilities.allow_arbitrary_text",
+                self.safety.capabilities.allow_arbitrary_text,
+                new_config.safety.capabilities.allow_arbitrary_text,
+            ),
+        ] {
+            if previous != next {
+                forbidden.push(ForbiddenChange {
+                    name: key.to_string(),
+                    reason: "Input capabilities are captured by policy engines; requires restart"
+                        .to_string(),
+                });
+            }
+        }
+
+        for (key, previous, next) in [
+            (
+                "safety.reservations.default_ttl_secs",
+                self.safety.reservations.default_ttl_secs,
+                new_config.safety.reservations.default_ttl_secs,
+            ),
+            (
+                "safety.reservations.max_ttl_secs",
+                self.safety.reservations.max_ttl_secs,
+                new_config.safety.reservations.max_ttl_secs,
+            ),
+        ] {
+            if previous != next {
+                forbidden.push(ForbiddenChange {
+                    name: key.to_string(),
+                    reason: "Reservation limits are captured by storage handles; requires restart"
+                        .to_string(),
+                });
+            }
+        }
+
         // Check hot-reloadable settings
         if self.general.log_level != new_config.general.log_level {
             changes.push(HotReloadChange {
@@ -6084,18 +6176,10 @@ impl Config {
             }
         }
 
-        // ft-1t4o4 [reality-check][safety]: these [safety.*] blocks are parsed
-        // but have ZERO behavior-affecting production consumers (verified: the
-        // runtime uses a fixed Redactor catalog, runtime PaneCapabilities, the
-        // storage PaneReservationConfig, and no SemanticShockResponder; and
-        // approval.require_reapproval_on_failure is read nowhere). Silently
-        // accepting a CUSTOMIZED value gives operators a false sense of safety —
-        // e.g. custom redaction patterns are dropped, which can leak secrets.
-        // Fail closed: reject a config that customizes one of these until it is
-        // wired to its runtime consumer, so the operator gets a clear error
-        // instead of a silent no-op. Default values are honored (no rejection)
-        // so existing default deployments are unaffected. Compared via
-        // serialization to avoid depending on PartialEq for every config type.
+        // ft-1t4o4: reject unsupported safety controls individually instead of
+        // silently accepting no-effect customization. Wired controls have their
+        // own validation and must remain configurable. Default values of the
+        // remaining unsupported fields preserve existing deployments.
         // [safety.redaction] patterns + placeholder are wired into PolicyEngine's
         // Redactor (ft-mgy5t2.17). Disabling mandatory secret redaction flags
         // (`enabled`, `redact_audit`, `redact_segments`) remains fail-closed.
@@ -6126,21 +6210,43 @@ impl Config {
                  built-in secret redaction is mandatory)",
             );
         }
-        if serde_json::to_value(&self.safety.capabilities).ok()
-            != serde_json::to_value(CapabilityConfig::default()).ok()
+        let capability_defaults = CapabilityConfig::default();
+        if self.safety.capabilities.allow_non_agent_panes
+            != capability_defaults.allow_non_agent_panes
         {
             unhonored_safety.push(
-                "safety.capabilities (allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/\
-                 confirm_dangerous_patterns are ignored — gating uses runtime PaneCapabilities)",
+                "safety.capabilities.allow_non_agent_panes (production input paths do not yet \
+                 supply authoritative agent identity)",
             );
         }
-        if serde_json::to_value(&self.safety.reservations).ok()
-            != serde_json::to_value(ReservationConfig::default()).ok()
+        if self.safety.capabilities.confirm_dangerous_patterns
+            != capability_defaults.confirm_dangerous_patterns
         {
             unhonored_safety.push(
-                "safety.reservations (default_ttl_secs/max_ttl_secs/conflict_behavior/\
-                 auto_release_on_complete are ignored — TTL clamping uses the storage \
-                 PaneReservationConfig)",
+                "safety.capabilities.confirm_dangerous_patterns (dangerous command handling \
+                 is governed by safety.command_gate)",
+            );
+        }
+        let reservations = &self.safety.reservations;
+        if reservations.default_ttl_secs == 0
+            || reservations.max_ttl_secs < reservations.default_ttl_secs
+            || reservations.max_ttl_secs > (i64::MAX / 1000) as u64
+        {
+            return Err(crate::error::ConfigError::ValidationError(
+                "safety.reservations requires 1 <= default_ttl_secs <= max_ttl_secs and TTLs representable as signed milliseconds"
+                    .to_string(),
+            )
+            .into());
+        }
+        let reservation_defaults = ReservationConfig::default();
+        if reservations.conflict_behavior != reservation_defaults.conflict_behavior {
+            unhonored_safety.push(
+                "safety.reservations.conflict_behavior (active reservation conflicts are always denied)",
+            );
+        }
+        if reservations.auto_release_on_complete != reservation_defaults.auto_release_on_complete {
+            unhonored_safety.push(
+                "safety.reservations.auto_release_on_complete (workflow completion does not consume this setting)",
             );
         }
         if serde_json::to_value(&self.safety.semantic_shock).ok()
@@ -8119,27 +8225,113 @@ max_sender_id_len = 0
     }
 
     #[test]
-    fn validate_rejects_customized_safety_capabilities() {
-        let mut config = Config::default();
-        config.safety.capabilities.allow_arbitrary_text =
-            !config.safety.capabilities.allow_arbitrary_text;
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("ft-1t4o4") && err.contains("safety.capabilities"),
-            "{err}"
-        );
+    fn validate_accepts_wired_input_capabilities() {
+        for allow_control_chars in [false, true] {
+            for allow_arbitrary_text in [false, true] {
+                let mut config = Config::default();
+                config.safety.capabilities.allow_control_chars = allow_control_chars;
+                config.safety.capabilities.allow_arbitrary_text = allow_arbitrary_text;
+                config
+                    .validate()
+                    .expect("wired capability controls are accepted");
+            }
+        }
     }
 
     #[test]
-    fn validate_rejects_customized_safety_reservations() {
+    fn hot_reload_requires_restart_for_input_capability_changes() {
+        let current = Config::default();
+        let mut updated = current.clone();
+        updated.safety.capabilities.allow_control_chars = false;
+        updated.safety.capabilities.allow_arbitrary_text = false;
+        updated.validate().expect("valid operator restrictions");
+        let diff = current.diff_for_hot_reload(&updated);
+        assert!(!diff.allowed);
+        for key in [
+            "safety.capabilities.allow_control_chars",
+            "safety.capabilities.allow_arbitrary_text",
+        ] {
+            assert!(diff.forbidden.iter().any(|change| change.name == key));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unwired_input_capabilities_individually() {
+        for key in ["allow_non_agent_panes", "confirm_dangerous_patterns"] {
+            let mut config = Config::default();
+            config.safety.capabilities.allow_control_chars = false;
+            config.safety.capabilities.allow_arbitrary_text = false;
+            if key == "allow_non_agent_panes" {
+                config.safety.capabilities.allow_non_agent_panes = true;
+            } else {
+                config.safety.capabilities.confirm_dangerous_patterns = false;
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("ft-1t4o4") && err.contains(key), "{err}");
+            assert!(!err.contains("allow_control_chars"), "{err}");
+            assert!(!err.contains("allow_arbitrary_text"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_configured_reservation_ttls() {
         let mut config = Config::default();
-        config.safety.reservations.default_ttl_secs =
-            config.safety.reservations.default_ttl_secs.wrapping_add(1);
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("ft-1t4o4") && err.contains("safety.reservations"),
-            "{err}"
-        );
+        config.safety.reservations.default_ttl_secs = 7;
+        config.safety.reservations.max_ttl_secs = 11;
+        config
+            .validate()
+            .expect("configured reservation TTLs are honored");
+    }
+
+    #[test]
+    fn reservation_ttl_changes_require_restart() {
+        let original = Config::default();
+        let mut updated = original.clone();
+        updated.safety.reservations.default_ttl_secs = 7;
+        updated.safety.reservations.max_ttl_secs = 11;
+        let result = original.diff_for_hot_reload(&updated);
+        for key in [
+            "safety.reservations.default_ttl_secs",
+            "safety.reservations.max_ttl_secs",
+        ] {
+            assert!(result.forbidden.iter().any(|change| change.name == key));
+            assert!(!result.changes.iter().any(|change| change.name == key));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_reservation_ttls() {
+        for (default_ttl_secs, max_ttl_secs) in [
+            (0, 3600),
+            (300, 0),
+            (301, 300),
+            (1, u64::MAX),
+            (u64::MAX, u64::MAX),
+        ] {
+            let mut config = Config::default();
+            config.safety.reservations.default_ttl_secs = default_ttl_secs;
+            config.safety.reservations.max_ttl_secs = max_ttl_secs;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("safety.reservations"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unwired_reservation_settings_individually() {
+        for key in ["conflict_behavior", "auto_release_on_complete"] {
+            let mut config = Config::default();
+            config.safety.reservations.default_ttl_secs = 7;
+            config.safety.reservations.max_ttl_secs = 11;
+            if key == "conflict_behavior" {
+                config.safety.reservations.conflict_behavior = "force".to_string();
+            } else {
+                config.safety.reservations.auto_release_on_complete = false;
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("ft-1t4o4") && err.contains(key), "{err}");
+            assert!(!err.contains("default_ttl_secs"), "{err}");
+            assert!(!err.contains("max_ttl_secs"), "{err}");
+        }
     }
 
     #[test]
@@ -8199,7 +8391,9 @@ max_sender_id_len = 0
         for max_segment_bytes in [1024, 4096, 65536, u32::MAX] {
             let mut config = Config::default();
             config.ingest.max_segment_bytes = max_segment_bytes;
-            config.validate().expect("wired segment bound must be accepted");
+            config
+                .validate()
+                .expect("wired segment bound must be accepted");
         }
         for max_segment_bytes in [0, 1, 1023] {
             let mut config = Config::default();
@@ -8224,7 +8418,10 @@ max_sender_id_len = 0
         assert_eq!(change.old_value, "65536");
         assert_eq!(change.new_value, "4096");
         assert_eq!(
-            updated.hot_reloadable().expect("hot config").max_segment_bytes,
+            updated
+                .hot_reloadable()
+                .expect("hot config")
+                .max_segment_bytes,
             4096
         );
     }

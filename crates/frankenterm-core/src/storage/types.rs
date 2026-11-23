@@ -1658,29 +1658,57 @@ impl PaneReservation {
 /// Configuration for pane reservation behavior.
 #[derive(Debug, Clone)]
 pub struct PaneReservationConfig {
-    /// Default TTL in milliseconds (30 minutes).
+    /// Default TTL in milliseconds (5 minutes).
     pub default_ttl_ms: i64,
-    /// Maximum allowed TTL in milliseconds (4 hours).
+    /// Maximum allowed TTL in milliseconds (1 hour).
     pub max_ttl_ms: i64,
 }
 
 impl Default for PaneReservationConfig {
     fn default() -> Self {
+        Self::from(&crate::config::ReservationConfig::default())
+    }
+}
+
+impl From<&crate::config::ReservationConfig> for PaneReservationConfig {
+    fn from(config: &crate::config::ReservationConfig) -> Self {
+        // Preserve invalid/overflowed inputs as an invalid policy, so opening
+        // storage fails before any database or parent directory is created.
+        let milliseconds = |seconds: u64| {
+            i64::try_from(seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .unwrap_or(0)
+        };
         Self {
-            default_ttl_ms: 30 * 60 * 1000, // 30 minutes
-            max_ttl_ms: 4 * 60 * 60 * 1000, // 4 hours
+            default_ttl_ms: milliseconds(config.default_ttl_secs),
+            max_ttl_ms: milliseconds(config.max_ttl_secs),
         }
     }
 }
 
 impl PaneReservationConfig {
+    /// Validate the policy before storage admits reservation mutations.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.default_ttl_ms < 1000 || self.max_ttl_ms < self.default_ttl_ms {
+            return Err(crate::error::ConfigError::ValidationError(
+                "safety.reservations requires 1000 <= default_ttl_ms <= max_ttl_ms; TTLs must fit in signed milliseconds"
+                    .to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Clamp a requested TTL to the allowed range.
     ///
     /// Returns the clamped TTL in milliseconds. The minimum is
     /// 1000 ms (1 second).
     #[must_use]
     pub fn clamp_ttl(&self, requested_ttl_ms: i64) -> i64 {
-        requested_ttl_ms.clamp(1000, self.max_ttl_ms)
+        // Storage rejects invalid policies. Keep this public helper total for
+        // callers inspecting an as-yet unvalidated configuration as well.
+        requested_ttl_ms.clamp(1000, self.max_ttl_ms.max(1000))
     }
 }
 

@@ -42,7 +42,15 @@ fn create_reservation_sync(
     ttl_ms: i64,
 ) -> Result<PaneReservation> {
     with_test_storage_backend(conn, |backend| {
-        create_reservation_backend(backend, pane_id, owner_kind, owner_id, reason, ttl_ms)
+        create_reservation_backend(
+            backend,
+            pane_id,
+            owner_kind,
+            owner_id,
+            reason,
+            ttl_ms,
+            &PaneReservationConfig::default(),
+        )
     })
 }
 
@@ -131,8 +139,17 @@ fn reservation_not_active_when_released() {
 #[test]
 fn config_default_values() {
     let cfg = PaneReservationConfig::default();
-    assert_eq!(cfg.default_ttl_ms, 30 * 60 * 1000);
-    assert_eq!(cfg.max_ttl_ms, 4 * 60 * 60 * 1000);
+    assert_eq!(cfg.default_ttl_ms, 5 * 60 * 1000);
+    assert_eq!(cfg.max_ttl_ms, 60 * 60 * 1000);
+    let parsed = crate::config::ReservationConfig::default();
+    assert_eq!(
+        cfg.default_ttl_ms,
+        i64::try_from(parsed.default_ttl_secs * 1000).unwrap()
+    );
+    assert_eq!(
+        cfg.max_ttl_ms,
+        i64::try_from(parsed.max_ttl_secs * 1000).unwrap()
+    );
 }
 
 #[test]
@@ -460,6 +477,206 @@ fn create_reservation_clamps_unrepresentable_ttl_to_config_bounds() {
         above_max.expires_at - above_max.created_at,
         PaneReservationConfig::default().max_ttl_ms
     );
+}
+
+#[test]
+fn configured_reservation_expiry_overflow_leaves_no_reservation() {
+    let mut conn = setup_db();
+    let policy = PaneReservationConfig {
+        default_ttl_ms: 1_000,
+        max_ttl_ms: i64::MAX,
+    };
+    let result = with_test_storage_backend(&mut conn, |backend| {
+        create_reservation_backend(backend, 1, "agent", "overflow", None, i64::MAX, &policy)
+    });
+    let error = result.expect_err("an expiry past the timestamp range must be rejected");
+    assert!(error.to_string().contains("overflow"));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pane_reservations", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0,
+        "a rejected expiry must not reserve the pane"
+    );
+    assert!(create_reservation_sync(&mut conn, 1, "agent", "valid", None, 1_000).is_ok());
+}
+
+fn reservation_test_pane(pane_id: u64) -> PaneRecord {
+    PaneRecord {
+        pane_id,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: None,
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_000,
+        last_seen_at: 1_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    }
+}
+
+#[test]
+fn configured_handle_persists_default_explicit_and_clamped_reservation_ttls() {
+    super::run_storage_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("configured-reservations.db");
+        let app: crate::config::Config =
+            toml::from_str("[safety.reservations]\ndefault_ttl_secs = 7\nmax_ttl_secs = 11\n")
+                .unwrap();
+        let cx = crate::cx::for_testing();
+        let handle = StorageHandle::with_config_with_cx(
+            &cx,
+            db_path.to_str().unwrap(),
+            StorageConfig::from(&app),
+        )
+        .await
+        .unwrap();
+        let cloned = handle.clone();
+        assert_eq!(cloned.reservation_config().default_ttl_ms, 7_000);
+        assert_eq!(cloned.reservation_config().max_ttl_ms, 11_000);
+
+        let cases = [
+            (1, cloned.reservation_config().default_ttl_ms, 7_000),
+            (2, 9_000, 9_000),
+            (3, i64::MAX, 11_000),
+            (4, 0, 1_000),
+        ];
+        for (pane_id, requested, expected) in cases {
+            handle
+                .upsert_pane_with_cx(&cx, reservation_test_pane(pane_id))
+                .await
+                .unwrap();
+            let reservation = cloned
+                .create_reservation_with_cx(&cx, pane_id, "agent", "configured", None, requested)
+                .await
+                .unwrap();
+            assert_eq!(reservation.expires_at - reservation.created_at, expected);
+        }
+        handle.shutdown_with_cx(&cx).await.unwrap();
+        drop(cloned);
+        drop(handle);
+
+        // Read the committed database independently of the returned receipts.
+        // In particular, this fails if only callers clamp but the writer still
+        // constructs its former hard-coded four-hour policy.
+        let conn = Connection::open(&db_path).unwrap();
+        for (pane_id, _, expected) in cases {
+            let stored_ttl: i64 = conn
+                .query_row(
+                    "SELECT expires_at - created_at FROM pane_reservations WHERE pane_id = ?1",
+                    [i64::try_from(pane_id).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored_ttl, expected, "persisted TTL for pane {pane_id}");
+        }
+    });
+}
+
+#[test]
+fn reservation_policy_is_owned_by_each_storage_handle() {
+    super::run_storage_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.db");
+        let second_path = dir.path().join("second.db");
+        let first = StorageHandle::with_config(
+            first_path.to_str().unwrap(),
+            StorageConfig {
+                reservation_config: PaneReservationConfig {
+                    default_ttl_ms: 5_000,
+                    max_ttl_ms: 13_000,
+                },
+                ..StorageConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let second = StorageHandle::with_config(
+            second_path.to_str().unwrap(),
+            StorageConfig {
+                reservation_config: PaneReservationConfig {
+                    default_ttl_ms: 17_000,
+                    max_ttl_ms: 29_000,
+                },
+                ..StorageConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for (handle, expected_default, expected_max) in
+            [(&first, 5_000, 13_000), (&second, 17_000, 29_000)]
+        {
+            assert_eq!(handle.reservation_config().default_ttl_ms, expected_default);
+            handle.upsert_pane(reservation_test_pane(1)).await.unwrap();
+            let reservation = handle
+                .create_reservation(1, "agent", "same-owner", None, 60_000)
+                .await
+                .unwrap();
+            assert_eq!(
+                reservation.expires_at - reservation.created_at,
+                expected_max
+            );
+        }
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn invalid_reservation_policy_is_rejected_before_opening_storage() {
+    super::run_storage_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (default_ttl_ms, max_ttl_ms)) in [
+            (0, 60_000),
+            (999, 60_000),
+            (-1, 60_000),
+            (1_000, 999),
+            (2_000, 1_000),
+            (1_000, -1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parent = dir.path().join(format!("invalid-policy-{index}"));
+            let db_path = parent.join("storage.db");
+            let config = StorageConfig {
+                reservation_config: PaneReservationConfig {
+                    default_ttl_ms,
+                    max_ttl_ms,
+                },
+                ..StorageConfig::default()
+            };
+            let cx = crate::cx::for_testing();
+            let result = if index % 2 == 0 {
+                StorageHandle::with_config(db_path.to_str().unwrap(), config).await
+            } else {
+                StorageHandle::with_config_with_cx(&cx, db_path.to_str().unwrap(), config).await
+            };
+            match result {
+                Ok(handle) => {
+                    handle.shutdown().await.unwrap();
+                    panic!(
+                        "invalid reservation policy was accepted: {default_ttl_ms}/{max_ttl_ms}"
+                    );
+                }
+                Err(error) => assert!(
+                    error.to_string().to_lowercase().contains("reservation"),
+                    "invalid policy must report its reservation setting: {error}"
+                ),
+            }
+            assert!(!db_path.exists(), "invalid policy created the database");
+            assert!(
+                !parent.exists(),
+                "invalid policy created the parent directory"
+            );
+        }
+    });
 }
 
 #[test]

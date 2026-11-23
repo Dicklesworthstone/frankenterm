@@ -2019,14 +2019,9 @@ impl ToolHandler for WaSteerPlanTool {
                 Some((runtime, storage))
             });
             if let Some((runtime, storage)) = runtime_and_storage {
-                let mut engine = crate::policy::PolicyEngine::new(
-                    self.config.safety.rate_limit_per_pane,
-                    self.config.safety.rate_limit_global,
-                    self.config.safety.require_prompt_active,
-                )
-                .with_tuning(&self.config.tuning)
-                .with_command_gate_config(self.config.safety.command_gate.clone())
-                .with_policy_rules(self.config.safety.rules.clone());
+                let mut engine =
+                    crate::policy::PolicyEngine::from_safety_config(&self.config.safety)
+                        .with_tuning(&self.config.tuning);
                 let _ = runtime.block_on(
                     crate::policy_kill_switch_state::restore_kill_switch_from_storage_with_cx(
                         ctx.cx(),
@@ -2076,7 +2071,11 @@ impl ToolHandler for WaSteerPlanTool {
                 let _ = runtime.block_on(storage.shutdown());
                 planned
             } else {
-                let policy_engine = RefCell::new(crate::policy::PolicyEngine::strict());
+                let policy_engine = RefCell::new(
+                    crate::policy::PolicyEngine::from_safety_config(&self.config.safety)
+                        .with_require_prompt_active(true)
+                        .with_tuning(&self.config.tuning),
+                );
                 let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(None);
                 let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, None);
                 crate::steer_plan::steer_plan_for_contract(
@@ -12548,6 +12547,8 @@ impl WaReserveTool {
 
 impl ToolHandler for WaReserveTool {
     fn definition(&self) -> Tool {
+        let reservation_config =
+            crate::storage::StorageConfig::from(self.config.as_ref()).reservation_config;
         Tool {
             name: "wa.reserve".to_string(),
             description: Some("Create an exclusive pane reservation (robot parity)".to_string()),
@@ -12558,7 +12559,7 @@ impl ToolHandler for WaReserveTool {
                     "owner_kind": { "type": "string", "description": "Kind of owner (workflow, agent, mcp, manual)" },
                     "owner_id": { "type": "string", "description": "Unique identifier for the owner" },
                     "reason": { "type": "string", "description": "Human-readable reason for reservation" },
-                    "ttl_ms": { "type": "integer", "minimum": 1000, "default": 300000, "description": "Time to live in milliseconds" }
+                    "ttl_ms": { "type": "integer", "minimum": 1000, "default": reservation_config.default_ttl_ms, "description": "Time to live in milliseconds" }
                 },
                 "required": ["pane_id", "owner_kind", "owner_id"],
                 "additionalProperties": false
@@ -12605,9 +12606,13 @@ impl ToolHandler for WaReserveTool {
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP reserve storage open.
                 let reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let storage = StorageHandle::new_with_cx(&reserve_cx, &db_path.to_string_lossy())
-                    .await
-                    .map_err(McpToolError::from_error)?;
+                let storage = StorageHandle::with_config_with_cx(
+                    &reserve_cx,
+                    &db_path.to_string_lossy(),
+                    crate::storage::StorageConfig::from(config.as_ref()),
+                )
+                .await
+                .map_err(McpToolError::from_error)?;
 
                 let mut engine = build_policy_engine_with_shared_rate_limiter(
                     &config,
@@ -12672,7 +12677,9 @@ impl ToolHandler for WaReserveTool {
                         &params.owner_kind,
                         &params.owner_id,
                         params.reason.as_deref(),
-                        params.ttl_ms,
+                        params
+                            .ttl_ms
+                            .unwrap_or(storage.reservation_config().default_ttl_ms),
                     )
                     .await
                     .map_err(McpToolError::from_error)?;
@@ -29030,6 +29037,56 @@ exit 17",
             .expect("wa.reserve should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.reserve should require pane_id");
+    }
+
+    #[test]
+    fn reserve_tool_uses_configured_default_and_writer_ttl_limits() {
+        for (requested_ttl, expected_ttl) in [
+            (None, 17_000),
+            (Some(7_000), 7_000),
+            (Some(0), 1_000),
+            (Some(i64::MIN), 1_000),
+            (Some(i64::MAX), 23_000),
+        ] {
+            let (_dir, path) = temp_db_path();
+            seed_event(path.as_path());
+            let mut config = Config::default();
+            config.storage.db_path = path.to_string_lossy().into_owned();
+            config.safety.reservations.default_ttl_secs = 17;
+            config.safety.reservations.max_ttl_secs = 23;
+            let tool = WaReserveTool::new(Arc::new(config), Arc::clone(&path));
+            assert_eq!(
+                tool.definition().input_schema["properties"]["ttl_ms"]["default"],
+                17_000
+            );
+            let mut arguments = serde_json::json!({
+                "pane_id": 7,
+                "owner_kind": "agent",
+                "owner_id": "configured-owner"
+            });
+            if let Some(ttl_ms) = requested_ttl {
+                arguments["ttl_ms"] = serde_json::json!(ttl_ms);
+            }
+
+            let envelope = parse_json_content(
+                tool.call(&test_mcp_context(), arguments)
+                    .expect("actual reservation handler"),
+            );
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            let reservation = &envelope["data"]["reservation"];
+            let actual_ttl = reservation["expires_at"].as_i64().unwrap()
+                - reservation["created_at"].as_i64().unwrap();
+            assert_eq!(actual_ttl, expected_ttl, "request: {requested_ttl:?}");
+            let connection = rusqlite::Connection::open(path.as_path()).unwrap();
+            let stored_ttl: i64 = connection
+                .query_row(
+                    "SELECT expires_at - created_at FROM pane_reservations WHERE id = ?1",
+                    [reservation["id"].as_i64().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored_ttl, expected_ttl);
+        }
     }
 
     // ========================================================================

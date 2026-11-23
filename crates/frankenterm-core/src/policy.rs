@@ -4690,6 +4690,10 @@ pub struct PolicyEngine {
     /// recent-gap gate has always fired unconditionally — this preserves that
     /// behavior while making the documented toggle honor a `false` config.
     block_recent_gap: bool,
+    /// Whether typed control actions and control bytes in text are permitted.
+    allow_control_chars: bool,
+    /// Whether direct callers may send text outside an identified workflow.
+    allow_arbitrary_text: bool,
     /// Command safety gate configuration
     command_gate: CommandGateConfig,
     /// Whether trauma-guard intervention is enabled.
@@ -4750,6 +4754,7 @@ impl PolicyEngine {
         rate_limit_global: u32,
         require_prompt_active: bool,
     ) -> Self {
+        let capabilities = crate::config::CapabilityConfig::default();
         Self {
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
                 rate_limit_per_pane,
@@ -4758,6 +4763,8 @@ impl PolicyEngine {
             require_prompt_active,
             block_alt_screen: false,
             block_recent_gap: true,
+            allow_control_chars: capabilities.allow_control_chars,
+            allow_arbitrary_text: capabilities.allow_arbitrary_text,
             command_gate: CommandGateConfig::default(),
             trauma_guard_enabled: true,
             trauma_guard_config: TraumaConfig::default(),
@@ -4808,8 +4815,8 @@ impl PolicyEngine {
     /// Create a policy engine from a `SafetyConfig`.
     ///
     /// This is the recommended constructor when building from TOML config,
-    /// since it wires command gate, policy rules, decision log, and trauma
-    /// guard settings in a single call.
+    /// since it wires input capabilities, command gate, policy rules,
+    /// redaction, decision log, and trauma guard settings in a single call.
     #[must_use]
     pub fn from_safety_config(config: &crate::config::SafetyConfig) -> Self {
         let mut engine = Self::new(
@@ -4823,6 +4830,8 @@ impl PolicyEngine {
         .with_trauma_guard_config(config.trauma_guard.clone())
         .with_policy_rules(config.rules.clone())
         .with_decision_log_config(config.decision_log.clone());
+        engine.allow_control_chars = config.capabilities.allow_control_chars;
+        engine.allow_arbitrary_text = config.capabilities.allow_arbitrary_text;
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
         engine.audit_chain = AuditChain::from_config(&config.audit_chain);
         engine.compliance_engine = ComplianceEngine::from_config(&config.compliance);
@@ -4943,6 +4952,15 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_command_gate_config(mut self, command_gate: CommandGateConfig) -> Self {
         self.command_gate = command_gate;
+        self
+    }
+
+    /// Override only prompt admission while preserving the remaining safety
+    /// configuration. Lifecycle operations and human workflow runners use
+    /// explicit prompt semantics rather than reconstructing a partial engine.
+    #[must_use]
+    pub fn with_require_prompt_active(mut self, require_prompt_active: bool) -> Self {
+        self.require_prompt_active = require_prompt_active;
         self
     }
 
@@ -7002,6 +7020,46 @@ impl PolicyEngine {
             None,
             Some("no reservation conflict".to_string()),
         );
+
+        // Operator capability restrictions are hard denials. Evaluate them
+        // before rate/prompt/gap approvals so an allow-once token or custom
+        // allow rule cannot authorize input forbidden by the configuration.
+        if !self.allow_control_chars {
+            let prohibited = match input.action {
+                ActionKind::SendCtrlC
+                | ActionKind::SendCtrlD
+                | ActionKind::SendCtrlZ
+                | ActionKind::SendControl => true,
+                ActionKind::SendText => input.command_text.as_deref().is_none_or(|text| {
+                    text.chars()
+                        .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
+                }),
+                _ => false,
+            };
+            if prohibited {
+                let reason = "safety.capabilities.allow_control_chars=false forbids control input; text must be available for inspection";
+                let rule = "policy.capabilities.control_chars";
+                context.record_rule(rule, true, Some("deny"), Some(reason.to_string()));
+                context.set_determining_rule(rule);
+                return PolicyDecision::deny_with_rule(reason, rule).with_context(context);
+            }
+        }
+        if !self.allow_arbitrary_text && input.action == ActionKind::SendText {
+            // A caller-supplied workflow ID is not authority: the dispatch
+            // surface must also identify the actor as the workflow executor.
+            let workflow_generated = input.actor == ActorKind::Workflow
+                && input
+                    .workflow_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty());
+            if !workflow_generated {
+                let reason = "safety.capabilities.allow_arbitrary_text=false permits text only from an identified workflow execution";
+                let rule = "policy.capabilities.arbitrary_text";
+                context.record_rule(rule, true, Some("deny"), Some(reason.to_string()));
+                context.set_determining_rule(rule);
+                return PolicyDecision::deny_with_rule(reason, rule).with_context(context);
+            }
+        }
 
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
@@ -11904,6 +11962,261 @@ mod tests {
             .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn configured_control_restriction_covers_actions_and_embedded_controls() {
+        let mut config = crate::config::SafetyConfig::default();
+        config.capabilities.allow_control_chars = false;
+        config.rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-all-input".to_string(),
+                description: None,
+                priority: 1,
+                match_on: PolicyRuleMatch::default(),
+                decision: PolicyRuleDecision::Allow,
+                message: None,
+            }],
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        for actor in [
+            ActorKind::Human,
+            ActorKind::Robot,
+            ActorKind::Mcp,
+            ActorKind::Workflow,
+        ] {
+            for action in [
+                ActionKind::SendCtrlC,
+                ActionKind::SendCtrlD,
+                ActionKind::SendCtrlZ,
+                ActionKind::SendControl,
+            ] {
+                let input = PolicyInput::new(action, actor)
+                    .with_pane(1)
+                    .with_workflow("wf-1")
+                    .with_capabilities(unreserved(PaneCapabilities::prompt()));
+                for decision in [engine.authorize(&input), engine.authorize_preview(&input)] {
+                    assert!(decision.is_denied(), "{actor:?} {action:?}: {decision:?}");
+                    assert_eq!(
+                        decision.rule_id(),
+                        Some("policy.capabilities.control_chars")
+                    );
+                }
+            }
+            for text in ["\0", "echo before\x03after", "\x1b[A", "\x7f", "\u{9b}31m"] {
+                let input = PolicyInput::new(ActionKind::SendText, actor)
+                    .with_pane(1)
+                    .with_command_text(text)
+                    .with_workflow("wf-1")
+                    .with_capabilities(unreserved(PaneCapabilities::prompt()));
+                let decision = engine.authorize(&input);
+                assert!(decision.is_denied(), "{actor:?}: {decision:?}");
+                assert_eq!(
+                    decision.rule_id(),
+                    Some("policy.capabilities.control_chars")
+                );
+            }
+        }
+        let unknown_text = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
+        assert_eq!(
+            engine.authorize(&unknown_text).rule_id(),
+            Some("policy.capabilities.control_chars"),
+            "a redacted summary cannot establish that the original input has no controls"
+        );
+        let ordinary_text =
+            unknown_text.with_command_text("plain text\twith a tab\r\nand Unicode λ");
+        assert!(engine.authorize(&ordinary_text).is_allowed());
+        assert!(
+            engine
+                .authorize(&PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn configured_text_restriction_requires_workflow_actor_and_execution_id() {
+        let mut config = crate::config::SafetyConfig::default();
+        config.capabilities.allow_arbitrary_text = false;
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        let make_input = |actor| {
+            PolicyInput::new(ActionKind::SendText, actor)
+                .with_pane(1)
+                .with_command_text("continue")
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
+        };
+        for actor in [ActorKind::Human, ActorKind::Robot, ActorKind::Mcp] {
+            let input = make_input(actor).with_workflow("forged-workflow-label");
+            let decision = engine.authorize(&input);
+            assert!(decision.is_denied(), "{actor:?}: {decision:?}");
+            assert_eq!(
+                decision.rule_id(),
+                Some("policy.capabilities.arbitrary_text")
+            );
+        }
+        for id in [None, Some(""), Some(" \n\t")] {
+            let mut input = make_input(ActorKind::Workflow);
+            input.workflow_id = id.map(str::to_owned);
+            assert_eq!(
+                engine.authorize_preview(&input).rule_id(),
+                Some("policy.capabilities.arbitrary_text")
+            );
+        }
+        let mut workflow = make_input(ActorKind::Workflow).with_workflow("wf-1");
+        assert!(engine.authorize(&workflow).is_allowed());
+        workflow.capabilities.alt_screen = Some(true);
+        assert!(engine.authorize(&workflow).requires_approval());
+        assert!(
+            engine
+                .authorize(&PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn capability_denial_precedes_approvable_state_and_custom_allow_rules() {
+        let mut config = crate::config::SafetyConfig::default();
+        config.capabilities.allow_arbitrary_text = false;
+        config.rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-all-input".to_string(),
+                description: None,
+                priority: 1,
+                match_on: PolicyRuleMatch::default(),
+                decision: PolicyRuleDecision::Allow,
+                message: None,
+            }],
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        let mut caps = unreserved(PaneCapabilities::unknown());
+        caps.has_recent_gap = true;
+        for capabilities in [caps, unreserved(PaneCapabilities::prompt())] {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(1)
+                .with_command_text("continue")
+                .with_capabilities(capabilities);
+            let decision = engine.authorize(&input);
+            assert!(decision.is_denied());
+            assert_eq!(
+                decision.rule_id(),
+                Some("policy.capabilities.arbitrary_text")
+            );
+        }
+        assert_eq!(engine.tracked_rate_limit_entry_count(), 0);
+    }
+
+    #[test]
+    fn default_input_capabilities_preserve_direct_and_workflow_behavior() {
+        let config = crate::config::SafetyConfig::default();
+        assert!(config.capabilities.allow_control_chars);
+        assert!(config.capabilities.allow_arbitrary_text);
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        for actor in [
+            ActorKind::Human,
+            ActorKind::Robot,
+            ActorKind::Mcp,
+            ActorKind::Workflow,
+        ] {
+            let input = PolicyInput::new(ActionKind::SendText, actor)
+                .with_pane(1)
+                .with_command_text("continue")
+                .with_capabilities(unreserved(PaneCapabilities::prompt()));
+            assert!(engine.authorize(&input).is_allowed());
+            let control = PolicyInput {
+                action: ActionKind::SendCtrlC,
+                ..input
+            };
+            let decision = engine.authorize(&control);
+            if actor == ActorKind::Human {
+                assert!(decision.is_allowed());
+            } else {
+                assert!(decision.requires_approval());
+                assert_eq!(decision.rule_id(), Some("policy.destructive_action"));
+            }
+        }
+    }
+
+    #[test]
+    fn configured_capabilities_prevent_live_and_detached_injector_effects() {
+        run_async_test(async {
+            let mut config = crate::config::SafetyConfig::default();
+            config.capabilities.allow_control_chars = false;
+            config.capabilities.allow_arbitrary_text = false;
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let mut injector =
+                PolicyGatedInjector::new(PolicyEngine::from_safety_config(&config), handle);
+            let caps = unreserved(PaneCapabilities::prompt());
+            let cx = crate::cx::for_request();
+            let before = mock.pane_state(42).await.unwrap().content;
+            for (action, actor, text, workflow) in [
+                (
+                    ActionKind::SendText,
+                    ActorKind::Robot,
+                    "must-not-run",
+                    Some("wf-1"),
+                ),
+                (
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    "missing-id",
+                    None,
+                ),
+                (
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    "\x03",
+                    Some("wf-1"),
+                ),
+                (
+                    ActionKind::SendCtrlC,
+                    ActorKind::Workflow,
+                    "\x03",
+                    Some("wf-1"),
+                ),
+            ] {
+                let direct = injector
+                    .inject_with_cx(&cx, 42, text, action, actor, &caps, workflow)
+                    .await;
+                assert!(
+                    matches!(direct, InjectionResult::Denied { .. }),
+                    "{direct:?}"
+                );
+                let detached = injector
+                    .inject_with_cx_detached(&cx, 42, text, action, actor, &caps, workflow)
+                    .await;
+                assert!(
+                    matches!(detached, InjectionResult::Denied { .. }),
+                    "{detached:?}"
+                );
+                assert_eq!(mock.pane_state(42).await.unwrap().content, before);
+            }
+            let permitted = injector
+                .send_text_with_cx(
+                    &cx,
+                    42,
+                    "continue\n",
+                    ActorKind::Workflow,
+                    &caps,
+                    Some("wf-1"),
+                )
+                .await;
+            assert!(
+                matches!(permitted, InjectionResult::Allowed { .. }),
+                "{permitted:?}"
+            );
+            assert!(
+                mock.pane_state(42)
+                    .await
+                    .unwrap()
+                    .content
+                    .contains("continue")
+            );
+        });
     }
 
     #[test]

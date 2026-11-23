@@ -1963,9 +1963,9 @@ SEE ALSO:
         /// Pane ID to reserve
         pane_id: u64,
 
-        /// TTL in seconds (default: 1800 = 30 minutes)
-        #[arg(long, default_value = "1800")]
-        ttl: u64,
+        /// TTL in seconds (defaults to safety.reservations.default_ttl_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
 
         /// Owner kind (workflow, agent, manual)
         #[arg(long, default_value = "manual")]
@@ -3078,9 +3078,9 @@ enum InterveneCommands {
         #[arg(long)]
         reason: Option<String>,
 
-        /// Reservation TTL in seconds
-        #[arg(long, default_value = "1800")]
-        ttl: u64,
+        /// Reservation TTL in seconds (defaults to safety.reservations.default_ttl_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
 
         /// Approval code to consume inline if policy requires approval
         #[arg(long)]
@@ -3122,9 +3122,9 @@ enum InterveneCommands {
         #[arg(long)]
         reason: String,
 
-        /// Reservation TTL in seconds
-        #[arg(long, default_value = "1800")]
-        ttl: u64,
+        /// Reservation TTL in seconds (defaults to safety.reservations.default_ttl_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
 
         /// Approval code to consume inline if policy requires approval
         #[arg(long)]
@@ -3148,9 +3148,9 @@ enum InterveneCommands {
         #[arg(long)]
         reason: Option<String>,
 
-        /// Reservation TTL in seconds
-        #[arg(long, default_value = "1800")]
-        ttl: u64,
+        /// Reservation TTL in seconds (defaults to safety.reservations.default_ttl_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
 
         /// Approval code to consume inline if policy requires approval
         #[arg(long)]
@@ -5680,9 +5680,9 @@ enum RobotReservationCommands {
         /// Pane ID to reserve
         pane_id: u64,
 
-        /// TTL in seconds (default: 1800 = 30 minutes)
-        #[arg(long, default_value = "1800")]
-        ttl: u64,
+        /// TTL in seconds (defaults to safety.reservations.default_ttl_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
 
         /// Owner kind (workflow, agent, manual)
         #[arg(long, default_value = "agent")]
@@ -23882,14 +23882,9 @@ async fn authorize_robot_event_mutation(
     };
     use frankenterm_core::storage::PolicyDeniedAuditRecord;
 
-    let mut engine = PolicyEngine::new(
-        config.safety.rate_limit_per_pane,
-        config.safety.rate_limit_global,
-        false,
-    )
-    .with_tuning(&config.tuning)
-    .with_command_gate_config(config.safety.command_gate.clone())
-    .with_policy_rules(config.safety.rules.clone());
+    let mut engine = PolicyEngine::from_safety_config(&config.safety)
+        .with_require_prompt_active(false)
+        .with_tuning(&config.tuning);
 
     let redacted = redact_for_output(summary);
     let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Robot)
@@ -24000,14 +23995,9 @@ async fn authorize_read_or_search_policy(
     pane_id: Option<u64>,
     summary: &str,
 ) -> Result<(frankenterm_core::policy::PolicyDecision, Option<String>), String> {
-    let mut engine = frankenterm_core::policy::PolicyEngine::new(
-        config.safety.rate_limit_per_pane,
-        config.safety.rate_limit_global,
-        false,
-    )
-    .with_tuning(&config.tuning)
-    .with_command_gate_config(config.safety.command_gate.clone())
-    .with_policy_rules(config.safety.rules.clone());
+    let mut engine = frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+        .with_require_prompt_active(false)
+        .with_tuning(&config.tuning);
 
     let redacted_summary = redact_for_output(summary);
     let mut input = frankenterm_core::policy::PolicyInput::new(action, actor)
@@ -24760,6 +24750,15 @@ impl InterventionVerb {
     }
 }
 
+fn reservation_ttl_ms(
+    ttl_secs: Option<u64>,
+    config: &frankenterm_core::storage::PaneReservationConfig,
+) -> i64 {
+    ttl_secs.map_or(config.default_ttl_ms, |seconds| {
+        i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
+    })
+}
+
 fn reservation_info_from_record(
     r: frankenterm_core::storage::PaneReservation,
 ) -> RobotReservationInfo {
@@ -25193,14 +25192,7 @@ fn build_send_dry_run_report(
         capabilities.has_recent_gap,
     );
 
-    let mut engine = PolicyEngine::new(
-        config.safety.rate_limit_per_pane,
-        config.safety.rate_limit_global,
-        config.safety.require_prompt_active,
-    )
-    .with_tuning(&config.tuning)
-    .with_command_gate_config(config.safety.command_gate.clone())
-    .with_policy_rules(config.safety.rules.clone());
+    let mut engine = PolicyEngine::from_safety_config(&config.safety).with_tuning(&config.tuning);
 
     let summary = bounded_send_text_summary(&engine, text);
     let input = build_mux_send_policy_input(
@@ -47670,7 +47662,7 @@ async fn run_distributed_agent(
     };
 
     let db_path = layout.db_path.to_string_lossy();
-    let storage_config = frankenterm_core::storage::StorageConfig::from(&config.storage);
+    let storage_config = frankenterm_core::storage::StorageConfig::from(config);
     // ft-xbnl0.2.3 tick 299: cx-first distributed agent storage open.
     let storage_open_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -48475,7 +48467,7 @@ async fn run_watcher(
 
     // Create storage handle
     let db_path = layout.db_path.to_string_lossy();
-    let storage_config = frankenterm_core::storage::StorageConfig::from(&config.storage);
+    let storage_config = frankenterm_core::storage::StorageConfig::from(&config);
     let requested_recorder_backend = config.storage.recorder_backend;
     let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
     let recorder_rusqlite_config = recorder_rusqlite_storage_config(layout, &config);
@@ -48881,8 +48873,7 @@ async fn run_watcher(
     // Set up workflow runner if auto_handle is enabled
     let workflow_runner_handle = if auto_handle {
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
-        let workflow_storage_config =
-            frankenterm_core::storage::StorageConfig::from(&config.storage);
+        let workflow_storage_config = frankenterm_core::storage::StorageConfig::from(&config);
         // ft-xbnl0.2.3 tick 299: cx-first workflow storage open.
         let wf_storage_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -52773,15 +52764,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 // (ft-y4iz3).
                                 let outbound_submit_text: &str = &text;
 
-                                let engine = PolicyEngine::new(
-                                    config.safety.rate_limit_per_pane,
-                                    config.safety.rate_limit_global,
-                                    config.safety.require_prompt_active,
-                                )
-                                .with_tuning(&config.tuning)
-                                .with_command_gate_config(config.safety.command_gate.clone())
-                                .with_trauma_guard_config(config.safety.trauma_guard.clone())
-                                .with_policy_rules(config.safety.rules.clone());
+                                let engine = PolicyEngine::from_safety_config(&config.safety)
+                                    .with_tuning(&config.tuning);
                                 // Serialize fresh authority reads and the entire
                                 // write/ENTER effect with reservation changes.
                                 let effect_fence = match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(storage.db_path())) {
@@ -57235,14 +57219,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     // construction at main.rs:17652 so a workflow's
                                     // PolicyGatedInjector has the same gates the direct
                                     // send path does.
-                                    let policy_engine = PolicyEngine::new(
-                                        config.safety.rate_limit_per_pane,
-                                        config.safety.rate_limit_global,
-                                        config.safety.require_prompt_active,
-                                    )
-                                    .with_tuning(&config.tuning)
-                                    .with_command_gate_config(config.safety.command_gate.clone())
-                                    .with_policy_rules(config.safety.rules.clone());
+                                    let policy_engine =
+                                        PolicyEngine::from_safety_config(&config.safety)
+                                            .with_tuning(&config.tuning);
                                     let policy_engine = with_persisted_kill_switch(
                                         policy_engine,
                                         &storage,
@@ -58958,16 +58937,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
-                                                frankenterm_core::policy::PolicyEngine::new(
-                                                    config.safety.rate_limit_per_pane,
-                                                    config.safety.rate_limit_global,
-                                                    config.safety.require_prompt_active,
+                                                frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                                    &config.safety,
                                                 )
-                                                .with_tuning(&config.tuning)
-                                                .with_command_gate_config(
-                                                    config.safety.command_gate.clone(),
-                                                )
-                                                .with_policy_rules(config.safety.rules.clone()),
+                                                .with_tuning(&config.tuning),
                                                 &storage,
                                                 "robot tx",
                                             )
@@ -59213,16 +59186,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     {
                                         let policy_engine = std::cell::RefCell::new(
                                             with_persisted_kill_switch(
-                                                frankenterm_core::policy::PolicyEngine::new(
-                                                    config.safety.rate_limit_per_pane,
-                                                    config.safety.rate_limit_global,
-                                                    config.safety.require_prompt_active,
+                                                frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                                    &config.safety,
                                                 )
-                                                .with_tuning(&config.tuning)
-                                                .with_command_gate_config(
-                                                    config.safety.command_gate.clone(),
-                                                )
-                                                .with_policy_rules(config.safety.rules.clone()),
+                                                .with_tuning(&config.tuning),
                                                 &storage,
                                                 "robot tx",
                                             )
@@ -60248,14 +60215,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             };
 
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match frankenterm_core::storage::StorageHandle::new(
-                                &db_path,
-                            )
-                            .await
-                            {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    let response =
+                            let storage =
+                                match frankenterm_core::storage::StorageHandle::with_config(
+                                    &db_path,
+                                    frankenterm_core::storage::StorageConfig::from(&config),
+                                )
+                                .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let response =
                                             RobotResponse::<RobotReservationsListData>::error_with_code(
                                                 ROBOT_ERR_STORAGE,
                                                 format!("Failed to open storage: {e}"),
@@ -60265,10 +60234,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 ),
                                                 elapsed_ms(start),
                                             );
-                                    print_robot_response(&response, format, stats)?;
-                                    return Ok(());
-                                }
-                            };
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
 
                             match command {
                                 RobotReservationCommands::Reserve {
@@ -60278,7 +60247,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     owner_id,
                                     reason,
                                 } => {
-                                    let ttl_ms = (ttl * 1000) as i64;
+                                    let ttl_ms =
+                                        reservation_ttl_ms(ttl, storage.reservation_config());
                                     match storage
                                         .create_reservation(
                                             pane_id,
@@ -63509,14 +63479,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // Claude Code submitting (ft-y4iz3).
                 let outbound_submit_text: &str = &text;
 
-                let engine = frankenterm_core::policy::PolicyEngine::new(
-                    config.safety.rate_limit_per_pane,
-                    config.safety.rate_limit_global,
-                    config.safety.require_prompt_active,
-                )
-                .with_tuning(&config.tuning)
-                .with_command_gate_config(config.safety.command_gate.clone())
-                .with_policy_rules(config.safety.rules.clone());
+                let engine =
+                    frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                        .with_tuning(&config.tuning);
                 let effect_fence =
                     match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(
                         Path::new(storage.db_path()),
@@ -64077,12 +64042,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
 
                         // Human mode requires prompt active
-                        let policy_engine = PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            true, // Require prompt active for human mode
-                        )
-                        .with_tuning(&config.tuning);
+                        let policy_engine = PolicyEngine::from_safety_config(&config.safety)
+                            .with_require_prompt_active(true)
+                            .with_tuning(&config.tuning);
                         let policy_engine =
                             with_persisted_kill_switch(policy_engine, &storage, "workflow run")
                                 .await;
@@ -65699,14 +65661,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .with_surface(frankenterm_core::policy::PolicySurface::Robot)
                     .with_actor(frankenterm_core::policy::ActorKind::Robot);
                     if let Ok(storage) = storage_result.as_ref() {
-                        let base_engine = frankenterm_core::policy::PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            config.safety.require_prompt_active,
-                        )
-                        .with_tuning(&config.tuning)
-                        .with_command_gate_config(config.safety.command_gate.clone())
-                        .with_policy_rules(config.safety.rules.clone());
+                        let base_engine =
+                            frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                &config.safety,
+                            )
+                            .with_tuning(&config.tuning);
                         let engine =
                             with_persisted_kill_switch(base_engine, storage, "steer plan").await;
                         let persisted_ks = match engine.kill_switch_state().level {
@@ -65757,7 +65716,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         // Fail closed when storage is unavailable: we cannot verify
                         // persisted kill-switch state, approvals, or live targets.
                         let policy_engine = std::cell::RefCell::new(
-                            frankenterm_core::policy::PolicyEngine::strict(),
+                            frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                &config.safety,
+                            )
+                            .with_require_prompt_active(true)
+                            .with_tuning(&config.tuning),
                         );
                         let approvals =
                             frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(None);
@@ -66159,14 +66122,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                     let policy_engine = std::cell::RefCell::new(
                         with_persisted_kill_switch(
-                            frankenterm_core::policy::PolicyEngine::new(
-                                config.safety.rate_limit_per_pane,
-                                config.safety.rate_limit_global,
-                                config.safety.require_prompt_active,
+                            frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                &config.safety,
                             )
-                            .with_tuning(&config.tuning)
-                            .with_command_gate_config(config.safety.command_gate.clone())
-                            .with_policy_rules(config.safety.rules.clone()),
+                            .with_tuning(&config.tuning),
                             &storage,
                             "steer run",
                         )
@@ -66882,14 +66841,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .await;
                 let capabilities = resolution.capabilities;
 
-                let mut engine = frankenterm_core::policy::PolicyEngine::new(
-                    config.safety.rate_limit_per_pane,
-                    config.safety.rate_limit_global,
-                    config.safety.require_prompt_active,
-                )
-                .with_tuning(&config.tuning)
-                .with_command_gate_config(config.safety.command_gate.clone())
-                .with_policy_rules(config.safety.rules.clone());
+                let mut engine =
+                    frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                        .with_tuning(&config.tuning);
 
                 let summary = bounded_send_text_summary(&engine, &text);
                 let input = build_mux_send_policy_input(
@@ -67163,14 +67117,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         .flatten()
                         .and_then(|record| record.pane_uuid);
 
-                    let engine = frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        config.safety.require_prompt_active,
-                    )
-                    .with_tuning(&config.tuning)
-                    .with_command_gate_config(config.safety.command_gate.clone())
-                    .with_policy_rules(config.safety.rules.clone());
+                    let engine =
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_tuning(&config.tuning);
                     let mut engine =
                         with_persisted_kill_switch(engine, &storage, "prepare workflow run").await;
 
@@ -67516,14 +67465,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await;
                     let capabilities = resolution.capabilities;
 
-                    let engine = frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        config.safety.require_prompt_active,
-                    )
-                    .with_tuning(&config.tuning)
-                    .with_command_gate_config(config.safety.command_gate.clone())
-                    .with_policy_rules(config.safety.rules.clone());
+                    let engine =
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_tuning(&config.tuning);
 
                     let mut engine =
                         with_persisted_kill_switch(engine, &storage, "commit send").await;
@@ -67811,14 +67755,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         exit_on_commit_validation_error(err, &plan_id);
                     }
 
-                    let engine = frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        config.safety.require_prompt_active,
-                    )
-                    .with_tuning(&config.tuning)
-                    .with_command_gate_config(config.safety.command_gate.clone())
-                    .with_policy_rules(config.safety.rules.clone());
+                    let engine =
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_tuning(&config.tuning);
                     let mut engine = with_persisted_kill_switch(
                         engine,
                         &storage,
@@ -67904,12 +67843,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let lock_manager = std::sync::Arc::new(
                         frankenterm_core::workflows::PaneWorkflowLockManager::new(),
                     );
-                    let policy_engine = frankenterm_core::policy::PolicyEngine::new(
-                        config.safety.rate_limit_per_pane,
-                        config.safety.rate_limit_global,
-                        true,
-                    )
-                    .with_tuning(&config.tuning);
+                    let policy_engine =
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_require_prompt_active(true)
+                            .with_tuning(&config.tuning);
                     let policy_engine = with_persisted_kill_switch(
                         policy_engine,
                         &storage,
@@ -68342,7 +68279,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     InterventionVerb::Resume,
                     pane_id,
                     InterventionVerb::Resume.default_reason().to_string(),
-                    0,
+                    None,
                     approval_code,
                     dry_run,
                     json,
@@ -68385,17 +68322,20 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let db_path = layout.db_path.to_string_lossy();
             let storage_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            let storage =
-                match frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Error: Failed to open database: {e}");
-                        eprintln!("Is the watcher running? Try: ft watch --foreground");
-                        std::process::exit(1);
-                    }
-                };
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
+                &storage_cx,
+                &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open database: {e}");
+                    eprintln!("Is the watcher running? Try: ft watch --foreground");
+                    std::process::exit(1);
+                }
+            };
             let workspace_id = layout.root.to_string_lossy().to_string();
             let _ = storage.expire_stale_reservations_with_cx(&storage_cx).await;
 
@@ -68414,14 +68354,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             .await
             .capabilities;
 
-            let engine = frankenterm_core::policy::PolicyEngine::new(
-                config.safety.rate_limit_per_pane,
-                config.safety.rate_limit_global,
-                config.safety.require_prompt_active,
-            )
-            .with_tuning(&config.tuning)
-            .with_command_gate_config(config.safety.command_gate.clone())
-            .with_policy_rules(config.safety.rules.clone());
+            let engine = frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                .with_tuning(&config.tuning);
             let mut engine = with_persisted_kill_switch(engine, &storage, "intervene").await;
             let raw_summary = format!(
                 "ft intervene {} pane={} reason={}",
@@ -68481,8 +68415,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         InterventionVerb::Pause
                         | InterventionVerb::Quarantine
                         | InterventionVerb::Takeover => {
-                            let ttl_ms =
-                                i64::try_from(ttl.saturating_mul(1000)).unwrap_or(i64::MAX);
+                            let ttl_ms = reservation_ttl_ms(ttl, storage.reservation_config());
                             match storage
                                 .create_reservation_with_cx(
                                     &storage_cx,
@@ -72537,11 +72470,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // ft-xbnl0.2.3 tick 300: cx-first storage open + create reservation.
             let reservation_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            let storage =
-                frankenterm_core::storage::StorageHandle::new_with_cx(&reservation_cx, &db_path)
-                    .await?;
+            let storage = frankenterm_core::storage::StorageHandle::with_config_with_cx(
+                &reservation_cx,
+                &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
+            )
+            .await?;
 
-            let ttl_ms = (ttl * 1000) as i64;
+            let ttl_ms = reservation_ttl_ms(ttl, storage.reservation_config());
             match storage
                 .create_reservation_with_cx(
                     &reservation_cx,
@@ -74379,14 +74315,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .await
                 {
                     Ok(storage) => {
-                        let base_engine = frankenterm_core::policy::PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            config.safety.require_prompt_active,
-                        )
-                        .with_tuning(&config.tuning)
-                        .with_command_gate_config(config.safety.command_gate.clone())
-                        .with_policy_rules(config.safety.rules.clone());
+                        let base_engine =
+                            frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                &config.safety,
+                            )
+                            .with_tuning(&config.tuning);
                         let engine = with_persisted_kill_switch(
                             base_engine,
                             &storage,
@@ -81837,14 +81770,8 @@ async fn handle_tx_command(
             let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
-                        frankenterm_core::policy::PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            config.safety.require_prompt_active,
-                        )
-                        .with_tuning(&config.tuning)
-                        .with_command_gate_config(config.safety.command_gate.clone())
-                        .with_policy_rules(config.safety.rules.clone()),
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_tuning(&config.tuning),
                         &storage,
                         "tx",
                     )
@@ -82049,14 +81976,8 @@ async fn handle_tx_command(
             let data = if let Some((storage, wezterm, tx_storage)) = real_runtime {
                 let policy_engine = std::cell::RefCell::new(
                     with_persisted_kill_switch(
-                        frankenterm_core::policy::PolicyEngine::new(
-                            config.safety.rate_limit_per_pane,
-                            config.safety.rate_limit_global,
-                            config.safety.require_prompt_active,
-                        )
-                        .with_tuning(&config.tuning)
-                        .with_command_gate_config(config.safety.command_gate.clone())
-                        .with_policy_rules(config.safety.rules.clone()),
+                        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                            .with_tuning(&config.tuning),
                         &storage,
                         "tx",
                     )
@@ -129818,6 +129739,43 @@ printf x > "$MINISIGN_MARKER"
     }
 
     #[test]
+    fn send_dry_run_honors_configured_input_capabilities() {
+        use frankenterm_core::policy::{ActorKind, PaneCapabilities};
+
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.capabilities.allow_arbitrary_text = false;
+        config.safety.capabilities.allow_control_chars = false;
+        let mut capabilities = PaneCapabilities::prompt();
+        capabilities.is_reserved = Some(false);
+        let command_ctx = frankenterm_core::dry_run::CommandContext::new("ft send --dry-run", true);
+        for (text, expected_rule) in [
+            ("continue", "policy.capabilities.arbitrary_text"),
+            ("\x03", "policy.capabilities.control_chars"),
+        ] {
+            let report = build_send_dry_run_report(
+                &command_ctx,
+                42,
+                None,
+                Some(&capabilities),
+                text,
+                false,
+                None,
+                10,
+                &config,
+                ActorKind::Robot,
+            );
+            let evaluation = report.policy_evaluation.expect("policy evaluation");
+            let decision = evaluation
+                .checks
+                .iter()
+                .find(|check| check.name == "policy")
+                .expect("actual policy decision");
+            assert!(!decision.passed);
+            assert_eq!(decision.details, Some(format!("rule: {expected_rule}")));
+        }
+    }
+
+    #[test]
     fn send_dry_run_report_includes_mux_policy_surface_check() {
         let config = frankenterm_core::config::Config::default();
         let command_ctx =
@@ -133395,6 +133353,67 @@ printf x > "$MINISIGN_MARKER"
     // =========================================================================
     // Reservation data structure tests
     // =========================================================================
+
+    #[test]
+    fn reservation_cli_ttl_preserves_omission_and_explicit_values() {
+        let commands: &[&[&str]] = &[
+            &["ft", "reserve", "7"],
+            &[
+                "ft",
+                "robot",
+                "reservations",
+                "reserve",
+                "7",
+                "--owner-id",
+                "agent",
+            ],
+            &["ft", "intervene", "pause", "7"],
+            &["ft", "intervene", "quarantine", "7", "--reason", "review"],
+            &["ft", "intervene", "takeover", "7"],
+        ];
+        for command in commands {
+            for requested in [None, Some(0), Some(37), Some(u64::MAX)] {
+                let mut arguments = command.to_vec();
+                let ttl_text = requested.map(|value| value.to_string());
+                if let Some(value) = ttl_text.as_deref() {
+                    arguments.extend(["--ttl", value]);
+                }
+                let cli = Cli::try_parse_from(arguments).expect("reservation CLI parses");
+                let parsed_ttl = match *cli.command.expect("reservation command") {
+                    Commands::Reserve { ttl, .. } => ttl,
+                    Commands::Robot {
+                        command:
+                            Some(RobotCommands::Reservations {
+                                command: RobotReservationCommands::Reserve { ttl, .. },
+                            }),
+                        ..
+                    } => ttl,
+                    Commands::Intervene {
+                        command:
+                            InterveneCommands::Pause { ttl, .. }
+                            | InterveneCommands::Quarantine { ttl, .. }
+                            | InterveneCommands::Takeover { ttl, .. },
+                    } => ttl,
+                    _ => panic!("unexpected reservation command"),
+                };
+                assert_eq!(parsed_ttl, requested, "command: {command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_ttl_conversion_uses_config_without_wrapping() {
+        let config = frankenterm_core::storage::PaneReservationConfig {
+            default_ttl_ms: 17_000,
+            max_ttl_ms: 23_000,
+        };
+        assert_eq!(reservation_ttl_ms(None, &config), 17_000);
+        assert_eq!(reservation_ttl_ms(Some(7), &config), 7_000);
+        assert_eq!(reservation_ttl_ms(Some(0), &config), 0);
+        assert_eq!(reservation_ttl_ms(Some(u64::MAX), &config), i64::MAX);
+        // The durable writer applies the configured cap after conversion.
+        assert_eq!(reservation_ttl_ms(Some(30), &config), 30_000);
+    }
 
     #[test]
     fn robot_reservation_info_json_schema() {

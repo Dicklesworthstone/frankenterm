@@ -80,16 +80,20 @@ fn config_default_validates() {
 
 #[test]
 fn safety_blocks_are_not_silently_ignored() {
-    // ft-1t4o4: four [safety.*] blocks + the approval reapproval flag have no
-    // behavior-affecting production consumer, so a customized value must fail
-    // closed (a silent no-op here is a false sense of safety — e.g. dropped
-    // custom redaction patterns can leak secrets).
+    // The remaining unsupported safety controls fail closed individually.
+    // Custom redaction patterns and input capability restrictions now have
+    // real consumers; rejecting those would disable supported functionality.
     assert_rejects("safety", "safety.redaction", |c| {
         c.safety.redaction.enabled = !c.safety.redaction.enabled;
     });
-    assert_rejects("safety", "safety.capabilities", |c| {
-        c.safety.capabilities.allow_control_chars = !c.safety.capabilities.allow_control_chars;
+    assert_rejects("safety", "safety.capabilities.allow_non_agent_panes", |c| {
+        c.safety.capabilities.allow_non_agent_panes = true
     });
+    assert_rejects(
+        "safety",
+        "safety.capabilities.confirm_dangerous_patterns",
+        |c| c.safety.capabilities.confirm_dangerous_patterns = false,
+    );
     assert_rejects("safety", "safety.reservations", |c| {
         // Flip a bound-free bool so `SafetyConfig::validate` (which runs before
         // the inline fail-closed reject) cannot fire a different cross-field
@@ -111,11 +115,53 @@ fn safety_blocks_are_not_silently_ignored() {
 }
 
 #[test]
+fn input_capability_config_changes_production_policy_decisions() {
+    use frankenterm_core::policy::{
+        ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput,
+    };
+
+    let mut config = Config::from_toml(
+        r#"
+        [safety.capabilities]
+        allow_control_chars = false
+        allow_arbitrary_text = false
+        "#,
+    )
+    .expect("supported capability controls must load from TOML");
+    let mut caps = PaneCapabilities::prompt();
+    caps.is_reserved = Some(false);
+    let text = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+        .with_pane(1)
+        .with_command_text("continue")
+        .with_capabilities(caps.clone());
+    let control = PolicyInput::new(ActionKind::SendCtrlC, ActorKind::Human)
+        .with_pane(1)
+        .with_capabilities(caps);
+    let mut restricted = PolicyEngine::from_safety_config(&config.safety);
+    for (input, expected_rule) in [
+        (&text, "policy.capabilities.arbitrary_text"),
+        (&control, "policy.capabilities.control_chars"),
+    ] {
+        let decision = restricted.authorize(input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some(expected_rule));
+    }
+
+    config.safety.capabilities.allow_control_chars = true;
+    config.safety.capabilities.allow_arbitrary_text = true;
+    config
+        .validate()
+        .expect("default input capabilities validate");
+    let mut unrestricted = PolicyEngine::from_safety_config(&config.safety);
+    assert!(unrestricted.authorize(&text).is_allowed());
+    assert!(unrestricted.authorize(&control).is_allowed());
+}
+
+#[test]
 fn ingest_fields_are_not_silently_ignored() {
-    // ft-ta5as: four [ingest] fields are parsed/documented but unconsumed
-    // (backpressure uses a fixed tailer threshold, gap recording is
-    // unconditional, no percentage heuristic, and the persist ceiling comes
-    // from tuning.ingest.max_persist_segment_bytes).
+    // These three ingest fields remain unconsumed: backpressure uses a fixed
+    // tailer threshold, gap recording is unconditional, and no percentage
+    // heuristic is wired. The segment ceiling is now consumed by persistence.
     assert_rejects("ingest", "ingest.backpressure_threshold", |c| {
         c.ingest.backpressure_threshold = c.ingest.backpressure_threshold.wrapping_add(1);
     });
@@ -126,8 +172,10 @@ fn ingest_fields_are_not_silently_ignored() {
         c.ingest.gap_detection_threshold_percent =
             c.ingest.gap_detection_threshold_percent.wrapping_add(1);
     });
-    assert_rejects("ingest", "ingest.max_segment_bytes", |c| {
-        c.ingest.max_segment_bytes = c.ingest.max_segment_bytes.wrapping_add(1);
+    // runtime_segment_limit_preserves_gap_and_reload_semantics exercises the
+    // actual persistence consumer; this matrix must accept its operator input.
+    assert_accepts("ingest.max_segment_bytes", |c| {
+        c.ingest.max_segment_bytes = 4096;
     });
 }
 

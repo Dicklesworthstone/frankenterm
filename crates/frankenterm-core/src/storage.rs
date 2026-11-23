@@ -1293,6 +1293,7 @@ enum WriteCommand {
         owner_id: String,
         reason: Option<String>,
         ttl_ms: i64,
+        config: PaneReservationConfig,
         respond: oneshot::Sender<Result<PaneReservation>>,
     },
     /// Release a pane reservation by ID
@@ -1650,6 +1651,8 @@ pub struct StorageConfig {
     pub write_queue_size: usize,
     /// Maximum number of idle read connections retained per database path.
     pub read_pool_size: usize,
+    /// Reservation TTL policy applied by the writer to every new lease.
+    pub reservation_config: PaneReservationConfig,
     /// [ft-wk5fo] Opt out of the synchronous FTS5 triggers.
     ///
     /// When `true`, the three `output_segments_a[iud]` triggers at
@@ -1698,6 +1701,7 @@ impl Default for StorageConfig {
         Self {
             write_queue_size: 1024,
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
+            reservation_config: PaneReservationConfig::default(),
             defer_fts_triggers: false,
             group_commit_events: false,
             group_commit_adaptive: false,
@@ -1721,6 +1725,16 @@ impl From<&crate::config::StorageConfig> for StorageConfig {
             read_pool_size: (app.read_pool_size as usize).max(1),
             // `defer_fts_triggers` is not exposed via `[storage]`; keep default.
             ..StorageConfig::default()
+        }
+    }
+}
+
+impl From<&crate::config::Config> for StorageConfig {
+    /// Include safety settings whenever opening a production reservation writer.
+    fn from(app: &crate::config::Config) -> Self {
+        Self {
+            reservation_config: PaneReservationConfig::from(&app.safety.reservations),
+            ..Self::from(&app.storage)
         }
     }
 }
@@ -3221,6 +3235,8 @@ pub struct StorageHandle {
     backend_provider: Arc<dyn StorageBackendProvider>,
     /// Configured idle read-pool capacity for this handle's default provider.
     read_pool_size: usize,
+    /// Immutable reservation policy shared by every clone of this handle.
+    reservation_config: PaneReservationConfig,
     /// Optional mmap mirror directory for segment fast-path reads.
     mmap_mirror_dir: Option<Arc<PathBuf>>,
     /// Durable writer join authority and terminal receipt, shared by clones.
@@ -4012,6 +4028,7 @@ impl StorageHandle {
         cx: Option<&crate::cx::Cx>,
         backend_provider: Arc<dyn StorageBackendProvider>,
     ) -> Result<Self> {
+        config.reservation_config.validate()?;
         if let Some(cx) = cx {
             Self::checkpoint_storage_open(cx, "before parent directory setup")?;
         }
@@ -4114,6 +4131,7 @@ impl StorageHandle {
             session_owner_identity: crate::session_retention::current_session_owner_identity(),
             backend_provider,
             read_pool_size: config.read_pool_size.max(1),
+            reservation_config: config.reservation_config,
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
             writer_join_state: Arc::new(WriterJoinAuthority::new(writer_handle)),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
@@ -10494,10 +10512,16 @@ impl StorageHandle {
     // Pane Reservation Operations
     // =========================================================================
 
+    /// Effective reservation limits for callers resolving an omitted TTL.
+    #[must_use]
+    pub fn reservation_config(&self) -> &PaneReservationConfig {
+        &self.reservation_config
+    }
+
     /// Create an exclusive pane reservation.
     ///
     /// Returns a conflict error if the pane already has an active reservation.
-    /// TTL is clamped to `[1s, max_ttl]` via `PaneReservationConfig`.
+    /// TTL is clamped to `[1s, max_ttl]` by the writer using this handle's policy.
     pub async fn create_reservation(
         &self,
         pane_id: u64,
@@ -10533,6 +10557,7 @@ impl StorageHandle {
                     owner_id: owner_id.to_string(),
                     reason: reason.map(String::from),
                     ttl_ms,
+                    config: self.reservation_config.clone(),
                     respond: tx,
                 },
             )
@@ -19897,6 +19922,7 @@ fn dispatch_write_command_raw(
             owner_id,
             reason,
             ttl_ms,
+            config,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -19907,6 +19933,7 @@ fn dispatch_write_command_raw(
                 &owner_id,
                 reason.as_deref(),
                 ttl_ms,
+                &config,
             );
             respond_oneshot_best_effort(respond, result);
         }
@@ -30392,7 +30419,9 @@ fn create_reservation_backend(
     owner_id: &str,
     reason: Option<&str>,
     ttl_ms: i64,
+    config: &PaneReservationConfig,
 ) -> Result<PaneReservation> {
+    config.validate()?;
     // The executing writer owns this guard through autocommit. Cancelling a
     // queued caller cannot release it. Never wait/retry here: a dispatch holding
     // the same fence may itself need the writer to service other commands.
@@ -30419,7 +30448,7 @@ fn create_reservation_backend(
         .into());
     }
 
-    let ttl_ms = PaneReservationConfig::default().clamp_ttl(ttl_ms);
+    let ttl_ms = config.clamp_ttl(ttl_ms);
     let expires_at = now
         .checked_add(ttl_ms)
         .ok_or_else(|| StorageError::Database("Pane reservation expiry overflowed".to_string()))?;
@@ -42494,7 +42523,10 @@ fn reservation_backend_refuses_unavailable_effect_authority_without_mutation() {
     std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
     with_test_storage_backend(&mut conn, |backend| {
         for error in [
-            create_reservation_backend(backend, 1, "workflow", "new", None, 60_000).unwrap_err(),
+            create_reservation_backend(
+                backend, 1, "workflow", "new", None, 60_000,
+                &PaneReservationConfig::default(),
+            ).unwrap_err(),
             release_reservation_backend(backend, 7).unwrap_err(),
             expire_stale_reservations_backend(backend).unwrap_err(),
         ] {
@@ -46714,6 +46746,7 @@ fn storage_handle_writer_queue_processes_all() {
             defer_fts_triggers: false,
             group_commit_events: false,
             group_commit_adaptive: false,
+            reservation_config: PaneReservationConfig::default(),
         };
         let storage = StorageHandle::with_config(&db_path_str, config)
             .await

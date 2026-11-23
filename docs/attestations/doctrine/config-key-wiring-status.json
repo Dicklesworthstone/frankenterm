@@ -111,20 +111,68 @@
       "validation": "Config::validate accepts valid custom regex patterns and non-empty placeholders, rejects invalid regexes/empty placeholders, and keeps enabled/redact_audit/redact_segments=false fail-closed"
     },
     {
-      "key": "safety.capabilities",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/confirm_dangerous_patterns are ignored — input gating uses runtime PaneCapabilities",
-      "tracking_bead": "ft-1t4o4",
-      "validation": "Config::validate rejects any non-default [safety.capabilities] block fail-closed"
+      "key": "safety.capabilities.allow_control_chars",
+      "status": "consumed",
+      "consumer": "crate::policy::PolicyEngine::evaluate_authorization",
+      "evidence": "configured false denies typed control actions and control characters embedded in SendText before approvable gates; tabs and line endings remain text",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "accepted for true and false; SendText without inspectable raw text fails closed when false; changing a running watcher's input capabilities requires restart"
     },
     {
-      "key": "safety.reservations",
+      "key": "safety.capabilities.allow_arbitrary_text",
+      "status": "consumed",
+      "consumer": "crate::policy::PolicyEngine::evaluate_authorization",
+      "evidence": "configured false permits SendText only for ActorKind::Workflow carrying a non-empty workflow execution ID; human, Robot and MCP callers cannot bypass it with an ID",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "accepted for true and false; independent command, prompt, reservation and control-character gates remain enforced; changing a running watcher's input capabilities requires restart"
+    },
+    {
+      "key": "safety.capabilities.allow_non_agent_panes",
       "status": "parsed_but_unconsumed",
       "consumer": "none",
-      "evidence": "default_ttl_secs/max_ttl_secs/conflict_behavior/auto_release_on_complete are ignored — TTL clamping uses the storage PaneReservationConfig",
+      "evidence": "production send paths do not consistently supply authoritative agent identity; runtime PaneCapabilities describes shell and reservation state only",
       "tracking_bead": "ft-1t4o4",
-      "validation": "Config::validate rejects any non-default [safety.reservations] block fail-closed"
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "safety.capabilities.confirm_dangerous_patterns",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "dangerous command handling is governed independently by safety.command_gate and cannot be bypassed with this flag",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "safety.reservations.default_ttl_secs",
+      "status": "consumed",
+      "consumer": "StorageConfig::from(&Config) -> StorageHandle reservation callers",
+      "evidence": "CLI, Robot, and MCP resolve an omitted reservation TTL from the configured storage policy",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate enforces positive, ordered TTLs representable as signed milliseconds"
+    },
+    {
+      "key": "safety.reservations.max_ttl_secs",
+      "status": "consumed",
+      "consumer": "StorageConfig::from(&Config) -> create_reservation_backend",
+      "evidence": "the database writer clamps every new reservation to the configured maximum before persisting expiry",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate enforces positive, ordered TTLs representable as signed milliseconds"
+    },
+    {
+      "key": "safety.reservations.conflict_behavior",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "active reservation conflicts are always denied; queue and force behavior are not implemented",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "safety.reservations.auto_release_on_complete",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "workflow completion does not consume this reservation setting",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects non-default values fail-closed"
     },
     {
       "key": "safety.semantic_shock",

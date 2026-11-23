@@ -906,12 +906,8 @@ pub(super) struct ReserveParams {
     pub owner_id: String,
     #[serde(default)]
     pub reason: Option<String>,
-    #[serde(default = "default_ttl_ms")]
-    pub ttl_ms: i64,
-}
-
-pub(super) fn default_ttl_ms() -> i64 {
-    300_000 // 5 minutes default
+    #[serde(default)]
+    pub ttl_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2228,7 +2224,7 @@ mod tests {
             prop_assert_eq!(&p.owner_kind, &owner_kind);
             prop_assert_eq!(&p.owner_id, &owner_id);
             prop_assert_eq!(p.reason, reason);
-            prop_assert_eq!(p.ttl_ms, ttl_ms);
+            prop_assert_eq!(p.ttl_ms, Some(ttl_ms));
         }
 
         // 30. ReserveParams defaults
@@ -2244,7 +2240,7 @@ mod tests {
                 "owner_id": owner_id,
             });
             let p: ReserveParams = serde_json::from_value(json).unwrap();
-            prop_assert_eq!(p.ttl_ms, 300_000);
+            prop_assert_eq!(p.ttl_ms, None);
         }
 
         // 31. ReleaseParams

@@ -159,7 +159,7 @@ use mcp_types::{
     McpPaneState, McpRuleItem, McpSearchHit, McpWaitForData, McpWorkflowRunData, TruncationInfo,
     apply_tail_truncation, default_cass_context_lines, default_cass_limit, default_cass_offset,
     default_cass_timeout_secs, default_events_limit, default_tail, default_timeout_secs,
-    default_ttl_ms, default_wait_tail,
+    default_wait_tail,
 };
 use mcp_types::{
     McpEnvelope, McpMissionAssignmentCounters, McpMissionAssignmentData,
@@ -350,15 +350,9 @@ fn reservation_to_mcp_info(r: &PaneReservation) -> McpReservationInfo {
 const MCP_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
 fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEngine {
-    PolicyEngine::new(
-        config.safety.rate_limit_per_pane,
-        config.safety.rate_limit_global,
-        require_prompt_active,
-    )
-    .with_tuning(&config.tuning)
-    .with_command_gate_config(config.safety.command_gate.clone())
-    .with_trauma_guard_config(config.safety.trauma_guard.clone())
-    .with_policy_rules(config.safety.rules.clone())
+    PolicyEngine::from_safety_config(&config.safety)
+        .with_require_prompt_active(require_prompt_active)
+        .with_tuning(&config.tuning)
 }
 
 fn build_mcp_shared_rate_limiter(config: &Config) -> SharedRateLimiter {
@@ -1071,6 +1065,46 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
+
+    #[test]
+    fn mcp_policy_builder_preserves_input_capabilities_and_custom_redaction() {
+        let mut config = Config::default();
+        config.safety.capabilities.allow_arbitrary_text = false;
+        config.safety.capabilities.allow_control_chars = false;
+        config.safety.redaction.patterns = vec!["private-value-[0-9]+".to_string()];
+        config.safety.redaction.placeholder = "[PRIVATE]".to_string();
+        config.validate().expect("valid policy configuration");
+        let mut caps = PaneCapabilities::prompt();
+        caps.is_reserved = Some(false);
+        for require_prompt_active in [false, true] {
+            let mut engine = build_policy_engine_with_shared_rate_limiter(
+                &config,
+                require_prompt_active,
+                build_mcp_shared_rate_limiter(&config),
+            );
+            assert_eq!(engine.redact_secrets("private-value-42"), "[PRIVATE]");
+            for (action, text, expected_rule) in [
+                (
+                    ActionKind::SendText,
+                    "continue",
+                    "policy.capabilities.arbitrary_text",
+                ),
+                (
+                    ActionKind::SendControl,
+                    "\x03",
+                    "policy.capabilities.control_chars",
+                ),
+            ] {
+                let input = PolicyInput::new(action, ActorKind::Mcp)
+                    .with_pane(42)
+                    .with_command_text(text)
+                    .with_capabilities(caps.clone());
+                let decision = engine.authorize(&input);
+                assert!(decision.is_denied());
+                assert_eq!(decision.rule_id(), Some(expected_rule));
+            }
+        }
+    }
 
     #[test]
     fn audit_queue_bounds_pending_jobs_and_survives_a_job_panic() {
@@ -3200,11 +3234,17 @@ mod tests {
     // Batch 2: RubyBeaver wa-1u90p.7.1 — map_*_error, struct serde, helpers
     // -----------------------------------------------------------------------
 
-    // ── default_ttl_ms ────────────────────────────────────────────────────
+    // ── reservation defaults ─────────────────────────────────────────────
 
     #[test]
-    fn default_ttl_ms_is_five_minutes() {
-        assert_eq!(default_ttl_ms(), 300_000);
+    fn reserve_params_defer_omitted_ttl_to_workspace_config() {
+        let params: mcp_types::ReserveParams = serde_json::from_value(serde_json::json!({
+            "pane_id": 7,
+            "owner_kind": "agent",
+            "owner_id": "mcp-client"
+        }))
+        .expect("reservation without an explicit TTL");
+        assert_eq!(params.ttl_ms, None);
     }
 
     // ── constants ─────────────────────────────────────────────────────────
