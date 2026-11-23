@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createFleetStream, createFleetRefresh } from "../../crates/frankenterm-browser-ui/web/app.mjs";
+import { createFleetStream, createFleetRefresh, createDetectionNotifications, notificationPaneExists } from "../../crates/frankenterm-browser-ui/web/app.mjs";
 
 const EPOCH = "0123456789abcdef0123456789abcdef";
 const OTHER_EPOCH = "fedcba9876543210fedcba9876543210";
@@ -59,6 +59,7 @@ function fixture({ reject = () => false, throwConstruct = false, resync = () => 
   const frames = [];
   const errors = [];
   const states = [];
+  const detections = [], checkpoints = [], halts = [];
   let nextTimer = 1;
   let resyncs = 0;
   class Source {
@@ -101,10 +102,13 @@ function fixture({ reject = () => false, throwConstruct = false, resync = () => 
     },
     clearTimer(id) { timers.delete(id); },
     onResync() { resyncs += 1; return resync(); },
+    onDetection: (target) => detections.push(target),
+    onCheckpoint: (target) => checkpoints.push(target),
+    onHalt: () => halts.push(true),
     readyTimeoutMs,
   });
   return {
-    feed, sources, timers, allCallbacks, delays, frames, errors, states,
+    feed, sources, timers, allCallbacks, delays, frames, errors, states, detections, checkpoints, halts,
     get resyncs() { return resyncs; },
     runTimer() {
       assert.equal(timers.size, 1, "exactly one retry owner");
@@ -1013,4 +1017,237 @@ test("integrated stream and refresh owners retain live data and its acknowledged
   assert.equal(sources[1].url.searchParams.get("cursor"), cursor("2"));
   stream.stop();
   f.snapshots.stop();
+});
+
+
+test("notification delivery follows admitted exact durable identities only", () => {
+  const f = fixture({ reject: (payload) => payload.includes("reject-me") });
+  const source = startReady(f, "9007199254740993");
+  assert.deepEqual(f.checkpoints, [{ epoch: EPOCH, id: "9007199254740993" }]);
+  source.emit("event", { data: durablePayload("9007199254740994", "private-terminal-text")
+    .replace('"pane_id":7', '"pane_id":18446744073709551615,"pane_uuid":"pane-original"'),
+    lastEventId: cursor("9007199254740994") });
+  assert.deepEqual(f.detections, [{ epoch: EPOCH, id: "9007199254740994",
+    paneId: "18446744073709551615", paneUuid: "pane-original", severity: "info", eventType: null }]);
+  assert.doesNotMatch(JSON.stringify(f.detections), /private-terminal-text|rule_id|matched_text|extracted/);
+  event(source, "9007199254740994", "duplicate");
+  source.emit("event", { data: livePayload(), lastEventId: cursor("9007199254740994") });
+  event(source, "9007199254740995", "reject-me");
+  assert.equal(f.detections.length, 1);
+  f.runTimer();
+  ready(f.sources.at(-1), "9007199254740994");
+  event(f.sources.at(-1), "9007199254740995", "accepted retry");
+  assert.equal(f.detections.length, 2);
+  checkpoint(f.sources.at(-1), "9007199254740998");
+  assert.equal(f.detections.length, 2, "page checkpoints do not display notifications");
+  discontinuity(f.sources.at(-1), "9007199254740998");
+  assert.equal(f.halts.length, 1);
+});
+
+function notificationFixture({ permission = "granted", scope = "https://example.test/ft/|session-a",
+  storage = null, requestPermission, constructError = false } = {}) {
+  const shown = [], inspected = [], states = [], timers = new Map();
+  let time = 0, nextTimer = 0, prompts = 0;
+  class Notification {
+    static permission = permission;
+    static async requestPermission() {
+      prompts += 1;
+      if (requestPermission) return requestPermission();
+      Notification.permission = "granted";
+      return "granted";
+    }
+    constructor(title, options) {
+      if (constructError) throw new Error("private platform diagnostic");
+      this.title = title; this.options = options; this.closed = false;
+      shown.push(this);
+    }
+    close() { this.closed = true; this.onclose?.(); }
+  }
+  const owner = createDetectionNotifications({
+    NotificationImpl: Notification, storage, scope, now: () => time,
+    setTimer(fn) { const id = ++nextTimer; timers.set(id, fn); return id; },
+    clearTimer(id) { timers.delete(id); },
+    onChange: (state) => states.push(state),
+    onInspect: (target) => inspected.push(target),
+  });
+  return {
+    owner, shown, inspected, states, timers, Notification, prompts: () => prompts,
+    tick(ms = 5000) {
+      time += ms;
+      for (const [id, fn] of [...timers]) { timers.delete(id); fn(); }
+    },
+  };
+}
+
+function detection(id, fields = {}) {
+  return { epoch: EPOCH, id, paneId: "18446744073709551615", paneUuid: "pane-original",
+    severity: "warning", eventType: "usage", ...fields };
+}
+
+test("notifications require explicit permission opt-in and keep system text private", async () => {
+  const f = notificationFixture({ permission: "default" });
+  f.owner.detection(detection("1"));
+  assert.equal(f.prompts(), 0);
+  assert.equal(f.shown.length, 0);
+  await f.owner.enable();
+  assert.equal(f.prompts(), 1);
+  assert.equal(f.owner.isEnabled(), true);
+  f.owner.detection(detection("2", { severity: "info" }));
+  assert.equal(f.shown.length, 0);
+  f.owner.detection(detection("3", { matched_text: "secret terminal text", title: "private pane",
+    extracted: { token: "secret-token" } }));
+  assert.equal(f.shown.length, 1);
+  assert.equal(f.shown[0].title, "FrankenTerm needs attention");
+  assert.match(f.shown[0].options.body, /new warning, error, or input request/);
+  assert.doesNotMatch(JSON.stringify(f.shown[0].options), /secret|private pane|18446744073709551615/);
+  f.shown[0].onclick(); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(f.inspected, [{ epoch: EPOCH, id: "3", paneId: "18446744073709551615", paneUuid: "pane-original" }]);
+  assert.equal(f.shown[0].closed, true);
+  f.owner.dispose();
+});
+
+test("notification bursts coalesce to one latest target and one bounded timer", async () => {
+  const f = notificationFixture(); await f.owner.enable();
+  f.owner.detection(detection("1"));
+  for (let id = 2; id <= 10_000; id++) f.owner.detection(detection(String(id)));
+  assert.equal(f.shown.length, 1);
+  assert.equal(f.timers.size, 1);
+  f.tick();
+  assert.equal(f.shown.length, 2);
+  assert.equal(f.shown[0].closed, true);
+  assert.equal(f.timers.size, 1);
+  f.shown[1].onclick(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.inspected[0].id, "10000");
+  f.owner.dispose();
+});
+
+test("notification deduplication survives reload and is scoped to auth, workspace and event epoch", async () => {
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) };
+  const f = notificationFixture({ storage }); await f.owner.enable();
+  f.owner.checkpoint({ epoch: EPOCH, id: "9007199254740993" });
+  f.owner.detection(detection("9007199254740993"));
+  f.owner.detection(detection("9007199254740994"));
+  f.owner.detection(detection("9007199254740994"));
+  assert.equal(f.shown.length, 1);
+  f.owner.dispose();
+  const reloaded = notificationFixture({ storage }); await reloaded.owner.enable();
+  reloaded.owner.detection(detection("9007199254740994"));
+  assert.equal(reloaded.shown.length, 0);
+  reloaded.owner.detection(detection("9007199254740995"));
+  assert.equal(reloaded.shown.length, 1);
+  reloaded.owner.dispose();
+  for (const scope of ["https://example.test/other/|session-a", "https://example.test/ft/|session-b"]) {
+    const next = notificationFixture({ storage, scope }); await next.owner.enable();
+    next.owner.detection(detection("9007199254740994"));
+    assert.equal(next.shown.length, 1);
+    next.owner.dispose();
+  }
+  const changedHistory = notificationFixture({ storage }); await changedHistory.owner.enable();
+  changedHistory.owner.detection(detection("1", { epoch: OTHER_EPOCH }));
+  assert.equal(changedHistory.shown.length, 1);
+  changedHistory.owner.dispose();
+  const saved = [...values.values()][0];
+  assert.doesNotMatch(saved, /pane-original|severity|matched_text|secret/);
+  assert.equal(values.size, 1);
+});
+
+test("notification cursor storage stays bounded and tolerates unavailable or malformed storage", async () => {
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) };
+  for (let index = 0; index < 12; index++) {
+    const f = notificationFixture({ storage, scope: "workspace-" + index });
+    await f.owner.enable(); f.owner.detection(detection("1")); f.owner.dispose();
+  }
+  assert.equal(JSON.parse([...values.values()][0]).length, 8);
+  for (const broken of [
+    { getItem() { throw new Error("storage blocked"); }, setItem() { throw new Error("storage blocked"); } },
+    { getItem: () => "[" + " ".repeat(25_000), setItem() {} },
+    { getItem: () => JSON.stringify([{ scope: "invalid", epoch: EPOCH, id: "-1" }]), setItem() {} },
+  ]) {
+    const f = notificationFixture({ storage: broken }); await f.owner.enable();
+    f.owner.detection(detection("1")); f.owner.detection(detection("1"));
+    assert.equal(f.shown.length, 1, "memory deduplication remains available");
+    f.owner.dispose();
+  }
+});
+
+test("permission revocation, disable and disposal close alerts and fence queued clicks", async () => {
+  for (const retire of ["permission", "disable", "dispose"]) {
+    const f = notificationFixture(); await f.owner.enable();
+    f.owner.detection(detection("1"));
+    const click = f.shown[0].onclick;
+    const tick = [...f.timers.values()][0];
+    f.owner.detection(detection("2"));
+    if (retire === "permission") { f.Notification.permission = "denied"; f.tick(); }
+    else f.owner[retire]();
+    click(); tick(); await Promise.resolve(); await Promise.resolve();
+    assert.equal(f.owner.isEnabled(), false, retire);
+    assert.equal(f.shown[0].closed, true, retire);
+    assert.equal(f.shown.length, 1, retire);
+    assert.equal(f.inspected.length, 0, retire);
+    assert.equal(f.timers.size, 0, retire);
+  }
+});
+
+test("late permission replies cannot enable a retired notification owner", async () => {
+  let resolvePermission;
+  const f = notificationFixture({ permission: "default",
+    requestPermission: () => new Promise((resolve) => { resolvePermission = resolve; }) });
+  const enabling = f.owner.enable();
+  assert.equal(f.owner.isRequesting(), true);
+  f.owner.disable();
+  f.Notification.permission = "granted"; resolvePermission("granted"); await enabling;
+  assert.equal(f.owner.isEnabled(), false);
+  assert.equal(f.timers.size, 0);
+  f.owner.detection(detection("1"));
+  assert.equal(f.shown.length, 0);
+});
+
+test("denied and unsupported notification APIs provide usable fallback guidance", async () => {
+  const denied = notificationFixture({ permission: "denied" }); await denied.owner.enable();
+  assert.equal(denied.owner.isEnabled(), false);
+  assert.equal(denied.prompts(), 0);
+  assert.match(denied.states.at(-1).message, /browser site settings/);
+  const states = [];
+  const unsupported = createDetectionNotifications({ NotificationImpl: null, onChange: (state) => states.push(state) });
+  await unsupported.enable();
+  assert.equal(states.at(-1).supported, false);
+  assert.match(states.at(-1).message, /Detections view|localhost|HTTPS/);
+  const failed = notificationFixture({ constructError: true }); await failed.owner.enable();
+  failed.owner.detection(detection("1"));
+  assert.equal(failed.owner.isEnabled(), false);
+  assert.equal(failed.timers.size, 0);
+  assert.match(failed.states.at(-1).message, /installed app/);
+  assert.doesNotMatch(failed.states.at(-1).message, /private platform/);
+});
+
+test("input-required detections alert without a warning severity and ordinary activity stays quiet", async () => {
+  const f = notificationFixture(); await f.owner.enable();
+  for (const [index, eventType] of ["command.completed", "auth.success", "auth.granted",
+    "approval.granted", "permission.granted", "prompt.complete"].entries()) {
+    f.owner.detection(detection(String(index + 1), { severity: "info", eventType }));
+  }
+  assert.equal(f.shown.length, 0);
+  f.owner.detection(detection("7", { severity: "info", eventType: "auth.device_code" }));
+  assert.equal(f.shown.length, 1);
+  f.tick();
+  f.owner.detection(detection("8", { severity: "info", eventType: "session.approval_needed" }));
+  assert.equal(f.shown.length, 2);
+  f.owner.dispose();
+});
+
+test("notification inspection requires exact retained pane identity, not a rounded or reused ID", () => {
+  const target = detection("1");
+  const body = '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}';
+  assert.equal(notificationPaneExists(target, body), true);
+  for (const invalid of [
+    body.replace("18446744073709551615", "18446744073709551614"),
+    body.replace("pane-original", "pane-reused"),
+    body.replace("18446744073709551615", '"18446744073709551615"'),
+    '{"ok":true,"data":{"panes":[]}}',
+    '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"},{"pane_id":18446744073709551615,"pane_uuid":"pane-reused"}]}}',
+    '{"ok":false,"data":{"panes":[]}}', "not JSON",
+  ]) assert.equal(notificationPaneExists(target, invalid), false);
+  assert.equal(notificationPaneExists({ ...target, paneUuid: null }, body), false);
 });

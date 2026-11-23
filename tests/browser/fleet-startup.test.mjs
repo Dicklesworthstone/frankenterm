@@ -69,7 +69,13 @@ function fixture(t, options = {}) {
   host.getSelection = () => selection;
   const frames = new Map(), timers = new Map(), intervals = new Map();
   let handle = 0;
-  const sources = [], requests = [], viewers = [], renderers = [], observers = [];
+  const sources = [], requests = [], viewers = [], renderers = [], observers = [], notifications = [];
+  class Notification {
+    static permission = "granted";
+    static async requestPermission() { return Notification.permission; }
+    constructor(title, config) { this.title = title; this.config = config; this.closed = false; notifications.push(this); }
+    close() { this.closed = true; this.onclose?.(); }
+  }
   class Source extends Events {
     static CLOSED = 2;
     constructor(url) { super(); this.url = new URL(url); this.readyState = 1; this.closed = false; sources.push(this); }
@@ -142,10 +148,14 @@ function fixture(t, options = {}) {
       results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "needle" }], total: 1,
     } }));
     if (options.pendingSnapshots) return new Promise(() => {});
+    if (request.url.pathname.endsWith("/panes") && options.paneSnapshot) return new Response(options.paneSnapshot);
     return new Response('{"ok":true,"data":[]}');
   };
   const app = mountFleetApp({
     document: doc, window: host, fetchImpl, EventSourceImpl: Source,
+    NotificationImpl: options.notifications ? Notification : undefined,
+    notificationStorage: null,
+    verifyNotificationSession: options.verifyNotificationSession ?? (async () => true),
     loadViewer: () => options.pendingModel ? modelGate.promise : options.modelImportFailure
       ? Promise.reject(new Error("private missing model")) : Promise.resolve(viewerModule),
     loadRenderer: () => options.pendingRenderer ? rendererGate.promise : options.rendererFailure === "import"
@@ -159,14 +169,14 @@ function fixture(t, options = {}) {
     ResizeObserverImpl: class { constructor(fn) { this.callback = fn; observers.push(this); } observe(node) { this.node = node; } },
     now: () => 10_000,
   });
-  t.after(() => app.suspend());
+  t.after(() => app.dispose());
   const frame = () => {
     assert.equal(frames.size, 1);
     const [id, fn] = frames.entries().next().value; frames.delete(id); fn();
   };
   const openPane = (id = "7") => { get("pane-output-id").value = id; get("pane-output-form").requestSubmit(); };
   return { app, doc, host, get, sources, requests, viewers, renderers, frames, timers, intervals, observers,
-    selection, frame, openPane,
+    selection, frame, openPane, notifications, Notification,
     visibility(state) { doc.visibilityState = state; doc.emit("visibilitychange"); },
     resolveSearch: (response) => searchGate.resolve(response),
     resolveModel: () => modelGate.resolve(viewerModule), rejectModel: () => modelGate.reject(new Error("missing model")),
@@ -550,4 +560,127 @@ test("hidden import completion cannot paint and pagehide wins over a visibility 
   assert.equal(f.fleetSources().length, 1);
   assert.equal(f.frames.size, 1);
   assert.ok(f.renderers[0].patches > 0);
+});
+
+
+const DETECTION_EPOCH = "0123456789abcdef0123456789abcdef";
+function notificationReady(source) {
+  const cursor = "event-v1:" + DETECTION_EPOCH + ":all:0";
+  source.message("ready", { schema: "ft.stream.v1", stream: "events", kind: "ready",
+    data: { channel: "all", pane_id: null, durable_detections: true, cursor } }, cursor);
+}
+function emitNotificationDetection(source, id = "1", paneUuid = "pane-original") {
+  source.emit("event", {
+    data: '{"schema":"ft.stream.v1","stream":"events","kind":"event","data":{"delivery":"durable","event":{"type":"pattern_detected","event_id":'
+      + id + ',"pane_id":18446744073709551615,"pane_uuid":' + JSON.stringify(paneUuid)
+      + ',"detection":{"severity":"warning","event_type":"usage","matched_text":"secret terminal text"}}}}',
+    lastEventId: "event-v1:" + DETECTION_EPOCH + ":all:" + id,
+  });
+}
+
+test("explicit notifications retain only detections while hidden, then resume one foreground owner", async (t) => {
+  const f = fixture(t, { notifications: true }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  f.openPane();
+  const pane = f.sources.at(-1);
+  const paints = f.renderers[0].renders, requests = f.requests.length;
+  f.visibility("hidden"); await flush();
+  assert.equal(feed.closed, false);
+  assert.equal(pane.closed, true, "notification opt-in never retains pane output");
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.intervals.size, 0);
+  const drains = f.viewers[0].drains;
+  emitNotificationDetection(feed);
+  assert.equal(f.notifications.length, 1);
+  assert.ok(f.viewers[0].drains > drains, "hidden model queues remain bounded without rendering");
+  assert.equal(f.renderers[0].renders, paints);
+  assert.equal(f.requests.length, requests);
+  assert.equal([...f.timers.values()].filter((timer) => timer.delay === 5000).length, 1);
+  f.visibility("visible"); await flush();
+  assert.equal(f.fleetSources().length, 1, "visibility does not replace the admitted detection stream");
+  assert.equal(f.frames.size, 1);
+  assert.equal(f.intervals.size, 1);
+  f.get("fleet-notifications-toggle").emit("click");
+  assert.equal(f.notifications[0].closed, true);
+  f.visibility("hidden"); await flush();
+  assert.equal(feed.closed, true);
+  assert.equal(f.timers.size, 0);
+});
+
+test("permission revocation stops a hidden notification feed and closes existing alerts", async (t) => {
+  const f = fixture(t, { notifications: true }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  f.visibility("hidden");
+  emitNotificationDetection(feed);
+  const timer = [...f.timers].find(([, timer]) => timer.delay === 5000);
+  f.Notification.permission = "denied";
+  f.timers.delete(timer[0]); timer[1].fn();
+  assert.equal(feed.closed, true);
+  assert.equal(f.notifications[0].closed, true);
+  assert.equal(f.timers.size, 0);
+  assert.match(f.get("fleet-notifications-status").textContent, /permission was removed/);
+});
+
+test("notification click verifies session and exact pane identity without opening a terminal stream", async (t) => {
+  let verified = 0;
+  const f = fixture(t, { notifications: true,
+    verifyNotificationSession: async () => { verified += 1; return true; },
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  emitNotificationDetection(feed);
+  const sources = f.sources.length;
+  f.notifications[0].onclick(); await flush();
+  assert.equal(verified, 1);
+  assert.equal(f.get("pane-output-id").value, "18446744073709551615");
+  assert.equal(f.viewers[0].view, "detections");
+  assert.equal(f.sources.length, sources, "inspection requires the manual Open output action");
+  assert.match(f.get("fleet-notifications-status").textContent, /Choose Open output.*may no longer be live/);
+});
+
+test("notification clicks cannot resolve a reused pane or outlive session retirement", async (t) => {
+  const verification = deferred();
+  const f = fixture(t, { notifications: true, verifyNotificationSession: () => verification.promise,
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"reused-pane"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  emitNotificationDetection(feed); f.notifications[0].onclick(); await flush();
+  f.app.dispose(); const requests = f.requests.length;
+  verification.resolve(true); await flush();
+  assert.equal(f.requests.length, requests);
+  assert.equal(f.get("pane-output-id").value, "");
+  assert.equal(f.get("screen-text").textContent, "");
+
+  const reused = fixture(t, { notifications: true,
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"reused-pane"}]}}',
+  }); await reused.app.ready; await flush();
+  const secondFeed = reused.fleetSources()[0]; notificationReady(secondFeed); await flush();
+  reused.get("fleet-notifications-toggle").emit("click"); await flush();
+  emitNotificationDetection(secondFeed); reused.notifications[0].onclick(); await flush();
+  assert.equal(reused.get("pane-output-id").value, "");
+  assert.match(reused.get("fleet-notifications-status").textContent, /identity changed/);
+});
+
+test("hidden notification click waits for foreground session admission and pagehide closes it", async (t) => {
+  let verified = 0;
+  const f = fixture(t, { notifications: true, verifyNotificationSession: async () => { verified += 1; return true; },
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  f.visibility("hidden"); emitNotificationDetection(feed);
+  f.notifications[0].onclick(); await flush();
+  assert.equal(verified, 0);
+  assert.equal(f.get("pane-output-id").value, "");
+  f.visibility("visible"); await flush();
+  assert.equal(verified, 1);
+  assert.equal(f.get("pane-output-id").value, "18446744073709551615");
+  f.host.emit("pagehide");
+  assert.equal(feed.closed, true);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.get("fleet-notifications-toggle").attrs["aria-pressed"], "false");
 });

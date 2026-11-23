@@ -45,6 +45,9 @@
       <button id="fleet-refresh" type="button" disabled>Refresh</button>
       <button id="fleet-text-toggle" type="button" aria-pressed="false" disabled>Use text view</button>
     </nav>
+    <button id="fleet-notifications-toggle" type="button" aria-pressed="false" aria-describedby="fleet-notifications-help fleet-notifications-status" disabled>Enable notifications</button>
+    <p id="fleet-notifications-status" role="status" aria-live="polite">Notifications are off for this tab.</p>
+    <p id="fleet-notifications-help">Opt in to private system alerts for new warnings, errors and input requests. Alerts contain no terminal text or pane titles. While enabled, detection updates and session checks continue when this tab is hidden; captured-output streams and rendering pause. Closing the tab stops alerts. Clicking an alert verifies the session and stored pane identity before offering read-only inspection.</p>
     <p id="fleet-selection" role="status">No fleet selection yet.</p>
     <p id="fleet-text-help">Text view supports native selection and copying. Select text to hold it steady; clear the selection to show updates. Use the navigation buttons, or focus the text and use arrows, 1/2, and Enter. Tab leaves the fleet.</p>
     <div id="fleet-viewport">

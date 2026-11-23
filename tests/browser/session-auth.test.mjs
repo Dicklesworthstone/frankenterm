@@ -65,7 +65,7 @@ function fixture(t, initial = { required: true, authenticated: false }, { hidden
     },
     mountApp: (options) => {
       const app = { options, disposals: 0, suspensions: 0, resumptions: 0,
-        dispose() { this.disposals += 1; }, suspend() { this.suspensions += 1; },
+        dispose() { this.disposals += 1; }, suspend(options) { this.suspensions += 1; this.suspendOptions = options; },
         resume() { this.resumptions += 1; } };
       apps.push(app);
       return app;
@@ -409,4 +409,74 @@ test("cross-tab revocation retires a hidden viewer before any visibility resume"
   f.visibility("visible"); await flush();
   assert.equal(f.apps[0].resumptions, 0);
   assert.equal(f.reloads(), 1);
+});
+
+
+test("notification opt-in retains session expiry and revocation checks while rendering is suspended", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const app = f.apps[0];
+  app.options.onNotificationsChanged(true);
+  assert.equal(app.options.notificationScope, "http://127.0.0.1:9999/|" + authorized().session_epoch);
+  f.visibility("hidden");
+  assert.deepEqual(app.suspendOptions, { keepNotifications: true });
+  assert.equal(app.resumptions, 0);
+  assert.equal(f.timers.size, 2, "expiry and status polling remain authoritative");
+  f.timer(15_000); await flush();
+  assert.equal(f.requests.length, 2);
+  assert.equal(app.resumptions, 0, "a status poll cannot resume a hidden renderer");
+  assert.equal(f.timers.size, 2);
+  const fresh = deferred(); f.respond(() => fresh.promise);
+  f.visibility("visible");
+  assert.equal(app.resumptions, 0);
+  fresh.resolve(reply(authorized())); await flush();
+  assert.equal(app.resumptions, 1);
+  assert.equal(f.apps.length, 1);
+});
+
+test("notification opt-out and revoked sessions close background ownership", async (t) => {
+  for (const reason of ["disabled", "expired", "revoked", "pagehide"]) {
+    const f = fixture(t, authorized()); await f.gate.ready;
+    const app = f.apps[0]; app.options.onNotificationsChanged(true);
+    f.visibility("hidden");
+    if (reason === "disabled") app.options.onNotificationsChanged(false);
+    if (reason === "expired") f.timer(3_600_000);
+    if (reason === "revoked") {
+      f.respond(async () => reply({ required: true, authenticated: false }));
+      f.timer(15_000); await flush();
+    }
+    if (reason === "pagehide") f.host.emit("pagehide");
+    assert.equal(f.timers.size, 0, reason);
+    assert.equal(f.get("workspace").hidden, true, reason);
+    if (reason === "disabled") {
+      assert.equal(app.suspendOptions, undefined);
+      assert.equal(app.disposals, 0);
+    } else assert.equal(app.disposals, 1, reason);
+    assert.equal(await app.options.verifyNotificationSession(), false, reason);
+  }
+});
+
+test("notification inspection revalidates grant identity and fences stale logout callbacks", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const app = f.apps[0];
+  assert.equal(await app.options.verifyNotificationSession(), true);
+  assert.equal(f.requests.length, 2);
+  f.respond(async () => reply({ ...authorized(), session_epoch: "abcdef0123456789abcdef0123456789" }));
+  assert.equal(await app.options.verifyNotificationSession(), false);
+  assert.equal(app.disposals, 1);
+  const requests = f.requests.length;
+  assert.equal(await app.options.verifyNotificationSession(), false);
+  assert.equal(f.requests.length, requests, "retired notification callbacks cannot issue requests");
+});
+
+test("an in-flight notification session check cannot survive sign-out", async (t) => {
+  const f = fixture(t, authorized()); await f.gate.ready;
+  const app = f.apps[0], pending = deferred();
+  f.respond(() => pending.promise);
+  const verification = app.options.verifyNotificationSession();
+  f.respond(async () => new Response("{}"));
+  f.get("web-auth-logout").emit("click");
+  pending.resolve(reply(authorized()));
+  assert.equal(await verification, false); await flush();
+  assert.equal(app.disposals, 1);
+  assert.equal(f.get("workspace").hidden, true);
 });

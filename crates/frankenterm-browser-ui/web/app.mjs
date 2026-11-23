@@ -17,6 +17,200 @@ const GRID_MAX_COLS = 240;
 const GRID_MAX_ROWS = 100;
 const SCREEN_TEXT_MAX_CHARS = 2 * GRID_MAX_COLS * GRID_MAX_ROWS + GRID_MAX_ROWS;
 
+const NOTIFICATION_INTERVAL_MS = 5_000;
+const NOTIFICATION_CURSOR_KEY = "frankenterm-detection-notifications-v1";
+
+// Explicit, per-tab opt-in. Persist only bounded cursor identities, never an
+// event payload, pane title, terminal text, access token or notification target.
+export function createDetectionNotifications({
+  NotificationImpl = globalThis.Notification,
+  storage = null,
+  scope,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+  now = Date.now,
+  onChange = () => {},
+  onInspect = () => {},
+} = {}) {
+  const supported = typeof NotificationImpl === "function"
+    && typeof NotificationImpl.requestPermission === "function";
+  const persistentScope = typeof scope === "string" && scope.length <= 2048 ? scope : null;
+  let enabled = false;
+  let requesting = false;
+  let disposed = false;
+  let generation = 0;
+  let timer = null;
+  let current = null;
+  let pending = null;
+  let highWater = null;
+  let lastDisplayedAt = -Infinity;
+  let message = supported ? "Notifications are off for this tab."
+    : "System notifications are unavailable here. Keep the Detections view open, or use a supported browser on localhost or HTTPS.";
+
+  const validCursor = (value) => value && typeof value.epoch === "string"
+    && /^[0-9a-f]{32}$/.test(value.epoch) && typeof value.id === "string"
+    && /^(0|[1-9][0-9]{0,18})$/.test(value.id) && BigInt(value.id) <= 9_223_372_036_854_775_807n;
+
+  function storedCursors() {
+    if (!persistentScope || !storage) return [];
+    try {
+      const raw = storage.getItem(NOTIFICATION_CURSOR_KEY);
+      if (!raw || raw.length > 24_576) return [];
+      const rows = JSON.parse(raw);
+      return Array.isArray(rows) && rows.length <= 8
+        ? rows.filter((row) => validCursor(row) && typeof row.scope === "string" && row.scope.length <= 2048) : [];
+    } catch (_) { return []; }
+  }
+  function remember(cursor) {
+    if (!validCursor(cursor)) return false;
+    if (highWater?.epoch !== cursor.epoch) {
+      const saved = storedCursors().find((row) => row.scope === persistentScope && row.epoch === cursor.epoch);
+      highWater = { epoch: cursor.epoch, id: saved?.id ?? "0" };
+    }
+    if (BigInt(cursor.id) <= BigInt(highWater.id)) return false;
+    highWater = { epoch: cursor.epoch, id: cursor.id };
+    return true;
+  }
+  function persist() {
+    if (!persistentScope || !storage || !highWater) return;
+    try {
+      const rows = storedCursors().filter((row) => row.scope !== persistentScope);
+      rows.push({ scope: persistentScope, ...highWater });
+      storage.setItem(NOTIFICATION_CURSOR_KEY, JSON.stringify(rows.slice(-8)));
+    } catch (_) { /* Private browsing may offer memory-only deduplication. */ }
+  }
+  function publishState() {
+    try { onChange({ enabled, requesting, supported, message }); } catch (_) { /* UI is optional. */ }
+  }
+  function closeCurrent() {
+    const previous = current;
+    current = null;
+    if (!previous) return;
+    previous.onclick = previous.onclose = previous.onerror = null;
+    try { previous.close(); } catch (_) { /* Revocation may already have closed it. */ }
+  }
+  function disable(reason = "Notifications are off for this tab.") {
+    if (enabled) persist();
+    enabled = requesting = false;
+    generation += 1;
+    pending = null;
+    if (timer !== null) clearTimer(timer);
+    timer = null;
+    closeCurrent();
+    message = reason;
+    publishState();
+  }
+  function checkPermission() {
+    if (!enabled || disposed) return false;
+    if (NotificationImpl.permission === "granted") return true;
+    disable("Notification permission was removed. Allow notifications in browser site settings, then enable them again.");
+    return false;
+  }
+  function displayPending() {
+    if (!pending || !checkPermission() || now() - lastDisplayedAt < NOTIFICATION_INTERVAL_MS) return;
+    const target = pending;
+    pending = null;
+    const expected = generation;
+    persist();
+    closeCurrent();
+    try {
+      const notification = new NotificationImpl("FrankenTerm needs attention", {
+        body: "A new warning, error, or input request was detected. Open the viewer to review it.",
+        tag: "frankenterm-detection-attention",
+        silent: true,
+      });
+      current = notification;
+      lastDisplayedAt = now();
+      notification.onclick = () => {
+        if (generation !== expected || current !== notification || !checkPermission()) return;
+        closeCurrent();
+        Promise.resolve().then(() => {
+          if (generation === expected && checkPermission()) return onInspect(target);
+        }).catch(() => {
+          if (generation !== expected || disposed) return;
+          message = "The detection could not be opened. Return to the Detections view to inspect it.";
+          publishState();
+        });
+      };
+      notification.onclose = () => { if (current === notification) current = null; };
+      notification.onerror = () => {
+        if (generation === expected && current === notification) {
+          disable("This browser could not display notifications. Use the Detections view; mobile browsers may require an installed app.");
+        }
+      };
+    } catch (_) {
+      disable("This browser could not display notifications. Use the Detections view; mobile browsers may require an installed app.");
+    }
+  }
+  function schedule() {
+    const expected = generation;
+    timer = setTimer(() => {
+      if (expected !== generation || !checkPermission()) return;
+      timer = null;
+      displayPending();
+      if (enabled && generation === expected) schedule();
+    }, NOTIFICATION_INTERVAL_MS);
+  }
+  publishState();
+  return {
+    async enable() {
+      if (!supported || enabled || requesting || disposed) return;
+      const expected = ++generation;
+      requesting = true;
+      message = "Allow notifications in the browser prompt to enable this tab.";
+      publishState();
+      let permission = NotificationImpl.permission;
+      try {
+        if (permission === "default") permission = await NotificationImpl.requestPermission();
+      } catch (_) { permission = "unavailable"; }
+      if (disposed || generation !== expected) return;
+      requesting = false;
+      if (permission !== "granted" || NotificationImpl.permission !== "granted") {
+        disable(permission === "denied"
+          ? "Notifications are blocked. Allow them in browser site settings, then enable them again."
+          : "Notifications were not enabled. Use the Detections view or try a supported browser on localhost or HTTPS.");
+        return;
+      }
+      enabled = true;
+      message = "Notifications are on for this tab. Only detection and session checks continue when it is hidden.";
+      persist();
+      publishState();
+      if (enabled && generation === expected) schedule();
+    },
+    disable,
+    isEnabled: () => enabled && !disposed,
+    isRequesting: () => requesting,
+    checkpoint(cursor) { if (!disposed) remember(cursor); },
+    detection(target) {
+      // Advance even while disabled: opting in must not announce old frames.
+      if (disposed || !remember(target) || !checkPermission()) return;
+      const attention = ["warning", "error", "critical"].includes(target.severity)
+        || ["auth.device_code", "auth.error", "auth.login_required", "auth.oauth_required",
+          "session.approval_needed", "auth.prompt", "prompt", "prompt.waiting",
+          "approval.required", "permission.required", "input.required", "waiting_for_input"].includes(target.eventType);
+      if (!attention) return;
+      // A burst keeps one latest target, one notification and one timer.
+      pending = { epoch: target.epoch, id: target.id, paneId: target.paneId, paneUuid: target.paneUuid ?? null };
+      displayPending();
+    },
+    report(value) { if (!disposed) { message = value; publishState(); } },
+    dispose() { if (!disposed) { disposed = true; disable(); } },
+  };
+}
+
+// The inventory contains retained panes, not a liveness promise. Never resolve
+// a notification through today's selected row, a rounded ID, or a reused ID.
+export function notificationPaneExists(target, payload) {
+  if (typeof target?.paneUuid !== "string" || !target.paneUuid.length) return false;
+  try {
+    const { frame, exact } = decodeFrame(payload);
+    if (frame?.ok !== true || !Array.isArray(frame.data?.panes)) return false;
+    const matches = frame.data.panes.filter((pane, index) =>
+      typeof pane?.pane_id === "number" && exact.data.panes[index]?.pane_id === target.paneId);
+    return matches.length === 1 && matches[0].pane_uuid === target.paneUuid;
+  } catch (_) { return false; }
+}
+
 // This feed subscribes to all panes. Retain the complete server token, and
 // compare IDs only within its epoch and scope. Number would round i64 IDs.
 function eventCursor(token) {
@@ -66,6 +260,9 @@ export function createFleetStream(viewer, {
   setTimer = globalThis.setTimeout,
   clearTimer = globalThis.clearTimeout,
   onResync = () => {},
+  onDetection = () => {},
+  onCheckpoint = () => {},
+  onHalt = () => {},
   readyTimeoutMs = 10_000,
 } = {}) {
   if (!Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs < 1 || readyTimeoutMs > 60_000) {
@@ -128,6 +325,7 @@ export function createFleetStream(viewer, {
     retire();
     viewer.setStreamState(STREAM.DISCONNECTED);
     viewer.reportError(terminalError);
+    try { onHalt(); } catch (_) { /* Feed retirement is already complete. */ }
   }
 
   function reconnect(message) {
@@ -254,6 +452,26 @@ export function createFleetStream(viewer, {
         // A TCP open/ready followed by a replay failure is not recovery.
         retryMs = 1_000;
       }
+      // Notify only after the model admits a durable event and its exact
+      // cursor. Snapshot replay, live-only frames and rejected rows never alert.
+      try {
+        if (nextCursor && message.type === "event") {
+          const event = frame.data.event;
+          const paneId = exact.data.event.pane_id;
+          if (typeof event.pane_id === "number" && typeof paneId === "string"
+              && /^(0|[1-9][0-9]{0,19})$/.test(paneId)
+              && BigInt(paneId) <= 18_446_744_073_709_551_615n) {
+            onDetection({
+              epoch: nextCursor.epoch, id: nextCursor.decimal, paneId,
+              paneUuid: typeof event.pane_uuid === "string" && event.pane_uuid.length <= 128 ? event.pane_uuid : null,
+              severity: ["info", "warning", "error", "critical"].includes(event.detection?.severity)
+                ? event.detection.severity : null,
+              eventType: typeof event.detection?.event_type === "string" && event.detection.event_type.length <= 128
+                ? event.detection.event_type : null,
+            });
+          }
+        } else if (nextCursor) onCheckpoint({ epoch: nextCursor.epoch, id: nextCursor.decimal });
+      } catch (_) { /* Optional system notifications cannot reject an admitted frame. */ }
       if (message.type === "ready" || message.type === "lag") resync();
     };
     for (const type of ["ready", "event", "checkpoint", "lag"]) candidate.addEventListener(type, onFrame);
@@ -561,6 +779,11 @@ export function mountFleetApp({
   loadRenderer = () => import("./pkg/FrankenTerm.js"),
   fetchImpl = globalThis.fetch,
   EventSourceImpl = globalThis.EventSource,
+  NotificationImpl = host.Notification,
+  notificationStorage,
+  notificationScope = null,
+  onNotificationsChanged = () => {},
+  verifyNotificationSession = async () => true,
   setTimer = globalThis.setTimeout,
   clearTimer = globalThis.clearTimeout,
   setRepeating = globalThis.setInterval,
@@ -578,6 +801,8 @@ export function mountFleetApp({
   const modeLine = element("fleet-mode");
   const selectionLine = element("fleet-selection");
   const textToggle = element("fleet-text-toggle");
+  const notificationToggle = element("fleet-notifications-toggle");
+  const notificationStatus = element("fleet-notifications-status");
   const navigation = new Map([
     ["fleet-panes", "1"], ["fleet-events", "2"], ["fleet-first", "Home"],
     ["fleet-previous", "ArrowUp"], ["fleet-next", "ArrowDown"],
@@ -595,6 +820,12 @@ export function mountFleetApp({
   let activityGeneration = 0;
   let disposed = false;
   let networkActive = false;
+  let backgroundNotifications = false;
+  let notificationsHalted = false;
+  let notifications = null;
+  let inspection = null;
+  let inspectionController = null;
+  let inspectionGeneration = 0;
   let refreshTimer = null;
   let frameHandle = null;
   let lastClock = 0;
@@ -618,6 +849,8 @@ export function mountFleetApp({
     for (const id of navigation.keys()) element(id).disabled = !viewer;
     element("pane-output-open").disabled = !viewer;
     textToggle.disabled = !viewer || !term;
+    notificationToggle.disabled = !viewer || disposed || notificationsHalted || typeof NotificationImpl !== "function"
+      || typeof NotificationImpl.requestPermission !== "function" || notifications?.isRequesting();
     textToggle.setAttribute("aria-pressed", String(asText));
     setText(textToggle, asText ? "Use canvas view" : "Use text view");
     const mode = viewer ? (asText ? "text" : "canvas") : modelFailed ? "capture-only" : "loading";
@@ -661,6 +894,7 @@ export function mountFleetApp({
   function present() {
     // takeFlatPatches also drains StepProgram's output buffers in text mode.
     const { cells, spans } = viewer.takeFlatPatches();
+    if (!active) return; // Drain bounded model output without rendering a hidden page.
     if (term && !preferText) {
       try {
         if (cells.length > 0) term.applyPatchBatchFlat(spans, cells);
@@ -670,15 +904,21 @@ export function mountFleetApp({
     mirrorText();
   }
 
-  function stopFleet() {
-    networkActive = false;
+  function stopFleet({ keepNotifications = false } = {}) {
+    backgroundNotifications = keepNotifications && notifications?.isEnabled() && !disposed && pagePresent;
     if (refreshTimer !== null) clearRepeating(refreshTimer);
     refreshTimer = null;
-    try { stream?.stop(); } finally { snapshots?.stop(); }
+    try {
+      if (!backgroundNotifications) { networkActive = false; stream?.stop(); }
+    } finally {
+      snapshots?.stop(); // Always abort pending inventory/history refreshes.
+      if (backgroundNotifications) snapshots?.start(); // Admit only the bounded live feed.
+    }
   }
 
   function failModel() {
     if (disposed) return;
+    notifications?.disable("Fleet detections are unavailable. Reload the viewer before enabling notifications.");
     try { stopFleet(); } catch (_) { /* stop still aborts outstanding snapshots */ }
     viewer = null;
     modelFailed = true;
@@ -696,10 +936,10 @@ export function mountFleetApp({
     if (active && snapshots && viewer) void snapshots.refresh().catch(failModel);
   };
   function startFleet() {
-    if (!active || !viewer || !snapshots || networkActive) return;
-    networkActive = true;
+    if (!active || !viewer || !snapshots || refreshTimer !== null) return;
+    backgroundNotifications = false;
     snapshots.start();
-    stream.start();
+    if (!networkActive) { networkActive = true; stream.start(); }
     refresh();
     const expected = activityGeneration;
     refreshTimer = setRepeating(() => {
@@ -734,6 +974,84 @@ export function mountFleetApp({
       element("pane-output-id").value = paneId;
       element("pane-output-form").requestSubmit();
     },
+  });
+
+  function cancelInspection() {
+    inspectionGeneration += 1;
+    inspection = null;
+    inspectionController?.abort();
+    inspectionController = null;
+  }
+  async function inspectNotification() {
+    if (!inspection || !active || disposed || !notifications.isEnabled()) return;
+    const target = inspection;
+    inspection = null;
+    const expected = ++inspectionGeneration;
+    const controller = new AbortController();
+    inspectionController = controller;
+    const current = () => !disposed && active && notifications.isEnabled()
+      && inspectionGeneration === expected && !controller.signal.aborted;
+    const deadline = setTimer(() => controller.abort(), 10_000);
+    try {
+      if (!await verifyNotificationSession()) {
+        if (current()) notifications.report("Your session could not be verified yet. Review Detections or try again after the session check completes.");
+        return;
+      }
+      if (!current()) return;
+      // Bring the read-only detection list forward only in response to this
+      // explicit click. Never inject input into a terminal or attach control.
+      viewer?.pushEncodedInput(JSON.stringify(keyInput({ key: "2" }, "down")));
+      advance();
+      const body = await readSnapshot("panes", apiRoot, fetchImpl, controller.signal, 8 * 1024 * 1024);
+      if (!current()) return;
+      if (notificationPaneExists(target, body)) {
+        element("pane-output-id").value = target.paneId;
+        notifications.report("The detected pane's stored identity was verified. Choose Open output to inspect retained capture; the pane may no longer be live.");
+        element("pane-output-id").focus();
+      } else {
+        notifications.report("The detected pane is unavailable or its identity changed. Review Detections or search captured history.");
+      }
+    } catch (_) {
+      if (!disposed && active && inspectionGeneration === expected) {
+        notifications.report("The detected pane could not be verified. Review Detections or search captured history.");
+      }
+    } finally {
+      clearTimer(deadline);
+      if (inspectionController === controller) inspectionController = null;
+    }
+  }
+  let cursorStorage = notificationStorage;
+  if (cursorStorage === undefined) {
+    try { cursorStorage = host.localStorage; } catch (_) { cursorStorage = null; }
+  }
+  notifications = createDetectionNotifications({
+    NotificationImpl, storage: cursorStorage,
+    scope: notificationScope ?? apiRoot.origin + apiRoot.pathname,
+    setTimer, clearTimer, now,
+    onChange(state) {
+      notificationToggle.disabled = !viewer || disposed || notificationsHalted || !state.supported || state.requesting;
+      notificationToggle.setAttribute("aria-pressed", String(state.enabled));
+      setText(notificationToggle, state.enabled ? "Disable notifications" : "Enable notifications");
+      setText(notificationStatus, state.message);
+      if (!state.enabled) {
+        cancelInspection();
+        if (backgroundNotifications) stopFleet();
+      }
+      onNotificationsChanged(state.enabled);
+    },
+    onInspect(target) {
+      if (disposed || !notifications.isEnabled()) return;
+      cancelInspection();
+      inspection = target;
+      host.focus?.();
+      if (active) return inspectNotification();
+      notifications.report("Return to this tab to verify the session and inspect the detection.");
+    },
+  });
+  notificationToggle.addEventListener("click", () => {
+    if (!active || !viewer || disposed || notificationsHalted) return;
+    if (notifications.isEnabled()) notifications.disable();
+    else void notifications.enable();
   });
 
   host.addEventListener("keydown", (event) => {
@@ -827,12 +1145,14 @@ export function mountFleetApp({
     resize();
     startFleet();
     scheduleFrame();
+    if (inspection) void inspectNotification();
   }
-  function suspend() {
-    if (!active) return;
+  function suspend({ keepNotifications = false } = {}) {
     active = false;
     activityGeneration += 1;
-    stopFleet();
+    cancelInspection();
+    if (notifications?.isRequesting()) notifications.disable("Enable notifications again after returning to this tab.");
+    stopFleet({ keepNotifications });
     inspector.suspend();
     historySearch.suspend();
     if (frameHandle !== null) cancelFrame(frameHandle);
@@ -844,6 +1164,7 @@ export function mountFleetApp({
   function dispose() {
     if (disposed) return;
     disposed = true;
+    notifications.dispose();
     suspend();
     inspector.close();
     historySearch.close();
@@ -859,14 +1180,18 @@ export function mountFleetApp({
     selectionLine.textContent = "";
     element("pane-output-id").value = "";
     for (const id of [...navigation.keys(), "pane-output-open", "pane-output-submit",
-      "pane-output-id", "history-search-open", "fleet-text-toggle"]) element(id).disabled = true;
+      "pane-output-id", "history-search-open", "fleet-text-toggle", "fleet-notifications-toggle"]) element(id).disabled = true;
     doc.documentElement.dataset.viewerReady = "locked";
   }
   if (managePageLifecycle) {
-    host.addEventListener("pagehide", () => { pagePresent = false; suspend(); });
+    host.addEventListener("pagehide", () => {
+      pagePresent = false;
+      notifications.disable();
+      suspend();
+    });
     host.addEventListener("pageshow", () => { pagePresent = true; resume(); });
     doc.addEventListener("visibilitychange", () => {
-      if (doc.visibilityState === "hidden") suspend();
+      if (doc.visibilityState === "hidden") suspend({ keepNotifications: notifications.isEnabled() });
       else resume();
     });
   }
@@ -884,7 +1209,22 @@ export function mountFleetApp({
     viewer.init();
     if (active) present();
     snapshots = createFleetRefresh(viewer, { apiRoot, fetchImpl, setTimer, clearTimer });
-    stream = createFleetStream(snapshots, { apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh });
+    stream = createFleetStream({
+      ingestStreamFrame(payload) {
+        snapshots.ingestStreamFrame(payload);
+        if (!active) advance(); // No hidden RAF is needed to drain the bounded model.
+      },
+      setStreamState: snapshots.setStreamState,
+      reportError: snapshots.reportError,
+    }, {
+      apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh,
+      onDetection: notifications.detection,
+      onCheckpoint: notifications.checkpoint,
+      onHalt() {
+        notificationsHalted = true;
+        notifications.disable("Detection history changed. Reload the viewer before enabling notifications again.");
+      },
+    });
     updateMode();
     resize();
     startFleet();
@@ -946,6 +1286,7 @@ export function mountAuthenticatedFleet({
   const controls = element("web-auth-controls");
   let app = null;
   let appSuspended = false;
+  let backgroundNotifications = false;
   let mounted = false;
   let retired = false;
   let pagePresent = true;
@@ -1127,9 +1468,35 @@ export function mountAuthenticatedFleet({
         }
         SessionEventSource.CLOSED = EventSourceImpl?.CLOSED ?? 2;
         app = mountApp({ document: doc, window: host, apiRoot, fetchImpl: guardedFetch,
-          EventSourceImpl: SessionEventSource, managePageLifecycle: false });
+          EventSourceImpl: SessionEventSource, managePageLifecycle: false,
+          notificationScope: apiRoot.origin + apiRoot.pathname + "|" + (appEpoch ?? "local"),
+          onNotificationsChanged(enabled) {
+            backgroundNotifications = enabled === true && current();
+            if (!backgroundNotifications && doc.visibilityState === "hidden") pause();
+          },
+          async verifyNotificationSession() {
+            if (!current() || pending || disposed) return false;
+            const expectedActivity = activityGeneration;
+            try {
+              const session = await request("GET");
+              if (!current() || activityGeneration !== expectedActivity) return false;
+              const nextEpoch = session.required ? session.session_epoch : null;
+              if (!session.authenticated || nextEpoch !== appEpoch) {
+                lock("Your session changed. Sign in again before inspecting this detection.");
+                return false;
+              }
+              schedule(session);
+              return true;
+            } catch (_) {
+              if (current() && activityGeneration === expectedActivity) {
+                lock("The server's session status could not be verified. Retry when it is available.");
+              }
+              return false;
+            }
+          },
+        });
         mounted = true;
-      } else if (appSuspended) {
+      } else if (appSuspended && doc.visibilityState !== "hidden") {
         appSuspended = false;
         app.resume();
       }
@@ -1202,13 +1569,18 @@ export function mountAuthenticatedFleet({
     showGate("Checking your session before reconnecting…", "suspended");
   }
   function activate() {
-    if (active || disposed || !pagePresent || doc.visibilityState === "hidden") return;
+    if (disposed || !pagePresent || doc.visibilityState === "hidden") return;
+    if (active) {
+      if (appSuspended) void check(); // Fresh status before exposing a background session.
+      return;
+    }
     active = true;
     activityGeneration += 1;
     void check();
   }
-  // Visibility is a pause, not a new grant: retain the bounded model/cursors,
-  // but let no consumer resume until status verifies the same session epoch.
+  // Without explicit notification opt-in visibility is a full network pause.
+  // Opt-in retains only the detection feed and the same expiry/revocation checks;
+  // rendering and pane output still wait for visible-session revalidation.
   // Navigation/BFCache is a terminal retirement even if the tab was hidden first.
   function suspend() {
     pagePresent = false;
@@ -1222,8 +1594,12 @@ export function mountAuthenticatedFleet({
   host.addEventListener("pagehide", suspend);
   host.addEventListener("pageshow", resume);
   doc.addEventListener("visibilitychange", () => {
-    if (doc.visibilityState === "hidden") pause();
-    else activate();
+    if (doc.visibilityState === "hidden") {
+      if (backgroundNotifications && active && sessionVerified && app) {
+        app.suspend({ keepNotifications: true });
+        appSuspended = true;
+      } else pause();
+    } else activate();
   });
   lock("Checking your session…");
   return { ready: check(), suspend, resume, dispose() { suspend(); disposed = true; channel?.close(); } };
