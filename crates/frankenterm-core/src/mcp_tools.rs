@@ -1041,8 +1041,12 @@ impl McpKillSwitchGate {
         use crate::policy_kill_switch_state::{KillSwitchStateError, apply_persisted_kill_switch};
 
         let checked = match self.freshness.lock() {
-            Ok(mut freshness) => freshness.bind(fence).and_then(|()| freshness.validate(loaded)),
-            Err(_) => Err(KillSwitchStateError::LoadFailed("MCP freshness unavailable".into())),
+            Ok(mut freshness) => freshness
+                .bind(fence)
+                .and_then(|()| freshness.validate(loaded)),
+            Err(_) => Err(KillSwitchStateError::LoadFailed(
+                "MCP freshness unavailable".into(),
+            )),
         };
         apply_persisted_kill_switch(engine, checked, now_ms())
     }
@@ -1054,8 +1058,8 @@ impl McpKillSwitchGate {
         engine: &mut PolicyEngine,
     ) -> std::result::Result<crate::policy_kill_switch_state::KillSwitchFence, McpToolError> {
         use crate::policy_kill_switch_state::{
-            KILL_SWITCH_FENCE_WAIT, KillSwitchRestore,
-            acquire_kill_switch_fence_within_with_cx, load_kill_switch_state_from_path_with_cx,
+            KILL_SWITCH_FENCE_WAIT, KillSwitchRestore, acquire_kill_switch_fence_within_with_cx,
+            load_kill_switch_state_from_path_with_cx,
         };
 
         let authority_error = |code: &str| {
@@ -15642,7 +15646,9 @@ mod tests {
                 by: "test-operator",
                 reason: "private operator reason",
             },
-            None => KillSwitchTransition::Reset { by: "test-operator" },
+            None => KillSwitchTransition::Reset {
+                by: "test-operator",
+            },
         };
         let receipt = transition_kill_switch_from_backend(
             &backend,
@@ -15650,7 +15656,8 @@ mod tests {
             u64::try_from(mcp_now_ms_i64()).unwrap(),
         )
         .unwrap();
-        let mut persisted = crate::policy_kill_switch_state::PersistedKillSwitch::from(&receipt.state);
+        let mut persisted =
+            crate::policy_kill_switch_state::PersistedKillSwitch::from(&receipt.state);
         persisted.revision = receipt.revision;
         persisted
     }
@@ -27746,10 +27753,15 @@ exit 17",
         ) -> crate::wezterm::WeztermFuture<'a, crate::wezterm::MuxPaneText> {
             Box::pin(async move {
                 if let Some(path) = &self.fence_path {
-                    assert!(matches!(
-                        crate::policy_kill_switch_state::acquire_kill_switch_fence(path),
-                        Err(crate::policy_kill_switch_state::KillSwitchStateError::FencePending)
-                    ), "the real read must retain workspace effect authority");
+                    assert!(
+                        matches!(
+                            crate::policy_kill_switch_state::acquire_kill_switch_fence(path),
+                            Err(
+                                crate::policy_kill_switch_state::KillSwitchStateError::FencePending
+                            )
+                        ),
+                        "the real read must retain workspace effect authority"
+                    );
                 }
                 self.requests.lock().unwrap().push((pane_id, escapes, tail));
                 if self.cancel_on_read {
@@ -27969,13 +27981,18 @@ exit 17",
                 mux.clone(),
             );
             let arguments = serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID});
-            let call = || parse_json_content(tool.call(&test_mcp_context(), arguments.clone()).unwrap());
+            let call =
+                || parse_json_content(tool.call(&test_mcp_context(), arguments.clone()).unwrap());
 
             transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::HardStop));
             let readable = call();
-            assert_eq!(readable["ok"], true, "valid HardStop permits reads: {readable}");
+            assert_eq!(
+                readable["ok"], true,
+                "valid HardStop permits reads: {readable}"
+            );
             assert_eq!(mux.requests.lock().unwrap().len(), 1);
-            let emergency = transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::EmergencyHalt));
+            let emergency =
+                transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::EmergencyHalt));
             let denied = call();
             assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
             assert_eq!(mux.requests.lock().unwrap().len(), 1);
@@ -27984,23 +28001,40 @@ exit 17",
             for corruption in ["malformed", "rollback", "missing"] {
                 match corruption {
                     "malformed" => {
-                        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2",
-                            ["private corrupt stop state", KILL_SWITCH_STATE_KEY]).unwrap();
+                        connection
+                            .execute(
+                                "UPDATE config SET value = ?1 WHERE key = ?2",
+                                ["private corrupt stop state", KILL_SWITCH_STATE_KEY],
+                            )
+                            .unwrap();
                     }
                     "rollback" => {
-                        connection.execute(
-                            "UPDATE config SET value = ?1 WHERE key = ?2",
-                            [
-                                serde_json::to_string(&initial).unwrap(),
-                                KILL_SWITCH_STATE_KEY.to_string(),
-                            ],
-                        ).unwrap();
-                        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2",
-                            [initial.revision.to_string(), KILL_SWITCH_REVISION_KEY.to_string()]).unwrap();
+                        connection
+                            .execute(
+                                "UPDATE config SET value = ?1 WHERE key = ?2",
+                                [
+                                    serde_json::to_string(&initial).unwrap(),
+                                    KILL_SWITCH_STATE_KEY.to_string(),
+                                ],
+                            )
+                            .unwrap();
+                        connection
+                            .execute(
+                                "UPDATE config SET value = ?1 WHERE key = ?2",
+                                [
+                                    initial.revision.to_string(),
+                                    KILL_SWITCH_REVISION_KEY.to_string(),
+                                ],
+                            )
+                            .unwrap();
                     }
                     "missing" => {
-                        connection.execute("DELETE FROM config WHERE key IN (?1, ?2)",
-                            [KILL_SWITCH_STATE_KEY, KILL_SWITCH_REVISION_KEY]).unwrap();
+                        connection
+                            .execute(
+                                "DELETE FROM config WHERE key IN (?1, ?2)",
+                                [KILL_SWITCH_STATE_KEY, KILL_SWITCH_REVISION_KEY],
+                            )
+                            .unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -28008,18 +28042,28 @@ exit 17",
                 assert_eq!(refused["ok"], false, "{corruption}: {refused}");
                 assert_eq!(refused["error_code"], MCP_ERR_POLICY, "{refused}");
                 assert!(!refused.to_string().contains("private corrupt stop state"));
-                assert_eq!(mux.requests.lock().unwrap().len(), 1,
-                    "invalid authority must never downgrade an observed emergency to a read");
+                assert_eq!(
+                    mux.requests.lock().unwrap().len(),
+                    1,
+                    "invalid authority must never downgrade an observed emergency to a read"
+                );
             }
 
             // Restore the last acknowledged authority, then use the real reset
             // API to advance it. Invalid reads must not permanently latch denial.
             for (key, value) in [
-                (KILL_SWITCH_STATE_KEY, serde_json::to_string(&emergency).unwrap()),
+                (
+                    KILL_SWITCH_STATE_KEY,
+                    serde_json::to_string(&emergency).unwrap(),
+                ),
                 (KILL_SWITCH_REVISION_KEY, emergency.revision.to_string()),
             ] {
-                connection.execute("INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
-                    [key, value.as_str()]).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                        [key, value.as_str()],
+                    )
+                    .unwrap();
             }
             transition_mcp_test_kill_switch(&path, None);
             let readable = call();
@@ -28041,16 +28085,25 @@ exit 17",
         }));
         for db_path in [None, Some(Arc::clone(&path))] {
             let tool = WaGetTextTool::with_wezterm_handle(Arc::clone(&cfg), db_path, mux.clone());
-            let response = parse_json_content(tool.call(&test_mcp_context(),
-                serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID})).unwrap());
+            let response = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({"pane_id": MCP_TAIL_TEST_PANE_ID}),
+                )
+                .unwrap(),
+            );
             assert_eq!(response["error_code"], MCP_ERR_POLICY, "{response}");
             assert!(!path.exists());
         }
         for response in [
-            WaReserveTool::new(Arc::clone(&cfg), Arc::clone(&path)).call(&test_mcp_context(),
-                serde_json::json!({"pane_id": 7, "owner_kind": "mcp", "owner_id": "blocked"})),
-            WaReleaseTool::new(cfg, Arc::clone(&path)).call(&test_mcp_context(),
-                serde_json::json!({"reservation_id": 1})),
+            WaReserveTool::new(Arc::clone(&cfg), Arc::clone(&path)).call(
+                &test_mcp_context(),
+                serde_json::json!({"pane_id": 7, "owner_kind": "mcp", "owner_id": "blocked"}),
+            ),
+            WaReleaseTool::new(cfg, Arc::clone(&path)).call(
+                &test_mcp_context(),
+                serde_json::json!({"reservation_id": 1}),
+            ),
         ] {
             let response = parse_json_content(response.unwrap());
             assert_eq!(response["error_code"], MCP_ERR_POLICY, "{response}");
@@ -29519,15 +29572,22 @@ exit 17",
         });
         transition_mcp_test_kill_switch(&path, Some(KillSwitchLevel::SoftStop));
         let created = parse_json_content(reserve.call(&context, args.clone()).unwrap());
-        assert_eq!(created["ok"], true, "SoftStop permits administrative mutations: {created}");
+        assert_eq!(
+            created["ok"], true,
+            "SoftStop permits administrative mutations: {created}"
+        );
         let reservation_id = created["data"]["reservation"]["id"].as_i64().unwrap();
         let release_args = serde_json::json!({"reservation_id": reservation_id});
         let connection = rusqlite::Connection::open(path.as_path()).unwrap();
-        let reservation_status = || connection.query_row(
-            "SELECT status FROM pane_reservations WHERE id = ?1",
-            [reservation_id],
-            |row| row.get::<_, String>(0),
-        ).unwrap();
+        let reservation_status = || {
+            connection
+                .query_row(
+                    "SELECT status FROM pane_reservations WHERE id = ?1",
+                    [reservation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
 
         for level in [KillSwitchLevel::HardStop, KillSwitchLevel::EmergencyHalt] {
             transition_mcp_test_kill_switch(&path, Some(level));
@@ -29544,14 +29604,24 @@ exit 17",
         }
 
         transition_mcp_test_kill_switch(&path, None);
-        assert_eq!(reservation_status(), "active", "reset cannot replay a denied release");
+        assert_eq!(
+            reservation_status(),
+            "active",
+            "reset cannot replay a denied release"
+        );
         let cancelled_cx = crate::cx::Cx::for_testing();
         cancelled_cx.set_cancel_requested(true);
-        let cancelled = parse_json_content(release.call(
-            &McpContext::new(cancelled_cx, 2), release_args.clone(),
-        ).unwrap());
+        let cancelled = parse_json_content(
+            release
+                .call(&McpContext::new(cancelled_cx, 2), release_args.clone())
+                .unwrap(),
+        );
         assert_eq!(cancelled["ok"], false, "{cancelled}");
-        assert_eq!(reservation_status(), "active", "request Cx must reach admission");
+        assert_eq!(
+            reservation_status(),
+            "active",
+            "request Cx must reach admission"
+        );
 
         // A normal request hands authority to the storage writer without
         // retaining a second fence that would make its mutation self-contend.
@@ -30060,8 +30130,11 @@ exit 17",
         let query = WaMissionStateTool::new(Arc::clone(&cfg));
         let pause = WaMissionPauseTool::new(cfg);
         let context = test_mcp_context();
-        let state = parse_json_content(query.call(&context,
-            serde_json::json!({"mission_file": mission_path})).unwrap());
+        let state = parse_json_content(
+            query
+                .call(&context, serde_json::json!({"mission_file": mission_path}))
+                .unwrap(),
+        );
         assert_eq!(state["ok"], true, "{state}");
         let args = serde_json::json!({
             "mission_file": mission_path,
@@ -30077,12 +30150,24 @@ exit 17",
         // Rewind both rows consistently; only the handler's retained watermark
         // distinguishes this old disarmed document from an authorized reset.
         let connection = rusqlite::Connection::open(db_path.as_path()).unwrap();
-        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2", [
-            serde_json::to_string(&disarmed).unwrap(), KILL_SWITCH_STATE_KEY.to_string(),
-        ]).unwrap();
-        connection.execute("UPDATE config SET value = ?1 WHERE key = ?2", [
-            disarmed.revision.to_string(), KILL_SWITCH_REVISION_KEY.to_string(),
-        ]).unwrap();
+        connection
+            .execute(
+                "UPDATE config SET value = ?1 WHERE key = ?2",
+                [
+                    serde_json::to_string(&disarmed).unwrap(),
+                    KILL_SWITCH_STATE_KEY.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE config SET value = ?1 WHERE key = ?2",
+                [
+                    disarmed.revision.to_string(),
+                    KILL_SWITCH_REVISION_KEY.to_string(),
+                ],
+            )
+            .unwrap();
         let refused = parse_json_content(pause.call(&context, args).unwrap());
         assert_eq!(refused["ok"], false, "{refused}");
         assert_eq!(refused["error_code"], MCP_ERR_POLICY, "{refused}");
