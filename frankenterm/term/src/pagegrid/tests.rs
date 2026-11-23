@@ -1047,7 +1047,9 @@ fn resize_truncation_releases_permuted_row_resources_and_reuses_clean_slots() {
     assert_eq!(page.styles().live(), 0);
     assert!(page.graphemes().is_empty());
     assert_eq!(page.links().live(), 0);
-    assert!(page.images().is_clean());
+    // Released, like the tables above. is_clean() would also demand zero
+    // capacity, which only Page::reset restores when it recycles the page.
+    assert_eq!(page.images().cell_count(), 0);
     page.check_invariants().unwrap();
     let row = page.grow(60).unwrap();
     assert!(page.write(

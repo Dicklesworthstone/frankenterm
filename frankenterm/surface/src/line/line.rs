@@ -799,9 +799,17 @@ impl Line {
             }
         }
 
+        // Like set_cell writing a hyperlinked cell, mark the explicit link, so
+        // has_hyperlink() and line equality agree with a row written cell by cell.
+        let bits = if attrs.hyperlink().is_some() && !cells.is_empty() {
+            LineBits::HAS_HYPERLINK
+        } else {
+            LineBits::NONE
+        };
+
         Line {
             cells: CellStorage::V(VecStorage::new(cells)),
-            bits: LineBits::NONE,
+            bits,
             seqno,
             zones: vec![],
             #[cfg(feature = "appdata")]
