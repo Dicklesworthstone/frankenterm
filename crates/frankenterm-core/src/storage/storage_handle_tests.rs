@@ -351,7 +351,7 @@ fn event_delivery_lease_clock_starts_at_writer_dispatch_after_queue_delay() {
         let dispatch_floor_ms = now_ms_strict().expect("clock before dispatch");
         let mut should_break = false;
         let mut mmap_mirror = None;
-        let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        let mut segment_redactors = SegmentRedactionState::default();
         dispatch_write_command_raw(
             &backend,
             command,
@@ -406,7 +406,7 @@ fn event_delivery_handled_timestamp_starts_at_writer_dispatch_after_queue_delay(
         let dispatch_floor_ms = now_ms_strict().expect("clock before finalization dispatch");
         let mut should_break = false;
         let mut mmap_mirror = None;
-        let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+        let mut segment_redactors = SegmentRedactionState::default();
         dispatch_write_command_raw(
             &backend,
             command,
@@ -1492,6 +1492,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
         &WriterWakeup::new(),
         false,
         None,
+        Arc::new(Redactor::new()),
     );
     let conn = backend
         .into_connection()

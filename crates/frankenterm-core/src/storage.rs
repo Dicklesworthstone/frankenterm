@@ -16982,7 +16982,7 @@ mod writer_io_scheduler_tests {
                     None,
                     None,
                     None,
-                    &mut HashMap::new(),
+                    &mut SegmentRedactionState::default(),
                 )
                 .expect("real SQLite append under separate diagnostic dispatcher");
                 tracing::warn!(

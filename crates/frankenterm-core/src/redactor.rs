@@ -2171,10 +2171,7 @@ mod tests {
         // Both inputs use source coordinates, including overlaps; already
         // removed bytes must not produce additional markers or stale offsets.
         assert_eq!(
-            redactor.redact_with_source_spans(
-                input,
-                &[(start, start + 4), (start + 2, start + 6)],
-            ),
+            redactor.redact_with_source_spans(input, &[(start, start + 4), (start + 2, start + 6)]),
             "$0 café $0 end"
         );
         assert_eq!(

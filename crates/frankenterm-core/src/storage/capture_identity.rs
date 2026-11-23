@@ -292,13 +292,12 @@ pub fn record_segment_capture_backend(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        PendingAppendSegmentWrite, RusqliteBackend, WriterResultResponder,
+        PendingAppendSegmentWrite, RusqliteBackend, SegmentRedactionState, WriterResultResponder,
         append_segment_commit_with_capture_backend, append_segment_group_commit_backend,
         initialize_schema, pending_append_segment_from_command,
     };
     use super::*;
     use crate::runtime_async::oneshot;
-    use std::collections::HashMap;
 
     const CAPTURE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const CAPTURE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -348,7 +347,7 @@ mod tests {
             None,
             None,
             None,
-            &mut HashMap::new(),
+            &mut SegmentRedactionState::default(),
             capture_uuid,
         )
         .map(|committed| committed.segment)
@@ -516,8 +515,12 @@ mod tests {
 
         let singleton = append(&backend, 7, Some(CAPTURE_A)).unwrap();
         let writes = [queued, pending(7, CAPTURE_B)];
-        let grouped = append_segment_group_commit_backend(&backend, &writes, &mut HashMap::new())
-            .unwrap_or_else(|error| panic!("commit queued captures: {error}"));
+        let grouped = append_segment_group_commit_backend(
+            &backend,
+            &writes,
+            &mut SegmentRedactionState::default(),
+        )
+        .unwrap_or_else(|error| panic!("commit queued captures: {error}"));
 
         for (segment, expected) in [
             (&singleton, CAPTURE_A),
@@ -553,7 +556,12 @@ mod tests {
         }
         let writes = [pending(7, CAPTURE_A), pending(7, CAPTURE_C)];
         assert!(
-            append_segment_group_commit_backend(&backend, &writes, &mut HashMap::new()).is_err()
+            append_segment_group_commit_backend(
+                &backend,
+                &writes,
+                &mut SegmentRedactionState::default(),
+            )
+            .is_err()
         );
         assert_eq!(segment_count(&backend), 0);
         let valid = append(&backend, 7, Some(CAPTURE_A)).unwrap();

@@ -10424,17 +10424,16 @@ impl ObservationRuntime {
                             if let Some(decision) = resync_decision.as_mut() {
                                 decision.finish(Ok(persisted.segment.seq));
                             }
-                            let recorded_segment =
-                                (replay_capture.is_some() || recording.is_some()).then(|| {
-                                    CapturedSegment {
-                                        pane_id,
-                                        seq: persisted.segment.seq,
-                                        seq_correction: bounded_segment.seq_correction,
-                                        content: persisted.segment.content.clone(),
-                                        kind: bounded_segment.kind.clone(),
-                                        captured_at,
-                                    }
-                                });
+                            let recorded_segment = (replay_capture.is_some()
+                                || recording.is_some())
+                            .then(|| CapturedSegment {
+                                pane_id,
+                                seq: persisted.segment.seq,
+                                seq_correction: bounded_segment.seq_correction,
+                                content: persisted.segment.content.clone(),
+                                kind: bounded_segment.kind.clone(),
+                                captured_at,
+                            });
                             if let (Some(adapter), Some(recorded_segment)) =
                                 (replay_capture.as_ref(), recorded_segment.as_ref())
                             {
@@ -21175,20 +21174,9 @@ mod tests {
         assert_eq!(live.span, detection.span);
         assert_eq!(live.agent_type, detection.agent_type);
 
-        let stored = detection_to_stored_event(
-            1,
-            Some("pane-a"),
-            &detection,
-            Some(100),
-            &redactor,
-        );
-        let builtin_only = detection_to_stored_event(
-            1,
-            Some("pane-a"),
-            &detection,
-            Some(100),
-            &Redactor::new(),
-        );
+        let stored = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &redactor);
+        let builtin_only =
+            detection_to_stored_event(1, Some("pane-a"), &detection, Some(100), &Redactor::new());
         assert_eq!(stored.matched_text.as_ref(), Some(&live.matched_text));
         assert_eq!(stored.extracted.as_ref(), Some(&live.extracted));
         assert_eq!(stored.dedupe_key, builtin_only.dedupe_key);
@@ -26392,13 +26380,8 @@ mod tests {
             span: (0, 13),
         };
 
-        let event = detection_to_stored_event(
-            1,
-            Some("uuid-abc"),
-            &detection,
-            Some(42),
-            &Redactor::new(),
-        );
+        let event =
+            detection_to_stored_event(1, Some("uuid-abc"), &detection, Some(42), &Redactor::new());
         assert_eq!(event.severity, "critical");
         assert_eq!(event.segment_id, Some(42));
         assert_eq!(event.matched_text.as_deref(), Some("out of memory"));
