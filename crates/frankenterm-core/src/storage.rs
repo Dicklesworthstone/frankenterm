@@ -1062,6 +1062,7 @@ enum WriteCommand {
     SettleWorkflowTerminal {
         workflow: WorkflowRecord,
         handled_status: String,
+        auto_release_on_complete: bool,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Create an execution without resetting an existing identity.
@@ -7949,8 +7950,9 @@ impl StorageHandle {
 
     /// Persist a workflow's terminal record (`completed` or `failed`) and mark
     /// its trigger event handled by it with `handled_status`, in one writer
-    /// transaction. Once the command is queued, cancelling the caller cannot
-    /// separate the two: either both are durable or neither is.
+    /// transaction. Successful completion also releases the execution's own
+    /// pane reservation when configured. Once queued, caller cancellation
+    /// cannot separate these writes: all are durable or none are.
     pub async fn settle_workflow_terminal_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7965,6 +7967,7 @@ impl StorageHandle {
                 WriteCommand::SettleWorkflowTerminal {
                     workflow,
                     handled_status: handled_status.to_owned(),
+                    auto_release_on_complete: self.reservation_config.auto_release_on_complete,
                     respond: tx,
                 },
             )
@@ -19542,10 +19545,16 @@ fn dispatch_write_command_raw(
         WriteCommand::SettleWorkflowTerminal {
             workflow,
             handled_status,
+            auto_release_on_complete,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = settle_workflow_terminal_backend(backend, &workflow, &handled_status);
+            let result = settle_workflow_terminal_backend(
+                backend,
+                &workflow,
+                &handled_status,
+                auto_release_on_complete,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::CreateWorkflow { workflow, respond } => {
@@ -23634,11 +23643,14 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
 /// trigger still read unhandled; a replay of that event only ever meets
 /// `AlreadyClaimed`, so nothing settled it again. A refused upsert (an aborted
 /// execution cannot be revived) now also leaves the trigger as the abort
-/// settled it instead of overwriting its status.
+/// settled it instead of overwriting its status. Successful completion may
+/// release the same execution's workflow reservation in this transaction;
+/// failures retain reservations for recovery or explicit operator release.
 fn settle_workflow_terminal_backend(
     backend: &dyn StorageBackend,
     workflow: &WorkflowRecord,
     handled_status: &str,
+    auto_release_on_complete: bool,
 ) -> Result<()> {
     if !matches!(workflow.status.as_str(), "completed" | "failed") || handled_status.is_empty() {
         return Err(StorageError::Database(format!(
@@ -23648,18 +23660,107 @@ fn settle_workflow_terminal_backend(
         ))
         .into());
     }
-    run_writer_transaction(
+    // Keep ownership outside the mutation closure: dropping a local release
+    // helper's fence before COMMIT would expose a partially settled workflow.
+    let mut reservation_fence = None;
+    let result = run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "settle terminal workflow",
         || {
+            let mut release_reservation = false;
+            if workflow.status == "completed" {
+                let existing = query_workflow_backend(backend, &workflow.id)?.ok_or_else(|| {
+                    StorageError::Database(
+                        "workflow completion requires an existing execution".to_string(),
+                    )
+                })?;
+                if existing.workflow_name != workflow.workflow_name
+                    || existing.pane_id != workflow.pane_id
+                    || existing.trigger_event_id != workflow.trigger_event_id
+                    || existing.started_at != workflow.started_at
+                    || existing.current_step != workflow.current_step
+                    || workflow.completed_at.is_none()
+                    || handled_status != "completed"
+                {
+                    return Err(StorageError::Database(
+                        "workflow completion identity or cursor changed; no settlement committed"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                if existing.status == "completed" {
+                    if existing.wait_condition == workflow.wait_condition
+                        && existing.context == workflow.context
+                        && existing.result == workflow.result
+                        && existing.error == workflow.error
+                        && existing.updated_at == workflow.updated_at
+                        && existing.completed_at == workflow.completed_at
+                    {
+                        // A completed execution may subsequently receive a new
+                        // operator claim. Replaying completion cannot release it.
+                        return Ok(());
+                    }
+                    return Err(StorageError::Database(
+                        "workflow is already completed; conflicting settlement refused".to_string(),
+                    )
+                    .into());
+                }
+                if !matches!(existing.status.as_str(), "running" | "waiting") {
+                    return Err(StorageError::Database(format!(
+                        "workflow is {}; stale completion cannot revive it",
+                        existing.status
+                    ))
+                    .into());
+                }
+                if auto_release_on_complete {
+                    let owned = backend
+                        .query_row_typed(
+                            "SELECT id FROM pane_reservations
+                             WHERE pane_id = ?1 AND owner_kind = 'workflow' AND owner_id = ?2
+                             AND status = 'active' AND released_at IS NULL LIMIT 1",
+                            &[
+                                ToSqlValue::Integer(u64_to_i64(existing.pane_id, "pane_id")?),
+                                ToSqlValue::Text(&existing.id),
+                            ],
+                        )
+                        .map_err(|error| {
+                            storage_backend_error("Find completed workflow reservation", error)
+                        })?;
+                    if owned.is_some() {
+                        // Nonblocking while the writer holds its transaction:
+                        // contention rolls everything back, never waits on an
+                        // injector that could itself be waiting for this writer.
+                        reservation_fence = reservation_mutation_fence(backend)?;
+                        release_reservation = true;
+                    }
+                }
+            }
             upsert_workflow_backend(backend, workflow)?;
             if let Some(event_id) = workflow.trigger_event_id {
                 mark_event_handled_backend(backend, event_id, Some(&workflow.id), handled_status)?;
             }
+            if release_reservation {
+                execute_typed(
+                    backend,
+                    "UPDATE pane_reservations SET status = 'released', released_at = ?1
+                     WHERE pane_id = ?2 AND owner_kind = 'workflow' AND owner_id = ?3
+                     AND status = 'active' AND released_at IS NULL",
+                    &[
+                        ToSqlValue::Integer(now_ms()),
+                        ToSqlValue::Integer(u64_to_i64(workflow.pane_id, "pane_id")?),
+                        ToSqlValue::Text(&workflow.id),
+                    ],
+                )
+                .map_err(|error| {
+                    storage_backend_error("Release completed workflow reservation", error)
+                })?;
+            }
             Ok(())
         },
-    )
+    );
+    drop(reservation_fence);
+    result
 }
 
 /// Upsert workflow action plan (synchronous)
@@ -37860,7 +37961,7 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
             workflow_name: "probe".to_string(),
             pane_id: 1,
             trigger_event_id: Some(event_id),
-            current_step: 0,
+            current_step: 3,
             status: "running".to_string(),
             wait_condition: None,
             context: None,
@@ -37875,7 +37976,6 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
     };
     let terminal = |running: &WorkflowRecord, status: &str| {
         let mut record = running.clone();
-        record.current_step = 3;
         record.status = status.to_string();
         record.updated_at = 5_000;
         record.completed_at = Some(5_000);
@@ -37887,7 +37987,7 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
     for (index, (status, handled_status)) in [("completed", "completed"), ("failed", "error")].into_iter().enumerate() {
         let running = admit(&format!("settle-{status}"), 1_000 + i64::try_from(index).unwrap());
         let event_id = running.trigger_event_id.unwrap();
-        settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status).unwrap();
+        settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status, true).unwrap();
         assert_eq!(query_workflow_backend(&backend, &running.id).unwrap().unwrap().status, status);
         let (handled_at, owner, recorded_status) = settlement(&backend, event_id);
         assert!(handled_at.is_some());
@@ -37904,7 +38004,7 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
          WHEN NEW.id = {event_id}
          BEGIN SELECT RAISE(ABORT, 'injected trigger settlement failure'); END;"
     )).unwrap();
-    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed").is_err());
+    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed", true).is_err());
     assert_eq!(
         serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap().unwrap()).unwrap(),
         serde_json::to_value(&running).unwrap(),
@@ -37924,7 +38024,7 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
          UPDATE events SET handled_at = 4000, handled_by_workflow_id = 'settle-after-abort',
          handled_status = 'aborted' WHERE id = {event_id};"
     )).unwrap();
-    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed").is_err());
+    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed", true).is_err());
     assert_eq!(query_workflow_backend(&backend, &running.id).unwrap().unwrap().status, "aborted");
     assert_eq!(
         settlement(&backend, event_id),
@@ -37936,13 +38036,143 @@ fn workflow_terminal_settlement_commits_record_and_trigger_together() {
     let running = admit("settle-invalid", 6_000);
     let event_id = running.trigger_event_id.unwrap();
     for (status, handled_status) in [("running", "completed"), ("waiting", "completed"), ("aborted", "aborted"), ("completed", "")] {
-        assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status).is_err());
+        assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status, true).is_err());
     }
     assert_eq!(
         serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap().unwrap()).unwrap(),
         serde_json::to_value(&running).unwrap(),
     );
     assert_eq!(settlement(&backend, event_id), (None, None, None));
+}
+
+fn completion_reservation_fixture_backend(
+    backend: &dyn StorageBackend,
+) -> (WorkflowRecord, WorkflowRecord, PaneReservation) {
+    let now = now_ms();
+    seed_pane_backend(backend, 1, now);
+    let event_id = seed_retention_event_backend(backend, 1, "warning", "trigger", now, None);
+    let running = WorkflowRecord {
+        id: "reservation-completion-owner".to_string(),
+        workflow_name: "completion_probe".to_string(),
+        pane_id: 1,
+        trigger_event_id: Some(event_id),
+        current_step: 2,
+        status: "running".to_string(),
+        wait_condition: None,
+        context: Some(serde_json::json!({"identity": "original"})),
+        result: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+    };
+    create_workflow_backend(backend, &running).unwrap();
+    let reservation = create_reservation_backend(
+        backend,
+        running.pane_id,
+        "workflow",
+        &running.id,
+        None,
+        3_600_000,
+        &PaneReservationConfig::default(),
+    )
+    .unwrap();
+    let mut completed = running.clone();
+    completed.status = "completed".to_string();
+    completed.result = Some(serde_json::json!({"finished": true}));
+    completed.updated_at = now + 1;
+    completed.completed_at = Some(now + 1);
+    (running, completed, reservation)
+}
+
+#[test]
+fn workflow_completion_cleanup_rejects_stale_identity_and_does_not_replay() {
+    let backend = memory_backend();
+    let (running, completed, original_reservation) = completion_reservation_fixture_backend(&backend);
+    for changed in ["execution", "workflow", "pane", "trigger", "start", "step", "completion"] {
+        let mut stale = completed.clone();
+        match changed {
+            "execution" => stale.id = "missing-execution".to_string(),
+            "workflow" => stale.workflow_name = "different_workflow".to_string(),
+            "pane" => stale.pane_id = 2,
+            "trigger" => stale.trigger_event_id = None,
+            "start" => stale.started_at += 1,
+            "step" => stale.current_step += 1,
+            "completion" => stale.completed_at = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            settle_workflow_terminal_backend(&backend, &stale, "completed", true).is_err(),
+            "changed {changed} must not authorize completion cleanup"
+        );
+        assert_eq!(
+            serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap()).unwrap(),
+            serde_json::to_value(Some(&running)).unwrap(),
+        );
+        assert_eq!(
+            get_active_reservation_backend(&backend, running.pane_id).unwrap().unwrap().id,
+            original_reservation.id,
+        );
+    }
+    assert!(query_workflow_backend(&backend, "missing-execution").unwrap().is_none());
+    settle_workflow_terminal_backend(&backend, &completed, "completed", true).unwrap();
+    assert!(get_active_reservation_backend(&backend, running.pane_id).unwrap().is_none());
+
+    let later_claim = create_reservation_backend(
+        &backend,
+        running.pane_id,
+        "workflow",
+        &running.id,
+        Some("operator claim after completion"),
+        3_600_000,
+        &PaneReservationConfig::default(),
+    )
+    .unwrap();
+    // Identical receipt is idempotent; a different result is refused. Neither
+    // is permission to release a reservation acquired after completion.
+    settle_workflow_terminal_backend(&backend, &completed, "completed", true).unwrap();
+    let mut conflicting = completed.clone();
+    conflicting.result = Some(serde_json::json!({"different": true}));
+    assert!(settle_workflow_terminal_backend(&backend, &conflicting, "completed", true).is_err());
+    assert_eq!(
+        get_active_reservation_backend(&backend, running.pane_id).unwrap().unwrap().id,
+        later_claim.id,
+    );
+    assert_eq!(
+        serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap()).unwrap(),
+        serde_json::to_value(Some(&completed)).unwrap(),
+    );
+}
+
+#[test]
+fn workflow_completion_reservation_or_trigger_failure_rolls_back_every_write() {
+    for rejected_table in ["events", "pane_reservations"] {
+        let backend = memory_backend();
+        let (running, completed, reservation) = completion_reservation_fixture_backend(&backend);
+        backend.execute_batch(&format!(
+            "CREATE TRIGGER reject_completion_write BEFORE UPDATE ON {rejected_table}
+             BEGIN SELECT RAISE(ABORT, 'injected completion write failure'); END;"
+        )).unwrap();
+        let error = settle_workflow_terminal_backend(&backend, &completed, "completed", true)
+            .expect_err("completion cannot commit without its trigger and reservation writes");
+        assert!(error.to_string().contains("injected completion write failure"), "{error}");
+        assert_eq!(
+            serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap()).unwrap(),
+            serde_json::to_value(Some(&running)).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(get_active_reservation_backend(&backend, running.pane_id).unwrap()).unwrap(),
+            serde_json::to_value(Some(&reservation)).unwrap(),
+        );
+        let row = backend.query_row_cells(
+            "SELECT handled_at, handled_by_workflow_id, handled_status FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(running.trigger_event_id.unwrap())],
+        ).unwrap().unwrap();
+        let reader = CellRowReader::new(&row);
+        assert!(reader.optional_i64(0).unwrap().is_none());
+        assert!(reader.optional_string(1).unwrap().is_none());
+        assert!(reader.optional_string(2).unwrap().is_none());
+    }
 }
 
 #[test]

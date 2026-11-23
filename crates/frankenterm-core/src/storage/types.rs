@@ -1662,6 +1662,9 @@ pub struct PaneReservationConfig {
     pub default_ttl_ms: i64,
     /// Maximum allowed TTL in milliseconds (1 hour).
     pub max_ttl_ms: i64,
+    /// Release this execution's workflow-owned pane reservation only when its
+    /// successful completion is committed. Failed or interrupted work retains it.
+    pub auto_release_on_complete: bool,
 }
 
 impl Default for PaneReservationConfig {
@@ -1683,6 +1686,7 @@ impl From<&crate::config::ReservationConfig> for PaneReservationConfig {
         Self {
             default_ttl_ms: milliseconds(config.default_ttl_secs),
             max_ttl_ms: milliseconds(config.max_ttl_secs),
+            auto_release_on_complete: config.auto_release_on_complete,
         }
     }
 }

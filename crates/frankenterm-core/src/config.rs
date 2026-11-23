@@ -979,11 +979,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "safety.reservations.auto_release_on_complete",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "workflow completion does not consume this reservation setting",
-        tracking_bead: "ft-1t4o4",
-        validation: "Config::validate rejects non-default values fail-closed",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "StorageConfig::from(&Config) -> settle_workflow_terminal_backend",
+        evidence: "when enabled, the terminal settlement transaction releases active same-pane workflow reservations owned by the exact execution only on its first successful completion; failures, interruptions, and repeated completion retain reservations",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "accepted for true and false; the setting is captured by storage handles and changes require restart",
     },
     ConfigKeyWiringRecord {
         key: "safety.semantic_shock",
@@ -3835,7 +3835,9 @@ pub struct ReservationConfig {
     /// Conflict behavior: "deny", "queue", "force" (with warning)
     pub conflict_behavior: String,
 
-    /// Auto-release on workflow completion
+    /// Release active reservations owned by the exact workflow execution and
+    /// pane when successful completion is committed. Failed, interrupted, and
+    /// repeated terminal settlements retain reservations. Changes require restart.
     pub auto_release_on_complete: bool,
 }
 
@@ -5406,6 +5408,17 @@ impl Config {
             }
         }
 
+        if self.safety.reservations.auto_release_on_complete
+            != new_config.safety.reservations.auto_release_on_complete
+        {
+            forbidden.push(ForbiddenChange {
+                name: "safety.reservations.auto_release_on_complete".to_string(),
+                reason:
+                    "Reservation completion policy is captured by storage handles; requires restart"
+                        .to_string(),
+            });
+        }
+
         // Check hot-reloadable settings
         if self.general.log_level != new_config.general.log_level {
             changes.push(HotReloadChange {
@@ -6242,11 +6255,6 @@ impl Config {
         if reservations.conflict_behavior != reservation_defaults.conflict_behavior {
             unhonored_safety.push(
                 "safety.reservations.conflict_behavior (active reservation conflicts are always denied)",
-            );
-        }
-        if reservations.auto_release_on_complete != reservation_defaults.auto_release_on_complete {
-            unhonored_safety.push(
-                "safety.reservations.auto_release_on_complete (workflow completion does not consume this setting)",
             );
         }
         if serde_json::to_value(&self.safety.semantic_shock).ok()
@@ -8300,6 +8308,37 @@ max_sender_id_len = 0
     }
 
     #[test]
+    fn validate_accepts_workflow_reservation_auto_release_toggle() {
+        for enabled in [false, true] {
+            let mut config = Config::default();
+            config.safety.reservations.auto_release_on_complete = enabled;
+            config
+                .validate()
+                .expect("workflow reservation cleanup supports both settings");
+        }
+    }
+
+    #[test]
+    fn workflow_reservation_auto_release_changes_require_restart() {
+        let key = "safety.reservations.auto_release_on_complete";
+        for enabled in [false, true] {
+            let mut original = Config::default();
+            original.safety.reservations.auto_release_on_complete = enabled;
+            assert!(original.diff_for_hot_reload(&original).allowed);
+
+            let mut updated = original.clone();
+            updated.safety.reservations.auto_release_on_complete = !enabled;
+            updated
+                .validate()
+                .expect("valid reservation completion policy");
+            let result = original.diff_for_hot_reload(&updated);
+            assert!(!result.allowed);
+            assert!(result.forbidden.iter().any(|change| change.name == key));
+            assert!(!result.changes.iter().any(|change| change.name == key));
+        }
+    }
+
+    #[test]
     fn validate_rejects_invalid_reservation_ttls() {
         for (default_ttl_secs, max_ttl_secs) in [
             (0, 3600),
@@ -8317,18 +8356,19 @@ max_sender_id_len = 0
     }
 
     #[test]
-    fn validate_rejects_unwired_reservation_settings_individually() {
-        for key in ["conflict_behavior", "auto_release_on_complete"] {
+    fn validate_rejects_unwired_reservation_conflict_behavior() {
+        for auto_release_on_complete in [false, true] {
             let mut config = Config::default();
             config.safety.reservations.default_ttl_secs = 7;
             config.safety.reservations.max_ttl_secs = 11;
-            if key == "conflict_behavior" {
-                config.safety.reservations.conflict_behavior = "force".to_string();
-            } else {
-                config.safety.reservations.auto_release_on_complete = false;
-            }
+            config.safety.reservations.auto_release_on_complete = auto_release_on_complete;
+            config.safety.reservations.conflict_behavior = "force".to_string();
             let err = config.validate().unwrap_err().to_string();
-            assert!(err.contains("ft-1t4o4") && err.contains(key), "{err}");
+            assert!(
+                err.contains("ft-1t4o4") && err.contains("conflict_behavior"),
+                "{err}"
+            );
+            assert!(!err.contains("auto_release_on_complete"), "{err}");
             assert!(!err.contains("default_ttl_secs"), "{err}");
             assert!(!err.contains("max_ttl_secs"), "{err}");
         }

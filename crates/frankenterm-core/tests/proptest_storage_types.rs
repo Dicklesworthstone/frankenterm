@@ -178,6 +178,7 @@ proptest! {
         let config = PaneReservationConfig {
             default_ttl_ms: 1_000,
             max_ttl_ms,
+            ..PaneReservationConfig::default()
         };
 
         prop_assert_eq!(

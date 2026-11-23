@@ -94,12 +94,8 @@ fn safety_blocks_are_not_silently_ignored() {
         "safety.capabilities.confirm_dangerous_patterns",
         |c| c.safety.capabilities.confirm_dangerous_patterns = false,
     );
-    assert_rejects("safety", "safety.reservations", |c| {
-        // Flip a bound-free bool so `SafetyConfig::validate` (which runs before
-        // the inline fail-closed reject) cannot fire a different cross-field
-        // (e.g. ttl) error first.
-        c.safety.reservations.auto_release_on_complete =
-            !c.safety.reservations.auto_release_on_complete;
+    assert_rejects("safety", "safety.reservations.conflict_behavior", |c| {
+        c.safety.reservations.conflict_behavior = "force".to_string();
     });
     assert_rejects("safety", "safety.semantic_shock", |c| {
         c.safety.semantic_shock.enabled = !c.safety.semantic_shock.enabled;
@@ -112,6 +108,18 @@ fn safety_blocks_are_not_silently_ignored() {
                 !c.safety.approval.require_reapproval_on_failure;
         },
     );
+}
+
+#[test]
+fn reservation_completion_config_reaches_storage_policy() {
+    for enabled in [false, true] {
+        let config = Config::from_toml(&format!(
+            "[safety.reservations]\nauto_release_on_complete = {enabled}\n"
+        ))
+        .expect("workflow reservation cleanup supports both settings");
+        let storage = frankenterm_core::storage::StorageConfig::from(&config);
+        assert_eq!(storage.reservation_config.auto_release_on_complete, enabled);
+    }
 }
 
 #[test]

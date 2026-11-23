@@ -168,11 +168,11 @@
     },
     {
       "key": "safety.reservations.auto_release_on_complete",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "workflow completion does not consume this reservation setting",
-      "tracking_bead": "ft-1t4o4",
-      "validation": "Config::validate rejects non-default values fail-closed"
+      "status": "consumed",
+      "consumer": "StorageConfig::from(&Config) -> settle_workflow_terminal_backend",
+      "evidence": "when enabled, the terminal settlement transaction releases active same-pane workflow reservations owned by the exact execution only on its first successful completion; failures, interruptions, and repeated completion retain reservations",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "accepted for true and false; the setting is captured by storage handles and changes require restart"
     },
     {
       "key": "safety.semantic_shock",

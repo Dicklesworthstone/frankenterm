@@ -5912,6 +5912,128 @@ mod tests {
     }
 
     #[test]
+    fn workflow_completion_honors_configured_reservation_cleanup_and_ownership() {
+        run_async_test(async {
+            for auto_release in [true, false] {
+                let temp_dir = tempfile::TempDir::new().unwrap();
+                let db_path = temp_dir
+                    .path()
+                    .join("completion_reservation_cleanup.db")
+                    .to_string_lossy()
+                    .to_string();
+                let mut config = crate::config::Config::default();
+                config.safety.reservations.auto_release_on_complete = auto_release;
+                config.validate().expect("supported reservation policy");
+                let cx = crate::cx::for_testing();
+                let storage = Arc::new(
+                    crate::storage::StorageHandle::with_config_with_cx(
+                        &cx,
+                        &db_path,
+                        crate::storage::StorageConfig::from(&config),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let handle: crate::wezterm::WeztermHandle =
+                    Arc::new(crate::wezterm::MockWezterm::new());
+                let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::from_safety_config(&config.safety),
+                    handle,
+                ));
+                let runner = WorkflowRunner::new(
+                    WorkflowEngine::default(),
+                    Arc::new(PaneWorkflowLockManager::new()),
+                    Arc::clone(&storage),
+                    injector,
+                    WorkflowRunnerConfig::default(),
+                );
+                let execution_id = "completion-reservation-owner";
+                for pane_id in [77, 78, 79] {
+                    seed_test_pane(&storage, pane_id, now_ms()).await;
+                }
+                let owned = storage
+                    .create_reservation_with_cx(
+                        &cx,
+                        77,
+                        "workflow",
+                        execution_id,
+                        Some("release after this execution succeeds"),
+                        60_000,
+                    )
+                    .await
+                    .unwrap();
+                let other_pane = storage
+                    .create_reservation_with_cx(&cx, 78, "workflow", execution_id, None, 60_000)
+                    .await
+                    .unwrap();
+                let manual = storage
+                    .create_reservation_with_cx(&cx, 79, "manual", execution_id, None, 60_000)
+                    .await
+                    .unwrap();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+                let result = runner
+                    .run_workflow_manual_with_cx(
+                        &cx,
+                        77,
+                        Arc::new(CompletionPersistenceProbeWorkflow {
+                            calls: Arc::clone(&calls),
+                        }),
+                        execution_id,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        result,
+                        ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Completed {
+                            ref execution_id,
+                            ..
+                        }) if execution_id == "completion-reservation-owner"
+                    ),
+                    "auto_release={auto_release}: {result:?}"
+                );
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let record = storage
+                    .get_workflow_with_cx(&cx, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.status, "completed");
+                assert!(record.completed_at.is_some());
+                assert_eq!(record.result, Some(serde_json::json!({ "ok": true })));
+
+                // Inspect the durable status as well as active visibility so
+                // expiration cannot masquerade as automatic cleanup.
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let (status, released_at): (String, Option<i64>) = conn
+                    .query_row(
+                        "SELECT status, released_at FROM pane_reservations WHERE id = ?1",
+                        [owned.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(status, if auto_release { "released" } else { "active" });
+                assert_eq!(released_at.is_some(), auto_release);
+                drop(conn);
+                let active = storage.list_active_reservations_with_cx(&cx).await.unwrap();
+                assert_eq!(
+                    active.iter().any(|reservation| reservation.id == owned.id),
+                    !auto_release
+                );
+                for preserved_id in [other_pane.id, manual.id] {
+                    assert!(
+                        active
+                            .iter()
+                            .any(|reservation| reservation.id == preserved_id)
+                    );
+                }
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn workflow_completion_persistence_failure_is_not_reported_completed() {
         run_async_test(async {
             let temp_dir = tempfile::TempDir::new().unwrap();
@@ -5938,6 +6060,10 @@ mod tests {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let cx = crate::cx::for_testing();
             seed_test_pane(&storage, 77, now_ms()).await;
+            let reservation = storage
+                .create_reservation_with_cx(&cx, 77, "workflow", execution_id, None, 60_000)
+                .await
+                .unwrap();
             reject_terminal_workflow_updates(&db_path);
             let result = runner
                 .run_workflow_manual_with_cx(
@@ -5965,6 +6091,20 @@ mod tests {
                 other => panic!("failed terminal persistence must not report success: {other:?}"),
             }
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let record = storage
+                .get_workflow_with_cx(&cx, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, "running");
+            assert!(record.completed_at.is_none());
+            let retained = storage
+                .get_active_reservation_with_cx(&cx, 77)
+                .await
+                .unwrap()
+                .expect("failed completion persistence must retain its reservation");
+            assert_eq!(retained.id, reservation.id);
+            assert!(retained.released_at.is_none());
 
             storage.shutdown().await.unwrap();
         });
@@ -6329,6 +6469,10 @@ mod tests {
             });
             let cx = crate::cx::for_testing();
             let execution_id = "invalid_initial_budget";
+            let reservation = storage
+                .create_reservation_with_cx(&cx, 77, "workflow", execution_id, None, 60_000)
+                .await
+                .unwrap();
             assert!(matches!(
                 runner
                     .run_workflow_manual_with_cx(&cx, 77, workflow, execution_id, None)
@@ -6341,6 +6485,13 @@ mod tests {
             let record = storage.get_workflow(execution_id).await.unwrap().unwrap();
             assert_eq!(record.status, "failed");
             assert!(record.completed_at.is_some());
+            let retained = storage
+                .get_active_reservation_with_cx(&cx, 77)
+                .await
+                .unwrap()
+                .expect("failed execution retains its reservation for recovery");
+            assert_eq!(retained.id, reservation.id);
+            assert!(retained.released_at.is_none());
             let audit = storage
                 .get_audit_actions(crate::storage::AuditQuery {
                     action_kind: Some("workflow_error".to_string()),

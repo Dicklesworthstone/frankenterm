@@ -57184,10 +57184,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     // Set up workflow infrastructure
                                     let db_path = &ctx.effective.paths.db_path;
                                     // ft-xbnl0.2.3 tick 302: cx-first storage open.
-                                    let storage = match StorageHandle::new_with_cx(
+                                    let storage = match StorageHandle::with_config_with_cx(
                                         &frankenterm_core::cx::Cx::current()
                                             .unwrap_or_else(frankenterm_core::cx::for_request),
                                         db_path,
+                                        frankenterm_core::storage::StorageConfig::from(&config),
                                     )
                                     .await
                                     {
@@ -64023,10 +64024,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         // Set up workflow infrastructure
                         let db_path = layout.db_path.to_string_lossy();
                         // ft-xbnl0.2.3 tick 302: cx-first storage open.
-                        let storage = match StorageHandle::new_with_cx(
+                        let storage = match StorageHandle::with_config_with_cx(
                             &frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request),
                             &db_path,
+                            frankenterm_core::storage::StorageConfig::from(&config),
                         )
                         .await
                         {
@@ -67298,10 +67300,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             approval_code,
         }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -133406,6 +133409,7 @@ printf x > "$MINISIGN_MARKER"
         let config = frankenterm_core::storage::PaneReservationConfig {
             default_ttl_ms: 17_000,
             max_ttl_ms: 23_000,
+            ..frankenterm_core::storage::PaneReservationConfig::default()
         };
         assert_eq!(reservation_ttl_ms(None, &config), 17_000);
         assert_eq!(reservation_ttl_ms(Some(7), &config), 7_000);

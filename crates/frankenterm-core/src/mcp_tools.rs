@@ -11034,7 +11034,11 @@ impl ToolHandler for WaWorkflowRunTool {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP workflow run storage open.
                 let wf_open_cx = ctx.cx().clone();
                 let storage =
-                    StorageHandle::new_with_cx(&wf_open_cx, &db_path.to_string_lossy())
+                    StorageHandle::with_config_with_cx(
+                        &wf_open_cx,
+                        &db_path.to_string_lossy(),
+                        crate::storage::StorageConfig::from(config.as_ref()),
+                    )
                         .await
                         .map_err(McpToolError::from_error)?;
                 let storage = Arc::new(storage);

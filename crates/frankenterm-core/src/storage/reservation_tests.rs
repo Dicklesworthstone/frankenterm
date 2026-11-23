@@ -485,6 +485,7 @@ fn configured_reservation_expiry_overflow_leaves_no_reservation() {
     let policy = PaneReservationConfig {
         default_ttl_ms: 1_000,
         max_ttl_ms: i64::MAX,
+        ..PaneReservationConfig::default()
     };
     let result = with_test_storage_backend(&mut conn, |backend| {
         create_reservation_backend(backend, 1, "agent", "overflow", None, i64::MAX, &policy)
@@ -590,6 +591,7 @@ fn reservation_policy_is_owned_by_each_storage_handle() {
                 reservation_config: PaneReservationConfig {
                     default_ttl_ms: 5_000,
                     max_ttl_ms: 13_000,
+                    ..PaneReservationConfig::default()
                 },
                 ..StorageConfig::default()
             },
@@ -602,6 +604,7 @@ fn reservation_policy_is_owned_by_each_storage_handle() {
                 reservation_config: PaneReservationConfig {
                     default_ttl_ms: 17_000,
                     max_ttl_ms: 29_000,
+                    ..PaneReservationConfig::default()
                 },
                 ..StorageConfig::default()
             },
@@ -629,6 +632,170 @@ fn reservation_policy_is_owned_by_each_storage_handle() {
 }
 
 #[test]
+fn workflow_completion_fences_owned_reservation_cleanup_atomically() {
+    super::run_storage_async_test(async {
+        for auto_release in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("completion-reservation-fence.db");
+            let cx = crate::cx::for_testing();
+            let handle = StorageHandle::with_config_with_cx(
+                &cx,
+                path.to_str().unwrap(),
+                StorageConfig {
+                    reservation_config: PaneReservationConfig {
+                        auto_release_on_complete: auto_release,
+                        ..PaneReservationConfig::default()
+                    },
+                    ..StorageConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            handle
+                .upsert_pane_with_cx(&cx, reservation_test_pane(1))
+                .await
+                .unwrap();
+            let started_at = now_ms();
+            let event_id = handle
+                .record_event_with_cx(
+                    &cx,
+                    StoredEvent {
+                        id: 0,
+                        pane_id: 1,
+                        rule_id: "test.completion_fence".to_string(),
+                        agent_type: "unknown".to_string(),
+                        event_type: "pattern".to_string(),
+                        severity: "info".to_string(),
+                        confidence: 1.0,
+                        extracted: None,
+                        matched_text: Some("workflow trigger".to_string()),
+                        segment_id: None,
+                        detected_at: started_at,
+                        dedupe_key: None,
+                        handled_at: None,
+                        handled_by_workflow_id: None,
+                        handled_status: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let running = WorkflowRecord {
+                id: "completion-fence-owner".to_string(),
+                workflow_name: "completion_fence_probe".to_string(),
+                pane_id: 1,
+                trigger_event_id: Some(event_id),
+                current_step: 0,
+                status: "running".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: None,
+                started_at,
+                updated_at: started_at,
+                completed_at: None,
+            };
+            handle
+                .create_workflow_with_cx(&cx, running.clone())
+                .await
+                .unwrap();
+            let reservation = handle
+                .create_reservation_with_cx(&cx, 1, "workflow", &running.id, None, 300_000)
+                .await
+                .unwrap();
+            let mut completed = running.clone();
+            completed.status = "completed".to_string();
+            completed.result = Some(serde_json::json!({ "ok": true }));
+            completed.updated_at = now_ms();
+            completed.completed_at = Some(completed.updated_at);
+
+            let conn = Connection::open(&path).unwrap();
+            let trigger_state = || {
+                conn.query_row(
+                    "SELECT handled_at, handled_by_workflow_id, handled_status
+                     FROM events WHERE id = ?1",
+                    [event_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+            let reservation_state = || {
+                conn.query_row(
+                    "SELECT status, released_at FROM pane_reservations WHERE id = ?1",
+                    [reservation.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(trigger_state(), (None, None, None));
+            assert_eq!(reservation_state(), ("active".to_string(), None));
+
+            let fence = crate::policy_kill_switch_state::acquire_kill_switch_fence(&path).unwrap();
+            let result = handle
+                .settle_workflow_terminal_with_cx(&cx, completed.clone(), "completed")
+                .await;
+            if auto_release {
+                let error =
+                    result.expect_err("owned cleanup must share workspace effect authority");
+                assert!(
+                    matches!(
+                        error,
+                        crate::Error::Storage(StorageError::Database(ref code))
+                            if code == "reservation_mutation_fence_pending"
+                    ),
+                    "{error:?}"
+                );
+                let retained = handle
+                    .get_workflow_with_cx(&cx, &running.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(retained).unwrap(),
+                    serde_json::to_value(&running).unwrap(),
+                    "fence contention cannot partially complete the execution"
+                );
+                assert_eq!(trigger_state(), (None, None, None));
+                assert_eq!(reservation_state(), ("active".to_string(), None));
+            } else {
+                result.expect("disabled cleanup needs no reservation mutation authority");
+            }
+            drop(fence);
+
+            if auto_release {
+                handle
+                    .settle_workflow_terminal_with_cx(&cx, completed.clone(), "completed")
+                    .await
+                    .unwrap();
+            }
+            let durable = handle
+                .get_workflow_with_cx(&cx, &running.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(durable).unwrap(),
+                serde_json::to_value(&completed).unwrap()
+            );
+            let (handled_at, owner, status) = trigger_state();
+            assert!(handled_at.is_some());
+            assert_eq!(owner.as_deref(), Some(running.id.as_str()));
+            assert_eq!(status.as_deref(), Some("completed"));
+            let (status, released_at) = reservation_state();
+            assert_eq!(status, if auto_release { "released" } else { "active" });
+            assert_eq!(released_at.is_some(), auto_release);
+            drop(conn);
+            handle.shutdown_with_cx(&cx).await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn invalid_reservation_policy_is_rejected_before_opening_storage() {
     super::run_storage_async_test(async {
         let dir = tempfile::tempdir().unwrap();
@@ -649,6 +816,7 @@ fn invalid_reservation_policy_is_rejected_before_opening_storage() {
                 reservation_config: PaneReservationConfig {
                     default_ttl_ms,
                     max_ttl_ms,
+                    ..PaneReservationConfig::default()
                 },
                 ..StorageConfig::default()
             };
