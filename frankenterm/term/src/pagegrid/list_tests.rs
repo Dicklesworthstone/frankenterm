@@ -153,6 +153,90 @@ fn refusal_hold_and_cap_changes_keep_legacy_eviction_counts() {
 }
 
 #[test]
+fn resize_truncation_keeps_stable_prefix_and_shared_pages_without_stale_floors() {
+    let mut list = PageList::with_page_rows(COLS, 4, 2, 17, 1);
+    for stable in 0..20 {
+        list.scroll(1, stable as usize + 1, false, admit_all);
+        put(&mut list, stable, stable as u32, stable as usize + 1);
+    }
+    assert_eq!(list.first_stable(), 3, "the first page is partially trimmed");
+    let boundary = Arc::clone(list.row(8).unwrap().sealed.unwrap());
+    let removed = Arc::clone(list.row(12).unwrap().sealed.unwrap());
+    list.mark_rows_changed(5..16, 50);
+    list.mark_all_changed(30);
+
+    list.truncate_for_resize(8);
+    assert_eq!(list.first_stable(), 3);
+    assert_eq!(list.end_stable(), 11);
+    assert_eq!(list.retained_rows(), 8);
+    assert_ne!(list.row(8).unwrap().page.serial(), boundary.serial());
+    assert_eq!(boundary.used(), 4, "a shared boundary page was not truncated");
+    assert_eq!(boundary.glyph(3, 0), Glyph::Char(glyph(11)));
+    assert_eq!(removed.glyph(0, 0), Glyph::Char(glyph(12)));
+    for stable in 3..11 {
+        assert_eq!(content(&list, stable), Some(stable as u32));
+        assert_eq!(
+            list.effective_seqno(stable),
+            Some(if stable < 5 { 30 } else { 50 })
+        );
+    }
+    assert!(list.range_floors().iter().all(|floor| floor.end <= 11));
+    check(&list);
+
+    list.push_for_resize(40);
+    assert_eq!(
+        list.effective_seqno(11),
+        Some(40),
+        "discarded range floors do not reach padding"
+    );
+    assert_eq!(content(&list, 11), None);
+    list.set_hot_cap(5);
+    list.push_for_resize(60);
+    assert_eq!(list.first_stable(), 3, "padding cannot evict history");
+    assert_eq!(list.retained_rows(), 10);
+    assert_eq!(list.over_cap(), Some(OverCap::CapLowered));
+    check(&list);
+
+    let scrolled = list.scroll(1, 61, false, admit_all);
+    assert_eq!(
+        scrolled.trimmed, 6,
+        "the next real scroll enforces the new cap"
+    );
+    assert_eq!(scrolled.first_new, 13);
+    assert_eq!(list.first_stable(), 9);
+    check(&list);
+    boundary.check_invariants().unwrap();
+    removed.check_invariants().unwrap();
+}
+
+#[test]
+fn resize_truncation_handles_page_boundaries_and_an_empty_retained_prefix() {
+    let mut list = PageList::with_page_rows(COLS, 4, 2, 9, 1);
+    for stable in 0..12 {
+        list.scroll(1, 1, false, admit_all);
+        put(&mut list, stable, stable as u32, 1);
+    }
+    assert_eq!(list.first_stable(), 3);
+    // Keep a whole tail page first, then only the partially trimmed first page.
+    for len in [5, 1, 0] {
+        list.truncate_for_resize(len);
+        assert_eq!(list.first_stable(), 3);
+        assert_eq!(list.end_stable(), 3 + len as StableRowIndex);
+        assert_eq!(list.retained_rows(), len);
+        for stable in 3..list.end_stable() {
+            assert_eq!(content(&list, stable), Some(stable as u32));
+        }
+        check(&list);
+    }
+    list.push_for_resize(2);
+    assert_eq!(list.first_stable(), 3);
+    assert_eq!(list.end_stable(), 4);
+    assert_eq!(content(&list, 3), None);
+    assert!(list.pages_reused() > 0);
+    check(&list);
+}
+
+#[test]
 fn sealed_pages_are_shared_and_written_by_copy_on_write() {
     let mut list = PageList::with_page_rows(COLS, 2, 2, 100, 1);
     for stable in 0..10 {

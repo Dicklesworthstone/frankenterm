@@ -1648,6 +1648,25 @@ impl Page {
         self.debug_check_row(row);
     }
 
+    /// Drops the rows at and after `used`, returning their slots to the clean
+    /// state that `grow` requires. Row headers can have been permuted by a
+    /// scroll region, so release each header's slot rather than its row number.
+    pub(crate) fn truncate_rows(&mut self, used: u32) {
+        if used >= self.used {
+            return;
+        }
+        for row in used..self.used {
+            let header = self.header(row);
+            let slot = header.slot();
+            self.release_range(slot, 0..header.len());
+            self.set_header(row, RowHeader::with_slot(slot));
+            let seqno = self.seqno_index(slot);
+            self.buf[seqno] = 0;
+        }
+        self.used = used;
+        self.max_seqno = self.computed_max_seqno();
+    }
+
     /// Recycles the page (I14): zero cells and seqnos, no rows, empty side
     /// tables at standard capacity, and a fresh serial.
     pub fn reset(&mut self, serial: u64) {

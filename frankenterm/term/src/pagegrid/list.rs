@@ -3,7 +3,10 @@
 //! The primary screen's rows, oldest first, in pages of `page_rows` rows. A
 //! row's coordinate is its `StableRowIndex`: [`PageList::scroll`] appends
 //! rows at the tail with the next index and trims rows at the front, so
-//! indices increase and are never reused (D6). A stable index maps to
+//! scroll indices increase and are never reused (D6). A resize may discard
+//! trailing blank coordinates after replacing the screen's coordinate witness;
+//! [`PageList::truncate_for_resize`] preserves the retained prefix in that new
+//! coordinate generation. A stable index maps to
 //! `(page, row)` by a binary search over the pages' first indices.
 //!
 //! **Scrolling is O(1) per row.** A new row is the next row of the tail page,
@@ -870,6 +873,54 @@ impl PageList {
         self.seal_eligible();
     }
 
+    /// Drops a resize's trailing rows without evicting history at the front.
+    /// The caller must replace its coordinate witness before this operation:
+    /// legacy resize can reuse the removed blank coordinates for padding, while
+    /// every retained row keeps its stable index. Scrolling never rewinds them.
+    pub(crate) fn truncate_for_resize(&mut self, len: usize) {
+        if len >= self.retained_rows {
+            return;
+        }
+        let end = self.next_stable - (self.retained_rows - len) as StableRowIndex;
+        while self.pages.back().is_some_and(|slot| slot.first_stable >= end) {
+            let slot = self.pages.pop_back().expect("the tail was checked above");
+            self.sealed = self.sealed.min(self.pages.len());
+            self.recycle_page(slot);
+        }
+        if let Some(index) = self.pages.len().checked_sub(1) {
+            self.sealed = self.sealed.min(index);
+            let PageList {
+                pages, next_serial, ..
+            } = self;
+            let tail = &mut pages[index];
+            tail.unseal(next_serial);
+            let used = tail.front_trim + (end - tail.first_stable) as u32;
+            tail.page_mut(next_serial).truncate_rows(used);
+        }
+        self.next_stable = end;
+        self.retained_rows = len;
+        // Floors attached to discarded rows must not dirty future padding at
+        // those coordinates. Surviving rows retain their existing floors.
+        self.range_floors.retain_mut(|floor| {
+            floor.end = floor.end.min(end);
+            floor.start < floor.end
+        });
+        self.set_hot_cap(self.hot_cap);
+        // The tail moved towards the history. Unseal pages now within reach of
+        // the viewport, forking only when an external reader holds them.
+        self.set_viewport_rows(self.viewport_rows);
+        self.debug_check_counts();
+    }
+
+    /// Adds resize padding without the eviction performed by a scroll. A
+    /// lowered cap is enforced by the next actual scroll, as in legacy.
+    pub(crate) fn push_for_resize(&mut self, seqno: SequenceNo) {
+        self.append_row(seqno, 0);
+        self.set_hot_cap(self.hot_cap);
+        self.seal_eligible();
+        self.debug_check_counts();
+    }
+
     /// The last stable index a sealed page may hold.
     fn seal_cutoff(&self) -> StableRowIndex {
         self.viewport_top() - SEAL_DISTANCE as StableRowIndex
@@ -988,6 +1039,12 @@ impl PageList {
     fn recycle_front(&mut self) {
         let slot = self.pages.pop_front().expect("a front page");
         self.sealed = self.sealed.saturating_sub(1);
+        self.recycle_page(slot);
+    }
+
+    /// Recycles a removed page from either end, retaining shared sealed pages
+    /// unchanged for their readers.
+    fn recycle_page(&mut self, slot: PageSlot) {
         match (slot.active, slot.sealed) {
             (Some(mut page), _) => {
                 if self.pool.len() < MAX_POOLED_PAGES {

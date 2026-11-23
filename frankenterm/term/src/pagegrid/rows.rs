@@ -10,7 +10,7 @@
 //!   native write stores it back into the page ([`PageRows::page_row`]);
 //! - an insertion or removal of rows other than the page engine's own scroll
 //!   operations turns the rows back into legacy `Line`s for good
-//!   ([`Rows::legacy_mut`]). Those come from resize, reflow, cold seams,
+//!   ([`Rows::legacy_mut`]). Those come from width reflow, cold seams,
 //!   recovery and erasing the scrollback, which later B3 beads make
 //!   page-native.
 
@@ -287,6 +287,36 @@ impl PageRows {
     /// between scrolls (a config change or a resize).
     pub fn set_hot_cap(&mut self, hot_cap: usize) {
         self.list.set_hot_cap(hot_cap);
+    }
+
+    /// Applies a same-width resize's retention limits without evicting rows.
+    pub(crate) fn set_resize_geometry(&mut self, viewport_rows: usize, hot_cap: usize) {
+        self.list.set_hot_cap(hot_cap);
+        self.list.set_viewport_rows(viewport_rows);
+    }
+
+    /// Discards only a resize's trailing rows and their views. Edited views in
+    /// the retained prefix remain authoritative; resize does not flush them.
+    pub(crate) fn truncate_for_resize(&mut self, len: usize) {
+        self.list.truncate_for_resize(len);
+        self.views.truncate(len);
+        debug_assert_eq!(self.views.len(), self.list.retained_rows());
+    }
+
+    /// Stores a resize's padding directly in its new page row. Preserve an
+    /// exceptional legacy view if its content cannot be represented there.
+    fn push_for_resize(&mut self, line: Line) {
+        self.list.push_for_resize(line.current_seqno());
+        let (page, row) = self.list.tail_row_mut().expect("a row was just appended");
+        let mut view = RowView::default();
+        if (line.implicit_hyperlinks_are_scanned() && line.has_hyperlink())
+            || !store_line(page, row, &line)
+        {
+            let _ = view.line.set(Box::new(line));
+            view.edited = true;
+        }
+        self.views.push_back(view);
+        debug_assert_eq!(self.views.len(), self.list.retained_rows());
     }
 
     /// [`Self::scroll`] for a scroll region with top margin 0 above `footer`
@@ -598,6 +628,22 @@ impl Rows {
     pub fn reserve(&mut self, additional: usize) {
         if let Rows::Legacy(lines) = self {
             lines.reserve(additional);
+        }
+    }
+
+    /// Resize-only structural edits preserve packed rows when the width stays
+    /// unchanged. Other edits retain their existing legacy fallback.
+    pub(crate) fn truncate_for_resize(&mut self, len: usize) {
+        match self {
+            Rows::Legacy(lines) => lines.truncate(len),
+            Rows::Page(rows) => rows.truncate_for_resize(len),
+        }
+    }
+
+    pub(crate) fn push_for_resize(&mut self, line: Line) {
+        match self {
+            Rows::Legacy(lines) => lines.push_back(line),
+            Rows::Page(rows) => rows.push_for_resize(line),
         }
     }
 
@@ -1054,8 +1100,8 @@ mod tests {
 
     /// ft-yccm0.3.3.4: page-engine rows decode exactly as legacy rows after
     /// the hot path's streams, whole and in 7-byte chunks, and the screen
-    /// keeps its rows in pages; a resize returns them to legacy storage and
-    /// they still decode the same.
+    /// keeps its rows in pages through height/DPI changes. A width change
+    /// returns them to legacy storage, where they still decode the same.
     #[test]
     fn page_rows_decode_as_legacy_rows() {
         let streams: Vec<(&str, Vec<u8>)> = vec![
@@ -1117,6 +1163,14 @@ mod tests {
             (
                 "alternate_screen_active",
                 b"main\r\n\x1b[?1049halt\x1b[2;3r\n\n\n\x1bMx\x1b[r\x1b[?47l\x1b[?47h".to_vec(),
+            ),
+            (
+                "saved_cursor_in_pruned_blank_rows",
+                b"\x1b[6;10H\x1b7\x1b[2;1Hprompt".to_vec(),
+            ),
+            (
+                "saved_wide_cursor_at_wrap",
+                "\x1b[1;9H界\x1b7\x1b[2;1Hprompt".as_bytes().to_vec(),
             ),
             (
                 "osc133_zones",
@@ -1218,6 +1272,49 @@ mod tests {
                     "{} zones",
                     what
                 );
+
+                for (rows, dpi) in [(3, 96), (9, 96), (9, 144), (6, 96)] {
+                    let size = TerminalSize {
+                        rows,
+                        cols: 10,
+                        pixel_width: 80,
+                        pixel_height: rows * 16,
+                        dpi,
+                    };
+                    legacy.resize(size);
+                    page.resize(size);
+                    assert_eq!(
+                        page.screen().grid_engine(),
+                        GridEngine::Page,
+                        "{what}, rows={rows}, dpi={dpi}"
+                    );
+                    assert_eq!(
+                        decoded(&page),
+                        decoded(&legacy),
+                        "{what}, rows={rows}, dpi={dpi}"
+                    );
+                    assert_eq!(
+                        page.cursor_pos(),
+                        legacy.cursor_pos(),
+                        "{what}, rows={rows}, dpi={dpi}"
+                    );
+                    assert_eq!(
+                        page.get_semantic_zones().unwrap(),
+                        legacy.get_semantic_zones().unwrap(),
+                        "{what} zones"
+                    );
+                }
+                if name.starts_with("saved_") {
+                    legacy.advance_bytes(b"\x1b8!");
+                    page.advance_bytes(b"\x1b8!");
+                    assert_eq!(
+                        page.cursor_pos(),
+                        legacy.cursor_pos(),
+                        "{what} restored cursor"
+                    );
+                    assert_eq!(decoded(&page), decoded(&legacy), "{what} restored content");
+                    assert_eq!(page.screen().grid_engine(), GridEngine::Page);
+                }
 
                 let size = TerminalSize {
                     rows: 4,

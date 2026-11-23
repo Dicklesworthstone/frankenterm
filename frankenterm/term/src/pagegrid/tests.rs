@@ -988,6 +988,84 @@ fn hidden_cell_rewrite_matches_legacy_recompression() {
 }
 
 #[test]
+fn resize_truncation_releases_permuted_row_resources_and_reuses_clean_slots() {
+    let fixture = Fixture::new();
+    let mut page = Page::new(8, 4, 1);
+    let style = rich(4);
+    let mut cache = None;
+    let images = vec![Box::new(fixture.images[0].clone())];
+    for seqno in [10, 0, 30, 40] {
+        let row = page.grow(seqno).unwrap();
+        let mut write = CellWrite::new(
+            Glyph::from_text("👩\u{200d}💻"),
+            StyleSpec::Rich {
+                style: &style,
+                cache: &mut cache,
+            },
+        );
+        write.wide = true;
+        write.hyperlink = Some(&fixture.links[0]);
+        write.images = &images;
+        assert!(page.write(row, 0, write, seqno));
+    }
+    page.swap_rows(0, 2);
+    page.swap_rows(1, 3);
+    let kept = [page.legacy_cell(0, 0), page.legacy_cell(1, 0)];
+    let CellStyle::Rich(style_id) = page.cell(0, 0).style() else {
+        panic!("fixture must exercise rich-style ownership");
+    };
+
+    page.truncate_rows(2);
+    assert_eq!(page.used(), 2);
+    assert_eq!(
+        page.max_seqno(),
+        40,
+        "the discarded zero seqno no longer dominates"
+    );
+    assert_eq!(page.styles().refs(style_id), 4, "two retained wide cells");
+    assert_eq!(page.graphemes().len(), 2);
+    for (row, expected) in kept.iter().enumerate() {
+        assert_same_cell(&page.legacy_cell(row as u32, 0), expected);
+    }
+    page.check_invariants().unwrap();
+
+    // New rows use the permuted slots just released, without stale flags,
+    // hyperlinks, images, graphemes or a sequence from the former occupant.
+    for expected in 2..4 {
+        let row = page.grow(50).unwrap();
+        assert_eq!(row, expected);
+        assert_eq!(page.row_len(row), 0);
+        assert_eq!(page.row_seqno(row), 50);
+        assert_eq!(
+            page.header(row).bits() & !u64::from(u32::MAX),
+            RowHeader::DIRTY
+        );
+    }
+    page.truncate_rows(u32::MAX);
+    assert_eq!(page.used(), 4, "growing truncation is a no-op");
+    page.truncate_rows(0);
+    assert_eq!(page.styles().live(), 0);
+    assert!(page.graphemes().is_empty());
+    assert_eq!(page.links().live(), 0);
+    assert!(page.images().is_clean());
+    page.check_invariants().unwrap();
+    let row = page.grow(60).unwrap();
+    assert!(page.write(
+        row,
+        0,
+        CellWrite::new(
+            Glyph::Char('x'),
+            StyleSpec::Rich {
+                style: &style,
+                cache: &mut cache,
+            },
+        ),
+        60,
+    ));
+    page.check_invariants().unwrap();
+}
+
+#[test]
 fn reset_returns_a_used_page_to_a_clean_state() {
     let fixture = Fixture::new();
     let mut page = Page::standard(120, 1);

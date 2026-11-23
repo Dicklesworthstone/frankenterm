@@ -9160,10 +9160,14 @@ impl Screen {
     /// the last row instead (see the end of `resize_with_prepared_reflow`).
     fn prune_resize_trailing_blanks(&mut self, cursor: CursorPosition) {
         let cursor_phys = self.phys_row(cursor.y);
-        for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
-                self.lines.pop_back();
-            }
+        let mut retained = self.lines.len();
+        while retained > cursor_phys.saturating_add(1)
+            && self.lines.get(retained - 1).is_some_and(Line::is_whitespace)
+        {
+            retained -= 1;
+        }
+        if retained < self.lines.len() {
+            self.lines.truncate_for_resize(retained);
         }
     }
 
@@ -9249,9 +9253,11 @@ impl Screen {
             self.finish_selection_anchor_resize(selection_anchors, seqno);
             return cursor;
         }
-        // Resize and reflow edit rows structurally: page-engine rows take
-        // them through legacy storage until page-wise reflow (B3.6).
-        self.lines.legacy_mut();
+        // Height and DPI changes retain packed storage. Column changes still
+        // use the legacy reflow path until page-wise wrapping (B3.6).
+        if physical_cols != self.physical_cols {
+            self.lines.legacy_mut();
+        }
         log::debug!(
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
             size.dpi
@@ -9395,6 +9401,9 @@ impl Screen {
         };
 
         let capacity = physical_rows + self.hot_scrollback_size();
+        if let Some(rows) = self.lines.page_mut() {
+            rows.set_resize_geometry(physical_rows, capacity);
+        }
         let current_capacity = self.lines.capacity();
         if capacity > current_capacity {
             self.lines.reserve(capacity - self.lines.len());
@@ -9404,7 +9413,8 @@ impl Screen {
         // lines than the viewport size, or we resized taller,
         // pad us back out to the viewport size
         while self.lines.len() < physical_rows {
-            self.lines.push_back(self.blank_line_borrowing_bidi(seqno));
+            self.lines
+                .push_for_resize(self.blank_line_borrowing_bidi(seqno));
         }
 
         let new_cursor_y;
@@ -9447,7 +9457,8 @@ impl Screen {
                 physical_rows.saturating_sub(new_cursor_y as usize);
             let actual_num_rows_after_cursor = self.lines.len().saturating_sub(cursor_y);
             for _ in actual_num_rows_after_cursor..required_num_rows_after_cursor {
-                self.lines.push_back(self.blank_line_borrowing_bidi(seqno));
+                self.lines
+                    .push_for_resize(self.blank_line_borrowing_bidi(seqno));
             }
         } else {
             // Compute the new cursor location; this is logically the inverse
@@ -21268,6 +21279,127 @@ pub(crate) mod tests {
     // =========================================================================
     // Core Screen::resize() behavior
     // =========================================================================
+
+    #[test]
+    fn page_same_width_resize_preserves_history_cursor_selection_and_edited_views() {
+        for is_conpty in [false, true] {
+            let mut legacy = test_screen_with_history(GridEngine::Legacy);
+            let mut page = test_screen_with_history(GridEngine::Page);
+            let mut attrs = CellAttributes::blank();
+            attrs.set_hyperlink(Some(Arc::new(frankenterm_cell::Hyperlink::new(
+                "https://example.com/resize",
+            ))));
+            for screen in [&mut legacy, &mut page] {
+                // This edited history row deliberately exceeds the page width:
+                // preserving its authoritative view is part of resize parity.
+                screen.lines[0] = Line::from_text(
+                    "history edited beyond the page width",
+                    &attrs,
+                    21,
+                    None,
+                );
+                let visible = screen.phys_row(0);
+                screen.lines[visible] = Line::from_text("A界e\u{301}👩\u{200d}💻", &attrs, 21, None);
+                screen.lines[visible].set_bidi_info(true, ParagraphDirectionHint::RightToLeft, 21);
+                let tail = screen.lines.len() - 1;
+                screen.lines[tail] = Line::from_text("  ", &attrs, 21, None);
+            }
+            let first = page.phys_to_stable_row_index(0);
+            let live = page.phys_to_stable_row_index(page.phys_row(0));
+            let points = [
+                anchor_point(0, first),
+                anchor_point(0, first),
+                anchor_point(4, live),
+            ];
+            let legacy_anchor = legacy.capture_selection_anchor(21, points).unwrap();
+            let page_anchor = page.capture_selection_anchor(21, points).unwrap();
+            let before_resize = page.capture_coordinate_witness();
+            let stable_offset = page.stable_row_index_offset;
+            let mut cursor = test_cursor(6, 0, 21);
+
+            for (step, (height, dpi)) in [(2, 96), (7, 96), (7, 144), (1, 144), (6, 96), (6, 96)]
+                .into_iter()
+                .enumerate()
+            {
+                let seqno = 22 + step;
+                let size = test_size(height, 8, dpi);
+                let expected_cursor = legacy.resize(size, cursor, seqno, is_conpty);
+                cursor = page.resize(size, cursor, seqno, is_conpty);
+                assert_eq!(cursor, expected_cursor, "ConPTY={is_conpty}, step={step}");
+                assert_eq!(page.grid_engine(), GridEngine::Page);
+                assert_eq!(page.stable_row_index_offset, stable_offset);
+                assert_eq!(page.stable_row_index_offset, legacy.stable_row_index_offset);
+                assert!(!page.matches_coordinate_witness(&before_resize));
+                if step == 0 {
+                    assert!(
+                        page.cached_page_views() < page.lines.len(),
+                        "resize materialized history"
+                    );
+                }
+                assert_eq!(page.lines, legacy.lines, "ConPTY={is_conpty}, step={step}");
+                assert_eq!(
+                    page.resolve_selection_anchor(&page_anchor, seqno),
+                    legacy.resolve_selection_anchor(&legacy_anchor, seqno),
+                );
+                assert_eq!(
+                    page.resolve_selection_anchor(&page_anchor, seqno),
+                    Some(points)
+                );
+                let rows = page.lines.page().unwrap();
+                assert!(
+                    rows.is_edited(0),
+                    "resize must not discard an unrepresentable edit"
+                );
+                assert_eq!(rows.list().first_stable(), first);
+                assert_eq!(rows.list().viewport_rows(), height);
+                assert_eq!(rows.list().hot_cap(), height + 8);
+                rows.list().check_invariants().unwrap();
+            }
+
+            // Parsing/scrolling after resize still uses pages and the revised
+            // retention cap, including ConPTY's extra rows below the cursor.
+            for screen in [&mut legacy, &mut page] {
+                screen.set_cell(0, cursor.y, &Cell::new('Z', CellAttributes::blank()), 30);
+                screen.scroll_up(&(0..6), 1, 31, CellAttributes::blank(), bidi_mode());
+            }
+            assert_eq!(page.grid_engine(), GridEngine::Page);
+            assert_eq!(page.lines, legacy.lines);
+            assert_eq!(page.stable_row_index_offset, legacy.stable_row_index_offset);
+            page.lines.page().unwrap().list().check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn page_height_and_dpi_resize_materializes_only_the_visible_frame() {
+        let mut screen = test_screen_with_config(
+            4,
+            80,
+            96,
+            TestTermConfig {
+                scrollback: 1_000,
+                grid_engine: Some(GridEngine::Page),
+                ..TestTermConfig::default()
+            },
+        );
+        for seqno in 1..=800 {
+            screen.scroll_up(&(0..4), 1, seqno, CellAttributes::blank(), bidi_mode());
+        }
+        screen.touch_all_rows(800);
+        assert_eq!(screen.cached_page_views(), 0);
+        let retained = screen.lines.len();
+        let cursor = screen.resize(test_size(8, 80, 144), test_cursor(0, 3, 800), 801, false);
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        assert_eq!(screen.lines.len(), retained);
+        assert_eq!(cursor.y, 7);
+        assert!(
+            screen.cached_page_views() <= 8,
+            "history acquired compatibility views"
+        );
+        screen.set_cell(0, cursor.y, &Cell::new('x', CellAttributes::blank()), 802);
+        screen.scroll_up(&(0..8), 1, 803, CellAttributes::blank(), bidi_mode());
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        screen.lines.page().unwrap().list().check_invariants().unwrap();
+    }
 
     #[test]
     fn resize_changes_physical_dimensions() {
