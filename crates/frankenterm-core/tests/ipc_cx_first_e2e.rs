@@ -582,6 +582,148 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
 }
 
 #[test]
+fn durable_subscription_uses_reopened_workspace_redaction_for_history_and_live_signals() {
+    use frankenterm_core::event_stream::DurableStreamCursor;
+    use frankenterm_core::events::Event;
+    use frankenterm_core::ipc::{IpcClient, IpcHandlerContext};
+    use frankenterm_core::storage::{EventQuery, PaneRecord, StorageConfig, StorageHandle};
+
+    run_async_test(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("redaction.sock");
+        let database = directory.path().join("events.db");
+        let cx = runtime_ipc_cx();
+        let secret = "PRIVATE_ORCHID";
+        let split_secret = "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m";
+
+        // The row predates the operator's custom policy. Write-time redaction
+        // cannot protect this historical payload when the policy changes.
+        let old_storage = StorageHandle::new(&database.to_string_lossy())
+            .await
+            .unwrap();
+        old_storage
+            .upsert_pane(PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+        let mut event = subscription_fixture_event(1);
+        event.matched_text = Some(format!("stored {split_secret}"));
+        event.extracted = Some(serde_json::json!({
+            "nested": [{"text": split_secret, "count": 3}],
+            "ordinary": "keep this",
+        }));
+        let event_id = old_storage.record_event(event).await.unwrap();
+        old_storage.shutdown().await.unwrap();
+        drop(old_storage);
+
+        let config = StorageConfig {
+            redaction_config: frankenterm_core::config::RedactionConfig {
+                patterns: vec!["PRIVATE_[A-Z]+".to_string()],
+                placeholder: "[workspace-hidden]".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = Arc::new(
+            StorageHandle::with_config(&database.to_string_lossy(), config)
+                .await
+                .unwrap(),
+        );
+        let historical = storage.get_events(EventQuery::default()).await.unwrap();
+        assert_eq!(historical.len(), 1);
+        assert!(
+            historical[0]
+                .matched_text
+                .as_deref()
+                .unwrap()
+                .contains("ORCHID")
+        );
+        let epoch = storage
+            .get_event_retention_snapshot()
+            .await
+            .unwrap()
+            .cursor_epoch;
+        let bus = Arc::new(EventBus::new(4));
+        let context =
+            IpcHandlerContext::new(Arc::clone(&bus)).with_event_storage(Arc::clone(&storage));
+        let server = IpcServer::bind_with_cx(&cx, &path).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let run_cx = cx.clone();
+        let server_task = task::spawn(async move {
+            server
+                .run_with_handler_context_with_cx(&run_cx, context, shutdown_rx)
+                .await;
+        });
+        let client = IpcClient::new(&path);
+        let mut stream = client
+            .subscribe_events_from_cursor_with_cx(
+                &cx,
+                Some(DurableStreamCursor {
+                    after_id: 0,
+                    epoch: epoch.clone(),
+                }),
+                None,
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let stored = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(stored["cursor"], event_id);
+        assert_eq!(stored["cursor_epoch"], epoch);
+        assert_eq!(stored["matched_text"], "stored [workspace-hidden]");
+        assert_eq!(
+            stored["extracted"]["nested"][0]["text"],
+            "[workspace-hidden]"
+        );
+        assert_eq!(stored["extracted"]["nested"][0]["count"], 3);
+        assert_eq!(stored["extracted"]["ordinary"], "keep this");
+
+        // These fields never pass through storage. The same configured policy
+        // must protect live-only pane metadata before it reaches the socket.
+        assert!(
+            bus.publish(Event::PaneDiscovered {
+                pane_id: 7,
+                domain: format!("remote:{secret}"),
+                title: format!("shell {split_secret}"),
+            }) > 0
+        );
+        let live = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(live["event_type"], "pane_discovered");
+        assert!(live["cursor"].is_null());
+        assert_eq!(live["pane_id"], 7);
+        assert_eq!(live["extracted"]["domain"], "remote:[workspace-hidden]");
+        assert_eq!(live["extracted"]["title"], "shell [workspace-hidden]");
+        assert!(!serde_json::to_string(&live).unwrap().contains("ORCHID"));
+        drop(stream);
+
+        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ())
+            .await
+            .unwrap();
+        frankenterm_core::runtime_async::timeout_with_cx(&cx, Duration::from_secs(2), server_task)
+            .await
+            .expect("subscription shutdown deadline")
+            .expect("server task settles");
+        assert!(!path.exists());
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn durable_subscription_checkpoints_filtered_pages_and_resumes_after_reopen() {
     use frankenterm_core::event_stream::DurableStreamCursor;
     use frankenterm_core::ipc::{IpcClient, IpcHandlerContext};

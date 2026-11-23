@@ -2725,6 +2725,29 @@ fn watch_lag_gap_record(missed_count: u64) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
+fn redact_subscription_text(text: &str, redactor: &crate::redactor::Redactor) -> String {
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    redactor.redact(&normalized)
+}
+
+#[cfg(unix)]
+fn redact_subscription_value(
+    mut value: serde_json::Value,
+    redactor: &crate::redactor::Redactor,
+) -> serde_json::Value {
+    let mut pending = vec![&mut value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(text) => *text = redact_subscription_text(text, redactor),
+            serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
+            serde_json::Value::Object(values) => pending.extend(values.values_mut()),
+            _ => {}
+        }
+    }
+    value
+}
+
 /// ft-7h5da.4.1/ft-0q7a2: build the NDJSON record for one live bus event.
 /// Detection records keep the DB-cursor-compatible shape and apply the same
 /// pane/severity/rule-glob filters as the DB-cursor path while redacting
@@ -2739,6 +2762,7 @@ fn subscribe_event_record(
     pane: Option<u64>,
     severity: Option<&str>,
     rule_glob: Option<&str>,
+    redactor: &crate::redactor::Redactor,
 ) -> Option<serde_json::Value> {
     if let Some(want) = pane {
         if event.pane_id() != Some(want) {
@@ -2769,20 +2793,19 @@ fn subscribe_event_record(
                     return None;
                 }
             }
-            let redacted = crate::runtime::redact_detection(detection);
             Some(serde_json::json!({
                 "type": "event",
                 "cursor": cursor,
                 "id": cursor,
                 "pane_id": pane_id,
-                "rule_id": redacted.rule_id,
-                "agent_type": redacted.agent_type.to_string(),
-                "event_type": redacted.event_type,
+                "rule_id": detection.rule_id,
+                "agent_type": detection.agent_type.to_string(),
+                "event_type": detection.event_type,
                 "severity": severity_label,
-                "confidence": redacted.confidence,
+                "confidence": detection.confidence,
                 "detected_at": now_ms_i64(),
-                "matched_text": redacted.matched_text,
-                "extracted": redacted.extracted,
+                "matched_text": redact_subscription_text(&detection.matched_text, redactor),
+                "extracted": redact_subscription_value(detection.extracted.clone(), redactor),
                 "handled": false,
                 "handled_status": serde_json::Value::Null,
             }))
@@ -2803,7 +2826,6 @@ fn subscribe_event_record(
             // (a shell putting the last command / env in the title), and the
             // same field is redacted on wa.state and the web SSE path; without
             // this the watch-events stream leaks it raw at IpcScope::Read.
-            let redactor = crate::policy::Redactor::new();
             Some(serde_json::json!({
                 "type": "event",
                 "cursor": serde_json::Value::Null,
@@ -2817,8 +2839,8 @@ fn subscribe_event_record(
                 "detected_at": now_ms_i64(),
                 "matched_text": serde_json::Value::Null,
                 "extracted": serde_json::json!({
-                    "domain": redactor.redact(domain),
-                    "title": redactor.redact(title),
+                    "domain": redact_subscription_text(domain, redactor),
+                    "title": redact_subscription_text(title, redactor),
                 }),
                 "handled": false,
                 "handled_status": serde_json::Value::Null,
@@ -2889,6 +2911,7 @@ fn subscribe_stored_event_record(
     pane: Option<u64>,
     severity: Option<&str>,
     rule_glob: Option<&str>,
+    redactor: &crate::redactor::Redactor,
 ) -> Option<serde_json::Value> {
     if pane.is_some_and(|want| event.pane_id != want)
         || severity.is_some_and(|want| !event.severity.eq_ignore_ascii_case(want))
@@ -2896,17 +2919,10 @@ fn subscribe_stored_event_record(
     {
         return None;
     }
-    let redactor = crate::policy::Redactor::new();
-    let mut extracted = event.extracted.clone().unwrap_or(serde_json::Value::Null);
-    let mut pending = vec![&mut extracted];
-    while let Some(value) = pending.pop() {
-        match value {
-            serde_json::Value::String(text) => *text = redactor.redact(text),
-            serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
-            serde_json::Value::Object(values) => pending.extend(values.values_mut()),
-            _ => {}
-        }
-    }
+    let extracted = redact_subscription_value(
+        event.extracted.clone().unwrap_or(serde_json::Value::Null),
+        redactor,
+    );
     Some(serde_json::json!({
         "type": "event",
         "cursor": event.id,
@@ -2919,10 +2935,10 @@ fn subscribe_stored_event_record(
         "severity": event.severity,
         "confidence": event.confidence,
         "detected_at": event.detected_at,
-        "matched_text": event.matched_text.as_deref().map(|text| redactor.redact(text)),
+        "matched_text": event.matched_text.as_deref().map(|text| redact_subscription_text(text, redactor)),
         "extracted": extracted,
         "handled": event.handled_at.is_some(),
-        "handled_status": event.handled_status.as_deref().map(|text| redactor.redact(text)),
+        "handled_status": event.handled_status.as_deref().map(|text| redact_subscription_text(text, redactor)),
     }))
 }
 
@@ -3023,6 +3039,7 @@ where
                     pane,
                     severity.as_deref(),
                     rule_glob.as_deref(),
+                    storage.redactor(),
                 ) {
                     Some(record) => record,
                     None => {
@@ -3038,6 +3055,7 @@ where
                 pane,
                 severity.as_deref(),
                 rule_glob.as_deref(),
+                storage.redactor(),
             ) {
                 Some(record) => record,
                 None => continue,
@@ -4540,6 +4558,8 @@ mod transport_roundtrip_tests {
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::redactor::Redactor;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4670,9 +4690,15 @@ mod tests {
             handled_by_workflow_id: Some("workflow-1".to_string()),
             handled_status: Some(format!("completed {secret}")),
         };
-        let record =
-            subscribe_stored_event_record(&event, epoch, Some(7), Some("WARNING"), Some("codex.*"))
-                .expect("matching stored record");
+        let record = subscribe_stored_event_record(
+            &event,
+            epoch,
+            Some(7),
+            Some("WARNING"),
+            Some("codex.*"),
+            &Redactor::new(),
+        )
+        .expect("matching stored record");
         assert_eq!(record["cursor"], 42);
         assert_eq!(record["id"], 42);
         assert_eq!(record["cursor_epoch"], epoch);
@@ -4688,7 +4714,17 @@ mod tests {
             (Some(7), Some("critical"), Some("codex.*")),
             (Some(7), Some("warning"), Some("claude.*")),
         ] {
-            assert!(subscribe_stored_event_record(&event, epoch, pane, severity, rule).is_none());
+            assert!(
+                subscribe_stored_event_record(
+                    &event,
+                    epoch,
+                    pane,
+                    severity,
+                    rule,
+                    &Redactor::new()
+                )
+                .is_none()
+            );
         }
     }
 
@@ -4810,7 +4846,8 @@ mod tests {
             ),
             event_id: Some(42),
         };
-        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let rec =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).expect("record");
         assert_eq!(rec["type"], "event");
         assert_eq!(rec["cursor"], 42);
         assert_eq!(rec["id"], 42);
@@ -4833,7 +4870,7 @@ mod tests {
             detection: sample_detection("codex.x", crate::patterns::Severity::Info, "hi"),
             event_id: None,
         };
-        assert!(subscribe_event_record(&event, None, None, None).is_none());
+        assert!(subscribe_event_record(&event, None, None, None, &Redactor::new()).is_none());
     }
 
     #[cfg(unix)]
@@ -4850,14 +4887,24 @@ mod tests {
             event_id: Some(5),
         };
         // Pane filter.
-        assert!(subscribe_event_record(&event, Some(4), None, None).is_none());
-        assert!(subscribe_event_record(&event, Some(3), None, None).is_some());
+        assert!(subscribe_event_record(&event, Some(4), None, None, &Redactor::new()).is_none());
+        assert!(subscribe_event_record(&event, Some(3), None, None, &Redactor::new()).is_some());
         // Severity filter (case-insensitive exact).
-        assert!(subscribe_event_record(&event, None, Some("warning"), None).is_none());
-        assert!(subscribe_event_record(&event, None, Some("CRITICAL"), None).is_some());
+        assert!(
+            subscribe_event_record(&event, None, Some("warning"), None, &Redactor::new()).is_none()
+        );
+        assert!(
+            subscribe_event_record(&event, None, Some("CRITICAL"), None, &Redactor::new())
+                .is_some()
+        );
         // Rule-id glob filter.
-        assert!(subscribe_event_record(&event, None, None, Some("claude_code.*")).is_none());
-        assert!(subscribe_event_record(&event, None, None, Some("codex.*")).is_some());
+        assert!(
+            subscribe_event_record(&event, None, None, Some("claude_code.*"), &Redactor::new())
+                .is_none()
+        );
+        assert!(
+            subscribe_event_record(&event, None, None, Some("codex.*"), &Redactor::new()).is_some()
+        );
     }
 
     #[cfg(unix)]
@@ -4872,9 +4919,56 @@ mod tests {
             detection: sample_detection("codex.x", crate::patterns::Severity::Info, fixture),
             event_id: Some(9),
         };
-        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let rec =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).expect("record");
         let matched = rec["matched_text"].as_str().unwrap_or_default();
         assert!(!matched.contains(fixture), "fixture leaked: {matched}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_uses_configured_redaction_after_terminal_normalization() {
+        let secret = "PRIVATE_ORCHID";
+        let split_secret = "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m";
+        let redactor = crate::config::RedactionConfig {
+            patterns: vec!["PRIVATE_[A-Z]+".to_string()],
+            placeholder: "[workspace-hidden]".to_string(),
+            ..Default::default()
+        }
+        .build_redactor()
+        .unwrap();
+        assert_eq!(Redactor::new().redact(secret), secret);
+        let mut detection = sample_detection(
+            "codex.usage.reached",
+            crate::patterns::Severity::Warning,
+            split_secret,
+        );
+        detection.extracted = serde_json::json!({
+            "nested": [{"text": split_secret, "count": 3}],
+            "ordinary": "keep this",
+        });
+        let event = Event::PatternDetected {
+            pane_id: 7,
+            pane_uuid: None,
+            detection,
+            event_id: Some(42),
+        };
+        let record = subscribe_event_record(&event, None, None, None, &redactor).unwrap();
+        assert_eq!(record["matched_text"], "[workspace-hidden]");
+        assert_eq!(
+            record["extracted"]["nested"][0]["text"],
+            "[workspace-hidden]"
+        );
+        assert_eq!(record["extracted"]["nested"][0]["count"], 3);
+        assert_eq!(record["extracted"]["ordinary"], "keep this");
+        assert_eq!(record["rule_id"], "codex.usage.reached");
+        assert_eq!(record["pane_id"], 7);
+        assert_eq!(record["cursor"], 42);
+
+        // Per-stream policy does not contaminate another workspace's output.
+        let default_record =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).unwrap();
+        assert_eq!(default_record["matched_text"], secret);
     }
 
     #[cfg(unix)]
@@ -4885,7 +4979,8 @@ mod tests {
             domain: "local".to_string(),
             title: "shell".to_string(),
         };
-        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let rec =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).expect("record");
         assert_eq!(rec["type"], "event");
         assert!(rec["cursor"].is_null());
         assert!(rec["id"].is_null());
@@ -4908,7 +5003,8 @@ mod tests {
             domain: format!("local:{fixture}"),
             title: format!("$ echo {fixture}"),
         };
-        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let rec =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).expect("record");
         let domain = rec["extracted"]["domain"].as_str().unwrap_or_default();
         let title = rec["extracted"]["title"].as_str().unwrap_or_default();
         assert!(!domain.contains(fixture), "domain leaked secret: {domain}");
@@ -4925,6 +5021,7 @@ mod tests {
             None,
             None,
             None,
+            &Redactor::new(),
         )
         .expect("record");
         assert_eq!(plain["extracted"]["domain"], "local");
@@ -4935,7 +5032,8 @@ mod tests {
     #[test]
     fn subscribe_event_record_emits_live_pane_disappeared_signal() {
         let event = Event::PaneDisappeared { pane_id: 1 };
-        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let rec =
+            subscribe_event_record(&event, None, None, None, &Redactor::new()).expect("record");
         assert_eq!(rec["type"], "event");
         assert!(rec["cursor"].is_null());
         assert_eq!(rec["pane_id"], 1);
@@ -4946,10 +5044,14 @@ mod tests {
     #[test]
     fn subscribe_event_record_filters_live_signals_by_pane_only() {
         let event = Event::PaneDisappeared { pane_id: 9 };
-        assert!(subscribe_event_record(&event, Some(8), None, None).is_none());
-        assert!(subscribe_event_record(&event, Some(9), None, None).is_some());
-        assert!(subscribe_event_record(&event, None, Some("warning"), None).is_none());
-        assert!(subscribe_event_record(&event, None, None, Some("codex.*")).is_none());
+        assert!(subscribe_event_record(&event, Some(8), None, None, &Redactor::new()).is_none());
+        assert!(subscribe_event_record(&event, Some(9), None, None, &Redactor::new()).is_some());
+        assert!(
+            subscribe_event_record(&event, None, Some("warning"), None, &Redactor::new()).is_none()
+        );
+        assert!(
+            subscribe_event_record(&event, None, None, Some("codex.*"), &Redactor::new()).is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -4960,7 +5062,7 @@ mod tests {
             success: true,
             reason: None,
         };
-        assert!(subscribe_event_record(&event, None, None, None).is_none());
+        assert!(subscribe_event_record(&event, None, None, None, &Redactor::new()).is_none());
     }
 
     #[cfg(unix)]

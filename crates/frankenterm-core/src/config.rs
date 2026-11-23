@@ -3779,8 +3779,12 @@ impl Default for ApprovalConfig {
     }
 }
 
-/// Redaction configuration for sensitive data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Redaction configuration for sensitive data.
+///
+/// Persistence and outbound services capture this policy at startup. Changes
+/// require a restart so a reload cannot leave those consumers using different
+/// secret policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedactionConfig {
     /// Enable automatic redaction of detected secrets
@@ -5417,6 +5421,18 @@ impl Config {
                 reason:
                     "Outbound MCP client settings cannot be changed at runtime; requires restart"
                         .to_string(),
+            });
+        }
+
+        // Custom patterns may contain literal secrets. Report only the policy
+        // section, never the old/new expressions or replacement marker. The
+        // full value comparison also covers changes to pattern ordering and
+        // every mandatory-redaction flag for directly constructed configs.
+        if self.safety.redaction != new_config.safety.redaction {
+            forbidden.push(ForbiddenChange {
+                name: "safety.redaction".to_string(),
+                reason: "Secret redaction policy is captured by persistence and outbound services; requires restart"
+                    .to_string(),
             });
         }
 
@@ -9301,6 +9317,108 @@ max_bytes_per_sec = 1048576
 
         assert!(!result.allowed);
         assert!(result.forbidden.iter().any(|f| f.name == "mcp_client"));
+    }
+
+    #[test]
+    fn hot_reload_requires_restart_for_every_redaction_policy_change() {
+        let mut original = Config::default();
+        original.safety.redaction.patterns = vec![
+            "private-old-[0-9]+".to_string(),
+            "private-second-[0-9]+".to_string(),
+        ];
+        original.safety.redaction.placeholder = "[PRIVATE_OLD_MARKER]".to_string();
+        original.validate().expect("valid startup redaction policy");
+
+        for case in [
+            "add_pattern",
+            "remove_pattern",
+            "replace_pattern",
+            "reorder_patterns",
+            "placeholder",
+            "enabled",
+            "redact_audit",
+            "redact_segments",
+        ] {
+            let mut updated = original.clone();
+            match case {
+                "add_pattern" => updated
+                    .safety
+                    .redaction
+                    .patterns
+                    .push("private-new-[0-9]+".to_string()),
+                "remove_pattern" => updated.safety.redaction.patterns.clear(),
+                "replace_pattern" => {
+                    updated.safety.redaction.patterns[0] = "private-new-[0-9]+".to_string();
+                }
+                "reorder_patterns" => updated.safety.redaction.patterns.reverse(),
+                "placeholder" => {
+                    updated.safety.redaction.placeholder = "[PRIVATE_NEW_MARKER]".to_string();
+                }
+                // These are rejected at config loading too, but the diff must
+                // stay fail-closed for programmatically constructed configs.
+                "enabled" => updated.safety.redaction.enabled = false,
+                "redact_audit" => updated.safety.redaction.redact_audit = false,
+                "redact_segments" => updated.safety.redaction.redact_segments = false,
+                _ => unreachable!("known redaction policy test case"),
+            }
+
+            let result = original.diff_for_hot_reload(&updated);
+            assert!(!result.allowed, "{case} must require a restart");
+            assert_eq!(result.forbidden.len(), 1, "{case}");
+            assert_eq!(result.forbidden[0].name, "safety.redaction", "{case}");
+            assert!(result.forbidden[0].reason.contains("restart"), "{case}");
+            assert!(result.changes.is_empty(), "{case}");
+            for diagnostic in [result.to_string(), format!("{result:?}")] {
+                for secret in [
+                    "private-old",
+                    "private-second",
+                    "private-new",
+                    "PRIVATE_OLD_MARKER",
+                    "PRIVATE_NEW_MARKER",
+                ] {
+                    assert!(
+                        !diagnostic.contains(secret),
+                        "{case} must not reflect redaction policy contents"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_redaction_policy_preserves_allowed_reload_but_mixed_changes_fail_closed() {
+        let original = Config::from_toml(
+            r"
+            [safety.redaction]
+            patterns = ['operator-only-[0-9]+']
+            placeholder = '[CUSTOM_MASK]'
+            ",
+        )
+        .expect("valid custom startup policy");
+        let unchanged = original.diff_for_hot_reload(&original.clone());
+        assert!(unchanged.allowed);
+        assert!(unchanged.changes.is_empty());
+        assert!(unchanged.forbidden.is_empty());
+
+        let mut updated = original.clone();
+        updated.general.log_level = "debug".to_string();
+        let allowed = original.diff_for_hot_reload(&updated);
+        assert!(allowed.allowed);
+        assert_eq!(allowed.changes.len(), 1);
+        assert_eq!(allowed.changes[0].name, "general.log_level");
+        assert!(allowed.forbidden.is_empty());
+
+        updated
+            .safety
+            .redaction
+            .patterns
+            .push("extra-private".to_string());
+        let mixed = original.diff_for_hot_reload(&updated);
+        assert!(!mixed.allowed);
+        assert_eq!(mixed.forbidden.len(), 1);
+        assert_eq!(mixed.forbidden[0].name, "safety.redaction");
+        assert_eq!(mixed.changes.len(), 1);
+        assert_eq!(mixed.changes[0].name, "general.log_level");
     }
 
     #[test]
