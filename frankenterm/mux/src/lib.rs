@@ -3224,10 +3224,12 @@ impl LiveParserCheckpointControl {
     }
 
     /// The ring's signals, for a reader that gathers batches.
+    #[cfg(unix)]
     fn data_ring_handle(&self) -> Option<pane_byte_ring::RingHandle> {
         self.data_closer.lock().clone()
     }
 
+    #[cfg(unix)]
     fn install_gather_interrupt(&self, writer: FileDescriptor) {
         *self.gather_interrupt.lock() = Some(writer);
     }

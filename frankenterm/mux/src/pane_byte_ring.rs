@@ -134,17 +134,21 @@ impl RingHandle {
 
     /// The reader announces that it is gathering a batch. False: the parser
     /// is already idle, so publish what was read now. Pair with `end_gather`.
+    /// Gathering readers (`pane_gather`) exist on Unix only.
+    #[cfg(any(unix, test))]
     pub(crate) fn begin_gather(&self) -> bool {
         self.0.reader_gathering.store(true, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         !self.0.parser_waiting.load(Ordering::SeqCst)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn end_gather(&self) {
         self.0.reader_gathering.store(false, Ordering::SeqCst);
     }
 
     /// True while the parser sleeps for want of output.
+    #[cfg(any(unix, test))]
     pub(crate) fn parser_idle(&self) -> bool {
         self.0.parser_waiting.load(Ordering::SeqCst)
     }

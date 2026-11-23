@@ -829,6 +829,8 @@ pub struct SealedAppendLogSegment {
     pub bytes: u64,
 }
 
+// Rolling (roll_and_prune) is Unix-only; other platforms never seal.
+#[cfg(any(unix, test))]
 fn sealed_segment_file_name(
     log_name: &str,
     segment_id: u64,
@@ -1265,9 +1267,17 @@ struct AppendLogInner {
     segment_id: u64,
     /// Ordinal of the first record in the active log (sealed segments hold
     /// everything before it).
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix-only roll_and_prune reads it")
+    )]
     segment_base_ordinal: u64,
     /// UTF-8 file name of the active log; sealed segments are named after it.
     /// `None` disables rolling.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix-only roll_and_prune reads it")
+    )]
     log_name: Option<String>,
     /// Last record of the newest sealed segment, reported while the active
     /// log is still empty after a roll.
