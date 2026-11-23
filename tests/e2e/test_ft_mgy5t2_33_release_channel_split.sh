@@ -13,6 +13,7 @@ import json
 import copy
 import hashlib
 import os
+import shlex
 import shutil
 import struct
 import subprocess
@@ -472,19 +473,33 @@ shutil.copyfile(source, target)
     # that the bound, not the truncation, refused it.
     assert "expanded-size bound" in verdict["inspection_errors"][0]["reason"], verdict
 
+    # The readelf stubs wrap a real readelf, so their reports parse and only the
+    # planted exit status, warning, or empty output can refuse the binary. The
+    # llvm-readelf stub is a clean wrapper: falling back to it after readelf ran
+    # and refused would accept the binary.
+    real_readelf = shlex.quote(shutil.which("readelf") or shutil.which("llvm-readelf"))
     inspector_bin = td_path / "inspectors"
     inspector_bin.mkdir()
     inspector_env = dict(os.environ, PATH=str(inspector_bin) + os.pathsep + os.environ["PATH"])
-    for case_id, body in [
-        ("neg_abi_inspector_failure", "printf 'inspection failed\\n' >&2\nexit 1\n"),
-        ("neg_abi_inspector_warning", "printf 'inspection warning\\n' >&2\nexit 0\n"),
-        ("neg_abi_inspector_empty_success", "exit 0\n"),
+    clean_inspector = f'#!/bin/sh\nexec {real_readelf} "$@"\n'
+    for case_id, readelf_stub, expected_rc, reason in [
+        ("neg_abi_inspector_failure",
+         f'#!/bin/sh\n{real_readelf} "$@"\nexit 1\n', 2, "readelf: readelf failed or warned"),
+        ("neg_abi_inspector_warning",
+         f"#!/bin/sh\n{real_readelf} \"$@\"\nprintf 'readelf: Warning: planted\\n' >&2\n", 2,
+         "readelf: readelf failed or warned"),
+        ("neg_abi_inspector_empty_success", "#!/bin/sh\nexit 0\n", 2, "readelf: missing or duplicate ELF field"),
+        # An inspector that cannot start gives no verdict, so the fallback runs.
+        ("pos_abi_inspector_fallback_when_readelf_cannot_start",
+         "#!/nonexistent/ft-abi-test-shell\n", 0, None),
     ]:
+        (inspector_bin / "readelf").write_text(readelf_stub)
+        (inspector_bin / "llvm-readelf").write_text(clean_inspector)
         for tool in ("readelf", "llvm-readelf"):
-            inspector = inspector_bin / tool
-            inspector.write_text("#!/bin/sh\n" + body)
-            inspector.chmod(0o755)
-        abi_case(case_id, [str(static_elf)], 2, env=inspector_env)
+            (inspector_bin / tool).chmod(0o755)
+        verdict = abi_case(case_id, [str(static_elf)], expected_rc, env=inspector_env)
+        if reason is not None:
+            assert reason in verdict["inspection_errors"][0]["reason"], (case_id, verdict)
 
     # 7. Positive/Negative: install.sh release_tag_with_assets skips -appstore.* companion tags & selects newest stable
     releases_fixture = [

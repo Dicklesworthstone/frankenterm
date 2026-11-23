@@ -249,6 +249,10 @@ def extract_elf_versions(path: Path) -> list[str]:
     with path.open("rb") as source:
         if source.read(4) != b"\x7fELF":
             raise Refusal(f"not a Linux ELF binary: {path}")
+    # Fall back to llvm-readelf only when readelf could not be started. Once a
+    # tool has run, its failure, warning, timeout, or unparseable report is the
+    # verdict: retrying with another tool would let the most lenient one pass a
+    # binary the other flagged as malformed.
     failures = []
     for tool in ("readelf", "llvm-readelf"):
         exe = shutil.which(tool)
@@ -260,8 +264,10 @@ def extract_elf_versions(path: Path) -> list[str]:
                 ("--file-header", "--program-headers", "--dynamic", "--version-info")
             ]
             return versions_from_reports(*reports)
-        except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
-            failures.append(f"{tool}: {error}")
+        except OSError as error:
+            failures.append(f"{tool} could not run: {error}")
+        except (Refusal, ValueError, subprocess.SubprocessError) as error:
+            raise Refusal(f"ELF inspection failed: {tool}: {error}") from None
     if failures:
         raise Refusal("ELF inspection failed: " + "; ".join(failures))
     raise Refusal("readelf or llvm-readelf is required; raw-byte scanning is not ABI evidence")
