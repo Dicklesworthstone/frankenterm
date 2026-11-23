@@ -31,9 +31,16 @@ public struct OpticalVideoPlan: Sendable {
 
     public init(sender: OpticalSender, symbolsPerSecond: Int = 5) throws {
         guard [3, 5, 10].contains(symbolsPerSecond) else { throw FTError.malformed("video.symbol_rate") }
-        let animation = try OpticalAnimationPlan(sender: sender, maximumFrames: Self.maximumSymbols)
         let hold = Self.framesPerSecond / symbolsPerSecond
-        guard animation.addresses.count * hold <= Self.maximumVideoFrames else { throw FTError.limit("video.use_live_transfer") }
+        // Optional cadence padding must respect the duration budget too. A
+        // complete recording that fitted before padding must remain admissible.
+        let animation: OpticalAnimationPlan
+        do {
+            animation = try OpticalAnimationPlan(sender: sender,
+                maximumFrames: min(Self.maximumSymbols, Self.maximumVideoFrames / hold))
+        } catch FTError.limit("animation.use_live_transfer") {
+            throw FTError.limit("video.use_live_transfer")
+        }
         addresses = animation.addresses
         self.symbolsPerSecond = symbolsPerSecond
         framesPerSymbol = hold

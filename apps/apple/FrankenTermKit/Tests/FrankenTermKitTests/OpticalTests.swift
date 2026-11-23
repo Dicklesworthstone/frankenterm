@@ -128,15 +128,138 @@ final class OpticalTests: XCTestCase {
     }
     func testSenderSchedulingAndBounds() throws {
         var sender = try OpticalSender(envelope: makeEnvelope(size: 40000), using: crypto)
-        for i in 0..<24 {
+        let expectedPages = Array(repeating: 0, count: 8) + Array(repeating: 1, count: 16)
+            + Array(repeating: 0, count: 8) + [0, 1, 0, 1, 0]
+        for expected in expectedPages + expectedPages {
             let frame = try OpticalFrame(text: sender.next(using: crypto))
-            XCTAssertEqual(frame.pageIndex, (i / 8) % 2)
+            XCTAssertEqual(frame.pageIndex, expected)
         }
         XCTAssertEqual(try OpticalFrame(text: sender.next(repairPage: 1, using: crypto)).pageIndex, 1)
         XCTAssertThrowsError(try sender.next(repairPage: -1, using: crypto))
         XCTAssertThrowsError(try sender.frame(page: 0, sequence: 0, using: crypto))
         XCTAssertThrowsError(try OpticalSender(envelope: Data(repeating: 0, count: FTLimit.envelope + 1), using: crypto))
     }
+    func testPageScheduleIsBoundedFairAndVisitsEveryPositionUnderPeriodicCapture() throws {
+        for count in 1...128 {
+            let schedule = try OpticalPageSchedule(pageCount: count)
+            XCTAssertGreaterThanOrEqual(schedule.cycleLength, 16 * count)
+            XCTAssertLessThanOrEqual(schedule.cycleLength, 32 * count)
+            let cycle = (0..<schedule.cycleLength).map { schedule.page(at: $0) }
+            XCTAssertEqual(Set(cycle), Set(0..<count))
+            let visits = (0..<count).map { page in cycle.filter { $0 == page }.count }
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(visits.min()), 16)
+            XCTAssertLessThanOrEqual(try XCTUnwrap(visits.max()) - XCTUnwrap(visits.min()), 1)
+            // Begin mid-cycle. Coprimality must expose every position, not just
+            // statistically plausible numbers of symbols from each page.
+            for step in [2, 3, 4, 5, 6, 8, 16, 24, 32, 64] where step < schedule.cycleLength {
+                let sampled = Set((0..<schedule.cycleLength).map {
+                    (step - 1 + $0 * step) % schedule.cycleLength
+                })
+                XCTAssertEqual(sampled.count, schedule.cycleLength, "pages=\(count), stride=\(step)")
+                XCTAssertEqual(Set(sampled.map { schedule.page(at: $0) }), Set(0..<count))
+            }
+            XCTAssertTrue((0..<count).contains(schedule.page(at: Int.max)))
+        }
+        for count in [-1, 0, 129, Int.max] {
+            XCTAssertThrowsError(try OpticalPageSchedule(pageCount: count))
+        }
+    }
+
+    func testLiveCaptureNoLongerStarvesAnEntirePageAtTheOldBurstPeriod() throws {
+        let envelope = try makeEnvelope(size: 40000)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        let patterns = [(step: 16, phase: 0), (step: 16, phase: 15),
+                        (step: 32, phase: 0), (step: 32, phase: 31)]
+        var receivers = patterns.map { _ in OpticalReceiver(selecting: first) }
+        for emission in 0..<16000 {
+            let text = try sender.next(using: crypto)
+            let interested = patterns.indices.filter {
+                !receivers[$0].isComplete && emission % patterns[$0].step == patterns[$0].phase
+            }
+            if interested.isEmpty { continue }
+            let frame = try OpticalFrame(text: text)
+            for index in interested { try receivers[index].receive(frame, using: crypto) }
+            if receivers.allSatisfy(\.isComplete) { break }
+        }
+        for receiver in receivers { XCTAssertEqual(try receiver.envelope(using: crypto), envelope) }
+
+        // Negative control: the previous (emission / 8) % pageCount schedule
+        // always chooses page zero at stride 16, regardless of how many fresh
+        // repair parts it emits. Even granting all its source parts cannot
+        // reconstruct page one.
+        var legacy = OpticalReceiver(selecting: first)
+        let count = try sender.sourcePartCount(page: 0)
+        for sample in 0..<count {
+            let page = ((sample * 16) / 8) % sender.identity.pageCount
+            XCTAssertEqual(page, 0)
+            try legacy.receive(OpticalFrame(text: sender.frame(page: page,
+                sequence: UInt32(sample + 1), using: crypto)), using: crypto)
+        }
+        XCTAssertEqual(legacy.verifiedPages, 1)
+        XCTAssertFalse(legacy.isComplete)
+        XCTAssertThrowsError(try legacy.envelope(using: crypto))
+    }
+
+    func testTargetedRepairAndNormalPlaybackKeepPerPageSequencesMonotonic() throws {
+        let envelope = try makeEnvelope(size: 40000)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        var lastRepair = [UInt32](repeating: 0, count: sender.identity.pageCount)
+        var observed = [Int](repeating: 0, count: sender.identity.pageCount)
+        for emission in 0..<800 {
+            let target: Int? = emission % 11 == 0 ? 1 : nil
+            let frame = try OpticalFrame(text: sender.next(repairPage: target, using: crypto))
+            if let target { XCTAssertEqual(frame.pageIndex, target) }
+            observed[frame.pageIndex] += 1
+            let part = try URPart(cbor: Bytewords.decode(frame.ur.split(separator: "/")[2]))
+            let sourceCount = try sender.sourcePartCount(page: frame.pageIndex)
+            if part.sequence > sourceCount {
+                XCTAssertGreaterThan(part.sequence, lastRepair[frame.pageIndex])
+                lastRepair[frame.pageIndex] = part.sequence
+            }
+        }
+        for page in observed.indices {
+            XCTAssertGreaterThan(observed[page], 300)
+            XCTAssertGreaterThan(lastRepair[page], UInt32(try sender.sourcePartCount(page: page)))
+        }
+        var unchanged = sender
+        XCTAssertThrowsError(try sender.next(repairPage: sender.identity.pageCount, using: crypto))
+        XCTAssertEqual(try sender.next(using: crypto), try unchanged.next(using: crypto))
+    }
+
+    func testSourceReplayCadenceEscapesEveryThirdReplayCapture() throws {
+        let envelope = try makeEnvelope(size: 5000)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        let count = try sender.sourcePartCount(page: 0)
+        XCTAssertEqual(count, 33)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        var receiver = OpticalReceiver(selecting: first), legacy = OpticalReceiver(selecting: first)
+        let period = try XCTUnwrap(OpticalCadence.primeLength(atLeast: 9 * count, atMost: 10 * count))
+        XCTAssertEqual(period, 307)
+        for emission in 0..<(count + 8 + 27 * period) {
+            let text = try sender.next(using: crypto)
+            guard emission >= count + 8, (emission - count - 8).isMultiple(of: 27) else { continue }
+            let frame = try OpticalFrame(text: text)
+            let part = try URPart(cbor: Bytewords.decode(frame.ur.split(separator: "/")[2]))
+            // Deliberately discard every repair. The bounded replay cycle alone
+            // must eventually expose all 33 original fragments.
+            if part.sequence <= count { try receiver.receive(frame, using: crypto) }
+        }
+        XCTAssertEqual(try receiver.envelope(using: crypto), envelope)
+        for sample in 0..<period {
+            // With a constant nine-emission interval, stride 27 reaches only
+            // source 1, 4, 7, ... forever, so replaying cannot repair this loss.
+            let sequence = UInt32(1 + (sample * 3) % count)
+            try legacy.receive(OpticalFrame(text: sender.frame(page: 0, sequence: sequence, using: crypto)), using: crypto)
+        }
+        XCTAssertEqual(legacy.independentParts, 11)
+        XCTAssertThrowsError(try legacy.envelope(using: crypto))
+        for sourceCount in 2...129 {
+            let length = try XCTUnwrap(OpticalCadence.primeLength(atLeast: 9 * sourceCount, atMost: 10 * sourceCount))
+            XCTAssertLessThanOrEqual(length - 9 * sourceCount, sourceCount)
+        }
+    }
+
     func testLateReceiverCanRecoverFromRepeatedSystematicPartsWhileFreshRepairsContinue() throws {
         let envelope = try makeEnvelope(size: 100)
         var sender = try OpticalSender(envelope: envelope, using: crypto)

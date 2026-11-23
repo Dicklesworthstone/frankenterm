@@ -104,7 +104,11 @@ public struct OpticalExportSession: Sendable, CustomDebugStringConvertible {
 }
 
 /// Finite recordings contain every source symbol plus the planned repair set.
-/// Replaying this schedule cannot create new fountain information.
+/// When the existing frame budget permits, fresh repair symbols extend the
+/// schedule to a prime loop length, breaking periodic capture aliasing across
+/// loops. At capacity the complete original schedule is preserved. Replaying
+/// either schedule cannot create new fountain information or overcome arbitrary
+/// permanent losses; slow playback and live page repair remain available.
 public struct OpticalAnimationPlan: Sendable {
     public struct Address: Sendable, Equatable { public let page: Int, sequence: UInt32 }
     public let addresses: [Address]
@@ -116,8 +120,11 @@ public struct OpticalAnimationPlan: Sendable {
         }
         let total = counts.reduce(0, +)
         guard total <= maximumFrames else { throw FTError.limit("animation.use_live_transfer") }
+        let repairPages = counts.indices.filter { counts[$0] > 1 }
+        let paddedTotal = repairPages.isEmpty ? total
+            : OpticalCadence.primeLength(atLeast: total, atMost: maximumFrames) ?? total
         var positions = Array(repeating: 0, count: counts.count), result: [Address] = []
-        result.reserveCapacity(total)
+        result.reserveCapacity(paddedTotal)
         while result.count < total {
             for page in counts.indices {
                 for _ in 0..<min(8, counts[page] - positions[page]) {
@@ -125,6 +132,11 @@ public struct OpticalAnimationPlan: Sendable {
                     result.append(.init(page: page, sequence: UInt32(positions[page])))
                 }
             }
+        }
+        for extra in 0..<(paddedTotal - total) {
+            let page = repairPages[extra % repairPages.count]
+            positions[page] += 1
+            result.append(.init(page: page, sequence: UInt32(positions[page])))
         }
         addresses = result
     }

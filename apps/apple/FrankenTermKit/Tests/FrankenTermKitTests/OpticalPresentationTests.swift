@@ -164,10 +164,14 @@ final class OpticalPresentationTests: XCTestCase {
         let sender = try OpticalSender(envelope: envelope, using: crypto), plan = try OpticalAnimationPlan(sender: sender)
         XCTAssertEqual(sender.identity.pageCount, 2)
         var receiver: OpticalReceiver?
+        var requiredFrames = 0
         for page in 0..<sender.identity.pageCount {
             let count = try sender.sourcePartCount(page: page)
+            let required = count + (count + 1) / 2 + 16
+            requiredFrames += required
             let numbers = plan.addresses.filter { $0.page == page }.map(\.sequence)
-            XCTAssertEqual(numbers, Array(UInt32(1)...UInt32(count + (count + 1) / 2 + 16)))
+            XCTAssertGreaterThanOrEqual(numbers.count, required)
+            XCTAssertEqual(numbers, Array(UInt32(1)...UInt32(numbers.count)), "padding adds fresh repair parts")
         }
         XCTAssertEqual(plan.addresses.prefix(8).map(\.page), Array(repeating: 0, count: 8))
         XCTAssertEqual(plan.addresses.dropFirst(8).prefix(8).map(\.page), Array(repeating: 1, count: 8))
@@ -177,10 +181,91 @@ final class OpticalPresentationTests: XCTestCase {
             try receiver?.receive(frame, using: crypto)
         }
         XCTAssertEqual(try receiver?.envelope(using: crypto), envelope)
-        XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: plan.addresses.count - 1), "never truncate a recording")
+        XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: requiredFrames - 1), "never truncate a recording")
         XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: 0))
         XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: 4097))
     }
+    private func recordingEnvelope(bytes: Int) throws -> Data {
+        try FTAG.sealArchiveBytes(Data(repeating: 7, count: bytes),
+            code: TransferCode(secret: Data(repeating: 1, count: 16)),
+            transferID: Data(repeating: 2, count: 16), salt: Data(repeating: 3, count: 16),
+            nonce: Data(repeating: 4, count: 12), compress: false, using: crypto)
+    }
+
+    func testFiniteLoopRecoversUnderPeriodicCaptureWhileTheOriginalLoopStalls() throws {
+        let envelope = try recordingEnvelope(bytes: 40000)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        let plan = try OpticalAnimationPlan(sender: sender)
+        let original = try OpticalAnimationPlan(sender: sender, maximumFrames: 276)
+        XCTAssertEqual(original.addresses.count, 276)
+        XCTAssertEqual(plan.addresses.count, 277)
+        XCTAssertEqual(Array(plan.addresses.prefix(original.addresses.count)), original.addresses)
+        let frames = try plan.addresses.map {
+            try OpticalFrame(text: sender.frame(page: $0.page, sequence: $0.sequence, using: crypto))
+        }
+        for step in [2, 3, 4, 5, 6, 8, 16, 32] {
+            let phases = step <= 6 ? Array(0..<step) : [0, step - 1]
+            for phase in phases {
+                var receiver = OpticalReceiver(selecting: frames[0])
+                // A full period of samples covers all symbol positions, in at
+                // most step playback loops, including every systematic part.
+                for sample in 0..<frames.count {
+                    try receiver.receive(frames[(phase + sample * step) % frames.count], using: crypto)
+                    if receiver.isComplete { break }
+                }
+                XCTAssertEqual(try receiver.envelope(using: crypto), envelope, "stride=\(step), phase=\(phase)")
+            }
+        }
+        for phase in 0..<2 {
+            var receiver = OpticalReceiver(selecting: frames[0])
+            var firstLoopProgress = 0
+            for loop in 0..<4 {
+                for position in stride(from: phase, to: original.addresses.count, by: 2) {
+                    try receiver.receive(frames[position], using: crypto)
+                }
+                if loop == 0 { firstLoopProgress = receiver.receivedParts }
+                else { XCTAssertEqual(receiver.receivedParts, firstLoopProgress, "finite repetitions add no new information") }
+            }
+            XCTAssertLessThan(receiver.receivedParts, sender.identity.sourcePartCount)
+            XCTAssertThrowsError(try receiver.envelope(using: crypto), "the old even loop remains phase locked")
+        }
+    }
+
+    func testCadencePaddingPreservesCompleteExportsAtCapacityAndSinglePartPages() throws {
+        for bytes in [100, 40000, 131000, 634800] {
+            let sender = try OpticalSender(envelope: recordingEnvelope(bytes: bytes), using: crypto)
+            let counts = try (0..<sender.identity.pageCount).map { page in
+                let count = try sender.sourcePartCount(page: page)
+                return count == 1 ? 1 : count + (count + 1) / 2 + 16
+            }
+            let required = counts.reduce(0, +)
+            let full = try OpticalAnimationPlan(sender: sender)
+            let exact = try OpticalAnimationPlan(sender: sender, maximumFrames: required)
+            XCTAssertEqual(exact.addresses.count, required)
+            XCTAssertEqual(exact.addresses, Array(full.addresses.prefix(required)))
+            XCTAssertLessThanOrEqual(full.addresses.count, 4096)
+            for capacity in required..<full.addresses.count {
+                XCTAssertEqual(try OpticalAnimationPlan(sender: sender, maximumFrames: capacity).addresses,
+                               exact.addresses, "optional cadence padding must not refuse a complete export")
+            }
+            for page in counts.indices {
+                let numbers = full.addresses.filter { $0.page == page }.map(\.sequence)
+                XCTAssertGreaterThanOrEqual(numbers.count, counts[page])
+                if counts[page] == 1 { XCTAssertEqual(numbers, [1], "single-part UR pages are never duplicated for padding") }
+                else { XCTAssertEqual(numbers, Array(UInt32(1)...UInt32(numbers.count))) }
+            }
+            XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: required - 1))
+        }
+        // The caller's existing hard cap wins when no prime fits above the
+        // complete set. Never cross that cap or truncate mandatory repairs.
+        for minimum in [1022, 1023, 1024] {
+            XCTAssertNil(OpticalCadence.primeLength(atLeast: minimum, atMost: 1024))
+        }
+        for minimum in [4094, 4095, 4096] {
+            XCTAssertNil(OpticalCadence.primeLength(atLeast: minimum, atMost: 4096))
+        }
+    }
+
     func testSelectedLocalFileBoundsAndRegularFileRequirement() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ft-input-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)

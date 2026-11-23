@@ -42,8 +42,10 @@ final class OpticalVideoTests: XCTestCase {
             for page in 0..<sender.identity.pageCount {
                 let count = try sender.sourcePartCount(page: page)
                 let expectedCount = count == 1 ? 1 : count + (count + 1) / 2 + 16
-                XCTAssertEqual(plan.addresses.filter { $0.page == page }.map(\.sequence),
-                               Array(UInt32(1)...UInt32(expectedCount)))
+                let numbers = plan.addresses.filter { $0.page == page }.map(\.sequence)
+                XCTAssertGreaterThanOrEqual(numbers.count, expectedCount)
+                XCTAssertEqual(numbers, Array(UInt32(1)...UInt32(numbers.count)))
+                if count == 1 { XCTAssertEqual(numbers, [1]) }
             }
             for frame in 0..<plan.frameCount {
                 try verifier.receive(decodedText: verifier.expectedTexts[frame / hold],
@@ -87,6 +89,45 @@ final class OpticalVideoTests: XCTestCase {
         let foreign = try OpticalVideoVerifier(source: source(bytes: 1000, transferByte: 9), symbolsPerSecond: 10, using: crypto)
         XCTAssertThrowsError(try expected.receive(decodedText: foreign.expectedTexts[0], presentationFrame: 0, durationFrames: 1, using: crypto))
         XCTAssertEqual(expected.receivedFrameCount, 0)
+    }
+
+    func testPeriodicSamplingOfWholeVideoFramesRecoversAtEverySupportedRate() throws {
+        let input = try source(bytes: 40000)
+        for rate in [3, 5, 10] {
+            let verifier = try OpticalVideoVerifier(source: input, symbolsPerSecond: rate, using: crypto)
+            let plan = verifier.plan, hold = plan.framesPerSymbol
+            let symbols = try verifier.expectedTexts.map { try OpticalFrame(text: $0) }
+            for step in [hold + 1, 2 * hold, 3 * hold] {
+                for phase in [0, hold - 1] {
+                    var receiver = OpticalReceiver(selecting: symbols[0])
+                    for sample in 0..<plan.frameCount {
+                        let position = (phase + sample * step) % plan.frameCount
+                        try receiver.receive(symbols[position / hold], using: crypto)
+                        if receiver.isComplete { break }
+                    }
+                    XCTAssertEqual(try receiver.envelope(using: crypto), input.envelope,
+                                   "rate=\(rate), capture stride=\(step), phase=\(phase)")
+                }
+            }
+        }
+    }
+
+    func testCadencePaddingRespectsBothTheSlowMovieAndSymbolBudgets() throws {
+        let slow = try OpticalSender(envelope: source(bytes: 135000).envelope, using: crypto)
+        let slowPlan = try OpticalVideoPlan(sender: slow, symbolsPerSecond: 3)
+        XCTAssertEqual(slowPlan.symbolCount, 883)
+        XCTAssertLessThanOrEqual(slowPlan.frameCount, OpticalVideoPlan.maximumVideoFrames)
+        let tooLong = try OpticalSender(envelope: source(bytes: 139000).envelope, using: crypto)
+        XCTAssertThrowsError(try OpticalVideoPlan(sender: tooLong, symbolsPerSecond: 3)) {
+            XCTAssertEqual($0 as? FTError, .limit("video.use_live_transfer"))
+        }
+        let nearSymbolCap = try OpticalSender(envelope: source(bytes: 155000).envelope, using: crypto)
+        for rate in [5, 10] {
+            let plan = try OpticalVideoPlan(sender: nearSymbolCap, symbolsPerSecond: rate)
+            XCTAssertEqual(plan.symbolCount, 1009)
+            XCTAssertLessThanOrEqual(plan.symbolCount, OpticalVideoPlan.maximumSymbols)
+            XCTAssertLessThanOrEqual(plan.frameCount, OpticalVideoPlan.maximumVideoFrames)
+        }
     }
 
     func testRecordingLimitsRejectInsteadOfDroppingSourceOrRepairSymbols() throws {

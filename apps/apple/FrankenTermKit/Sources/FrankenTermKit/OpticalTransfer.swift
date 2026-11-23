@@ -367,9 +367,52 @@ public enum TransferCodeFrame {
     }
 }
 
+/// Presentation timing is independent of UR fragment selection. A prime loop
+/// length makes every smaller positive integer capture stride coprime to the
+/// loop, so repeated playback visits every symbol position. This does not cover
+/// arbitrary permanent losses, stopped playback or a stride equal to the loop.
+enum OpticalCadence {
+    static func primeLength(atLeast minimum: Int, atMost maximum: Int) -> Int? {
+        guard minimum > 1, minimum <= maximum else { return nil }
+        for candidate in minimum...maximum {
+            var divisor = 2
+            while divisor <= candidate / divisor, !candidate.isMultiple(of: divisor) { divisor += 1 }
+            if divisor > candidate / divisor { return candidate }
+        }
+        return nil
+    }
+}
+
+/// Two short-burst rounds, with the second starting one page later, followed by
+/// a few round-robin visits to reach a prime period. Only page selection repeats:
+/// each page's fountain sequence keeps advancing across these schedule cycles.
+struct OpticalPageSchedule: Sendable {
+    let pageCount: Int
+    let cycleLength: Int
+
+    init(pageCount: Int) throws {
+        guard (1...(FTLimit.envelope / FTLimit.page)).contains(pageCount),
+              let length = OpticalCadence.primeLength(atLeast: 16 * pageCount, atMost: 32 * pageCount) else {
+            throw FTError.limit("qr.pages")
+        }
+        self.pageCount = pageCount; cycleLength = length
+    }
+
+    func page(at emission: Int) -> Int {
+        let position = emission % cycleLength
+        if position < 16 * pageCount {
+            let visit = position / 8
+            return (visit % pageCount + visit / pageCount) % pageCount
+        }
+        return (position - 16 * pageCount) % pageCount
+    }
+}
+
 public struct OpticalSender: Sendable {
     public let identity: OpticalFrame.Identity
     private let pages: [URPageEncoder], pageDigests: [Data]
+    private let pageSchedule: OpticalPageSchedule
+    private let replayCyclePadding: [Int]
     private var sequences: [UInt32]
     private var repairPartsSinceReplay: [Int], nextSystematicReplay: [Int]
     private var emitted = 0
@@ -377,7 +420,14 @@ public struct OpticalSender: Sendable {
         let header = try FTAGHeader(envelope: envelope)
         identity = OpticalFrame.Identity(transferID: header.transferID, envelopeDigest: crypto.sha256(envelope), envelopeLength: envelope.count)
         let chunks = stride(from: 0, to: envelope.count, by: FTLimit.page).map { envelope.subdata(in: $0..<min($0 + FTLimit.page, envelope.count)) }
-        pages = chunks.map(URPageEncoder.init); pageDigests = chunks.map(crypto.sha256)
+        let encoders = chunks.map(URPageEncoder.init)
+        pages = encoders; pageDigests = chunks.map(crypto.sha256)
+        pageSchedule = try OpticalPageSchedule(pageCount: chunks.count)
+        replayCyclePadding = encoders.map { page in
+            let count = page.fragments.count
+            guard count > 1 else { return 0 }
+            return (OpticalCadence.primeLength(atLeast: 9 * count, atMost: 10 * count) ?? 9 * count) - 9 * count
+        }
         sequences = Array(repeating: 0, count: chunks.count)
         repairPartsSinceReplay = Array(repeating: 0, count: chunks.count)
         nextSystematicReplay = Array(repeating: 1, count: chunks.count)
@@ -394,14 +444,17 @@ public struct OpticalSender: Sendable {
         return text
     }
     public mutating func next<C: AirGapCryptography>(repairPage: Int? = nil, using crypto: C) throws -> String {
-        let page = repairPage ?? ((emitted / 8) % pages.count)
+        let page = repairPage ?? pageSchedule.page(at: emitted)
         guard pages.indices.contains(page), emitted < Int.max else { throw FTError.limit("qr.sequence") }
         let sourceCount = pages[page].fragments.count
-        // After the first systematic pass, one in nine emissions revisits a
-        // source fragment. Repair sequence numbers continue monotonically; source
-        // replay never reseals the envelope or changes the fragment geometry.
-        // The cadence is per page, including when targeted repair is selected.
-        let replay = sourceCount == 1 || repairPartsSinceReplay[page] == 8
+        // After the first systematic pass, revisit a source fragment after
+        // eight or nine fresh repairs. The small per-cycle padding makes a full
+        // source replay cycle prime: a periodic camera must not sample only
+        // every third replay forever. Fresh repair sequences remain monotonic.
+        // This is per page, including targeted repair; it never reseals bytes
+        // or changes UR fragment selection, geometry or playback speed.
+        let repairInterval = 8 + (nextSystematicReplay[page] <= replayCyclePadding[page] ? 1 : 0)
+        let replay = sourceCount == 1 || repairPartsSinceReplay[page] == repairInterval
         let sequence: UInt32
         if replay { sequence = UInt32(nextSystematicReplay[page]) }
         else {
