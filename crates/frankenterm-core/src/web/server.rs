@@ -281,7 +281,7 @@ fn apply_https_origin_setting(
     let auth = config.session_auth.take().ok_or_else(|| {
         Error::runtime_backend(
             "web HTTPS origin configuration",
-            "FT_WEB_HTTPS_ORIGIN requires operator session authentication; configure --auth-token-env before enabling HTTPS proxy access",
+            "FT_WEB_HTTPS_ORIGIN requires operator session authentication; configure --auth-token-env (ft web) or --web-auth-token-env (ft watch --web) before enabling HTTPS proxy access",
         )
     })?;
     config.session_auth = Some(auth.with_https_origin(&origin).map_err(|_| {
@@ -705,7 +705,11 @@ mod tests {
         )
         .expect_err("an origin must never opt an unauthenticated server into remote access")
         .to_string();
-        assert!(error.contains("--auth-token-env"));
+        assert!(error.contains("--auth-token-env (ft web)"), "{error}");
+        assert!(
+            error.contains("--web-auth-token-env (ft watch --web)"),
+            "{error}"
+        );
     }
 
     #[test]

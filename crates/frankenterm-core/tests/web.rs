@@ -673,6 +673,10 @@ mod web_tests {
                 ensure!(!header.to_ascii_lowercase().contains("domain="));
                 ensure!(!response.contains(VIEWER_TEST_CREDENTIAL));
                 let cookie = header.split(';').next().context("cookie value")?.to_owned();
+                ensure!(
+                    cookie.starts_with("__Host-ft_viewer_session="),
+                    "an HTTPS session cookie must be host-only prefixed"
+                );
 
                 for path in ["/panes", "/openapi.json"] {
                     let request =

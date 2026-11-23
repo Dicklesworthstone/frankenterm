@@ -28,6 +28,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 const COOKIE_NAME: &str = "ft_viewer_session";
+// Browsers only accept a `__Host-` cookie that is Secure, host-only and
+// Path=/. Other hosts under the same site, such as tailnet peers, cannot plant
+// one. Without the prefix, a planted Domain cookie turns into a duplicate that
+// makes every route refuse with 401, which the server cannot clear.
+const HTTPS_COOKIE_NAME: &str = "__Host-ft_viewer_session";
 const LOGIN_BODY_LIMIT: usize = 1024;
 const CREDENTIAL_DOMAIN: &[u8] = b"frankenterm.local-web-bootstrap.v1";
 // Both SSE routes share these budgets. Eight streams allow four viewer tabs
@@ -139,6 +144,14 @@ impl WebSessionAuth {
 
     pub(super) fn https_origin(&self) -> Option<&str> {
         self.https_origin.as_deref()
+    }
+
+    fn cookie_name(&self) -> &'static str {
+        if self.https_origin.is_some() {
+            HTTPS_COOKIE_NAME
+        } else {
+            COOKIE_NAME
+        }
     }
 
     /// Override the lifetime of newly issued sessions. Existing grants retain
@@ -535,7 +548,7 @@ impl SessionAuthMiddleware {
         if Self::login(req) {
             check_login_body_size(req)?;
         }
-        let digest = cookie_digest(req)?;
+        let digest = cookie_digest(req, auth.cookie_name())?;
         let grant = auth
             .lookup(digest)?
             .filter(|grant| grant.0.origin == origin);
@@ -742,7 +755,7 @@ fn check_browser_boundary_for_route(
     Ok(origin)
 }
 
-fn cookie_digest(req: &Request) -> Result<Option<[u8; 32]>, Response> {
+fn cookie_digest(req: &Request, cookie_name: &str) -> Result<Option<[u8; 32]>, Response> {
     let Some(cookie) = req.headers().get("cookie") else {
         return Ok(None);
     };
@@ -760,9 +773,9 @@ fn cookie_digest(req: &Request) -> Result<Option<[u8; 32]>, Response> {
         let Some((name, value)) = part.trim().split_once('=') else {
             continue;
         };
-        if name.trim() == COOKIE_NAME {
+        if name.trim() == cookie_name {
             if found.is_some()
-                || name != COOKIE_NAME
+                || name != cookie_name
                 || value.len() != 64
                 || !value
                     .bytes()
@@ -846,7 +859,7 @@ pub(super) fn handle_login(req: &mut Request) -> Response {
             "Viewer login requires application/json",
         );
     }
-    let replace = match cookie_digest(req) {
+    let replace = match cookie_digest(req, auth.cookie_name()) {
         Ok(digest) => digest,
         Err(response) => return response,
     };
@@ -867,7 +880,8 @@ pub(super) fn handle_login(req: &mut Request) -> Response {
         Ok((token, grant)) => status(Some(&auth), Some(&grant)).header(
             "set-cookie",
             format!(
-                "{COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+                "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+                auth.cookie_name(),
                 token.as_str(),
                 auth.session_ttl.as_secs(),
                 if auth.https_origin.is_some() {
@@ -887,7 +901,7 @@ pub(super) fn handle_logout(req: &Request) -> Response {
         .get_extension::<SessionAuthMiddleware>()
         .and_then(|middleware| middleware.auth.as_ref());
     if let Some(auth) = auth {
-        let digest = match cookie_digest(req) {
+        let digest = match cookie_digest(req, auth.cookie_name()) {
             Ok(digest) => digest,
             Err(response) => return response,
         };
@@ -898,7 +912,8 @@ pub(super) fn handle_logout(req: &Request) -> Response {
     status(auth, None).header(
         "set-cookie",
         format!(
-            "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            auth.map_or(COOKIE_NAME, WebSessionAuth::cookie_name),
             if auth.is_some_and(|auth| auth.https_origin.is_some()) {
                 "; Secure"
             } else {
@@ -943,6 +958,13 @@ mod tests {
     fn set_cookie(req: &mut Request, token: &str) {
         req.headers_mut()
             .insert("cookie", format!("{COOKIE_NAME}={token}").into_bytes());
+    }
+
+    fn set_https_cookie(req: &mut Request, token: &str) {
+        req.headers_mut().insert(
+            "cookie",
+            format!("{HTTPS_COOKIE_NAME}={token}").into_bytes(),
+        );
     }
 
     fn https_request(method: Method, path: &str) -> Request {
@@ -1235,20 +1257,20 @@ mod tests {
             .split(';')
             .next()
             .unwrap()
-            .strip_prefix("ft_viewer_session=")
+            .strip_prefix("__Host-ft_viewer_session=")
             .unwrap();
         let epoch = body(&response)["data"]["session_epoch"]
             .as_str()
             .unwrap()
             .to_owned();
         let mut read = https_request(Method::Get, "/panes");
-        set_cookie(&mut read, token);
+        set_https_cookie(&mut read, token);
         guard.admit(&mut read).unwrap();
         let grant = read.get_extension::<SessionGrant>().unwrap().clone();
         assert_eq!(grant.0.origin, HTTPS_ORIGIN);
 
         let mut stream = https_request(Method::Get, "/stream/events");
-        set_cookie(&mut stream, token);
+        set_https_cookie(&mut stream, token);
         assert_eq!(
             guard.check_request(&stream).unwrap_err().status(),
             StatusCode::UNAUTHORIZED
@@ -1263,7 +1285,7 @@ mod tests {
                 .unwrap(),
         );
         let mut moved = https_request(Method::Get, "/panes");
-        set_cookie(&mut moved, token);
+        set_https_cookie(&mut moved, token);
         moved
             .headers_mut()
             .insert("host", b"other.example.ts.net".to_vec());
@@ -1277,14 +1299,14 @@ mod tests {
         );
 
         let mut logout = https_request(Method::Delete, "/auth/session");
-        set_cookie(&mut logout, token);
+        set_https_cookie(&mut logout, token);
         guard.admit(&mut logout).unwrap();
         let response = handle_logout(&logout);
         assert_eq!(response.status(), StatusCode::OK);
         let cleared = std::str::from_utf8(header(&response, "set-cookie").unwrap()).unwrap();
         assert_eq!(
             cleared,
-            "ft_viewer_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
+            "__Host-ft_viewer_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
         );
         assert!(!grant.is_valid());
         assert_eq!(
@@ -1652,13 +1674,59 @@ mod tests {
             format!("{COOKIE_NAME}=short"),
         ] {
             req.headers_mut().insert("cookie", value.into_bytes());
-            assert!(cookie_digest(&req).is_err());
+            assert!(cookie_digest(&req, COOKIE_NAME).is_err());
         }
         req.headers_mut().insert(
             "cookie",
             format!("theme=dark; {COOKIE_NAME}={token}").into_bytes(),
         );
-        assert_eq!(cookie_digest(&req).unwrap(), Some(session_digest(&token)));
+        assert_eq!(
+            cookie_digest(&req, COOKIE_NAME).unwrap(),
+            Some(session_digest(&token))
+        );
+    }
+
+    /// Another host under the same site, such as a tailnet peer, can plant
+    /// Domain cookies under the plain name. In HTTPS mode the server reads only
+    /// the host-only `__Host-` cookie. Planted ones can neither lock out sign-in
+    /// nor select authority, and duplicate prefixed cookies are still refused.
+    #[test]
+    fn https_mode_ignores_planted_unprefixed_cookies() {
+        let auth = authority().with_https_origin(HTTPS_ORIGIN).unwrap();
+        let guard = middleware(auth.clone());
+        let (token, _) = auth
+            .issue(None, HTTPS_ORIGIN.to_owned())
+            .unwrap_or_else(|_| panic!("issue synthetic session"));
+        let planted = format!("{COOKIE_NAME}={}; {COOKIE_NAME}=junk", "a".repeat(64));
+
+        let mut status = https_request(Method::Get, "/auth/status");
+        status
+            .headers_mut()
+            .insert("cookie", planted.clone().into_bytes());
+        assert!(
+            guard.check_request(&status).is_ok(),
+            "planted cookies must not lock out sign-in"
+        );
+
+        let mut read = https_request(Method::Get, "/panes");
+        read.headers_mut().insert(
+            "cookie",
+            format!("{planted}; {HTTPS_COOKIE_NAME}={}", token.as_str()).into_bytes(),
+        );
+        assert!(matches!(guard.check_request(&read), Ok(Some(_))));
+
+        read.headers_mut().insert(
+            "cookie",
+            format!(
+                "{HTTPS_COOKIE_NAME}={0}; {HTTPS_COOKIE_NAME}={0}",
+                token.as_str()
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            guard.check_request(&read).unwrap_err().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
