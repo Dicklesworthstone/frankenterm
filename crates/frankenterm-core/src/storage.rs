@@ -22558,6 +22558,7 @@ fn set_event_triage_state_backend(
     triage_state: Option<&str>,
     updated_by: Option<&str>,
 ) -> Result<bool> {
+    let _effect_fence = storage_policy_mutation_fence(backend)?;
     let row = if let Some(state) = triage_state {
         let now = now_ms();
         backend.query_row_typed(
@@ -22599,6 +22600,7 @@ fn set_event_note_backend(
     note: Option<&str>,
     updated_by: Option<&str>,
 ) -> Result<()> {
+    let _effect_fence = storage_policy_mutation_fence(backend)?;
     if let Some(note) = note {
         let redactor = Redactor::new();
         let note = redactor.redact(note);
@@ -22641,6 +22643,7 @@ fn add_event_label_backend(
     label: &str,
     created_by: Option<&str>,
 ) -> Result<bool> {
+    let _effect_fence = storage_policy_mutation_fence(backend)?;
     let now = now_ms();
     let row = backend
         .query_row_typed(
@@ -22667,6 +22670,7 @@ fn remove_event_label_backend(
     event_id: i64,
     label: &str,
 ) -> Result<bool> {
+    let _effect_fence = storage_policy_mutation_fence(backend)?;
     let row = backend
         .query_row_typed(
             "DELETE FROM event_labels WHERE event_id = ?1 AND label = ?2 RETURNING 1",
@@ -30535,6 +30539,60 @@ fn list_active_limit_windows_backend(
 }
 
 // =============================================================================
+// Policy-Fenced User Mutations
+// =============================================================================
+
+/// The writer owns admission through SQL settlement, even if the requesting
+/// future is cancelled after enqueueing. Caller-held guards cannot provide
+/// that guarantee and would contend with this fence during the handoff.
+fn storage_policy_mutation_fence(
+    backend: &dyn StorageBackend,
+) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>> {
+    let fence = crate::policy_kill_switch_state::backend_fence(backend).map_err(|error| {
+        crate::Error::Policy(format!(
+            "storage mutation refused: {} (no change applied)",
+            error.code()
+        ))
+    })?;
+    check_storage_mutation_kill_switch(backend)?;
+    Ok(fence)
+}
+
+/// Recheck durable authority while the executing writer holds the shared
+/// effect fence. SoftStop still permits administrative actions; HardStop and
+/// EmergencyHalt refuse them. Internal expiry and completed-workflow cleanup
+/// use only the fence so a stop cannot prevent already-owned work settling.
+fn check_storage_mutation_kill_switch(backend: &dyn StorageBackend) -> Result<()> {
+    use crate::policy_kill_switch_state::{decode_kill_switch_state, load_kill_switch_state};
+
+    let state = load_kill_switch_state(backend)
+        .and_then(|raw| raw.as_deref().map(decode_kill_switch_state).transpose())
+        .map_err(|error| {
+            tracing::warn!(
+                reason_code = error.code(),
+                "storage mutation refused: persisted kill-switch authority unavailable"
+            );
+            crate::Error::Policy(
+                "storage mutation refused: persisted kill-switch authority unavailable; no change applied"
+                    .to_string(),
+            )
+        })?;
+    if let Some(mut state) = state {
+        // The strict clock is nonnegative; zero also keeps a timed stop armed
+        // if that clock contract ever changes.
+        state.tick(u64::try_from(now_ms_strict()?).unwrap_or_default());
+        if !state.allows_inflight() {
+            tracing::warn!(level = %state.level, "storage mutation denied by kill switch");
+            return Err(crate::Error::Policy(format!(
+                "storage mutation denied: kill switch {} active; no change applied",
+                state.level
+            )));
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Pane Reservation Sync Operations
 // =============================================================================
 
@@ -30570,6 +30628,7 @@ fn create_reservation_backend(
     // queued caller cannot release it. Never wait/retry here: a dispatch holding
     // the same fence may itself need the writer to service other commands.
     let _effect_fence = reservation_mutation_fence(backend)?;
+    check_storage_mutation_kill_switch(backend)?;
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let now = now_ms();
 
@@ -30633,6 +30692,7 @@ fn create_reservation_backend(
 
 fn release_reservation_backend(backend: &dyn StorageBackend, reservation_id: i64) -> Result<bool> {
     let _effect_fence = reservation_mutation_fence(backend)?;
+    check_storage_mutation_kill_switch(backend)?;
     let now = now_ms();
     let updated_rows = backend
         .query_map_typed(
@@ -42772,6 +42832,202 @@ fn storage_blank_event_dedupe_key_is_not_identity() {
 
         storage.shutdown_with_cx(&cx).await.unwrap();
     });
+}
+
+#[test]
+fn storage_writer_user_mutations_observe_later_stop_and_reset() {
+    use crate::policy_kill_switch_state::{
+        KILL_SWITCH_STATE_KEY, KillSwitchTransition, transition_kill_switch_from_backend,
+    };
+    use crate::policy_quarantine::KillSwitchLevel;
+
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("writer-kill-switch.db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        initialize_schema(&conn).unwrap();
+        let (event_id, reservation_id) = with_test_storage_backend(&mut conn, |backend| {
+            seed_pane_backend(backend, 31, 1);
+            seed_pane_backend(backend, 32, 1);
+            let event_id = seed_retention_event_backend(backend, 31, "warning", "stop", 1, None);
+            set_event_note_backend(backend, event_id, Some("original note"), Some("operator"))?;
+            set_event_triage_state_backend(backend, event_id, Some("investigating"), Some("operator"))?;
+            add_event_label_backend(backend, event_id, "retained", Some("operator"))?;
+            let reservation = create_reservation_backend(
+                backend, 31, "human", "original", None, 3_600_000, &PaneReservationConfig::default(),
+            )?;
+            Ok((event_id, reservation.id))
+        }).unwrap();
+        let cx = crate::cx::for_testing();
+        // This long-lived writer is constructed before either operator trip.
+        let storage = StorageHandle::new_with_cx(&cx, path.to_str().unwrap()).await.unwrap();
+
+        for level in [KillSwitchLevel::HardStop, KillSwitchLevel::EmergencyHalt] {
+            // An independent connection uses the real revisioned transition and
+            // shared fence, as a later operator process would.
+            with_test_storage_backend(&mut conn, |backend| {
+                transition_kill_switch_from_backend(
+                    backend,
+                    KillSwitchTransition::Trip { level, by: "operator", reason: "private stop reason" },
+                    u64::try_from(now_ms()).unwrap(),
+                ).unwrap();
+                Ok(())
+            }).unwrap();
+
+            let denied = [
+                storage.create_reservation_with_cx(&cx, 32, "mcp", "new", None, 60_000).await.map(drop),
+                storage.release_reservation_with_cx(&cx, reservation_id).await.map(drop),
+                storage.set_event_note_with_cx(&cx, event_id, Some("replacement".to_string()), None).await,
+                storage.set_event_note_with_cx(&cx, event_id, None, None).await,
+                storage.set_event_triage_state_with_cx(&cx, event_id, Some("resolved".to_string()), None).await.map(drop),
+                storage.set_event_triage_state_with_cx(&cx, event_id, None, None).await.map(drop),
+                storage.add_event_label_with_cx(&cx, event_id, "new".to_string(), None).await.map(drop),
+                storage.remove_event_label_with_cx(&cx, event_id, "retained".to_string()).await.map(drop),
+            ];
+            for result in denied {
+                let error = result.unwrap_err();
+                assert!(matches!(&error, crate::Error::Policy(reason)
+                    if reason.contains(&level.to_string()) && !reason.contains("private stop reason")),
+                    "{error:?}");
+            }
+
+            // A dropped caller response must not turn the queued operation into
+            // an unfenced write. A subsequent writer message is the queue barrier.
+            let (respond, abandoned) = oneshot::channel();
+            drop(abandoned);
+            storage.write_tx.send_with_cx(&cx, WriteCommand::SetEventNote {
+                event_id,
+                note: Some("abandoned request".to_string()),
+                updated_by: None,
+                respond,
+            }).await.unwrap();
+            storage.set_config_value_with_cx(&cx, "test.writer_barrier", "settled").await.unwrap();
+
+            let annotations = storage.get_event_annotations_with_cx(&cx, event_id).await.unwrap().unwrap();
+            assert_eq!(annotations.note.as_deref(), Some("original note"));
+            assert_eq!(annotations.triage_state.as_deref(), Some("investigating"));
+            assert_eq!(annotations.labels, vec!["retained".to_string()]);
+            assert_eq!(storage.get_active_reservation_with_cx(&cx, 31).await.unwrap().unwrap().id, reservation_id);
+            assert!(storage.get_active_reservation_with_cx(&cx, 32).await.unwrap().is_none());
+        }
+
+        // Corruption is not a reset; the revision anchor remains authoritative.
+        conn.execute("UPDATE config SET value = ?1 WHERE key = ?2",
+            ["invalid stop state", KILL_SWITCH_STATE_KEY]).unwrap();
+        let corrupt = storage.set_event_note_with_cx(&cx, event_id, None, None).await.unwrap_err();
+        assert!(matches!(corrupt, crate::Error::Policy(ref reason)
+            if reason.contains("authority unavailable")));
+        assert!(storage.release_reservation_with_cx(&cx, reservation_id).await.is_err());
+
+        with_test_storage_backend(&mut conn, |backend| {
+            let reset = transition_kill_switch_from_backend(
+                backend, KillSwitchTransition::Reset { by: "operator" },
+                u64::try_from(now_ms()).unwrap(),
+            ).unwrap();
+            assert_eq!(reset.revision, 3);
+            // SoftStop pauses new workflows, not these administrative actions.
+            transition_kill_switch_from_backend(
+                backend,
+                KillSwitchTransition::Trip {
+                    level: KillSwitchLevel::SoftStop, by: "operator", reason: "draining",
+                },
+                u64::try_from(now_ms()).unwrap(),
+            ).unwrap();
+            Ok(())
+        }).unwrap();
+        let created = storage.create_reservation_with_cx(&cx, 32, "mcp", "after-reset", None, 60_000).await.unwrap();
+        assert!(storage.release_reservation_with_cx(&cx, reservation_id).await.unwrap());
+        storage.set_event_note_with_cx(&cx, event_id, Some("after reset".to_string()), None).await.unwrap();
+        assert!(storage.set_event_triage_state_with_cx(&cx, event_id, None, None).await.unwrap());
+        assert!(storage.add_event_label_with_cx(&cx, event_id, "new".to_string(), None).await.unwrap());
+        assert!(storage.remove_event_label_with_cx(&cx, event_id, "retained".to_string()).await.unwrap());
+        let annotations = storage.get_event_annotations_with_cx(&cx, event_id).await.unwrap().unwrap();
+        assert_eq!(annotations.note.as_deref(), Some("after reset"));
+        assert_eq!(annotations.triage_state, None);
+        assert_eq!(annotations.labels, vec!["new".to_string()]);
+        assert_eq!(storage.get_active_reservation_with_cx(&cx, 32).await.unwrap().unwrap().id, created.id);
+        storage.shutdown_with_cx(&cx).await.unwrap();
+    });
+}
+
+#[test]
+fn storage_user_mutations_reject_invalid_stop_authority_before_sql() {
+    use crate::policy_kill_switch_state::{KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY};
+
+    for (raw, revision) in [
+        ("not-json", None),
+        ("[]", None),
+        (r#"{"schema":2,"level":"disarmed","changed_at_ms":0,"changed_by":"","reason":"","auto_disarm_at_ms":0}"#, None),
+        (r#"{"schema":1,"revision":2,"level":"disarmed","changed_at_ms":0,"changed_by":"","reason":"","auto_disarm_at_ms":0}"#, Some("3")),
+        (r#"{"schema":1,"revision":2,"level":"disarmed","changed_at_ms":0,"changed_by":"","reason":"","auto_disarm_at_ms":0}"#, Some("invalid")),
+    ] {
+        let backend = memory_backend();
+        let (running, _, reservation) = completion_reservation_fixture_backend(&backend);
+        seed_pane_backend(&backend, 2, 1);
+        let event_id = running.trigger_event_id.unwrap();
+        set_event_note_backend(&backend, event_id, Some("retained"), None).unwrap();
+        add_event_label_backend(&backend, event_id, "retained", None).unwrap();
+        set_config_value_backend(&backend, KILL_SWITCH_STATE_KEY, raw).unwrap();
+        if let Some(revision) = revision {
+            set_config_value_backend(&backend, KILL_SWITCH_REVISION_KEY, revision).unwrap();
+        }
+        for result in [
+            create_reservation_backend(&backend, 2, "mcp", "blocked", None, 60_000, &PaneReservationConfig::default()).map(drop),
+            release_reservation_backend(&backend, reservation.id).map(drop),
+            set_event_note_backend(&backend, event_id, None, None),
+            set_event_triage_state_backend(&backend, event_id, Some("resolved"), None).map(drop),
+            add_event_label_backend(&backend, event_id, "new", None).map(drop),
+            remove_event_label_backend(&backend, event_id, "retained").map(drop),
+        ] {
+            assert!(matches!(result, Err(crate::Error::Policy(ref reason))
+                if reason.contains("authority unavailable")), "{result:?}");
+        }
+        assert_eq!(get_active_reservation_backend(&backend, 1).unwrap().unwrap().id, reservation.id);
+        assert!(get_active_reservation_backend(&backend, 2).unwrap().is_none());
+        let annotations = query_event_annotations_backend(&backend, event_id).unwrap().unwrap();
+        assert_eq!(annotations.note.as_deref(), Some("retained"));
+        assert_eq!(annotations.triage_state, None);
+        assert_eq!(annotations.labels, vec!["retained".to_string()]);
+    }
+}
+
+#[test]
+fn storage_stop_preserves_owned_cleanup_and_honors_timed_disarm() {
+    use crate::policy_kill_switch_state::{
+        KILL_SWITCH_STATE_KEY, KillSwitchTransition, encode_kill_switch_state,
+        transition_kill_switch_from_backend,
+    };
+    use crate::policy_quarantine::{KillSwitch, KillSwitchLevel};
+
+    let backend = memory_backend();
+    let (running, completed, reservation) = completion_reservation_fixture_backend(&backend);
+    seed_pane_backend(&backend, 2, 1);
+    let expired = create_reservation_backend(
+        &backend, 2, "human", "expired", None, 60_000, &PaneReservationConfig::default(),
+    ).unwrap();
+    execute_typed(&backend, "UPDATE pane_reservations SET expires_at = 0 WHERE id = ?1",
+        &[ToSqlValue::Integer(expired.id)]).unwrap();
+    transition_kill_switch_from_backend(
+        &backend,
+        KillSwitchTransition::Trip { level: KillSwitchLevel::HardStop, by: "operator", reason: "stop" },
+        u64::try_from(now_ms()).unwrap(),
+    ).unwrap();
+    assert!(release_reservation_backend(&backend, reservation.id).is_err());
+    assert_eq!(expire_stale_reservations_backend(&backend).unwrap(), 1);
+    settle_workflow_terminal_backend(&backend, &completed, "completed", true).unwrap();
+    assert!(get_active_reservation_backend(&backend, running.pane_id).unwrap().is_none());
+    assert_eq!(query_workflow_backend(&backend, &running.id).unwrap().unwrap().status, "completed");
+
+    let timed = memory_backend();
+    seed_pane_backend(&timed, 1, 1);
+    let mut state = KillSwitch::disarmed();
+    state.trip_with_timeout(KillSwitchLevel::HardStop, "operator", "timeout", 1, 1);
+    set_config_value_backend(&timed, KILL_SWITCH_STATE_KEY,
+        &encode_kill_switch_state(&state).unwrap()).unwrap();
+    let admitted = create_reservation_backend(
+        &timed, 1, "human", "after-timeout", None, 60_000, &PaneReservationConfig::default(),
+    ).unwrap();
+    assert!(release_reservation_backend(&timed, admitted.id).unwrap());
 }
 
 #[test]
