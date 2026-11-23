@@ -581,6 +581,7 @@ fn write_revisioned_state(
 
 /// Operator transitions reload under the same authority used by dispatch.
 /// `by` is an audit label; the calling operator surface owns authentication.
+#[derive(Clone, Copy)]
 pub enum KillSwitchTransition<'a> {
     Trip {
         level: KillSwitchLevel,
@@ -646,6 +647,37 @@ pub fn transition_kill_switch_from_backend(
         fenced_owner: "policy_gated_injector",
         pre_admitted_remote_effects: "not_proven_settled",
     })
+}
+
+/// [`transition_kill_switch_from_backend`] for an operator command. Sends,
+/// fenced live reads and MCP mutations hold the fence across their effect,
+/// so a single nonblocking attempt can lose to ordinary agent traffic. That
+/// would leave the operator unable to escalate exactly when a swarm is busiest.
+/// `FencePending` comes only from the fence acquired before anything is read
+/// or written, so it applied nothing and is retried. The budget and the 2-50 ms
+/// backoff match effect admission, and the clock is re-read for each attempt.
+/// Contention that outlasts `budget` is still `FencePending`.
+pub fn transition_kill_switch_from_backend_within(
+    backend: &dyn StorageBackend,
+    transition: KillSwitchTransition<'_>,
+    now_ms: impl Fn() -> u64,
+    budget: std::time::Duration,
+) -> Result<KillSwitchTransitionReceipt, KillSwitchStateError> {
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        match transition_kill_switch_from_backend(backend, transition, now_ms()) {
+            Err(KillSwitchStateError::FencePending) => {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(KillSwitchStateError::FencePending);
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Restore through a one-shot backend: load + apply in one call.
@@ -1123,6 +1155,63 @@ pub(crate) mod tests {
                 ));
                 assert!(started.elapsed() >= std::time::Duration::from_millis(60));
             });
+    }
+
+    /// An operator escalation must not lose to one in-flight agent effect. A
+    /// brief holder is waited out and the trip lands; a holder that outlasts
+    /// the budget still leaves the transition pending and unapplied.
+    #[test]
+    fn operator_transition_waits_out_a_brief_effect_but_never_applies_while_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.db");
+        let backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
+        backend.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)").unwrap();
+        let trip = KillSwitchTransition::Trip {
+            level: KillSwitchLevel::EmergencyHalt,
+            by: "operator",
+            reason: "escalate",
+        };
+
+        let held = acquire_kill_switch_fence(&path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            transition_kill_switch_from_backend_within(
+                &backend,
+                trip,
+                || 5000,
+                std::time::Duration::from_millis(60),
+            ),
+            Err(KillSwitchStateError::FencePending)
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        assert_eq!(
+            load_kill_switch_state(&backend).unwrap(),
+            None,
+            "a transition that never owned the fence must not persist"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        let clock = std::sync::atomic::AtomicU64::new(5000);
+        let receipt = transition_kill_switch_from_backend_within(
+            &backend,
+            trip,
+            || clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("a brief holder is waited out");
+        release.join().unwrap();
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(receipt.state.level, KillSwitchLevel::EmergencyHalt);
+        assert_eq!(
+            receipt.state.changed_at_ms,
+            clock.load(std::sync::atomic::Ordering::Relaxed) - 1,
+            "the applied attempt is stamped with its own clock reading"
+        );
     }
 
     /// ft-d1n3l: a dropped fence is free at once, even while a child forked

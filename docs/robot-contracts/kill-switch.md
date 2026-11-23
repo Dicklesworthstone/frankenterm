@@ -45,9 +45,11 @@ rows without a revision start at zero.
 - **Lapsed auto-disarm** deadlines are applied during restore. `status` is
   read-only and does not write an expired snapshot over a newer trip.
 - **Concurrency:** operator transitions reload current state under an exclusive
-  workspace fence. The injector holds that fence through dispatch settlement.
-  Contention reports `fence_pending` without applying or acknowledging the
-  transition. A trip must raise the current persisted tier.
+  workspace fence. The injector holds that fence through dispatch settlement,
+  and fenced MCP reads and mutations hold it through their effect. A transition
+  waits up to 2 s for such a holder. Contention that outlasts that wait reports
+  `fence_pending` without applying or acknowledging the transition. A trip must
+  raise the current persisted tier.
 - **Reset:** an explicit operator reset advances the revision and can repair a
   corrupt state blob when the separate revision anchor is valid. If revision
   authority is also corrupt, reset fails without rewriting it. Reset does not

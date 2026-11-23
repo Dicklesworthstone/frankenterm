@@ -60836,9 +60836,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             // construction. Contract:
                             // docs/robot-contracts/kill-switch.md.
                             use frankenterm_core::policy_kill_switch_state::{
-                                KILL_SWITCH_STATE_KEY, KillSwitchRestore, KillSwitchTransition,
-                                restore_kill_switch_from_backend,
-                                transition_kill_switch_from_backend,
+                                KILL_SWITCH_FENCE_WAIT, KILL_SWITCH_STATE_KEY, KillSwitchRestore,
+                                KillSwitchTransition, restore_kill_switch_from_backend,
+                                transition_kill_switch_from_backend_within,
                             };
                             use frankenterm_core::policy_quarantine::KillSwitchLevel;
 
@@ -60933,7 +60933,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             };
                             let transition_response =
                                 |action: &str, transition: KillSwitchTransition<'_>| {
-                                    match transition_kill_switch_from_backend(&backend, transition, now) {
+                                    // Wait out an in-flight send or fenced read
+                                    // rather than lose the escalation to it.
+                                    match transition_kill_switch_from_backend_within(
+                                        &backend,
+                                        transition,
+                                        || u64::try_from(now_epoch_ms()).unwrap_or_default(),
+                                        KILL_SWITCH_FENCE_WAIT,
+                                    ) {
                                     Ok(receipt) => RobotResponse::<serde_json::Value>::success(
                                         serde_json::json!({
                                             "action": action,

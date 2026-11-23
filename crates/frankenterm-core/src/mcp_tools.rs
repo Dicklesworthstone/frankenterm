@@ -1021,6 +1021,50 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
     input
 }
 
+const MCP_KILL_SWITCH_AUTHORITY_HINT: &str =
+    "Inspect the workspace kill-switch state before retrying.";
+
+/// Unavailable authority is not a policy decision: no persisted level was
+/// observed, so the refusal names the authority failure instead of a stop.
+fn mcp_kill_switch_authority_unavailable(code: &str) -> String {
+    format!("MCP effect refused: kill-switch authority unavailable ({code})")
+}
+
+/// Synchronous MCP mutation handlers wait out a concurrent send or mutation
+/// with the same budget and 2-50 ms backoff as async effect admission and the
+/// transaction executor. Only lock acquisition is retried. Each short sleep is
+/// followed by a cancellation checkpoint. Contention that outlasts the budget,
+/// or cancellation, is still `FencePending`, never permission.
+fn acquire_mcp_mutation_fence(
+    cx: &crate::cx::Cx,
+    db_path: &Path,
+) -> std::result::Result<
+    crate::policy_kill_switch_state::KillSwitchFence,
+    crate::policy_kill_switch_state::KillSwitchStateError,
+> {
+    use crate::policy_kill_switch_state::{
+        KILL_SWITCH_FENCE_WAIT, KillSwitchStateError, acquire_kill_switch_fence,
+    };
+
+    let started = Instant::now();
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        cx.checkpoint()
+            .map_err(|_| KillSwitchStateError::FencePending)?;
+        match acquire_kill_switch_fence(db_path) {
+            Err(KillSwitchStateError::FencePending) => {
+                let remaining = KILL_SWITCH_FENCE_WAIT.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(KillSwitchStateError::FencePending);
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Revision authority belongs to the long-lived handler, not its fresh
 /// per-request policy engine. Restore only under the effect owner's fence.
 #[derive(Default)]
@@ -1065,8 +1109,8 @@ impl McpKillSwitchGate {
         let authority_error = |code: &str| {
             McpToolError::new(
                 MCP_ERR_POLICY,
-                format!("MCP effect refused: kill-switch authority unavailable ({code})"),
-                Some("Inspect the workspace kill-switch state before retrying.".to_string()),
+                mcp_kill_switch_authority_unavailable(code),
+                Some(MCP_KILL_SWITCH_AUTHORITY_HINT.to_string()),
             )
         };
         let fence = acquire_kill_switch_fence_within_with_cx(cx, db_path, KILL_SWITCH_FENCE_WAIT)
@@ -1129,8 +1173,7 @@ fn mcp_authorize_mcp_mutation(
     start: Instant,
 ) -> Result<crate::policy_kill_switch_state::KillSwitchFence, McpResult<Vec<Content>>> {
     use crate::policy_kill_switch_state::{
-        KillSwitchStateError, acquire_kill_switch_fence, apply_persisted_kill_switch,
-        load_kill_switch_state_from_path_with_cx,
+        KillSwitchStateError, load_kill_switch_state_from_path_with_cx,
     };
 
     let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
@@ -1148,40 +1191,43 @@ fn mcp_authorize_mcp_mutation(
     let mut decision = engine.authorize_preview(&input);
     let mut effect_fence = None;
     if decision.is_allowed() {
-        let db_path = match audit_db_path {
+        let admitted = match audit_db_path {
             Some(path) => Ok(path.to_path_buf()),
             None => tx_mutation_workspace_layout(config)
                 .map(|layout| layout.db_path)
                 .map_err(|_| KillSwitchStateError::FenceFailed),
-        };
-        let fence = cx
-            .checkpoint()
-            .map_err(|_| {
-                KillSwitchStateError::LoadFailed("cancelled before mutation admission".into())
-            })
-            .and_then(|()| {
-                db_path
-                    .as_ref()
-                    .map_err(Clone::clone)
-                    .and_then(|path| acquire_kill_switch_fence(path))
-            });
-        let loaded = match (&fence, &db_path) {
-            (Ok(_), Ok(path)) => path
-                .to_str()
-                .ok_or(KillSwitchStateError::FenceFailed)
-                .and_then(|path| load_kill_switch_state_from_path_with_cx(cx, path)),
-            (Err(error), _) => Err(error.clone()),
-            (_, Err(error)) => Err(error.clone()),
-        };
-        match &fence {
-            Ok(fence) => {
-                kill_switch_gate.restore(fence, &mut engine, loaded);
-            }
-            Err(_) => {
-                apply_persisted_kill_switch(&mut engine, loaded, now_ms());
-            }
         }
-        effect_fence = fence.ok();
+        .and_then(|db_path| {
+            let fence = acquire_mcp_mutation_fence(cx, &db_path)?;
+            Ok((db_path, fence))
+        });
+        let (db_path, fence) = match admitted {
+            Ok(admitted) => admitted,
+            // Missing storage, contention that outlasted the wait, or
+            // cancellation observed no persisted level. Reporting it as a
+            // synthetic HardStop, and auditing that as a policy denial,
+            // misled clients and operators whenever a send was in flight.
+            Err(error) => {
+                tracing::warn!(
+                    target: "ft::security::policy",
+                    tool = %summary,
+                    code = error.code(),
+                    "MCP mutation refused: kill-switch authority unavailable"
+                );
+                return Err(envelope_to_content(McpEnvelope::<()>::error(
+                    MCP_ERR_POLICY,
+                    mcp_kill_switch_authority_unavailable(error.code()),
+                    Some(MCP_KILL_SWITCH_AUTHORITY_HINT.to_string()),
+                    elapsed_ms(start),
+                )));
+            }
+        };
+        let loaded = db_path
+            .to_str()
+            .ok_or(KillSwitchStateError::FenceFailed)
+            .and_then(|path| load_kill_switch_state_from_path_with_cx(cx, path));
+        kill_switch_gate.restore(&fence, &mut engine, loaded);
+        effect_fence = Some(fence);
         decision = engine.authorize(&input);
     }
     if decision.is_denied() {
@@ -30047,6 +30093,64 @@ exit 17",
         );
         drop(fence);
         assert!(transition_in_test_process(&db_path, "trip").contains("KILL_SWITCH_CHILD_RECEIPT"));
+    }
+
+    /// A mutation that only lost the fence race to an in-flight send must
+    /// neither claim a stop nor record a policy denial. A brief holder is
+    /// waited out; one that outlasts the budget is refused as unavailable
+    /// authority.
+    #[test]
+    fn mcp_mutation_waits_out_contention_and_never_reports_it_as_a_stop() {
+        use crate::policy_kill_switch_state::{KILL_SWITCH_FENCE_WAIT, acquire_kill_switch_fence};
+
+        let (_dir, db_path) = temp_db_path();
+        seed_event(&db_path);
+        let cfg = config_with_db_path(&db_path);
+        let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+        let authorize = || {
+            super::mcp_authorize_mcp_mutation(
+                test_mcp_context().cx(),
+                &super::McpKillSwitchGate::default(),
+                cfg.as_ref(),
+                None,
+                &rate_limiter,
+                "wa.tx_run",
+                "tx.run",
+                std::time::Instant::now(),
+            )
+        };
+        let denials = || -> i64 {
+            rusqlite::Connection::open(db_path.as_path())
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM policy_denied_audit", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+
+        let held = acquire_kill_switch_fence(&db_path).unwrap();
+        let started = std::time::Instant::now();
+        let refused = parse_json_content(
+            authorize()
+                .err()
+                .expect("a held fence must not grant authority")
+                .unwrap(),
+        );
+        assert!(started.elapsed() >= KILL_SWITCH_FENCE_WAIT);
+        assert_eq!(refused["error_code"], MCP_ERR_POLICY, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("robot.kill_switch.fence_pending"), "{error}");
+        assert!(!error.contains("HardStop"), "{error}");
+        assert_eq!(denials(), 0, "contention is not a policy denial");
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        let admitted = authorize();
+        release.join().unwrap();
+        assert!(admitted.is_ok(), "a brief holder is waited out");
+        assert_eq!(denials(), 0);
     }
 
     #[test]
