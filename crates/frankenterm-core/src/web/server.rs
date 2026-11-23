@@ -715,7 +715,7 @@ mod tests {
             Ok("https://terminal.example:8443".to_string()),
         )
         .expect("explicit authenticated HTTPS origin");
-        assert_eq!(config.bind_addr(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.bind_addr(), "127.0.0.1:8080");
         assert_eq!(
             config.session_auth.as_ref().unwrap().https_origin(),
             Some("https://terminal.example:8443")
@@ -781,8 +781,7 @@ mod tests {
     fn https_listener_announcement_names_the_browser_origin_and_proxy_upstream() {
         let addr = "127.0.0.1:8080".parse().unwrap();
         let mut output = Vec::new();
-        write_listening_announcement(&mut output, addr, Some("https://terminal.example"))
-            .unwrap();
+        write_listening_announcement(&mut output, addr, Some("https://terminal.example")).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "ft web listening on https://terminal.example (proxy upstream http://127.0.0.1:8080)\n"

@@ -11956,10 +11956,9 @@ pub(crate) mod tests {
             assert!(screen.selection_anchor_rows_unchanged_since(&points, 21));
             assert!(screen.selection_anchor_rows_unchanged_since(&[points[0]; 3], 20));
             assert!(!screen.selection_anchor_rows_unchanged_since(&[None; 3], 20));
-            assert!(!screen.selection_anchor_rows_unchanged_since(
-                &[anchor_point(0, first - 1); 3],
-                20
-            ));
+            assert!(
+                !screen.selection_anchor_rows_unchanged_since(&[anchor_point(0, first - 1); 3], 20)
+            );
             #[cfg(feature = "use_serde")]
             {
                 assert!(!screen.selection_points_resident_span_unchanged_since(&mixed, 20));
@@ -15502,7 +15501,12 @@ pub(crate) mod tests {
                 (start..end).collect::<Vec<_>>()
             );
             assert!(screen.get_changed_stable_rows(start..end, 20).is_empty());
-            for range in [first - 2..first, end..end + 2, start..start, start + 1..start] {
+            for range in [
+                first - 2..first,
+                end..end + 2,
+                start..start,
+                start + 1..start,
+            ] {
                 assert!(screen.get_changed_stable_rows(range, 19).is_empty());
             }
             assert_eq!(screen.cached_page_views(), 0);

@@ -1139,11 +1139,14 @@ mod tests {
         let mut req = https_request(Method::Get, "/auth/status");
         req.headers_mut()
             .insert("x-forwarded-host", b"evil.invalid".to_vec());
-        req.headers_mut().insert("x-forwarded-proto", b"http".to_vec());
+        req.headers_mut()
+            .insert("x-forwarded-proto", b"http".to_vec());
         req.headers_mut()
             .insert("forwarded", b"host=evil.invalid;proto=http".to_vec());
-        req.headers_mut()
-            .insert("tailscale-user-login", b"untrusted@example.invalid".to_vec());
+        req.headers_mut().insert(
+            "tailscale-user-login",
+            b"untrusted@example.invalid".to_vec(),
+        );
         assert!(
             guard.check_request(&req).is_ok(),
             "forwarded and identity headers cannot select authority"
@@ -1172,7 +1175,8 @@ mod tests {
                 "http://workstation.example.ts.net",
                 "https://other.invalid",
             ] {
-                req.headers_mut().insert("origin", origin.as_bytes().to_vec());
+                req.headers_mut()
+                    .insert("origin", origin.as_bytes().to_vec());
                 assert_eq!(
                     guard.check_request(&req).unwrap_err().status(),
                     StatusCode::FORBIDDEN
@@ -1525,7 +1529,10 @@ mod tests {
         ] {
             req.headers_mut()
                 .insert("origin", origin.as_bytes().to_vec());
-            assert!(check_browser_boundary(&req, 4321, None).is_err(), "{origin}");
+            assert!(
+                check_browser_boundary(&req, 4321, None).is_err(),
+                "{origin}"
+            );
         }
         req.headers_mut().remove("origin");
         assert!(check_browser_boundary(&req, 4321, None).is_err());

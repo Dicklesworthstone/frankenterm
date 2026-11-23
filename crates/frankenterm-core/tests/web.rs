@@ -640,7 +640,12 @@ mod web_tests {
             assert_eq!(server.https_origin(), Some(ORIGIN));
 
             let scenario = Box::pin(timeout(Duration::from_secs(20), async {
-                for path in ["/panes", "/openapi.json", "/stream/events", "/stream/deltas"] {
+                for path in [
+                    "/panes",
+                    "/openapi.json",
+                    "/stream/events",
+                    "/stream/deltas",
+                ] {
                     let request = session_request_for_origin(HOST, ORIGIN, "GET", path, None, None);
                     let response = fetch_raw(addr, request.as_bytes()).await?;
                     ensure!(extract_status(&response) == 401, "anonymous route {path}");
@@ -657,7 +662,10 @@ mod web_tests {
                     Some(&body),
                 );
                 let response = fetch_raw(addr, login.as_bytes()).await?;
-                ensure!(extract_status(&response) == 200, "HTTPS-origin login succeeds");
+                ensure!(
+                    extract_status(&response) == 200,
+                    "HTTPS-origin login succeeds"
+                );
                 let header = header_value(&response, "set-cookie").context("session cookie")?;
                 for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
                     ensure!(header.contains(attribute), "cookie attribute {attribute}");
@@ -667,16 +675,13 @@ mod web_tests {
                 let cookie = header.split(';').next().context("cookie value")?.to_owned();
 
                 for path in ["/panes", "/openapi.json"] {
-                    let request = session_request_for_origin(
-                        HOST,
-                        ORIGIN,
-                        "GET",
-                        path,
-                        Some(&cookie),
-                        None,
-                    );
+                    let request =
+                        session_request_for_origin(HOST, ORIGIN, "GET", path, Some(&cookie), None);
                     let response = fetch_raw(addr, request.as_bytes()).await?;
-                    ensure!(extract_status(&response) == 200, "authenticated route {path}");
+                    ensure!(
+                        extract_status(&response) == 200,
+                        "authenticated route {path}"
+                    );
                     if path == "/panes" {
                         ensure!(
                             response.contains("test-pane"),
@@ -730,14 +735,8 @@ mod web_tests {
                 ] {
                     let mut stream = TcpStream::connect(addr).await?;
                     let path = format!("{path}&session_epoch={epoch}");
-                    let request = session_request_for_origin(
-                        HOST,
-                        ORIGIN,
-                        "GET",
-                        &path,
-                        Some(&cookie),
-                        None,
-                    );
+                    let request =
+                        session_request_for_origin(HOST, ORIGIN, "GET", &path, Some(&cookie), None);
                     stream.write_all(request.as_bytes()).await?;
                     let mut response = Vec::new();
                     let ready =
@@ -762,7 +761,10 @@ mod web_tests {
                     None,
                 );
                 let response = fetch_raw(addr, logout.as_bytes()).await?;
-                ensure!(extract_status(&response) == 200, "HTTPS-origin logout succeeds");
+                ensure!(
+                    extract_status(&response) == 200,
+                    "HTTPS-origin logout succeeds"
+                );
                 let header = header_value(&response, "set-cookie").context("cleared cookie")?;
                 ensure!(header.contains("Secure") && header.contains("Max-Age=0"));
                 for mut stream in streams {
@@ -777,14 +779,8 @@ mod web_tests {
                     "logout settles both producers"
                 );
                 for path in ["/panes", "/stream/events", "/stream/deltas"] {
-                    let request = session_request_for_origin(
-                        HOST,
-                        ORIGIN,
-                        "GET",
-                        path,
-                        Some(&cookie),
-                        None,
-                    );
+                    let request =
+                        session_request_for_origin(HOST, ORIGIN, "GET", path, Some(&cookie), None);
                     let response = fetch_raw(addr, request.as_bytes()).await?;
                     ensure!(
                         extract_status(&response) == 401,

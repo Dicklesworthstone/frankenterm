@@ -25028,16 +25028,14 @@ pub fn record_policy_denial_audit_blocking(
 ) -> Result<i64> {
     // Denial observability must never create a fresh, disarmed database.
     // Enforce existence in the open itself, not with a racy path precheck.
-    let connection = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .map_err(|e| {
-        StorageError::Database(format!(
-            "open {} for policy_denied_audit: {e}",
-            db_path.display()
-        ))
-    })?;
+    let connection =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| {
+                StorageError::Database(format!(
+                    "open {} for policy_denied_audit: {e}",
+                    db_path.display()
+                ))
+            })?;
     let backend = RusqliteBackend::new(connection)
         .map_err(|error| storage_backend_error("Initialize policy denial audit backend", error))?;
     backend

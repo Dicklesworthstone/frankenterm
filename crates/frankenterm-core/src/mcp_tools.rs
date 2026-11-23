@@ -14841,8 +14841,7 @@ impl ToolHandler for WaEventsAnnotateTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage =
-                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
+            let storage = StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
             let prior_annotations = storage
                 .get_event_annotations_with_cx(ctx.cx(), params.event_id)
                 .await?
@@ -15083,8 +15082,7 @@ impl ToolHandler for WaEventsTriageTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage =
-                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
+            let storage = StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
 
             let changed = storage
                 .set_event_triage_state_with_cx(
@@ -15339,8 +15337,7 @@ impl ToolHandler for WaEventsLabelTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage =
-                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
+            let storage = StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
             let ts = mcp_now_ms_i64();
 
             let changed = if let Some(label) = params.add.clone() {
@@ -15526,7 +15523,7 @@ mod tests {
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_load_submit_profile,
         mcp_now_ms_i64, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, read_mcp_rehearsal_manifest,
+        merge_distributed_remote_mcp_states, now_ms, read_mcp_rehearsal_manifest,
         redact_mcp_output_secrets, redact_mcp_pane_state_fields,
         redact_mcp_pane_text_with_escape_contract, redact_mcp_wait_pattern_for_output,
         resolve_mcp_rehearsal_manifest_path, serialize_mcp_audit_decision_context,
@@ -29979,9 +29976,7 @@ exit 17",
             transition_in_test_process(&db_path, "pending").contains("KILL_SWITCH_CHILD_PENDING")
         );
         drop(fence);
-        assert!(
-            transition_in_test_process(&db_path, "trip").contains("KILL_SWITCH_CHILD_RECEIPT")
-        );
+        assert!(transition_in_test_process(&db_path, "trip").contains("KILL_SWITCH_CHILD_RECEIPT"));
     }
 
     #[test]
@@ -30000,16 +29995,24 @@ exit 17",
         let abort = WaMissionAbortTool::new(cfg);
         let context = test_mcp_context();
         let initial = parse_json_content(
-            query.call(&context, serde_json::json!({"mission_file": path})).unwrap(),
+            query
+                .call(&context, serde_json::json!({"mission_file": path}))
+                .unwrap(),
         );
         assert_eq!(initial["ok"], true, "{initial}");
         let before = std::fs::read(&path).unwrap();
         transition_in_test_process(&db_path, "trip");
 
         for result in [
-            pause.call(&context, serde_json::json!({"mission_file": path, "reason": "pause"})),
+            pause.call(
+                &context,
+                serde_json::json!({"mission_file": path, "reason": "pause"}),
+            ),
             resume.call(&context, serde_json::json!({"mission_file": path})),
-            abort.call(&context, serde_json::json!({"mission_file": path, "reason": "abort"})),
+            abort.call(
+                &context,
+                serde_json::json!({"mission_file": path, "reason": "abort"}),
+            ),
         ] {
             let denied = parse_json_content(result.unwrap());
             assert_eq!(denied["ok"], false, "{denied}");
@@ -30017,21 +30020,30 @@ exit 17",
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
         let readable = parse_json_content(
-            query.call(&context, serde_json::json!({"mission_file": path})).unwrap(),
+            query
+                .call(&context, serde_json::json!({"mission_file": path}))
+                .unwrap(),
         );
         assert_eq!(readable["ok"], true, "{readable}");
 
         transition_in_test_process(&db_path, "reset");
         let accepted = parse_json_content(
-            pause.call(&context, serde_json::json!({
-                "mission_file": path,
-                "reason": "after-reset",
-                "expected_token": initial["data"]["revision_token"]
-            })).unwrap(),
+            pause
+                .call(
+                    &context,
+                    serde_json::json!({
+                        "mission_file": path,
+                        "reason": "after-reset",
+                        "expected_token": initial["data"]["revision_token"]
+                    }),
+                )
+                .unwrap(),
         );
         assert_eq!(accepted["ok"], true, "{accepted}");
         assert_eq!(
-            super::mcp_load_mission_from_path(&path).unwrap().lifecycle_state,
+            super::mcp_load_mission_from_path(&path)
+                .unwrap()
+                .lifecycle_state,
             MissionLifecycleState::Paused
         );
     }
@@ -30079,9 +30091,7 @@ exit 17",
 
     #[test]
     fn mission_mutation_rejects_missing_cancelled_contended_and_corrupt_authority_ft_xxfwy_42() {
-        use crate::policy_kill_switch_state::{
-            KILL_SWITCH_STATE_KEY, acquire_kill_switch_fence,
-        };
+        use crate::policy_kill_switch_state::{KILL_SWITCH_STATE_KEY, acquire_kill_switch_fence};
 
         let dir = workspace_tempdir();
         let path = write_mission_file(&dir, MissionLifecycleState::Running);
@@ -30090,37 +30100,40 @@ exit 17",
         let tool = WaMissionPauseTool::new(config_with_db_path(&db_path));
         let arguments = serde_json::json!({"mission_file": path, "reason": "must-not-write"});
 
-        let missing = parse_json_content(
-            tool.call(&test_mcp_context(), arguments.clone()).unwrap(),
-        );
+        let missing =
+            parse_json_content(tool.call(&test_mcp_context(), arguments.clone()).unwrap());
         assert_eq!(missing["error_code"], MCP_ERR_POLICY, "{missing}");
-        assert!(!db_path.exists(), "admission must never manufacture disarmed storage");
+        assert!(
+            !db_path.exists(),
+            "admission must never manufacture disarmed storage"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         seed_event(&db_path);
         let cx = crate::cx::Cx::for_testing();
         cx.set_cancel_requested(true);
         let cancelled = parse_json_content(
-            tool.call(&McpContext::new(cx, 2), arguments.clone()).unwrap(),
+            tool.call(&McpContext::new(cx, 2), arguments.clone())
+                .unwrap(),
         );
         assert_eq!(cancelled["error_code"], MCP_ERR_POLICY, "{cancelled}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         let fence = acquire_kill_switch_fence(&db_path).unwrap();
-        let contended = parse_json_content(
-            tool.call(&test_mcp_context(), arguments.clone()).unwrap(),
-        );
+        let contended =
+            parse_json_content(tool.call(&test_mcp_context(), arguments.clone()).unwrap());
         assert_eq!(contended["error_code"], MCP_ERR_POLICY, "{contended}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         drop(fence);
 
-        rusqlite::Connection::open(&db_path).unwrap().execute(
-            "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
-            [KILL_SWITCH_STATE_KEY, "private malformed stop state"],
-        ).unwrap();
-        let corrupt = parse_json_content(
-            tool.call(&test_mcp_context(), arguments).unwrap(),
-        );
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                [KILL_SWITCH_STATE_KEY, "private malformed stop state"],
+            )
+            .unwrap();
+        let corrupt = parse_json_content(tool.call(&test_mcp_context(), arguments).unwrap());
         assert_eq!(corrupt["error_code"], MCP_ERR_POLICY, "{corrupt}");
         assert!(!corrupt.to_string().contains("private malformed stop state"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -30143,8 +30156,14 @@ exit 17",
         transition_in_test_process(&db_path, "trip");
 
         for result in [
-            run.call(&test_mcp_context(), serde_json::json!({"contract_file": contract_path})),
-            rollback.call(&test_mcp_context(), serde_json::json!({"contract_file": contract_path})),
+            run.call(
+                &test_mcp_context(),
+                serde_json::json!({"contract_file": contract_path}),
+            ),
+            rollback.call(
+                &test_mcp_context(),
+                serde_json::json!({"contract_file": contract_path}),
+            ),
         ] {
             let denied = parse_json_content(result.unwrap());
             assert_eq!(denied["ok"], false, "{denied}");
@@ -30177,8 +30196,12 @@ exit 17",
             let label = WaEventsLabelTool::new(cfg, Arc::clone(&db_path));
             let operator = RusqliteBackend::open_path(
                 &db_path,
-                &OpenConfig { wal_mode: false, ..Default::default() },
-            ).unwrap();
+                &OpenConfig {
+                    wal_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             transition_kill_switch_from_backend(
                 &operator,
                 KillSwitchTransition::Trip {
@@ -30187,20 +30210,30 @@ exit 17",
                     reason: "private operator detail",
                 },
                 now_ms(),
-            ).unwrap();
+            )
+            .unwrap();
             drop(operator);
 
             let allowed = level == KillSwitchLevel::SoftStop;
             for result in [
-                annotate.call(&test_mcp_context(), serde_json::json!({
-                    "event_id": event_id, "note": "accepted metadata"
-                })),
-                triage.call(&test_mcp_context(), serde_json::json!({
-                    "event_id": event_id, "state": "investigating"
-                })),
-                label.call(&test_mcp_context(), serde_json::json!({
-                    "event_id": event_id, "add": "reviewed"
-                })),
+                annotate.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "event_id": event_id, "note": "accepted metadata"
+                    }),
+                ),
+                triage.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "event_id": event_id, "state": "investigating"
+                    }),
+                ),
+                label.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "event_id": event_id, "add": "reviewed"
+                    }),
+                ),
             ] {
                 let envelope = parse_json_content(result.unwrap());
                 assert_eq!(envelope["ok"], allowed, "{level}: {envelope}");
@@ -30219,12 +30252,20 @@ exit 17",
             }
 
             let readable = parse_json_content(
-                label.call(&test_mcp_context(), serde_json::json!({
-                    "event_id": event_id, "list": true
-                })).unwrap(),
+                label
+                    .call(
+                        &test_mcp_context(),
+                        serde_json::json!({
+                            "event_id": event_id, "list": true
+                        }),
+                    )
+                    .unwrap(),
             );
             assert_eq!(readable["ok"], true, "{readable}");
-            assert!(!unrelated_db.exists(), "explicit workspace authority must win");
+            assert!(
+                !unrelated_db.exists(),
+                "explicit workspace authority must win"
+            );
         }
     }
 

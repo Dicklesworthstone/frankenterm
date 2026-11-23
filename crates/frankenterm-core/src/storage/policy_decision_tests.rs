@@ -26,7 +26,10 @@ fn blocking_policy_denial_audit_never_creates_or_recreates_storage() {
     };
 
     assert!(record_policy_denial_audit_blocking(&path, &record).is_err());
-    assert!(!path.exists(), "denial audit must not create workspace storage");
+    assert!(
+        !path.exists(),
+        "denial audit must not create workspace storage"
+    );
 
     {
         let connection = Connection::open(&path).unwrap();
@@ -34,11 +37,8 @@ fn blocking_policy_denial_audit_never_creates_or_recreates_storage() {
     }
     let id = record_policy_denial_audit_blocking(&path, &record).unwrap();
     {
-        let connection = Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let saved: (String, String, String, String) = connection
             .query_row(
                 "SELECT tool_name, reason_code, rule_id, decision FROM policy_denied_audit WHERE id = ?1",
@@ -58,7 +58,10 @@ fn blocking_policy_denial_audit_never_creates_or_recreates_storage() {
     std::fs::rename(&path, &relocated).unwrap();
     let retained = std::fs::read(&relocated).unwrap();
     assert!(record_policy_denial_audit_blocking(&path, &record).is_err());
-    assert!(!path.exists(), "denial audit must not recreate a moved database");
+    assert!(
+        !path.exists(),
+        "denial audit must not recreate a moved database"
+    );
     assert_eq!(std::fs::read(&relocated).unwrap(), retained);
 
     // A replacement that is not a database is also left untouched.
