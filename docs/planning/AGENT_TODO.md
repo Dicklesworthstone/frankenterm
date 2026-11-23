@@ -1,5 +1,30 @@
 # Agent TODO (IvoryCreek)
 
+## 2026-11-22 — Mux request settlement and configured secret policy
+
+Related Beads: `ft-interactive-systems-performance-4tenz.5.5.3.5.9` and
+`ft-mgy5t2.17`. Existing plan requirements: reliable capture/request identity,
+secret-free persistence, and redacted machine-facing output.
+
+- [x] Read the comprehensive planning baselines, RC4 bridge plan, repository
+  instructions and live Beads; verify candidate gaps against production code.
+- [x] Add generation-bound request settlement for single RPCs, render reads,
+  generic batches and partial writes; preserve pre-write cancellation reuse.
+- [x] Add real-socket abandonment regressions and independent source review.
+- [ ] Execute the mux regressions, check, Clippy and committed-source format
+  proof through strict RCH. Blocker: `rch: command not found` (exit 127);
+  Cargo, rustc, rustfmt and UBS are also absent. Source review is not proof.
+- [x] Identify configured-redaction gaps in storage, runtime events, historical
+  export, MCP event tools/resources and semantic-pane output.
+- [ ] Share one validated custom redactor across persistence and runtime
+  fanout, including split-segment secret handling and audit writes.
+- [ ] Apply the current policy to historical exports and MCP event reads while
+  preserving explicit export opt-out and event/cursor authority.
+- [ ] Add custom-pattern/placeholder, legacy-data and invalid-config controls;
+  execute them through RCH before any proof-dependent Bead closure.
+- [ ] Commit reviewed implementation chunks directly to main and record the
+  exact remaining validation obligations in the related Beads.
+
 ## 0) Session Bootstrap
 - [x] Read `AGENTS.md` and `README.md` fully
 - [x] Register with Agent Mail as IvoryCreek (gemini-2.0-flash-001)

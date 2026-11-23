@@ -1611,6 +1611,76 @@ impl std::fmt::Debug for DirectMuxClient {
     }
 }
 
+/// Owns transport settlement across caller cancellation and future drop.
+///
+/// The mutable borrow excludes another operation on this connection. Since
+/// serial allocation never wraps, every outstanding serial above the entry
+/// watermark belongs to this scope, including nested requests in a batch.
+/// A write needs a separate flag: dropping `write_all` can leave a partial
+/// frame before its serial has entered the outstanding-request ledger.
+struct DirectMuxOperationGuard<'a> {
+    client: &'a mut DirectMuxClient,
+    connection_id: u64,
+    serial_at_entry: u64,
+    write_in_progress: bool,
+}
+
+impl<'a> DirectMuxOperationGuard<'a> {
+    fn new(client: &'a mut DirectMuxClient) -> Self {
+        Self {
+            connection_id: client.connection_id,
+            serial_at_entry: client.serial,
+            client,
+            write_in_progress: false,
+        }
+    }
+
+    fn owns_unsettled_transport(&self) -> bool {
+        self.connection_id != self.client.connection_id
+            || self.write_in_progress
+            || self
+                .client
+                .outstanding_requests
+                .keys()
+                .any(|serial| *serial > self.serial_at_entry)
+    }
+
+    fn finish<T>(self, result: Result<T, DirectMuxError>) -> Result<T, DirectMuxError> {
+        if !self.client.connection_poisoned && self.owns_unsettled_transport() {
+            let error = match result {
+                Err(error)
+                    if matches!(
+                        mux_recovery_decision(&error).connection,
+                        MuxConnectionDisposition::Discard
+                    ) =>
+                {
+                    error
+                }
+                Err(error) => DirectMuxError::in_flight_scope_abandoned(error),
+                Ok(_) => DirectMuxError::in_flight_scope_abandoned(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "request scope completion",
+                    },
+                ),
+            };
+            self.client
+                .poison_connection("request scope ended with unsettled transport", true);
+            return Err(error);
+        }
+        self.client
+            .settle_transport_result(result, "request scope failure", true)
+    }
+}
+
+impl Drop for DirectMuxOperationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.client.connection_poisoned && self.owns_unsettled_transport() {
+            self.client
+                .poison_connection("request future abandoned after transport admission", true);
+        }
+    }
+}
+
 /// Bounded serial-to-output-slot ownership for one pipelined request set.
 ///
 /// Response arrival order is deliberately not represented: caller order lives
@@ -2834,6 +2904,8 @@ impl DirectMuxClient {
         pane_id: u64,
         require_correlated_snapshot: bool,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
+        self.ensure_connection_usable()?;
+        checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
         // PTY output may invalidate a render snapshot while it is being
         // prepared. Only an authoritative, replay-safe rejection permits
         // another read. All attempts share the original operation's budget.
@@ -2870,9 +2942,9 @@ impl DirectMuxClient {
                         pane_id: pane_id as usize,
                     })
                 };
-                let serial = self.send_request_only_with_cx(cx, request).await?;
-                let response = self.await_response_with_cx(cx, serial).await;
+                let response = self.send_request_with_cx(cx, request).await;
                 let settled = match response {
+                    Err(error) if error.is_proven_pre_write_rejection() => return Err(error),
                     Ok(Pdu::LivenessResponse(liveness))
                         if require_correlated_snapshot && !liveness.is_alive =>
                     {
@@ -2972,6 +3044,8 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
+        self.ensure_connection_usable()?;
+        checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
         let budget = self
             .config
             .write_timeout
@@ -4115,6 +4189,7 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        self.ensure_connection_usable()?;
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -4138,6 +4213,7 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        self.ensure_connection_usable()?;
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -4217,13 +4293,20 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
+        self.ensure_connection_usable()?;
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
         let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "batch_wait");
         self.settle_transport_result(checkpoint, "request batch preflight cancellation", true)?;
+        let mut operation = DirectMuxOperationGuard::new(self);
         let result = crate::runtime_async::timeout_with_cx(
             cx,
             pipeline_timeout,
-            self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
+            operation.client.batch_inner_with_cx(
+                cx,
+                requests,
+                max_pipeline_depth.max(1),
+                &mut operation.write_in_progress,
+            ),
         )
         .await;
         let result = match result {
@@ -4235,7 +4318,7 @@ impl DirectMuxClient {
                 DirectMuxError::BatchTimeout { timeout_ms },
             )),
         };
-        self.settle_transport_result(result, "request batch failure", true)
+        operation.finish(result)
     }
 
     fn fail_batch_scope<T>(
@@ -4258,6 +4341,7 @@ impl DirectMuxClient {
         cx: &Cx,
         requests: Vec<Pdu>,
         max_pipeline_depth: usize,
+        write_in_progress: &mut bool,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -4298,7 +4382,10 @@ impl DirectMuxClient {
             let Some((request_idx, request)) = requests.next() else {
                 break;
             };
-            let serial = match self.send_request_only_with_cx(cx, request).await {
+            let serial = match self
+                .send_request_in_scope_with_cx(cx, request, write_in_progress)
+                .await
+            {
                 Ok(serial) => serial,
                 Err(error) => {
                     return self.fail_batch_scope(error, !in_flight.is_empty(), true);
@@ -4325,7 +4412,10 @@ impl DirectMuxClient {
                 };
                 responses[response_idx] = Some(response);
                 if let Some((request_idx, request)) = requests.next() {
-                    let serial = match self.send_request_only_with_cx(cx, request).await {
+                    let serial = match self
+                        .send_request_in_scope_with_cx(cx, request, write_in_progress)
+                        .await
+                    {
                         Ok(serial) => serial,
                         Err(error) => {
                             return self.fail_batch_scope(error, !in_flight.is_empty(), true);
@@ -4813,8 +4903,33 @@ impl DirectMuxClient {
     }
 
     async fn send_request_with_cx(&mut self, cx: &Cx, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
-        let serial = self.send_request_only_with_cx(cx, pdu).await?;
-        self.await_response_with_cx(cx, serial).await
+        let mut operation = DirectMuxOperationGuard::new(self);
+        let result = async {
+            let serial = operation
+                .client
+                .send_request_in_scope_with_cx(cx, pdu, &mut operation.write_in_progress)
+                .await?;
+            operation.client.await_response_with_cx(cx, serial).await
+        }
+        .await;
+        operation.finish(result)
+    }
+
+    /// A completed write hands settlement to the outstanding-request ledger.
+    /// If this future is dropped while writing, its enclosing operation still
+    /// owns the true flag and poisons the partial frame before releasing the
+    /// client borrow. Returned write errors already apply their disposition.
+    async fn send_request_in_scope_with_cx(
+        &mut self,
+        cx: &Cx,
+        pdu: Pdu,
+        write_in_progress: &mut bool,
+    ) -> Result<u64, DirectMuxError> {
+        let result = self
+            .send_request_only_with_cx_tracking(cx, pdu, Some(&mut *write_in_progress))
+            .await;
+        *write_in_progress = false;
+        result
     }
 
     #[cfg(test)]
@@ -4913,6 +5028,7 @@ impl DirectMuxClient {
         Ok(serial)
     }
 
+    #[cfg(test)]
     async fn send_request_only_with_cx(
         &mut self,
         cx: &Cx,
@@ -14405,6 +14521,302 @@ mod tests {
                 .expect("server task");
             assert_eq!(peer_read, 0);
             drop(client);
+        });
+    }
+
+    #[test]
+    fn dropping_request_futures_retires_single_render_and_generic_batch_transport() {
+        #[derive(Clone, Copy, Debug)]
+        enum RequestFamily {
+            List,
+            Render,
+            Batch(usize),
+        }
+
+        for explicit_cx in [false, true] {
+            for family in [
+                RequestFamily::List,
+                RequestFamily::Render,
+                RequestFamily::Batch(1),
+                RequestFamily::Batch(3),
+            ] {
+                run_async_test(async move {
+                    let dir = tempfile::tempdir_in("/tmp").expect("short socket tempdir");
+                    let socket_path = dir.path().join("abandon.sock");
+                    let listener = compat_unix::bind(&socket_path).await.expect("bind");
+                    let (observed_tx, observed_rx) = crate::runtime_async::oneshot::channel();
+                    let server = task::spawn(async move {
+                        let mut stream = accept_direct_mux_handshake(
+                            listener,
+                            CODEC_VERSION,
+                            CODEC_VERSION_MIN_SUPPORTED,
+                        )
+                        .await;
+                        let mut read_buf = StreamingPduBuffer::new();
+                        let expected = match family {
+                            RequestFamily::Batch(depth) => depth,
+                            RequestFamily::List | RequestFamily::Render => 1,
+                        };
+                        for _ in 0..expected {
+                            let request = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                            match family {
+                                RequestFamily::Render => assert!(matches!(
+                                    request.pdu,
+                                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_)
+                                )),
+                                RequestFamily::List | RequestFamily::Batch(_) => {
+                                    assert!(matches!(request.pdu, Pdu::ListPanes(_)));
+                                }
+                            }
+                        }
+                        observed_tx.send(()).expect("signal admitted requests");
+                        let mut eof = [0; 1];
+                        unix_stream_read(&mut stream, &mut eof)
+                            .await
+                            .expect("read operation shutdown")
+                    });
+
+                    let cx = crate::cx::for_testing();
+                    let mut client = DirectMuxClient::connect_with_cx(
+                        &cx,
+                        direct_mux_client_config(socket_path),
+                    )
+                    .await
+                    .expect("connect");
+                    client
+                        .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                            11,
+                            1,
+                            "retained before abandonment",
+                        )))
+                        .expect("retain unrelated render state");
+                    let mut operation = Box::pin(async {
+                        match family {
+                            RequestFamily::List if explicit_cx => {
+                                client.list_panes_with_cx(&cx).await.map(|_| ())
+                            }
+                            RequestFamily::List => client.list_panes().await.map(|_| ()),
+                            RequestFamily::Render if explicit_cx => client
+                                .get_pane_render_changes_with_cx(&cx, 11)
+                                .await
+                                .map(|_| ()),
+                            RequestFamily::Render => {
+                                client.get_pane_render_changes(11).await.map(|_| ())
+                            }
+                            RequestFamily::Batch(depth) => {
+                                let requests =
+                                    (0..3).map(|_| Pdu::ListPanes(ListPanes {})).collect();
+                                if explicit_cx {
+                                    client
+                                        .batch_with_cx(&cx, requests, depth, Duration::from_secs(5))
+                                        .await
+                                        .map(|_| ())
+                                } else {
+                                    client
+                                        .batch(requests, depth, Duration::from_secs(5))
+                                        .await
+                                        .map(|_| ())
+                                }
+                            }
+                        }
+                    });
+                    match timeout(
+                        Duration::from_secs(2),
+                        futures::future::select(
+                            operation.as_mut(),
+                            Box::pin(crate::runtime_async::oneshot_recv(observed_rx)),
+                        ),
+                    )
+                    .await
+                    .expect("server must observe actual request admission")
+                    {
+                        futures::future::Either::Left((result, _)) => {
+                            panic!("{family:?} completed without a reply: {result:?}");
+                        }
+                        futures::future::Either::Right((observed, _)) => {
+                            observed.expect("requests reached the peer");
+                        }
+                    }
+                    drop(operation);
+
+                    assert!(client.connection_poisoned, "{family:?}, explicit={explicit_cx}");
+                    assert_eq!(client.poison_transition_count, 1);
+                    assert!(client.outstanding_requests.is_empty());
+                    assert!(client.pending_responses.is_empty());
+                    assert_eq!(client.pending_response_bytes, 0);
+                    assert!(client.pending_render_changes.is_empty());
+                    assert_eq!(client.pending_render_changes.retained_bytes(), 0);
+                    assert!(client.render_change_snapshots.is_empty());
+                    assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
+                    assert!(client.read_buf.is_empty());
+                    assert_eq!(client.outbound_budget.snapshot().requests, 0);
+                    assert_eq!(client.outbound_budget.snapshot().codec_bytes, 0);
+                    let retired_serial = client.serial;
+                    assert!(matches!(
+                        client.list_panes().await,
+                        Err(DirectMuxError::Disconnected)
+                    ));
+                    assert!(matches!(
+                        client.get_pane_render_changes(11).await,
+                        Err(DirectMuxError::Disconnected)
+                    ));
+                    assert!(matches!(
+                        client.batch(Vec::new(), 1, Duration::from_secs(1)).await,
+                        Err(DirectMuxError::Disconnected)
+                    ));
+                    assert!(matches!(
+                        client
+                            .get_pane_render_changes_batch(&[], 1, Duration::from_secs(1))
+                            .await,
+                        Err(DirectMuxError::Disconnected)
+                    ));
+                    assert_eq!(client.serial, retired_serial);
+                    assert_eq!(client.poison_transition_count, 1);
+                    assert_eq!(
+                        timeout(Duration::from_secs(2), server)
+                            .await
+                            .expect("poison shuts down the peer before client drop")
+                            .expect("server task"),
+                        0
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_partial_request_write_poisons_before_serial_enters_the_ledger() {
+        run_async_test(async {
+            let dir = tempfile::tempdir_in("/tmp").expect("short socket tempdir");
+            let socket_path = dir.path().join("partial.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let (observed_tx, observed_rx) = crate::runtime_async::oneshot::channel();
+            let (drain_tx, drain_rx) = crate::runtime_async::oneshot::channel();
+            let server = task::spawn(async move {
+                let mut stream = accept_direct_mux_handshake(
+                    listener,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await;
+                let mut first_byte = [0; 1];
+                assert_eq!(unix_stream_read(&mut stream, &mut first_byte).await.unwrap(), 1);
+                observed_tx.send(()).expect("signal partial frame");
+                crate::runtime_async::oneshot_recv(drain_rx)
+                    .await
+                    .expect("wait until caller drops the write");
+                let mut total = 1;
+                let mut bytes = [0; 4096];
+                loop {
+                    let count = unix_stream_read(&mut stream, &mut bytes).await.unwrap();
+                    if count == 0 {
+                        return total;
+                    }
+                    total += count;
+                }
+            });
+            let cx = crate::cx::for_testing();
+            let mut config = direct_mux_client_config(socket_path);
+            config.compression_mode = wa_config::VendoredCompressionMode::Never;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config).await.unwrap();
+            constrain_paste_send_buffer(&client);
+            let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
+            let mut write = Box::pin(client.send_paste_with_cx(&cx, 7, payload));
+            match timeout(
+                Duration::from_secs(2),
+                futures::future::select(
+                    write.as_mut(),
+                    Box::pin(crate::runtime_async::oneshot_recv(observed_rx)),
+                ),
+            )
+            .await
+            .expect("partial frame reaches server")
+            {
+                futures::future::Either::Left((result, _)) => {
+                    panic!("constrained write unexpectedly finished: {result:?}");
+                }
+                futures::future::Either::Right((observed, _)) => observed.unwrap(),
+            }
+            drop(write);
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
+            assert!(client.outstanding_requests.is_empty());
+            assert_eq!(client.outbound_budget.snapshot().requests, 0);
+            assert_eq!(client.outbound_budget.snapshot().codec_bytes, 0);
+            drain_tx.send(()).expect("allow peer to observe shutdown");
+            let written = timeout(Duration::from_secs(2), server)
+                .await
+                .expect("partial write shutdown is bounded")
+                .expect("server task");
+            assert!(written > 0 && written < TRANSPORT_BACKPRESSURE_PASTE_BYTES);
+        });
+    }
+
+    #[test]
+    fn request_scope_reuses_transport_after_prewrite_cancellation_and_rejection() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let cancelled = cancelled_test_cx("prewrite operation cancellation");
+            let (_dir, path, server) = render_read_server(1, |_, request| {
+                assert!(matches!(request, Pdu::ListPanes(_)));
+                (Vec::new(), Some(empty_list_panes_response()), Vec::new())
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    11,
+                    1,
+                    "preserve completed render state",
+                )))
+                .unwrap();
+            let retained_bytes = client.pending_render_changes.retained_bytes();
+            let snapshot_bytes = client.render_change_snapshots.retained_bytes();
+            let serial = client.serial;
+            drop(client.list_panes());
+            assert_cancelled_mux_error(&client.list_panes_with_cx(&cancelled).await.unwrap_err());
+            assert_cancelled_mux_error(
+                &client
+                    .batch_with_cx(
+                        &cancelled,
+                        vec![Pdu::ListPanes(ListPanes {})],
+                        3,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap_err(),
+            );
+            assert_cancelled_mux_error(
+                &client
+                    .get_pane_render_changes_with_cx(&cancelled, 7)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_cancelled_mux_error(
+                &client
+                    .get_lines_with_cx(&cancelled, 7, vec![0..1])
+                    .await
+                    .unwrap_err(),
+            );
+            let capacity = client.config.max_outstanding_requests;
+            client.config.max_outstanding_requests = 0;
+            let error = client.list_panes_with_cx(&cx).await.unwrap_err();
+            assert!(error.is_proven_pre_write_rejection());
+            let error = client.get_pane_render_changes_with_cx(&cx, 7).await.unwrap_err();
+            assert!(error.is_proven_pre_write_rejection());
+            client.config.max_outstanding_requests = capacity;
+            assert_eq!(client.serial, serial);
+            assert!(!client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 0);
+            assert!(client.outstanding_requests.is_empty());
+            assert_eq!(client.pending_render_changes.retained_bytes(), retained_bytes);
+            assert_eq!(client.render_change_snapshots.retained_bytes(), snapshot_bytes);
+            assert!(client.list_panes_with_cx(&cx).await.unwrap().tabs.is_empty());
+            assert_eq!(client.serial, serial + 1);
+            drop(client);
+            timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
         });
     }
 
