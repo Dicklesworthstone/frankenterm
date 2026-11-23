@@ -50656,6 +50656,14 @@ fn main() {
             }
         }
     });
+    // Tear the runtime down here, while its worker threads still run. block_on
+    // leaves a handle in this thread's TLS, so otherwise the last reference
+    // drops in the TLS destructors at process exit. On Windows, ExitProcess
+    // has already killed every other thread by then, so the runtime's worker
+    // join panics ("threads should not terminate unexpectedly") and the
+    // process aborts with 0xC0000409 after a successful command.
+    drop(rt);
+    frankenterm_core::runtime_async::clear_runtime_handle();
 }
 
 fn dispatch_mobile_attach_before_runtime() -> Option<anyhow::Result<()>> {
