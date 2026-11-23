@@ -372,7 +372,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
-| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). Optional operator-token sign-in protects HTTP reads and live streams. Authenticated Tailscale access, terminal attach and DSR-packaged assets remain under `ft-browser-frankenterm-7z4il` |
+| Browser fleet viewer | **Preview: read-only, local or HTTPS proxy** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). Operator-token sign-in protects HTTP reads and live streams; `FT_WEB_HTTPS_ORIGIN` enables exact-origin authentication behind a trusted HTTPS proxy. Live tailnet qualification, terminal attach and DSR-packaged assets remain under `ft-browser-frankenterm-7z4il` |
 | Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
 | MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
@@ -1131,18 +1131,26 @@ ft watch --web --web-ui-dir /tmp/ft-ui/site --web-auth-token-env FT_BROWSER_TOKE
 
 The viewer checks `/auth/status` before starting any data requests. Sign-in exchanges the operator token for an opaque `HttpOnly`, `SameSite=Strict` cookie; the token is never placed in a URL or browser storage. Sessions expire after one hour, with at most 16 concurrent sessions. Sign-out revokes that session, stops its stream producers, and clears the viewer, pane output and history results. Restarting the server revokes all sessions. Each session has an independent nonsecret epoch that binds reads and stream reconnects to the original viewer; a changed session starts with a fresh model and cursor. Health, session status and UI assets stay public; data routes and OpenAPI require a valid session.
 
-Authentication is opt-in. With either token flag, Host and Origin checks require the actual loopback listener address and port, and a session stays bound to its original origin. This mode does not accept reverse-proxy or Tailscale origins, and does not qualify remote authenticated access. The pinned HTTP substrate still collapses duplicate raw header lines and does not provide a cancellation deadline for a blocked socket write; those transport requirements remain part of `ft-xxfwy.55.3`.
+Authentication is opt-in. Without `FT_WEB_HTTPS_ORIGIN`, either token flag limits Host and Origin checks to the actual loopback listener address and port. Sessions stay bound to the exact origin used at sign-in.
 
-The server always refuses to bind any non-loopback address. Without a token flag, the existing unauthenticated local mode remains available. To forward that mode from a laptop, tablet or phone, put Tailscale Serve in front of it. Tailscale terminates HTTPS with the machine's tailnet certificate and accepts only devices on your tailnet:
+For authenticated access from your other devices through [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve), or another trusted HTTPS reverse proxy, set `FT_WEB_HTTPS_ORIGIN` to the browser's exact canonical HTTPS origin. Use a lower-case hostname and omit a trailing slash, path, query, fragment, credentials and the default `:443` port. A non-default HTTPS port is allowed. The setting requires the existing token flag; missing authentication or an invalid origin stops startup before the listener binds.
 
 ```bash
-ft web --ui-dir /tmp/ft-ui/site &
-tailscale serve --bg 9999           # then open https://<this-machine>.<tailnet>.ts.net/ui/ on any tailnet device
-tailscale serve status              # show what is shared
+# FT_BROWSER_TOKEN contains your randomly generated 32–256 character access token.
+# Replace this example origin with your machine's actual Tailscale HTTPS origin.
+export FT_WEB_HTTPS_ORIGIN='https://this-machine.your-tailnet.ts.net'
+ft web --ui-dir /tmp/ft-ui/site --auth-token-env FT_BROWSER_TOKEN &
+tailscale serve --bg http://127.0.0.1:9999
+tailscale serve status
+# Open https://this-machine.your-tailnet.ts.net/ui/ and sign in.
 tailscale serve --https=443 off     # stop sharing
 ```
 
-In this unauthenticated forwarding mode, everything `ft web` serves is readable from every device allowed by the tailnet rules. That includes captured pane output and history search. The streams redact the secrets they recognize, but the application does not authenticate the reader. Use tailnet access rules to restrict access. Never use `tailscale funnel`: it publishes to the whole internet. The milestones still open in `ft-browser-frankenterm-7z4il` are authenticated tailnet access, terminal attach, and DSR packaging.
+The same setting applies to `ft watch --web --web-auth-token-env FT_BROWSER_TOKEN`. In HTTPS mode the startup announcement names the browser origin and the internal HTTP proxy upstream. The listener remains loopback-only: the proxy must terminate HTTPS and preserve the original `Host` and `Origin` headers. Forwarded headers and Tailscale identity headers never establish application authority. Sign-in and sign-out cookies include `Secure`; sign-out and expiry retain the same live-stream revocation and session-epoch fencing as local mode. Use the configured HTTPS URL in this mode, because local HTTP aliases are refused.
+
+This is one operator's read-only session authority over the existing data routes, not per-user or per-pane sharing. Tailnet access rules control who can reach the sign-in page; the operator token is still required to read captured output, history and live streams. Omitting both token authentication and `FT_WEB_HTTPS_ORIGIN` preserves the unauthenticated local mode. Do not forward that mode when application sign-in is required, and do not use `tailscale funnel` to publish the viewer to the internet.
+
+The backend socket tests exercise authenticated proxy requests and stream revocation; they do not establish live TLS/Tailscale or device qualification. The pinned HTTP substrate still collapses duplicate raw header lines and does not provide a cancellation deadline for a blocked socket write; those transport requirements remain part of `ft-xxfwy.55.3`. Live tailnet qualification, terminal attach, controller leases and DSR packaging remain open in the browser campaign.
 
 `ft web` runs no capture pipeline of its own. Its storage tail follows newly persisted `events` rows written by the watcher and republishes wakeups on its in-process bus. Subscriptions always obtain detection content and ordering from storage, so a delayed or reordered wakeup cannot skip an earlier row. The tail starts after existing history; explicit subscription cursors control replay. Embedders that publish to the same bus in-process can disable the extra wakeup tail with `WebServerConfig::with_storage_event_tail(false)`.
 

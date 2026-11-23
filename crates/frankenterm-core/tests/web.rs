@@ -391,8 +391,26 @@ mod web_tests {
         cookie: Option<&str>,
         body: Option<&str>,
     ) -> String {
+        session_request_for_origin(
+            &addr.to_string(),
+            &format!("http://{addr}"),
+            method,
+            path,
+            cookie,
+            body,
+        )
+    }
+
+    fn session_request_for_origin(
+        host: &str,
+        origin: &str,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> String {
         let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: close\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: close\r\n"
         );
         if let Some(cookie) = cookie {
             request.push_str(&format!("Cookie: {cookie}\r\n"));
@@ -583,6 +601,246 @@ mod web_tests {
             scenario
                 .expect("session scenario deadline")
                 .expect("session assertions");
+        });
+    }
+
+    /// Exercise the proxy-to-loopback HTTP hop, with the exact Host and Origin
+    /// an HTTPS proxy must preserve. TLS termination itself belongs to the
+    /// proxy and is deliberately not claimed by this socket fixture.
+    #[test]
+    fn https_proxy_sessions_protect_data_and_revoke_both_live_streams() {
+        use anyhow::{Context, ensure};
+
+        const HOST: &str = "terminal.example:8443";
+        const ORIGIN: &str = "https://terminal.example:8443";
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(16));
+            let auth = WebSessionAuth::new(VIEWER_TEST_CREDENTIAL)
+                .unwrap()
+                .with_https_origin(ORIGIN)
+                .unwrap();
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_runtime_limits(WebRuntimeLimits {
+                        stream_keepalive_secs: 60,
+                        ..frankenterm_core::web::resolve_runtime_limits(None)
+                    })
+                    .with_session_auth(auth),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            assert!(addr.ip().is_loopback());
+            assert_eq!(server.https_origin(), Some(ORIGIN));
+
+            let scenario = Box::pin(timeout(Duration::from_secs(20), async {
+                for path in ["/panes", "/openapi.json", "/stream/events", "/stream/deltas"] {
+                    let request = session_request_for_origin(HOST, ORIGIN, "GET", path, None, None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 401, "anonymous route {path}");
+                    ensure!(!response.contains("test-pane"));
+                }
+
+                let body = serde_json::json!({ "token": VIEWER_TEST_CREDENTIAL }).to_string();
+                let login = session_request_for_origin(
+                    HOST,
+                    ORIGIN,
+                    "POST",
+                    "/auth/session",
+                    None,
+                    Some(&body),
+                );
+                let response = fetch_raw(addr, login.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "HTTPS-origin login succeeds");
+                let header = header_value(&response, "set-cookie").context("session cookie")?;
+                for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
+                    ensure!(header.contains(attribute), "cookie attribute {attribute}");
+                }
+                ensure!(!header.to_ascii_lowercase().contains("domain="));
+                ensure!(!response.contains(VIEWER_TEST_CREDENTIAL));
+                let cookie = header.split(';').next().context("cookie value")?.to_owned();
+
+                for path in ["/panes", "/openapi.json"] {
+                    let request = session_request_for_origin(
+                        HOST,
+                        ORIGIN,
+                        "GET",
+                        path,
+                        Some(&cookie),
+                        None,
+                    );
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "authenticated route {path}");
+                    if path == "/panes" {
+                        ensure!(
+                            response.contains("test-pane"),
+                            "real persisted pane is visible"
+                        );
+                    }
+                }
+
+                // The token cannot be replayed on the old local origin or on
+                // a second HTTPS host, even with otherwise matching headers.
+                let local = session_request(addr, "GET", "/panes", Some(&cookie), None);
+                let response = fetch_raw(addr, local.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 403,
+                    "local alias is not a proxy authority"
+                );
+                let alias = session_request_for_origin(
+                    "other.example:8443",
+                    "https://other.example:8443",
+                    "GET",
+                    "/panes",
+                    Some(&cookie),
+                    None,
+                );
+                let response = fetch_raw(addr, alias.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 403,
+                    "unconfigured HTTPS authority refused"
+                );
+
+                let status = session_request_for_origin(
+                    HOST,
+                    ORIGIN,
+                    "GET",
+                    "/auth/status",
+                    Some(&cookie),
+                    None,
+                );
+                let response = fetch_raw(addr, status.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200);
+                let status: serde_json::Value = serde_json::from_str(extract_body(&response))?;
+                ensure!(status["data"]["authenticated"] == true);
+                let epoch = status["data"]["session_epoch"]
+                    .as_str()
+                    .context("authenticated viewer epoch")?;
+
+                let mut streams = Vec::new();
+                for path in [
+                    "/stream/events?channel=all&pane_id=7",
+                    "/stream/deltas?pane_id=7",
+                ] {
+                    let mut stream = TcpStream::connect(addr).await?;
+                    let path = format!("{path}&session_epoch={epoch}");
+                    let request = session_request_for_origin(
+                        HOST,
+                        ORIGIN,
+                        "GET",
+                        &path,
+                        Some(&cookie),
+                        None,
+                    );
+                    stream.write_all(request.as_bytes()).await?;
+                    let mut response = Vec::new();
+                    let ready =
+                        read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                    ensure!(
+                        extract_status(&ready) == 200,
+                        "authorized HTTPS-origin SSE starts"
+                    );
+                    streams.push(stream);
+                }
+                ensure!(
+                    event_bus.subscriber_count() >= 2,
+                    "both SSE producers are active"
+                );
+
+                let logout = session_request_for_origin(
+                    HOST,
+                    ORIGIN,
+                    "DELETE",
+                    "/auth/session",
+                    Some(&cookie),
+                    None,
+                );
+                let response = fetch_raw(addr, logout.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "HTTPS-origin logout succeeds");
+                let header = header_value(&response, "set-cookie").context("cleared cookie")?;
+                ensure!(header.contains("Secure") && header.contains("Max-Age=0"));
+                for mut stream in streams {
+                    let mut tail = Vec::new();
+                    timeout(Duration::from_secs(2), stream.read_to_end(&mut tail))
+                        .await
+                        .map_err(anyhow::Error::msg)??;
+                    ensure!(!String::from_utf8_lossy(&tail).contains("data: "));
+                }
+                ensure!(
+                    event_bus.subscriber_count() == 0,
+                    "logout settles both producers"
+                );
+                for path in ["/panes", "/stream/events", "/stream/deltas"] {
+                    let request = session_request_for_origin(
+                        HOST,
+                        ORIGIN,
+                        "GET",
+                        path,
+                        Some(&cookie),
+                        None,
+                    );
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(
+                        extract_status(&response) == 401,
+                        "revoked session cannot read {path}"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            server.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+            scenario
+                .expect("HTTPS proxy session deadline")
+                .expect("HTTPS proxy session assertions");
+        });
+    }
+
+    #[test]
+    fn https_proxy_boundary_refuses_spoofed_authority_before_reading_body() {
+        run_async_test(async {
+            let auth = WebSessionAuth::new(VIEWER_TEST_CREDENTIAL)
+                .unwrap()
+                .with_https_origin("https://terminal.example")
+                .unwrap();
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_session_auth(auth),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let invalid_heads = [
+                format!("Host: {addr}\r\nOrigin: https://terminal.example\r\nX-Forwarded-Host: terminal.example\r\nX-Forwarded-Proto: https\r\nForwarded: host=terminal.example;proto=https\r\n"),
+                "Host: terminal.example\r\nOrigin: http://terminal.example\r\n".to_string(),
+                "Host: terminal.example\r\nOrigin: https://elsewhere.invalid\r\n".to_string(),
+                "Host: terminal.example\r\nOrigin: null\r\n".to_string(),
+                "Host: terminal.example\r\n".to_string(),
+                "Host: terminal.example\r\nOrigin: https://terminal.example\r\nSec-Fetch-Site: same-site\r\n".to_string(),
+                "Host: terminal.example:443\r\nOrigin: https://terminal.example\r\n".to_string(),
+            ];
+            let mut responses = Vec::new();
+            for head in invalid_heads {
+                let request = format!(
+                    "POST /auth/session HTTP/1.1\r\n{head}Content-Type: application/json\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"
+                );
+                responses.push(fetch_raw(addr, request.as_bytes()).await);
+            }
+            server.shutdown().await.unwrap();
+            for response in responses {
+                let response = response.expect("rejected proxy heads must not wait for the body");
+                assert_eq!(extract_status(&response), 403);
+                assert!(!response.contains("100 Continue"));
+                assert!(header_value(&response, "set-cookie").is_none());
+                assert_eq!(header_value(&response, "connection"), Some("close"));
+            }
         });
     }
 

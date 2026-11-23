@@ -1,7 +1,9 @@
-//! Opt-in operator sessions for the loopback web viewer.
+//! Opt-in operator sessions for the web viewer's loopback listener.
 //!
-//! This is one local operator's read authority, not a remote sharing or pane
-//! grant system. FastAPI's session middleware uses different request/handler
+//! An explicit HTTPS origin allows this same operator authority through a
+//! TLS-terminating proxy that preserves Host. Forwarded headers never grant
+//! access. This is not a multi-user sharing or pane grant system. FastAPI's
+//! session middleware uses different request/handler
 //! types; its generic store also cannot notify an already-open SSE body of
 //! revocation. Keep this small store bounded and use the existing runtime's
 //! lifecycle/timer primitives rather than introducing another web runtime.
@@ -44,6 +46,10 @@ pub enum WebSessionAuthError {
     InvalidLifetime,
     #[error("web session capacity must be between 1 and 256")]
     InvalidCapacity,
+    #[error(
+        "web HTTPS origin must be one canonical HTTPS origin without credentials, a path, query or fragment"
+    )]
+    InvalidHttpsOrigin,
     #[error("secure randomness for web sessions is unavailable")]
     EntropyUnavailable,
 }
@@ -61,6 +67,7 @@ pub struct WebSessionAuth {
     sessions: Arc<Mutex<HashMap<[u8; 32], SessionGrant>>>,
     session_ttl: Duration,
     max_sessions: usize,
+    https_origin: Option<String>,
 }
 
 impl std::fmt::Debug for WebSessionAuth {
@@ -68,6 +75,7 @@ impl std::fmt::Debug for WebSessionAuth {
         f.debug_struct("WebSessionAuth")
             .field("session_ttl", &self.session_ttl)
             .field("max_sessions", &self.max_sessions)
+            .field("https_origin", &self.https_origin)
             .finish_non_exhaustive()
     }
 }
@@ -94,7 +102,43 @@ impl WebSessionAuth {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_ttl: Duration::from_secs(3600),
             max_sessions: 16,
+            https_origin: None,
         })
+    }
+
+    /// Admit this operator's viewer through one explicitly configured HTTPS
+    /// origin, for example `https://workstation.example.ts.net` behind
+    /// Tailscale Serve. The proxy must terminate TLS and preserve Host while
+    /// forwarding to the loopback listener. No forwarded or identity header
+    /// establishes authority, and the loopback browser origin is not also
+    /// admitted in this mode. Issued and cleared cookies require HTTPS.
+    pub fn with_https_origin(mut self, origin: &str) -> Result<Self, WebSessionAuthError> {
+        if origin.len() > 256
+            || !origin.is_ascii()
+            || origin
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(WebSessionAuthError::InvalidHttpsOrigin);
+        }
+        let parsed =
+            url::Url::parse(origin).map_err(|_| WebSessionAuthError::InvalidHttpsOrigin)?;
+        if parsed.scheme() != "https"
+            || parsed.host().is_none()
+            || parsed
+                .host_str()
+                .is_some_and(|host| host.ends_with('.') || host.contains('*'))
+            || parsed.port_or_known_default() == Some(0)
+            || parsed.origin().ascii_serialization() != origin
+        {
+            return Err(WebSessionAuthError::InvalidHttpsOrigin);
+        }
+        self.https_origin = Some(origin.to_owned());
+        Ok(self)
+    }
+
+    pub(super) fn https_origin(&self) -> Option<&str> {
+        self.https_origin.as_deref()
     }
 
     /// Override the lifetime of newly issued sessions. Existing grants retain
@@ -486,6 +530,7 @@ impl SessionAuthMiddleware {
             req,
             self.listener_port.load(Ordering::Acquire),
             self.public_read(req),
+            auth.https_origin.as_deref(),
         )?;
         if Self::login(req) {
             check_login_body_size(req)?;
@@ -580,7 +625,7 @@ fn boundary_error() -> Response {
     json_err(
         StatusCode::FORBIDDEN,
         "web_origin_refused",
-        "Use the local viewer's own loopback origin",
+        "Use the viewer's configured origin",
     )
 }
 
@@ -610,17 +655,23 @@ fn check_session_epoch(req: &Request, grant: &SessionGrant) -> Result<(), Respon
     Ok(())
 }
 
-fn check_browser_boundary(req: &Request, listener_port: u16) -> Result<String, Response> {
-    check_browser_boundary_for_route(req, listener_port, false)
+fn check_browser_boundary(
+    req: &Request,
+    listener_port: u16,
+    https_origin: Option<&str>,
+) -> Result<String, Response> {
+    check_browser_boundary_for_route(req, listener_port, false, https_origin)
 }
 
 fn check_browser_boundary_for_route(
     req: &Request,
     listener_port: u16,
     public_navigation: bool,
+    https_origin: Option<&str>,
 ) -> Result<String, Response> {
-    // No forwarded header establishes authority. A loopback Host prevents a
-    // browser from reaching this listener through a DNS-rebinding hostname.
+    // No forwarded header establishes authority. Host must name the exact
+    // configured HTTPS origin, or a canonical loopback origin in local mode.
+    // The listener itself remains loopback in both modes.
     let host = req
         .headers()
         .get("host")
@@ -635,23 +686,35 @@ fn check_browser_boundary_for_route(
                 })
         })
         .ok_or_else(boundary_error)?;
-    let origin = format!("http://{host}");
-    let parsed = url::Url::parse(&origin).map_err(|_| boundary_error())?;
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(name)) => name == "localhost",
-        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
-        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
-        None => false,
-    };
-    // Require canonical syntax (no shorthand integer/octal IP authorities,
-    // trailing dot, empty port, userinfo or URL parser normalization).
-    if !loopback
-        || listener_port == 0
-        || parsed.port_or_known_default() != Some(listener_port)
-        || parsed.origin().ascii_serialization() != origin
-    {
+    if listener_port == 0 {
         return Err(boundary_error());
     }
+    let origin = if let Some(configured) = https_origin {
+        // The builder validated this origin once. Never infer HTTPS or the
+        // expected hostname from proxy-supplied headers on a request.
+        if configured.strip_prefix("https://") != Some(host) {
+            return Err(boundary_error());
+        }
+        configured.to_owned()
+    } else {
+        let origin = format!("http://{host}");
+        let parsed = url::Url::parse(&origin).map_err(|_| boundary_error())?;
+        let loopback = match parsed.host() {
+            Some(url::Host::Domain(name)) => name == "localhost",
+            Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
+            Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
+            None => false,
+        };
+        // Require canonical syntax (no shorthand integer/octal IP authorities,
+        // trailing dot, empty port, userinfo or URL parser normalization).
+        if !loopback
+            || parsed.port_or_known_default() != Some(listener_port)
+            || parsed.origin().ascii_serialization() != origin
+        {
+            return Err(boundary_error());
+        }
+        origin
+    };
     if let Some(presented) = req.headers().get("origin") {
         if presented != origin.as_bytes() {
             return Err(boundary_error());
@@ -764,7 +827,11 @@ pub(super) fn handle_login(req: &mut Request) -> Response {
     };
     let origin = match req.get_extension::<SessionAuthMiddleware>() {
         Some(middleware) => {
-            match check_browser_boundary(req, middleware.listener_port.load(Ordering::Acquire)) {
+            match check_browser_boundary(
+                req,
+                middleware.listener_port.load(Ordering::Acquire),
+                auth.https_origin.as_deref(),
+            ) {
                 Ok(origin) => origin,
                 Err(response) => return response,
             }
@@ -800,9 +867,14 @@ pub(super) fn handle_login(req: &mut Request) -> Response {
         Ok((token, grant)) => status(Some(&auth), Some(&grant)).header(
             "set-cookie",
             format!(
-                "{COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+                "{COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
                 token.as_str(),
                 auth.session_ttl.as_secs(),
+                if auth.https_origin.is_some() {
+                    "; Secure"
+                } else {
+                    ""
+                },
             )
             .into_bytes(),
         ),
@@ -825,7 +897,15 @@ pub(super) fn handle_logout(req: &Request) -> Response {
     }
     status(auth, None).header(
         "set-cookie",
-        format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0").into_bytes(),
+        format!(
+            "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            if auth.is_some_and(|auth| auth.https_origin.is_some()) {
+                "; Secure"
+            } else {
+                ""
+            },
+        )
+        .into_bytes(),
     )
 }
 
@@ -837,6 +917,7 @@ mod tests {
 
     const SECRET: &str = "local-test-bootstrap-0123456789abcdef";
     const ORIGIN: &str = "http://localhost:4321";
+    const HTTPS_ORIGIN: &str = "https://workstation.example.ts.net";
 
     fn authority() -> WebSessionAuth {
         WebSessionAuth::new(SECRET).expect("synthetic credential")
@@ -862,6 +943,15 @@ mod tests {
     fn set_cookie(req: &mut Request, token: &str) {
         req.headers_mut()
             .insert("cookie", format!("{COOKIE_NAME}={token}").into_bytes());
+    }
+
+    fn https_request(method: Method, path: &str) -> Request {
+        let mut req = request(method, path);
+        req.headers_mut()
+            .insert("host", b"workstation.example.ts.net".to_vec());
+        req.headers_mut()
+            .insert("origin", HTTPS_ORIGIN.as_bytes().to_vec());
+        req
     }
 
     fn issue(auth: &WebSessionAuth) -> (Zeroizing<String>, SessionGrant) {
@@ -931,6 +1021,296 @@ mod tests {
         assert!(second.is_valid());
         assert!(auth.lookup(Some(session_digest(&token))).unwrap().is_none());
         assert_eq!(auth.sessions.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn https_origin_configuration_rejects_ambiguous_and_non_https_origins() {
+        for origin in [
+            HTTPS_ORIGIN,
+            "https://workstation.example.ts.net:8443",
+            "https://192.0.2.10",
+            "https://[2001:db8::1]:8443",
+        ] {
+            let auth = authority().with_https_origin(origin).unwrap();
+            assert_eq!(auth.https_origin.as_deref(), Some(origin));
+        }
+        for origin in [
+            "",
+            "null",
+            "http://workstation.example.ts.net",
+            "HTTPS://workstation.example.ts.net",
+            "https://WORKSTATION.example.ts.net",
+            "https://workstation.example.ts.net.",
+            "https://*.example.ts.net",
+            "https://workstation.example.ts.net/",
+            "https://workstation.example.ts.net/ui",
+            "https://workstation.example.ts.net?credential=sentinel-secret",
+            "https://workstation.example.ts.net#fragment",
+            "https://user:sentinel-secret@workstation.example.ts.net",
+            "https://workstation.example.ts.net:443",
+            "https://workstation.example.ts.net:",
+            "https://workstation.example.ts.net:0",
+            "https://workstation.example.ts.net:08443",
+            " https://workstation.example.ts.net",
+            "https://workstation.example.ts.net\n",
+            "https://workstation.example.ts.net https://other.invalid",
+            "https://wörkstation.example.ts.net",
+            "https://%77orkstation.example.ts.net",
+            "https://127.1",
+        ] {
+            let error = authority().with_https_origin(origin).unwrap_err();
+            assert!(matches!(&error, WebSessionAuthError::InvalidHttpsOrigin));
+            assert!(!error.to_string().contains("sentinel-secret"));
+        }
+        assert!(authority().with_https_origin(&"x".repeat(257)).is_err());
+        assert!(
+            authority().https_origin.is_none(),
+            "local mode is the default"
+        );
+    }
+
+    #[test]
+    fn https_origin_admission_uses_only_configured_host_and_origin() {
+        let auth = authority().with_https_origin(HTTPS_ORIGIN).unwrap();
+        let guard = middleware(auth.clone());
+        let req = https_request(Method::Get, "/auth/status");
+        assert!(guard.check_request(&req).is_ok());
+        assert_eq!(
+            middleware(authority())
+                .check_request(&req)
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "the same proxy request must be refused without explicit opt-in"
+        );
+        assert_eq!(
+            guard
+                .check_request(&request(Method::Get, "/auth/status"))
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "HTTPS mode must not also admit an HTTP loopback alias"
+        );
+        for path in [
+            "/panes",
+            "/search",
+            "/openapi.json",
+            "/stream/events",
+            "/stream/deltas",
+        ] {
+            assert_eq!(
+                guard
+                    .check_request(&https_request(Method::Get, path))
+                    .unwrap_err()
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "proxy access still requires the operator session: {path}"
+            );
+        }
+        let unbound = SessionAuthMiddleware::new(Some(auth), std::iter::empty());
+        assert_eq!(
+            unbound.check_request(&req).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+        for host in [
+            "localhost:4321",
+            "workstation.example.ts.net:443",
+            "workstation.example.ts.net:8443",
+            "workstation.example.ts.net.",
+            "WORKSTATION.example.ts.net",
+            "workstation.example.ts.net.evil.invalid",
+        ] {
+            let mut req = https_request(Method::Get, "/auth/status");
+            req.headers_mut().insert("host", host.as_bytes().to_vec());
+            req.headers_mut()
+                .insert("x-forwarded-host", b"workstation.example.ts.net".to_vec());
+            req.headers_mut()
+                .insert("x-forwarded-proto", b"https".to_vec());
+            req.headers_mut().insert(
+                "forwarded",
+                b"host=workstation.example.ts.net;proto=https".to_vec(),
+            );
+            assert_eq!(
+                guard.check_request(&req).unwrap_err().status(),
+                StatusCode::FORBIDDEN,
+                "{host}"
+            );
+        }
+        let mut req = https_request(Method::Get, "/auth/status");
+        req.headers_mut()
+            .insert("x-forwarded-host", b"evil.invalid".to_vec());
+        req.headers_mut().insert("x-forwarded-proto", b"http".to_vec());
+        req.headers_mut()
+            .insert("forwarded", b"host=evil.invalid;proto=http".to_vec());
+        req.headers_mut()
+            .insert("tailscale-user-login", b"untrusted@example.invalid".to_vec());
+        assert!(
+            guard.check_request(&req).is_ok(),
+            "forwarded and identity headers cannot select authority"
+        );
+        req.headers_mut()
+            .insert("origin", b"https://other.example.ts.net".to_vec());
+        assert_eq!(
+            guard.check_request(&req).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn https_origin_keeps_csrf_and_public_navigation_boundaries() {
+        let guard = middleware(authority().with_https_origin(HTTPS_ORIGIN).unwrap());
+        for method in [Method::Post, Method::Delete] {
+            let mut req = https_request(method, "/auth/session");
+            req.headers_mut().remove("origin");
+            assert_eq!(
+                guard.check_request(&req).unwrap_err().status(),
+                StatusCode::FORBIDDEN
+            );
+            for origin in [
+                "null",
+                ORIGIN,
+                "http://workstation.example.ts.net",
+                "https://other.invalid",
+            ] {
+                req.headers_mut().insert("origin", origin.as_bytes().to_vec());
+                assert_eq!(
+                    guard.check_request(&req).unwrap_err().status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+        for site in ["same-site", "cross-site"] {
+            let mut req = https_request(Method::Get, "/panes");
+            req.headers_mut()
+                .insert("sec-fetch-site", site.as_bytes().to_vec());
+            assert_eq!(
+                guard.check_request(&req).unwrap_err().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut navigation = https_request(Method::Get, "/ui/");
+        navigation.headers_mut().remove("origin");
+        navigation
+            .headers_mut()
+            .insert("sec-fetch-site", b"cross-site".to_vec());
+        navigation
+            .headers_mut()
+            .insert("sec-fetch-mode", b"navigate".to_vec());
+        navigation
+            .headers_mut()
+            .insert("sec-fetch-dest", b"document".to_vec());
+        assert!(guard.check_request(&navigation).is_ok());
+        navigation
+            .headers_mut()
+            .insert("sec-fetch-dest", b"iframe".to_vec());
+        assert_eq!(
+            guard.check_request(&navigation).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn https_login_and_logout_use_secure_cookies_and_revoke_exact_stream_authority() {
+        let auth = authority().with_https_origin(HTTPS_ORIGIN).unwrap();
+        let guard = middleware(auth.clone());
+        let mut login = https_request(Method::Post, "/auth/session");
+        login
+            .headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        login.set_body(FrameworkRequestBody::Bytes(
+            format!("{{\"token\":\"{SECRET}\"}}").into_bytes(),
+        ));
+        guard.admit(&mut login).unwrap();
+        let response = handle_login(&mut login);
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = std::str::from_utf8(header(&response, "set-cookie").unwrap()).unwrap();
+        assert!(cookie.contains("; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600; Secure"));
+        assert!(!cookie.contains("Domain="));
+        assert!(!cookie.contains(SECRET));
+        let token = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("ft_viewer_session=")
+            .unwrap();
+        let epoch = body(&response)["data"]["session_epoch"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut read = https_request(Method::Get, "/panes");
+        set_cookie(&mut read, token);
+        guard.admit(&mut read).unwrap();
+        let grant = read.get_extension::<SessionGrant>().unwrap().clone();
+        assert_eq!(grant.0.origin, HTTPS_ORIGIN);
+
+        let mut stream = https_request(Method::Get, "/stream/events");
+        set_cookie(&mut stream, token);
+        assert_eq!(
+            guard.check_request(&stream).unwrap_err().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        stream.set_query(Some(format!("session_epoch={epoch}")));
+        guard.admit(&mut stream).unwrap();
+        let permit = reserve_stream(&stream).unwrap();
+
+        let other = middleware(
+            auth.clone()
+                .with_https_origin("https://other.example.ts.net")
+                .unwrap(),
+        );
+        let mut moved = https_request(Method::Get, "/panes");
+        set_cookie(&mut moved, token);
+        moved
+            .headers_mut()
+            .insert("host", b"other.example.ts.net".to_vec());
+        moved
+            .headers_mut()
+            .insert("origin", b"https://other.example.ts.net".to_vec());
+        assert_eq!(
+            other.check_request(&moved).unwrap_err().status(),
+            StatusCode::UNAUTHORIZED,
+            "even shared session state cannot retarget a grant to another origin"
+        );
+
+        let mut logout = https_request(Method::Delete, "/auth/session");
+        set_cookie(&mut logout, token);
+        guard.admit(&mut logout).unwrap();
+        let response = handle_logout(&logout);
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared = std::str::from_utf8(header(&response, "set-cookie").unwrap()).unwrap();
+        assert_eq!(
+            cleared,
+            "ft_viewer_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
+        );
+        assert!(!grant.is_valid());
+        assert_eq!(
+            guard.check_request(&read).unwrap_err().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            reserve_stream(&stream).is_err(),
+            "revoked stream cannot reserve more output"
+        );
+        let late = guard.finish(&read, json_ok("late-private-content"));
+        assert_eq!(late.status(), StatusCode::UNAUTHORIZED);
+        assert!(!body(&late).to_string().contains("late-private-content"));
+        drop(permit);
+    }
+
+    #[test]
+    fn https_login_rechecks_origin_even_if_a_handler_is_called_directly() {
+        let auth = authority().with_https_origin(HTTPS_ORIGIN).unwrap();
+        let guard = middleware(auth.clone());
+        let mut login = request(Method::Post, "/auth/session");
+        login.insert_extension(guard);
+        login
+            .headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        login.set_body(FrameworkRequestBody::Bytes(
+            format!("{{\"token\":\"{SECRET}\"}}").into_bytes(),
+        ));
+        assert_eq!(handle_login(&mut login).status(), StatusCode::FORBIDDEN);
+        assert!(auth.sessions.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1133,7 +1513,7 @@ mod tests {
         ] {
             let mut req = request(Method::Get, "/health");
             req.headers_mut().insert("host", host.as_bytes().to_vec());
-            assert!(check_browser_boundary(&req, 4321).is_err(), "{host}");
+            assert!(check_browser_boundary(&req, 4321, None).is_err(), "{host}");
         }
         let mut req = request(Method::Post, "/auth/session");
         for origin in [
@@ -1145,24 +1525,24 @@ mod tests {
         ] {
             req.headers_mut()
                 .insert("origin", origin.as_bytes().to_vec());
-            assert!(check_browser_boundary(&req, 4321).is_err(), "{origin}");
+            assert!(check_browser_boundary(&req, 4321, None).is_err(), "{origin}");
         }
         req.headers_mut().remove("origin");
-        assert!(check_browser_boundary(&req, 4321).is_err());
+        assert!(check_browser_boundary(&req, 4321, None).is_err());
         req.headers_mut()
             .insert("origin", ORIGIN.as_bytes().to_vec());
-        assert!(check_browser_boundary(&req, 4321).is_ok());
+        assert!(check_browser_boundary(&req, 4321, None).is_ok());
         assert!(
-            check_browser_boundary(&req, 0).is_err(),
+            check_browser_boundary(&req, 0, None).is_err(),
             "unbound applications cannot admit"
         );
         req.headers_mut()
             .insert("sec-fetch-site", b"same-site".to_vec());
-        assert!(check_browser_boundary(&req, 4321).is_err());
+        assert!(check_browser_boundary(&req, 4321, None).is_err());
         req.headers_mut().remove("sec-fetch-site");
         req.headers_mut()
             .insert("authorization", b"Bearer second-credential".to_vec());
-        assert!(check_browser_boundary(&req, 4321).is_err());
+        assert!(check_browser_boundary(&req, 4321, None).is_err());
     }
 
     #[test]
@@ -1175,12 +1555,12 @@ mod tests {
             .insert("x-forwarded-host", b"evil.invalid".to_vec());
         req.headers_mut()
             .insert("x-forwarded-proto", b"https".to_vec());
-        assert!(check_browser_boundary(&req, 4321).is_ok());
+        assert!(check_browser_boundary(&req, 4321, None).is_ok());
         req.headers_mut()
             .insert("host", b"evil.invalid:4321".to_vec());
         req.headers_mut()
             .insert("x-forwarded-host", b"localhost:4321".to_vec());
-        assert!(check_browser_boundary(&req, 4321).is_err());
+        assert!(check_browser_boundary(&req, 4321, None).is_err());
     }
 
     #[test]

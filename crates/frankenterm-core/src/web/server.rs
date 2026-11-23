@@ -170,8 +170,8 @@ pub(super) async fn spawn_storage_event_tail(
 
 /// Start the web server and return a handle for shutdown.
 ///
-/// Refuses to bind on non-localhost addresses because the current web API has
-/// no authentication boundary.
+/// The listener stays on loopback. An operator may opt into authenticated
+/// access through an HTTPS reverse proxy with `FT_WEB_HTTPS_ORIGIN`.
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     start_web_server_with_cx(&cx, config).await
@@ -195,7 +195,12 @@ pub async fn start_web_server_with_cx(
     cx.checkpoint()
         .map_err(|err| web_cx_error(cx, "start_web_server", &err))?;
 
+    let config = apply_https_origin_setting(config, std::env::var("FT_WEB_HTTPS_ORIGIN"))?;
     validate_bind_config(&config)?;
+    let https_origin = config
+        .session_auth
+        .as_ref()
+        .and_then(|auth| auth.https_origin().map(str::to_owned));
     let bind_addr = config.bind_addr();
     let runtime_limits = config.runtime_limits;
     let tail_inputs = if config.storage_event_tail_enabled() {
@@ -244,6 +249,7 @@ pub async fn start_web_server_with_cx(
 
     Ok(WebServerHandle {
         bound_addr: local_addr,
+        https_origin,
         runtime,
         storage_tail,
     })
@@ -253,6 +259,38 @@ pub async fn start_web_server_with_cx(
 pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     run_web_server_with_cx(&cx, config).await
+}
+
+/// Resolve the explicit proxy origin before binding or starting background
+/// tasks. Accept the environment result as an input so tests never mutate the
+/// process environment while other web servers are running.
+fn apply_https_origin_setting(
+    mut config: WebServerConfig,
+    setting: std::result::Result<String, std::env::VarError>,
+) -> Result<WebServerConfig> {
+    let origin = match setting {
+        Ok(origin) => origin,
+        Err(std::env::VarError::NotPresent) => return Ok(config),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::runtime_backend(
+                "web HTTPS origin configuration",
+                "FT_WEB_HTTPS_ORIGIN must be a canonical ASCII HTTPS origin",
+            ));
+        }
+    };
+    let auth = config.session_auth.take().ok_or_else(|| {
+        Error::runtime_backend(
+            "web HTTPS origin configuration",
+            "FT_WEB_HTTPS_ORIGIN requires operator session authentication; configure --auth-token-env before enabling HTTPS proxy access",
+        )
+    })?;
+    config.session_auth = Some(auth.with_https_origin(&origin).map_err(|_| {
+        Error::runtime_backend(
+            "web HTTPS origin configuration",
+            "FT_WEB_HTTPS_ORIGIN must be a canonical HTTPS origin with no path, query, fragment, or credentials",
+        )
+    })?);
+    Ok(config)
 }
 
 fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
@@ -268,7 +306,7 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
     Err(Error::runtime_backend(
         "web bind validation",
         format!(
-            "refusing to bind web server on non-localhost address '{}'{}: the current web API has no authentication boundary; bind to 127.0.0.1, ::1, or localhost until auth middleware lands",
+            "refusing to bind web server on non-localhost address '{}'{}: the web API has no authentication boundary for public listeners; bind to 127.0.0.1, ::1, or localhost and use an authenticated HTTPS proxy",
             config.host, override_note
         ),
     ))
@@ -277,8 +315,15 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
 fn write_listening_announcement(
     mut writer: impl Write,
     bound_addr: SocketAddr,
+    https_origin: Option<&str>,
 ) -> std::io::Result<()> {
-    writeln!(writer, "ft web listening on http://{bound_addr}")
+    match https_origin {
+        Some(origin) => writeln!(
+            writer,
+            "ft web listening on {origin} (proxy upstream http://{bound_addr})"
+        ),
+        None => writeln!(writer, "ft web listening on http://{bound_addr}"),
+    }
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
@@ -298,11 +343,16 @@ fn write_listening_announcement(
 pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
         bound_addr,
+        https_origin,
         mut runtime,
         storage_tail,
     } = start_web_server_with_cx(cx, config).await?;
 
-    if let Err(error) = write_listening_announcement(std::io::stdout().lock(), bound_addr) {
+    if let Err(error) = write_listening_announcement(
+        std::io::stdout().lock(),
+        bound_addr,
+        https_origin.as_deref(),
+    ) {
         warn!(
             target: "wa.web",
             error = %error,
@@ -424,8 +474,8 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_bind_config, write_listening_announcement};
-    use crate::web::WebServerConfig;
+    use super::{apply_https_origin_setting, validate_bind_config, write_listening_announcement};
+    use crate::web::{WebServerConfig, WebSessionAuth};
     use std::io::{self, Write};
     use std::net::SocketAddr;
 
@@ -640,10 +690,115 @@ mod tests {
         assert!(validate_bind_config(&config).is_ok());
     }
 
+    fn authenticated_config() -> WebServerConfig {
+        WebServerConfig::new(8080).with_session_auth(
+            WebSessionAuth::new("https-viewer-test-credential-at-least-32-characters")
+                .expect("valid test credential"),
+        )
+    }
+
+    #[test]
+    fn https_origin_setting_requires_existing_operator_authentication() {
+        let error = apply_https_origin_setting(
+            WebServerConfig::default(),
+            Ok("https://terminal.example".to_string()),
+        )
+        .expect_err("an origin must never opt an unauthenticated server into remote access")
+        .to_string();
+        assert!(error.contains("--auth-token-env"));
+    }
+
+    #[test]
+    fn https_origin_setting_configures_auth_without_changing_loopback_bind() {
+        let config = apply_https_origin_setting(
+            authenticated_config(),
+            Ok("https://terminal.example:8443".to_string()),
+        )
+        .expect("explicit authenticated HTTPS origin");
+        assert_eq!(config.bind_addr(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            config.session_auth.as_ref().unwrap().https_origin(),
+            Some("https://terminal.example:8443")
+        );
+        assert!(validate_bind_config(&config).is_ok());
+
+        let public = config.with_host("0.0.0.0").with_dangerous_public_bind();
+        assert!(validate_bind_config(&public).is_err());
+    }
+
+    #[test]
+    fn absent_https_origin_setting_preserves_explicit_auth_configuration() {
+        let unauthenticated = apply_https_origin_setting(
+            WebServerConfig::default(),
+            Err(std::env::VarError::NotPresent),
+        )
+        .unwrap();
+        assert!(unauthenticated.session_auth.is_none());
+
+        let auth = WebSessionAuth::new("https-viewer-test-credential-at-least-32-characters")
+            .unwrap()
+            .with_https_origin("https://terminal.example")
+            .unwrap();
+        let configured = apply_https_origin_setting(
+            WebServerConfig::default().with_session_auth(auth),
+            Err(std::env::VarError::NotPresent),
+        )
+        .unwrap();
+        assert_eq!(
+            configured.session_auth.as_ref().unwrap().https_origin(),
+            Some("https://terminal.example")
+        );
+    }
+
+    #[test]
+    fn invalid_https_origin_setting_fails_without_disclosing_its_value() {
+        for origin in [
+            "",
+            "http://terminal.example",
+            "https://terminal.example/",
+            "https://secret-sentinel@terminal.example",
+            "https://terminal.example?token=secret-sentinel",
+        ] {
+            let error = apply_https_origin_setting(authenticated_config(), Ok(origin.to_string()))
+                .expect_err("invalid configured origins must fail closed")
+                .to_string();
+            assert!(error.contains("FT_WEB_HTTPS_ORIGIN"));
+            assert!(!error.contains("secret-sentinel"));
+        }
+        let error = apply_https_origin_setting(
+            authenticated_config(),
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "secret-sentinel",
+            ))),
+        )
+        .expect_err("a non-Unicode environment value must fail closed")
+        .to_string();
+        assert!(error.contains("FT_WEB_HTTPS_ORIGIN"));
+        assert!(!error.contains("secret-sentinel"));
+    }
+
+    #[test]
+    fn https_listener_announcement_names_the_browser_origin_and_proxy_upstream() {
+        let addr = "127.0.0.1:8080".parse().unwrap();
+        let mut output = Vec::new();
+        write_listening_announcement(&mut output, addr, Some("https://terminal.example"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ft web listening on https://terminal.example (proxy upstream http://127.0.0.1:8080)\n"
+        );
+        let mut output = Vec::new();
+        write_listening_announcement(&mut output, addr, None).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ft web listening on http://127.0.0.1:8080\n"
+        );
+    }
+
     #[test]
     fn listener_announcement_write_failure_is_returned_without_panicking() {
         let bound_addr: SocketAddr = "127.0.0.1:8000".parse().expect("valid loopback address");
-        let error = write_listening_announcement(BrokenPipeWriter, bound_addr)
+        let error = write_listening_announcement(BrokenPipeWriter, bound_addr, None)
             .expect_err("closed stdout must be reported as an ordinary I/O error");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);

@@ -306,7 +306,7 @@ variable and pass its name with `--auth-token-env` (or
 the secret is never accepted as a command-line token or URL parameter.
 
 The `/ui/` sign-in form posts JSON to `/auth/session`, which requires an
-exact local Origin and `Content-Type: application/json`. Successful sign-in
+exact configured Origin and `Content-Type: application/json`. Successful sign-in
 sets a `HttpOnly`, `SameSite=Strict` session cookie. The default lifetime is
 one hour, with a maximum of 16 active sessions. `/auth/status` reports
 whether authentication is required and whether the current cookie is valid;
@@ -320,21 +320,39 @@ Health, session status and UI assets remain public; all data routes and
 OpenAPI are protected. The viewer clears its previous data when a session
 ends and reloads after sign-in instead of reusing old stream cursors.
 
-Authenticated mode requires the exact loopback Host/Origin and listener
-port, including on reconnect. It does not support reverse-proxy or Tailscale
-origins. Omitting the token flag preserves unauthenticated local access.
-To forward that unauthenticated mode to your other devices, put Tailscale
-Serve in front of it. Tailscale provides HTTPS and limits access to your
-tailnet:
+By default, authenticated mode requires the exact loopback Host/Origin and
+listener port, including on reconnect. For a trusted HTTPS reverse proxy,
+set `FT_WEB_HTTPS_ORIGIN` to the exact browser origin and retain the token flag:
 
 ```bash
-tailscale serve --bg 9999          # https://<this-machine>.<tailnet>.ts.net/ -> 127.0.0.1:9999
+export FT_WEB_HTTPS_ORIGIN='https://this-machine.your-tailnet.ts.net'
+ft web --ui-dir /tmp/ft-ui/site --auth-token-env FT_BROWSER_TOKEN
+# In another terminal:
+tailscale serve --bg http://127.0.0.1:9999
+tailscale serve status
 tailscale serve --https=443 off    # stop sharing
 ```
 
-Every device on the tailnet can then read all captured pane output. Use
-tailnet access rules to narrow that if it is too wide. Never use
-`tailscale funnel`, which publishes to the internet.
+Replace the example hostname with the actual HTTPS origin and set
+`FT_BROWSER_TOKEN` as described above. The origin must be canonical ASCII
+HTTPS with no credentials, trailing slash, path, query or fragment. Omit
+default `:443`; non-default ports are supported. Invalid values, including
+an empty value, or configuring an origin without authentication fail startup.
+The same environment setting applies to `ft watch --web`.
+
+The listener stays on loopback. The HTTPS proxy must preserve `Host` and
+`Origin`; `Forwarded`, `X-Forwarded-*` and Tailscale identity headers do not
+authorize requests. Only the configured HTTPS origin is accepted in this
+mode, and both issued and cleared session cookies carry `Secure`. The startup
+announcement identifies the browser URL separately from the HTTP proxy
+upstream. Direct local HTTP browser access is refused in HTTPS mode.
+
+This authenticates one operator's existing read-only data access; it is not
+per-user or per-pane sharing. Tailnet access rules restrict who can reach the
+login page, and the operator token is still needed for data reads. Omitting
+both the token flag and `FT_WEB_HTTPS_ORIGIN` preserves unauthenticated local
+access. Live TLS/Tailscale qualification and interactive terminal control
+remain separate browser-campaign work.
 
 Behavior notes:
 - Streams emit keepalive comments while idle.

@@ -159,8 +159,8 @@ pub struct WebServerConfig {
     redactor: Arc<Redactor>,
     /// Records explicit operator intent for public binding.
     ///
-    /// This does not currently permit non-localhost binding because the web API
-    /// has no authentication boundary yet.
+    /// This does not permit non-localhost binding. Authenticated remote access
+    /// uses an HTTPS reverse proxy in front of the loopback listener.
     allow_public_bind: bool,
     /// Tail newly persisted detection events from storage into the event bus
     /// so a standalone `ft web` (which runs no capture pipeline of its own)
@@ -171,7 +171,7 @@ pub struct WebServerConfig {
     storage_event_tail: bool,
     /// The verified browser fleet viewer package served under `/ui/`.
     ui_assets: Option<Arc<UiAssetSet>>,
-    /// Optional bounded local-operator sessions for data reads and streams.
+    /// Optional bounded operator sessions for data reads and streams.
     session_auth: Option<WebSessionAuth>,
 }
 
@@ -219,8 +219,10 @@ impl WebServerConfig {
         self
     }
 
-    /// Require expiring local-operator browser sessions for data reads,
-    /// generated API schemas and streams. This does not permit public binds.
+    /// Require expiring operator browser sessions for data reads, generated API
+    /// schemas and streams. This does not permit public binds. Configure an
+    /// HTTPS proxy origin with [`WebSessionAuth::with_https_origin`] or the
+    /// explicit `FT_WEB_HTTPS_ORIGIN` startup environment setting.
     #[must_use]
     pub fn with_session_auth(mut self, auth: WebSessionAuth) -> Self {
         self.session_auth = Some(auth);
@@ -406,6 +408,8 @@ impl StorageEventTail {
 /// Handle to a running web server.
 pub struct WebServerHandle {
     bound_addr: SocketAddr,
+    /// The external browser origin when authenticated HTTPS proxy mode is active.
+    https_origin: Option<String>,
     runtime: FrameworkWebRuntime,
     /// Storage → bus event tail, when the server was configured with both a
     /// storage handle and an event bus and the tail was not disabled.
@@ -417,6 +421,12 @@ impl WebServerHandle {
     #[must_use]
     pub fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
+    }
+
+    /// The configured browser origin, when an HTTPS proxy serves this listener.
+    #[must_use]
+    pub fn https_origin(&self) -> Option<&str> {
+        self.https_origin.as_deref()
     }
 
     /// Trigger graceful shutdown and wait for completion.
