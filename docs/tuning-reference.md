@@ -2,6 +2,14 @@
 
 `TuningConfig` is loaded from the `[tuning]` section of `ft.toml`. Every key is optional. If you omit a key, `ft` keeps the hard-coded default from `crates/frankenterm-core/src/tuning_config.rs`.
 
+Not every documented key reaches the runtime yet. `ft` parses and validates the keys below, but no runtime code reads them; changing them has no effect until they are wired (tracked on ft-mgy5t2.17):
+
+- `[tuning.runtime]`: `output_coalesce_window_ms`, `output_coalesce_max_delay_ms`, `output_coalesce_max_bytes`, `telemetry_percentile_window`, the four `resize_watchdog_*` keys, `state_detection_max_age_secs`
+- `[tuning.patterns]`: `max_seen_keys`, `max_tail_size_bytes`, `bloom_false_positive_rate`
+- `[tuning.policy]`: `max_tracked_panes`, `cost_tracker_max_panes`
+- `[tuning.workflows]`: `swarm_learning_index_timeout_secs` and the five `*_cooldown_ms` keys
+- `[tuning.search]`: `saved_search_limit`, `cass_export_limit`
+
 This reference is for operators tuning live fleets. The ranges below are starting points, not promises. Change one subsystem at a time, run `ft config validate`, then watch capture lag, queue depth, SQLite lock timing, memory pressure, search latency, and workflow completion time before moving further.
 
 Before you tune a live deployment:
@@ -108,6 +116,8 @@ Validation:
 - `output_coalesce_max_bytes >= 4096`
 - `resize_watchdog_warning_ms < resize_watchdog_critical_ms`
 - `resize_watchdog_stalled_limit >= 1`
+- `storage_lock_wait_warn_ms` and `storage_lock_hold_warn_ms` must be finite and `> 0`
+- `cursor_snapshot_memory_warn_bytes > 0`
 
 ## `[tuning.backpressure]`
 
@@ -132,6 +142,8 @@ These keys live under `[tuning.snapshot]`.
 
 Validation:
 - `trigger_bridge_tick_secs >= 5`
+- `idle_window_secs >= 1`
+- `memory_trigger_cooldown_secs >= 1`
 
 ## `[tuning.ingest]`
 

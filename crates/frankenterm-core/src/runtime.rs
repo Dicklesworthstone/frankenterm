@@ -5603,6 +5603,7 @@ impl ObservationRuntime {
             wezterm_handle: Arc::clone(&self.wezterm_handle),
             native_events: native_handle,
             scheduler_snapshot: Arc::clone(&self.scheduler_snapshot),
+            health_warn: HealthWarnThresholds::from_tuning(&self.tuning),
         })
     }
 
@@ -5617,6 +5618,13 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let registry = Arc::clone(&self.registry);
         let metrics = Arc::clone(&self.metrics);
+        // The operator's [tuning.snapshot] and [tuning.runtime] values; their
+        // defaults equal the compiled constants these reads replaced.
+        let bridge_tick = Duration::from_secs(self.tuning.snapshot.trigger_bridge_tick_secs);
+        let idle_window = Duration::from_secs(self.tuning.snapshot.idle_window_secs);
+        let memory_trigger_cooldown =
+            Duration::from_secs(self.tuning.snapshot.memory_trigger_cooldown_secs);
+        let memory_trigger_bytes = self.tuning.runtime.cursor_snapshot_memory_warn_bytes;
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -5649,7 +5657,7 @@ impl ObservationRuntime {
                         changed = shutdown_rx.changed(&loop_cx) => Err(changed),
                         receive = runtime_timeout(
                             &loop_cx,
-                            Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                            bridge_tick,
                             sub.recv_cx(&loop_cx),
                         ) => Ok(receive),
                     };
@@ -5728,10 +5736,7 @@ impl ObservationRuntime {
                 } else {
                     let sleep_result = crate::runtime_async::select! {
                         changed = shutdown_rx.changed(&loop_cx) => Err(changed),
-                        result = runtime_sleep(
-                            &loop_cx,
-                            Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                        ) => Ok(result),
+                        result = runtime_sleep(&loop_cx, bridge_tick) => Ok(result),
                     };
                     match sleep_result {
                         Err(Ok(())) => continue,
@@ -5767,16 +5772,8 @@ impl ObservationRuntime {
 
                 if tick_only
                     && idle_enabled
-                    && runtime_time_elapsed_at_least(
-                        now,
-                        last_activity,
-                        Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS),
-                    )
-                    && runtime_time_elapsed_at_least(
-                        now,
-                        last_idle_trigger,
-                        Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS),
-                    )
+                    && runtime_time_elapsed_at_least(now, last_activity, idle_window)
+                    && runtime_time_elapsed_at_least(now, last_idle_trigger, idle_window)
                 {
                     let observed_panes = {
                         let reg = match registry.read_with_cx(&loop_cx).await {
@@ -5813,13 +5810,9 @@ impl ObservationRuntime {
                 // check by preventing an idle timer tick. The cooldown bounds
                 // emission independently of event throughput.
                 let cursor_snapshot_bytes = metrics.cursor_snapshot_bytes_last();
-                if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES
+                if cursor_snapshot_bytes >= memory_trigger_bytes
                     && last_memory_trigger.is_none_or(|last_trigger| {
-                        runtime_time_elapsed_at_least(
-                            now,
-                            last_trigger,
-                            Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS),
-                        )
+                        runtime_time_elapsed_at_least(now, last_trigger, memory_trigger_cooldown)
                     })
                 {
                     if loop_cx.checkpoint().is_err() {
@@ -5962,6 +5955,7 @@ impl ObservationRuntime {
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
         let fleet_poll_pressure_level = Arc::clone(&self.fleet_poll_pressure_level);
         let backpressure_manager = Arc::clone(&self.backpressure_manager);
+        let warn = HealthWarnThresholds::from_tuning(&self.tuning);
 
         let initial_retention_days = self.config.retention_days;
         let initial_retention_policy = Arc::clone(&self.config.retention_policy);
@@ -6531,7 +6525,7 @@ impl ObservationRuntime {
                     #[allow(clippy::cast_precision_loss)]
                     if capture_cap > 0 {
                         let ratio = capture_depth as f64 / capture_cap as f64;
-                        if ratio >= BACKPRESSURE_WARN_RATIO {
+                        if ratio >= warn.queue_ratio {
                             warnings.push(format!(
                                         "Capture queue backpressure: {capture_depth}/{capture_cap} ({:.0}%)",
                                         ratio * 100.0
@@ -6542,7 +6536,7 @@ impl ObservationRuntime {
                     #[allow(clippy::cast_precision_loss)]
                     if write_cap > 0 {
                         let ratio = write_depth as f64 / write_cap as f64;
-                        if ratio >= BACKPRESSURE_WARN_RATIO {
+                        if ratio >= warn.queue_ratio {
                             warnings.push(format!(
                                 "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
                                 ratio * 100.0
@@ -6553,7 +6547,7 @@ impl ObservationRuntime {
                     if !db_writable {
                         warnings.push("Database is not writable".to_string());
                     }
-                    if metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+                    if metrics.max_storage_lock_wait_ms() >= warn.lock_wait_ms {
                         warnings.push(format!(
                             "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
                             metrics.max_storage_lock_wait_ms(),
@@ -6561,14 +6555,14 @@ impl ObservationRuntime {
                             metrics.storage_lock_contention_events()
                         ));
                     }
-                    if metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+                    if metrics.max_storage_lock_hold_ms() >= warn.lock_hold_ms {
                         warnings.push(format!(
                             "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
                             metrics.max_storage_lock_hold_ms(),
                             metrics.avg_storage_lock_hold_ms(),
                         ));
                     }
-                    if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
+                    if cursor_snapshot_bytes >= warn.cursor_snapshot_bytes {
                         warnings.push(format!(
                             "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
                             bytes_to_mib(cursor_snapshot_bytes),
@@ -11227,24 +11221,48 @@ pub struct RuntimeHandle {
     wezterm_handle: WeztermHandle,
     /// Shared scheduler snapshot for health reporting (written by capture task).
     scheduler_snapshot: Arc<RwLock<crate::tailer::SchedulerSnapshot>>,
+    /// Health-warning thresholds from the operator's `[tuning]` section.
+    health_warn: HealthWarnThresholds,
 }
 
-// Backpressure, storage lock, and snapshot defaults — canonical values in TuningConfig.
-// To override: set [tuning.backpressure], [tuning.runtime], or [tuning.snapshot] in ft.toml.
+/// Health-warning thresholds from `[tuning.backpressure]` and
+/// `[tuning.runtime]`. The runtime reads these from the operator's
+/// `TuningConfig` (see `ObservationRuntime::with_tuning`), not from defaults.
+#[derive(Debug, Clone, Copy)]
+struct HealthWarnThresholds {
+    queue_ratio: f64,
+    lock_wait_ms: f64,
+    lock_hold_ms: f64,
+    cursor_snapshot_bytes: u64,
+}
+
+impl HealthWarnThresholds {
+    fn from_tuning(tuning: &crate::tuning_config::TuningConfig) -> Self {
+        Self {
+            queue_ratio: tuning.backpressure.warn_ratio,
+            lock_wait_ms: tuning.runtime.storage_lock_wait_warn_ms,
+            lock_hold_ms: tuning.runtime.storage_lock_hold_warn_ms,
+            cursor_snapshot_bytes: tuning.runtime.cursor_snapshot_memory_warn_bytes,
+        }
+    }
+}
+
+// Compiled defaults of the tuning values above, for tests that exercise them.
+#[cfg(test)]
 const BACKPRESSURE_WARN_RATIO: f64 = crate::tuning_config::BackpressureTuning::DEFAULT_WARN_RATIO;
 const STORAGE_LOCK_CONTENTION_MIN_US: u64 = 1_000;
+#[cfg(test)]
 const STORAGE_LOCK_WAIT_WARN_MS: f64 =
     crate::tuning_config::RuntimeTuning::DEFAULT_STORAGE_LOCK_WAIT_WARN_MS;
+#[cfg(test)]
 const STORAGE_LOCK_HOLD_WARN_MS: f64 =
     crate::tuning_config::RuntimeTuning::DEFAULT_STORAGE_LOCK_HOLD_WARN_MS;
+#[cfg(test)]
 const CURSOR_SNAPSHOT_MEMORY_WARN_BYTES: u64 =
     crate::tuning_config::RuntimeTuning::DEFAULT_CURSOR_SNAPSHOT_MEMORY_WARN_BYTES;
+#[cfg(test)]
 const SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS: u64 =
     crate::tuning_config::SnapshotTuning::DEFAULT_TRIGGER_BRIDGE_TICK_SECS;
-const SNAPSHOT_IDLE_WINDOW_SECS: u64 =
-    crate::tuning_config::SnapshotTuning::DEFAULT_IDLE_WINDOW_SECS;
-const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 =
-    crate::tuning_config::SnapshotTuning::DEFAULT_MEMORY_TRIGGER_COOLDOWN_SECS;
 const CONNECTOR_OUTBOUND_BRIDGE_TICK_MS: u64 = 250;
 const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13469,7 +13487,7 @@ impl RuntimeHandle {
         #[allow(clippy::cast_precision_loss)]
         if capture_cap > 0 {
             let ratio = capture_depth as f64 / capture_cap as f64;
-            if ratio >= BACKPRESSURE_WARN_RATIO {
+            if ratio >= self.health_warn.queue_ratio {
                 warnings.push(format!(
                     "Capture queue backpressure: {capture_depth}/{capture_cap} ({:.0}%)",
                     ratio * 100.0
@@ -13480,7 +13498,7 @@ impl RuntimeHandle {
         #[allow(clippy::cast_precision_loss)]
         if write_cap > 0 {
             let ratio = write_depth as f64 / write_cap as f64;
-            if ratio >= BACKPRESSURE_WARN_RATIO {
+            if ratio >= self.health_warn.queue_ratio {
                 warnings.push(format!(
                     "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
                     ratio * 100.0
@@ -13491,7 +13509,7 @@ impl RuntimeHandle {
         if !db_writable {
             warnings.push("Database is not writable".to_string());
         }
-        if self.metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+        if self.metrics.max_storage_lock_wait_ms() >= self.health_warn.lock_wait_ms {
             warnings.push(format!(
                 "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
                 self.metrics.max_storage_lock_wait_ms(),
@@ -13499,14 +13517,14 @@ impl RuntimeHandle {
                 self.metrics.storage_lock_contention_events()
             ));
         }
-        if self.metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+        if self.metrics.max_storage_lock_hold_ms() >= self.health_warn.lock_hold_ms {
             warnings.push(format!(
                 "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
                 self.metrics.max_storage_lock_hold_ms(),
                 self.metrics.avg_storage_lock_hold_ms(),
             ));
         }
-        if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
+        if cursor_snapshot_bytes >= self.health_warn.cursor_snapshot_bytes {
             warnings.push(format!(
                 "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
                 bytes_to_mib(cursor_snapshot_bytes),
@@ -20909,6 +20927,7 @@ mod tests {
             capture_queue_capacity: 1,
             wezterm_handle: runtime.wezterm_handle.clone(),
             scheduler_snapshot: Arc::clone(&runtime.scheduler_snapshot),
+            health_warn: HealthWarnThresholds::from_tuning(&runtime.tuning),
         };
 
         (dir, handle, dropped)
@@ -23127,6 +23146,39 @@ mod tests {
             assert!(BACKPRESSURE_WARN_RATIO > 0.0);
             assert!(BACKPRESSURE_WARN_RATIO < 1.0);
         }
+    }
+
+    #[test]
+    fn health_warn_thresholds_follow_operator_tuning() {
+        let defaults =
+            HealthWarnThresholds::from_tuning(&crate::tuning_config::TuningConfig::default());
+        assert_eq!(
+            defaults.queue_ratio.to_bits(),
+            BACKPRESSURE_WARN_RATIO.to_bits()
+        );
+        assert_eq!(
+            defaults.lock_wait_ms.to_bits(),
+            STORAGE_LOCK_WAIT_WARN_MS.to_bits()
+        );
+        assert_eq!(
+            defaults.lock_hold_ms.to_bits(),
+            STORAGE_LOCK_HOLD_WARN_MS.to_bits()
+        );
+        assert_eq!(
+            defaults.cursor_snapshot_bytes,
+            CURSOR_SNAPSHOT_MEMORY_WARN_BYTES
+        );
+
+        let mut tuning = crate::tuning_config::TuningConfig::default();
+        tuning.backpressure.warn_ratio = 0.4;
+        tuning.runtime.storage_lock_wait_warn_ms = 3.0;
+        tuning.runtime.storage_lock_hold_warn_ms = 9.0;
+        tuning.runtime.cursor_snapshot_memory_warn_bytes = 4096;
+        let warn = HealthWarnThresholds::from_tuning(&tuning);
+        assert_eq!(warn.queue_ratio.to_bits(), 0.4_f64.to_bits());
+        assert_eq!(warn.lock_wait_ms.to_bits(), 3.0_f64.to_bits());
+        assert_eq!(warn.lock_hold_ms.to_bits(), 9.0_f64.to_bits());
+        assert_eq!(warn.cursor_snapshot_bytes, 4096);
     }
 
     #[test]

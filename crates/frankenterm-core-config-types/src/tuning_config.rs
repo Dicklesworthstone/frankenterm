@@ -212,11 +212,11 @@ pub struct SnapshotTuning {
     pub trigger_bridge_tick_secs: u64,
 
     /// Idle duration (seconds) before emitting `IdleWindow` trigger.
-    /// Source: runtime.rs SNAPSHOT_IDLE_WINDOW_SECS = 300
+    /// Default 300. Checked on each trigger bridge tick.
     pub idle_window_secs: u64,
 
     /// Minimum interval (seconds) between memory-pressure-triggered snapshots.
-    /// Source: runtime.rs SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS = 120
+    /// Default 120.
     pub memory_trigger_cooldown_secs: u64,
 }
 
@@ -954,6 +954,27 @@ impl TuningConfig {
         if self.runtime.resize_watchdog_stalled_limit < 1 {
             errors.push("tuning.runtime.resize_watchdog_stalled_limit must be >= 1".into());
         }
+        // Health warnings compare against these, so NaN would never warn and
+        // zero or less would always warn.
+        for (key, value) in [
+            (
+                "storage_lock_wait_warn_ms",
+                self.runtime.storage_lock_wait_warn_ms,
+            ),
+            (
+                "storage_lock_hold_warn_ms",
+                self.runtime.storage_lock_hold_warn_ms,
+            ),
+        ] {
+            if !(value.is_finite() && value > 0.0) {
+                errors.push(format!("tuning.runtime.{key} must be finite and > 0"));
+            }
+        }
+        // Zero would warn on every health tick and request a memory-pressure
+        // snapshot after every cooldown.
+        if self.runtime.cursor_snapshot_memory_warn_bytes == 0 {
+            errors.push("tuning.runtime.cursor_snapshot_memory_warn_bytes must be > 0".into());
+        }
 
         // Backpressure
         if !(0.1..=0.99).contains(&self.backpressure.warn_ratio) {
@@ -963,6 +984,12 @@ impl TuningConfig {
         // Snapshot
         if self.snapshot.trigger_bridge_tick_secs < 5 {
             errors.push("tuning.snapshot.trigger_bridge_tick_secs must be >= 5".into());
+        }
+        if self.snapshot.idle_window_secs < 1 {
+            errors.push("tuning.snapshot.idle_window_secs must be >= 1".into());
+        }
+        if self.snapshot.memory_trigger_cooldown_secs < 1 {
+            errors.push("tuning.snapshot.memory_trigger_cooldown_secs must be >= 1".into());
         }
 
         // Ingest
@@ -1322,6 +1349,33 @@ default_port = 9000
             errors.len() >= 6,
             "expected multiple errors including ingest/search bounds: {errors:?}"
         );
+    }
+
+    /// The runtime reads these for health warnings and snapshot triggers, so
+    /// values that would never warn, always warn, or never wait are refused.
+    #[test]
+    fn validation_refuses_degenerate_health_and_snapshot_thresholds() {
+        assert!(TuningConfig::default().validate().is_empty());
+        let mut cfg = TuningConfig::default();
+        cfg.runtime.storage_lock_wait_warn_ms = f64::NAN;
+        cfg.runtime.storage_lock_hold_warn_ms = 0.0;
+        cfg.runtime.cursor_snapshot_memory_warn_bytes = 0;
+        cfg.snapshot.idle_window_secs = 0;
+        cfg.snapshot.memory_trigger_cooldown_secs = 0;
+        let errors = cfg.validate();
+        for expected in [
+            "tuning.runtime.storage_lock_wait_warn_ms must be finite and > 0",
+            "tuning.runtime.storage_lock_hold_warn_ms must be finite and > 0",
+            "tuning.runtime.cursor_snapshot_memory_warn_bytes must be > 0",
+            "tuning.snapshot.idle_window_secs must be >= 1",
+            "tuning.snapshot.memory_trigger_cooldown_secs must be >= 1",
+        ] {
+            assert!(
+                errors.iter().any(|err| err == expected),
+                "{expected}: {errors:?}"
+            );
+        }
+        assert_eq!(errors.len(), 5, "{errors:?}");
     }
 
     #[test]
