@@ -9,6 +9,66 @@
 use super::*;
 use rusqlite::{Connection, params};
 
+#[test]
+fn blocking_policy_denial_audit_never_creates_or_recreates_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.sqlite3");
+    let record = PolicyDeniedAuditRecord {
+        id: 0,
+        ts_ms: 1_700_000_000_000,
+        agent_id: None,
+        tool_name: "wa.mission_pause".to_string(),
+        intent_hash: Some("opaque-intent".to_string()),
+        reason: "System kill switch blocks new actions".to_string(),
+        reason_code: PolicyDeniedAuditRecord::REASON_CODE_DENIED.to_string(),
+        rule_id: Some("policy.kill_switch".to_string()),
+        decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
+    };
+
+    assert!(record_policy_denial_audit_blocking(&path, &record).is_err());
+    assert!(!path.exists(), "denial audit must not create workspace storage");
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        initialize_schema(&connection).unwrap();
+    }
+    let id = record_policy_denial_audit_blocking(&path, &record).unwrap();
+    {
+        let connection = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let saved: (String, String, String, String) = connection
+            .query_row(
+                "SELECT tool_name, reason_code, rule_id, decision FROM policy_denied_audit WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(saved.0, record.tool_name);
+        assert_eq!(saved.1, record.reason_code);
+        assert_eq!(Some(saved.2), record.rule_id);
+        assert_eq!(saved.3, record.decision);
+    }
+
+    // The authority path can disappear after admission. An existence check
+    // before an OPEN_CREATE would recreate an unauthoritative database here.
+    let relocated = directory.path().join("relocated.sqlite3");
+    std::fs::rename(&path, &relocated).unwrap();
+    let retained = std::fs::read(&relocated).unwrap();
+    assert!(record_policy_denial_audit_blocking(&path, &record).is_err());
+    assert!(!path.exists(), "denial audit must not recreate a moved database");
+    assert_eq!(std::fs::read(&relocated).unwrap(), retained);
+
+    // A replacement that is not a database is also left untouched.
+    let sentinel = b"replacement is not workspace storage";
+    std::fs::write(&path, sentinel).unwrap();
+    assert!(record_policy_denial_audit_blocking(&path, &record).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+    assert_eq!(std::fs::read(&relocated).unwrap(), retained);
+}
+
 fn record_audit_action_for_conn(conn: &mut Connection, action: &AuditActionRecord) -> Result<i64> {
     with_test_storage_backend(conn, |backend| record_audit_action_backend(backend, action))
 }

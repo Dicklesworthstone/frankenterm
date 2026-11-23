@@ -1025,8 +1025,11 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// surface (tx / mission control). Runs `PolicyEngine.authorize` against a
 /// `PolicySurface::Mcp` + `ActionKind::ExecCommand` input carrying the tool
 /// name as summary and a stable `command_text` so policy rules can match per
-/// operation. Returns `None` on Allow; `Some(err_envelope)` on Deny or
-/// RequireApproval — callers `return` that directly.
+/// operation. An allow result owns the workspace kill-switch fence; callers
+/// retain it through synchronous file effects or hand off to a writer/executor
+/// that independently fences and revalidates the actual effect. A local policy
+/// refusal needs no database, but permission requires readable existing
+/// workspace storage. Missing storage is never manufactured as a disarmed state.
 ///
 /// Intentionally lighter than the `wa.workflow_run` pattern at mcp_tools.rs:2242:
 /// no `ApprovalStore::attach_to_decision` plumbing here, since these handlers
@@ -1049,13 +1052,19 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// these tools support the full flow is still tracked as a future
 /// follow-up; this fix removes the misleading dead end.
 fn mcp_authorize_mcp_mutation(
+    cx: &crate::cx::Cx,
     config: &Config,
     audit_db_path: Option<&std::path::Path>,
     policy_rate_limiter: &SharedRateLimiter,
     summary: &str,
     command_text: &str,
     start: Instant,
-) -> Option<McpResult<Vec<Content>>> {
+) -> Result<crate::policy_kill_switch_state::KillSwitchFence, McpResult<Vec<Content>>> {
+    use crate::policy_kill_switch_state::{
+        KillSwitchStateError, acquire_kill_switch_fence, apply_persisted_kill_switch,
+        load_kill_switch_state_from_path_with_cx,
+    };
+
     let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
         .with_surface(PolicySurface::Mcp)
         .with_text_summary(summary.to_string())
@@ -1065,7 +1074,41 @@ fn mcp_authorize_mcp_mutation(
         config.safety.require_prompt_active,
         Arc::clone(policy_rate_limiter),
     );
-    let decision = engine.authorize(&input);
+    // A denied or approval-blocked request never needs effect authority. The
+    // preview does not consume the shared rate budget; actual admission charges
+    // it exactly once, after checking the persisted switch under its fence.
+    let mut decision = engine.authorize_preview(&input);
+    let mut effect_fence = None;
+    if decision.is_allowed() {
+        let db_path = match audit_db_path {
+            Some(path) => Ok(path.to_path_buf()),
+            None => tx_mutation_workspace_layout(config)
+                .map(|layout| layout.db_path)
+                .map_err(|_| KillSwitchStateError::FenceFailed),
+        };
+        let fence = cx
+            .checkpoint()
+            .map_err(|_| {
+                KillSwitchStateError::LoadFailed("cancelled before mutation admission".into())
+            })
+            .and_then(|()| {
+                db_path
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|path| acquire_kill_switch_fence(path))
+            });
+        let loaded = match (&fence, &db_path) {
+            (Ok(_), Ok(path)) => path
+                .to_str()
+                .ok_or(KillSwitchStateError::FenceFailed)
+                .and_then(|path| load_kill_switch_state_from_path_with_cx(cx, path)),
+            (Err(error), _) => Err(error.clone()),
+            (_, Err(error)) => Err(error.clone()),
+        };
+        apply_persisted_kill_switch(&mut engine, loaded, now_ms());
+        effect_fence = fence.ok();
+        decision = engine.authorize(&input);
+    }
     if decision.is_denied() {
         let reason = policy_reason(&decision)
             .unwrap_or("Policy denied this MCP mutation")
@@ -1099,7 +1142,7 @@ fn mcp_authorize_mcp_mutation(
             Some(POLICY_DENY_HINT.to_string()),
             elapsed_ms(start),
         );
-        return Some(envelope_to_content(envelope));
+        return Err(envelope_to_content(envelope));
     }
     if decision.requires_approval() {
         // br-ft-6h1rv: this surface does not wire ApprovalStore;
@@ -1143,9 +1186,24 @@ fn mcp_authorize_mcp_mutation(
              path returned a misleading 'obtain an allow-once token and retry' hint."
         ));
         let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, hint, elapsed_ms(start));
-        return Some(envelope_to_content(envelope));
+        return Err(envelope_to_content(envelope));
     }
-    None
+    if cx.checkpoint().is_err() {
+        return Err(envelope_to_content(McpEnvelope::<()>::error(
+            MCP_ERR_POLICY,
+            "MCP mutation cancelled before dispatch",
+            None,
+            elapsed_ms(start),
+        )));
+    }
+    effect_fence.ok_or_else(|| {
+        envelope_to_content(McpEnvelope::<()>::error(
+            MCP_ERR_POLICY,
+            "MCP mutation has no workspace effect authority",
+            None,
+            elapsed_ms(start),
+        ))
+    })
 }
 
 /// ft-rsqap: best-effort audit-table write for a denied/require-approval
@@ -11830,7 +11888,8 @@ impl ToolHandler for WaTxRunTool {
         };
 
         // ft-x86z2: policy gate before any side effect (contract load, tx execute).
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let admission_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -11838,8 +11897,9 @@ impl ToolHandler for WaTxRunTool {
             "tx.run",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
 
         let layout = match tx_mutation_workspace_layout(self.config.as_ref()) {
             Ok(layout) => layout,
@@ -12009,6 +12069,10 @@ impl ToolHandler for WaTxRunTool {
             }
         };
         let mut persisted_contract = contract.clone();
+        // PaneStepExecutor revalidates the persisted switch under its own
+        // per-effect fence. Retaining this admission guard would self-contend
+        // and would prevent a later operator stop from fencing subsequent steps.
+        drop(admission_fence);
         let execution_result =
             execution_engine.execute_with_store(&mut persisted_contract, &mut idem_store, now_ms);
         let save_result = mcp_save_mission_tx_contract_to_path(
@@ -12154,7 +12218,8 @@ impl ToolHandler for WaTxRollbackTool {
         };
 
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let admission_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -12162,8 +12227,9 @@ impl ToolHandler for WaTxRollbackTool {
             "tx.rollback",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
 
         let layout = match tx_mutation_workspace_layout(self.config.as_ref()) {
             Ok(layout) => layout,
@@ -12336,6 +12402,8 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
         let mut persisted_contract = contract.clone();
+        // Compensation uses the same independently fenced executor as commit.
+        drop(admission_fence);
         let rollback_result = match execution_engine.rollback_with_store(
             &mut persisted_contract,
             &mut idem_store,
@@ -14075,7 +14143,7 @@ impl ToolHandler for WaMissionPauseTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: MissionPauseParams = match serde_json::from_value(arguments) {
             Ok(parsed) => parsed,
@@ -14104,7 +14172,8 @@ impl ToolHandler for WaMissionPauseTool {
         };
 
         // ft-x86z2: policy gate before mission load + state transition.
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let _effect_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14112,8 +14181,9 @@ impl ToolHandler for WaMissionPauseTool {
             "mission.pause",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
 
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
@@ -14236,7 +14306,7 @@ impl ToolHandler for WaMissionResumeTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: MissionResumeParams = if arguments.is_null() {
             MissionResumeParams {
@@ -14259,7 +14329,8 @@ impl ToolHandler for WaMissionResumeTool {
         };
 
         // ft-x86z2: policy gate before mission load + state transition.
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let _effect_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14267,8 +14338,9 @@ impl ToolHandler for WaMissionResumeTool {
             "mission.resume",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
 
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
@@ -14395,7 +14467,7 @@ impl ToolHandler for WaMissionAbortTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: MissionAbortParams = match serde_json::from_value(arguments) {
             Ok(parsed) => parsed,
@@ -14424,7 +14496,8 @@ impl ToolHandler for WaMissionAbortTool {
         };
 
         // ft-x86z2: policy gate before mission load + abort decision.
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let _effect_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             None,
             &self.policy_rate_limiter,
@@ -14432,8 +14505,9 @@ impl ToolHandler for WaMissionAbortTool {
             "mission.abort",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
 
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
@@ -14563,7 +14637,7 @@ impl ToolHandler for WaEventsAnnotateTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: EventsAnnotateParams = match serde_json::from_value(arguments) {
@@ -14621,7 +14695,8 @@ impl ToolHandler for WaEventsAnnotateTool {
             }
         }
 
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let admission_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
@@ -14629,8 +14704,12 @@ impl ToolHandler for WaEventsAnnotateTool {
             "event.annotate",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
+        // The executing storage writer rechecks the switch and owns its fence
+        // through commit, even when this caller stops waiting after enqueue.
+        drop(admission_fence);
 
         let db_path = Arc::clone(&self.db_path);
         let runtime = CompatRuntimeBuilder::current_thread()
@@ -14638,9 +14717,10 @@ impl ToolHandler for WaEventsAnnotateTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let storage =
+                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
             let prior_annotations = storage
-                .get_event_annotations(params.event_id)
+                .get_event_annotations_with_cx(ctx.cx(), params.event_id)
                 .await?
                 .ok_or_else(|| {
                     crate::Error::Storage(crate::StorageError::Database(format!(
@@ -14651,7 +14731,12 @@ impl ToolHandler for WaEventsAnnotateTool {
             let prior_note = prior_annotations.note.clone();
 
             storage
-                .set_event_note(params.event_id, params.note.clone(), params.by.clone())
+                .set_event_note_with_cx(
+                    ctx.cx(),
+                    params.event_id,
+                    params.note.clone(),
+                    params.by.clone(),
+                )
                 .await?;
 
             let ts = mcp_now_ms_i64();
@@ -14700,7 +14785,7 @@ impl ToolHandler for WaEventsAnnotateTool {
                 .await;
 
             let annotations = storage
-                .get_event_annotations(params.event_id)
+                .get_event_annotations_with_cx(ctx.cx(), params.event_id)
                 .await?
                 .ok_or_else(|| {
                     crate::Error::Storage(crate::StorageError::Database(format!(
@@ -14792,7 +14877,7 @@ impl ToolHandler for WaEventsTriageTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: EventsTriageParams = match serde_json::from_value(arguments) {
@@ -14850,7 +14935,8 @@ impl ToolHandler for WaEventsTriageTool {
             }
         }
 
-        if let Some(deny) = mcp_authorize_mcp_mutation(
+        let admission_fence = match mcp_authorize_mcp_mutation(
+            ctx.cx(),
             self.config.as_ref(),
             Some(self.db_path.as_ref().as_path()),
             &self.policy_rate_limiter,
@@ -14858,8 +14944,11 @@ impl ToolHandler for WaEventsTriageTool {
             "event.triage",
             start,
         ) {
-            return deny;
-        }
+            Ok(fence) => fence,
+            Err(deny) => return deny,
+        };
+        // The writer owns final admission and settlement, not this request.
+        drop(admission_fence);
 
         let db_path = Arc::clone(&self.db_path);
         let runtime = CompatRuntimeBuilder::current_thread()
@@ -14867,10 +14956,16 @@ impl ToolHandler for WaEventsTriageTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let storage =
+                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
 
             let changed = storage
-                .set_event_triage_state(params.event_id, params.state.clone(), params.by.clone())
+                .set_event_triage_state_with_cx(
+                    ctx.cx(),
+                    params.event_id,
+                    params.state.clone(),
+                    params.by.clone(),
+                )
                 .await?;
 
             let ts = mcp_now_ms_i64();
@@ -14928,7 +15023,7 @@ impl ToolHandler for WaEventsTriageTool {
                 .await;
 
             let annotations = storage
-                .get_event_annotations(params.event_id)
+                .get_event_annotations_with_cx(ctx.cx(), params.event_id)
                 .await?
                 .ok_or_else(|| {
                     crate::Error::Storage(crate::StorageError::Database(format!(
@@ -15010,7 +15105,7 @@ impl ToolHandler for WaEventsLabelTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: EventsLabelParams = match serde_json::from_value(arguments) {
@@ -15091,7 +15186,8 @@ impl ToolHandler for WaEventsLabelTool {
         // tightened mutation policy.
         let is_mutation = params.add.is_some() || params.remove.is_some();
         if is_mutation {
-            if let Some(deny) = mcp_authorize_mcp_mutation(
+            let admission_fence = match mcp_authorize_mcp_mutation(
+                ctx.cx(),
                 self.config.as_ref(),
                 Some(self.db_path.as_ref().as_path()),
                 &self.policy_rate_limiter,
@@ -15099,8 +15195,12 @@ impl ToolHandler for WaEventsLabelTool {
                 "event.label",
                 start,
             ) {
-                return deny;
-            }
+                Ok(fence) => fence,
+                Err(deny) => return deny,
+            };
+            // Mutation commands re-admit in the writer; read-only listing
+            // remains available without acquiring mutation authority.
+            drop(admission_fence);
         }
 
         let db_path = Arc::clone(&self.db_path);
@@ -15109,12 +15209,18 @@ impl ToolHandler for WaEventsLabelTool {
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let storage =
+                StorageHandle::new_with_cx(ctx.cx(), &db_path.to_string_lossy()).await?;
             let ts = mcp_now_ms_i64();
 
             let changed = if let Some(label) = params.add.clone() {
                 let inserted = storage
-                    .add_event_label(params.event_id, label.clone(), params.by.clone())
+                    .add_event_label_with_cx(
+                        ctx.cx(),
+                        params.event_id,
+                        label.clone(),
+                        params.by.clone(),
+                    )
                     .await?;
                 let input_summary =
                     format!("wa.events_label event_id={} add={label}", params.event_id);
@@ -15160,7 +15266,7 @@ impl ToolHandler for WaEventsLabelTool {
                 Some(inserted)
             } else if let Some(label) = params.remove.clone() {
                 let removed = storage
-                    .remove_event_label(params.event_id, label.clone())
+                    .remove_event_label_with_cx(ctx.cx(), params.event_id, label.clone())
                     .await?;
                 let input_summary = format!(
                     "wa.events_label event_id={} remove={label}",
@@ -15211,7 +15317,7 @@ impl ToolHandler for WaEventsLabelTool {
             };
 
             let annotations = storage
-                .get_event_annotations(params.event_id)
+                .get_event_annotations_with_cx(ctx.cx(), params.event_id)
                 .await?
                 .ok_or_else(|| {
                     crate::Error::Storage(crate::StorageError::Database(format!(
@@ -24672,7 +24778,9 @@ mod tests {
     fn mission_mutation_tools_serialize_revisions_and_reject_stale_abort_resume() {
         let dir = workspace_tempdir();
         let path = write_mission_file(&dir, MissionLifecycleState::Running);
-        let cfg = config();
+        let db_path = dir.path().join("mission.sqlite3");
+        seed_event(&db_path);
+        let cfg = config_with_db_path(&db_path);
         let query = WaMissionStateTool::new(Arc::clone(&cfg));
         let pause = WaMissionPauseTool::new(Arc::clone(&cfg));
         let resume = WaMissionResumeTool::new(Arc::clone(&cfg));
@@ -24922,7 +25030,9 @@ mod tests {
     fn tx_run_tool_rejects_unknown_fail_step_with_guidance() {
         let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
-        let tool = WaTxRunTool::new(config());
+        let db_path = dir.path().join("transaction.sqlite3");
+        seed_event(&db_path);
+        let tool = WaTxRunTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -25575,6 +25685,7 @@ mod tests {
     #[test]
     fn tx_run_tool_denies_when_real_prepare_targets_are_missing() {
         let (_db_dir, db_path) = temp_db_path();
+        seed_event(&db_path);
         let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
@@ -25818,7 +25929,9 @@ mod tests {
     fn tx_rollback_tool_rejects_committed_contract_without_commit_receipts() {
         let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Committed);
-        let tool = WaTxRollbackTool::new(config());
+        let db_path = dir.path().join("transaction.sqlite3");
+        seed_event(&db_path);
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -25957,7 +26070,9 @@ mod tests {
     fn tx_rollback_tool_rejects_unknown_compensation_step_with_guidance() {
         let dir = workspace_tempdir();
         let contract_path = write_tx_contract_with_receipt_only_commit_claims(&dir);
-        let tool = WaTxRollbackTool::new(config());
+        let db_path = dir.path().join("transaction.sqlite3");
+        seed_event(&db_path);
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -25987,7 +26102,9 @@ mod tests {
         let dir = workspace_tempdir();
         let contract_path = write_tx_contract_with_receipt_only_commit_claims(&dir);
         let original_contract = std::fs::read(&contract_path).expect("read forged contract");
-        let tool = WaTxRollbackTool::new(config());
+        let db_path = dir.path().join("transaction.sqlite3");
+        seed_event(&db_path);
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -29396,6 +29513,7 @@ exit 17",
         let cfg = require_approval_mcp_exec_command_config("tx\\.run", "test require approval");
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
+            test_mcp_context().cx(),
             cfg.as_ref(),
             None,
             &rate_limiter,
@@ -29404,6 +29522,7 @@ exit 17",
             std::time::Instant::now(),
         );
         let envelope_content = result
+            .err()
             .expect("RequireApproval policy must produce an error envelope")
             .expect("envelope_to_content infallible for valid envelope");
         let envelope = parse_json_content(envelope_content);
@@ -29453,6 +29572,7 @@ exit 17",
             require_approval_mcp_exec_command_config("mission\\.pause", "test require approval");
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
         let result = super::mcp_authorize_mcp_mutation(
+            test_mcp_context().cx(),
             cfg.as_ref(),
             None,
             &rate_limiter,
@@ -29461,6 +29581,7 @@ exit 17",
             std::time::Instant::now(),
         );
         let envelope_content = result
+            .err()
             .expect("RequireApproval policy must produce an error envelope")
             .expect("envelope_to_content infallible for valid envelope");
         let envelope = parse_json_content(envelope_content);
@@ -29474,27 +29595,237 @@ exit 17",
         );
     }
 
-    /// br-ft-6h1rv: vacuous-regression guard. When the policy does
-    /// NOT return RequireApproval (default config has no policy
-    /// rules; helper returns None → Allow), the helper returns None
-    /// and the tool proceeds. This pins that the new fail-closed
-    /// language doesn't false-positive on the legitimate Allow path.
+    /// An allowed request owns authority until its effect settles. The real
+    /// operator transition in another process must remain pending until the
+    /// returned guard drops; permission is not merely a cached decision.
     #[test]
-    fn mcp_authorize_mutation_returns_none_on_allow_ft_6h1rv() {
-        let cfg = config();
+    fn mcp_authorize_mutation_returns_effect_fence_on_allow_ft_xxfwy_42() {
+        use crate::policy_kill_switch_state::tests::transition_in_test_process;
+
+        let (_dir, db_path) = temp_db_path();
+        seed_event(&db_path);
+        let cfg = config_with_db_path(&db_path);
         let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
-        let result = super::mcp_authorize_mcp_mutation(
+        let fence = super::mcp_authorize_mcp_mutation(
+            test_mcp_context().cx(),
             cfg.as_ref(),
             None,
             &rate_limiter,
             "wa.tx_run",
             "tx.run",
             std::time::Instant::now(),
-        );
+        )
+        .expect("Allow must retain effect authority until the caller settles");
         assert!(
-            result.is_none(),
-            "ft-6h1rv: default-config Allow path must return None (proceed)"
+            transition_in_test_process(&db_path, "pending").contains("KILL_SWITCH_CHILD_PENDING")
         );
+        drop(fence);
+        assert!(
+            transition_in_test_process(&db_path, "trip").contains("KILL_SWITCH_CHILD_RECEIPT")
+        );
+    }
+
+    #[test]
+    fn mission_controls_observe_later_operator_trip_and_reset_ft_xxfwy_42() {
+        use crate::policy_kill_switch_state::tests::transition_in_test_process;
+
+        let dir = workspace_tempdir();
+        let path = write_mission_file(&dir, MissionLifecycleState::Running);
+        let db_path = dir.path().join("mission.sqlite3");
+        seed_event(&db_path);
+        let cfg = config_with_db_path(&db_path);
+        // Construct all long-lived tools before the independent operator acts.
+        let query = WaMissionStateTool::new(Arc::clone(&cfg));
+        let pause = WaMissionPauseTool::new(Arc::clone(&cfg));
+        let resume = WaMissionResumeTool::new(Arc::clone(&cfg));
+        let abort = WaMissionAbortTool::new(cfg);
+        let context = test_mcp_context();
+        let initial = parse_json_content(
+            query.call(&context, serde_json::json!({"mission_file": path})).unwrap(),
+        );
+        assert_eq!(initial["ok"], true, "{initial}");
+        let before = std::fs::read(&path).unwrap();
+        transition_in_test_process(&db_path, "trip");
+
+        for result in [
+            pause.call(&context, serde_json::json!({"mission_file": path, "reason": "pause"})),
+            resume.call(&context, serde_json::json!({"mission_file": path})),
+            abort.call(&context, serde_json::json!({"mission_file": path, "reason": "abort"})),
+        ] {
+            let denied = parse_json_content(result.unwrap());
+            assert_eq!(denied["ok"], false, "{denied}");
+            assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let readable = parse_json_content(
+            query.call(&context, serde_json::json!({"mission_file": path})).unwrap(),
+        );
+        assert_eq!(readable["ok"], true, "{readable}");
+
+        transition_in_test_process(&db_path, "reset");
+        let accepted = parse_json_content(
+            pause.call(&context, serde_json::json!({
+                "mission_file": path,
+                "reason": "after-reset",
+                "expected_token": initial["data"]["revision_token"]
+            })).unwrap(),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(
+            super::mcp_load_mission_from_path(&path).unwrap().lifecycle_state,
+            MissionLifecycleState::Paused
+        );
+    }
+
+    #[test]
+    fn mission_mutation_rejects_missing_cancelled_contended_and_corrupt_authority_ft_xxfwy_42() {
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_STATE_KEY, acquire_kill_switch_fence,
+        };
+
+        let dir = workspace_tempdir();
+        let path = write_mission_file(&dir, MissionLifecycleState::Running);
+        let before = std::fs::read(&path).unwrap();
+        let db_path = dir.path().join("mission.sqlite3");
+        let tool = WaMissionPauseTool::new(config_with_db_path(&db_path));
+        let arguments = serde_json::json!({"mission_file": path, "reason": "must-not-write"});
+
+        let missing = parse_json_content(
+            tool.call(&test_mcp_context(), arguments.clone()).unwrap(),
+        );
+        assert_eq!(missing["error_code"], MCP_ERR_POLICY, "{missing}");
+        assert!(!db_path.exists(), "admission must never manufacture disarmed storage");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        seed_event(&db_path);
+        let cx = crate::cx::Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let cancelled = parse_json_content(
+            tool.call(&McpContext::new(cx, 2), arguments.clone()).unwrap(),
+        );
+        assert_eq!(cancelled["error_code"], MCP_ERR_POLICY, "{cancelled}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let fence = acquire_kill_switch_fence(&db_path).unwrap();
+        let contended = parse_json_content(
+            tool.call(&test_mcp_context(), arguments.clone()).unwrap(),
+        );
+        assert_eq!(contended["error_code"], MCP_ERR_POLICY, "{contended}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(fence);
+
+        rusqlite::Connection::open(&db_path).unwrap().execute(
+            "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+            [KILL_SWITCH_STATE_KEY, "private malformed stop state"],
+        ).unwrap();
+        let corrupt = parse_json_content(
+            tool.call(&test_mcp_context(), arguments).unwrap(),
+        );
+        assert_eq!(corrupt["error_code"], MCP_ERR_POLICY, "{corrupt}");
+        assert!(!corrupt.to_string().contains("private malformed stop state"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn tx_mutation_admission_observes_persisted_stop_before_dispatch_ft_xxfwy_42() {
+        use crate::policy_kill_switch_state::tests::transition_in_test_process;
+
+        let dir = workspace_tempdir();
+        let db_path = dir.path().join("transaction.sqlite3");
+        seed_event(&db_path);
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let before = std::fs::read(&contract_path).unwrap();
+        let cfg = config_with_db_path(&db_path);
+        let run = WaTxRunTool::new(Arc::clone(&cfg));
+        let rollback = WaTxRollbackTool::new(cfg);
+        let _guard = lock_tx_run_test_wezterm_override();
+        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
+        transition_in_test_process(&db_path, "trip");
+
+        for result in [
+            run.call(&test_mcp_context(), serde_json::json!({"contract_file": contract_path})),
+            rollback.call(&test_mcp_context(), serde_json::json!({"contract_file": contract_path})),
+        ] {
+            let denied = parse_json_content(result.unwrap());
+            assert_eq!(denied["ok"], false, "{denied}");
+            assert_eq!(denied["error_code"], MCP_ERR_POLICY, "{denied}");
+            assert_eq!(std::fs::read(&contract_path).unwrap(), before);
+        }
+        assert!(!dir.path().join(".ft").join("tx_ledgers").exists());
+    }
+
+    #[test]
+    fn event_metadata_tools_use_explicit_database_stop_tiers_ft_xxfwy_42() {
+        use crate::policy_kill_switch_state::{
+            KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+        use crate::policy_quarantine::KillSwitchLevel;
+        use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
+
+        for level in [
+            KillSwitchLevel::SoftStop,
+            KillSwitchLevel::HardStop,
+            KillSwitchLevel::EmergencyHalt,
+        ] {
+            let (_dir, db_path) = temp_db_path();
+            let event_id = seed_event(&db_path);
+            let before = event_mutation_snapshot(&db_path, event_id);
+            let unrelated_db = db_path.with_file_name("unrelated.sqlite3");
+            let cfg = config_with_db_path(&unrelated_db);
+            let annotate = WaEventsAnnotateTool::new(Arc::clone(&cfg), Arc::clone(&db_path));
+            let triage = WaEventsTriageTool::new(Arc::clone(&cfg), Arc::clone(&db_path));
+            let label = WaEventsLabelTool::new(cfg, Arc::clone(&db_path));
+            let operator = RusqliteBackend::open_path(
+                &db_path,
+                &OpenConfig { wal_mode: false, ..Default::default() },
+            ).unwrap();
+            transition_kill_switch_from_backend(
+                &operator,
+                KillSwitchTransition::Trip {
+                    level,
+                    by: "operator",
+                    reason: "private operator detail",
+                },
+                now_ms(),
+            ).unwrap();
+            drop(operator);
+
+            let allowed = level == KillSwitchLevel::SoftStop;
+            for result in [
+                annotate.call(&test_mcp_context(), serde_json::json!({
+                    "event_id": event_id, "note": "accepted metadata"
+                })),
+                triage.call(&test_mcp_context(), serde_json::json!({
+                    "event_id": event_id, "state": "investigating"
+                })),
+                label.call(&test_mcp_context(), serde_json::json!({
+                    "event_id": event_id, "add": "reviewed"
+                })),
+            ] {
+                let envelope = parse_json_content(result.unwrap());
+                assert_eq!(envelope["ok"], allowed, "{level}: {envelope}");
+                assert!(!envelope.to_string().contains("private operator detail"));
+                if !allowed {
+                    assert_eq!(envelope["error_code"], MCP_ERR_POLICY, "{envelope}");
+                }
+            }
+            if allowed {
+                assert_ne!(event_mutation_snapshot(&db_path, event_id), before);
+            } else {
+                assert_eq!(event_mutation_snapshot(&db_path, event_id), before);
+                for name in ["wa.events_annotate", "wa.events_triage", "wa.events_label"] {
+                    assert_event_denial_audited(&db_path, name);
+                }
+            }
+
+            let readable = parse_json_content(
+                label.call(&test_mcp_context(), serde_json::json!({
+                    "event_id": event_id, "list": true
+                })).unwrap(),
+            );
+            assert_eq!(readable["ok"], true, "{readable}");
+            assert!(!unrelated_db.exists(), "explicit workspace authority must win");
+        }
     }
 
     /// br-ft-6h1rv: serde stability for the new audit-record

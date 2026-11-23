@@ -25012,8 +25012,9 @@ impl Drop for PooledReadConn {
 /// ft-rsqap: sync-path convenience for writing a policy denial audit row
 /// without going through the `StorageHandle` writer thread.
 ///
-/// Opens a short-lived `RusqliteBackend`, sets a 5s busy timeout so a
-/// contended WAL doesn't drop the audit silently, runs one INSERT, closes.
+/// Opens an existing database through a short-lived `RusqliteBackend`,
+/// sets a 5s busy timeout, runs one INSERT, and closes. Opening never creates
+/// storage, including when the database disappears after mutation admission.
 /// Intended for callers that live in a synchronous context (e.g.
 /// `mcp_authorize_mcp_mutation`) and can't easily await the async
 /// `StorageHandle::record_policy_denial_audit` path.
@@ -25025,16 +25026,20 @@ pub fn record_policy_denial_audit_blocking(
     db_path: &Path,
     record: &PolicyDeniedAuditRecord,
 ) -> Result<i64> {
-    let config = crate::storage_backend_trait::OpenConfig {
-        wal_mode: false,
-        ..crate::storage_backend_trait::OpenConfig::default()
-    };
-    let backend = RusqliteBackend::open_path(db_path, &config).map_err(|e| {
+    // Denial observability must never create a fresh, disarmed database.
+    // Enforce existence in the open itself, not with a racy path precheck.
+    let connection = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .map_err(|e| {
         StorageError::Database(format!(
             "open {} for policy_denied_audit: {e}",
             db_path.display()
         ))
     })?;
+    let backend = RusqliteBackend::new(connection)
+        .map_err(|error| storage_backend_error("Initialize policy denial audit backend", error))?;
     backend
         .set_busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| {
