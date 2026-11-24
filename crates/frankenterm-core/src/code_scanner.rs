@@ -1659,6 +1659,11 @@ report() {{
         }
 
         fn run(future: impl std::future::Future<Output = ()>) {
+            // Scans run controlled supervisors; a concurrent test that fills
+            // the process-wide limit would otherwise refuse them.
+            let _shared = crate::runtime_async::process::CONTROLLED_SUPERVISOR_TEST_GATE
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
                 .enable_all()
                 .build()

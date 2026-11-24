@@ -4102,6 +4102,13 @@ pub mod process {
     const CONTROLLED_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
     static CONTROLLED_SUPERVISORS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    /// The supervisor limit is process-wide, and lib tests share a process. A
+    /// test that fills or counts the limit holds this exclusively; other tests
+    /// that run controlled supervisors hold it shared, so neither sees the
+    /// other's permits.
+    #[cfg(test)]
+    pub(crate) static CONTROLLED_SUPERVISOR_TEST_GATE: std::sync::RwLock<()> =
+        std::sync::RwLock::new(());
     // A forcibly dropped caller cannot join asynchronously in Drop. Retain
     // its finite owner here, bounded by the same admission permits, and reap
     // finished owners before the next admission. Never call detachment joined.
@@ -6260,6 +6267,9 @@ pub mod process {
         #[cfg(unix)]
         #[test]
         fn controlled_supervisors_bound_admission_cancel_before_spawn_and_retain_dropped_owners() {
+            let _exclusive = CONTROLLED_SUPERVISOR_TEST_GATE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
                 .enable_all()
                 .build()
