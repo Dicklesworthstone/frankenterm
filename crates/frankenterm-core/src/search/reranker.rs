@@ -381,14 +381,14 @@ fn rerank_search_rows<T>(
             }
         })
         .collect();
-    let reranked = reranker.rerank(query, documents.clone())?;
+    let model_output = reranker.rerank(query, documents.clone())?;
     let scores = validate_model_scores(
         count,
-        reranked
+        model_output
             .iter()
             .map(|doc| (usize::try_from(doc.id).unwrap_or(usize::MAX), doc.score)),
     )?;
-    for doc in &reranked {
+    for doc in &model_output {
         let index = usize::try_from(doc.id).map_err(|_| {
             RerankError::ModelError("reranker returned an unknown candidate identity".into())
         })?;
@@ -1892,7 +1892,8 @@ mod tests {
         assert_eq!(result.len(), documents.len());
         assert!(result.iter().all(|doc| doc.score.is_finite()));
         assert!(result.windows(2).all(|pair| pair[0].score >= pair[1].score));
-        assert!(result.windows(2).any(|pair| pair[0].score != pair[1].score));
+        // Sorted non-increasing above, so a strict drop means the scores differ.
+        assert!(result.windows(2).any(|pair| pair[0].score > pair[1].score));
         let mut ids: Vec<_> = result.iter().map(|doc| doc.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![31, 72, 94]);
