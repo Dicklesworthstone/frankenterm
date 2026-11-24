@@ -38282,6 +38282,17 @@ mod watch_events_tests {
         let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
             .lock()
             .expect("serialize global claimed-output coordinator tests");
+        // Darwin's F_GETFL also reports FWASWRITTEN (0x10000), a status bit
+        // the kernel sets once a descriptor is written; F_SETFL cannot clear
+        // it, so it is not part of the flags a guard can restore.
+        let restorable = |raw: i32| {
+            let flags = nix::fcntl::OFlag::from_bits_retain(raw);
+            if cfg!(target_os = "macos") {
+                flags & !nix::fcntl::OFlag::from_bits_retain(0x0001_0000)
+            } else {
+                flags
+            }
+        };
 
         for explicitly_restore in [true, false] {
             let (descriptor, _peer) =
@@ -38312,8 +38323,8 @@ mod watch_events_tests {
             let restored_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
                 .expect("read restored descriptor flags");
             assert_eq!(
-                nix::fcntl::OFlag::from_bits_retain(restored_raw),
-                original,
+                restorable(restored_raw),
+                restorable(original.bits()),
                 "both explicit completion and Drop must restore the exact original flags"
             );
         }
@@ -38352,8 +38363,8 @@ mod watch_events_tests {
         let restored_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
             .expect("read restored control-output flags");
         assert_eq!(
-            nix::fcntl::OFlag::from_bits_retain(restored_raw),
-            original,
+            restorable(restored_raw),
+            restorable(original.bits()),
             "the command-lifetime backpressure guard must restore exact descriptor flags"
         );
     }
@@ -46591,10 +46602,13 @@ where
 fn distributed_shutdown_tcp_test_reader(
     reader: &mut runtime_io::BufReader<runtime_net::TcpStream>,
 ) {
-    reader
-        .get_mut()
-        .shutdown(std::net::Shutdown::Both)
-        .expect("shutdown distributed listener test stream");
+    match reader.get_mut().shutdown(std::net::Shutdown::Both) {
+        Ok(()) => {}
+        // BSD-derived systems report ENOTCONN once the peer has already torn
+        // the connection down; the stream is closed either way.
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(error) => panic!("shutdown distributed listener test stream: {error}"),
+    }
 }
 
 #[cfg(all(test, feature = "distributed"))]

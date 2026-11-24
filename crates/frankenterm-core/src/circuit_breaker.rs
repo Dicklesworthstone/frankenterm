@@ -752,6 +752,11 @@ mod tests {
     use super::*;
     use crate::degradation::{OverallStatus, active_degradations, recover};
 
+    /// Serializes the tests that drive the process-wide degradation manager
+    /// and cascade tracker through mapped circuits. Each one recovers
+    /// subsystems the other asserts on, so in parallel they race.
+    static GLOBAL_DEGRADATION_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn transport_key(kind: TransportCircuitKind, components: &[&str]) -> TransportCircuitKey {
         let components: Vec<_> = components.iter().map(std::ffi::OsStr::new).collect();
         TransportCircuitKey::new(kind, &components)
@@ -925,6 +930,9 @@ mod tests {
 
     #[test]
     fn circuit_open_enters_degraded_mode_for_mapped_subsystem() {
+        let _serial = GLOBAL_DEGRADATION_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = DegradationManager::init_global();
         recover(Subsystem::WeztermCli);
 
@@ -945,6 +953,9 @@ mod tests {
 
     #[test]
     fn cascade_detection_degrades_workflow_engine() {
+        let _serial = GLOBAL_DEGRADATION_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = DegradationManager::init_global();
         recover(Subsystem::WeztermCli);
         recover(Subsystem::MuxConnection);

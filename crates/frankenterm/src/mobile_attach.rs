@@ -614,17 +614,28 @@ mod tests {
         let input = NonblockingDescriptor::duplicate(&input).unwrap();
         let output = NonblockingDescriptor::duplicate(&output).unwrap();
         let server = NonblockingDescriptor::duplicate(&server).unwrap();
-        assert!(
-            relay(
-                &input.fd,
-                &output.fd,
-                &server.fd,
-                Duration::from_secs(5),
-                Duration::from_secs(5)
-            )
-            .is_err()
+        let result = relay(
+            &input.fd,
+            &output.fd,
+            &server.fd,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
         );
+        // The reply must arrive intact either way (checked by the consumer).
+        // Only a kernel that refuses the input makes it uncertain; macOS
+        // accepts and discards writes to a peer that stopped reading.
+        if read_shutdown_peer_refuses_writes() {
+            assert!(result.is_err(), "refused input must be reported");
+        }
         responder.join().unwrap();
         consumer.join().unwrap();
+    }
+
+    /// Whether a write to a Unix stream whose peer shut down reading fails:
+    /// Linux returns EPIPE; macOS accepts the bytes and drops them.
+    fn read_shutdown_peer_refuses_writes() -> bool {
+        let (mut probe, closed) = UnixStream::pair().unwrap();
+        closed.shutdown(std::net::Shutdown::Read).unwrap();
+        probe.write_all(b"probe").is_err()
     }
 }
