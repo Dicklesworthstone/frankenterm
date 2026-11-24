@@ -800,7 +800,18 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                         machineID = id
                         let session = try self.liveDirectTerminal(machineID: id, controllerID: controllerID)
                         guard let pane = self.selection(for: session).paneID else { throw TerminalFleetOverview.Failure.stale }
-                        focusPlan = try self.navigation.navigation.plan(paneID: pane)
+                        if self.navigation.navigation.machines.first(where: { $0.id == id })?
+                            .panes.contains(where: { $0.id == pane }) == true {
+                            focusPlan = try self.navigation.navigation.plan(paneID: pane)
+                        } else if self.sessions[id] === session {
+                            // A machine's primary terminal that connected while
+                            // hidden has no keyboard binding yet, so navigation
+                            // does not list its pane. Showing the machine shows
+                            // it; the selected-session check below confirms.
+                            focusPlan = try self.navigation.navigation.plan(machineID: id)
+                        } else {
+                            throw TerminalFleetOverview.Failure.stale
+                        }
                     }
                     if let plan = focusPlan {
                         try await self.navigation.perform(plan)

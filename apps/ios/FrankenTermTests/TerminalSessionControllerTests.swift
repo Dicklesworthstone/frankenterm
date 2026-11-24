@@ -939,8 +939,13 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(mounted[1].input.isEditable)
         mounted[1].input.insertText("echo WRONG-TAB >> \(path)\n")
         let survivor = extras[1], survivorView = mounted[2]
+        // type() returns once the text is queued. The overview refuses to
+        // open over unadmitted local input, so let the primary's line settle.
+        for _ in 0..<400 where primaryView.input.session.accounting.pendingEvents > 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         scene.beginOverview()
-        let visit = try XCTUnwrap(scene.overviewSessionID)
+        let visit = try XCTUnwrap(scene.overviewSessionID, "overview refused: \(String(describing: scene.problem))")
         let fleet = try await scene.makeOverview()
         let terminals = try fleet.search(.init(scope: .directTerminals)).rows
         XCTAssertEqual(terminals.map(\.directControllerID), ([primary] + extras).map { Optional($0.id) })
@@ -948,7 +953,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         let hidden = try XCTUnwrap(terminals.first { $0.directControllerID == survivor.id })
         try scene.chooseOverview(hidden.id, in: fleet)
         scene.finishOverviewDismissal(visit)
-        for _ in 0..<400 where scene.selectedSession !== survivor || scene.navigation.phase != .ready {
+        // The overview job installs the chosen input only after its fence
+        // clears; keys typed before then go to an input it retires.
+        for _ in 0..<400 where scene.selectedSession !== survivor || scene.navigation.phase != .ready
+            || !scene.permitsTerminalCreation {
             try await Task.sleep(for: .milliseconds(10))
         }
         try await type("echo TAB-$FT_TAB >> \(path)", into: survivorView)
@@ -1015,6 +1023,41 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
         let remaining = await live.connections.manager.connections()
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    /// Open Terminal on a machine that is not on screen makes its shell live
+    /// with no keyboard binding, so navigation does not list its pane. The
+    /// fleet overview still lists it under SSH tabs, and choosing it there
+    /// shows that machine.
+    func testOverviewShowsADirectTerminalThatWentLiveWhileHidden() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let alpha = try await connect(scene, "alpha")
+        let alphaView = try shown(alpha)
+        defer { alphaView.removeFromSuperview() }
+        XCTAssertEqual(scene.selectedMachineID, "alpha")
+        scene.openTerminal("beta")
+        let beta = try XCTUnwrap(scene.sessions["beta"])
+        for _ in 0..<400 where beta.phase != .live && !beta.settled { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(beta.phase, .live)
+        XCTAssertTrue(beta.isLiveDirectTerminal)
+        XCTAssertEqual(scene.selectedMachineID, "alpha", "Open Terminal on another machine does not show it")
+        for _ in 0..<400 where scene.navigation.phase != .ready { try await Task.sleep(for: .milliseconds(10)) }
+
+        scene.beginOverview()
+        let visit = try XCTUnwrap(scene.overviewSessionID, "overview refused: \(String(describing: scene.problem))")
+        let fleet = try await scene.makeOverview()
+        let row = try XCTUnwrap(try fleet.search(.init(scope: .directTerminals)).rows.first { $0.directControllerID == beta.id })
+        XCTAssertFalse(row.selected)
+        try scene.chooseOverview(row.id, in: fleet)
+        scene.finishOverviewDismissal(visit)
+        for _ in 0..<400 where scene.selectedSession !== beta || scene.navigation.phase != .ready
+            || !scene.permitsTerminalCreation {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(scene.selectedMachineID, "beta", "choosing it shows it: \(String(describing: scene.problem))")
+        XCTAssertTrue(scene.selectedSession === beta)
+        XCTAssertNil(scene.problem)
+        await scene.close()
     }
 
     /// A layout change (the keyboard's bar on iPad, a window resized) redraws
