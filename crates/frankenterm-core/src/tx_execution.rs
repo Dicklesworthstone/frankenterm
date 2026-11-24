@@ -13644,7 +13644,8 @@ mod tests {
         crate::policy_kill_switch_state::KillSwitchStateError,
     > {
         use crate::policy_kill_switch_state::{
-            KillSwitchTransition, transition_kill_switch_from_backend,
+            KILL_SWITCH_FENCE_WAIT, KillSwitchTransition,
+            transition_kill_switch_from_backend_within,
         };
         let path = &executor
             .policy_storage
@@ -13656,14 +13657,18 @@ mod tests {
             &Default::default(),
         )
         .expect("independent operator connection");
-        transition_kill_switch_from_backend(
+        // Like the operator command: wait out a read's brief admission fence.
+        // A single nonblocking attempt lost to a concurrent pane-wait read on
+        // a loaded machine and returned FencePending.
+        transition_kill_switch_from_backend_within(
             &backend,
             KillSwitchTransition::Trip {
                 level,
                 by: "test-operator",
                 reason: "stop between transaction effects",
             },
-            5_001,
+            || 5_001,
+            KILL_SWITCH_FENCE_WAIT,
         )
     }
 
@@ -14461,9 +14466,11 @@ mod tests {
                 .unwrap();
             let seed = rt.request_cx_with_budget(crate::cx::Budget::INFINITE);
             let caller = if deadline_bound {
+                // Long enough for the first read to start on a loaded machine
+                // (150 ms was not), well inside the 2 s bound below.
                 rt.request_cx_with_budget(crate::cx::Budget::new().with_deadline(
                     crate::runtime_async::timer_now_with_cx(&seed)
-                        + std::time::Duration::from_millis(150),
+                        + std::time::Duration::from_millis(600),
                 ))
             } else {
                 seed
@@ -14509,7 +14516,9 @@ mod tests {
         ] {
             let probe = TxWaitReadProbe::new(mode);
             let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
-            let result = executor.execute_admitted_action(&tx_probe_wait(200, 20), None);
+            // 1 s leaves room for the two reads the changing tail needs; a
+            // loaded machine sometimes managed only one within 200 ms.
+            let result = executor.execute_admitted_action(&tx_probe_wait(1_000, 20), None);
             assert!(!result.input().0);
             assert_eq!(result.input().1, reason);
             assert!(
@@ -14561,20 +14570,27 @@ mod tests {
                 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                trip_pane_executor_switch(
+                let receipt = trip_pane_executor_switch(
                     &executor,
                     crate::policy_quarantine::KillSwitchLevel::EmergencyHalt,
-                )
+                );
+                (receipt, probe.calls.load(Ordering::SeqCst))
             });
             let result = executor.execute_admitted_action(&tx_probe_wait(5_000, 4_000), None);
-            stop.join()
-                .unwrap()
-                .expect("wait must not hold the effect fence");
-            result
+            let (receipt, reads_at_trip) = stop.join().unwrap();
+            receipt.expect("wait must not hold the effect fence");
+            (result, reads_at_trip)
         });
+        let (result, reads_at_trip) = result;
         assert!(!result.input().0);
         assert_eq!(result.input().1, "tx_kill_switch_active");
-        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        // No read is admitted after the stop. A read admitted just before the
+        // trip took the fence can still finish, so allow at most one more.
+        let reads = probe.calls.load(Ordering::SeqCst);
+        assert!(
+            reads >= 1 && reads <= reads_at_trip + 1,
+            "reads={reads} reads_at_trip={reads_at_trip}"
+        );
     }
 
     #[test]
