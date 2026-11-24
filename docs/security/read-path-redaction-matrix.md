@@ -30,6 +30,7 @@ The configured-policy follow-up covers these production boundaries:
 | MCP call audits | Production audit wrappers carry the server policy through the bounded background queue into storage. Argument-key summaries, proxy error evidence, and worker diagnostics use that same policy. |
 | JSONL exports, session reports, and VC export pages | Read-time redaction uses the storage policy, including history written before it existed. VC continuous, pruned, and unavailable-legacy-history branches share it. |
 | Diagnostic bundles | The supplied Config policy is compiled before files are created. Historical text, metadata, and trace string values are normalized and redacted before JSON encoding. |
+| Live desktop and webhook notifications | Storage-backed pipelines use the same handle's configured policy as persistence and mute checks. Extracted string values are normalized and redacted before template JSON encoding, and completed display text is checked again before delivery. Event identities and deduplication remain unchanged. |
 | Recording capture and cast/HTML exports | Capture uses the CLI policy before disk. Explicit-policy export APIs protect retained frames, titles, and marker annotations; existing convenience APIs retain the built-in policy. |
 | Config reload | Changes to redaction patterns, marker, or enablement fields require restart; a running service never reports success while retaining its old immutable policy. |
 

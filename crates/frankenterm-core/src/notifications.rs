@@ -165,7 +165,8 @@ impl NotificationPayload {
 }
 
 fn redact_text(redactor: &Redactor, text: &str) -> String {
-    redactor.redact(text)
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    redactor.redact(&normalized)
 }
 
 fn severity_str(detection: &Detection) -> String {
@@ -387,6 +388,9 @@ pub struct NotificationPipeline {
     gate: NotificationGate,
     senders: Vec<Box<dyn NotificationSender>>,
     mute_store: Option<Arc<crate::runtime_async::RwLock<StorageHandle>>>,
+    /// Standalone callers retain the built-in policy. A storage-backed pipeline
+    /// uses that handle's immutable workspace policy for each delivery.
+    fallback_redactor: Redactor,
 }
 
 impl NotificationPipeline {
@@ -397,10 +401,13 @@ impl NotificationPipeline {
             gate,
             senders,
             mute_store: None,
+            fallback_redactor: Redactor::new(),
         }
     }
 
-    /// Create a pipeline with access to persistent mute storage.
+    /// Create a pipeline with persistent mutes and the storage handle's
+    /// configured redaction policy. Filtering and deduplication still use the
+    /// original event identity; only the outgoing presentation is redacted.
     #[must_use]
     pub fn with_mute_store(
         gate: NotificationGate,
@@ -411,6 +418,7 @@ impl NotificationPipeline {
             gate,
             senders,
             mute_store: Some(storage),
+            fallback_redactor: Redactor::new(),
         }
     }
 
@@ -460,7 +468,7 @@ impl NotificationPipeline {
         pane_uuid: Option<&str>,
         event_id: Option<i64>,
     ) -> crate::Result<NotificationOutcome> {
-        if let Some(storage) = &self.mute_store {
+        let storage_handle = if let Some(storage) = &self.mute_store {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
             let storage_handle = storage
@@ -477,19 +485,26 @@ impl NotificationPipeline {
                     deliveries: Vec::new(),
                 });
             }
-        }
+            Some(storage_handle)
+        } else {
+            None
+        };
 
         let decision = self.gate.should_notify(detection, pane_id, pane_uuid);
         Ok(match decision {
             NotifyDecision::Send {
                 suppressed_since_last,
             } => {
-                let rendered = render_detection(detection, pane_id, event_id);
-                let payload = NotificationPayload::from_detection(
+                let redactor = storage_handle
+                    .as_ref()
+                    .map_or(&self.fallback_redactor, StorageHandle::redactor);
+                let rendered = render_detection(detection, pane_id, event_id, redactor);
+                let payload = NotificationPayload::from_detection_with_redactor(
                     detection,
                     pane_id,
                     &rendered,
                     suppressed_since_last,
+                    redactor,
                 );
                 // ft-xbnl0.2.3: thread caller cx through each sender so
                 // Cx-aware transports (webhooks, SMTP, etc.) respect
@@ -524,7 +539,12 @@ impl NotificationPipeline {
     }
 }
 
-fn render_detection(detection: &Detection, pane_id: u64, event_id: Option<i64>) -> RenderedEvent {
+fn render_detection(
+    detection: &Detection,
+    pane_id: u64,
+    event_id: Option<i64>,
+    redactor: &Redactor,
+) -> RenderedEvent {
     let event = StoredEvent {
         id: event_id.unwrap_or(0),
         pane_id,
@@ -543,7 +563,10 @@ fn render_detection(detection: &Detection, pane_id: u64, event_id: Option<i64>) 
         handled_status: None,
     };
 
-    render_event(&event)
+    // Templates can stringify nested extracted values. Scrub their raw string
+    // leaves before JSON encoding hides terminal controls behind escape text;
+    // the completed payload is normalized and redacted again before dispatch.
+    render_event(&crate::export::redact_event(event, redactor))
 }
 
 fn now_epoch_ms() -> i64 {
@@ -671,6 +694,187 @@ mod tests {
         assert!(!payload.description.contains("sk-abc"));
         assert!(payload.quick_fix.is_some());
         assert!(!payload.quick_fix.unwrap().contains("sk-abc"));
+    }
+
+    const WORKSPACE_NOTIFICATION_CANARY: &str = "warehouse-notification-secret";
+    const WORKSPACE_NOTIFICATION_SPLIT: &str = "warehouse-notifi\x1b[31mcation-secret\x1b[0m";
+
+    fn notification_policy(placeholder: &str) -> crate::config::RedactionConfig {
+        crate::config::RedactionConfig {
+            patterns: vec![WORKSPACE_NOTIFICATION_CANARY.to_string()],
+            placeholder: placeholder.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn workspace_notification_detection() -> Detection {
+        let mut detection = test_detection();
+        detection.rule_id = "saved_search.alert".to_string();
+        detection.event_type = "saved_search.alert".to_string();
+        detection.extracted = serde_json::json!({
+            "search_name": format!("visible {WORKSPACE_NOTIFICATION_SPLIT}"),
+            "query": {
+                "nested": [{"value": WORKSPACE_NOTIFICATION_SPLIT}],
+                "plain": "visible"
+            },
+            "scope": "pane 7",
+            "match_count": 1,
+            "snippet": WORKSPACE_NOTIFICATION_SPLIT
+        });
+        detection
+    }
+
+    #[test]
+    fn payload_normalizes_controls_before_builtin_and_custom_redaction() {
+        let redactor = notification_policy("[PRIVATE]").build_redactor().unwrap();
+        assert_eq!(
+            Redactor::new().redact(WORKSPACE_NOTIFICATION_CANARY),
+            WORKSPACE_NOTIFICATION_CANARY,
+            "this fixture must exercise an operator-defined pattern"
+        );
+        let key = "sk-\x1b[31mabc123456789012345678901234567890123456789012345678901";
+        let text = format!("visible {WORKSPACE_NOTIFICATION_SPLIT} {key}");
+        let rendered = RenderedEvent {
+            summary: text.clone(),
+            description: text.clone(),
+            suggestions: vec![crate::event_templates::Suggestion::with_command(
+                "Inspect",
+                text,
+            )],
+            severity: Severity::Warning,
+        };
+        let payload = NotificationPayload::from_detection_with_redactor(
+            &test_detection(),
+            7,
+            &rendered,
+            3,
+            &redactor,
+        );
+        for field in [
+            payload.summary.as_str(),
+            payload.description.as_str(),
+            payload.quick_fix.as_deref().unwrap(),
+        ] {
+            assert!(field.contains("visible"));
+            assert!(field.contains("[PRIVATE]"));
+            assert!(!field.contains("warehouse"));
+            assert!(!field.contains("sk-"));
+            assert!(!field.contains('\x1b'));
+        }
+        assert_eq!(payload.event_type, "core.codex:usage_reached");
+        assert_eq!(payload.pane_id, 7);
+        assert_eq!(payload.suppressed_since_last, 3);
+    }
+
+    #[test]
+    fn notification_templates_scrub_nested_strings_before_json_encoding() {
+        let detection = workspace_notification_detection();
+        let redactor = notification_policy("[WORKSPACE]").build_redactor().unwrap();
+        let rendered = render_detection(&detection, 7, Some(42), &redactor);
+        let payload = NotificationPayload::from_detection_with_redactor(
+            &detection,
+            7,
+            &rendered,
+            0,
+            &redactor,
+        );
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(payload.summary.contains("[WORKSPACE]"));
+        assert!(payload.description.contains("[WORKSPACE]"));
+        assert!(payload.quick_fix.as_deref().unwrap().contains("[WORKSPACE]"));
+        assert!(payload.description.contains("nested"));
+        assert!(payload.description.contains("visible"));
+        assert!(!serialized.contains("warehouse"));
+        assert!(!serialized.contains("\\u001b"));
+        assert_eq!(payload.event_type, detection.rule_id);
+        assert_eq!(payload.agent_type, "codex");
+        assert_eq!(payload.severity, "warning");
+        assert_eq!(payload.confidence, detection.confidence);
+        assert_eq!(
+            detection.extracted["snippet"].as_str(),
+            Some(WORKSPACE_NOTIFICATION_SPLIT),
+            "outgoing redaction must not change the event used for identity and gating"
+        );
+    }
+
+    #[test]
+    fn storage_backed_notification_pipelines_use_independent_workspace_policies() {
+        run_async_test(async {
+            let alpha_dir = tempfile::tempdir().unwrap();
+            let beta_dir = tempfile::tempdir().unwrap();
+            let alpha = StorageHandle::with_config(
+                alpha_dir.path().join("alpha.db").to_str().unwrap(),
+                crate::storage::StorageConfig {
+                    redaction_config: notification_policy("[ALPHA]"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let beta = StorageHandle::with_config(
+                beta_dir.path().join("beta.db").to_str().unwrap(),
+                crate::storage::StorageConfig {
+                    redaction_config: notification_policy("[BETA]"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let gate = || {
+                NotificationGate::from_config(
+                    EventFilter::allow_all(),
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+            };
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut alpha_pipeline = NotificationPipeline::with_mute_store(
+                gate(),
+                vec![Box::new(MockSender::new("alpha", Arc::clone(&sent)))],
+                Arc::new(crate::runtime_async::RwLock::new(alpha.clone())),
+            );
+            let mut beta_pipeline = NotificationPipeline::with_mute_store(
+                gate(),
+                vec![Box::new(MockSender::new("beta", Arc::clone(&sent)))],
+                Arc::new(crate::runtime_async::RwLock::new(beta.clone())),
+            );
+            let detection = workspace_notification_detection();
+            let cx = crate::cx::for_request();
+            for (index, marker) in ["[ALPHA]", "[BETA]", "[ALPHA]"].into_iter().enumerate() {
+                let pipeline = if index == 1 {
+                    &mut beta_pipeline
+                } else {
+                    &mut alpha_pipeline
+                };
+                let pane_id = u64::try_from(index).unwrap() + 7;
+                let outcome = pipeline
+                    .handle_detection_with_cx(&cx, &detection, pane_id, None, Some(42))
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+                assert!(outcome.deliveries[0].success);
+                let payload = sent.lock().unwrap().last().unwrap().clone();
+                assert_eq!(payload.pane_id, pane_id);
+                assert_eq!(payload.event_type, detection.rule_id);
+                assert!(payload.summary.contains(marker));
+                assert!(payload.description.contains(marker));
+                assert!(payload.quick_fix.as_deref().unwrap().contains(marker));
+                let serialized = serde_json::to_string(&payload).unwrap();
+                assert!(!serialized.contains("warehouse"));
+                assert!(!serialized.contains("\\u001b"));
+                assert!(matches!(
+                    pipeline
+                        .handle_detection_with_cx(&cx, &detection, pane_id, None, Some(43))
+                        .await
+                        .unwrap()
+                        .decision,
+                    NotifyDecision::Deduplicated { .. }
+                ));
+            }
+            assert_eq!(sent.lock().unwrap().len(), 3);
+            alpha.shutdown().await.unwrap();
+            beta.shutdown().await.unwrap();
+        });
     }
 
     #[derive(Clone)]
