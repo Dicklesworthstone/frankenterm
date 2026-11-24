@@ -531,11 +531,17 @@ impl NotificationPipeline {
         cx: &crate::cx::Cx,
         payload: &NotificationPayload,
     ) -> Vec<NotificationDelivery> {
-        let mut deliveries = Vec::with_capacity(self.senders.len());
-        for sender in &self.senders {
-            deliveries.push(sender.send_with_cx(cx, payload).await);
-        }
-        deliveries
+        // Channels are independent. Deliver to all of them at once so one
+        // stalled transport (an unreachable SMTP relay or webhook waiting out
+        // its timeout) cannot hold back desktop or webhook delivery, nor make
+        // the detection subscriber lag and drop later events. Results keep
+        // sender order.
+        futures::future::join_all(
+            self.senders
+                .iter()
+                .map(|sender| sender.send_with_cx(cx, payload)),
+        )
+        .await
     }
 }
 
@@ -1644,6 +1650,110 @@ mod tests {
                 sent_b.lock().unwrap().is_empty(),
                 "pipeline Cx-first path must NOT fall back to sender_b.send"
             );
+        });
+    }
+
+    /// One channel stalled on its transport must not hold back the others.
+    /// The stalled sender is listed first and completes only after the fast
+    /// sender has delivered, so sequential dispatch can never finish.
+    #[test]
+    fn a_stalled_sender_does_not_delay_the_other_channels() {
+        struct Handoff {
+            fast_delivered: std::sync::atomic::AtomicBool,
+            stalled_waker: Mutex<Option<std::task::Waker>>,
+        }
+        struct StalledSender(Arc<Handoff>);
+        struct FastSender(Arc<Handoff>);
+        fn delivered(sender: &str) -> NotificationDelivery {
+            NotificationDelivery {
+                sender: sender.to_string(),
+                success: true,
+                rate_limited: false,
+                error: None,
+                records: Vec::new(),
+            }
+        }
+        impl NotificationSender for StalledSender {
+            fn name(&self) -> &'static str {
+                "stalled"
+            }
+
+            fn send<'a>(&'a self, _payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+                let handoff = Arc::clone(&self.0);
+                Box::pin(std::future::poll_fn(move |task| {
+                    if handoff
+                        .fast_delivered
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return std::task::Poll::Ready(delivered("stalled"));
+                    }
+                    *handoff
+                        .stalled_waker
+                        .lock()
+                        .unwrap_or_else(record_poison_and_recover) = Some(task.waker().clone());
+                    std::task::Poll::Pending
+                }))
+            }
+        }
+        impl NotificationSender for FastSender {
+            fn name(&self) -> &'static str {
+                "fast"
+            }
+
+            fn send<'a>(&'a self, _payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+                let handoff = Arc::clone(&self.0);
+                Box::pin(async move {
+                    handoff
+                        .fast_delivered
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let waker = handoff
+                        .stalled_waker
+                        .lock()
+                        .unwrap_or_else(record_poison_and_recover)
+                        .take();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                    delivered("fast")
+                })
+            }
+        }
+
+        run_async_test(async {
+            let handoff = Arc::new(Handoff {
+                fast_delivered: std::sync::atomic::AtomicBool::new(false),
+                stalled_waker: Mutex::new(None),
+            });
+            let gate = NotificationGate::from_config(
+                EventFilter::allow_all(),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let senders: Vec<Box<dyn NotificationSender>> = vec![
+                Box::new(StalledSender(Arc::clone(&handoff))),
+                Box::new(FastSender(Arc::clone(&handoff))),
+            ];
+            let mut pipeline = NotificationPipeline::new(gate, senders);
+            let cx = crate::cx::for_request();
+            let outcome = crate::runtime_async::timeout(
+                Duration::from_secs(5),
+                Box::pin(pipeline.handle_detection_with_cx(
+                    &cx,
+                    &test_detection(),
+                    7,
+                    None,
+                    Some(42),
+                )),
+            )
+            .await
+            .expect("a stalled channel must not block the other senders")
+            .expect("notification pipeline");
+            let senders: Vec<_> = outcome
+                .deliveries
+                .iter()
+                .map(|delivery| delivery.sender.as_str())
+                .collect();
+            assert_eq!(senders, ["stalled", "fast"], "results keep sender order");
         });
     }
 
