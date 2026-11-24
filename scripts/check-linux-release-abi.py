@@ -124,12 +124,19 @@ def readelf(tool, option, binary):
     return result.stdout
 
 
-def verify(binary, policy, tool):
-    before = hashlib.sha256(binary.read_bytes()).hexdigest()
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify(binary, policy, tool, before):
     reports = [readelf(tool, option, binary) for option in
                ("--file-header", "--program-headers", "--dynamic", "--version-info")]
     result = check_reports(*reports, policy)
-    require(hashlib.sha256(binary.read_bytes()).hexdigest() == before, "binary changed during verification")
+    require(file_sha256(binary) == before, "binary changed during verification")
     return {"path": str(binary), "sha256": before, **result}
 
 
@@ -249,8 +256,8 @@ def main():
         require(policy["image"]["config_matches_pulled_image"] is True, "unbound baseline image")
         for provider in policy["providers"].values():
             require(re.fullmatch(r"[0-9a-f]{64}", provider["sha256"]), "invalid provider hash")
-        tool = shutil.which("readelf")
-        require(tool is not None, "readelf unavailable")
+        tool = shutil.which("readelf") or shutil.which("llvm-readelf")
+        require(tool is not None, "readelf or llvm-readelf unavailable")
         receipt.update(baseline_sha256=hashlib.sha256(baseline_bytes).hexdigest(), image=policy["image"])
         failures = False
         for name, binary, expected in (("ft", args.ft, "ft"),
@@ -258,9 +265,9 @@ def main():
                                        ("guardian", args.guardian, "frankenterm-pty-guardian")):
             identity = {"path": str(binary)}
             try:
-                identity["sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+                identity["sha256"] = file_sha256(binary)
                 require(binary.name == expected, "incorrect component basename")
-                receipt["components"][name] = {"status": "passed", **verify(binary, policy, tool)}
+                receipt["components"][name] = {"status": "passed", **verify(binary, policy, tool, identity["sha256"])}
             except (Refusal, OSError, subprocess.SubprocessError) as error:
                 failures = True
                 receipt["components"][name] = {"status": "failed", **identity, "reason": str(error)}

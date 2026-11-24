@@ -39,7 +39,7 @@
 #   3. bounded regular-file sizes, manifest hashes/sizes, and exact checksum
 #      sidecar contents;
 #   4. every Minisign signature against the tracked release/minisign.pub key;
-#   5. archive member inventories accepted by the production installer;
+#   5. installer archive inventories and direct Linux ELF ABI requirements;
 #   6. online release/tag identity bound to the manifest source commit.
 #
 # This preserves the v0.15.1 negative contract: its four-artifact unsigned
@@ -671,7 +671,7 @@ verify_exact_inventory() {
 
 verify_archive_inventory() {
   local name="$1"
-  local archive_kind manifest_name
+  local archive_kind manifest_name linux_target="" archive_error
   case "$name" in
     ft-darwin-arm64.tar.xz)
       archive_kind="process-tar"
@@ -680,10 +680,12 @@ verify_archive_inventory() {
     ft-linux-amd64.tar.xz)
       archive_kind="process-tar"
       manifest_name="ft-linux-amd64.component-manifest.json"
+      linux_target="x86_64-unknown-linux-gnu"
       ;;
     ft-linux-arm64.tar.xz)
       archive_kind="process-tar"
       manifest_name="ft-linux-arm64.component-manifest.json"
+      linux_target="aarch64-unknown-linux-gnu"
       ;;
     ft-windows-amd64.zip)
       archive_kind="process-zip"
@@ -699,14 +701,23 @@ verify_archive_inventory() {
       ;;
   esac
 
-  if python3 - "$ASSETS_DIR/$name" "$archive_kind" "$manifest_name" <<'PY'
+  if archive_error=$(python3 - "$ASSETS_DIR/$name" "$archive_kind" "$manifest_name" \
+      "$linux_target" "$ROOT/scripts/check-linux-release-abi.py" 2>&1 <<'PY'
+from contextlib import ExitStack
+import json
+from pathlib import Path
 import posixpath
+import shutil
+import subprocess
+import tempfile
 import stat
 import sys
 import tarfile
 import zipfile
 
-archive_path, archive_kind, manifest_name = sys.argv[1:]
+archive_path, archive_kind, manifest_name, linux_target, abi_checker = sys.argv[1:]
+executables = {"ft", "frankenterm-mux-server", "frankenterm-pty-guardian"}
+process_members = executables | {"verify-components.sh", manifest_name}
 max_entries = 1_000_000
 max_name_bytes = 64 * 1024 * 1024
 
@@ -721,7 +732,11 @@ def canonical_name(name):
 if archive_kind in ("process-tar", "app-tar"):
     members = []
     name_bytes = 0
-    with tarfile.open(archive_path, mode="r:xz") as archive:
+    with ExitStack() as resources:
+        archive = resources.enter_context(tarfile.open(archive_path, mode="r|xz" if linux_target else "r:xz"))
+        if linux_target:
+            staging = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="ft-release-abi-")))
+            seen = set()
         for member in archive:
             if len(members) >= max_entries:
                 raise SystemExit("archive exceeds its member-count bound")
@@ -731,19 +746,39 @@ if archive_kind in ("process-tar", "app-tar"):
                 raise SystemExit("archive exceeds its member-name bound")
             if member.islnk() or member.ischr() or member.isblk() or member.isfifo():
                 raise SystemExit("archive contains a hard link or special member")
+            if linux_target:
+                if name not in process_members or name in seen or not member.isfile():
+                    raise SystemExit("invalid or duplicate Linux process-family archive member")
+                if not 0 <= member.size <= 1024 * 1024 * 1024:
+                    raise SystemExit(f"{name} exceeds the 1 GiB expanded member bound")
+                seen.add(name)
+                if name in executables:
+                    # Only fixed component names reach disk. Never execute a release binary.
+                    with archive.extractfile(member) as source, (staging / name).open("xb") as dest:
+                        shutil.copyfileobj(source, dest, 1024 * 1024)
             members.append((name, member))
+        if linux_target:
+            if seen != process_members:
+                raise SystemExit("Linux process-family archive is missing required members")
+            result = subprocess.run(
+                [sys.executable, abi_checker, "--target", linux_target,
+                 "--ft", staging / "ft", "--mux", staging / "frankenterm-mux-server",
+                 "--guardian", staging / "frankenterm-pty-guardian"],
+                capture_output=True, text=True,
+            )
+            if result.returncode:
+                if not result.stdout.strip():
+                    raise SystemExit("Linux ABI checker did not report a verdict: " + result.stderr.strip())
+                report = json.loads(result.stdout)
+                reasons = [f"{key}: {component['reason']}" for key, component in
+                           report["components"].items() if component["status"] == "failed"]
+                raise SystemExit("Linux ABI verification failed: " +
+                                 (report.get("reason") or ", ".join(reasons)))
     names = [name for name, _ in members]
     if len(names) != len(set(names)):
         raise SystemExit("archive contains duplicate member names")
     if archive_kind == "process-tar":
-        expected = {
-            "ft",
-            "frankenterm-mux-server",
-            "frankenterm-pty-guardian",
-            "verify-components.sh",
-            manifest_name,
-        }
-        if set(names) != expected or any(not member.isfile() for _, member in members):
+        if set(names) != process_members or any(not member.isfile() for _, member in members):
             raise SystemExit("Unix process-family archive violates the exact five-file installer contract")
     else:
         by_name = dict(members)
@@ -786,10 +821,13 @@ elif archive_kind == "process-zip":
 else:
     raise SystemExit("unknown release archive kind")
 PY
-  then
+  ); then
     good "$name satisfies its production installer archive-inventory contract"
+    if [[ -n "$linux_target" ]]; then
+      good "$name: all three executables satisfy the $linux_target ABI baseline"
+    fi
   else
-    bad "$name violates its production installer archive-inventory contract"
+    bad "$name failed archive verification: $archive_error"
   fi
 }
 
@@ -955,7 +993,10 @@ for name in "${BASE_ASSETS[@]}"; do
     good "$name.minisig verifies against release/minisign.pub"
   fi
 
-  verify_archive_inventory "$name"
+  # Inspect only authenticated bytes. No platform binary is executed.
+  if [[ $fail -eq 0 ]]; then
+    verify_archive_inventory "$name"
+  fi
 done
 
 if ! cmp -s "$ASSETS_DIR/SHA256SUMS" <(

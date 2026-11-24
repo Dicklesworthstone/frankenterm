@@ -12,6 +12,7 @@ python3 - "$ROOT" <<'PY'
 import json
 import copy
 import hashlib
+import io
 import os
 import shlex
 import shutil
@@ -20,6 +21,7 @@ import subprocess
 import tarfile
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -346,7 +348,7 @@ shutil.copyfile(source, target)
     abi_case("neg_abi_configured_lower_ceiling",
              ["--max-glibc", "2.34", "--symbols-file", str(transcript)], 1, observed="GLIBC_2.35")
 
-    def make_elf(path, version=None):
+    def make_elf(path, version=None, arch="amd64"):
         base = 0x400000
         ident = b"\x7fELF\x02\x01\x01" + b"\x00" * 9
         if version is None:
@@ -369,7 +371,8 @@ shutil.copyfile(source, target)
             return offset, len(blob)
 
         text_offset, text_size = append_blob(b"\xeb\xfe", 1)
-        interp_offset, interp_size = append_blob(b"/lib64/ld-linux-x86-64.so.2\x00", 1)
+        interpreter = b"/lib64/ld-linux-x86-64.so.2" if arch == "amd64" else b"/lib/ld-linux-aarch64.so.1"
+        interp_offset, interp_size = append_blob(interpreter + b"\x00", 1)
         strings = b"\x00libc.so.6\x00" + version.encode("ascii") + b"\x00"
         strings_offset, strings_size = append_blob(strings, 1)
         needs = struct.pack("<HHIII", 1, 1, 1, 16, 0) + struct.pack("<IHHII", 0, 0, 2, 11, 0)
@@ -405,7 +408,7 @@ shutil.copyfile(source, target)
                 base + offset if flags & 2 else 0, offset, size, link, info, alignment, entry_size,
             ))
         data[:64] = ident + struct.pack(
-            "<HHIQQQIHHHHHH", 2, 62, 1, base + text_offset, 64, section_offset, 0,
+            "<HHIQQQIHHHHHH", 2, 62 if arch == "amd64" else 183, 1, base + text_offset, 64, section_offset, 0,
             64, 56, 3, 64, 7, 6,
         )
         programs = [
@@ -418,6 +421,81 @@ shutil.copyfile(source, target)
 
     if not any(shutil.which(tool) for tool in ("readelf", "llvm-readelf")):
         raise SystemExit("readelf or llvm-readelf is required for real ELF ABI regression tests")
+    # Exercise the final signed 17-asset set. Re-sign every altered fixture so
+    # ABI rejection cannot be satisfied by a manifest/hash/signature failure.
+    shutil.copyfile(root / "scripts/check-linux-release-abi.py", fixture_root / "scripts/check-linux-release-abi.py")
+    shutil.copyfile(root / "release/linux-abi-baseline.json", fixture_root / "release/linux-abi-baseline.json")
+    stable_dir = td_path / "stable-assets"
+    stable_dir.mkdir()
+    components = ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian")
+    stable_manifest = td_path / "stable-manifest.json"
+
+    def stable_case(case_id, change=None, reason=None):
+        artifacts = []
+        aggregate = []
+        for platform in ("linux/amd64", "linux/arm64", "darwin/arm64", "windows/amd64", "additional"):
+            base = "ft-" + platform.replace("/", "-")
+            component_manifest = base + ".component-manifest.json"
+            if platform == "windows/amd64":
+                path = stable_dir / (base + ".zip")
+                with zipfile.ZipFile(path, "w") as archive:
+                    for name in (*components, "frankenterm-gui"):
+                        archive.writestr(name + ".exe", b"fixture")
+                    archive.writestr("verify-components.sh", b"fixture")
+                    archive.writestr(component_manifest, b"{}")
+            else:
+                is_app = platform == "additional"
+                path = stable_dir / (("FrankenTerm-darwin-arm64.app" if is_app else base) + ".tar.xz")
+                with tarfile.open(path, "w:xz") as archive:
+                    if is_app:
+                        app = tarfile.TarInfo("FrankenTerm.app")
+                        app.type = tarfile.DIRTYPE
+                        archive.addfile(app)
+                        names = ["FrankenTerm.app.component-manifest.json"]
+                    else:
+                        names = [*components, "verify-components.sh", component_manifest]
+                    for name in names:
+                        data = b"fixture"
+                        if platform.startswith("linux/") and name in components:
+                            arch, version = platform.split("/")[1], "GLIBC_2.35"
+                            if change and (platform, name) == change[:2]:
+                                arch, version = change[2:]
+                            binary = td_path / "elf-fixture"
+                            make_elf(binary, version, arch)
+                            data = binary.read_bytes()
+                        member = tarfile.TarInfo(name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            checksum = f"{digest}  {path.name}\n"
+            (stable_dir / (path.name + ".sha256")).write_text(checksum)
+            sign(path)
+            aggregate.append(checksum)
+            artifacts.append({"target": platform, "name": path.name, "sha256": digest, "size_bytes": path.stat().st_size})
+        sums_path = stable_dir / "SHA256SUMS"
+        sums_path.write_text("".join(sorted(aggregate)))
+        sign(sums_path)
+        stable_manifest.write_text(json.dumps({
+            "tool": "frankenterm", "version": "v1.0.0",
+            "source": {"git_ref": "v1.0.0", "git_sha": "a" * 40, "dependencies": []},
+            "status": "success", "summary": {"total": 4, "success": 4, "failed": 0},
+            "artifacts": artifacts,
+        }))
+        proc = subprocess.run(["bash", str(fixture_verify), "--json", "--manifest", str(stable_manifest),
+                               "--assets-dir", str(stable_dir)], text=True, capture_output=True)
+        record(case_id, "stable", "negative" if reason else "positive", int(bool(reason)), proc)
+        verdict = json.loads(proc.stdout)
+        assert verdict["ok"] == (reason is None), verdict
+        if reason:
+            assert any(change[0].replace("/", "-") in failure and reason in failure
+                       for failure in verdict["failures"]), verdict
+
+    stable_case("pos_signed_stable_linux_family_abi")
+    stable_case("neg_signed_stable_mux_glibc", ("linux/amd64", components[1], "amd64", "GLIBC_2.43"),
+                "mux: unsupported provider version: libc.so.6:GLIBC_2.43")
+    stable_case("neg_signed_stable_guardian_machine", ("linux/arm64", components[2], "amd64", "GLIBC_2.35"),
+                "guardian: ELF machine mismatch")
+
     static_elf = td_path / "static.elf"
     dynamic_elf = td_path / "dynamic.elf"
     truncated_elf = td_path / "truncated.elf"
