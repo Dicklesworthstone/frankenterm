@@ -2442,8 +2442,10 @@ fn every_initial_handshake_stage_has_its_own_bounded_reply() {
         assert!(harness.session.advance_time(deadline - 1));
         while harness.session.next_event().is_some() {}
         assert!(!harness.session.advance_time(deadline));
-        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
-            if reason.contains(stages[pending].1)));
+        assert!(
+            matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains(stages[pending].1))
+        );
         assert!(harness.session.next_event().is_none());
         assert_eq!(harness.session.next_input_wake_ns(), None);
         assert!(harness.session.take_outgoing().is_empty());
@@ -2519,8 +2521,10 @@ fn live_traffic_cannot_extend_a_missing_inventory_or_replay_pending_input() {
     assert!(harness.session.unanswered_input(7));
     assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
     assert!(harness.session.unanswered_input(7));
-    assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
-        if reason.contains("pane inventory")));
+    assert!(
+        matches!(harness.session.next_event(), Some(Event::Failed { reason })
+        if reason.contains("pane inventory"))
+    );
     harness.session.receive(&late_inventory);
     harness.session.receive(&late_input);
     assert!(!harness.session.is_ready());
@@ -2556,8 +2560,10 @@ fn pane_authority_observation_and_rows_cannot_wait_forever() {
         assert!(harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS - 1));
         while harness.session.next_event().is_some() {}
         assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
-        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
-            if reason.contains(stages[pending].1)));
+        assert!(
+            matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains(stages[pending].1))
+        );
         harness.session.receive(&late);
         assert!(!harness.session.is_ready());
         assert!(harness.session.next_event().is_none());
@@ -2621,8 +2627,10 @@ fn reopening_cannot_extend_the_row_fetch_that_still_blocks_its_mirror() {
         Some(REQUIRED_REPLY_DEADLINE_NS)
     );
     assert!(!harness.session.advance_time(REQUIRED_REPLY_DEADLINE_NS));
-    assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
-        if reason.contains("pane rows")));
+    assert!(
+        matches!(harness.session.next_event(), Some(Event::Failed { reason })
+        if reason.contains("pane rows"))
+    );
     harness.session.receive(&late_rows);
     assert!(!harness.session.is_ready());
     assert!(harness.session.next_event().is_none());

@@ -1189,7 +1189,9 @@ fn strip_null_fields(value: Value) -> Value {
     }
 }
 
-fn validated_bootstrap_commands(profile: &AgentProfile) -> Result<Vec<String>, ProfileHandlerError> {
+fn validated_bootstrap_commands(
+    profile: &AgentProfile,
+) -> Result<Vec<String>, ProfileHandlerError> {
     profile
         .validate()
         .map_err(|err| ProfileHandlerError::ValidationFailed {
@@ -2130,8 +2132,12 @@ mod tests {
                 assert!(executor.spawned.is_empty());
                 assert!(executor.stopped.is_empty());
             }
-            let hash =
-                compute_apply_content_hash(&profile.name, profile.updated_at_ms, 2, &HashMap::new());
+            let hash = compute_apply_content_hash(
+                &profile.name,
+                profile.updated_at_ms,
+                2,
+                &HashMap::new(),
+            );
             assert!(get_apply_receipt(&conn, &hash).unwrap().is_none());
             assert_eq!(get_agent_profile(&conn, "broken").unwrap(), Some(profile));
         }
@@ -2186,9 +2192,13 @@ mod tests {
             let mut request = params.clone();
             request["dry_run"] = json!(dry_run);
             let mut executor = FakeApplyExecutor::new();
-            let error =
-                handle_profile_apply_with_executor(&request, &conn, &mut executor, 1_700_000_000_000)
-                    .unwrap_err();
+            let error = handle_profile_apply_with_executor(
+                &request,
+                &conn,
+                &mut executor,
+                1_700_000_000_000,
+            )
+            .unwrap_err();
             assert_eq!(error.error_code(), "robot.profile.bad_params");
             assert!(executor.spawned.is_empty());
         }

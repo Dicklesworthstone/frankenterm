@@ -695,13 +695,17 @@ impl Session {
                 Request::ConditionalResize { intent } => Some(intent.deadline_ns),
                 _ => None,
             }))
-            .chain(self.reply_deadlines.iter().filter_map(|(serial, deadline)| {
-                if self.required_reply_pending(*serial) {
-                    *deadline
-                } else {
-                    None
-                }
-            }))
+            .chain(
+                self.reply_deadlines
+                    .iter()
+                    .filter_map(|(serial, deadline)| {
+                        if self.required_reply_pending(*serial) {
+                            *deadline
+                        } else {
+                            None
+                        }
+                    }),
+            )
             .chain(
                 self.resize_successors
                     .values()
