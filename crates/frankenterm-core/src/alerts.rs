@@ -342,9 +342,13 @@ impl WatcherAlertConfig {
                         rule.id
                     ));
                 }
-            } else if rule.service.is_some() {
+            } else if rule.service.is_some() || rule.account_id.is_some() {
+                // Pane-scoped usage rows are recorded without an account, and
+                // account-attributed rows have no pane, so an account filter on
+                // a pane total could never match and the rule would never fire.
                 return Err(format!(
-                    "alerts rule {} service is only supported for account_balance",
+                    "alerts rule {} service and account_id are only supported for \
+                     account_balance; recorded pane usage carries no account",
                     rule.id
                 ));
             }
@@ -710,12 +714,38 @@ fn alert_level_from_code(code: u8) -> crate::Result<AlertLevel> {
 /// recorded recovery permits an identical later alert to start a new episode.
 pub struct WatcherAlertMonitor {
     config: WatcherAlertConfig,
+    /// The unavailable reason last warned per rule ID. A persistent condition,
+    /// such as account data nobody has refreshed, warns once per change
+    /// instead of on every sweep.
+    unavailable_warned: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl WatcherAlertMonitor {
     pub fn new(config: WatcherAlertConfig) -> Result<Self, String> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            unavailable_warned: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Records an unavailable evaluation. Returns true when the reason is new
+    /// for this rule and deserves a warning.
+    fn note_unavailable(&self, rule_id: &str, reason: &str) -> bool {
+        self.unavailable_warned.lock().map_or(true, |mut warned| {
+            warned
+                .insert(rule_id.to_string(), reason.to_string())
+                .as_deref()
+                != Some(reason)
+        })
+    }
+
+    /// Records a successful evaluation. Returns true when the rule had been
+    /// reported unavailable.
+    fn note_available(&self, rule_id: &str) -> bool {
+        self.unavailable_warned
+            .lock()
+            .is_ok_and(|mut warned| warned.remove(rule_id).is_some())
     }
 
     pub async fn evaluate_with_cx(
@@ -746,13 +776,25 @@ impl WatcherAlertMonitor {
                 .evaluate_rule_with_cx(cx, storage, event_bus, rule, now)
                 .await
             {
-                Ok(emitted) => sweep.emitted += usize::from(emitted),
+                Ok(emitted) => {
+                    sweep.emitted += usize::from(emitted);
+                    if self.note_available(&rule.id) {
+                        tracing::info!(rule = %rule.id, pane_id = rule.pane_id,
+                            "Usage alert evaluation available again");
+                    }
+                }
                 Err(error) => {
                     cx.checkpoint()
                         .map_err(|error| alert_check_cancelled_error(error.to_string()))?;
                     sweep.unavailable += 1;
-                    tracing::warn!(rule = %rule.id, pane_id = rule.pane_id, %error,
-                        "Usage alert evaluation unavailable; retaining prior state");
+                    if self.note_unavailable(&rule.id, &error.to_string()) {
+                        tracing::warn!(rule = %rule.id, pane_id = rule.pane_id, %error,
+                            "Usage alert evaluation unavailable; retaining prior state \
+                             (repeats are logged at debug)");
+                    } else {
+                        tracing::debug!(rule = %rule.id, pane_id = rule.pane_id, %error,
+                            "Usage alert evaluation still unavailable");
+                    }
                 }
             }
         }
@@ -966,7 +1008,7 @@ mod tests {
                 threshold: 100.0,
                 period: AlertPeriod::Day,
                 agent_type: Some("claude_code".to_string()),
-                account_id: Some("build".to_string()),
+                account_id: None,
                 service: None,
                 enabled: true,
             }],
@@ -1013,7 +1055,8 @@ mod tests {
             metric_type: MetricType::ApiCost,
             pane_id: Some(7),
             agent_type: Some("claude_code".to_string()),
-            account_id: Some("build".to_string()),
+            // As in production: pane-scoped usage rows carry no account.
+            account_id: None,
             workflow_id: None,
             count: None,
             amount: Some(amount),
@@ -1076,9 +1119,30 @@ period = "day"
         );
         invalid.rules[0].service = Some("anthropic".to_string());
         invalid.rules[0].agent_type = None;
+        invalid.rules[0].account_id = Some("build".to_string());
         assert!(invalid.validate().is_ok());
         invalid.rules[0].account_id = None;
         assert!(invalid.validate().is_err(), "account ID must be explicit");
+        // Pane usage rows carry no account, so this filter could never match.
+        invalid = watcher_config();
+        invalid.rules[0].account_id = Some("build".to_string());
+        assert!(invalid.validate().is_err(), "a pane total takes no account");
+    }
+
+    #[test]
+    fn a_persistent_unavailable_reason_warns_once_per_change() {
+        let monitor = WatcherAlertMonitor::new(watcher_config()).unwrap();
+        assert!(monitor.note_unavailable("build-budget", "account evidence is stale"));
+        // The same condition on later sweeps does not warn again.
+        assert!(!monitor.note_unavailable("build-budget", "account evidence is stale"));
+        assert!(!monitor.note_unavailable("build-budget", "account evidence is stale"));
+        // Another rule, or a different reason, does.
+        assert!(monitor.note_unavailable("other-rule", "account evidence is stale"));
+        assert!(monitor.note_unavailable("build-budget", "configured pane is not observed"));
+        // Recovery is reported once, and a later failure warns afresh.
+        assert!(monitor.note_available("build-budget"));
+        assert!(!monitor.note_available("build-budget"));
+        assert!(monitor.note_unavailable("build-budget", "configured pane is not observed"));
     }
 
     #[test]
@@ -1098,8 +1162,6 @@ period = "day"
             other_pane.pane_id = Some(8);
             let mut other_agent = watcher_cost(now, 500.0);
             other_agent.agent_type = Some("codex".to_string());
-            let mut other_account = watcher_cost(now, 500.0);
-            other_account.account_id = Some("other".to_string());
             storage
                 .record_usage_metrics_batch(vec![
                     watcher_cost(now - 1, 80.0),
@@ -1107,7 +1169,6 @@ period = "day"
                     watcher_cost(now + 1, 500.0),
                     other_pane,
                     other_agent,
-                    other_account,
                 ])
                 .await
                 .unwrap();
@@ -1233,6 +1294,7 @@ period = "day"
             config.rules[0].threshold = 20.0;
             config.rules[0].agent_type = None;
             config.rules[0].service = Some("anthropic".to_string());
+            config.rules[0].account_id = Some("build".to_string());
             let monitor = WatcherAlertMonitor::new(config).unwrap();
             assert_eq!(
                 monitor

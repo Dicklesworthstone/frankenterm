@@ -3047,7 +3047,7 @@ When detections fire, `ft watch` can notify operators through desktop notificati
 
 ### Alert manager (`alerts.rs`)
 
-`ft watch` can monitor recorded API costs, token usage, rate-limit counts, and an explicitly selected account's remaining balance. Alerts are opt-in and require an observed pane ID. Cost, token and rate-limit rules total that pane's recorded metrics over a rolling `day`, `week`, or 30-day `month`; optional `agent_type` and `account_id` filters narrow the total.
+`ft watch` can monitor recorded API costs, token usage, rate-limit counts, and an explicitly selected account's remaining balance. Alerts are opt-in and require an observed pane ID. Cost, token and rate-limit rules total that pane's recorded metrics over a rolling `day`, `week`, or 30-day `month`; an optional `agent_type` filter narrows the total. These rules reject `account_id`, because recorded pane usage carries no account.
 
 ```toml
 [alerts]
