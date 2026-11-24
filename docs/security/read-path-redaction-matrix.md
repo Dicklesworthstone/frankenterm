@@ -6,13 +6,53 @@ through `Redactor::redact` (or an equivalent policy-engine wrapper).
 
 **Design invariant:** current local and distributed capture paths redact pane
 content before `output_segments` persistence (`storage::redact_segment_for_persistence`
-and the distributed aggregator ingest choke point). **Every** outbound read path
-still normalizes terminal control sequences and redacts with the current live
-catalog as defense in depth. Normalization must happen first: otherwise ANSI
+and the distributed aggregator ingest choke point). **Every** outbound read path is required to normalize terminal control
+sequences and redact with its active workspace policy, including configured
+patterns, as defense in depth. Normalization must happen first: otherwise ANSI
 can split a token that is reconstructed after escape stripping. A single miss
 is a secret leak; this matrix is the regression benchmark.
 
-## Matrix (as of 2026-08-05)
+## Configured workspace policy (2026-11-23)
+
+The earlier matrix below establishes normalization and built-in catalog coverage.
+It does not establish that a caller uses `safety.redaction`. A default redactor
+can pass built-in-token tests while leaking workspace-only secrets. Persistence
+under an older policy also cannot protect historical rows from newly added
+patterns.
+
+The configured-policy follow-up covers these production boundaries:
+
+| Surface | Policy and behavior |
+|---|---|
+| CLI pane reads, state/search/DOM, prepared sends, event/audit streams, and transcripts | Normal command startup compiles the validated policy once before dispatch; shared output helpers use that immutable policy. |
+| IPC event subscriptions | History and live metadata use `storage.redactor()`; text is normalized before matching. Event identities, cursor epochs, and JSON types remain intact. |
+| MCP tools, proxy tools, resources, and templates | Each server owns its configured output policy. Textual responses are scrubbed before JSON/TOON delivery; matching object keys, protocol identities, and resource URIs cause a content-free refusal. A rejected or cancelled response releases prepared event delivery. |
+| MCP call audits | Production audit wrappers carry the server policy through the bounded background queue into storage. Argument-key summaries, proxy error evidence, and worker diagnostics use that same policy. |
+| JSONL exports, session reports, and VC export pages | Read-time redaction uses the storage policy, including history written before it existed. VC continuous, pruned, and unavailable-legacy-history branches share it. |
+| Diagnostic bundles | The supplied Config policy is compiled before files are created. Historical text, metadata, and trace string values are normalized and redacted before JSON encoding. |
+| Recording capture and cast/HTML exports | Capture uses the CLI policy before disk. Explicit-policy export APIs protect retained frames, titles, and marker annotations; existing convenience APIs retain the built-in policy. |
+| Config reload | Changes to redaction patterns, marker, or enablement fields require restart; a running service never reports success while retaining its old immutable policy. |
+
+Regression fixtures use custom-only canaries, ANSI-split text, configured
+replacement markers, and databases reopened under a new policy. Coverage also
+includes real CLI subprocesses, a real IPC socket, MCP JSON/TOON and independent
+server policies, invalid policy rejection, and event-delivery settlement.
+
+**Validation status:** these are source changes with regression tests added.
+The IPC/config increment passed direct rustfmt, whitespace, and pre-commit checks.
+After the command environment recovered, scoped whitespace, pre-commit guard,
+and differential Rust syntax checks passed; unchanged baseline parser
+limitations in `main.rs`, `diagnostic.rs`, and `mcp_tools.rs` remain. Rust
+compilation and regression execution remain unverified: this session's strict
+RCH command exited 127 (`rch: command not found`), and the recovered environment
+has no Rust formatter. This follow-up is not a release attestation or bead closeout.
+
+Explicit unredacted export options retain their existing behavior. Early
+config-independent recovery commands retain the built-in policy. Recording
+redaction remains per frame; secrets split across frame boundaries, binary MCP
+payload decoding, and MCP catalog definitions are outside this follow-up.
+
+## Earlier normalization matrix (2026-08-05)
 
 Column meanings:
 - **Redacts?** `✓` = path normalizes terminal text and then invokes
@@ -76,14 +116,10 @@ Column meanings:
 
 ## Actionable findings from this audit
 
-- No open source-level findings remain in the reviewed MCP, robot CLI, and
-  human CLI output chokepoints. These paths normalize before redaction,
-  including state/search/DOM/send fields and escape-preserving get-text paths;
-  bounded diagnostic surfaces also apply explicit input and output ceilings.
-  Escape-preserving paths retain explicitly requested raw escape bytes but fail
-  closed to normalized redacted text when the normalized view reveals an
-  ANSI-split secret. Runtime and compiler proof remain separate from this
-  source-level matrix.
+- The earlier review established normalization at the listed output chokepoints.
+  The configured-policy follow-up above closes a separate class of gaps where
+  those chokepoints constructed a default redactor or relied only on write-time
+  protection. Compiler and runtime proof remain outstanding for that follow-up.
 - Policy-denial audit wiring (ft-h90rh / ft-rsqap / ft-mw1zb): 11 of 12 deny paths now also persist to `policy_denied_audit`. Only `wa.send` is deliberately routed through `PolicyGatedInjector` (which already writes to `audit_actions`); adding a second audit stream would double-count. See `docs/security/policy-denial-audit-wiring-matrix.md`.
 
 ## Regression discipline

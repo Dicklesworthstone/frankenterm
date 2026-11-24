@@ -8,7 +8,7 @@ use super::mcp_tools::{
     MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
 };
 use super::{
-    AuditedToolHandler, Config, Result,
+    Config, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
     WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
     WaAttentionTool, WaAttestationRetractionsResource, WaAwaitEventTool, WaCassSearchTool,
@@ -416,7 +416,7 @@ async fn build_server_inner(
 
     if let Some(ref db_path) = db_path {
         builder = builder
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaGetTextTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Some(Arc::clone(db_path)),
@@ -425,7 +425,7 @@ async fn build_server_inner(
                 "wa.get_text",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaDomTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Some(Arc::clone(db_path)),
@@ -434,7 +434,7 @@ async fn build_server_inner(
                 "wa.dom",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaSearchTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -443,13 +443,13 @@ async fn build_server_inner(
                 "wa.search",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaEventsTool::new(Arc::clone(db_path)),
                 "wa.events",
                 Arc::clone(db_path),
             )))
             .tool(output.tool_with_response_delivery(
-                AuditedToolHandler::new(
+                output.audited_tool(
                     WaAwaitEventTool::new_with_response_delivery(
                         Arc::clone(db_path),
                         Arc::clone(&response_delivery),
@@ -459,7 +459,7 @@ async fn build_server_inner(
                 ),
                 Arc::clone(&response_delivery),
             ))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaEventsAnnotateTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -468,7 +468,7 @@ async fn build_server_inner(
                 "wa.events_annotate",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaEventsTriageTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -477,7 +477,7 @@ async fn build_server_inner(
                 "wa.events_triage",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaEventsLabelTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -486,12 +486,12 @@ async fn build_server_inner(
                 "wa.events_label",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaReservationsTool::new(Arc::clone(db_path)),
                 "wa.reservations",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaReserveTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -500,7 +500,7 @@ async fn build_server_inner(
                 "wa.reserve",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaReleaseTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -509,7 +509,7 @@ async fn build_server_inner(
                 "wa.release",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaSendTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -518,7 +518,7 @@ async fn build_server_inner(
                 "wa.send",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaWorkflowRunTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -527,17 +527,17 @@ async fn build_server_inner(
                 "wa.workflow_run",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaWorkflowStatusTool::new(Arc::clone(db_path)),
                 "wa.workflow_status",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaAccountsTool::new(Arc::clone(db_path)),
                 "wa.accounts",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaAccountsRefreshTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -554,7 +554,7 @@ async fn build_server_inner(
             // `db_path` (their constructors take Config + rate
             // limiter), but AuditedToolHandler needs it to write
             // the audit records. See DB_GATED_MUTATING_TOOL_NAMES.
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaTxRunTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -562,7 +562,7 @@ async fn build_server_inner(
                 "wa.tx_run",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaTxRollbackTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -570,7 +570,7 @@ async fn build_server_inner(
                 "wa.tx_rollback",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaMissionPauseTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -578,7 +578,7 @@ async fn build_server_inner(
                 "wa.mission_pause",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaMissionResumeTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -586,7 +586,7 @@ async fn build_server_inner(
                 "wa.mission_resume",
                 Arc::clone(db_path),
             )))
-            .tool(output.tool(AuditedToolHandler::new(
+            .tool(output.tool(output.audited_tool(
                 WaMissionAbortTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),

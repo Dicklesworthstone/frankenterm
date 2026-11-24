@@ -222,7 +222,7 @@ use crate::mcp_framework::{
     FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 
-use super::mcp_middleware::{AuditedToolHandler, McpOutputPolicy};
+use super::mcp_middleware::McpOutputPolicy;
 use crate::Result;
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_client::{
@@ -545,7 +545,7 @@ pub(super) async fn compose_proxy_tools(
              the top of compose_proxy_tools",
         );
         for (exposed_name, handler) in mounted_handlers {
-            builder = builder.tool(output.proxy_tool(AuditedToolHandler::new(
+            builder = builder.tool(output.proxy_tool(output.audited_tool(
                 handler,
                 exposed_name,
                 Arc::clone(audit_path),

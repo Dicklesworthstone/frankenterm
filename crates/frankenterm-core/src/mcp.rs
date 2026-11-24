@@ -96,7 +96,9 @@ pub use mcp_bridge::{
     build_server, build_server_degraded, build_server_with_db,
     mcp_bridge_tools_skipped_no_db_count, run_stdio_server,
 };
+#[cfg(test)]
 use mcp_middleware::AuditedToolHandler;
+use mcp_middleware::McpOutputPolicy;
 #[cfg(test)]
 use mcp_middleware::{
     McpOutputFormat, augment_tool_schema_with_format, encode_mcp_contents,
@@ -605,6 +607,45 @@ fn redact_mcp_args(tool_name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+struct McpAuditFields {
+    tool_name: String,
+    summary: String,
+    error_code: Option<String>,
+}
+
+fn redact_mcp_audit_text(text: &str, redactor: &crate::redactor::Redactor) -> Option<String> {
+    if text.len() > MCP_AUDIT_MAX_JOB_BYTES {
+        return None;
+    }
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    let redacted = redactor.redact(&normalized);
+    (redacted.len() <= MCP_AUDIT_MAX_JOB_BYTES).then_some(redacted)
+}
+
+fn redact_mcp_audit_fields(
+    tool_name: &str,
+    summary: &str,
+    error_code: Option<&str>,
+    redactor: &crate::redactor::Redactor,
+) -> Option<McpAuditFields> {
+    Some(McpAuditFields {
+        tool_name: redact_mcp_audit_text(tool_name, redactor)?,
+        summary: redact_mcp_audit_text(summary, redactor)?,
+        error_code: match error_code {
+            Some(code) => Some(redact_mcp_audit_text(code, redactor)?),
+            None => None,
+        },
+    })
+}
+
+fn redact_mcp_audit_diagnostic(
+    error: &impl std::fmt::Display,
+    redactor: &crate::redactor::Redactor,
+) -> String {
+    redact_mcp_audit_text(&error.to_string(), redactor)
+        .unwrap_or_else(|| "MCP audit diagnostic exceeds safety limit".to_string())
+}
+
 fn mcp_audit_decision_context(
     tool_name: &str,
     action_kind: &str,
@@ -791,8 +832,34 @@ async fn record_mcp_audit(
     error_code: Option<&str>,
     elapsed_ms: u64,
 ) {
+    // Normalize decoded strings before JSON-encoding the decision context.
+    // The storage policy also redacts the resulting row, but applying a regex
+    // only to escaped JSON could miss an ANSI-split custom secret.
+    let Some(McpAuditFields {
+        tool_name,
+        summary: input_summary,
+        error_code,
+    }) = redact_mcp_audit_fields(
+        tool_name,
+        &input_summary,
+        error_code,
+        storage.redactor(),
+    ) else {
+        record_mcp_audit_failure();
+        tracing::warn!("MCP audit fields exceed bounded payload capacity");
+        return;
+    };
     let ts = i64::try_from(now_ms()).unwrap_or(0);
-    let action_kind = format!("mcp.{tool_name}");
+    // AuditFieldRedactor intentionally leaves routing metadata alone. Apply
+    // the policy to the complete label too, including its generated prefix.
+    let Some(action_kind) = redact_mcp_audit_text(
+        &format!("mcp.{tool_name}"),
+        storage.redactor(),
+    ) else {
+        record_mcp_audit_failure();
+        tracing::warn!("MCP audit action label exceeds bounded payload capacity");
+        return;
+    };
     let audit = crate::storage::AuditActionRecord {
         id: 0,
         ts,
@@ -803,16 +870,16 @@ async fn record_mcp_audit(
         domain: None,
         action_kind: action_kind.clone(),
         policy_decision: decision.to_string(),
-        decision_reason: error_code.map(|c| format!("error_code={c}")),
+        decision_reason: error_code.as_ref().map(|c| format!("error_code={c}")),
         rule_id: None,
         input_summary: Some(format!("{input_summary} elapsed_ms={elapsed_ms}")),
         verification_summary: None,
         decision_context: mcp_audit_decision_context(
-            tool_name,
+            &tool_name,
             &action_kind,
             decision,
             result,
-            error_code,
+            error_code.as_deref(),
             elapsed_ms,
         ),
         result: result.to_string(),
@@ -825,7 +892,8 @@ async fn record_mcp_audit(
     {
         // br-ft-luav8: silent-failure observability counter.
         record_mcp_audit_failure();
-        tracing::warn!(tool = tool_name, error = %e, "Failed to record MCP audit entry");
+        let error = redact_mcp_audit_diagnostic(&e, storage.redactor());
+        tracing::warn!(tool = %tool_name, %error, "Failed to record MCP audit entry");
     }
 }
 
@@ -906,6 +974,7 @@ fn mcp_audit_queue() -> std::result::Result<crossbeam::channel::Sender<McpAuditJ
 /// reduction loop: if `checked_add(d)` overflows, halve `d`
 /// recursively until it succeeds or we bottom out at zero
 /// (effectively one-shot). Still no infinite-retry risk.
+#[cfg(test)]
 fn record_mcp_audit_sync(
     db_path: &std::path::Path,
     tool_name: &str,
@@ -915,10 +984,62 @@ fn record_mcp_audit_sync(
     elapsed_ms: u64,
     max_retry_duration: Option<std::time::Duration>,
 ) {
-    let summary = redact_mcp_args(tool_name, args);
+    let output = match McpOutputPolicy::new(&crate::config::RedactionConfig::default()) {
+        Ok(output) => output,
+        Err(_) => {
+            record_mcp_audit_failure();
+            tracing::warn!("Default MCP audit redaction policy is invalid");
+            return;
+        }
+    };
+    record_mcp_audit_sync_with_policy(
+        &output, db_path, tool_name, args, ok, error_code, elapsed_ms, max_retry_duration,
+    );
+}
+
+/// Queue only redacted metadata, retaining the same immutable workspace policy
+/// for storage and worker diagnostics after the request has returned.
+#[allow(clippy::too_many_arguments)]
+fn record_mcp_audit_sync_with_policy(
+    output: &McpOutputPolicy,
+    db_path: &std::path::Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+    max_retry_duration: Option<std::time::Duration>,
+) {
     let db_path_str = db_path.to_string_lossy().to_string();
-    let tool_name = tool_name.to_string();
-    let error_code = error_code.map(|s| s.to_string());
+    // Reject oversized key lists before joining them or running regexes.
+    // Tool metadata occurs both separately and in the shape-only summary.
+    let mut raw_bytes = db_path_str.len()
+        .saturating_add(tool_name.len().saturating_mul(2))
+        .saturating_add(error_code.map_or(0, str::len))
+        .saturating_add(64);
+    if let Some(object) = args.as_object() {
+        for key in object.keys() {
+            raw_bytes = raw_bytes.saturating_add(key.len()).saturating_add(1);
+            if raw_bytes > MCP_AUDIT_MAX_JOB_BYTES {
+                break;
+            }
+        }
+    }
+    if raw_bytes > MCP_AUDIT_MAX_JOB_BYTES {
+        record_mcp_audit_failure();
+        tracing::warn!("MCP audit job exceeds bounded payload capacity");
+        return;
+    }
+    let Some(McpAuditFields { tool_name, summary, error_code }) = redact_mcp_audit_fields(
+        tool_name,
+        &redact_mcp_args(tool_name, args),
+        error_code,
+        output.redactor(),
+    ) else {
+        record_mcp_audit_failure();
+        tracing::warn!("MCP audit fields exceed bounded payload capacity");
+        return;
+    };
     let decision = if ok { "allow" } else { "deny" };
     let result = if ok { "success" } else { "error" };
     let spawn_tool_name = tool_name.clone();
@@ -941,10 +1062,12 @@ fn record_mcp_audit_sync(
         Ok(queue) => queue,
         Err(error) => {
             record_mcp_audit_failure();
+            let error = redact_mcp_audit_diagnostic(&error, output.redactor());
             tracing::warn!(%error, "Failed to initialize MCP audit workers");
             return;
         }
     };
+    let audit_policy = output.clone();
     if let Err(error) = queue.try_send(Box::new(move || {
         // ft-7p1bx: route through the canonical runtime_async builder so
         // this runtime gets a real blocking pool — the bare asupersync
@@ -956,9 +1079,10 @@ fn record_mcp_audit_sync(
             Err(e) => {
                 // br-ft-luav8: silent failure point #2.
                 record_mcp_audit_failure();
+                let error = redact_mcp_audit_diagnostic(&e, audit_policy.redactor());
                 tracing::warn!(
                     tool = %tool_name,
-                    error = %e,
+                    %error,
                     "Failed to create native asupersync runtime for MCP audit"
                 );
                 return;
@@ -998,7 +1122,15 @@ fn record_mcp_audit_sync(
                 // Detached audit persistence owns its own runtime, so it must
                 // bootstrap a fresh request-scoped capability context here.
                 let audit_open_cx = crate::cx::for_request();
-                let storage = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await?;
+                let storage = StorageHandle::with_config_with_cx(
+                    &audit_open_cx,
+                    &db_path_str,
+                    crate::storage::StorageConfig {
+                        redaction_config: audit_policy.shared_redaction_config().as_ref().clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
                 record_mcp_audit(
                     &storage,
                     &tool_name,
@@ -1012,6 +1144,7 @@ fn record_mcp_audit_sync(
                 // Do not let a completed job leave its writer behind while
                 // the fixed worker starts another database epoch.
                 if let Err(error) = storage.shutdown().await {
+                    let error = redact_mcp_audit_diagnostic(&error, audit_policy.redactor());
                     tracing::warn!(%error, "MCP audit storage shutdown failed");
                 }
                 Ok::<(), crate::Error>(())
@@ -1028,9 +1161,10 @@ fn record_mcp_audit_sync(
                     // br-ft-luav8: silent failure point #3
                     // (storage-open retry exhausted after 10s).
                     record_mcp_audit_failure();
+                    let error = redact_mcp_audit_diagnostic(&e, audit_policy.redactor());
                     tracing::warn!(
                         tool = %tool_name,
-                        error = %e,
+                        %error,
                         "Failed to open storage for MCP audit"
                     );
                     break;
@@ -2381,6 +2515,208 @@ mod tests {
         assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
         assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
         assert_eq!(evidence(&context, "elapsed_ms"), Some("42"));
+    }
+
+    struct ConfiguredAuditErrorTool {
+        error_code: String,
+    }
+
+    impl ToolHandler for ConfiguredAuditErrorTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "test.configured_audit_error".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            // A remote tool can supply an arbitrary error code. Audit runs
+            // inside the final output wrapper, which will refuse this code.
+            Ok(vec![Content::Text {
+                text: serde_json::json!({
+                    "ok": false, "error_code": self.error_code, "error": "remote failure"
+                })
+                .to_string(),
+            }])
+        }
+    }
+
+    #[test]
+    fn configured_mcp_audit_persistence_uses_isolated_workspace_policies() {
+        let orchid_secret = "orchid-private-value";
+        let violet_secret = "violet-private-value";
+        let orchid_marker = r#"[ORCHID "$0"]"#;
+        let violet_marker = r#"[VIOLET "$0"]"#;
+        let first = McpOutputPolicy::new(&crate::config::RedactionConfig {
+            patterns: vec![
+                regex::escape(orchid_secret),
+                r"elapsed_ms=[0-9]+".to_string(),
+                r"^mcp\.remote/.*/composed$".to_string(),
+            ],
+            placeholder: orchid_marker.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let second = McpOutputPolicy::new(&crate::config::RedactionConfig {
+            patterns: vec![
+                regex::escape(violet_secret),
+                r"elapsed_ms=[0-9]+".to_string(),
+            ],
+            placeholder: violet_marker.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let (_first_dir, first_db) = temp_db_path();
+        let (_second_dir, second_db) = temp_db_path();
+        let mixed = "orchid-\x1b[31mprivate-value\x1b[0m violet-\x1b[32mprivate-value\x1b[0m";
+        let args = serde_json::json!({
+            (mixed): "argument-value-must-never-persist",
+            "pane_id": 7
+        });
+
+        // Use the production factory and shared worker pool. Returning to the
+        // first policy after the second must not adopt another server's rules.
+        for (policy, db_path, suffix, marker, hidden, visible, expected_mixed) in [
+            (
+                &first, &first_db, "first", orchid_marker, orchid_secret, violet_secret,
+                format!("{orchid_marker} {violet_secret}"),
+            ),
+            (
+                &second, &second_db, "second", violet_marker, violet_secret, orchid_secret,
+                format!("{orchid_secret} {violet_marker}"),
+            ),
+            (
+                &first, &first_db, "again", orchid_marker, orchid_secret, violet_secret,
+                format!("{orchid_marker} {violet_secret}"),
+            ),
+            (
+                &first, &first_db, "composed", orchid_marker, orchid_secret, violet_secret,
+                format!("{orchid_marker} {violet_secret}"),
+            ),
+        ] {
+            let raw_tool = format!("remote/{mixed}/{suffix}");
+            let expected_tool = format!("remote/{expected_mixed}/{suffix}");
+            let expected_code = format!("REMOTE_ERROR {expected_mixed}");
+            // The anchored rule matches only after the action prefix exists.
+            let action_kind = if suffix == "composed" {
+                marker.to_string()
+            } else {
+                format!("mcp.{expected_tool}")
+            };
+            let handler = policy.proxy_tool(policy.audited_tool(
+                ConfiguredAuditErrorTool { error_code: format!("REMOTE_ERROR {mixed}") },
+                raw_tool,
+                Arc::new(db_path.clone()),
+            ));
+            let contents = handler
+                .call(
+                    &McpContext::new(crate::mcp_framework::FrameworkCx::for_testing(), 1),
+                    args.clone(),
+                )
+                .unwrap();
+            let Content::Text { text } = &contents[0] else {
+                panic!("expected final refusal envelope");
+            };
+            let response: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(response["ok"], false);
+            assert!(!text.contains(hidden));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let audit = loop {
+                if let Some(audit) = try_latest_audit_action(db_path, &action_kind) {
+                    break audit;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "configured MCP audit did not persist for {suffix}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            assert_eq!(audit.action_kind, action_kind);
+            assert_eq!(audit.policy_decision, "deny");
+            assert_eq!(audit.result, "error");
+            assert_eq!(
+                audit.decision_reason.as_deref(),
+                Some(format!("error_code={expected_code}").as_str())
+            );
+            let summary = audit.input_summary.as_deref().unwrap();
+            assert!(summary.contains(&expected_mixed));
+            assert!(summary.contains("pane_id"));
+            // This suffix is appended after queue sanitization. Its redaction
+            // proves the worker opened storage with this workspace's policy.
+            assert!(!summary.contains("elapsed_ms="));
+            assert!(summary.ends_with(marker));
+
+            let context: DecisionContext =
+                serde_json::from_str(audit.decision_context.as_deref().unwrap()).unwrap();
+            assert_eq!(evidence(&context, "tool"), Some(expected_tool.as_str()));
+            assert_eq!(evidence(&context, "error_code"), Some(expected_code.as_str()));
+            let encoded = serde_json::to_string(&audit).unwrap();
+            assert!(!encoded.contains(hidden));
+            assert!(encoded.contains(visible));
+            assert!(!encoded.contains("argument-value-must-never-persist"));
+            assert!(!encoded.contains("\\u001b"));
+        }
+    }
+
+    #[test]
+    fn configured_mcp_audit_refuses_oversized_raw_or_redacted_jobs() {
+        let _guard = audit_counter_test_lock();
+        let (_dir, db_path) = temp_db_path();
+        let normal = McpOutputPolicy::new(&crate::config::RedactionConfig {
+            patterns: vec!["orchid-private-value".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let expanding = McpOutputPolicy::new(&crate::config::RedactionConfig {
+            patterns: vec!["orchid-private-value".to_string()],
+            placeholder: "[WIDE]".repeat(MCP_AUDIT_MAX_JOB_BYTES / 6 + 1),
+            ..Default::default()
+        })
+        .unwrap();
+        let oversized_key = "x".repeat(MCP_AUDIT_MAX_JOB_BYTES + 1);
+        for (policy, args) in [
+            (&normal, serde_json::json!({(oversized_key): null})),
+            (&expanding, serde_json::json!({"orchid-private-value": null})),
+        ] {
+            let before = mcp_audit_failure_count();
+            record_mcp_audit_sync_with_policy(
+                policy,
+                &db_path,
+                "wa.test",
+                &args,
+                false,
+                None,
+                1,
+                Some(std::time::Duration::ZERO),
+            );
+            assert!(mcp_audit_failure_count() > before);
+            assert!(!db_path.exists(), "rejected job must not open storage");
+        }
+    }
+
+    #[test]
+    fn configured_mcp_audit_diagnostics_redact_paths_and_terminal_splits() {
+        let marker = r#"[PRIVATE "$0"]"#;
+        let output = McpOutputPolicy::new(&crate::config::RedactionConfig {
+            patterns: vec!["orchid-private-value".to_string()],
+            placeholder: marker.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = std::io::Error::other(
+            "unable to open /tmp/orchid-\x1b[31mprivate-value\x1b[0m/audit.db",
+        );
+        assert_eq!(
+            redact_mcp_audit_diagnostic(&error, output.redactor()),
+            format!("unable to open /tmp/{marker}/audit.db")
+        );
     }
 
     /// br-ft-2fjx0: explicit caller-supplied retry-window override

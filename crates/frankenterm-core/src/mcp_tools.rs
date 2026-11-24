@@ -53,7 +53,7 @@ use super::{
     mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
     mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
-    policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
+    policy_reason, redact_mcp_args, reservation_to_mcp_info,
     resolve_alt_screen_state, resolve_workspace_id, to_storage_search_options,
 };
 use super::{

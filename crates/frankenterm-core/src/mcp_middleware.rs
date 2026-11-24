@@ -2,7 +2,7 @@
 
 use super::{
     MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, McpEnvelope, elapsed_ms, envelope_to_content,
-    record_mcp_audit_sync,
+    record_mcp_audit_sync_with_policy,
 };
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -20,15 +20,40 @@ use std::time::Instant;
 /// A server-owned output policy shared by native tools, resources and templates.
 /// Construction validates directly supplied configs as well as loaded configs;
 /// no process-global state can leak one workspace's policy into another server.
+#[derive(Clone)]
 pub(super) struct McpOutputPolicy {
     redactor: Arc<Redactor>,
+    redaction_config: Arc<crate::config::RedactionConfig>,
 }
 
 impl McpOutputPolicy {
     pub(super) fn new(config: &crate::config::RedactionConfig) -> crate::Result<Self> {
         Ok(Self {
             redactor: Arc::new(config.build_redactor()?),
+            redaction_config: Arc::new(config.clone()),
         })
+    }
+
+    pub(super) fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
+    pub(super) fn shared_redaction_config(&self) -> Arc<crate::config::RedactionConfig> {
+        Arc::clone(&self.redaction_config)
+    }
+
+    pub(super) fn audited_tool<T: ToolHandler>(
+        &self,
+        inner: T,
+        tool_name: impl Into<String>,
+        db_path: Arc<PathBuf>,
+    ) -> AuditedToolHandler<T> {
+        AuditedToolHandler {
+            inner,
+            tool_name: tool_name.into(),
+            db_path,
+            output: self.clone(),
+        }
     }
 
     pub(super) fn tool<T: ToolHandler>(&self, inner: T) -> FormatAwareToolHandler<T> {
@@ -666,15 +691,15 @@ pub(super) struct AuditedToolHandler<T: ToolHandler> {
     inner: T,
     pub(super) tool_name: String,
     db_path: Arc<PathBuf>,
+    output: McpOutputPolicy,
 }
 
+#[cfg(test)]
 impl<T: ToolHandler> AuditedToolHandler<T> {
     pub(super) fn new(inner: T, tool_name: impl Into<String>, db_path: Arc<PathBuf>) -> Self {
-        Self {
-            inner,
-            tool_name: tool_name.into(),
-            db_path,
-        }
+        McpOutputPolicy::new(&crate::config::RedactionConfig::default())
+            .expect("default MCP audit redaction")
+            .audited_tool(inner, tool_name, db_path)
     }
 }
 
@@ -702,7 +727,8 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
         // pre-expired-budget hole.
         if let Err(cx_err) = ctx.cx().checkpoint() {
             let error_code = "deadline_exceeded".to_string();
-            record_mcp_audit_sync(
+            record_mcp_audit_sync_with_policy(
+                &self.output,
                 &self.db_path,
                 &self.tool_name,
                 &raw_args,
@@ -730,7 +756,8 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
         // deferred to a follow-up commit so this fix stays
         // bounded — the parameter ships now so future callers
         // have a place to thread their budget through.
-        record_mcp_audit_sync(
+        record_mcp_audit_sync_with_policy(
+            &self.output,
             &self.db_path,
             &self.tool_name,
             &raw_args,
