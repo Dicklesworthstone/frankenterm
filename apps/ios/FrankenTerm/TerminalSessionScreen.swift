@@ -1622,6 +1622,7 @@ final class TerminalSessionController {
 
     /// The machine's mux, which searches its panes' scrollback on the server;
     /// nil for a session that is a shell of its own.
+    var isLiveDirectTerminal: Bool { !stopped && phase == .live && connection != nil && !attachedToMux }
     var muxControl: TerminalMuxControl? { stopped ? nil : connection?.muxControl }
 
     /// The device's network took a new route. A live session probes its

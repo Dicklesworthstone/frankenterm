@@ -939,7 +939,15 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(mounted[1].input.isEditable)
         mounted[1].input.insertText("echo WRONG-TAB >> \(path)\n")
         let survivor = extras[1], survivorView = mounted[2]
-        scene.selectTerminal(survivor)
+        scene.beginOverview()
+        let visit = try XCTUnwrap(scene.overviewSessionID)
+        let fleet = try await scene.makeOverview()
+        let terminals = try fleet.search(.init(scope: .directTerminals)).rows
+        XCTAssertEqual(terminals.map(\.directControllerID), ([primary] + extras).map { Optional($0.id) })
+        XCTAssertEqual(terminals.filter(\.selected).map(\.directControllerID), [primary.id])
+        let hidden = try XCTUnwrap(terminals.first { $0.directControllerID == survivor.id })
+        try scene.chooseOverview(hidden.id, in: fleet)
+        scene.finishOverviewDismissal(visit)
         for _ in 0..<400 where scene.selectedSession !== survivor || scene.navigation.phase != .ready {
             try await Task.sleep(for: .milliseconds(10))
         }

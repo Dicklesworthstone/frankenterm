@@ -21,6 +21,31 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         try XCTUnwrap(catalog.search(.init(scope: .panes)).rows.first { $0.paneID == id }?.id)
     }
 
+    func testDirectTerminalsAreSearchableByTheirOwnRouteAndBoundToTheirController() throws {
+        let primary = UUID(), sibling = UUID()
+        let machine = TerminalFleetOverview.Machine(id: "build", name: "Build Host", endpoint: "current.example",
+            status: .attention, directTerminals: [
+                .init(controllerID: primary, title: "Terminal 1", endpoint: "primary.example"),
+                .init(controllerID: sibling, title: "Terminal 2", endpoint: "sibling.example", selected: true)
+            ])
+        let catalog = try TerminalFleetOverview(machines: [machine], selectedMachineID: machine.id)
+        XCTAssertEqual(catalog.directTerminalCount, 2)
+        XCTAssertEqual(try catalog.search(.init(scope: .machines)).matchingCount, 1)
+        XCTAssertEqual(try catalog.search(.init(scope: .panes)).matchingCount, 0)
+        XCTAssertEqual(try catalog.search(.init(text: "current.example", scope: .directTerminals)).matchingCount, 0)
+        let found = try catalog.search(.init(text: "build sibling.example 2", scope: .directTerminals, filter: .connected))
+        let row = try XCTUnwrap(found.rows.first)
+        XCTAssertEqual(found.matchingCount, 1)
+        XCTAssertTrue(row.selected)
+        XCTAssertEqual(try catalog.resolve(row.id), .directTerminal(machineID: machine.id, controllerID: sibling))
+
+        let replacement = try TerminalFleetOverview(machines: [machine])
+        XCTAssertThrowsError(try replacement.resolve(row.id))
+        let other = TerminalFleetOverview.Machine(id: "other", name: "Other", endpoint: "", status: .live,
+            directTerminals: [.init(controllerID: sibling, title: "Terminal 1", endpoint: "other.example")])
+        XCTAssertThrowsError(try TerminalFleetOverview(machines: [machine, other]))
+    }
+
     func testEmptyInventoryAndEmptyQuery() throws {
         let catalog = try TerminalFleetOverview(machines: [])
         let result = try catalog.search()

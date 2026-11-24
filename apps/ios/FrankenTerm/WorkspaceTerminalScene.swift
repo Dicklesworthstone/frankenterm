@@ -636,9 +636,17 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 }
                 shown = state.shown; paneCount += panes.count
             }
+            let directTerminals = terminalControllers(machine.id).compactMap { controller -> TerminalFleetOverview.DirectTerminal? in
+                guard controller.isLiveDirectTerminal else { return nil }
+                let selected = self.selectedSession === controller
+                return .init(controllerID: controller.id, title: terminalTitle(controller),
+                    endpoint: WorkspaceTerminalScreen.via(controller.route), selected: selected,
+                    newOutput: !selected && controller.hasUnseenOutput)
+            }
             inventory.append(.init(id: machine.id, name: machine.name, endpoint: endpoint, status: status,
                 sessionID: session?.id, panes: panes, selectedPaneID: shown,
-                newOutput: hasUnseenOutput(machine.id), tags: machine.tags, attention: attentionReasons(machine.id)))
+                newOutput: hasUnseenOutput(machine.id), tags: machine.tags, attention: attentionReasons(machine.id),
+                directTerminals: directTerminals))
         }
         let selected = selectedMachineID
         let frozenInventory = inventory
@@ -735,12 +743,21 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         switch try catalog.resolve(choice) {
         case .machine(let machineID):
             guard navigationMachineIDs.contains(machineID) else { throw TerminalFleetOverview.Failure.stale }
+        case let .directTerminal(machineID, controllerID):
+            _ = try liveDirectTerminal(machineID: machineID, controllerID: controllerID)
         case let .pane(machineID, sessionID, _):
             guard navigationMachineIDs.contains(machineID),
                   let session = sessions[machineID], session.id == sessionID, session.phase == .live,
                   let control = session.muxControl else { throw TerminalFleetOverview.Failure.stale }
             _ = try catalog.validatePane(choice, sessionID: sessionID, routing: control.inputRouting)
         }
+    }
+
+    private func liveDirectTerminal(machineID: String, controllerID: UUID) throws -> TerminalSessionController {
+        guard navigationMachineIDs.contains(machineID),
+              let session = terminalControllers(machineID).first(where: { $0.id == controllerID }),
+              session.isLiveDirectTerminal else { throw TerminalFleetOverview.Failure.stale }
+        return session
     }
 
     /// One retained operation owns dismissal, machine focus, and an optional
@@ -774,16 +791,26 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     try self.validateOverviewChoice(selection, in: catalog)
                     let target = try catalog.resolve(selection)
                     let machineID: String
+                    let focusPlan: TerminalNavigationPlan?
                     switch target {
-                    case .machine(let id): machineID = id
-                    case .pane(let id, _, _): machineID = id
+                    case .machine(let id), .pane(let id, _, _):
+                        machineID = id
+                        focusPlan = try self.machinePlan(id)
+                    case let .directTerminal(id, controllerID):
+                        machineID = id
+                        let session = try self.liveDirectTerminal(machineID: id, controllerID: controllerID)
+                        guard let pane = self.selection(for: session).paneID else { throw TerminalFleetOverview.Failure.stale }
+                        focusPlan = try self.navigation.navigation.plan(paneID: pane)
                     }
-                    if let plan = try self.machinePlan(machineID) {
+                    if let plan = focusPlan {
                         try await self.navigation.perform(plan)
                     }
                     try self.checkOverviewNavigation(generation)
                     try self.validateOverviewChoice(selection, in: catalog)
                     guard self.selectedMachineID == machineID else { throw TerminalFleetOverview.Failure.stale }
+                    if case let .directTerminal(_, controllerID) = target, self.selectedSession?.id != controllerID {
+                        throw TerminalFleetOverview.Failure.stale
+                    }
                     if case let .pane(_, sessionID, plan) = target {
                         // A machine handoff may have prepared its old pane's
                         // keyboard. It was never installed behind the picker;
@@ -4379,7 +4406,7 @@ private struct WorkspaceFleetOverviewScreen: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Browse machines in the current navigation group and their discovered panes. Filter this snapshot below, or search terminal output on its connected machines.")
+                    Text("Browse machines in the current navigation group, their live SSH terminals, and discovered mux panes. Filter this snapshot below, or search terminal output on its connected machines.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let visit = scene.overviewSessionID {
                         NavigationLink {
@@ -4389,13 +4416,14 @@ private struct WorkspaceFleetOverviewScreen: View {
                         }.accessibilityIdentifier("terminal.fleet.search-output")
                     }
                     if let catalog {
-                        Text("\(catalog.machineCount) machines · \(catalog.paneCount) discovered panes")
+                        Text("\(catalog.machineCount) machines · \(catalog.directTerminalCount) SSH terminals · \(catalog.paneCount) mux panes")
                             .font(.caption).monospacedDigit()
                     }
                     Picker("Show", selection: $query.scope) {
                         Text("All").tag(TerminalFleetOverview.Scope.all)
                         Text("Machines").tag(TerminalFleetOverview.Scope.machines)
-                        Text("Panes").tag(TerminalFleetOverview.Scope.panes)
+                        Text("SSH tabs").tag(TerminalFleetOverview.Scope.directTerminals)
+                        Text("Mux panes").tag(TerminalFleetOverview.Scope.panes)
                     }.pickerStyle(.segmented)
                     Picker("Show at refresh", selection: $query.filter) {
                         Text("Any status").tag(TerminalFleetOverview.Filter.all)
@@ -4423,7 +4451,7 @@ private struct WorkspaceFleetOverviewScreen: View {
                             ForEach(results.rows) { row in
                                 Button { choose(row.id) } label: { resultRow(row) }
                                     .buttonStyle(.plain)
-                                    .accessibilityHint(row.paneID == nil ? "Show this machine" : "Show this exact pane")
+                                    .accessibilityHint(row.isMachine ? "Show this machine" : "Show this exact terminal")
                             }
                         } header: {
                             Text(results.limited
@@ -4436,7 +4464,7 @@ private struct WorkspaceFleetOverviewScreen: View {
             .navigationTitle("Fleet Overview")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query.text, placement: .navigationBarDrawer(displayMode: .always),
-                        prompt: "Machine, tag, host, pane, tab, or directory")
+                        prompt: "Machine, tag, host, terminal, pane, tab, or directory")
             .textInputAutocapitalization(.never).autocorrectionDisabled()
             .onSubmit(of: .search) {
                 // Return is an explicit shortcut only for an unambiguous result.
@@ -4508,12 +4536,14 @@ private struct WorkspaceFleetOverviewScreen: View {
 
     private func resultRow(_ row: TerminalFleetOverview.Row) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: row.paneID == nil ? "desktopcomputer" : "rectangle.split.2x1")
+            Image(systemName: row.isMachine ? "desktopcomputer" : (row.paneID == nil ? "terminal" : "rectangle.split.2x1"))
                 .foregroundStyle(Color(ftHex: scene.themes[row.machineID]?.accent ?? "#3B82F6"))
                 .frame(width: 24).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 if let pane = row.paneID {
                     Text(verbatim: "\(row.machineName) · Pane \(pane)").font(.caption).foregroundStyle(.secondary)
+                } else if row.directControllerID != nil {
+                    Text(verbatim: row.machineName).font(.caption).foregroundStyle(.secondary)
                 }
                 Text(verbatim: row.title).font(.body.weight(row.selected ? .semibold : .regular)).lineLimit(2)
                 if !row.detail.isEmpty { Text(verbatim: row.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2) }

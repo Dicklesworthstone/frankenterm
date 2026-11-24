@@ -31,7 +31,7 @@ public enum TerminalAttentionReason: String, CaseIterable, Hashable, Sendable {
     }
 }
 
-/// A bounded, immutable index of already-known machines and mux panes. Building
+/// A bounded, immutable index of already-known machines, direct SSH terminals, and mux panes. Building
 /// or searching it performs no discovery, authentication, terminal creation, or
 /// rendering. A result is a navigation candidate, never permission to send input.
 public struct TerminalFleetOverview: Identifiable, Sendable {
@@ -48,7 +48,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             }
         }
     }
-    public enum Scope: String, CaseIterable, Sendable { case all, machines, panes }
+    public enum Scope: String, CaseIterable, Sendable { case all, machines, panes, directTerminals }
     /// `newOutput` keeps the rows marked with output not yet shown at refresh.
     public enum Filter: String, CaseIterable, Sendable { case all, connected, attention, newOutput }
     public enum Failure: Error, Equatable, Sendable, LocalizedError {
@@ -73,6 +73,18 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             self.newOutput = newOutput
         }
     }
+    /// One already-live SSH shell. Its controller identity changes on restart,
+    /// even when the machine, local tab number and displayed title stay the same.
+    public struct DirectTerminal: Sendable {
+        public let controllerID: UUID
+        public let title: String, endpoint: String
+        public let selected: Bool, newOutput: Bool
+
+        public init(controllerID: UUID, title: String, endpoint: String, selected: Bool = false, newOutput: Bool = false) {
+            self.controllerID = controllerID; self.title = title; self.endpoint = endpoint
+            self.selected = selected; self.newOutput = newOutput
+        }
+    }
     public struct Machine: Sendable {
         public let id: String, name: String, endpoint: String
         /// Imported fleet labels participate in machine and pane search without
@@ -81,6 +93,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let status: Status
         public let sessionID: UUID?
         public let panes: [Pane]
+        public let directTerminals: [DirectTerminal]
         public let selectedPaneID: Int?
         /// The machine printed while off screen, as its strip chip marks it.
         public let newOutput: Bool
@@ -89,10 +102,10 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let attention: Set<TerminalAttentionReason>
         public init(id: String, name: String, endpoint: String, status: Status,
                     sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil, newOutput: Bool = false,
-                    tags: [String] = [], attention: Set<TerminalAttentionReason> = []) {
+                    tags: [String] = [], attention: Set<TerminalAttentionReason> = [], directTerminals: [DirectTerminal] = []) {
             self.id = id; self.name = name; self.endpoint = endpoint; self.status = status
             self.sessionID = sessionID; self.panes = panes; self.selectedPaneID = selectedPaneID
-            self.newOutput = newOutput; self.tags = tags; self.attention = attention
+            self.newOutput = newOutput; self.tags = tags; self.attention = attention; self.directTerminals = directTerminals
         }
     }
     public struct Query: Hashable, Sendable {
@@ -110,6 +123,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
     }
     public enum Target: Equatable, Sendable {
         case machine(String)
+        case directTerminal(machineID: String, controllerID: UUID)
         case pane(machineID: String, sessionID: UUID, plan: TerminalMuxInputRouting.NavigationPlan)
     }
     public struct Row: Identifiable, Sendable {
@@ -117,6 +131,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let machineID: String, machineName: String, title: String, detail: String
         public let status: Status
         public let paneID: Int?
+        public let directControllerID: UUID?
+        public var isMachine: Bool { paneID == nil && directControllerID == nil }
         public let selected: Bool
         public let newOutput: Bool
         public let attention: Set<TerminalAttentionReason>
@@ -134,11 +150,12 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
     public static let maximumMachines = 128
     public static let maximumTagsPerMachine = 64
     public static let maximumTagBytes = 128
+    public static let maximumDirectTerminals = 512
     public static let maximumPanes = 4096
     public static let maximumTextBytes = 2 * 1024 * 1024
     public static let maximumResults = 512
     public let id: UUID
-    public let machineCount: Int, paneCount: Int
+    public let machineCount: Int, paneCount: Int, directTerminalCount: Int
     private let entries: [IndexedRow]
 
     public init(machines: [Machine], selectedMachineID: String? = nil) throws {
@@ -146,6 +163,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         let owner = UUID()
         var entries: [IndexedRow] = [], identifiers = Set<String>()
         var paneCount = 0, textBytes = 0, indexedBytes = 0
+        var controllerIDs = Set<UUID>()
         func charge(_ value: String, maximum: Int) throws {
             let count = value.utf8.count
             guard count <= maximum, count <= Self.maximumTextBytes - textBytes else { throw Failure.capacity }
@@ -175,10 +193,29 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
                 newOutput: machine.newOutput))
             let machineRow = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                 machineName: machine.name, title: machine.name, detail: machine.endpoint,
-                status: machine.status, paneID: nil, selected: machine.id == selectedMachineID,
+                status: machine.status, paneID: nil, directControllerID: nil, selected: machine.id == selectedMachineID,
                 newOutput: machine.newOutput, attention: attention)
             entries.append(IndexedRow(row: machineRow, target: .machine(machine.id),
                 machineSearch: machineSearch, paneSearch: ""))
+            guard machine.directTerminals.count <= Self.maximumDirectTerminals - controllerIDs.count else {
+                throw Failure.capacity
+            }
+            let directMachineSearch = machine.directTerminals.isEmpty ? ""
+                : try index(([machine.id, machine.name] + machine.tags).joined(separator: "\n"))
+            for terminal in machine.directTerminals {
+                guard controllerIDs.insert(terminal.controllerID).inserted else { throw Failure.invalidInventory }
+                try charge(terminal.title, maximum: 1024)
+                try charge(terminal.endpoint, maximum: 2048)
+                let row = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
+                    machineName: machine.name, title: terminal.title, detail: terminal.endpoint,
+                    status: .live, paneID: nil, directControllerID: terminal.controllerID,
+                    selected: selectedMachineID == machine.id && terminal.selected,
+                    newOutput: terminal.newOutput, attention: terminal.newOutput ? [.newOutput] : [])
+                entries.append(IndexedRow(row: row,
+                    target: .directTerminal(machineID: machine.id, controllerID: terminal.controllerID),
+                    machineSearch: directMachineSearch,
+                    paneSearch: try index(terminal.title + "\n" + terminal.endpoint)))
+            }
             var paneIDs = Set<Int>()
             for pane in machine.panes {
                 try Task.checkCancellation()
@@ -193,7 +230,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
                 let paneSearch = try index(fallback + "\n" + pane.title + "\n" + pane.tabTitle + "\n" + pane.workingDirectory)
                 let row = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                     machineName: machine.name, title: title.isEmpty ? fallback : title, detail: detail,
-                    status: machine.status, paneID: pane.plan.paneID,
+                    status: machine.status, paneID: pane.plan.paneID, directControllerID: nil,
                     selected: machine.id == selectedMachineID && machine.selectedPaneID == pane.plan.paneID,
                     newOutput: pane.newOutput, attention: pane.newOutput ? [.newOutput] : [])
                 entries.append(IndexedRow(row: row,
@@ -202,6 +239,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             }
             paneCount += machine.panes.count
         }
+        directTerminalCount = controllerIDs.count
         id = owner; self.machineCount = machines.count; self.paneCount = paneCount; self.entries = entries
     }
 
@@ -219,7 +257,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         for entry in entries {
             try Task.checkCancellation()
             let row = entry.row
-            if query.scope == .machines && row.paneID != nil { continue }
+            if query.scope == .machines && !row.isMachine { continue }
+            if query.scope == .directTerminals && row.directControllerID == nil { continue }
             if query.scope == .panes && row.paneID == nil { continue }
             if query.filter == .connected && row.status != .live && row.status != .ready { continue }
             if query.filter == .attention && row.attention.isEmpty { continue }
