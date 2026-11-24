@@ -166,6 +166,7 @@ fn e2e_capture_search_real_sqlite_roundtrip() {
                 SearchOptions {
                     limit: Some(20),
                     pane_id: None,
+                    pane_ids: None,
                     zone_type: None,
                     since: None,
                     until: None,

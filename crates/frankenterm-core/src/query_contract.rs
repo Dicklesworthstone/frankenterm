@@ -347,6 +347,7 @@ pub fn to_storage_search_options(query: &UnifiedSearchQuery) -> SearchOptions {
     SearchOptions {
         limit: Some(query.limit),
         pane_id: query.pane,
+        pane_ids: None,
         zone_type: query.zone.clone(),
         since: query.since,
         until: query.until,

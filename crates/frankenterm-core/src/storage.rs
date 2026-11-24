@@ -11113,13 +11113,19 @@ impl StorageHandle {
     }
 }
 
-/// Search options for FTS queries
+const MAX_SEARCH_PANE_IDS: u64 = 4_096;
+
+/// Search options shared by lexical and semantic queries.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     /// Maximum number of results
     pub limit: Option<usize>,
     /// Filter by pane ID
     pub pane_id: Option<u64>,
+    /// Restrict retrieval to a sorted, deduplicated set of at most 4,096 panes.
+    /// `None` leaves the scope unrestricted; an empty set matches nothing.
+    /// When `pane_id` is also set, both filters must match.
+    pub pane_ids: Option<PaneIdSet>,
     /// Filter by semantic zone type (`prompt`, `input`, or `output`).
     pub zone_type: Option<String>,
     /// Filter by time range (epoch ms)
@@ -11139,6 +11145,28 @@ pub struct SearchOptions {
     pub highlight_prefix: Option<String>,
     /// Snippet highlight suffix (default: "<<<")
     pub highlight_suffix: Option<String>,
+}
+
+impl SearchOptions {
+    fn validate_pane_scope(&self) -> Result<()> {
+        if let Some(pane_id) = self.pane_id {
+            u64_to_i64(pane_id, "pane_id")?;
+        }
+        if let Some(pane_ids) = &self.pane_ids {
+            if pane_ids.len() > MAX_SEARCH_PANE_IDS {
+                return Err(StorageError::Database(format!(
+                    "search pane filter exceeds {MAX_SEARCH_PANE_IDS} unique IDs"
+                ))
+                .into());
+            }
+            // PaneIdSet is already sorted and unique. Checking its largest
+            // value validates the whole set before SQL or cache admission.
+            if let Some(pane_id) = pane_ids.iter().last() {
+                u64_to_i64(pane_id, "pane_ids")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Semantic lane budget/caching controls for hybrid retrieval.
@@ -11237,6 +11265,7 @@ pub struct SemanticBudgetSnapshot {
 struct SemanticQueryCacheKey {
     embedder_id: String,
     pane_id: Option<u64>,
+    pane_ids: Option<Vec<u64>>,
     zone_type: Option<String>,
     since: Option<i64>,
     until: Option<i64>,
@@ -11549,6 +11578,7 @@ fn semantic_query_cache_key(
     SemanticQueryCacheKey {
         embedder_id: embedder_id.to_string(),
         pane_id: options.pane_id,
+        pane_ids: options.pane_ids.as_ref().map(PaneIdSet::to_vec),
         zone_type: options.zone_type.clone(),
         since: options.since,
         until: options.until,
@@ -31297,6 +31327,7 @@ fn search_fts_with_snippets_backend(
     query: &str,
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
+    options.validate_pane_scope()?;
     ensure_fts_search_ready_backend(backend)?;
     validate_fts_query_backend(backend, query)?;
 
@@ -31348,14 +31379,24 @@ fn search_fts_with_snippets_backend(
     Ok(results)
 }
 
-fn append_fts_filter_backend_params(
+fn append_search_filter_backend_params(
     sql: &mut String,
     params: &mut Vec<ToSqlValue<'_>>,
     options: &SearchOptions,
 ) -> Result<()> {
+    options.validate_pane_scope()?;
     if let Some(pane_id) = options.pane_id {
         sql.push_str(" AND s.pane_id = ?");
         params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(pane_ids) = &options.pane_ids {
+        // Checked integer literals avoid a bind parameter per pane while
+        // keeping SQL size bounded, even for a large bookmarked fleet.
+        let predicate = pane_ids
+            .as_sql_in_clause_for_column("s.pane_id", MAX_SEARCH_PANE_IDS as usize)
+            .ok_or_else(|| StorageError::Database("invalid search pane filter".to_string()))?;
+        sql.push_str(" AND ");
+        sql.push_str(&predicate);
     }
     if let Some(zone_type) = options.zone_type.as_deref() {
         sql.push_str(" AND s.zone_type = ?");
@@ -31385,7 +31426,7 @@ fn search_fts_rank_stage_backend(
          WHERE output_segments_fts MATCH ?1",
     );
     let mut params = vec![ToSqlValue::Text(query)];
-    append_fts_filter_backend_params(&mut sql, &mut params, options)?;
+    append_search_filter_backend_params(&mut sql, &mut params, options)?;
 
     sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
     params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
@@ -31485,7 +31526,7 @@ fn search_fts_rank_only_backend(
          WHERE output_segments_fts MATCH ?1",
     );
     let mut params = vec![ToSqlValue::Text(query)];
-    append_fts_filter_backend_params(&mut sql, &mut params, options)?;
+    append_search_filter_backend_params(&mut sql, &mut params, options)?;
 
     sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
     params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
@@ -31661,22 +31702,7 @@ fn search_semantic_backend_with_scan_limit(
            AND se.dimension = ?2",
     );
 
-    if let Some(pane_id) = options.pane_id {
-        sql.push_str(" AND s.pane_id = ?");
-        params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
-    }
-    if let Some(zone_type) = options.zone_type.as_deref() {
-        sql.push_str(" AND s.zone_type = ?");
-        params.push(ToSqlValue::OwnedText(zone_type.to_string()));
-    }
-    if let Some(since) = options.since {
-        sql.push_str(" AND s.captured_at >= ?");
-        params.push(ToSqlValue::Integer(since));
-    }
-    if let Some(until) = options.until {
-        sql.push_str(" AND s.captured_at <= ?");
-        params.push(ToSqlValue::Integer(until));
-    }
+    append_search_filter_backend_params(&mut sql, &mut params, options)?;
 
     // Stable base order before similarity sort.
     sql.push_str(" ORDER BY s.id ASC");
@@ -31872,6 +31898,8 @@ fn hybrid_search_with_results_backend(
     fusion_backend: Option<FusionBackend>,
     semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
 ) -> Result<HybridSearchBundle> {
+    // Validate before semantic cache lookup as well as SQL construction.
+    options.validate_pane_scope()?;
     let top_k = options.limit.unwrap_or(100);
 
     let requested_mode = mode;
@@ -39137,6 +39165,224 @@ fn hybrid_backend_search_returns_fused_ranked_results() {
         first.fusion_score > second.fusion_score,
         "matching lexical+semantic rank should outrank the weaker candidate"
     );
+}
+
+mod pane_scope_search_tests {
+    use super::*;
+
+    const EMBEDDER: &str = "pane-scope-embedder";
+
+    fn fixture() -> (RusqliteBackend, [i64; 3]) {
+        let backend = memory_backend();
+        for pane_id in 1..=3 {
+            seed_pane_backend(&backend, pane_id, 1_000);
+        }
+        let rows = [
+            (1, 0, "needle alpha beta gamma", 1_000, "output", [1.0_f32, 0.1]),
+            (1, 1, "needle needle needle needle beta", 1_001, "output", [1.0, 0.2]),
+            (2, 0, "needle gamma", 1_002, "output", [0.1, 1.0]),
+            // Better semantic hits that must be excluded by pane, time, or zone.
+            (3, 0, "needle outside", 1_001, "output", [1.0, 0.0]),
+            (1, 2, "needle expired", 999, "output", [1.0, 0.0]),
+            (2, 1, "needle future", 1_003, "output", [1.0, 0.0]),
+            (2, 2, "needle prompt", 1_001, "prompt", [1.0, 0.0]),
+        ];
+        let mut ids = Vec::new();
+        for (pane_id, seq, content, captured_at, zone, vector) in rows {
+            let id = seed_segment_with_zone_backend(
+                &backend, pane_id, seq, content, captured_at, Some(zone),
+            );
+            seed_segment_embedding_backend(
+                &backend,
+                id,
+                EMBEDDER,
+                2,
+                &encode_f32_embedding_blob(&vector).unwrap(),
+                captured_at,
+            );
+            ids.push(id);
+        }
+        (backend, [ids[0], ids[1], ids[2]])
+    }
+
+    fn options(pane_ids: &[u64], limit: usize) -> SearchOptions {
+        SearchOptions {
+            limit: Some(limit),
+            pane_ids: Some(PaneIdSet::from_pane_ids(pane_ids.iter().copied())),
+            zone_type: Some("output".to_owned()),
+            since: Some(1_000),
+            until: Some(1_002),
+            ..SearchOptions::default()
+        }
+    }
+
+    fn budget() -> Arc<Mutex<SemanticBudgetState>> {
+        Arc::new(Mutex::new(SemanticBudgetState::new(SemanticBudgetConfig {
+            max_semantic_latency_ms: u64::MAX,
+            max_semantic_queries_per_window: 0,
+            ..SemanticBudgetConfig::default()
+        })))
+    }
+
+    fn retrieve(
+        backend: &dyn StorageBackend,
+        options: &SearchOptions,
+        mode: SearchMode,
+        state: &Arc<Mutex<SemanticBudgetState>>,
+    ) -> Result<HybridSearchBundle> {
+        hybrid_search_with_results_backend(
+            backend, "needle", options, EMBEDDER, &[1.0, 0.0], mode,
+            60, 0.5, 0.5, Some(FusionBackend::FrankenSearchRrf), state,
+        )
+    }
+
+    #[test]
+    fn semantic_top_k_keeps_multiple_strong_hits_from_the_same_pane() {
+        let (backend, [first, second, weak]) = fixture();
+        let scope = options(&[2, 1, 2], 2);
+        let raw = search_semantic_backend(&backend, EMBEDDER, &[1.0, 0.0], &scope).unwrap();
+        assert_eq!(raw.iter().map(|hit| hit.segment_id).collect::<Vec<_>>(), [first, second]);
+        assert!(raw.iter().all(|hit| hit.score > 0.98));
+
+        let result = retrieve(&backend, &scope, SearchMode::Semantic, &budget()).unwrap();
+        assert_eq!(
+            result.results.iter().map(|hit| hit.result.segment.id).collect::<Vec<_>>(),
+            [first, second],
+            "the weak pane's local rank-one hit must not displace the strong pane's second hit",
+        );
+        assert!(!result.results.iter().any(|hit| hit.result.segment.id == weak));
+        assert_eq!(result.semantic_rows_scanned, 3);
+        assert_eq!(result.results[0].semantic_rank, Some(0));
+        assert_eq!(result.results[1].semantic_rank, Some(1));
+        for (hit, raw) in result.results.iter().zip(raw) {
+            assert_eq!(hit.semantic_score, Some(raw.score));
+        }
+    }
+
+    #[test]
+    fn hybrid_ranks_match_a_union_of_untruncated_single_pane_lanes() {
+        let (backend, [first, second, _]) = fixture();
+        let mut lexical = Vec::new();
+        let mut semantic = Vec::new();
+        for pane_id in [1, 2] {
+            let mut scope = options(&[], 100);
+            scope.pane_ids = None;
+            scope.pane_id = Some(pane_id);
+            lexical.extend(search_fts_with_snippets_backend(&backend, "needle", &scope).unwrap());
+            semantic.extend(search_semantic_backend(&backend, EMBEDDER, &[1.0, 0.0], &scope).unwrap());
+        }
+        lexical.sort_by(|left, right| {
+            left.score.total_cmp(&right.score)
+                .then_with(|| left.segment.captured_at.cmp(&right.segment.captured_at))
+                .then_with(|| left.segment.id.cmp(&right.segment.id))
+        });
+        semantic.sort_by(|left, right| {
+            right.score.total_cmp(&left.score).then_with(|| left.segment_id.cmp(&right.segment_id))
+        });
+        // The storage contract admits top_k semantic candidates and 4*top_k
+        // lexical candidates, with RRF ranks assigned over the complete scope.
+        lexical.truncate(8);
+        semantic.truncate(2);
+        let mut expected_scores = BTreeMap::<i64, f64>::new();
+        for (rank, hit) in lexical.iter().enumerate() {
+            *expected_scores.entry(hit.segment.id).or_default() += 0.5 / (61.0 + rank as f64);
+        }
+        for (rank, hit) in semantic.iter().enumerate() {
+            *expected_scores.entry(hit.segment_id).or_default() += 0.5 / (61.0 + rank as f64);
+        }
+        let mut expected = expected_scores.into_iter().collect::<Vec<_>>();
+        expected.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        expected.truncate(2);
+        assert!(expected.iter().all(|(id, _)| [first, second].contains(id)));
+
+        let state = budget();
+        for pane_ids in [&[1, 2][..], &[2, 1, 1, 2][..]] {
+            let result = retrieve(&backend, &options(pane_ids, 2), SearchMode::Hybrid, &state).unwrap();
+            assert_eq!(result.results.len(), expected.len());
+            for (hit, (id, score)) in result.results.iter().zip(&expected) {
+                assert_eq!(hit.result.segment.id, *id);
+                assert!((hit.fusion_score - score).abs() < 1e-6);
+            }
+            assert_eq!(result.lexical_candidates, 3);
+            assert_eq!(result.semantic_candidates, 2);
+        }
+    }
+
+    #[test]
+    fn pane_scope_intersection_and_empty_set_apply_to_every_lane() {
+        let (backend, [first, second, third]) = fixture();
+        for (pane_ids, pane_id, expected) in [
+            (vec![2, 1, 2], None, vec![first, second, third]),
+            (vec![1, 2], Some(1), vec![first, second]),
+            (vec![1, 2], Some(2), vec![third]),
+            (vec![1, 2], Some(3), vec![]),
+            (vec![], None, vec![]),
+        ] {
+            let mut scope = options(&pane_ids, 10);
+            scope.pane_id = pane_id;
+            for snippets in [false, true] {
+                scope.include_snippets = Some(snippets);
+                let rows = search_fts_with_snippets_backend(&backend, "needle", &scope).unwrap();
+                let mut ids = rows.iter().map(|row| row.segment.id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, expected);
+                assert!(rows.iter().all(|row| row.snippet.is_some() == snippets));
+            }
+            for mode in [SearchMode::Lexical, SearchMode::Semantic, SearchMode::Hybrid] {
+                let result = retrieve(&backend, &scope, mode, &budget()).unwrap();
+                let mut ids = result.results.iter().map(|hit| hit.result.segment.id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "scope must be shared across lanes: {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_cache_reuses_permutations_but_never_crosses_pane_scopes() {
+        let (backend, [first, second, third]) = fixture();
+        let state = budget();
+        let original = retrieve(&backend, &options(&[2, 1, 2], 2), SearchMode::Semantic, &state).unwrap();
+        assert!(!original.semantic_cache_hit);
+        let equivalent = retrieve(&backend, &options(&[1, 2], 2), SearchMode::Semantic, &state).unwrap();
+        assert!(equivalent.semantic_cache_hit);
+        assert_eq!(equivalent.results.iter().map(|hit| hit.result.segment.id).collect::<Vec<_>>(), [first, second]);
+
+        let other = retrieve(&backend, &options(&[2], 2), SearchMode::Semantic, &state).unwrap();
+        assert!(!other.semantic_cache_hit);
+        assert_eq!(other.results.iter().map(|hit| hit.result.segment.id).collect::<Vec<_>>(), [third]);
+
+        let empty = retrieve(&backend, &options(&[], 2), SearchMode::Semantic, &state).unwrap();
+        assert!(!empty.semantic_cache_hit);
+        assert!(empty.results.is_empty());
+        let mut unscoped = options(&[], 2);
+        unscoped.pane_ids = None;
+        let all = retrieve(&backend, &unscoped, SearchMode::Semantic, &state).unwrap();
+        assert!(!all.semantic_cache_hit);
+        assert_eq!(all.results[0].result.segment.pane_id, 3);
+    }
+
+    #[test]
+    fn pane_scope_is_bounded_before_sql_or_semantic_cache_admission() {
+        let (backend, _) = fixture();
+        let mut largest = options(&[], 10);
+        largest.pane_ids = Some(PaneIdSet::from_pane_ids(0..MAX_SEARCH_PANE_IDS));
+        // A valid large scope must not consume one SQLite bind per pane.
+        assert_eq!(search_fts_with_snippets_backend(&backend, "needle", &largest).unwrap().len(), 4);
+        assert_eq!(search_semantic_backend(&backend, EMBEDDER, &[1.0, 0.0], &largest).unwrap().len(), 4);
+
+        for pane_ids in [
+            PaneIdSet::from_pane_ids(0..=MAX_SEARCH_PANE_IDS),
+            PaneIdSet::from_pane_ids([u64::MAX]),
+        ] {
+            let mut scope = options(&[], 10);
+            scope.pane_ids = Some(pane_ids);
+            assert!(search_fts_with_snippets_backend(&backend, "needle", &scope).is_err());
+            assert!(search_semantic_backend(&backend, EMBEDDER, &[1.0, 0.0], &scope).is_err());
+            let state = budget();
+            assert!(retrieve(&backend, &scope, SearchMode::Hybrid, &state).is_err());
+            assert_eq!(state.lock().unwrap().metrics.total_semantic_requests, 0);
+        }
+    }
 }
 
 #[test]
@@ -46541,6 +46787,7 @@ fn indeterminate_embedding_mutation_invalidates_semantic_cache_before_return() {
         let key = SemanticQueryCacheKey {
             embedder_id: "embedder-test".to_owned(),
             pane_id: None,
+            pane_ids: None,
             zone_type: None,
             since: None,
             until: None,
@@ -46587,6 +46834,7 @@ fn semantic_cache_epoch_replacement_clears_entries_without_identity_reuse() {
     let key = SemanticQueryCacheKey {
         embedder_id: "epoch-test".to_owned(),
         pane_id: None,
+        pane_ids: None,
         zone_type: None,
         since: None,
         until: None,
@@ -46749,6 +46997,7 @@ fn semantic_budget_poison_recovery_retires_cache_authority_and_transient_state()
             SemanticQueryCacheKey {
                 embedder_id: "poison-test".to_owned(),
                 pane_id: None,
+                pane_ids: None,
                 zone_type: None,
                 since: None,
                 until: None,

@@ -62353,6 +62353,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let options = frankenterm_core::storage::SearchOptions {
                                 limit: Some(limit),
                                 pane_id: saved.pane_id,
+                                pane_ids: None,
                                 zone_type: None,
                                 since,
                                 until: None,
@@ -62815,7 +62816,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         }
                     };
 
-                    let mut bookmark_pane_ids = match resolve_bookmark_pane_ids(
+                    let bookmark_pane_ids = match resolve_bookmark_pane_ids(
                         &storage,
                         bookmark.as_deref(),
                         bookmark_tag.as_deref(),
@@ -62828,12 +62829,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             std::process::exit(1);
                         }
                     };
-
-                    if let Some(filter_pane_id) = pane
-                        && let Some(ref mut pane_ids) = bookmark_pane_ids
-                    {
-                        pane_ids.retain(|pane_id| *pane_id == filter_pane_id);
-                    }
 
                     let redacted_query = bounded_terminal_preview(&query, 400, 1_600);
                     let display_bookmark = bookmark
@@ -63042,21 +63037,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         None
                     };
 
-                    let mut pane_candidates = bookmark_pane_ids.map(|pane_ids| {
-                        let mut ids: Vec<u64> = pane_ids.into_iter().collect();
-                        ids.sort_unstable();
-                        ids
-                    });
-                    if pane_candidates.is_none()
-                        && let Some(filter_pane_id) = pane
-                    {
-                        pane_candidates = Some(vec![filter_pane_id]);
-                    }
-
-                    // Build base search options
+                    // Rank all selected panes together before applying the
+                    // result limit or hybrid fusion. Per-pane reciprocal ranks
+                    // are not comparable across separate searches.
                     let mut base_options =
                         frankenterm_core::query_contract::to_storage_search_options(&canonical);
-                    base_options.pane_id = None;
+                    base_options.pane_id = pane;
+                    base_options.pane_ids =
+                        bookmark_pane_ids.map(|pane_ids| pane_ids.into_iter().collect());
                     let query_for_storage = canonical.query.clone();
                     let hybrid_rrf_k = effective_search_rrf_k(&config);
                     let (hybrid_lexical_weight, hybrid_semantic_weight) =
@@ -63067,167 +63055,33 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         effective_search_quality_timeout_ms(&config);
                     storage.set_semantic_budget_config(semantic_budget_config);
 
-                    let search_results = if let Some(candidate_panes) = pane_candidates {
-                        if candidate_panes.is_empty() {
-                            Ok(Vec::new())
-                        } else if candidate_panes.len() == 1 {
-                            let mut options = base_options.clone();
-                            options.pane_id = Some(candidate_panes[0]);
-                            match requested_mode {
-                                frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
-                                    storage
-                                        .search_with_results(&query_for_storage, options)
-                                        .await
-                                }
-                                frankenterm_core::query_contract::UnifiedSearchMode::Semantic
-                                | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
-                                    let (embedder_id, query_vector) = semantic_query
-                                        .as_ref()
-                                        .expect("semantic query should be initialized");
-                                    match storage
-                                        .hybrid_search_with_results(
-                                            &query_for_storage,
-                                            options,
-                                            embedder_id,
-                                            query_vector,
-                                            search_mode,
-                                            hybrid_rrf_k,
-                                            hybrid_lexical_weight,
-                                            hybrid_semantic_weight,
-                                            Some(hybrid_fusion_backend),
-                                        )
-                                        .await
-                                    {
-                                        Ok(bundle) => Ok(bundle
-                                            .results
-                                            .into_iter()
-                                            .map(|hit| {
-                                                let mut result = hit.result;
-                                                result.score = hit.fusion_score;
-                                                result
-                                            })
-                                            .collect()),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                            }
-                        } else {
-                            let mut combined = Vec::new();
-                            for candidate_pane in candidate_panes {
-                                let mut options = base_options.clone();
-                                options.pane_id = Some(candidate_pane);
-                                // ft-xbnl0.2.3 tick 245: cx-first storage search.
-                                let storage_cx = frankenterm_core::cx::Cx::current()
-                                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                                let mut pane_results = match requested_mode {
-                                    frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
-                                        match storage.search_with_results_with_cx(&storage_cx, &query_for_storage, options).await {
-                                            Ok(results) => results,
-                                            Err(e) => {
-                                                emit_bounded_display_error(
-                                                    output_format,
-                                                    "Search failed: ",
-                                                    &e,
-                                                );
-                                                std::process::exit(1);
-                                            }
-                                        }
-                                    }
-                                    frankenterm_core::query_contract::UnifiedSearchMode::Semantic
-                                    | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
-                                        let (embedder_id, query_vector) = semantic_query
-                                            .as_ref()
-                                            .expect("semantic query should be initialized");
-                                        match storage
-                                            .hybrid_search_with_results(
-                                                &query_for_storage,
-                                                options,
-                                                embedder_id,
-                                                query_vector,
-                                                search_mode,
-                                                hybrid_rrf_k,
-                                                hybrid_lexical_weight,
-                                                hybrid_semantic_weight,
-                                                Some(hybrid_fusion_backend),
-                                            )
-                                            .await
-                                        {
-                                            Ok(bundle) => bundle
-                                                .results
-                                                .into_iter()
-                                                .map(|hit| {
-                                                    let mut result = hit.result;
-                                                    result.score = hit.fusion_score;
-                                                    result
-                                                })
-                                                .collect(),
-                                            Err(e) => {
-                                                emit_bounded_display_error(
-                                                    output_format,
-                                                    "Search failed: ",
-                                                    &e,
-                                                );
-                                                std::process::exit(1);
-                                            }
-                                        }
-                                    }
-                                };
-                                combined.append(&mut pane_results);
-                            }
-                            if matches!(
-                                requested_mode,
-                                frankenterm_core::query_contract::UnifiedSearchMode::Semantic
-                                    | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid
-                            ) {
-                                combined.sort_by(|left, right| {
-                                    right
-                                        .score
-                                        .total_cmp(&left.score)
-                                        .then_with(|| {
-                                            right.segment.captured_at.cmp(&left.segment.captured_at)
-                                        })
-                                        .then_with(|| right.segment.id.cmp(&left.segment.id))
-                                });
-                            } else {
-                                combined.sort_by(|left, right| {
-                                    left.score
-                                        .total_cmp(&right.score)
-                                        .then_with(|| {
-                                            left.segment.captured_at.cmp(&right.segment.captured_at)
-                                        })
-                                        .then_with(|| left.segment.id.cmp(&right.segment.id))
-                                });
-                            }
-                            combined.truncate(canonical.limit);
-                            Ok(combined)
+                    let search_results = match requested_mode {
+                        frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+                            storage
+                                .search_with_results_with_cx(cx, &query_for_storage, base_options)
+                                .await
                         }
-                    } else {
-                        match requested_mode {
-                            frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
-                                storage
-                                    .search_with_results(&query_for_storage, base_options)
-                                    .await
-                            }
-                            frankenterm_core::query_contract::UnifiedSearchMode::Semantic
-                            | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
-                                let (embedder_id, query_vector) = semantic_query
-                                    .as_ref()
-                                    .expect("semantic query should be initialized");
-                                match storage
-                                    .hybrid_search_with_results(
-                                        &query_for_storage,
-                                        base_options,
-                                        embedder_id,
-                                        query_vector,
-                                        search_mode,
-                                        hybrid_rrf_k,
-                                        hybrid_lexical_weight,
-                                        hybrid_semantic_weight,
-                                        Some(hybrid_fusion_backend),
-                                    )
-                                    .await
-                                {
-                                    Ok(bundle) => Ok(bundle
+                        frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                        | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+                            let (embedder_id, query_vector) = semantic_query
+                                .as_ref()
+                                .expect("semantic query should be initialized");
+                            storage
+                                .hybrid_search_with_results_with_cx(
+                                    cx,
+                                    &query_for_storage,
+                                    base_options,
+                                    embedder_id,
+                                    query_vector,
+                                    search_mode,
+                                    hybrid_rrf_k,
+                                    hybrid_lexical_weight,
+                                    hybrid_semantic_weight,
+                                    Some(hybrid_fusion_backend),
+                                )
+                                .await
+                                .map(|bundle| {
+                                    bundle
                                         .results
                                         .into_iter()
                                         .map(|hit| {
@@ -63235,10 +63089,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             result.score = hit.fusion_score;
                                             result
                                         })
-                                        .collect()),
-                                    Err(e) => Err(e),
-                                }
-                            }
+                                        .collect()
+                                })
                         }
                     };
 
