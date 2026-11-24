@@ -12307,14 +12307,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
-    use std::sync::{Mutex as StdMutex, Once};
+    use std::sync::Mutex as StdMutex;
+    #[cfg(unix)]
+    use std::sync::Once;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
     use wezterm_term::TerminalSize;
 
+    // The installed logger and the reader-shutdown check serve only the
+    // Unix-socket transport tests below.
+    #[cfg(unix)]
     static TEST_LOGGER: TestLogger = TestLogger {
         records: StdMutex::new(Vec::new()),
     };
+    #[cfg(unix)]
     static TEST_LOGGER_INIT: Once = Once::new();
     const MAX_CAPTURED_COMPAT_WARNINGS: usize = 32;
     #[cfg(unix)]
@@ -13261,6 +13267,7 @@ mod tests {
         fn flush(&self) {}
     }
 
+    #[cfg(unix)]
     fn reset_test_logger() {
         TEST_LOGGER_INIT.call_once(|| {
             log::set_logger(&TEST_LOGGER).expect("install test logger");
@@ -13273,6 +13280,7 @@ mod tests {
             .clear();
     }
 
+    #[cfg(unix)]
     fn captured_logs() -> Vec<String> {
         TEST_LOGGER
             .records
@@ -13322,6 +13330,7 @@ mod tests {
             .block_on(future)
     }
 
+    #[cfg(unix)]
     fn assert_expected_reader_shutdown(result: anyhow::Result<()>) {
         let error = result.expect_err("reader must not report success when its transport ends");
         let client_destroyed = error

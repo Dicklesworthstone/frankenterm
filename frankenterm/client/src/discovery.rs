@@ -363,7 +363,7 @@ mod windows {
     impl FileMapping {
         /// Create a new or open an existing mapping with the specified name/size
         pub fn create(name: &str, size: usize) -> anyhow::Result<Self> {
-            let wide_name = wide_string(&name);
+            let wide_name = wide_string(name);
 
             let handle = unsafe {
                 CreateFileMappingW(
@@ -388,7 +388,7 @@ mod windows {
 
         /// Attempt to open an existing mapping
         pub fn open(name: &str, size: usize) -> anyhow::Result<Self> {
-            let wide_name = wide_string(&name);
+            let wide_name = wide_string(name);
 
             let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr()) };
             if handle.is_null() {
