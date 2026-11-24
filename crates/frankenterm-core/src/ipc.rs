@@ -2518,7 +2518,7 @@ async fn handle_client_with_context_with_cx(
         })
         .await
     } else {
-        handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+        handle_request_with_context_with_cx(&cx, envelope, &ctx, limits).await
     };
     let response = response.with_timing(start);
 
@@ -2649,7 +2649,7 @@ async fn handle_client_with_context_with_cx(
         })
         .await
     } else {
-        handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+        handle_request_with_context_with_cx(&cx, envelope, &ctx, limits).await
     };
     let response = response.with_timing(start);
 
@@ -3120,10 +3120,12 @@ where
     }
 }
 
-/// Handle a parsed IPC request with full context.
+/// Handle a parsed IPC request with full context and finite registry access.
 async fn handle_request_with_context(
+    cx: &crate::cx::Cx,
     envelope: IpcEnvelope,
     ctx: &IpcHandlerContext,
+    limits: IpcRuntimeLimits,
 ) -> IpcResponse {
     match envelope.request {
         IpcRequest::UserVar {
@@ -3215,7 +3217,42 @@ async fn handle_request_with_context(
             payload["allocator"] = allocator_status_payload();
             if let Some(registry_lock) = ctx.registry.as_ref() {
                 let (active_count, panes) = {
-                    let registry = registry_lock.read().await;
+                    if ctx.connection_shutdown.is_cancelled() {
+                        return registry_lock_error_response(LockAcquireError::Cancelled);
+                    }
+                    // A blocked status snapshot retains an admitted connection.
+                    // Bound that wait by the server's I/O limit and the caller's
+                    // budget, and release it during cooperative server shutdown.
+                    let read = crate::runtime_async::timeout_with_cx(
+                        cx,
+                        limits.io_timeout(),
+                        registry_lock.read_with_cx(cx),
+                    );
+                    let result = match futures::future::select(
+                        Box::pin(read),
+                        Box::pin(wait_for_ipc_shutdown(cx, ctx)),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((result, _)) => result,
+                        futures::future::Either::Right(((), read)) => {
+                            if ctx.connection_shutdown.is_cancelled() {
+                                return registry_lock_error_response(LockAcquireError::Cancelled);
+                            }
+                            // The Cx ended the shutdown wait. Let the bounded
+                            // acquire preserve its cancellation/budget class.
+                            read.await
+                        }
+                    };
+                    let registry = match result {
+                        Ok(Ok(registry)) => registry,
+                        Ok(Err(error)) => return registry_lock_error_response(error),
+                        Err(_) => {
+                            return registry_lock_error_response(
+                                LockAcquireError::DeadlineExceeded,
+                            );
+                        }
+                    };
                     let snapshot = registry.pane_arena_stats_snapshot();
                     let active_count = snapshot.len();
                     let panes: Vec<_> = snapshot
@@ -3288,15 +3325,14 @@ async fn handle_request_with_context(
 ///
 /// Routes PaneState / SetPanePriority / ClearPanePriority to their
 /// cx-first handler siblings so a cancelled client-handler cx
-/// propagates into the registry RwLock acquires. All other branches
-/// (UserVar, Ping, Status) delegate to the legacy dispatcher;
-/// they don't benefit from cx threading at this layer (Status does
-/// have a registry read but the telemetry-friendly path is
-/// best-effort — cancel-surfaces-as-delay is acceptable there).
+/// propagates into the registry RwLock acquires. The shared dispatcher
+/// also receives the explicit cx and limits so Status cannot retain a
+/// connection indefinitely while waiting for the registry.
 async fn handle_request_with_context_with_cx(
     cx: &crate::cx::Cx,
     envelope: IpcEnvelope,
     ctx: &IpcHandlerContext,
+    limits: IpcRuntimeLimits,
 ) -> IpcResponse {
     let IpcEnvelope {
         token,
@@ -3327,30 +3363,28 @@ async fn handle_request_with_context_with_cx(
             })
             .await
         }
-        // Non-lock branches delegate to the legacy dispatcher (the
-        // registry-read in the Status branch is best-effort; a
-        // cancel-surfaces-as-delay contract is acceptable there).
+        // Status keeps the caller's context and finite server limit when
+        // delegating to the shared dispatcher.
         other => {
             let envelope = IpcEnvelope {
                 token,
                 request_id,
                 request: other,
             };
-            handle_request_with_context(envelope, ctx).await
+            handle_request_with_context(cx, envelope, ctx, limits).await
         }
     }
 }
 
-/// Wake both unread connections and admitted RPC owners on the same server
-/// stop signal, without cancelling their shared caller Cx. Only the former
-/// may drop their work immediately; admitted RPCs must await settlement.
+/// Wake unread connections, blocked status snapshots, and admitted RPC owners
+/// on the same server stop signal, without cancelling their shared caller Cx.
+/// Only admitted RPCs must retain their work until process settlement.
 ///
 /// A cancelled `cx` also ends the wait. asupersync 0.6's `Sleep` completes
 /// early, with `Ok`, once its context is cancelled (other than by a timeout
 /// or deadline, which `sleep_with_cx` reports as `Err`), so without that
 /// check the 10 ms poll became one scheduler trip per iteration until the
 /// server cancelled `connection_shutdown`.
-#[cfg(any(unix, windows))]
 async fn wait_for_ipc_shutdown(cx: &crate::cx::Cx, ctx: &IpcHandlerContext) {
     while !ctx.connection_shutdown.is_cancelled() && !cx.is_cancel_requested() {
         if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
@@ -7231,6 +7265,7 @@ mod tests {
             let event_bus = Arc::new(EventBus::new(10));
             let ctx = IpcHandlerContext::new(event_bus);
             let response = handle_request_with_context(
+                &crate::cx::for_testing(),
                 IpcEnvelope {
                     token: None,
                     request_id: Some("control-unavailable".to_string()),
@@ -7242,6 +7277,7 @@ mod tests {
                     },
                 },
                 &ctx,
+                resolve_limits(None),
             )
             .await;
             assert!(!response.ok);
@@ -7285,6 +7321,7 @@ mod tests {
                 expected_instance_id: "fedcba9876543210fedcba9876543210".to_string(),
             };
             let response = handle_request_with_context(
+                &crate::cx::for_testing(),
                 IpcEnvelope {
                     token: None,
                     request_id: Some("control-42".to_string()),
@@ -7293,6 +7330,7 @@ mod tests {
                     },
                 },
                 &ctx,
+                resolve_limits(None),
             )
             .await;
             assert!(response.ok);
@@ -7319,6 +7357,13 @@ mod tests {
                 handle_pane_state_with_cx(&cx, 7, &ctx).await,
                 handle_set_pane_priority_with_cx(&cx, 7, 9, None, &ctx).await,
                 handle_clear_pane_priority_with_cx(&cx, 7, &ctx).await,
+                handle_request_with_context_with_cx(
+                    &cx,
+                    status_envelope(),
+                    &ctx,
+                    resolve_limits(None),
+                )
+                .await,
             ];
 
             for response in responses {
@@ -7329,6 +7374,233 @@ mod tests {
                 );
                 assert!(response.data.is_none());
             }
+        });
+    }
+
+    fn status_envelope() -> IpcEnvelope {
+        IpcEnvelope {
+            token: None,
+            request_id: Some("status-registry-wait".to_string()),
+            request: IpcRequest::Status,
+        }
+    }
+
+    #[test]
+    fn status_registry_wait_ends_on_cancellation_and_server_shutdown() {
+        run_async_test(async {
+            for server_shutdown in [false, true] {
+                let witness_cx = crate::cx::for_testing();
+                let request_cx = crate::cx::for_testing();
+                let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+                let ctx = IpcHandlerContext::with_registry(
+                    Arc::new(EventBus::new(10)),
+                    Arc::clone(&registry),
+                );
+                let writer = registry
+                    .write_with_cx(&witness_cx)
+                    .await
+                    .expect("hold the registry write lock");
+                let mut request = Box::pin(handle_request_with_context_with_cx(
+                    &request_cx,
+                    status_envelope(),
+                    &ctx,
+                    resolve_limits(None),
+                ));
+
+                // Establish that the real dispatcher reached the held lock
+                // before sending either signal; no sleep decides admission.
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        std::future::Future::poll(request.as_mut(), task_cx).is_pending(),
+                        "status must wait while the writer owns the registry"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if server_shutdown {
+                    ctx.connection_shutdown.cancel();
+                } else {
+                    request_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel blocked status request"),
+                    );
+                }
+
+                let response = crate::runtime_async::timeout_with_cx(
+                    &witness_cx,
+                    Duration::from_secs(2),
+                    request,
+                )
+                .await
+                .expect("blocked status must end without releasing the writer");
+                assert!(!response.ok);
+                assert_eq!(
+                    response.error_code.as_deref(),
+                    Some("ipc.request_cancelled")
+                );
+                assert!(response.data.is_none());
+                assert!(!witness_cx.is_cancel_requested());
+                assert_eq!(request_cx.is_cancel_requested(), !server_shutdown);
+
+                drop(writer);
+                let recovered = crate::runtime_async::timeout_with_cx(
+                    &witness_cx,
+                    Duration::from_secs(2),
+                    registry.write_with_cx(&witness_cx),
+                )
+                .await
+                .expect("cancelled status must dequeue its registry waiter")
+                .expect("the registry remains usable");
+                drop(recovered);
+            }
+        });
+    }
+
+    #[test]
+    fn status_registry_wait_respects_server_limit_and_earlier_cx_deadline() {
+        run_async_test(async {
+            for caller_deadline in [false, true] {
+                let witness_cx = crate::cx::for_testing();
+                let request_cx = if caller_deadline {
+                    let deadline = crate::runtime_async::timer_now_with_cx(&witness_cx)
+                        + Duration::from_millis(100);
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_deadline(deadline),
+                    )
+                } else {
+                    crate::cx::for_testing()
+                };
+                let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+                let ctx = IpcHandlerContext::with_registry(
+                    Arc::new(EventBus::new(10)),
+                    Arc::clone(&registry),
+                );
+                let writer = registry
+                    .write_with_cx(&witness_cx)
+                    .await
+                    .expect("hold the registry write lock");
+                let mut limits = resolve_limits(None);
+                limits.io_timeout_ms = if caller_deadline { 30_000 } else { 100 };
+
+                let response = crate::runtime_async::timeout_with_cx(
+                    &witness_cx,
+                    Duration::from_secs(2),
+                    handle_request_with_context_with_cx(
+                        &request_cx,
+                        status_envelope(),
+                        &ctx,
+                        limits,
+                    ),
+                )
+                .await
+                .expect("status must finish at the earlier finite deadline");
+                assert!(!response.ok);
+                assert_eq!(
+                    response.error_code.as_deref(),
+                    Some("ipc.request_deadline_exceeded")
+                );
+                assert!(response.data.is_none());
+                assert!(!witness_cx.is_cancel_requested());
+                assert!(!ctx.connection_shutdown.is_cancelled());
+
+                drop(writer);
+                let recovered = crate::runtime_async::timeout_with_cx(
+                    &witness_cx,
+                    Duration::from_secs(2),
+                    registry.write_with_cx(&witness_cx),
+                )
+                .await
+                .expect("expired status must dequeue its registry waiter")
+                .expect("the registry remains usable");
+                drop(recovered);
+            }
+        });
+    }
+
+    #[test]
+    fn status_registry_deadline_releases_live_server_connection_capacity() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("status-registry.sock");
+            let witness_cx = crate::cx::for_testing();
+            let server_cx = crate::cx::for_testing();
+            let mut limits = resolve_limits(None);
+            limits.max_concurrent_connections = 1;
+            limits.io_timeout_ms = 1_000;
+            let server = IpcServer::bind_with_permissions_and_limits_with_cx(
+                &server_cx,
+                &socket_path,
+                Some(0o600),
+                limits,
+            )
+            .await
+            .expect("bind the status test server");
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let mut writer = registry
+                .write_with_cx(&witness_cx)
+                .await
+                .expect("hold the registry throughout the blocked request");
+            writer.discovery_tick(vec![make_pane_info(7)]);
+            let server_registry = Arc::clone(&registry);
+            let event_bus = Arc::new(EventBus::new(10));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let run_cx = server_cx.clone();
+            let server_handle = crate::runtime_async::task::spawn(async move {
+                server
+                    .run_with_registry_with_cx(&run_cx, event_bus, server_registry, shutdown_rx)
+                    .await;
+            });
+
+            let client = IpcClient::new(&socket_path);
+            let response = crate::runtime_async::timeout_with_cx(
+                &witness_cx,
+                Duration::from_secs(5),
+                client.status(),
+            )
+            .await
+            .expect("the live handler must enforce its configured registry deadline")
+            .expect("the server must return a typed status error");
+            assert_eq!(
+                response.error_code.as_deref(),
+                Some("ipc.request_deadline_exceeded")
+            );
+            assert!(!server_cx.is_cancel_requested());
+
+            // The registry writer is still held. A successful Ping proves the
+            // expired status released the server's only admission slot.
+            let ping = crate::runtime_async::timeout_with_cx(
+                &witness_cx,
+                Duration::from_secs(2),
+                client.ping(),
+            )
+            .await
+            .expect("the only connection slot must be reusable")
+            .expect("ping after status deadline");
+            assert!(ping.ok);
+
+            drop(writer);
+            let recovered = crate::runtime_async::timeout_with_cx(
+                &witness_cx,
+                Duration::from_secs(2),
+                client.status(),
+            )
+            .await
+            .expect("status must recover after registry contention ends")
+            .expect("read the recovered status response");
+            assert!(recovered.ok);
+            let data = recovered.data.expect("status payload");
+            assert_eq!(data["pane_arenas"]["active_count"], 1);
+            assert_eq!(data["pane_arenas"]["panes"][0]["pane_id"], 7);
+
+            send_shutdown(&shutdown_tx).await;
+            crate::runtime_async::timeout_with_cx(
+                &witness_cx,
+                Duration::from_secs(2),
+                server_handle,
+            )
+            .await
+            .expect("server must stop after bounded status handling")
+            .expect("server task must complete normally");
         });
     }
 
