@@ -39,8 +39,6 @@ pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX
 pub const IPC_EVENT_STREAM_VERSION: u32 = 2;
 /// One-response RPC execution budget, measured from authenticated admission.
 pub const IPC_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(all(any(unix, windows), test))]
-const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// Pause after a failed `accept()` so a persistent error (e.g. `EMFILE`)
 /// cannot spin the accept loop. Matches the pacing the loop had when it
 /// polled the shutdown channel for 1 ms before every accept.
@@ -2025,23 +2023,18 @@ async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
 }
 
-/// Test probe: is a shutdown signal pending right now (within 1 ms)?
+/// Test probe: is a shutdown signal pending right now?
+///
+/// Polls the receive exactly once. A 1 ms timeout used to bound it, but the
+/// runtime checks that deadline before the first poll, so a slow scheduler
+/// turned an already closed channel into "not pending" (about 1 run in 5).
 #[cfg(all(any(unix, windows), test))]
 async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,
 ) -> bool {
-    // Tick 193 (ft-xbnl0.2.3): the timeout is bound to the caller's cx,
-    // not the thread-local one.
-    matches!(
-        crate::runtime_async::timeout_with_cx(
-            cx,
-            IPC_SHUTDOWN_POLL_INTERVAL,
-            shutdown_signal_with_cx(shutdown_rx, cx),
-        )
-        .await,
-        Ok(true)
-    )
+    let signal = std::pin::pin!(shutdown_signal_with_cx(shutdown_rx, cx));
+    matches!(futures::poll!(signal), std::task::Poll::Ready(true))
 }
 
 /// Waits for the next shutdown-channel event. `true` means shut down (a

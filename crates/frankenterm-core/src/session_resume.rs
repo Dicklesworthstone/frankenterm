@@ -4398,8 +4398,12 @@ mod tests {
             ..Default::default()
         });
         let started = std::time::Instant::now();
+        // The shell releases stderr before it forks, so only stdout escapes.
+        // With `sleep 1 2>/dev/null &`, the forked child held stderr until it
+        // applied its own redirect, and a loaded machine let that outlast the
+        // 100 ms drain (stderr_open: true).
         let error = resumer
-            .run_casr(&["-c", "sleep 1 >&1 2>/dev/null &"])
+            .run_casr(&["-c", "exec 2>/dev/null; sleep 1 >&1 &"])
             .expect_err("inherited output descriptor must fail closed");
         assert_eq!(
             error,
