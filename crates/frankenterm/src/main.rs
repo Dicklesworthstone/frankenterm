@@ -141904,23 +141904,35 @@ printf x > "$MINISIGN_MARKER"
     }
 
     /// The runnable part of a documented `ft ...` line: trailing comments,
-    /// pipes and redirections are cut, and synopsis lines (`[optional]`,
-    /// `{a|b}`, `a|b`, `...`) are skipped.
+    /// pipes, background `&` and redirections are cut, and synopsis lines
+    /// (`[optional]`, `{a|b}`, `a|b`, `...`) are skipped.
     fn runnable_example(line: &str) -> Option<&str> {
         if !line.starts_with("ft ") {
             return None;
         }
         let mut line = line;
-        for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
+        for cut in [" #", " | ", " && ", " || ", " & ", " > ", " 2>"] {
             if let Some(index) = line.find(cut) {
                 line = &line[..index];
             }
         }
         let line = line.trim();
+        let line = line.strip_suffix(" &").unwrap_or(line);
         (!["[", "{", "...", "|"]
             .into_iter()
             .any(|token| line.contains(token)))
         .then_some(line)
+    }
+
+    #[test]
+    fn runnable_example_cuts_shell_control_operators() {
+        assert_eq!(
+            runnable_example("ft web --ui-dir /srv/ui --auth-token-env TOKEN &"),
+            Some("ft web --ui-dir /srv/ui --auth-token-env TOKEN")
+        );
+        assert_eq!(runnable_example("ft watch & ft status"), Some("ft watch"));
+        assert_eq!(runnable_example("ft status && ft ping"), Some("ft status"));
+        assert_eq!(runnable_example("ft status # note"), Some("ft status"));
     }
 
     /// `ft ...` commands that product code hands to operators and agents:
