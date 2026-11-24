@@ -460,3 +460,204 @@ private struct MuxSearchContextScreen: View {
         copied = true
     }
 }
+
+/// Remote output search across this navigation group's connected mux owners.
+/// Matches contain captured text only; the live terminal stays behind the
+/// overview's existing keyboard/navigation fence until an explicit Show Pane.
+struct TerminalFleetHistorySearchScreen: View {
+    let scene: WorkspaceTerminalScene
+    let visit: UUID
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var text = ""
+    @State private var caseSensitive = false
+    @State private var regex = false
+    @State private var search: TerminalFleetHistorySearch?
+    @State private var update = UUID()
+    @State private var generation = UUID()
+    @State private var typing: Task<Void, Never>?
+    @State private var waiting = false
+    @State private var opened: UUID?
+    @State private var failure: String?
+    @State private var coverageExpanded = false
+
+    var body: some View {
+        // The transport observer belongs to each terminal controller. A single
+        // bounded polling task publishes only changed aggregate revisions here.
+        let _ = update
+        List {
+            Section {
+                Text("Search retained scrollback on already-connected mux machines in the current navigation group.")
+                    .font(.callout)
+                Text("Disconnected machines and connections without remote history appear in coverage. Search never opens a connection.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if waiting { ProgressView("Waiting for your query…") }
+                if let failure { Text(verbatim: failure).font(.callout).foregroundStyle(.orange) }
+            }
+            if let search {
+                Section {
+                    let complete = search.coverage.filter { $0.status == .complete }.count
+                    HStack {
+                        if search.isRunning { ProgressView().controlSize(.small) }
+                        Text("\(search.hits.count) matches · \(complete) of \(search.coverage.count) machines finished")
+                            .font(.caption).monospacedDigit()
+                        Spacer()
+                        if search.isRunning {
+                            Button("Stop") { search.stop(); update = search.revision }
+                                .accessibilityIdentifier("terminal.fleet.history.stop")
+                        }
+                    }
+                    if let issue = search.issue { Text(verbatim: issue).font(.callout).foregroundStyle(.orange) }
+                    if search.hits.isEmpty && !search.isRunning {
+                        Text("No matches received in the reported searched rows. Check coverage for machines or panes that could not be searched.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(search.coverage) { source in
+                    let matches = search.hits.filter { $0.machineID == source.id }
+                    if !matches.isEmpty {
+                        Section {
+                            ForEach(matches) { hit in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Button {
+                                        opened = opened == hit.id ? nil : hit.id
+                                        failure = nil
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text(verbatim: "\(hit.paneTitle) · Pane \(hit.paneID)")
+                                                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                            Text(MuxSearchHighlight.marked(hit.match))
+                                                .font(.system(.footnote, design: .monospaced)).lineLimit(3)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }.buttonStyle(.plain)
+                                        .accessibilityHint("Read the captured match and choose whether to show its pane")
+                                    if opened == hit.id { details(hit.id, in: search) }
+                                }
+                            }
+                        } header: { Text(verbatim: source.machineName) }
+                    }
+                }
+                Section {
+                    DisclosureGroup(isExpanded: $coverageExpanded) {
+                        ForEach(search.coverage) { source in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(verbatim: source.machineName).lineLimit(2)
+                                    Spacer()
+                                    Text(verbatim: source.status.label).font(.caption).foregroundStyle(.secondary)
+                                }
+                                if source.totalPanes > 0 {
+                                    Text("\(source.searchedPanes)/\(source.totalPanes) panes · \(source.searchedRows.formatted()) rows reported")
+                                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                                }
+                                if let issue = source.issue {
+                                    Text(verbatim: issue).font(.caption).foregroundStyle(.orange)
+                                }
+                            }
+                        }
+                    } label: {
+                        Text(coverageLabel(search)).font(.callout)
+                    }
+                    Text("At most 3 machines run at once. Results stop at 512 matches or 512 KiB of text, with per-machine and overall deadlines. Rows reflect each server's retained history when it answered, not a synchronized workspace snapshot.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } header: { Text("Search Coverage") }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("Search Connected Output").navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $text, placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "Find output across connected machines")
+        .textInputAutocapitalization(.never).autocorrectionDisabled()
+        .onSubmit(of: .search) { run(after: .zero) }
+        .onChange(of: text) { run(after: .milliseconds(350)) }
+        .onChange(of: caseSensitive) { run(after: .zero) }
+        .onChange(of: regex) { run(after: .zero) }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Toggle("Match Case", systemImage: "textformat", isOn: $caseSensitive)
+                    Toggle("Regular Expression", systemImage: "asterisk", isOn: $regex)
+                    Button("Search Again", systemImage: "arrow.clockwise") { run(after: .zero) }
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } label: { Label("Search Options", systemImage: "line.3.horizontal.decrease.circle") }
+            }
+            ToolbarItem(placement: .confirmationAction) { Button("Done") { scene.dismissOverview() } }
+        }
+        .task(id: search?.id) { await monitor(search) }
+        .onDisappear { retire() }
+        .onChange(of: scenePhase) { _, phase in if phase != .active { retire() } }
+        .onChange(of: scene.overviewPresented) { _, presented in if !presented { retire() } }
+    }
+
+    @ViewBuilder private func details(_ id: UUID, in owner: TerminalFleetHistorySearch) -> some View {
+        if let hit = owner.hit(id) {
+            Text("Captured rows \(hit.match.row)–\(hit.match.endRow), columns \(hit.match.startColumn + 1)–\(hit.match.endColumn).")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: hit.match.text).font(.system(.footnote, design: .monospaced))
+                .textSelection(.disabled)
+            HStack {
+                Button("Copy Match", systemImage: "doc.on.doc") {
+                    guard let current = owner.hit(id) else { return }
+                    UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic: current.match.text]],
+                        options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+                }.buttonStyle(.bordered)
+                Button("Show Pane", systemImage: "terminal") {
+                    do { try scene.chooseFleetHistoryHit(id, in: owner, visit: visit) }
+                    catch { failure = TerminalSessionController.describe(error) }
+                }.buttonStyle(.borderedProminent).disabled(!hit.canNavigate)
+            }
+            Text(hit.canNavigate
+                 ? "Show Pane opens this exact pane's live viewport. Copies stay on this device and expire after two minutes."
+                 : "This pane closed or changed. Its captured text remains readable, but Show Pane is no longer available.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func coverageLabel(_ owner: TerminalFleetHistorySearch) -> String {
+        let coverage = owner.coverage
+        let complete = coverage.filter { $0.status == .complete }.count
+        let pending = coverage.filter { $0.status == .queued || $0.status == .searching }.count
+        return "\(complete) searched · \(pending) pending · \(coverage.count - complete - pending) incomplete or unavailable"
+    }
+
+    private func run(after delay: Duration) {
+        typing?.cancel(); generation = UUID()
+        if let search { scene.endFleetHistorySearch(search) }
+        search = nil; opened = nil; failure = nil; waiting = false
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard scenePhase == .active, scene.overviewPresented, !query.isEmpty else { return }
+        let request = TerminalMuxControl.SearchQuery(text: query, caseSensitive: caseSensitive, regex: regex)
+        let expected = generation
+        waiting = true
+        typing = Task {
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, generation == expected, scenePhase == .active,
+                  scene.overviewPresented else { return }
+            waiting = false
+            do {
+                let owner = try scene.makeFleetHistorySearch(request, visit: visit)
+                search = owner; update = owner.revision
+                coverageExpanded = !owner.isRunning
+            } catch { failure = TerminalSessionController.describe(error) }
+        }
+    }
+
+    private func monitor(_ owner: TerminalFleetHistorySearch?) async {
+        guard let owner else { return }
+        defer { scene.endFleetHistorySearch(owner) }
+        while !Task.isCancelled, scenePhase == .active, search === owner {
+            owner.advance()
+            update = owner.revision
+            if let opened, owner.hit(opened) == nil { self.opened = nil }
+            if owner.isRetired { search = nil; return }
+            do { try await Task.sleep(for: .milliseconds(250)) }
+            catch { return }
+        }
+    }
+
+    private func retire() {
+        typing?.cancel(); typing = nil; generation = UUID()
+        if let search { scene.endFleetHistorySearch(search) }
+        search = nil; opened = nil; waiting = false; text = ""
+    }
+}

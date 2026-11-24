@@ -83,6 +83,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored private var overviewBuildID: UUID?
     @ObservationIgnored private var overviewCatalogID: UUID?
     @ObservationIgnored private var overviewChoice: (TerminalFleetOverview, TerminalFleetOverview.Choice)?
+    @ObservationIgnored private var fleetHistorySearch: TerminalFleetHistorySearch?
     @ObservationIgnored private var overviewJob: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var overviewAllowsTargetPresentation = false
     private var overviewBlocksInput: Bool { overviewVisit != nil || overviewJob != nil }
@@ -653,6 +654,64 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         return catalog
     }
 
+    /// Search only the current group's already-live mux owners. Merely opening
+    /// this panel never prepares a route, changes connection intent or discovers
+    /// new panes. Every query takes a fresh availability snapshot.
+    func makeFleetHistorySearch(_ query: TerminalMuxControl.SearchQuery,
+                                visit: UUID) throws -> TerminalFleetHistorySearch {
+        guard overviewPresented, overviewVisit == visit, presentedPanel == .fleet,
+              foreground, onScreen, !closed else { throw TerminalFleetHistorySearch.Failure.stale }
+        fleetHistorySearch?.retire(); fleetHistorySearch = nil
+        let sources: [TerminalFleetHistorySearch.Source] = navigationMachines.map { machine in
+            guard let session = sessions[machine.id], session.phase == .live else {
+                return .init(machineID: machine.id, machineName: machine.name,
+                             unavailable: "This machine was not connected when the query started.")
+            }
+            guard let control = session.muxControl else {
+                return .init(machineID: machine.id, machineName: machine.name,
+                             unavailable: "This connection does not offer remote mux history. Search its retained output from the terminal.")
+            }
+            let machineID = machine.id
+            return .init(machineID: machineID, machineName: machine.name, sessionID: session.id, control: control,
+                isCurrent: { [weak self, weak session, weak control] in
+                    guard let self, let session, let control else { return false }
+                    return self.navigationMachineIDs.contains(machineID)
+                        && self.sessions[machineID] === session && session.phase == .live
+                        && session.muxControl === control
+                })
+        }
+        let search = try TerminalFleetHistorySearch(query: query, sources: sources, isCurrent: { [weak self] in
+            guard let self else { return false }
+            return self.overviewPresented && self.overviewVisit == visit && self.presentedPanel == .fleet
+                && self.foreground && self.onScreen && !self.closed
+        })
+        fleetHistorySearch = search
+        return search
+    }
+
+    func endFleetHistorySearch(_ search: TerminalFleetHistorySearch) {
+        search.retire()
+        if fleetHistorySearch === search { fleetHistorySearch = nil }
+    }
+
+    /// Reuse the overview's captured-choice handoff. The tiny catalog carries
+    /// the original connection/session and pane plan through sheet dismissal,
+    /// keyboard suspension and machine switching; no numeric-ID lookup replaces it.
+    func chooseFleetHistoryHit(_ id: UUID, in search: TerminalFleetHistorySearch, visit: UUID) throws {
+        guard overviewPresented, overviewVisit == visit, fleetHistorySearch === search,
+              foreground, onScreen, !closed else { throw TerminalFleetHistorySearch.Failure.stale }
+        let target = try search.navigationTarget(id)
+        let catalog = try TerminalFleetOverview(machines: [
+            .init(id: target.machineID, name: target.machineName, endpoint: "", status: .live,
+                  sessionID: target.sessionID, panes: [.init(plan: target.plan, title: target.paneTitle)])
+        ], selectedMachineID: selectedMachineID)
+        guard let choice = try catalog.search(.init(scope: .panes), limit: 1).rows.first?.id else {
+            throw TerminalFleetHistorySearch.Failure.stale
+        }
+        overviewCatalogID = catalog.id
+        try chooseOverview(choice, in: catalog)
+    }
+
     /// Selection first records a frozen candidate. Actual navigation waits for
     /// the sheet's dismissal; a delayed row callback cannot replace the choice.
     func chooseOverview(_ choice: TerminalFleetOverview.Choice, in catalog: TerminalFleetOverview) throws {
@@ -660,11 +719,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               foreground, onScreen, !closed else { throw TerminalFleetOverview.Failure.stale }
         try validateOverviewChoice(choice, in: catalog)
         overviewChoice = (catalog, choice)
+        fleetHistorySearch?.retire(); fleetHistorySearch = nil
         overviewPresented = false
     }
 
     func dismissOverview() {
         guard overviewVisit != nil else { return }
+        fleetHistorySearch?.retire(); fleetHistorySearch = nil
         remoteFiles?.retire()
         overviewChoice = nil; overviewPresented = false
     }
@@ -686,6 +747,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// pane handoff. Backgrounding/closing invalidates it and never replays it.
     func finishOverviewDismissal(_ expectedVisit: UUID) {
         guard let generation = overviewVisit, generation == expectedVisit, overviewJob == nil else { return }
+        fleetHistorySearch?.retire(); fleetHistorySearch = nil
         let files = remoteFiles
         files?.retire(); remoteFiles = nil
         let choice = overviewChoice
@@ -764,6 +826,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     private func cancelOverview() {
+        fleetHistorySearch?.retire(); fleetHistorySearch = nil
         remoteFiles?.retire()
         overviewGeneration = UUID(); overviewPresented = false
         // Keep the closing sheet's slot until its exact dismissal arrives.
@@ -4316,8 +4379,15 @@ private struct WorkspaceFleetOverviewScreen: View {
         NavigationStack {
             List {
                 Section {
-                    Text("Browse machines in the current navigation group and their discovered panes. This snapshot does not connect to machines or search terminal output.")
+                    Text("Browse machines in the current navigation group and their discovered panes. Filter this snapshot below, or search terminal output on its connected machines.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let visit = scene.overviewSessionID {
+                        NavigationLink {
+                            TerminalFleetHistorySearchScreen(scene: scene, visit: visit)
+                        } label: {
+                            Label("Search Connected Output", systemImage: "text.magnifyingglass")
+                        }.accessibilityIdentifier("terminal.fleet.search-output")
+                    }
                     if let catalog {
                         Text("\(catalog.machineCount) machines · \(catalog.paneCount) discovered panes")
                             .font(.caption).monospacedDigit()

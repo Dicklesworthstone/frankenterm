@@ -878,8 +878,23 @@ public final class TerminalMuxControl: @unchecked Sendable {
     /// each answers. A new search replaces the last one.
     @discardableResult
     public func search(_ query: SearchQuery, panes: [Int]) -> UUID {
+        requestSearch(query, panes: panes, onlyIfIdle: false).id
+    }
+
+    /// Claims an unused query slot without replacing another screen's search
+    /// or context. The claim and pending-work publication share the same lock.
+    @discardableResult
+    public func searchIfIdle(_ query: SearchQuery, panes: [Int]) -> UUID? {
+        let request = requestSearch(query, panes: panes, onlyIfIdle: true)
+        return request.admitted ? request.id : nil
+    }
+
+    private func requestSearch(_ query: SearchQuery, panes: [Int], onlyIfIdle: Bool) -> (id: UUID, admitted: Bool) {
         let id = UUID()
+        var admitted = false
         let (notify, snapshot, wake) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State, (@Sendable () -> Void)?) in
+            guard !onlyIfIdle || (state.search == nil && state.context == nil) else { return (nil, state, nil) }
+            admitted = true
             let validText = (1...4096).contains(query.text.utf8.count)
             let validPanes = !panes.isEmpty && panes.count <= Self.maximumSearchPanes
                 && Set(panes).count == panes.count && panes.allSatisfy { id in
@@ -899,7 +914,20 @@ public final class TerminalMuxControl: @unchecked Sendable {
             return (observer, state, waker)
         }
         notify?(snapshot); wake?()
-        return id
+        return (id, admitted)
+    }
+
+    /// Releases only the captured search and its unsent work. Context readers
+    /// have separate ownership and may start after this search's admission;
+    /// releasing a fleet query must preserve their state and pending requests.
+    public func clearSearch(_ id: UUID) {
+        let (notify, snapshot, wake) = lock.withLock { () -> ((@Sendable (State) -> Void)?, State, (@Sendable () -> Void)?) in
+            guard state.search?.id == id else { return (nil, state, nil) }
+            if pendingSearch?.id == id { pendingSearch = nil }
+            state.search = nil; state.revision = UUID()
+            return (observer, state, waker)
+        }
+        notify?(snapshot); wake?()
     }
 
     public func clearSearch() {
