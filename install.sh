@@ -393,13 +393,21 @@ resolve_version() {
   # release need not ship them: a
   # macOS-only or `-appstore.*` companion release can sit at `/releases/latest`
   # while the newest cross-platform stable release sits in the release list.
-  local binary_release=0
+  local requested_app=0
   local -a needed=()
   if [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ] && [ -n "${ASSET:-}" ]; then
-    binary_release=1
     needed=("$ASSET")
     [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || needed+=("${ASSET}.sha256")
     [ "$NO_MINISIGN" -eq 1 ] || [ -n "${MINISIGN_SIGNATURE_URL:-}" ] || needed+=("${ASSET}.minisig")
+  fi
+  # Automatic app staging is best effort. For explicit --with-app, select
+  # one release containing the GUI bundle and its independent verification
+  # files. An overridden CLI artifact or sidecar only applies to the CLI.
+  if [ "$INSTALL_APP" -eq 1 ] && [ "$FROM_SOURCE" -eq 0 ] && \
+     [ "${OS:-}" = darwin ] && [ "${ARCH:-}" = aarch64 ]; then
+    requested_app=1
+    needed+=("$APP_ASSET" "${APP_ASSET}.sha256")
+    [ "$NO_MINISIGN" -eq 1 ] || [ -n "$APP_MINISIGN_SIGNATURE_URL" ] || needed+=("${APP_ASSET}.minisig")
   fi
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases"
   local latest_json latest_tag raw_latest_tag releases_json resolved status
@@ -416,7 +424,7 @@ except Exception:
 ' 2>/dev/null || true)
   latest_tag=$(printf '%s' "$latest_json" | release_tag_with_assets) || latest_tag=""
   if [ -n "$latest_tag" ]; then
-    if [ "$binary_release" -eq 0 ]; then
+    if [ -z "${needed[0]:-}" ]; then
       VERSION="$latest_tag"
       info "Resolved latest stable version: $VERSION"
       return 0
@@ -476,7 +484,7 @@ print(len(releases))
       list_error="could not inspect release-list page $page"
       break
     fi
-    if [ "$binary_release" -eq 1 ] && [ -z "$archive_only_tag" ]; then
+    if [ "$requested_app" -eq 0 ] && [ -n "${needed[0]:-}" ] && [ -z "$archive_only_tag" ]; then
       archive_only_tag=$(printf '%s' "$releases_json" | release_tag_with_assets "$ASSET") || archive_only_tag=""
     fi
     if [ "$page_count" -lt 100 ]; then
@@ -490,7 +498,10 @@ print(len(releases))
       err "Older releases were not checked. Specify --version vX.Y.Z to select a known release."
       return 1
     fi
-    if [ "$binary_release" -eq 1 ]; then
+    if [ "$requested_app" -eq 1 ]; then
+      err "No published stable release supplies all files required by --with-app: ${needed[*]}"
+      err "Nothing was installed. Use --no-app to select a CLI-only release."
+    elif [ -n "${needed[0]:-}" ]; then
       err "No published stable release ships a verifiable $ASSET for ${OS:-this OS}/${ARCH:-this arch} yet"
       err "(GitHub latest tag $display_latest is not a verifiable stable release for this target). Nothing was installed. Options:"
       if [ -n "$archive_only_tag" ]; then

@@ -628,7 +628,8 @@ sys.exit(response.get("status", 0))
                    FT_TEST_RESOLVER_LOG=str(resolver_log), VERSION="", FROM_SOURCE="0",
                    ARTIFACT_URL="", ASSET=asset_name, CHECKSUM="", CHECKSUM_URL="",
                    MINISIGN_SIGNATURE_URL="", NO_MINISIGN="0", OWNER="fixture",
-                   REPO="frankenterm", OS="linux", ARCH="x86_64")
+                   REPO="frankenterm", OS="linux", ARCH="x86_64", INSTALL_APP="-1",
+                   APP_ASSET="FrankenTerm-darwin-arm64.app.tar.xz", APP_MINISIGN_SIGNATURE_URL="")
         env.update(overrides or {})
         p = subprocess.run(["bash", "-c", resolver_script], env=env,
                            capture_output=True, text=True, timeout=15)
@@ -699,6 +700,39 @@ sys.exit(response.get("status", 0))
             asset_base + requested[-1]: {"status": 22},
         }, fallback_requests + [asset_base + name for name in requested],
             error="cannot provide required file " + requested[-1])
+    # A specifically requested app and process family must come from the
+    # same release. CLI checksum/signature overrides do not authenticate the app.
+    mac_cli = "ft-darwin-arm64.tar.xz"
+    mac_app = "FrankenTerm-darwin-arm64.app.tar.xz"
+    with_app = {"OS": "darwin", "ARCH": "aarch64", "ASSET": mac_cli, "INSTALL_APP": "1"}
+    app_files = [mac_app, mac_app + ".sha256", mac_app + ".minisig"]
+    complete = dict(releases_fixture[1], tag_name="v0.15.21",
+                    created_at="2026-11-08T00:00:00Z",
+                    assets=releases_fixture[1]["assets"] + [{"name": name} for name in app_files])
+    for missing in app_files:
+        partial = dict(complete, tag_name=stable_tag, created_at="2026-11-09T00:00:00Z",
+                       assets=[a for a in complete["assets"] if a["name"] != missing])
+        resolver_case("pos_resolver_with_app_requires_" + missing, {
+            latest_url: {"body": partial}, page_url(1): {"body": [partial, complete]},
+        }, [latest_url, page_url(1)], version=complete["tag_name"],
+            overrides=dict(with_app, MINISIGN_SIGNATURE_URL="https://fixture.invalid/cli.sig",
+                           CHECKSUM_URL="https://fixture.invalid/cli.sha256"))
+    resolver_case("pos_resolver_no_app_uses_cli_latest", {latest_url: {"body": releases_fixture[1]}},
+                  [latest_url], version=stable_tag, overrides=dict(with_app, INSTALL_APP="0"))
+    partial = dict(complete, assets=[a for a in complete["assets"] if a["name"] != mac_app + ".minisig"])
+    for suffix, policy in [("override", {"APP_MINISIGN_SIGNATURE_URL": "https://fixture.invalid/app.sig"}),
+                           ("no_verify", {"NO_MINISIGN": "1"})]:
+        resolver_case("pos_resolver_app_signature_" + suffix, {latest_url: {"body": partial}},
+                      [latest_url], version=complete["tag_name"], overrides=dict(with_app, **policy))
+    resolver_case("neg_resolver_custom_cli_redirect_requires_app_checksum", {
+        **fallback, asset_base + mac_app: {}, asset_base + mac_app + ".sha256": {"status": 22},
+    }, fallback_requests + [asset_base + mac_app, asset_base + mac_app + ".sha256"],
+        error="cannot provide required file " + mac_app + ".sha256",
+        overrides=dict(with_app, ARTIFACT_URL="https://fixture.invalid/cli.tar.xz"))
+    resolver_case("neg_resolver_with_app_no_joint_release", {
+        latest_url: {"body": releases_fixture[1]},
+        page_url(1): {"body": [releases_fixture[1], dict(complete, assets=[{"name": n} for n in app_files])]},
+    }, [latest_url, page_url(1)], error="No published stable release supplies all files required by --with-app", overrides=with_app)
     for suffix, overrides, needed_files in [
         ("checksum", {"CHECKSUM": "a" * 64}, [asset_name, asset_name + ".minisig"]),
         ("checksum_url_no_verify", {"CHECKSUM_URL": "https://fixture.invalid/checksum", "NO_MINISIGN": "1"}, [asset_name]),
