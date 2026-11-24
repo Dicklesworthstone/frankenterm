@@ -77108,6 +77108,53 @@ async fn handle_rules_command(
     }
 }
 
+/// `ft config show` output gets pasted into reports, so the secrets a config
+/// can hold inline are replaced by a marker. A set value still shows as set.
+fn redact_config_secrets(config: &mut frankenterm_core::config::Config) {
+    const REDACTED: &str = "[redacted]";
+    if config.distributed.token.is_some() {
+        config.distributed.token = Some(REDACTED.to_string());
+    }
+    for token in &mut config.ipc.tokens {
+        token.token = REDACTED.to_string();
+    }
+    if config.notifications.email.password.is_some() {
+        config.notifications.email.password = Some(REDACTED.to_string());
+    }
+}
+
+#[cfg(test)]
+mod redact_config_secrets_tests {
+    use super::*;
+    use frankenterm_core::config::Config;
+
+    #[test]
+    fn config_show_never_prints_inline_secrets() {
+        let mut config = Config::default();
+        config.distributed.token = Some("distributed-secret-sentinel".to_string());
+        config.ipc.tokens = vec![frankenterm_core::config::IpcAuthToken {
+            token: "ipc-secret-sentinel".to_string(),
+            ..Default::default()
+        }];
+        config.notifications.email.password = Some("smtp-secret-sentinel".to_string());
+        redact_config_secrets(&mut config);
+        // The same renderings ft config show uses, including its TOML fallback.
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let toml = toml::to_string_pretty(&config).unwrap_or_else(|_| format!("{config:?}"));
+        for shown in [&json, &toml] {
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            assert!(shown.contains("[redacted]"));
+        }
+
+        // An unset secret stays unset instead of looking configured.
+        let mut unset = Config::default();
+        redact_config_secrets(&mut unset);
+        assert!(unset.distributed.token.is_none());
+        assert!(unset.ipc.tokens.is_empty());
+        assert!(unset.notifications.email.password.is_none());
+    }
+}
+
 /// Handle `ft config` subcommands
 async fn handle_config_command(
     command: ConfigCommands,
@@ -77228,7 +77275,7 @@ async fn handle_config_command(
                 cli_config.map(std::path::PathBuf::from)
             };
 
-            let config = Config::load_with_overrides(
+            let mut config = Config::load_with_overrides(
                 config_path.as_deref(),
                 false,
                 &ConfigOverrides::default(),
@@ -77237,7 +77284,8 @@ async fn handle_config_command(
             if effective {
                 // Show effective config with resolved paths
                 let workspace_root = cli_workspace.map(std::path::PathBuf::from);
-                let effective_config = config.effective_config(workspace_root.as_deref())?;
+                let mut effective_config = config.effective_config(workspace_root.as_deref())?;
+                redact_config_secrets(&mut effective_config.config);
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&effective_config)?);
@@ -77280,6 +77328,7 @@ async fn handle_config_command(
                 }
             } else {
                 // Show raw config
+                redact_config_secrets(&mut config);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 } else {
