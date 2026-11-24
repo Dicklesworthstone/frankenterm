@@ -262,14 +262,16 @@ impl Reranker for CrossEncoderReranker {
         let model = guard
             .as_mut()
             .ok_or_else(|| RerankError::ModelNotLoaded(self.model_path.clone()))?;
+        let mut cancelled = false;
         let inference = frankenterm_sigpipe::catch_recoverable(
             frankenterm_sigpipe::RecoverablePanicSite::CoreSearchBridge,
             std::panic::AssertUnwindSafe(|| {
                 for batch in docs.chunks_mut(SEARCH_RERANK_BATCH_SIZE) {
-                    if let Some(cx) = crate::cx::Cx::current() {
-                        cx.checkpoint().map_err(|_| {
-                            RerankError::ModelError("search reranking cancelled".into())
-                        })?;
+                    if let Some(cx) = crate::cx::Cx::current()
+                        && cx.checkpoint().is_err()
+                    {
+                        cancelled = true;
+                        return Err(RerankError::ModelError("search reranking cancelled".into()));
                     }
                     let texts: Vec<&str> = batch
                         .iter()
@@ -298,7 +300,13 @@ impl Reranker for CrossEncoderReranker {
         })
         .and_then(|result| result);
         if let Err(error) = inference {
-            *guard = None;
+            // Only a failed or panicked inference makes the model suspect.
+            // Dropping it on cancellation would make the next search pay a full
+            // reload, and a deadline shorter than load-plus-inference would then
+            // fail every search.
+            if !cancelled {
+                *guard = None;
+            }
             return Err(error);
         }
         // Stable ties retain original retrieval order.
@@ -1901,6 +1909,123 @@ mod tests {
             let original = documents.iter().find(|doc| doc.id == scored.id).unwrap();
             assert_eq!(scored.text, original.text);
         }
+    }
+
+    /// A cancelled search must not discard the loaded model: otherwise a search
+    /// deadline shorter than load-plus-inference makes every later search
+    /// reload the model and time out again.
+    #[cfg(feature = "semantic-search")]
+    #[test]
+    #[ignore = "set FT_TEST_RERANK_MODEL to a compatible local model.onnx and run explicitly"]
+    fn cross_encoder_cancelled_rerank_keeps_the_loaded_model() {
+        let path = std::env::var("FT_TEST_RERANK_MODEL")
+            .expect("FT_TEST_RERANK_MODEL must explicitly name a local model.onnx");
+        let mut model = CrossEncoderReranker::new(path);
+        model
+            .load()
+            .expect("local model must initialize and complete readiness inference");
+        let documents = vec![ScoredDoc {
+            id: 5,
+            text: "Rust compilation failed with error E0308.".into(),
+            score: 0.0,
+        }];
+        let cancelled = crate::cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        {
+            let _current = crate::cx::Cx::set_current(Some(cancelled));
+            let error = model
+                .rerank("Rust compiler error", documents.clone())
+                .expect_err("a cancelled search must not publish scores");
+            assert!(error.to_string().contains("cancelled"), "{error}");
+        }
+        assert!(model.is_loaded(), "cancellation discarded the loaded model");
+        let result = model
+            .rerank("Rust compiler error", documents)
+            .expect("the kept model must serve the next search");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].score.is_finite());
+    }
+
+    /// The live stage that `ft search`, robot search and wa.search call, run
+    /// against a real bundle laid out as `<models_dir>/reranker/model.onnx`.
+    #[cfg(feature = "semantic-search")]
+    #[test]
+    #[ignore = "set FT_TEST_RERANK_MODEL to <models_dir>/reranker/model.onnx and run explicitly"]
+    fn live_reranking_with_a_local_bundle_moves_the_relevant_row_first() {
+        let path = std::path::PathBuf::from(
+            std::env::var("FT_TEST_RERANK_MODEL")
+                .expect("FT_TEST_RERANK_MODEL must explicitly name a local model.onnx"),
+        );
+        let models_dir = path
+            .parent()
+            .filter(|directory| directory.ends_with("reranker"))
+            .and_then(std::path::Path::parent)
+            .expect("FT_TEST_RERANK_MODEL must sit in a reranker/ directory")
+            .to_string_lossy()
+            .into_owned();
+        let config = crate::config::SearchConfig {
+            reranker_enabled: true,
+            models_dir,
+            ..Default::default()
+        };
+        let rows = vec![
+            SearchRow {
+                id: 11,
+                text: "A recipe for roasting carrots with olive oil.".into(),
+                retrieval_score: -3.0,
+            },
+            SearchRow {
+                id: 12,
+                text: "The train leaves at six in the morning.".into(),
+                retrieval_score: -2.0,
+            },
+            SearchRow {
+                id: 13,
+                text: "error[E0308]: mismatched types: expected u64, found String".into(),
+                retrieval_score: -1.0,
+            },
+        ];
+        run_rerank_async_test(async move {
+            let cx = crate::cx::for_request();
+            // One stage is admitted per process, and a parallel test may hold it.
+            let mut attempts = 0;
+            let (output, report) = loop {
+                match rerank_search_results_with_cx(
+                    &cx,
+                    &config,
+                    "Rust compiler mismatched types error",
+                    rows.clone(),
+                    search_document,
+                )
+                .await
+                {
+                    Err(error) if error.to_string().contains("busy") && attempts < 50 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    other => break other.expect("live reranking with a real bundle"),
+                }
+            };
+            let report = report.expect("an enabled stage reports");
+            assert!(report.reranked);
+            assert_eq!(report.candidates_reranked, 3);
+            assert_eq!(report.truncated_documents, 0);
+            assert_eq!(report.scores.len(), 3);
+            assert_eq!(report.scores[0].segment_id, 13);
+            assert_eq!(report.scores[0].original_rank, 3);
+            assert_eq!(output[0], rows[2]);
+            let mut ids: Vec<i64> = output.iter().map(|row| row.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![11, 12, 13]);
+            // Retrieval scores travel with their rows unchanged.
+            for row in &output {
+                let original = rows
+                    .iter()
+                    .find(|candidate| candidate.id == row.id)
+                    .unwrap();
+                assert_eq!(row, original);
+            }
+        });
     }
 
     // =====================================================================
