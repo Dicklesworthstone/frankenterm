@@ -123469,7 +123469,17 @@ cp "$FAKE_INSTALLER_SOURCE" "$output"
             "#!/usr/bin/env python3\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:ft:{target}:release-interactive:0.15.2;\n"
         );
         source.push_str(
-            r#"import hashlib, json, os, sys, time
+            r#"import hashlib, json, os, stat, sys, time
+
+def fully_sealed(path):
+    observed = os.lstat(path)
+    if stat.S_ISLNK(observed.st_mode):
+        return True
+    if observed.st_mode & 0o222:
+        return False
+    if stat.S_ISDIR(observed.st_mode):
+        return all(fully_sealed(os.path.join(path, name)) for name in os.listdir(path))
+    return True
 
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
@@ -123521,6 +123531,11 @@ stage = os.path.join(parent, stage_name)
 target = os.path.join(parent, target_name)
 stage_exists = os.path.lexists(stage)
 target_exists = os.path.lexists(target)
+# Same contract as the real helper: only a fully sealed stage (no write bit
+# on the stage or anything under it; symlinks exempt) is ever published.
+if stage_exists and not fully_sealed(stage):
+    print("Error: atomic transition staged entry does not match its expected sealed content identity", file=sys.stderr)
+    raise SystemExit(1)
 outcome = "applied"
 if operation == "publish-noreplace":
     if stage_exists and not target_exists:
@@ -124874,13 +124889,19 @@ cat "$FAKE_FONT_ARCHIVE"
         let publish = active
             .find("$stage_id\" missing publish-noreplace")
             .expect("atomic generation publish");
-        // macOS refuses to rename a read-only directory, so the stage is
-        // published owner-writable and sealed 0555 only afterwards (B-I2).
-        assert!(!active.contains("chmod 0555 \"$stage\""));
+        // The atomic helper publishes only a fully sealed stage, so the stage
+        // is sealed before its content identity is taken (GH #139).
+        let stage_seal = active
+            .find("seal_published_installer_generation \"$stage\" || return 1")
+            .expect("pre-publication stage seal");
+        let stage_identity = active
+            .find("stage_id=$(atomic_path_content_id \"$helper\" \"$generations\" \"$stage_name\")")
+            .expect("stage content identity");
         let seal = active
             .find("seal_published_installer_generation \"$generation\" || return 1")
-            .expect("post-publication generation seal");
-        assert!(ft_probe < publish && mux_probe < publish && guardian_probe < publish);
+            .expect("post-publication generation seal check");
+        assert!(ft_probe < stage_seal && mux_probe < stage_seal && guardian_probe < stage_seal);
+        assert!(stage_seal < stage_identity && stage_identity < publish);
         assert!(publish < seal);
         assert!(active.contains("stage_name=\".generation-${generation_id}.installing\""));
         assert!(!active.contains("stage_name=\".generation-${generation_id}.installing-$$\""));
@@ -126123,18 +126144,26 @@ with tarfile.open(path, "w") as archive:
         let publication = font
             .find("atomic_path_transition")
             .expect("atomic font generation publication");
-        // Published owner-writable, sealed after (macOS refuses to rename or
-        // exchange a read-only directory; B-I2).
+        // The atomic helper publishes only a fully sealed stage, so the stage
+        // is sealed before its content identity is taken (GH #139).
+        let stage_seal = font
+            .find("seal_font_generation_stage \"$font_stage\" \"$tree_receipt\"")
+            .expect("exact pre-publication font stage seal");
+        let stage_identity = font
+            .find("stage_id=$(atomic_path_content_id \"$helper\" \"$font_parent\" \"$font_stage_name\")")
+            .expect("font stage content identity");
         let seal = font
             .find("seal_font_generation_stage \"$font_dir\"")
             .expect("exact post-publication font receipt seal");
-        assert_eq!(font.matches("seal_font_generation_stage").count(), 1);
+        assert_eq!(font.matches("seal_font_generation_stage").count(), 2);
         assert!(receipt < download);
         assert!(download < checksum);
         assert!(checksum < scan_receipt);
         assert!(scan_receipt < direct_stage);
         assert!(direct_stage < extraction);
-        assert!(extraction < publication);
+        assert!(extraction < stage_seal);
+        assert!(stage_seal < stage_identity);
+        assert!(stage_identity < publication);
         assert!(publication < seal);
         assert!(!font.contains("zstd -dc \"$TMP/pragmasevka.zip.zst\" | tar"));
         assert!(font.contains("font - \"$font_identity\""));

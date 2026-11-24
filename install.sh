@@ -1283,9 +1283,9 @@ print(f"{stat.S_IMODE(observed.st_mode):04o}")
 PY
 }
 
-# Make a published generation directory immutable (0555) and durable. It is
-# published at 0700 because macOS refuses to rename a read-only directory; a
-# crash between publication and this seal leaves 0700, which a rerun seals.
+# Make a generation directory immutable (0555) and durable: a complete stage
+# before its atomic publication (the helper publishes only a fully sealed
+# stage), or a generation an earlier installer published at 0700.
 seal_published_installer_generation() {
   local generation="$1" mode
   mode=$(installer_stage_mode "$generation") || return 1
@@ -2130,14 +2130,19 @@ install_process_family() {
     "$stage/ft" --version >/dev/null 2>&1 || return 1
     "$stage/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
     "$stage/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
+    # Seal the complete stage before its content identity is taken. The
+    # atomic helper publishes only a fully sealed stage (its identity covers
+    # the stage's own mode), so a stage published owner-writable is refused
+    # on every platform. Renaming a sealed directory within one parent works
+    # on Linux and macOS, as the app generation already relies on. A rerun
+    # resumes a stage a previous run left at 0700 or sealed.
+    seal_published_installer_generation "$stage" || return 1
     fsync_installer_tree "$stage" || return 1
     stage_id=$(atomic_path_content_id "$helper" "$generations" "$stage_name") || return 1
     txid=$(atomic_transition_txid "generation:$DEST:$generation_id") || return 1
-    # Publish while the stage is still owner-writable: macOS refuses to
-    # rename a read-only directory even within one parent, so sealing it 0555
-    # first failed every non-root macOS install. Seal after publication.
     atomic_path_transition "$helper" "$generations" "$stage_name" "$generation_id" \
       "$txid" "$stage_id" missing publish-noreplace || return 1
+    # Already sealed; kept so the published generation is checked as 0555.
     seal_published_installer_generation "$generation" || return 1
     verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   fi
@@ -2195,10 +2200,12 @@ install_process_family() {
         done
         ensure_exact_staged_file "$legacy_manifest" "$legacy_stage/legacy-family.json" 0444 || return 1
         [ "$(legacy_process_family_manifest "$legacy_stage" -)" = "$legacy_manifest_id" ] || return 1
+        # Seal before taking the content identity: the atomic helper
+        # publishes only a fully sealed stage.
+        seal_published_installer_generation "$legacy_stage" || return 1
         fsync_installer_tree "$legacy_stage" || return 1
         stage_id=$(atomic_path_content_id "$helper" "$generations" "$legacy_stage_name") || return 1
         txid=$(atomic_transition_txid "legacy-generation:$DEST:$legacy_id") || return 1
-        # Publish writable, then seal (macOS refuses to rename a 0555 dir).
         atomic_path_transition "$helper" "$generations" "$legacy_stage_name" "$legacy_id" \
           "$txid" "$stage_id" missing publish-noreplace || return 1
       fi
@@ -5622,15 +5629,12 @@ install_pragmasevka() {
   fi
   installer_failpoint after-font-extraction
   installer_test_mutate_font_stage "$font_stage" || return 0
-  # The stage is published owner-writable and sealed 0555 only afterwards:
-  # macOS refuses to rename (or exchange) a read-only directory, so sealing
-  # first made every non-root macOS install fail. A stage a prior run sealed
-  # is reopened to 0700 before its content identity is taken.
-  if [ "$(installer_stage_mode "$font_stage" 2>/dev/null)" = 0555 ]; then
-    chmod 0700 "$font_stage" || return 0
-  fi
+  # The stage is sealed 0555 before its content identity is taken: the atomic
+  # helper publishes only a fully sealed stage, so a stage left owner-writable
+  # was refused and the font was never installed.
   if ! fsync_installer_tree "$font_stage" ||
-      ! verify_font_tree_receipt "$font_stage" "$tree_receipt" 0; then
+      ! verify_font_tree_receipt "$font_stage" "$tree_receipt" 0 ||
+      ! seal_font_generation_stage "$font_stage" "$tree_receipt"; then
     warn "Pragmasevka generation failed its exact pre-publication receipt; skipping"
     return 0
   fi
@@ -5642,7 +5646,7 @@ install_pragmasevka() {
   }
   # This second receipt check followed by the atomic helper's stage-content-ID
   # check closes the final same-UID mutation window before the namespace move.
-  verify_font_tree_receipt "$font_stage" "$tree_receipt" 0 || return 0
+  verify_font_tree_receipt "$font_stage" "$tree_receipt" 1 || return 0
   if [ -e "$font_dir" ]; then
     [ -d "$font_dir" ] && [ ! -L "$font_dir" ] || return 0
     # An exchange renames the prior generation too; reopen a sealed one.
