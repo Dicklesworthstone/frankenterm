@@ -1250,7 +1250,27 @@ fn mcp_authorize_mcp_mutation(
             .to_str()
             .ok_or(KillSwitchStateError::FenceFailed)
             .and_then(|path| load_kill_switch_state_from_path_with_cx(cx, path));
-        kill_switch_gate.restore(&fence, &mut engine, loaded);
+        // An unreadable state (a lock outlasting the short read wait, a
+        // malformed row, a regressed revision) still refuses the mutation. It
+        // is refused as unavailable authority, like the fence failure above
+        // and McpKillSwitchGate::refresh: evaluating the synthetic HardStop
+        // reported, and audited, a stop that no operator had set.
+        if let crate::policy_kill_switch_state::KillSwitchRestore::FailedClosed { error } =
+            kill_switch_gate.restore(&fence, &mut engine, loaded)
+        {
+            tracing::warn!(
+                target: "ft::security::policy",
+                tool = %summary,
+                code = error.code(),
+                "MCP mutation refused: kill-switch state unreadable"
+            );
+            return Err(envelope_to_content(McpEnvelope::<()>::error(
+                MCP_ERR_POLICY,
+                mcp_kill_switch_authority_unavailable(error.code()),
+                Some(MCP_KILL_SWITCH_AUTHORITY_HINT.to_string()),
+                elapsed_ms(start),
+            )));
+        }
         effect_fence = Some(fence);
         decision = engine.authorize(&input);
     }
@@ -16321,6 +16341,14 @@ mod tests {
                 })
                 .await;
             }
+            // Join the writer before the tool runs. A dropped handle's writer
+            // may still hold the database while it closes, and the tool's
+            // kill-switch read waits only 100 ms before failing closed as a
+            // HardStop. Under a parallel test run that wait was exceeded.
+            storage
+                .shutdown()
+                .await
+                .expect("seed storage should shut down");
         });
         (1..=3u64)
             .map(|pane_id| set_test_pane_state_override(safe_test_ipc_pane_state(pane_id)))
@@ -16346,6 +16374,11 @@ mod tests {
                     .await
                     .expect("pane liveness should refresh");
             }
+            // As in seed_tx_run_real_targets: release the database first.
+            storage
+                .shutdown()
+                .await
+                .expect("liveness storage should shut down");
         });
     }
 
@@ -26170,7 +26203,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["ok"], true, "{envelope}");
         assert_eq!(envelope["data"]["prepare_report"]["outcome"], "all_ready");
         assert_eq!(
             envelope["data"]["commit_report"]["outcome"],
@@ -30708,6 +30741,13 @@ exit 17",
         let corrupt = parse_json_content(tool.call(&test_mcp_context(), arguments).unwrap());
         assert_eq!(corrupt["error_code"], MCP_ERR_POLICY, "{corrupt}");
         assert!(!corrupt.to_string().contains("private malformed stop state"));
+        // Refused as unreadable authority, not as a stop no operator set.
+        let message = corrupt["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("kill-switch authority unavailable"),
+            "{corrupt}"
+        );
+        assert!(!message.contains("System kill switch"), "{corrupt}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
