@@ -57,25 +57,118 @@ final class TerminalFleetHistorySearchTests: XCTestCase {
         XCTAssertTrue(machines.allSatisfy { $0.control.current.search == nil })
     }
 
-    func testDisconnectedBusyContextEmptyAndOversizedSourcesAreExplicitlyNotSearched() async throws {
+    func testDisconnectedBusyContextAndEmptySourcesAreExplicitlyNotSearched() async throws {
         let busy = try machine("busy"), context = try machine("context")
-        let empty = try machine("empty", panes: []), oversized = try machine("large", panes: Array(1...129))
+        let empty = try machine("empty", panes: [])
         let other = busy.control.search(query, panes: [1])
         context.control.readContext(pane: 1, row: 5)
         let contextID = context.control.current.context?.id
         let owner = try TerminalFleetHistorySearch(query: query, sources: [
             .init(machineID: "offline", machineName: "Offline", unavailable: "Disconnected at query start."),
-            busy.source, context.source, empty.source, oversized.source
+            busy.source, context.source, empty.source
         ])
         XCTAssertFalse(owner.isRunning)
-        XCTAssertEqual(owner.coverage.map(\.status), [.unavailable, .notSearched, .notSearched, .notSearched, .notSearched])
+        XCTAssertEqual(owner.coverage.map(\.status), [.unavailable, .notSearched, .notSearched, .notSearched])
         XCTAssertTrue(owner.coverage.allSatisfy { $0.issue != nil })
         XCTAssertEqual(busy.control.current.search?.id, other)
         XCTAssertEqual(context.control.current.context?.id, contextID)
-        XCTAssertNil(empty.control.current.search); XCTAssertNil(oversized.control.current.search)
+        XCTAssertNil(empty.control.current.search)
         owner.retire()
         XCTAssertEqual(busy.control.takeSearch()?.id, other)
         XCTAssertEqual(context.control.current.context?.id, contextID)
+    }
+
+    func testLargeMachineSearchesAllBatchesWithoutIncludingNewOrReusedPanes() async throws {
+        let now = ContinuousClock.now
+        let fixture = try machine("large", panes: Array(1...200))
+        let owner = try TerminalFleetHistorySearch(query: query, sources: [fixture.source], at: now)
+        let first = try XCTUnwrap(fixture.control.current.search)
+        XCTAssertEqual(first.panes, Array(1...128))
+        for id in first.panes { try answer(fixture, pane: id, count: 0, rows: 1) }
+
+        // Pane 129 closed and its numeric ID was reused before its turn.
+        let inventory = fixture.control.current.panes
+        let newPane = try XCTUnwrap(try machine("new", panes: [201]).control.current.panes.first)
+        fixture.control.remove(pane: 129)
+        fixture.control.inputRouting.remove(pane: 129)
+        try fixture.control.inputRouting.replaceInventory(Array(1...201))
+        fixture.control.publish(panes: inventory + [newPane], shown: 1)
+        owner.advance(at: now.advanced(by: .seconds(1)))
+        let second = try XCTUnwrap(fixture.control.current.search)
+        XCTAssertNotEqual(first.id, second.id)
+        XCTAssertEqual(second.panes, Array(130...200))
+        for id in second.panes { try answer(fixture, pane: id, count: id == 200 ? 1 : 0, rows: 1) }
+        owner.advance(at: now.advanced(by: .seconds(2)))
+        let coverage = try XCTUnwrap(owner.coverage.first)
+        XCTAssertEqual(coverage.totalPanes, 200)
+        XCTAssertEqual(coverage.searchedPanes, 199)
+        XCTAssertEqual(coverage.searchedRows, 199)
+        XCTAssertEqual(coverage.failedPanes, 1)
+        XCTAssertEqual(coverage.status, .partial)
+        XCTAssertEqual(owner.hits.map(\.paneID), [200])
+        XCTAssertFalse(owner.isRunning)
+        XCTAssertNil(fixture.control.current.search)
+    }
+
+    func testLargeMachineFinishesEveryBatchAndReleasesTheFinalRequest() async throws {
+        let now = ContinuousClock.now
+        let fixture = try machine("large", panes: Array(1...257))
+        let owner = try TerminalFleetHistorySearch(query: query, sources: [fixture.source], at: now)
+        for (index, expected) in [Array(1...128), Array(129...256), [257]].enumerated() {
+            let batch = try XCTUnwrap(fixture.control.current.search)
+            XCTAssertEqual(batch.panes, expected)
+            for id in batch.panes { try answer(fixture, pane: id, count: 0, rows: 1) }
+            owner.advance(at: now.advanced(by: .seconds(index + 1)))
+        }
+        let coverage = try XCTUnwrap(owner.coverage.first)
+        XCTAssertEqual(coverage.status, .complete)
+        XCTAssertEqual(coverage.searchedPanes, 257)
+        XCTAssertEqual(coverage.searchedRows, 257)
+        XCTAssertNil(fixture.control.current.search)
+        XCTAssertFalse(owner.isRunning)
+    }
+
+    func testSynchronousBatchHandoffObserverCannotStartAFourthMachine() async throws {
+        let now = ContinuousClock.now
+        let large = try machine("large", panes: Array(1...129))
+        let others = try ["second", "third", "fourth"].map { try machine($0) }
+        let owner = try TerminalFleetHistorySearch(query: query, sources: ([large] + others).map(\.source), at: now)
+        for id in 1...128 { try answer(large, pane: id, count: 0) }
+        large.control.observe { snapshot in
+            if snapshot.search == nil {
+                MainActor.assumeIsolated { owner.advance(at: now.advanced(by: .seconds(1))) }
+            }
+        }
+        owner.advance(at: now.advanced(by: .seconds(1)))
+        XCTAssertEqual(large.control.current.search?.panes, [129])
+        XCTAssertEqual(owner.coverage.map(\.status), [.searching, .searching, .searching, .queued])
+        XCTAssertNil(others.last?.control.current.search)
+        owner.retire()
+        XCTAssertNil(others.last?.control.takeSearch())
+    }
+
+    func testLaterBatchSharesDeadlineAndPreservesIndependentContext() async throws {
+        for contextOpened in [false, true] {
+            let now = ContinuousClock.now
+            let fixture = try machine("large", panes: Array(1...129))
+            let owner = try TerminalFleetHistorySearch(query: query, sources: [fixture.source], at: now)
+            let first = try XCTUnwrap(fixture.control.current.search)
+            for id in first.panes { try answer(fixture, pane: id, count: 0) }
+            if contextOpened { fixture.control.readContext(pane: 1, row: 8) }
+            let context = fixture.control.current.context
+            owner.advance(at: now.advanced(by: .seconds(31)))
+            if contextOpened {
+                XCTAssertNil(fixture.control.current.search)
+                XCTAssertEqual(fixture.control.current.context, context)
+                XCTAssertNotNil(fixture.control.takeContext())
+            } else {
+                XCTAssertEqual(fixture.control.current.search?.panes, [129])
+                owner.advance(at: now.advanced(by: .seconds(32)))
+            }
+            XCTAssertEqual(owner.coverage.first?.status, .partial)
+            XCTAssertEqual(owner.coverage.first?.searchedPanes, 128)
+            XCTAssertNil(fixture.control.current.search)
+        }
     }
 
     func testInvalidQueriesAndInventoriesDoNotPublishAnyWork() async throws {

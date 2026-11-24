@@ -101,6 +101,8 @@ public final class TerminalFleetHistorySearch {
         var coverage: Coverage
         var request: UUID?
         var panes: [CapturedPane] = []
+        var nextPane = 0
+        var batch: ArraySlice<CapturedPane> = []
         var harvested = Set<Int>()
         var deadline: ContinuousClock.Instant?
 
@@ -126,6 +128,7 @@ public final class TerminalFleetHistorySearch {
     private let deadline: ContinuousClock.Instant
     private var lastNow: ContinuousClock.Instant
     private var accepting = true
+    private var advancing = false
 
     public init(query: TerminalMuxControl.SearchQuery, sources: [Source],
                 at now: ContinuousClock.Instant = .now,
@@ -144,7 +147,13 @@ public final class TerminalFleetHistorySearch {
     /// controller's existing presentation observer and query driver in place.
     /// Continue stepping after completion to expire retired sources and panes.
     public func advance(at now: ContinuousClock.Instant = .now) {
-        guard !isRetired else { return }
+        guard !isRetired, !advancing else { return }
+        advancing = true
+        defer { advancing = false }
+        // Transport notifications run synchronously and can consume part of
+        // this tick. Charge that time before admitting more remote work.
+        let tickStart = ContinuousClock.now
+        func admissionTime() -> ContinuousClock.Instant { now + tickStart.duration(to: .now) }
         guard isCurrent() else { retire(); return }
         guard now >= lastNow else { stop(reason: "The search clock changed. Search again."); return }
         lastNow = now
@@ -178,6 +187,21 @@ public final class TerminalFleetHistorySearch {
                 return
             }
             if search.pending.isEmpty {
+                // Keep the wire query and its reply storage bounded. All batches
+                // share this machine's original deadline and captured registrations.
+                if search.issue == nil && !search.limitReached && entry.nextPane < entry.panes.count {
+                    entry.request = nil
+                    control.clearSearch(request)
+                    guard accepting, !isRetired, entry.coverage.status == .searching else { continue }
+                    guard isCurrent() else { retire(); return }
+                    guard entry.source.isCurrent() else { invalidate(entry); continue }
+                    if hits.count == Self.maximumMatches || textBytes == Self.maximumTextBytes {
+                        stop(reason: "The workspace result limit was reached. Narrow the query to search the remaining output.")
+                        return
+                    }
+                    startBatch(entry, control: control, admissionTime: admissionTime)
+                    continue
+                }
                 let complete = search.issue == nil && !search.limitReached && entry.coverage.failedPanes == 0
                     && entry.coverage.searchedPanes == entry.coverage.totalPanes
                 finish(entry, status: complete ? .complete : .partial,
@@ -191,7 +215,8 @@ public final class TerminalFleetHistorySearch {
         var active = entries.filter { $0.request != nil }.count
         for entry in entries where entry.coverage.status == .queued {
             guard active < Self.maximumConcurrentMachines else { break }
-            start(entry, at: now)
+            guard accepting, !isRetired else { return }
+            start(entry, at: now, admissionTime: admissionTime)
             if entry.request != nil { active += 1 }
         }
     }
@@ -204,9 +229,10 @@ public final class TerminalFleetHistorySearch {
     /// Old replies cannot repopulate the retired owner.
     public func retire() {
         guard !isRetired else { return }
+        accepting = false; isRetired = true
         for entry in entries { release(entry) }
         hits.removeAll(); entries.removeAll(); query = nil; textBytes = 0
-        issue = nil; accepting = false; isRetired = true; revision = UUID()
+        issue = nil; revision = UUID()
     }
 
     public func hit(_ id: UUID) -> Hit? {
@@ -228,8 +254,8 @@ public final class TerminalFleetHistorySearch {
                                 sessionID: hit.sessionID, plan: hit.plan)
     }
 
-    private func start(_ entry: Entry, at now: ContinuousClock.Instant) {
-        guard let query, let control = entry.source.control, entry.source.isCurrent() else {
+    private func start(_ entry: Entry, at now: ContinuousClock.Instant, admissionTime: () -> ContinuousClock.Instant) {
+        guard let control = entry.source.control, entry.source.isCurrent() else {
             invalidate(entry); return
         }
         let state = control.current
@@ -237,8 +263,8 @@ public final class TerminalFleetHistorySearch {
             finish(entry, status: .notSearched, reason: "No discovered mux panes were available when this machine's turn began.")
             return
         }
-        guard state.panes.count <= TerminalMuxControl.maximumSearchPanes else {
-            finish(entry, status: .notSearched, reason: "This machine has more than 128 panes. Search a smaller scope on that machine.")
+        guard state.panes.count <= TerminalFleetOverview.maximumPanes else {
+            finish(entry, status: .notSearched, reason: "The pane inventory exceeds the workspace overview limit. Search a smaller scope on that machine.")
             return
         }
         // Capture the pane identity before requesting its output. Merely
@@ -255,20 +281,59 @@ public final class TerminalFleetHistorySearch {
             finish(entry, status: .notSearched, reason: "The pane inventory changed before this machine could be searched.")
             return
         }
-        guard let request = control.searchIfIdle(query, panes: entry.panes.map(\.id)) else {
-            finish(entry, status: .notSearched, reason: "Another search or output reader is using this connection.")
+        entry.coverage.totalPanes = entry.panes.count
+        entry.deadline = now.advanced(by: Self.machineTimeout)
+        startBatch(entry, control: control, admissionTime: admissionTime)
+    }
+
+    private func startBatch(_ entry: Entry, control: TerminalMuxControl, admissionTime: () -> ContinuousClock.Instant) {
+        guard let query else { return }
+        while entry.nextPane < entry.panes.count {
+            let end = min(entry.nextPane + TerminalMuxControl.maximumSearchPanes, entry.panes.count)
+            entry.batch = entry.panes[entry.nextPane..<end]
+            entry.nextPane = end
+            entry.harvested.removeAll(keepingCapacity: true)
+            let ids = entry.batch.compactMap { pane -> Int? in
+                guard (try? control.inputRouting.validateNavigation(pane.plan)) != nil else {
+                    entry.coverage.failedPanes += 1
+                    entry.coverage.issue = entry.coverage.issue ?? "A pane closed or changed before its search."
+                    return nil
+                }
+                return pane.id
+            }
+            guard !ids.isEmpty else { continue }
+            let admittedAt = admissionTime()
+            if admittedAt >= deadline {
+                stop(reason: "The 90-second workspace search deadline was reached. Unfinished machines were not fully searched.")
+                return
+            }
+            if let deadline = entry.deadline, admittedAt >= deadline {
+                finish(entry, status: .partial, reason: "This machine did not finish before its search deadline.")
+                return
+            }
+            guard let request = control.searchIfIdle(query, panes: ids) else {
+                finish(entry, status: entry.coverage.status == .queued ? .notSearched : .partial,
+                       reason: "Another search or output reader is using this connection.")
+                return
+            }
+            // Admission notifies observers outside the control lock. One may
+            // dismiss the search or retire this connection synchronously.
+            guard accepting, !isRetired else { control.clearSearch(request); return }
+            entry.request = request
+            guard isCurrent() else { retire(); return }
+            guard entry.source.isCurrent() else { invalidate(entry); return }
+            entry.coverage.status = .searching
+            revision = UUID()
             return
         }
-        entry.request = request; entry.deadline = now.advanced(by: Self.machineTimeout)
-        entry.coverage.totalPanes = entry.panes.count; entry.coverage.status = .searching
-        revision = UUID()
+        finish(entry, status: .partial, reason: entry.coverage.issue)
     }
 
     /// Returns false before retaining anything beyond the aggregate byte/count
     /// budget. Per-machine replies have already passed the mux's wire bounds.
     private func collect(_ search: TerminalMuxControl.Search, from entry: Entry,
                          control: TerminalMuxControl) -> Bool {
-        for pane in entry.panes where !entry.harvested.contains(pane.id) {
+        for pane in entry.batch where !entry.harvested.contains(pane.id) {
             guard let result = search.results[pane.id] else { continue }
             entry.harvested.insert(pane.id); revision = UUID()
             if let error = result.error {
@@ -297,7 +362,7 @@ public final class TerminalFleetHistorySearch {
 
     private func release(_ entry: Entry) {
         if let request = entry.request { entry.source.control?.clearSearch(request) }
-        entry.request = nil; entry.deadline = nil; entry.panes.removeAll(); entry.harvested.removeAll()
+        entry.request = nil; entry.deadline = nil; entry.batch = []; entry.panes.removeAll(); entry.harvested.removeAll()
     }
 
     private func finish(_ entry: Entry, status: Status, reason: String?) {
