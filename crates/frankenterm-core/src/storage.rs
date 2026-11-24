@@ -19564,8 +19564,13 @@ fn dispatch_write_command_raw(
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result =
-                set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref());
+            let result = set_event_note_backend(
+                backend,
+                event_id,
+                note.as_deref(),
+                updated_by.as_deref(),
+                segment_redactors.redactor.as_ref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::AddEventLabel {
@@ -22655,10 +22660,10 @@ fn set_event_note_backend(
     event_id: i64,
     note: Option<&str>,
     updated_by: Option<&str>,
+    redactor: &Redactor,
 ) -> Result<()> {
     let _effect_fence = storage_policy_mutation_fence(backend)?;
     if let Some(note) = note {
-        let redactor = Redactor::new();
         let note = redactor.redact(note);
         let now = now_ms();
         execute_typed(
@@ -36052,11 +36057,18 @@ fn event_annotations_bulk_supports_bounded_json_each_snapshot() {
     let third = seed_retention_event_backend(&backend, 1, "critical", "third", 30, None);
 
     assert!(set_event_triage_state_backend(&backend, first, Some("investigating"), Some("operator-a")).unwrap());
-    set_event_note_backend(&backend, first, Some("checked carefully"), Some("operator-b")).unwrap();
+    set_event_note_backend(
+        &backend,
+        first,
+        Some("checked carefully"),
+        Some("operator-b"),
+        &Redactor::new(),
+    )
+    .unwrap();
     assert!(add_event_label_backend(&backend, first, "zulu", Some("operator-c")).unwrap());
     assert!(add_event_label_backend(&backend, first, "alpha", Some("operator-c")).unwrap());
-    set_event_note_backend(&backend, second, Some(""), None).unwrap();
-    set_event_note_backend(&backend, third, Some("third note"), None).unwrap();
+    set_event_note_backend(&backend, second, Some(""), None, &Redactor::new()).unwrap();
+    set_event_note_backend(&backend, third, Some("third note"), None, &Redactor::new()).unwrap();
 
     let annotations = query_event_annotations_bulk_backend(
         &backend,
@@ -43226,7 +43238,13 @@ fn storage_writer_user_mutations_observe_later_stop_and_reset() {
             seed_pane_backend(backend, 31, 1);
             seed_pane_backend(backend, 32, 1);
             let event_id = seed_retention_event_backend(backend, 31, "warning", "stop", 1, None);
-            set_event_note_backend(backend, event_id, Some("original note"), Some("operator"))?;
+            set_event_note_backend(
+                backend,
+                event_id,
+                Some("original note"),
+                Some("operator"),
+                &Redactor::new(),
+            )?;
             set_event_triage_state_backend(backend, event_id, Some("investigating"), Some("operator"))?;
             add_event_label_backend(backend, event_id, "retained", Some("operator"))?;
             let reservation = create_reservation_backend(
@@ -43341,7 +43359,8 @@ fn storage_user_mutations_reject_invalid_stop_authority_before_sql() {
         let (running, _, reservation) = completion_reservation_fixture_backend(&backend);
         seed_pane_backend(&backend, 2, 1);
         let event_id = running.trigger_event_id.unwrap();
-        set_event_note_backend(&backend, event_id, Some("retained"), None).unwrap();
+        set_event_note_backend(&backend, event_id, Some("retained"), None, &Redactor::new())
+            .unwrap();
         add_event_label_backend(&backend, event_id, "retained", None).unwrap();
         set_config_value_backend(&backend, KILL_SWITCH_STATE_KEY, raw).unwrap();
         if let Some(revision) = revision {
@@ -43350,7 +43369,7 @@ fn storage_user_mutations_reject_invalid_stop_authority_before_sql() {
         for result in [
             create_reservation_backend(&backend, 2, "mcp", "blocked", None, 60_000, &PaneReservationConfig::default()).map(drop),
             release_reservation_backend(&backend, reservation.id).map(drop),
-            set_event_note_backend(&backend, event_id, None, None),
+            set_event_note_backend(&backend, event_id, None, None, &Redactor::new()),
             set_event_triage_state_backend(&backend, event_id, Some("resolved"), None).map(drop),
             add_event_label_backend(&backend, event_id, "new", None).map(drop),
             remove_event_label_backend(&backend, event_id, "retained").map(drop),
@@ -47873,7 +47892,7 @@ fn configured_redaction_preserves_context_at_both_append_edges() {
 }
 
 #[test]
-fn configured_redaction_covers_event_audit_and_undo_admission() {
+fn configured_redaction_covers_event_notes_audit_and_undo_admission() {
     run_storage_async_test(async {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("egress.db").to_string_lossy().to_string();
@@ -47917,6 +47936,75 @@ fn configured_redaction_covers_event_audit_and_undo_admission() {
         assert_eq!(extracted["array"][0], "[PRIVATE]");
         assert_eq!(extracted["array"][1], 42);
         assert_eq!(extracted["array"][2], true);
+
+        let cx = crate::cx::for_testing();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let raw_note = format!("operator note {secret} sk-abcdefghijklmnopqrstuvwxyz012345");
+        for direct_writer in [false, true] {
+            if direct_writer {
+                // The effect owner must apply the configured policy even for
+                // messages that did not pass through a public admission API.
+                let (respond, response) = oneshot::channel();
+                storage
+                    .write_tx
+                    .send_with_cx(
+                        &cx,
+                        WriteCommand::SetEventNote {
+                            event_id,
+                            note: Some(raw_note.clone()),
+                            updated_by: Some("operator".to_string()),
+                            respond,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                StorageHandle::recv_writer_response_with_cx(&cx, response)
+                    .await
+                    .unwrap();
+            } else {
+                storage
+                    .set_event_note(
+                        event_id,
+                        Some(raw_note.clone()),
+                        Some("operator".to_string()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Inspect SQL directly so an outbound scrub cannot conceal a
+            // plaintext persistence failure. Built-in and custom patterns
+            // share the configured literal placeholder.
+            let stored: (String, String) = connection
+                .query_row(
+                    "SELECT note, updated_by FROM event_notes WHERE event_id = ?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored.0, "operator note [PRIVATE] [PRIVATE]");
+            assert_eq!(stored.1, "operator");
+            let annotations = storage
+                .get_event_annotations_with_cx(&cx, event_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(annotations.note.as_deref(), Some(stored.0.as_str()));
+
+            storage
+                .set_event_note_with_cx(&cx, event_id, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM event_notes WHERE event_id = ?1",
+                        [event_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
 
         // These are the ordinary APIs: choosing the older unsuffixed method
         // must not bypass mandatory audit redaction.
