@@ -23292,10 +23292,29 @@ fn shell_single_quote(value: &str) -> String {
     }
 }
 
+// A CLI process owns exactly one workspace configuration. Install its policy
+// once before command dispatch so every output helper and runtime task observes
+// the same immutable redactor.
+static CONFIGURED_OUTPUT_REDACTOR: std::sync::OnceLock<frankenterm_core::policy::Redactor> =
+    std::sync::OnceLock::new();
+
+fn initialize_output_redactor(
+    config: &frankenterm_core::config::RedactionConfig,
+) -> anyhow::Result<()> {
+    let redactor = config.build_redactor()?;
+    CONFIGURED_OUTPUT_REDACTOR
+        .set(redactor)
+        .map_err(|_| anyhow::anyhow!("CLI output redaction policy is already initialized"))
+}
+
 fn output_redactor() -> &'static frankenterm_core::policy::Redactor {
-    static REDACTOR: LazyLock<frankenterm_core::policy::Redactor> =
+    // Early help, configuration errors, and config-independent recovery commands
+    // still need built-in secret protection before a workspace policy is loaded.
+    static DEFAULT_REDACTOR: LazyLock<frankenterm_core::policy::Redactor> =
         LazyLock::new(frankenterm_core::policy::Redactor::new);
-    &REDACTOR
+    CONFIGURED_OUTPUT_REDACTOR
+        .get()
+        .unwrap_or(&DEFAULT_REDACTOR)
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -23309,13 +23328,21 @@ fn redact_single_line_for_output(text: &str) -> String {
 }
 
 fn redact_pane_text_for_output(text: &str, preserve_terminal_escapes: bool) -> String {
+    redact_pane_text_with_redactor(text, preserve_terminal_escapes, output_redactor())
+}
+
+fn redact_pane_text_with_redactor(
+    text: &str,
+    preserve_terminal_escapes: bool,
+    redactor: &frankenterm_core::policy::Redactor,
+) -> String {
+    let normalized = frankenterm_core::output::normalize_terminal_text_for_redaction(text);
     if !preserve_terminal_escapes {
-        return redact_for_output(text);
+        return redactor.redact(&normalized);
     }
 
     let ansi_stripped = frankenterm_core::output::strip_ansi(text);
-    let normalized = frankenterm_core::output::normalize_terminal_text_for_redaction(text);
-    let redacted_normalized = output_redactor().redact(&normalized);
+    let redacted_normalized = redactor.redact(&normalized);
     if redacted_normalized != normalized || ansi_stripped != normalized {
         // An escape sequence may have split a secret that is only recognizable
         // after normalization, or a non-ANSI display control may have been
@@ -23324,13 +23351,22 @@ fn redact_pane_text_for_output(text: &str, preserve_terminal_escapes: bool) -> S
         // downstream could reconstruct a token or retain a spoofing control.
         redacted_normalized
     } else {
-        output_redactor().redact(text)
+        redactor.redact(text)
     }
 }
 
 const TERMINAL_TEXT_INPUT_MAX_BYTES: usize = 64 * 1024;
 
 fn bounded_terminal_diagnostic(text: &str, max_columns: usize, max_bytes: usize) -> String {
+    bounded_terminal_diagnostic_with_redactor(text, max_columns, max_bytes, output_redactor())
+}
+
+fn bounded_terminal_diagnostic_with_redactor(
+    text: &str,
+    max_columns: usize,
+    max_bytes: usize,
+    redactor: &frankenterm_core::policy::Redactor,
+) -> String {
     if text.len() > TERMINAL_TEXT_INPUT_MAX_BYTES {
         return frankenterm_core::output::truncate_bounded(
             "diagnostic unavailable",
@@ -23343,7 +23379,7 @@ fn bounded_terminal_diagnostic(text: &str, max_columns: usize, max_bytes: usize)
         text,
         max_columns,
         max_bytes,
-        |sanitized| output_redactor().redact(sanitized),
+        |sanitized| redactor.redact(sanitized),
     );
     if bounded.trim().is_empty() {
         frankenterm_core::output::truncate_bounded("diagnostic unavailable", max_columns, max_bytes)
@@ -23722,6 +23758,125 @@ fn output_redaction_normalizes_ansi_split_secrets_without_breaking_explicit_esca
         redact_pane_text_for_output("first\nsecond", false),
         "first\nsecond"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn configured_pane_redaction_covers_custom_and_builtin_secrets_and_ansi_splits() {
+    let mut config = frankenterm_core::config::RedactionConfig::default();
+    config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+    config.placeholder = "<workspace-secret>".to_string();
+    let redactor = config.build_redactor().expect("configured redactor");
+    let custom = "ORBITCANARY867530";
+    assert_eq!(
+        frankenterm_core::policy::Redactor::new().redact(custom),
+        custom,
+        "the fixture must exercise a workspace-only secret"
+    );
+
+    for preserve_escapes in [false, true] {
+        assert_eq!(
+            redact_pane_text_with_redactor(
+                "ORBIT\x1b[31mCANARY867530\nAKIAIOSFODNN7EXAMPLE",
+                preserve_escapes,
+                &redactor,
+            ),
+            "<workspace-secret>\n<workspace-secret>"
+        );
+    }
+    let styled_safe = "safe \x1b[31mred\x1b[0m text";
+    assert_eq!(
+        redact_pane_text_with_redactor(styled_safe, true, &redactor),
+        styled_safe
+    );
+    assert_eq!(
+        redact_pane_text_with_redactor(styled_safe, false, &redactor),
+        "safe red text"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn configured_mux_dump_topology_matches_the_redacted_record_fingerprint() {
+    let mut config = frankenterm_core::config::RedactionConfig::default();
+    config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+    config.placeholder = "<workspace-secret>".to_string();
+    let redactor = config.build_redactor().unwrap();
+    let pane: frankenterm_core::wezterm::PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": 1,
+        "tab_id": 2,
+        "window_id": 3,
+        "domain_name": "ORBIT\u{001b}[31mCANARY867530",
+        "workspace": "ORBIT\u{001b}[31mCANARY867530",
+    }))
+    .unwrap();
+    let expected_record = serde_json::json!({
+        "pane": {
+            "pane_id": 1,
+            "tab_id": 2,
+            "window_id": 3,
+            "domain_id": null,
+            "domain_name": "<workspace-secret>",
+            "workspace": "<workspace-secret>",
+            "rows": 24,
+            "cols": 80,
+            "left_col": null,
+            "top_row": null,
+            "is_active": false,
+            "is_zoomed": false,
+        }
+    });
+    assert_eq!(
+        mux_dump_topology_fingerprint(&[pane], &redactor).unwrap(),
+        mux_dump_topology_fingerprint_from_records(&[expected_record]).unwrap()
+    );
+    assert_eq!(
+        bounded_terminal_diagnostic_with_redactor(
+            "failure ORBIT\x1b[31mCANARY867530\nnext",
+            240,
+            1024,
+            &redactor,
+        ),
+        "failure <workspace-secret> next"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn mux_dump_refuses_metadata_drift_hidden_by_custom_redaction() {
+    let mut config = frankenterm_core::config::RedactionConfig::default();
+    config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+    let redactor = config.build_redactor().unwrap();
+    let initial: frankenterm_core::wezterm::PaneInfo =
+        serde_json::from_value(serde_json::json!({
+            "pane_id": 1,
+            "tab_id": 2,
+            "window_id": 3,
+            "domain_name": "local",
+            "workspace": "ORBITCANARY111111",
+        }))
+        .unwrap();
+    let mut final_pane = initial.clone();
+    final_pane.workspace = Some("ORBITCANARY222222".to_string());
+    let initial_panes = [initial];
+    let final_panes = [final_pane];
+    let initial_public = mux_dump_topology_fingerprint(&initial_panes, &redactor).unwrap();
+    let final_public = mux_dump_topology_fingerprint(&final_panes, &redactor).unwrap();
+    assert_eq!(initial_public, final_public, "redaction collapses these identities");
+    let initial_private = mux_dump_topology_fingerprint_inner(&initial_panes, None).unwrap();
+    let final_private = mux_dump_topology_fingerprint_inner(&final_panes, None).unwrap();
+    assert_ne!(initial_private, final_private);
+    let result = check_mux_dump_topology_redaction_collision(
+        &initial_private,
+        &final_private,
+        &initial_public,
+        &final_public,
+    );
+    let error = result.expect_err("capture must refuse before an artifact can be published");
+    assert!(error.to_string().contains("topology_changed_during_capture"));
+    assert!(!error.to_string().contains("ORBIT"));
+    assert!(!error.to_string().contains(&initial_private));
+    assert!(!error.to_string().contains(&final_private));
 }
 
 #[cfg(test)]
@@ -25394,7 +25549,7 @@ fn redact_prepare_plan(
     plan: &frankenterm_core::plan::ActionPlan,
 ) -> frankenterm_core::plan::ActionPlan {
     let mut redacted = plan.clone();
-    let redactor = frankenterm_core::policy::Redactor::new();
+    let redactor = output_redactor();
 
     for step in &mut redacted.steps {
         if let frankenterm_core::plan::StepAction::Custom {
@@ -25403,9 +25558,9 @@ fn redact_prepare_plan(
         } = &mut step.action
         {
             if action_type == "prepare.send_text" {
-                redact_payload_field(payload, "text", &redactor);
+                redact_payload_field(payload, "text", redactor);
             } else if action_type == "prepare.wait_for" {
-                redact_payload_field(payload, "pattern", &redactor);
+                redact_payload_field(payload, "pattern", redactor);
             }
         }
     }
@@ -25478,7 +25633,8 @@ fn redact_payload_field(
     };
 
     let len = serde_json::Number::from(text.len() as u64);
-    let redacted = redactor.redact(text);
+    let normalized = frankenterm_core::output::normalize_terminal_text_for_redaction(text);
+    let redacted = redactor.redact(&normalized);
     *value = serde_json::Value::String(redacted);
     obj.insert(format!("{field}_len"), serde_json::Value::Number(len));
 }
@@ -42375,7 +42531,7 @@ fn robot_dom_unavailable(
         requested_command_index,
         zones,
         reason,
-        &frankenterm_core::redactor::Redactor::new(),
+        output_redactor(),
     )
 }
 
@@ -42392,7 +42548,7 @@ fn build_robot_dom_data(
         query,
         requested_command_index,
         &snapshot,
-        &frankenterm_core::redactor::Redactor::new(),
+        output_redactor(),
     )
 }
 
@@ -45399,10 +45555,9 @@ async fn distributed_persist_payload(
                 // `output_segments` — a fail-closed redaction violation at the
                 // storage layer (an unredacted DB export or any direct-segment read
                 // would leak secrets, even though the standard read APIs redact at
-                // output). Redaction is idempotent, so the read-path redactors that
-                // run later are unaffected.
-                let redacted_content =
-                    frankenterm_core::redactor::Redactor::new().redact(&delta.content);
+                // output). Read paths also apply the current workspace policy
+                // so newly configured patterns protect retained content.
+                let redacted_content = redact_for_output(&delta.content);
                 let segment = storage_handle
                     .append_segment(
                         remote_pane_id,
@@ -51104,6 +51259,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
     };
 
+    initialize_output_redactor(&config.safety.redaction)?;
+
     let workspace_path = workspace.as_deref().map(Path::new);
     let workspace_root = config.resolve_workspace_root(workspace_path)?;
     let layout = config.workspace_layout(Some(&workspace_root))?;
@@ -55632,7 +55789,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     heartbeat_interval_ms,
                                     poll_interval_ms,
                                 );
-                            let redactor = frankenterm_core::redactor::Redactor::new();
+                            let redactor = output_redactor().clone();
                             let max_hz_interval = watch_max_hz_interval(max_hz);
                             let mut current_cursor = cursor;
                             let mut current_cursor_epoch = cursor_epoch;
@@ -68918,7 +69075,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
 
                 let mut cursor: Option<i64> = None;
-                let redactor = frankenterm_core::policy::Redactor::new();
+                let redactor = output_redactor().clone();
                 let page_limit = if limit == 0 { 1 } else { limit };
                 let mut stdout = std::io::stdout();
 
@@ -68952,7 +69109,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                     let record_count = page.records.len();
                     for action in page.records {
-                        let record = frankenterm_core::storage::AuditStreamRecord::from_action(
+                        let record = frankenterm_core::export::redact_audit_stream_record(
                             action, &redactor,
                         );
                         if let Ok(line) = serde_json::to_string(&record) {
@@ -71692,7 +71849,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                 println!("Recording pane {pane_id} to {}", out_path.display());
                 if let Some(ref t) = title {
-                    println!("Title: {t}");
+                    println!("Title: {}", redact_single_line_for_output(t));
                 }
                 if let Some(ms) = auto_stop_ms {
                     println!("Auto-stop after {}s", ms / 1000);
@@ -71705,8 +71862,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // every recording failed at its first capture with 0 frames.
                 let wez = frankenterm_core::wezterm::build_unified_client(&config);
                 // A recording is a pane-content read path like any other:
-                // secrets are redacted before a frame reaches disk.
-                let redactor = frankenterm_core::redactor::Redactor::new();
+                // configured secrets are normalized and redacted before disk.
                 let mut last_text = String::new();
                 let start = std::time::Instant::now();
 
@@ -71726,7 +71882,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await
                     {
                         Ok(text) => {
-                            let text = redactor.redact(&text);
+                            let text = redact_pane_text_for_output(&text, false);
                             if text != last_text {
                                 let delta = if last_text.is_empty() {
                                     text.as_bytes().to_vec()
@@ -71917,7 +72073,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 redact_patterns,
             } => {
                 use frankenterm_core::replay::{
-                    ExportFormat, ExportOptions, Recording, export_asciinema, export_html,
+                    ExportFormat, ExportOptions, Recording, export_asciinema_with_redactor,
+                    export_html_with_redactor,
                 };
 
                 let recording = Recording::load(&file).map_err(|e| {
@@ -71947,7 +72104,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let mut f = std::fs::File::create(path).map_err(|e| {
                                 anyhow::anyhow!("Failed to create '{}': {e}", path.display())
                             })?;
-                            let count = export_asciinema(&recording, &opts, &mut f)?;
+                            let count = export_asciinema_with_redactor(
+                                &recording,
+                                &opts,
+                                output_redactor(),
+                                &mut f,
+                            )?;
                             eprintln!(
                                 "Exported {count} events to {} (asciinema cast)",
                                 path.display()
@@ -71955,7 +72117,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         } else {
                             let stdout = std::io::stdout();
                             let mut handle = stdout.lock();
-                            export_asciinema(&recording, &opts, &mut handle)?;
+                            export_asciinema_with_redactor(
+                                &recording,
+                                &opts,
+                                output_redactor(),
+                                &mut handle,
+                            )?;
                         }
                     }
                     ExportFormat::Html => {
@@ -71963,7 +72130,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let mut f = std::fs::File::create(path).map_err(|e| {
                                 anyhow::anyhow!("Failed to create '{}': {e}", path.display())
                             })?;
-                            let count = export_html(&recording, &opts, &mut f)?;
+                            let count = export_html_with_redactor(
+                                &recording,
+                                &opts,
+                                output_redactor(),
+                                &mut f,
+                            )?;
                             eprintln!(
                                 "Exported {count} events to {} (HTML player)",
                                 path.display()
@@ -71971,7 +72143,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         } else {
                             let stdout = std::io::stdout();
                             let mut handle = stdout.lock();
-                            export_html(&recording, &opts, &mut handle)?;
+                            export_html_with_redactor(
+                                &recording,
+                                &opts,
+                                output_redactor(),
+                                &mut handle,
+                            )?;
                         }
                     }
                 }
@@ -72798,12 +72975,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
             };
 
-            // Open storage handle
+            // Historical rows must be protected by the current workspace
+            // policy even when they were captured before its patterns existed.
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -74035,10 +74214,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let period_label = format_period_label(&period);
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -85992,21 +86172,19 @@ async fn handle_session_command(
                 max_entries,
             )
             .unwrap_or_else(|error| {
-                let error =
-                    frankenterm_core::redactor::Redactor::new().redact(&format!("{error:#}"));
+                let error = redact_for_output(&format!("{error:#}"));
                 exit_session_durable_error(&error, output_format)
             });
-            let redactor = frankenterm_core::redactor::Redactor::new();
             for pane in &mut panes {
                 if let Some(description) = pane.command_description.as_mut() {
-                    *description = redactor.redact(description);
+                    *description = redact_for_output(description);
                 }
                 if let Some(error) = pane.error.as_mut() {
-                    *error = redactor.redact(error);
+                    *error = redact_for_output(error);
                 }
-                pane.path = PathBuf::from(redactor.redact(&pane.path.display().to_string()));
+                pane.path = PathBuf::from(redact_for_output(&pane.path.display().to_string()));
             }
-            let display_scrollback_dir = redactor.redact(&scrollback_dir.display().to_string());
+            let display_scrollback_dir = redact_for_output(&scrollback_dir.display().to_string());
             if output_format.is_structured() {
                 print_snapshot_session_structured_output(
                     &serde_json::json!({
@@ -86102,21 +86280,19 @@ async fn handle_session_command(
                 max_physical_bytes,
             )
             .unwrap_or_else(|error| {
-                let error =
-                    frankenterm_core::redactor::Redactor::new().redact(&format!("{error:#}"));
+                let error = redact_for_output(&format!("{error:#}"));
                 exit_session_durable_error(&error, output_format)
             });
-            let redactor = frankenterm_core::redactor::Redactor::new();
-            let transcript = redactor.redact(&export.transcript).into_bytes();
-            let command_description = redactor.redact(&export.command_description);
+            let transcript = redact_for_output(&export.transcript).into_bytes();
+            let command_description = redact_for_output(&export.command_description);
             let output_path = output.unwrap_or_else(|| default_orphan_transcript_path(&pane_uuid));
             let artifact =
                 write_new_private_artifact(&output_path, &transcript).unwrap_or_else(|error| {
-                    let error = redactor.redact(&format!("{error:#}"));
+                    let error = redact_for_output(&format!("{error:#}"));
                     exit_session_durable_error(&error, output_format)
                 });
-            let display_source_path = redactor.redact(&export.source_path.display().to_string());
-            let display_output_path = redactor.redact(&output_path.display().to_string());
+            let display_source_path = redact_for_output(&export.source_path.display().to_string());
+            let display_output_path = redact_for_output(&output_path.display().to_string());
             let result = serde_json::json!({
                 "ok": true,
                 "action": "export_durable",
@@ -86339,9 +86515,7 @@ async fn handle_session_command(
             for chunk in &replay_plan.chunks {
                 decoded_transcript.push_str(&chunk.text);
             }
-            let transcript = frankenterm_core::redactor::Redactor::new()
-                .redact(&decoded_transcript)
-                .into_bytes();
+            let transcript = redact_for_output(&decoded_transcript).into_bytes();
             if transcript.len() > limits.max_transcript_bytes {
                 exit_session_export_error(
                     "session.orphan_redacted_limit_exceeded",
@@ -91976,6 +92150,13 @@ fn mux_dump_topology_fingerprint(
     panes: &[frankenterm_core::wezterm::PaneInfo],
     redactor: &frankenterm_core::redactor::Redactor,
 ) -> anyhow::Result<String> {
+    mux_dump_topology_fingerprint_inner(panes, Some(redactor))
+}
+
+fn mux_dump_topology_fingerprint_inner(
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+    redactor: Option<&frankenterm_core::redactor::Redactor>,
+) -> anyhow::Result<String> {
     let mut topology: Vec<MuxDumpTopologyPane<'_>> = panes
         .iter()
         .map(|pane| {
@@ -91985,11 +92166,22 @@ fn mux_dump_topology_fingerprint(
                 tab_id: pane.tab_id,
                 window_id: pane.window_id,
                 domain_id: pane.domain_id,
-                domain_name: std::borrow::Cow::Owned(redactor.redact(&domain_name)),
-                workspace: pane
-                    .workspace
-                    .as_deref()
-                    .map(|workspace| std::borrow::Cow::Owned(redactor.redact(workspace))),
+                domain_name: std::borrow::Cow::Owned(redactor.map_or_else(
+                    || domain_name.clone(),
+                    |policy| redact_pane_text_with_redactor(&domain_name, false, policy),
+                )),
+                workspace: pane.workspace.as_deref().map(|workspace| {
+                    redactor.map_or_else(
+                        || std::borrow::Cow::Borrowed(workspace),
+                        |policy| {
+                            std::borrow::Cow::Owned(redact_pane_text_with_redactor(
+                                workspace,
+                                false,
+                                policy,
+                            ))
+                        },
+                    )
+                }),
                 rows: pane.effective_rows(),
                 cols: pane.effective_cols(),
                 left_col: pane.left_col,
@@ -92001,6 +92193,22 @@ fn mux_dump_topology_fingerprint(
         .collect();
     topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
     hash_mux_dump_topology(&topology)
+}
+
+fn check_mux_dump_topology_redaction_collision(
+    initial_private: &str,
+    final_private: &str,
+    initial_redacted: &str,
+    final_redacted: &str,
+) -> anyhow::Result<()> {
+    // v1 partial artifacts require different public hashes for a topology-change
+    // error. A change hidden by redaction cannot satisfy that evidence contract,
+    // so refuse publication instead of claiming stable authoritative metadata.
+    anyhow::ensure!(
+        initial_private == final_private || initial_redacted != final_redacted,
+        "topology_changed_during_capture: protected pane metadata changed; no dump was published"
+    );
+    Ok(())
 }
 
 fn mux_dump_topology_fingerprint_from_records(
@@ -92115,10 +92323,15 @@ async fn capture_live_mux_dump(
         );
     }
 
+    let redactor = config.safety.redaction.build_redactor()?;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
     let mut panes = robot_list_panes_on_runtime_task(wezterm.clone())
         .await
-        .map_err(|err| anyhow::anyhow!("Failed to list live mux panes for dump: {err}"))?;
+        .map_err(|err| {
+            let detail =
+                bounded_terminal_diagnostic_with_redactor(&err.to_string(), 240, 1024, &redactor);
+            anyhow::anyhow!("Failed to list live mux panes for dump: {detail}")
+        })?;
     panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
     if panes.len() > max_panes {
         anyhow::bail!(
@@ -92126,11 +92339,12 @@ async fn capture_live_mux_dump(
             panes.len()
         );
     }
-    let redactor = frankenterm_core::redactor::Redactor::new();
     let initial_pane_count = panes.len();
     let mut initial_pane_ids = panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
     initial_pane_ids.sort_unstable();
     let initial_topology_sha256 = mux_dump_topology_fingerprint(&panes, &redactor)?;
+    // This digest is never serialized, logged, or included in an error.
+    let initial_private_topology = mux_dump_topology_fingerprint_inner(&panes, None)?;
 
     let mut captured = Vec::with_capacity(panes.len());
     let mut errors = Vec::new();
@@ -92139,13 +92353,19 @@ async fn capture_live_mux_dump(
 
     for pane in panes {
         let (domain_name, domain_identity_authority) = mux_dump_domain_identity(&pane);
-        domains.insert(redactor.redact(&domain_name));
+        domains.insert(redact_pane_text_with_redactor(&domain_name, false, &redactor));
         let text =
             match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false, 0).await {
-                Ok(pane_text) => redactor.redact(&pane_text.text),
+                Ok(pane_text) => {
+                    redact_pane_text_with_redactor(&pane_text.text, false, &redactor)
+                }
                 Err(err) => {
-                    let detail =
-                        bounded_terminal_diagnostic(&redactor.redact(&err.to_string()), 240, 1024);
+                    let detail = bounded_terminal_diagnostic_with_redactor(
+                        &err.to_string(),
+                        240,
+                        1024,
+                        &redactor,
+                    );
                     errors.push(serde_json::json!({
                         "pane_id": pane.pane_id,
                         "code": "pane_text_unavailable",
@@ -92175,15 +92395,23 @@ async fn capture_live_mux_dump(
                 "tab_id": pane.tab_id,
                 "window_id": pane.window_id,
                 "domain_id": pane.domain_id,
-                "domain_name": redactor.redact(&domain_name),
+                "domain_name": redact_pane_text_with_redactor(&domain_name, false, &redactor),
                 "domain_identity_authority": domain_identity_authority,
                 "identity_stability": "mux_incarnation_local_ephemeral",
-                "workspace": pane.workspace.as_deref().map(|value| redactor.redact(value)),
+                "workspace": pane.workspace.as_deref().map(|value| {
+                    redact_pane_text_with_redactor(value, false, &redactor)
+                }),
                 "rows": pane.effective_rows(),
                 "cols": pane.effective_cols(),
-                "title": pane.title.as_deref().map(|value| redactor.redact(value)),
-                "cwd": pane.cwd.as_deref().map(|value| redactor.redact(value)),
-                "tty_name": pane.tty_name.as_deref().map(|value| redactor.redact(value)),
+                "title": pane.title.as_deref().map(|value| {
+                    redact_pane_text_with_redactor(value, false, &redactor)
+                }),
+                "cwd": pane.cwd.as_deref().map(|value| {
+                    redact_pane_text_with_redactor(value, false, &redactor)
+                }),
+                "tty_name": pane.tty_name.as_deref().map(|value| {
+                    redact_pane_text_with_redactor(value, false, &redactor)
+                }),
                 "cursor_x": pane.cursor_x,
                 "cursor_y": pane.cursor_y,
                 "cursor_visibility": pane.cursor_visibility,
@@ -92210,6 +92438,14 @@ async fn capture_live_mux_dump(
                 let final_count = final_panes.len();
                 match mux_dump_topology_fingerprint(&final_panes, &redactor) {
                     Ok(final_sha256) => {
+                        let final_private_topology =
+                            mux_dump_topology_fingerprint_inner(&final_panes, None)?;
+                        check_mux_dump_topology_redaction_collision(
+                            &initial_private_topology,
+                            &final_private_topology,
+                            &initial_topology_sha256,
+                            &final_sha256,
+                        )?;
                         if final_sha256 != initial_topology_sha256 {
                             errors.push(serde_json::json!({
                                 "scope": "mux_topology",
@@ -92226,10 +92462,11 @@ async fn capture_live_mux_dump(
                         errors.push(serde_json::json!({
                             "scope": "mux_topology",
                             "code": "final_topology_fingerprint_failed",
-                            "detail": bounded_terminal_diagnostic(
-                                &redactor.redact(&err.to_string()),
+                            "detail": bounded_terminal_diagnostic_with_redactor(
+                                &err.to_string(),
                                 240,
                                 1024,
+                                &redactor,
                             ),
                         }));
                         (Some(final_count), None)
@@ -92240,10 +92477,11 @@ async fn capture_live_mux_dump(
                 errors.push(serde_json::json!({
                     "scope": "mux_topology",
                     "code": "final_topology_list_failed",
-                    "detail": bounded_terminal_diagnostic(
-                        &redactor.redact(&err.to_string()),
+                    "detail": bounded_terminal_diagnostic_with_redactor(
+                        &err.to_string(),
                         240,
                         1024,
+                        &redactor,
                     ),
                 }));
                 (None, None)

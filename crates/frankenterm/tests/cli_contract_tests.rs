@@ -3957,6 +3957,340 @@ fn contract_rules_list_json() {
 // ft export contract tests
 // =============================================================================
 
+mod configured_redaction_contract {
+    use super::*;
+
+    const CUSTOM_SECRET: &str = "ORBITCANARY867530";
+    const MARKER: &str = "<workspace-secret>";
+
+    fn write_config(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("custom-redaction.toml");
+        std::fs::write(
+            &path,
+            r#"[safety.redaction]
+patterns = ["ORBITCANARY[0-9]{6}"]
+placeholder = "<workspace-secret>"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frankenterm_core::policy::Redactor::new().redact(CUSTOM_SECRET),
+            CUSTOM_SECRET,
+            "the fixture must not be covered by a built-in rule"
+        );
+        path
+    }
+
+    fn command(root: &std::path::Path, config: &std::path::Path) -> Command {
+        let mut command = wa_cmd_for(root.to_str().unwrap());
+        command
+            .current_dir(root)
+            .timeout(std::time::Duration::from_secs(30))
+            .env("HOME", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data-home"))
+            .env("XDG_CONFIG_HOME", root.join("config-home"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env_remove("WEZTERM_UNIX_SOCKET")
+            .env_remove("FRANKENTERM_UNIX_SOCKET")
+            .env_remove("WEZTERM_CONFIG_FILE")
+            .env_remove("WEZTERM_CONFIG_DIR")
+            .env_remove("FRANKENTERM_CONFIG_FILE")
+            .env_remove("FRANKENTERM_CONFIG_DIR")
+            .arg("--config")
+            .arg(config);
+        command
+    }
+
+    #[test]
+    fn historical_jsonl_export_applies_current_policy_without_mutating_evidence() {
+        let (dir, _) = setup_populated_workspace();
+        let config = write_config(dir.path());
+        let database = dir.path().join(".ft/ft.db");
+        let original = format!("{CUSTOM_SECRET}\nORBIT\x1b[31mCANARY867530");
+        let extracted = serde_json::json!({
+            "nested": ["ORBIT\x1b[31mCANARY867530", CUSTOM_SECRET]
+        })
+        .to_string();
+        // Seed directly to model retained rows from before this policy existed.
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, extracted, detected_at)
+                 SELECT max_event_id + 1, 1, 'configured.custom', 'test', 'custom', 'info', 1.0, ?1, ?2, 1700000000000
+                 FROM event_retention_state WHERE singleton = 1",
+                rusqlite::params![&original, &extracted],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, context, result, started_at, updated_at, completed_at)
+                 VALUES ('configured-workflow', 'test', 1, 0, 'completed', ?1, ?1, 1700000000000, 1700000000025, 1700000000025)",
+                rusqlite::params![&extracted],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, decision_context, input_summary)
+                 VALUES (1700000000000, 'human', 'configured_context', 'allow', 'success', ?1, ?2)",
+                rusqlite::params![&extracted, &original],
+            )
+            .unwrap();
+        drop(connection);
+
+        for kind in ["events", "workflows", "audit"] {
+            let output = command(dir.path(), &config)
+                .args(["export", kind])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(!stdout.contains("ORBIT"), "{kind}: {stdout}");
+            assert!(stdout.contains(MARKER), "{kind}: {stdout}");
+            let records: Vec<serde_json::Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records[0]["redacted"], true);
+            if kind == "events" {
+                let event = records
+                    .iter()
+                    .find(|record| record["rule_id"] == "configured.custom")
+                    .unwrap();
+                assert_eq!(event["matched_text"], format!("{MARKER}\n{MARKER}"));
+                assert_eq!(event["extracted"]["nested"][0], MARKER);
+                assert_eq!(event["extracted"]["nested"][1], MARKER);
+            } else if kind == "workflows" {
+                let workflow = records
+                    .iter()
+                    .find(|record| record["id"] == "configured-workflow")
+                    .unwrap();
+                assert_eq!(workflow["context"]["nested"][0], MARKER);
+                assert_eq!(workflow["result"]["nested"][1], MARKER);
+            } else {
+                let audit = records
+                    .iter()
+                    .find(|record| record["action_kind"] == "configured_context")
+                    .unwrap();
+                let context: serde_json::Value =
+                    serde_json::from_str(audit["decision_context"].as_str().unwrap()).unwrap();
+                assert_eq!(context["nested"][0], MARKER);
+                assert_eq!(context["nested"][1], MARKER);
+            }
+        }
+
+        let tail = command(dir.path(), &config)
+            .args(["audit", "tail"])
+            .output()
+            .unwrap();
+        assert!(
+            tail.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tail.stderr)
+        );
+        let tail = String::from_utf8(tail.stdout).unwrap();
+        assert!(!tail.contains("ORBIT"), "{tail}");
+        let audit = tail
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["action_kind"] == "configured_context")
+            .unwrap();
+        assert_eq!(audit["input_summary"], format!("{MARKER}\n{MARKER}"));
+        let context: serde_json::Value =
+            serde_json::from_str(audit["decision_context"].as_str().unwrap()).unwrap();
+        assert_eq!(context["nested"][0], MARKER);
+
+        let raw = command(dir.path(), &config)
+            .args(["export", "events", "--no-redact"])
+            .output()
+            .unwrap();
+        assert!(
+            raw.status.success(),
+            "{}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
+        let raw = String::from_utf8(raw.stdout).unwrap();
+        let event = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["rule_id"] == "configured.custom")
+            .unwrap();
+        assert_eq!(event["matched_text"], original);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let retained: String = connection
+            .query_row(
+                "SELECT matched_text FROM events WHERE rule_id = 'configured.custom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained, original,
+            "redacted export must not rewrite old evidence"
+        );
+    }
+
+    #[cfg(feature = "vc-export")]
+    #[test]
+    fn analytics_vc_export_uses_current_workspace_policy_for_historical_events() {
+        let (dir, _) = setup_populated_workspace();
+        let config = write_config(dir.path());
+        let split = "ORBIT\x1b[31mCANARY867530";
+        let connection = rusqlite::Connection::open(dir.path().join(".ft/ft.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, matched_text, extracted, handled_status, detected_at)
+                 SELECT max_event_id + 1, 1, 'configured.vc', 'test', 'custom', 'info', 1.0, ?1, ?2, ?1, 1700000000000
+                 FROM event_retention_state WHERE singleton = 1",
+                rusqlite::params![split, serde_json::json!({"nested": [split]}).to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        let output = command(dir.path(), &config)
+            .args(["analytics", "vc-export", "--include-text", "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("ORBIT"), "{stdout}");
+        let page: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let event = page["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["rule_id"] == "configured.vc")
+            .unwrap();
+        assert_eq!(event["matched_text"], MARKER);
+        assert_eq!(event["handled_status"], MARKER);
+        assert_eq!(event["extracted"]["nested"][0], MARKER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_reads_and_recording_use_the_configured_policy_in_real_cli_processes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _) = setup_populated_workspace();
+        let config = write_config(dir.path());
+        let fixture = dir.path().join("fixture-wezterm");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+set -eu
+case "$*" in
+  'cli --no-auto-start list --format json')
+    printf '%s\n' '[{"pane_id":1,"tab_id":1,"window_id":1,"domain_name":"local","title":"redaction-fixture","cwd":"file:///tmp"}]'
+    ;;
+  'cli --no-auto-start get-text --pane-id 1'*)
+    printf 'ORBIT\033[31mCANARY867530\nAKIAIOSFODNN7EXAMPLE\n'
+    ;;
+  *)
+    echo 'unsupported redaction fixture operation' >&2
+    exit 64
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for args in [
+            vec!["get-text", "1", "--escapes"],
+            vec!["robot", "--format", "json", "get-text", "1", "--escapes"],
+        ] {
+            let output = command(dir.path(), &config)
+                .env("FT_WEZTERM_CLI", &fixture)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(!stdout.contains("ORBIT"), "{stdout}");
+            assert!(!stdout.contains("AKIAIOSFODNN7EXAMPLE"), "{stdout}");
+            assert!(stdout.contains(MARKER), "{stdout}");
+        }
+
+        let captured = dir.path().join("captured.war");
+        let output = command(dir.path(), &config)
+            .env("FT_WEZTERM_CLI", &fixture)
+            .args([
+                "record",
+                "start",
+                "--pane",
+                "1",
+                "--auto-stop",
+                "1s",
+                "--output",
+            ])
+            .arg(&captured)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recording = frankenterm_core::replay::Recording::load(&captured).unwrap();
+        assert!(
+            !recording.frames.is_empty(),
+            "fixture must have reached capture"
+        );
+        for frame in recording.frames {
+            let payload = String::from_utf8(frame.payload).unwrap();
+            assert!(!payload.contains("ORBIT"));
+            assert!(!payload.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(payload.contains(MARKER));
+        }
+
+        // Export an older raw recording, not the already-protected capture.
+        let retained = dir.path().join("retained.war");
+        let frame = frankenterm_core::recording::RecordingFrame::new(
+            0,
+            frankenterm_core::recording::FrameType::Output,
+            0,
+            CUSTOM_SECRET.as_bytes().to_vec(),
+        )
+        .unwrap();
+        std::fs::write(&retained, frame.encode()).unwrap();
+        for no_redact in [false, true] {
+            let mut export = command(dir.path(), &config);
+            export
+                .args(["record", "export"])
+                .arg(&retained)
+                .args(["--title", CUSTOM_SECRET]);
+            if no_redact {
+                export.arg("--no-redact");
+            }
+            let output = export.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let rows: Vec<serde_json::Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let expected = if no_redact { CUSTOM_SECRET } else { MARKER };
+            assert_eq!(rows[0]["title"], expected);
+            assert_eq!(rows[1][2], expected);
+        }
+    }
+}
+
 #[test]
 fn contract_export_events_json() {
     let (_dir, ws) = setup_populated_workspace();

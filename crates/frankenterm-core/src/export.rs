@@ -137,11 +137,9 @@ pub async fn export_jsonl_with_cx<W: Write>(
             source: crate::error::RuntimeOperationSource::Cancelled(err.to_string()),
         })?;
 
-    let redactor = if opts.redact {
-        Some(Redactor::new())
-    } else {
-        None
-    };
+    // The storage handle carries the workspace policy. Reapply it at export
+    // time so rows captured before a custom pattern was added are protected.
+    let redactor = opts.redact.then(|| storage.redactor());
 
     let count = match opts.kind {
         ExportKind::Segments => {
@@ -151,7 +149,7 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for record in records {
-                let record = if let Some(ref r) = redactor {
+                let record = if let Some(r) = redactor {
                     redact_segment(record, r)
                 } else {
                     record
@@ -165,7 +163,7 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for record in records {
-                write_record(writer, &record, opts.pretty)?;
+                write_redacted_record(writer, &record, opts.pretty, redactor)?;
             }
             count
         }
@@ -181,7 +179,7 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for record in records {
-                let record = if let Some(ref r) = redactor {
+                let record = if let Some(r) = redactor {
                     redact_event(record, r)
                 } else {
                     record
@@ -197,10 +195,10 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for wf in &records {
-                write_record(writer, wf, opts.pretty)?;
+                write_redacted_record(writer, wf, opts.pretty, redactor)?;
                 if let Ok(steps) = storage.get_step_logs_with_cx(cx, &wf.id).await {
                     for step in &steps {
-                        let step = if let Some(ref r) = redactor {
+                        let step = if let Some(r) = redactor {
                             redact_step_log(step.clone(), r)
                         } else {
                             step.clone()
@@ -218,7 +216,7 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for record in &records {
-                write_record(writer, record, opts.pretty)?;
+                write_redacted_record(writer, record, opts.pretty, redactor)?;
             }
             count
         }
@@ -232,14 +230,11 @@ pub async fn export_jsonl_with_cx<W: Write>(
                 action_kind: opts.audit_action.clone(),
                 ..Default::default()
             };
-            let mut records = storage.get_audit_actions_with_cx(cx, query).await?;
+            let records = storage.get_audit_actions_with_cx(cx, query).await?;
             let count = records.len();
             write_header(writer, opts, count)?;
-            for record in &mut records {
-                if let Some(ref r) = redactor {
-                    record.redact_fields(r);
-                }
-                write_record(writer, record, opts.pretty)?;
+            for record in &records {
+                write_redacted_record(writer, record, opts.pretty, redactor)?;
             }
             count
         }
@@ -250,7 +245,7 @@ pub async fn export_jsonl_with_cx<W: Write>(
             let count = records.len();
             write_header(writer, opts, count)?;
             for record in &records {
-                write_record(writer, record, opts.pretty)?;
+                write_redacted_record(writer, record, opts.pretty, redactor)?;
             }
             count
         }
@@ -290,6 +285,49 @@ fn write_header<W: Write>(
     write_record(writer, &header, opts.pretty)
 }
 
+fn write_redacted_record<W: Write, T: Serialize>(
+    writer: &mut W,
+    record: &T,
+    pretty: bool,
+    redactor: Option<&Redactor>,
+) -> crate::Result<()> {
+    let Some(redactor) = redactor else {
+        return write_record(writer, record, pretty);
+    };
+    let value = serde_json::to_value(record).map_err(|error| {
+        crate::Error::Storage(crate::StorageError::Database(format!(
+            "JSON serialization failed: {error}"
+        )))
+    })?;
+    write_record(writer, &redact_export_record(value, redactor), pretty)
+}
+
+fn redact_export_record(value: serde_json::Value, redactor: &Redactor) -> serde_json::Value {
+    let fields = match value {
+        serde_json::Value::Object(fields) => fields,
+        other => return redact_json_value(other, redactor),
+    };
+    serde_json::Value::Object(
+        fields
+            .into_iter()
+            .map(|(key, value)| {
+                // These schema fields may carry serialized JSON in older rows.
+                // Decode one known layer only; arbitrary nested strings remain
+                // strings and cannot trigger an unbounded decode loop.
+                let value = match (key.as_str(), value) {
+                    (
+                        "decision_context" | "wait_condition" | "context" | "result"
+                        | "external_meta",
+                        serde_json::Value::String(encoded),
+                    ) => serde_json::Value::String(redact_json_text(&encoded, redactor)),
+                    (_, value) => redact_json_value(value, redactor),
+                };
+                (key, value)
+            })
+            .collect(),
+    )
+}
+
 fn write_record<W: Write, T: Serialize>(
     writer: &mut W,
     record: &T,
@@ -315,21 +353,66 @@ fn write_record<W: Write, T: Serialize>(
 // Redaction helpers
 // =============================================================================
 
+fn redact_terminal_text(text: &str, redactor: &Redactor) -> String {
+    let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+    redactor.redact(&normalized)
+}
+
+/// Redact one schema-known serialized JSON layer while preserving its string
+/// field type. Containers are canonicalized so duplicate keys cannot retain
+/// uninspected raw values; malformed encoded input fails closed.
+pub(crate) fn redact_json_text(text: &str, redactor: &Redactor) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(parsed) => {
+            let container = matches!(
+                &parsed,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            );
+            let redacted = redact_json_value(parsed.clone(), redactor);
+            if !container && redacted == parsed {
+                // Unchanged scalar JSON has no discarded duplicate keys.
+                text.to_string()
+            } else {
+                // Objects/arrays must be emitted from the inspected tree:
+                // duplicate keys may have hidden secrets in the raw input.
+                redacted.to_string()
+            }
+        }
+        Err(_) => {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with('{')
+                || trimmed.starts_with('[')
+                || trimmed.starts_with('"')
+                || text.contains('\\')
+            {
+                // Malformed JSON/escapes cannot be safely interpreted. Retain a
+                // JSON string containing the marker, never the encoded secret.
+                serde_json::Value::String(redactor.marker().to_string()).to_string()
+            } else {
+                // Some legacy result summaries are ordinary, unencoded prose.
+                redact_terminal_text(text, redactor)
+            }
+        }
+    }
+}
+
 fn redact_segment(mut seg: Segment, redactor: &Redactor) -> Segment {
-    seg.content = redactor.redact(&seg.content);
+    seg.content = redact_terminal_text(&seg.content, redactor);
     seg
 }
 
-/// Redact secret material from a stored event before emission: `matched_text`
-/// and every string leaf inside the structured `extracted` payload. Idempotent
-/// and secret-pattern-scoped (non-secret strings are untouched). Reused by the
-/// export path and `ft robot watch-events` (ft-7h5da.4.4).
+/// Normalize and redact secret material from a stored event before emission:
+/// `matched_text`, `handled_status`, and every string leaf inside `extracted`.
+/// Reused by the export path and `ft robot watch-events` (ft-7h5da.4.4).
 pub fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent {
     if let Some(ref text) = event.matched_text {
-        event.matched_text = Some(redactor.redact(text));
+        event.matched_text = Some(redact_terminal_text(text, redactor));
     }
     if let Some(extracted) = event.extracted.take() {
         event.extracted = Some(redact_json_value(extracted, redactor));
+    }
+    if let Some(status) = event.handled_status.as_mut() {
+        *status = redact_terminal_text(status, redactor);
     }
     event
 }
@@ -350,7 +433,7 @@ pub fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent 
 fn redact_json_value(value: serde_json::Value, redactor: &Redactor) -> serde_json::Value {
     use serde_json::Value;
     match value {
-        Value::String(s) => Value::String(redactor.redact(&s)),
+        Value::String(s) => Value::String(redact_terminal_text(&s, redactor)),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
@@ -367,12 +450,47 @@ fn redact_json_value(value: serde_json::Value, redactor: &Redactor) -> serde_jso
     }
 }
 
-fn redact_step_log(mut step: WorkflowStepLogRecord, redactor: &Redactor) -> WorkflowStepLogRecord {
-    if let Some(ref data) = step.result_data {
-        step.result_data = Some(redactor.redact(data));
+struct AuditOutputRedactor<'a>(&'a Redactor);
+
+impl frankenterm_core_audit_types::storage_audit::AuditFieldRedactor for AuditOutputRedactor<'_> {
+    fn redact(&self, value: &str) -> String {
+        redact_terminal_text(value, self.0)
     }
-    if let Some(ref summary) = step.policy_summary {
-        step.policy_summary = Some(redactor.redact(summary));
+}
+
+/// Redact the known sensitive audit-stream fields using the current policy.
+/// Context stays a serialized JSON string, with its decoded leaves normalized
+/// before redaction. Removing it before the typed conversion avoids applying a
+/// custom replacement marker to itself a second time.
+pub fn redact_audit_stream_record(
+    mut action: crate::storage::AuditActionRecord,
+    redactor: &Redactor,
+) -> crate::storage::AuditStreamRecord {
+    let context = action
+        .decision_context
+        .take()
+        .map(|text| redact_json_text(&text, redactor));
+    let mut record = crate::storage::AuditStreamRecord::from_action(
+        action,
+        &AuditOutputRedactor(redactor),
+    );
+    record.decision_context = context;
+    record
+}
+
+fn redact_step_log(mut step: WorkflowStepLogRecord, redactor: &Redactor) -> WorkflowStepLogRecord {
+    step.step_name = redact_terminal_text(&step.step_name, redactor);
+    if let Some(data) = step.result_data.as_mut() {
+        *data = redact_json_text(data, redactor);
+    }
+    if let Some(summary) = step.policy_summary.as_mut() {
+        *summary = redact_json_text(summary, redactor);
+    }
+    if let Some(references) = step.verification_refs.as_mut() {
+        *references = redact_json_text(references, redactor);
+    }
+    if let Some(error) = step.error_code.as_mut() {
+        *error = redact_terminal_text(error, redactor);
     }
     step
 }
@@ -404,6 +522,188 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn configured_export_redaction_normalizes_string_leaves_and_preserves_json() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+        config.placeholder = "<workspace-secret>".to_string();
+        let redactor = config.build_redactor().expect("configured redactor");
+        let record = serde_json::json!({
+            "context": {
+                "quote": "\"ORBIT\x1b[31mCANARY867530\"\nnext",
+                "items": ["AKIAIOSFODNN7EXAMPLE", 42, true, null]
+            }
+        });
+
+        let mut output = Vec::new();
+        write_redacted_record(&mut output, &record, false, Some(&redactor))
+            .expect("redacted JSONL record");
+        let decoded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(decoded["context"]["quote"], "\"<workspace-secret>\"\nnext");
+        assert_eq!(decoded["context"]["items"][0], "<workspace-secret>");
+        assert_eq!(decoded["context"]["items"][1], 42);
+        assert_eq!(decoded["context"]["items"][2], true);
+        assert!(decoded["context"]["items"][3].is_null());
+
+        let mut raw_output = Vec::new();
+        write_redacted_record(&mut raw_output, &record, false, None).expect("explicit raw export");
+        let decoded_raw: serde_json::Value = serde_json::from_slice(&raw_output).unwrap();
+        assert_eq!(decoded_raw, record, "no-redact must preserve retained evidence");
+    }
+
+    #[test]
+    fn configured_export_redacts_encoded_context_without_changing_field_types() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+        config.placeholder = "<workspace-secret>".to_string();
+        let redactor = config.build_redactor().unwrap();
+        let encoded = r#"{"ansi":"ORBIT\u001b[31mCANARY867530","escaped":"\u004fRBITCANARY867530"}"#;
+        let record = serde_json::json!({
+            "decision_context": encoded,
+            "wait_condition": encoded,
+            "context": encoded,
+            "result": encoded,
+            "external_meta": encoded,
+        });
+        let mut output = Vec::new();
+        write_redacted_record(&mut output, &record, false, Some(&redactor)).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        for field in [
+            "decision_context",
+            "wait_condition",
+            "context",
+            "result",
+            "external_meta",
+        ] {
+            let text = decoded[field]
+                .as_str()
+                .expect("schema field remains a string");
+            let inner: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(inner["ansi"], "<workspace-secret>");
+            assert_eq!(inner["escaped"], "<workspace-secret>");
+        }
+        for duplicate in [
+            r#"{"text":"ORBITCANARY867530","text":"safe"}"#,
+            r#"[{"nested":{"text":"ORBIT\u001b[31mCANARY867530","text":"safe"}}]"#,
+        ] {
+            let protected = redact_json_text(duplicate, &redactor);
+            assert!(!protected.contains("ORBIT"), "{protected}");
+            assert!(protected.contains("safe"));
+            serde_json::from_str::<serde_json::Value>(&protected).unwrap();
+        }
+        let malformed = r#"{"ansi":"ORBIT\u001b[31mCANARY867530"#;
+        let protected = redact_json_text(malformed, &redactor);
+        assert!(!protected.contains("ORBIT"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&protected).unwrap(),
+            "<workspace-secret>"
+        );
+        assert_eq!(
+            redact_json_text("ordinary legacy prose", &redactor),
+            "ordinary legacy prose"
+        );
+        let mut raw = Vec::new();
+        write_redacted_record(&mut raw, &record, false, None).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn configured_audit_stream_normalizes_fields_and_preserves_context_json() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+        config.placeholder = r#"masked"by"policy"#.to_string();
+        let redactor = config.build_redactor().unwrap();
+        let split = "ORBIT\x1b[31mCANARY867530";
+        let action = crate::storage::AuditActionRecord {
+            id: 7,
+            ts: 1000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some(split.to_string()),
+            rule_id: None,
+            input_summary: Some(split.to_string()),
+            verification_summary: Some(split.to_string()),
+            decision_context: Some(serde_json::json!({"nested": [split]}).to_string()),
+            result: "success".to_string(),
+        };
+        let record = redact_audit_stream_record(action, &redactor);
+        for field in [
+            record.decision_reason.as_deref(),
+            record.input_summary.as_deref(),
+            record.verification_summary.as_deref(),
+        ] {
+            assert_eq!(field, Some(r#"masked"by"policy"#));
+        }
+        let context: serde_json::Value =
+            serde_json::from_str(record.decision_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["nested"][0], r#"masked"by"policy"#);
+        let emitted = serde_json::to_value(record).unwrap();
+        assert!(emitted["decision_context"].is_string());
+        assert!(!emitted.to_string().contains("ORBIT"));
+    }
+
+    #[test]
+    fn configured_export_redacts_step_json_names_and_event_handling_status() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+        config.placeholder = "<workspace-secret>".to_string();
+        let redactor = config.build_redactor().unwrap();
+        let split = "ORBIT\x1b[31mCANARY867530";
+        let encoded = serde_json::json!({"detail": split}).to_string();
+        let step = WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index: 0,
+            step_name: split.to_string(),
+            step_id: None,
+            step_kind: None,
+            result_type: "done".to_string(),
+            result_data: Some(encoded.clone()),
+            policy_summary: Some(encoded.clone()),
+            verification_refs: Some(encoded),
+            error_code: Some(split.to_string()),
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        };
+        let step = redact_step_log(step, &redactor);
+        assert_eq!(step.step_name, "<workspace-secret>");
+        assert_eq!(step.error_code.as_deref(), Some("<workspace-secret>"));
+        for text in [step.result_data, step.policy_summary, step.verification_refs] {
+            let inner: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+            assert_eq!(inner["detail"], "<workspace-secret>");
+        }
+
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "test".to_string(),
+            event_type: "test".to_string(),
+            severity: "info".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: Some(2000),
+            handled_by_workflow_id: None,
+            handled_status: Some(split.to_string()),
+        };
+        let event = redact_event(event, &redactor);
+        assert_eq!(event.handled_status.as_deref(), Some("<workspace-secret>"));
     }
 
     #[test]
@@ -2784,7 +3084,7 @@ mod tests {
                 "secret sk-abc123def456ghi789jkl012mno345pqr678stu901v leaked".to_string(),
             ),
             policy_summary: Some("clean summary no secrets".to_string()),
-            verification_refs: Some("[ref1, ref2]".to_string()),
+            verification_refs: Some(r#"["ref1","ref2"]"#.to_string()),
             error_code: Some("E001".to_string()),
             started_at: 5000,
             completed_at: 6000,
@@ -2800,7 +3100,10 @@ mod tests {
         assert_eq!(redacted.step_id, Some("step-abc".to_string()));
         assert_eq!(redacted.step_kind, Some("action".to_string()));
         assert_eq!(redacted.result_type, "success");
-        assert_eq!(redacted.verification_refs, Some("[ref1, ref2]".to_string()));
+        assert_eq!(
+            redacted.verification_refs,
+            Some(r#"["ref1","ref2"]"#.to_string())
+        );
         assert_eq!(redacted.error_code, Some("E001".to_string()));
         assert_eq!(redacted.started_at, 5000);
         assert_eq!(redacted.completed_at, 6000);

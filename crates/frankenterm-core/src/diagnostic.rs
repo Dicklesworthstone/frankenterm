@@ -408,7 +408,9 @@ fn redact_step(step: crate::storage::WorkflowStepLogRecord, redactor: &Redactor)
         step_index: step.step_index,
         step_name: redact_text(&step.step_name, redactor),
         result_type: step.result_type,
-        policy_summary: step.policy_summary.map(|s| redact_text(&s, redactor)),
+        policy_summary: step
+            .policy_summary
+            .map(|summary| crate::export::redact_json_text(&summary, redactor)),
         started_at: step.started_at,
         completed_at: step.completed_at,
     }
@@ -2067,6 +2069,64 @@ mod tests {
         let summary = redacted.policy_summary.unwrap();
         assert!(summary.contains("[REDACTED]"));
         assert!(!summary.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn redact_step_decodes_policy_json_without_exposing_escaped_or_duplicate_secrets() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["PRIVATE_ORCHID".to_string()];
+        config.placeholder = "[private] \"hidden\"".to_string();
+        let redactor = config.build_redactor().unwrap();
+        let replacement = config.placeholder.clone();
+
+        for (encoded, expected) in [
+            (
+                r#"{"nested":{"token":"PRIVATE_\u001b[31mORCHID"},"escaped":"\u0050RIVATE_ORCHID","count":3}"#,
+                serde_json::json!({
+                    "nested": {"token": replacement},
+                    "escaped": replacement,
+                    "count": 3,
+                }),
+            ),
+            (
+                r#"{"nested":{"token":"PRIVATE_ORCHID","token":"safe"}}"#,
+                serde_json::json!({"nested": {"token": "safe"}}),
+            ),
+            (
+                r#"{"token":"PRIVATE_\u001b[31mORCHID"#,
+                serde_json::json!(replacement),
+            ),
+        ] {
+            let step = crate::storage::WorkflowStepLogRecord {
+                id: 1,
+                workflow_id: "wf-1".to_string(),
+                audit_action_id: None,
+                step_index: 0,
+                step_name: "policy_check".to_string(),
+                step_id: None,
+                step_kind: None,
+                result_type: "done".to_string(),
+                result_data: None,
+                policy_summary: Some(encoded.to_string()),
+                verification_refs: None,
+                error_code: None,
+                started_at: 1000,
+                completed_at: 1500,
+                duration_ms: 500,
+            };
+            let redacted = redact_step(step, &redactor);
+            let outer = serde_json::to_value(&redacted).unwrap();
+            let summary = outer["policy_summary"]
+                .as_str()
+                .expect("diagnostic policy summary remains a JSON string");
+            let decoded: serde_json::Value =
+                serde_json::from_str(summary).expect("inner JSON remains valid");
+            assert_eq!(decoded, expected);
+            assert!(!summary.contains("PRIVATE_"));
+            assert!(!summary.contains("\\u001b"));
+            assert_eq!(outer["step_name"], "policy_check");
+            assert_eq!(outer["step_index"], 0);
+        }
     }
 
     #[test]

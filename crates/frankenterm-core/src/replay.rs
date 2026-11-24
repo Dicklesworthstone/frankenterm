@@ -823,33 +823,71 @@ pub enum ExportFormat {
     Html,
 }
 
-/// Redact the output bytes of a recording, returning a new Recording with
-/// all `Output` and `Input` frame payloads redacted.
-fn redact_recording(recording: &Recording, redact_extra: &[String]) -> Result<Recording> {
-    use crate::policy::Redactor;
+struct RecordingExportRedactor<'a> {
+    redactor: &'a crate::policy::Redactor,
+    extra_patterns: Vec<regex::Regex>,
+}
 
-    let redactor = Redactor::new();
-    let mut extra_patterns: Vec<regex::Regex> = Vec::new();
-    for pat in redact_extra {
-        let re = regex::Regex::new(pat).map_err(|e| {
-            replay_backend_error(
-                "replay.redact_recording",
-                format!("Invalid redaction pattern '{pat}': {e}"),
-            )
-        })?;
-        extra_patterns.push(re);
+impl<'a> RecordingExportRedactor<'a> {
+    fn new(redactor: &'a crate::policy::Redactor, extra: &[String]) -> Result<Self> {
+        let mut extra_patterns = Vec::with_capacity(extra.len());
+        for (index, pattern) in extra.iter().enumerate() {
+            let regex = regex::Regex::new(pattern).map_err(|_| {
+                // A redaction expression can contain the literal secret.
+                // Regex diagnostics echo it, so expose only the failing index.
+                replay_backend_error(
+                    "replay.redact_recording",
+                    format!("Invalid extra redaction pattern at index {index}"),
+                )
+            })?;
+            extra_patterns.push(regex);
+        }
+        Ok(Self {
+            redactor,
+            extra_patterns,
+        })
     }
 
+    fn redact_patterns(&self, text: &str) -> String {
+        let mut redacted = self.redactor.redact(text);
+        for pattern in &self.extra_patterns {
+            redacted = pattern
+                .replace_all(&redacted, regex::NoExpand(self.redactor.marker()))
+                .into_owned();
+        }
+        redacted
+    }
+
+    fn redact_title(&self, text: &str) -> String {
+        let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+        self.redact_patterns(&normalized)
+    }
+
+    fn redact_frame(&self, text: &str) -> String {
+        let normalized = crate::output::normalize_terminal_text_for_redaction(text);
+        let redacted = self.redact_patterns(&normalized);
+        if redacted != normalized || crate::output::strip_ansi(text) != normalized {
+            // Rendering controls can split a secret. Preserve styling only
+            // when it cannot reconstruct protected text after export.
+            redacted
+        } else {
+            self.redact_patterns(text)
+        }
+    }
+}
+
+/// Redact text-bearing export frames, including annotations rendered by the
+/// cast/HTML player. Resize and detection frames retain their binary encoding.
+fn redact_recording(
+    recording: &Recording,
+    redactor: &RecordingExportRedactor<'_>,
+) -> Result<Recording> {
     let mut new_frames = Vec::with_capacity(recording.frames.len());
     for frame in &recording.frames {
         match frame.header.frame_type {
-            FrameType::Output | FrameType::Input => {
+            FrameType::Output | FrameType::Input | FrameType::Marker => {
                 let text = String::from_utf8_lossy(&frame.payload);
-                let mut redacted = redactor.redact(&text);
-                for re in &extra_patterns {
-                    redacted = re.replace_all(&redacted, "[REDACTED]").to_string();
-                }
-                let payload = redacted.into_bytes();
+                let payload = redactor.redact_frame(&text).into_bytes();
                 let payload_len =
                     checked_frame_payload_len("redacted replay export", payload.len())?;
                 new_frames.push(RecordingFrame {
@@ -885,8 +923,39 @@ pub fn export_asciinema<W: std::io::Write>(
     opts: &ExportOptions,
     writer: &mut W,
 ) -> Result<usize> {
-    let source = if opts.redact {
-        redact_recording(recording, &opts.extra_redact_patterns)?
+    export_asciinema_with_redactor(recording, opts, &crate::policy::Redactor::new(), writer)
+}
+
+/// Export a cast using the caller's workspace redaction policy.
+///
+/// The explicit `opts.redact = false` option preserves raw retained evidence,
+/// including titles and markers. Otherwise custom patterns augment the built-in
+/// catalog, and export-only patterns use the configured replacement marker.
+pub fn export_asciinema_with_redactor<W: std::io::Write>(
+    recording: &Recording,
+    opts: &ExportOptions,
+    redactor: &crate::policy::Redactor,
+    writer: &mut W,
+) -> Result<usize> {
+    let redaction = if opts.redact {
+        Some(RecordingExportRedactor::new(
+            redactor,
+            &opts.extra_redact_patterns,
+        )?)
+    } else {
+        None
+    };
+    export_asciinema_with_policy(recording, opts, redaction.as_ref(), writer)
+}
+
+fn export_asciinema_with_policy<W: std::io::Write>(
+    recording: &Recording,
+    opts: &ExportOptions,
+    redaction: Option<&RecordingExportRedactor<'_>>,
+    writer: &mut W,
+) -> Result<usize> {
+    let source = if let Some(redactor) = redaction {
+        redact_recording(recording, redactor)?
     } else {
         recording.clone()
     };
@@ -900,7 +969,8 @@ pub fn export_asciinema<W: std::io::Write>(
     header.insert("width".into(), serde_json::Value::Number(cols.into()));
     header.insert("height".into(), serde_json::Value::Number(rows.into()));
     if let Some(ref title) = opts.title {
-        header.insert("title".into(), serde_json::Value::String(title.clone()));
+        let title = redaction.map_or_else(|| title.clone(), |policy| policy.redact_title(title));
+        header.insert("title".into(), serde_json::Value::String(title));
     }
     if source.duration_ms > 0 {
         let duration_secs = source.duration_ms as f64 / 1000.0;
@@ -1012,21 +1082,37 @@ pub fn export_html<W: std::io::Write>(
     opts: &ExportOptions,
     writer: &mut W,
 ) -> Result<usize> {
-    // First generate the cast data into a buffer
+    export_html_with_redactor(recording, opts, &crate::policy::Redactor::new(), writer)
+}
+
+/// Export an HTML player using the caller's workspace redaction policy.
+/// The title, annotations, and embedded cast share the same policy.
+pub fn export_html_with_redactor<W: std::io::Write>(
+    recording: &Recording,
+    opts: &ExportOptions,
+    redactor: &crate::policy::Redactor,
+    writer: &mut W,
+) -> Result<usize> {
+    let redaction = if opts.redact {
+        Some(RecordingExportRedactor::new(
+            redactor,
+            &opts.extra_redact_patterns,
+        )?)
+    } else {
+        None
+    };
     let mut cast_buf = Vec::new();
-    let event_count = export_asciinema(recording, opts, &mut cast_buf)?;
+    let event_count =
+        export_asciinema_with_policy(recording, opts, redaction.as_ref(), &mut cast_buf)?;
     let cast_data = String::from_utf8_lossy(&cast_buf);
 
     let title = opts.title.as_deref().unwrap_or("ft Session Recording");
-    let (cols, rows) = find_terminal_size(
-        &if opts.redact {
-            redact_recording(recording, &opts.extra_redact_patterns)?
-        } else {
-            recording.clone()
-        },
-        opts.cols,
-        opts.rows,
-    );
+    let title = redaction
+        .as_ref()
+        .map_or_else(|| title.to_string(), |policy| policy.redact_title(title));
+    // Redaction does not change resize frames; avoid cloning and redacting
+    // the whole recording a second time just to obtain terminal dimensions.
+    let (cols, rows) = find_terminal_size(recording, opts.cols, opts.rows);
 
     // Emit self-contained HTML
     write!(
@@ -1099,7 +1185,7 @@ pub fn export_html<W: std::io::Write>(
 </body>
 </html>
 "#,
-        title = html_escape(title),
+        title = html_escape(&title),
         cols = cols,
         rows = rows,
         event_count = event_count,
@@ -1969,6 +2055,94 @@ mod tests {
         let html = String::from_utf8(buf).unwrap();
         assert!(!html.contains(&key));
         assert!(html.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn configured_recording_exports_redact_custom_secrets_titles_and_markers() {
+        let mut config = crate::config::RedactionConfig::default();
+        config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
+        config.placeholder = "<workspace-secret>".to_string();
+        let redactor = config.build_redactor().expect("configured redactor");
+        let custom = "ORBITCANARY867530";
+        assert_eq!(crate::policy::Redactor::new().redact(custom), custom);
+        let data = build_recording(&[
+            (
+                0,
+                FrameType::Output,
+                b"ORBIT\x1b[31mCANARY867530\nAKIAIOSFODNN7EXAMPLE".to_vec(),
+            ),
+            (100, FrameType::Marker, custom.as_bytes().to_vec()),
+            (200, FrameType::Output, b"fixture-123".to_vec()),
+            (300, FrameType::Output, b"safe \x1b[32mgreen\x1b[0m".to_vec()),
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            title: Some(custom.to_string()),
+            extra_redact_patterns: vec!["fixture-[0-9]+".to_string()],
+            ..Default::default()
+        };
+        let mut cast = Vec::new();
+        assert_eq!(
+            export_asciinema_with_redactor(&rec, &opts, &redactor, &mut cast).unwrap(),
+            4
+        );
+        let cast = String::from_utf8(cast).unwrap();
+        let lines: Vec<serde_json::Value> = cast
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["title"], "<workspace-secret>");
+        assert_eq!(lines[1][2], "<workspace-secret>\n<workspace-secret>");
+        assert_eq!(lines[2][1], "m");
+        assert_eq!(lines[2][2], "<workspace-secret>");
+        assert_eq!(lines[3][2], "<workspace-secret>");
+        assert_eq!(lines[4][2], "safe \x1b[32mgreen\x1b[0m");
+        assert!(!cast.contains("ORBIT"));
+        assert!(!cast.contains("fixture-123"));
+
+        let mut html = Vec::new();
+        export_html_with_redactor(&rec, &opts, &redactor, &mut html).unwrap();
+        let html = String::from_utf8(html).unwrap();
+        assert!(!html.contains("ORBIT"));
+        assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!html.contains("fixture-123"));
+        assert!(html.contains("<title>&lt;workspace-secret&gt;</title>"));
+
+        let raw_opts = ExportOptions {
+            redact: false,
+            ..opts
+        };
+        let mut raw = Vec::new();
+        export_asciinema_with_redactor(&rec, &raw_opts, &redactor, &mut raw).unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        let raw_lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(raw_lines[0]["title"], custom);
+        assert_eq!(
+            raw_lines[1][2],
+            "ORBIT\x1b[31mCANARY867530\nAKIAIOSFODNN7EXAMPLE"
+        );
+        assert_eq!(raw_lines[2][2], custom);
+        assert_eq!(raw_lines[3][2], "fixture-123");
+    }
+
+    #[test]
+    fn recording_export_invalid_pattern_diagnostic_omits_literal_secret() {
+        let rec = Recording::from_bytes(&[]).unwrap();
+        let opts = ExportOptions {
+            extra_redact_patterns: vec!["ORBITCANARY867530(".to_string()],
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let error = export_asciinema(&rec, &opts, &mut output).unwrap_err();
+        assert!(error.to_string().contains("index 0"));
+        assert!(!error.to_string().contains("ORBIT"));
+        assert!(
+            output.is_empty(),
+            "invalid policy must fail before emitting a header"
+        );
     }
 
     #[test]
