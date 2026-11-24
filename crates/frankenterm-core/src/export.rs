@@ -3369,32 +3369,48 @@ mod tests {
             let (storage, tmp) = test_db_with_pane("no_redact").await;
 
             let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
-            // We use an Event rather than a Segment to test export-time redaction
-            // because segments are unconditionally redacted at write-time by the
-            // storage writer thread.
+            // A workflow step log tests export-time redaction because storage
+            // keeps it as written. Segments, events and audit actions are
+            // redacted at write time, so a secret never reaches their rows.
             storage
-                .record_event(crate::storage::StoredEvent {
-                    id: 0,
+                .upsert_workflow(crate::storage::WorkflowRecord {
+                    id: "wf-no-redact".to_string(),
+                    workflow_name: "no_redact".to_string(),
                     pane_id: 1,
-                    rule_id: "test".to_string(),
-                    agent_type: "test".to_string(),
-                    event_type: "test".to_string(),
-                    severity: "info".to_string(),
-                    confidence: 1.0,
-                    extracted: None,
-                    matched_text: Some(format!("has secret: {}", secret)),
-                    segment_id: None,
-                    detected_at: 0,
-                    dedupe_key: None,
-                    handled_at: None,
-                    handled_by_workflow_id: None,
-                    handled_status: None,
+                    trigger_event_id: None,
+                    current_step: 0,
+                    status: "completed".to_string(),
+                    wait_condition: None,
+                    context: None,
+                    result: None,
+                    error: None,
+                    started_at: 1000,
+                    updated_at: 2000,
+                    completed_at: Some(2000),
                 })
+                .await
+                .unwrap();
+            storage
+                .insert_step_log(
+                    "wf-no-redact",
+                    None,
+                    0,
+                    "check",
+                    None,
+                    None,
+                    "done",
+                    Some(format!("has secret: {secret}")),
+                    None,
+                    None,
+                    None,
+                    1000,
+                    2000,
+                )
                 .await
                 .unwrap();
 
             let opts = ExportOptions {
-                kind: ExportKind::Events,
+                kind: ExportKind::Workflows,
                 query: ExportQuery::default(),
                 audit_actor: None,
                 audit_action: None,
@@ -3407,7 +3423,8 @@ mod tests {
 
             let output = String::from_utf8(buf).unwrap();
             let (_header, records) = parse_jsonl(&output);
-            let content = records[0]["matched_text"].as_str().unwrap();
+            assert_eq!(records.len(), 2);
+            let content = records[1]["result_data"].as_str().unwrap();
             // Secret should NOT be redacted when redact=false
             assert!(
                 content.contains(secret),
