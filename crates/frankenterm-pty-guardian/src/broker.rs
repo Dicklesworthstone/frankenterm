@@ -11196,7 +11196,18 @@ fn read_exact_blocking_with_deadline(
     deadline: Instant,
 ) -> Result<(), std::io::Error> {
     while !buffer.is_empty() {
-        stream.set_read_timeout(Some(blocking_io_deadline_remaining(deadline)?))?;
+        match stream.set_read_timeout(Some(blocking_io_deadline_remaining(deadline)?)) {
+            Ok(()) => {}
+            // Darwin refuses every socket option with EINVAL once a socket is
+            // shut down both ways, which a UNIX socket is as soon as its peer
+            // closes, even with the peer's complete reply still buffered.
+            // Such a socket cannot block (the read returns the buffered bytes,
+            // then EOF), so read on rather than discard a reply the broker
+            // sent before closing.
+            Err(error)
+                if cfg!(target_vendor = "apple") && error.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(error) => return Err(error),
+        }
         match stream.read(buffer) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -26601,6 +26612,30 @@ mod tests {
                 .write_timeout()
                 .expect("read restored drip-fed Census write timeout"),
             Some(original_write_timeout)
+        );
+    }
+
+    #[test]
+    fn deadline_read_returns_a_reply_its_peer_sent_before_closing() {
+        // Darwin refuses SO_RCVTIMEO with EINVAL once the peer has closed. The
+        // complete reply already buffered must still be read, then EOF.
+        let (mut client, mut peer) =
+            BlockingUnixStream::pair().expect("create closed-peer socket pair");
+        std::io::Write::write_all(&mut peer, b"reply-12").expect("buffer the reply");
+        drop(peer);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reply = [0_u8; 8];
+        read_exact_blocking_with_deadline(&mut client, &mut reply[..4], deadline)
+            .expect("read the first part of a buffered reply");
+        read_exact_blocking_with_deadline(&mut client, &mut reply[4..], deadline)
+            .expect("read the rest of a reply the peer sent before closing");
+        assert_eq!(&reply, b"reply-12");
+        let mut past_end = [0_u8; 1];
+        assert_eq!(
+            read_exact_blocking_with_deadline(&mut client, &mut past_end, deadline)
+                .expect_err("a closed peer has no more bytes")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
         );
     }
 
