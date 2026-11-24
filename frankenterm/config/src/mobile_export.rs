@@ -735,8 +735,11 @@ impl SshSources {
                                     .methods
                                     .contains(&"publickey")
                                 {
-                                    identities
-                                        .extend(split_paths(options.get("identityfile"), context));
+                                    if let Some(paths) =
+                                        resolver.identity_files(&options, &target.alias, context)
+                                    {
+                                        identities.extend(paths);
+                                    }
                                     certificate_files
                                         .extend(resolver.certificate_files(&options).0);
                                 }
@@ -863,6 +866,7 @@ struct AliasResolver {
     revocation_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
     proxies: BTreeMap<String, ProxySetting>,
     authentication_values: BTreeMap<String, Option<String>>,
+    identity_templates: Vec<(String, Option<String>)>,
     certificate_paths: Vec<(String, Option<PathBuf>)>,
     aliases: BTreeSet<String>,
     incomplete: bool,
@@ -1006,6 +1010,41 @@ impl AliasResolver {
             config.set_option("port", port.to_string());
         }
         config.for_host(&target.alias)
+    }
+
+    /// IdentityFile is additive across globals, matching Host stanzas and
+    /// the later system source. A matching "none" suppresses the defaults.
+    /// Keep path boundaries until the hop's user, hostname and port are final.
+    fn identity_files(
+        &self,
+        options: &frankenterm_ssh::ConfigMap,
+        alias: &str,
+        context: &InventoryContext,
+    ) -> Option<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let mut matched = false;
+        for (slot, template) in &self.identity_templates {
+            if !options.contains_key(slot) {
+                continue;
+            }
+            matched = true;
+            let template = template.as_deref()?;
+            if template.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let path = identity_path(template, options, alias, &context.home)?;
+            if !paths.contains(&path) {
+                if paths.len() == MAX_PUBLIC_KEY_FILES {
+                    return None;
+                }
+                paths.push(path);
+            }
+        }
+        Some(if matched {
+            paths
+        } else {
+            default_identities(context)
+        })
     }
 
     /// Every matching CertificateFile contributes in source order. Opaque,
@@ -1379,6 +1418,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     let mut revocation_lists = BTreeMap::new();
     let mut proxies = BTreeMap::new();
     let mut authentication_values = BTreeMap::new();
+    let mut identity_templates = Vec::new();
     let mut certificate_paths = Vec::new();
     let mut passive = String::new();
     let mut incomplete = false;
@@ -1387,6 +1427,9 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
             if keyword
                 .to_ascii_lowercase()
                 .starts_with("frankenterm_certificate_")
+                || keyword
+                    .to_ascii_lowercase()
+                    .starts_with("frankenterm_identity_")
                 || keyword.eq_ignore_ascii_case("frankenterm_required_certificate")
             {
                 // Source text cannot select a synthetic parser slot belonging
@@ -1411,6 +1454,15 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                     // This private parser slot cannot be selected by source
                     // text to bypass a real ProxyCommand/ProxyJump directive.
                     incomplete = true;
+                    continue;
+                }
+                "identityfile" => {
+                    let template = configuration_words(value)
+                        .filter(|words| words.len() == 1)
+                        .and_then(|mut words| words.pop());
+                    let slot = format!("frankenterm_identity_{}", identity_templates.len());
+                    passive.push_str(&format!("{} yes\n", slot));
+                    identity_templates.push((slot, template));
                     continue;
                 }
                 "certificatefile" => {
@@ -1566,6 +1618,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
         revocation_lists,
         proxies,
         authentication_values,
+        identity_templates,
         certificate_paths,
         aliases,
         incomplete,
@@ -1592,15 +1645,58 @@ pub fn ssh_config_hosts(home: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn split_paths(value: Option<&String>, context: &InventoryContext) -> Vec<PathBuf> {
-    value
-        .map(|text| {
-            text.split_whitespace()
-                .filter(|path| !path.eq_ignore_ascii_case("none"))
-                .map(|path| context.expand(path))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Expand one path without splitting it or interpreting characters introduced
+/// by a substitution. Only HOME and resolved endpoint tokens are available
+/// to the passive export. Unprovable paths refuse the whole candidate list.
+fn identity_path(
+    template: &str,
+    options: &frankenterm_ssh::ConfigMap,
+    alias: &str,
+    home: &Path,
+) -> Option<PathBuf> {
+    if template.is_empty() || template.len() > 4096 || template.chars().any(char::is_control) {
+        return None;
+    }
+    let mut expanded = String::new();
+    let mut rest = template;
+    if rest.starts_with("~/") {
+        expanded.push_str(home.to_str()?);
+        rest = &rest[1..];
+    }
+    while !rest.is_empty() {
+        let (value, suffix) = if let Some(tokens) = rest.strip_prefix('%') {
+            let token = tokens.chars().next()?;
+            let value = match token {
+                '%' => "%",
+                'd' => home.to_str()?,
+                'n' => alias,
+                'h' => options.get("hostname")?,
+                'r' => options.get("user")?,
+                'p' => options.get("port")?,
+                _ => return None,
+            };
+            (value, &tokens[token.len_utf8()..])
+        } else if let Some(suffix) = rest.strip_prefix("${HOME}") {
+            (home.to_str()?, suffix)
+        } else if rest.starts_with("${") {
+            return None;
+        } else {
+            // A literal dollar without a braced name is part of the filename.
+            let n = rest
+                .char_indices()
+                .skip(1)
+                .find(|(_, ch)| matches!(ch, '%' | '$'))
+                .map_or(rest.len(), |(i, _)| i);
+            rest.split_at(n)
+        };
+        if expanded.len().checked_add(value.len())? > 4096 {
+            return None;
+        }
+        expanded.push_str(value);
+        rest = suffix;
+    }
+    let path = PathBuf::from(expanded);
+    (path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)).then_some(path)
 }
 
 fn public_key_path(identity: &Path) -> PathBuf {
@@ -3039,9 +3135,17 @@ fn resolve_endpoint(
                     note(notes, problem.clone());
                 }
             }
+            let mut identities = Vec::new();
             let mut certificates = Vec::new();
             let mut identity_policy_complete = true;
             if authentication.methods.contains(&"publickey") {
+                match resolver.identity_files(&options, alias, context) {
+                    Some(paths) => identities = paths,
+                    None => {
+                        identity_policy_complete = false;
+                        note(notes, "IdentityFile could not be resolved to a complete bounded list of absolute paths for this route; no partial identity list was exported".into());
+                    }
+                }
                 let (paths, incomplete) = resolver.certificate_files(&options);
                 if incomplete || paths.len() > MAX_PUBLIC_KEY_FILES {
                     identity_policy_complete = false;
@@ -3192,11 +3296,7 @@ fn resolve_endpoint(
                 host,
                 port,
                 user,
-                identities: if authentication.methods.contains(&"publickey") {
-                    split_paths(options.get("identityfile"), context)
-                } else {
-                    Vec::new()
-                },
+                identities,
                 authentication_methods: authentication.methods,
                 pubkey_accepted_algorithms,
                 certificates,
@@ -6466,18 +6566,63 @@ socket = "/run/frankenterm.sock"
     }
 
     #[test]
+    fn raw_identity_sources_accumulate_across_user_and_system_stanzas() {
+        let mut sources = sources(Some(
+            "IdentityFile ~/.ssh/global\nHost other\n IdentityFile /not-selected\nHost app\n HostName css.example\n User operator\n IdentityFile \"~/.ssh/host %r\"\n IdentityFile none\nHost *\n IdentityFile ~/.ssh/global\n GlobalKnownHostsFile none\n",
+        ));
+        sources.system_config = KnownHostsSource::Present("IdentityFile ~/.ssh/system\n".into());
+        let mut expected = Vec::new();
+        for (i, name) in ["global", "host operator", "system"].iter().enumerate() {
+            let key = fake_key(1 + i as u8);
+            expected.push(PublicKey::parse_line(&key).unwrap().fingerprint());
+            sources
+                .public_keys
+                .insert(context().home.join(format!(".ssh/{}.pub", name)), key);
+        }
+        let exported = jump_export(&sources).unwrap();
+        for id in ["r.app.ssh", "r.app.mux"] {
+            let route = exported_route(&exported, id);
+            assert!(route["required_capabilities"].is_null());
+            let fingerprints: Vec<_> = route["credential_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|credential| {
+                    exported_credential(&exported, credential)["public_fingerprint"]
+                        .as_str()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(fingerprints, expected);
+        }
+        for invalid in ["~/.ssh/first ~/.ssh/second", "~/.ssh/%j", "${OTHER}/key"] {
+            sources.system_config =
+                KnownHostsSource::Present(format!("IdentityFile {}\n", invalid));
+            let blocked = jump_export(&sources).unwrap();
+            for id in ["r.app.ssh", "r.app.mux"] {
+                assert_eq!(exported_route(&blocked, id)["credential_refs"], json!([]));
+                assert_eq!(
+                    exported_route(&blocked, id)["required_capabilities"],
+                    json!([UNRESOLVED_POLICY])
+                );
+            }
+            assert!(blocked.identity_files.is_empty());
+        }
+    }
+
+    #[test]
     fn qualified_proxyjump_discovers_exact_expanded_public_identity_candidates_in_order() {
         let directory = tempfile::tempdir().unwrap();
-        let home = directory.path().join("home");
+        let home = directory.path().join("home with spaces");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(home.join("trust")).unwrap();
         write_source(
             &home.join(".ssh/config"),
-            "Host app\n HostName app.internal\n User deploy\n IdentityFile ~/.ssh/app\n UserKnownHostsFile ~/trust/app\n ProxyJump selected-user@first:2200\nHost first\n HostName jump.internal\n User configured-user\n Port 2022\n IdentityFile ~/.ssh/%r-%p\n IdentityFile ~/.ssh/backup\n PreferredAuthentications publickey\n UserKnownHostsFile ~/trust/first\nHost *\n GlobalKnownHostsFile none\n ProxyCommand none\n",
+            "Host app\n HostName app.internal\n User deploy\n IdentityFile ~/.ssh/app\n UserKnownHostsFile ~/trust/app\n ProxyJump selected-user@first:2200\nHost first\n HostName jump.internal\n User configured-user\n Port 2022\n IdentityFile ~/.ssh/%r-%p\n  PreferredAuthentications publickey\n UserKnownHostsFile ~/trust/first\nHost first\n IdentityFile \"~/.ssh/backup identity\"\nHost *\n GlobalKnownHostsFile none\n ProxyCommand none\n",
         );
         for (file, seed) in [
             ("selected-user-2200", 1),
-            ("backup", 2),
+            ("backup identity", 2),
             ("app", 3),
             ("configured-user-2022", 4),
         ] {
@@ -6504,7 +6649,7 @@ socket = "/run/frankenterm.sock"
             .contains_key(&context.home.join(".ssh/selected-user-2200.pub")));
         assert!(snapshot
             .public_keys
-            .contains_key(&context.home.join(".ssh/backup.pub")));
+            .contains_key(&context.home.join(".ssh/backup identity.pub")));
         assert!(
             !snapshot
                 .public_keys
@@ -8024,11 +8169,6 @@ ssh = "right"
         assert!(trust["pins"].as_array().unwrap().is_empty());
         assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
         assert!(trust["required_capabilities"].is_null());
-        assert_eq!(
-            split_paths(Some(&"none ~/.ssh/allowed NONE".to_string()), &context()),
-            vec![PathBuf::from("/home/me/.ssh/allowed")],
-            "IdentityFile none is never a key path"
-        );
     }
 
     #[test]
