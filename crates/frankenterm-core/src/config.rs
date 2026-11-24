@@ -701,7 +701,7 @@ pub struct SearchConfig {
     /// Default query mode: "lexical" (or "fts5"), "semantic", or "hybrid".
     /// An explicit CLI or MCP mode overrides this setting.
     pub mode: ConfiguredSearchMode,
-    /// Directory for downloaded model files.
+    /// Directory for model files; reranking reads a locally provisioned reranker/ bundle.
     pub models_dir: String,
     /// RRF fusion K parameter.
     pub rrf_k: u32,
@@ -713,7 +713,8 @@ pub struct SearchConfig {
     pub fast_only: bool,
     /// Hybrid fusion backend selector.
     pub fusion_backend: String,
-    /// Enable cross-encoder reranking.
+    /// Enable bounded local cross-encoder reranking for lexical, semantic, and hybrid queries.
+    /// Requires semantic-search build support and the local models_dir/reranker bundle.
     pub reranker_enabled: bool,
     /// Incremental document indexing settings (FrankenSearch pipeline).
     pub indexing: SearchIndexingConfig,
@@ -763,25 +764,19 @@ impl SearchConfig {
     }
 
     fn validate_key_wiring(&self) -> Result<(), String> {
-        let defaults = Self::default();
-        // ft-vyg9y: search.reranker_enabled has no production reranking consumer.
-        // Its only reader, `advertised_embedder_tiers`, just appends a
-        // "cross-encoder" string to the status-tier list. No production search
-        // dispatch reranks: the storage hybrid path (the live wa.search/ft search
-        // backend) has no rerank step, `rerank_fused_results` is reached only from
-        // the test-only orchestrator scaffold, and the only `Reranker` impls are
-        // `PassthroughReranker` (no-op) and `CrossEncoderReranker` (an ONNX stub
-        // whose `rerank` returns candidates unchanged). Toggling it on therefore
-        // reranks nothing. Fail closed so the operator gets a clear error instead
-        // of a silent no-op (and a false sense that results are being reranked),
-        // mirroring the search.daemon honesty gates. Wiring a real
-        // cross-encoder (ONNX runtime) is a separate feature; until it lands, leave
-        // this at its default.
-        if self.reranker_enabled != defaults.reranker_enabled {
-            return Err(parsed_but_unconsumed_config_key_message(
-                "search.reranker_enabled",
-                "no production search dispatch reranks results — the only reader appends a 'cross-encoder' status-tier string, the storage hybrid path has no rerank step, and the reranker subsystem (rerank_fused_results / CrossEncoderReranker) is a test-only scaffold with an unimplemented ONNX stub",
-            ));
+        if self.reranker_enabled {
+            if !cfg!(feature = "semantic-search") {
+                return Err(
+                    "search.reranker_enabled requires a build with the semantic-search feature"
+                        .to_string(),
+                );
+            }
+            if self.models_dir.trim().is_empty() {
+                return Err(
+                    "search.models_dir must name the local model directory when search.reranker_enabled is true"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -881,11 +876,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "search.reranker_enabled",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "only advertised_embedder_tiers reads it (appends a 'cross-encoder' status-tier string); no production search dispatch reranks — the storage hybrid path has no rerank step, and rerank_fused_results/CrossEncoderReranker are a test-only orchestrator scaffold with an unimplemented ONNX stub",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "ft search, ft robot search, and wa.search -> rerank_search_results_with_cx",
+        evidence: "authorized lexical and hybrid candidates are reranked by a bounded local fastembed cross-encoder; query text and original retrieval scores are preserved and model/inference failures are explicit",
         tracking_bead: "ft-vyg9y",
-        validation: "SearchConfig::validate_key_wiring rejects reranker_enabled=true as parsed but no-effect",
+        validation: "SearchConfig::validate_key_wiring requires semantic-search build support and a nonempty models_dir; live searches validate the local ONNX/tokenizer bundle before inference",
     },
     ConfigKeyWiringRecord {
         key: "workflows.audit_steps",

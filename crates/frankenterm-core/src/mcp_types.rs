@@ -220,6 +220,8 @@ pub(super) struct McpSearchData {
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<crate::search::SearchRerankReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3231,6 +3233,7 @@ mod tests {
                 until_filter: None,
                 mode: mode.clone(),
                 metrics: None,
+                rerank: None,
             };
             let v = serde_json::to_value(&d).unwrap();
             prop_assert_eq!(v["query"].as_str().unwrap(), query.as_str());
@@ -3238,6 +3241,7 @@ mod tests {
             prop_assert_eq!(v["limit"].as_u64().unwrap(), limit as u64);
             prop_assert_eq!(v["mode"].as_str().unwrap(), mode.as_str());
             prop_assert!(v["results"].is_array());
+            prop_assert!(v.get("rerank").is_none());
         }
 
         // 66. McpAccountsRefreshData (composite)

@@ -71,7 +71,8 @@ pub use indexing_pipeline::{
 pub use reranker::{FrankenSearchRerankAdapter, apply_frankensearch_rerank_scores};
 pub use reranker::{
     PassthroughReranker, RerankBackend, RerankConfig, RerankError, RerankOutcome, Reranker,
-    ScoredDoc, rerank_fused_results,
+    SEARCH_RERANK_MAX_CANDIDATES, SEARCH_RERANK_MAX_TEXT_BYTES, ScoredDoc, SearchRerankReport,
+    SearchRerankScore, rerank_fused_results, rerank_search_results_with_cx,
 };
 pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
 
@@ -108,7 +109,8 @@ pub use model_registry::{ModelInfo, ModelRegistry};
 #[cfg(feature = "semantic-search")]
 pub use reranker::CrossEncoderReranker;
 
-/// Report the embedder backends that this build can truthfully advertise.
+/// Report configured backends supported by this build, not model readiness.
+/// Reranking is independent of the lexical/semantic retrieval selection.
 #[must_use]
 pub fn advertised_embedder_tiers(search_enabled: bool, reranker_enabled: bool) -> Vec<String> {
     let _ = (search_enabled, reranker_enabled);
@@ -116,8 +118,10 @@ pub fn advertised_embedder_tiers(search_enabled: bool, reranker_enabled: bool) -
     let mut tiers = vec!["hash".to_string()];
 
     #[cfg(feature = "semantic-search")]
-    if search_enabled {
-        tiers.push("fastembed".to_string());
+    {
+        if search_enabled {
+            tiers.push("fastembed".to_string());
+        }
         if reranker_enabled {
             tiers.push("cross-encoder".to_string());
         }
@@ -375,8 +379,18 @@ mod tests {
 
     #[test]
     fn advertised_embedder_tiers_without_semantic_search_only_reports_hash() {
-        let tiers = advertised_embedder_tiers(false, true);
+        let tiers = advertised_embedder_tiers(false, false);
         assert_eq!(tiers, vec!["hash".to_string()]);
+    }
+
+    #[test]
+    fn advertised_reranker_is_independent_of_semantic_retrieval() {
+        let tiers = advertised_embedder_tiers(false, true);
+        assert_eq!(
+            tiers.iter().any(|tier| tier == "cross-encoder"),
+            cfg!(feature = "semantic-search")
+        );
+        assert!(!tiers.iter().any(|tier| tier == "fastembed"));
     }
 
     #[test]

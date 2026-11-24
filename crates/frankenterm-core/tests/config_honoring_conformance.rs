@@ -284,13 +284,32 @@ fn search_daemon_unconsumed_fields_are_not_silently_ignored() {
 
 #[test]
 fn search_reranker_enabled_is_not_silently_ignored() {
-    // ft-vyg9y: search.reranker_enabled is parsed but its only reader appends a
-    // "cross-encoder" status-tier string — no production dispatch reranks (the
-    // reranker subsystem is a test-only scaffold with an ONNX stub). Setting it
-    // must fail closed, not silently enable nothing.
-    assert_rejects("search.reranker", "search.reranker_enabled", |c| {
-        c.search.reranker_enabled = true;
-    });
+    // Admission checks build capability; the live search stage validates the
+    // explicitly supplied local model and rejects missing/invalid bundles.
+    #[cfg(feature = "semantic-search")]
+    {
+        assert_accepts("search.reranker_enabled", |c| {
+            c.search.reranker_enabled = true;
+        });
+        let mut config = Config::default();
+        config.search.reranker_enabled = true;
+        config.search.models_dir = "  ".to_string();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("search.models_dir")
+        );
+    }
+    #[cfg(not(feature = "semantic-search"))]
+    {
+        let mut config = Config::default();
+        config.search.reranker_enabled = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("search.reranker_enabled"));
+        assert!(error.contains("semantic-search"));
+    }
 }
 
 #[test]

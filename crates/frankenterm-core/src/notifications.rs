@@ -738,8 +738,7 @@ mod tests {
             summary: text.clone(),
             description: text.clone(),
             suggestions: vec![crate::event_templates::Suggestion::with_command(
-                "Inspect",
-                text,
+                "Inspect", text,
             )],
             severity: Severity::Warning,
         };
@@ -772,16 +771,18 @@ mod tests {
         let redactor = notification_policy("[WORKSPACE]").build_redactor().unwrap();
         let rendered = render_detection(&detection, 7, Some(42), &redactor);
         let payload = NotificationPayload::from_detection_with_redactor(
-            &detection,
-            7,
-            &rendered,
-            0,
-            &redactor,
+            &detection, 7, &rendered, 0, &redactor,
         );
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(payload.summary.contains("[WORKSPACE]"));
         assert!(payload.description.contains("[WORKSPACE]"));
-        assert!(payload.quick_fix.as_deref().unwrap().contains("[WORKSPACE]"));
+        assert!(
+            payload
+                .quick_fix
+                .as_deref()
+                .unwrap()
+                .contains("[WORKSPACE]")
+        );
         assert!(payload.description.contains("nested"));
         assert!(payload.description.contains("visible"));
         assert!(!serialized.contains("warehouse"));

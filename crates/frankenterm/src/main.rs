@@ -10384,6 +10384,26 @@ fn unified_search_mode_to_core_mode(
     }
 }
 
+async fn rerank_search_rows_for_output<T: Send + 'static>(
+    cx: &frankenterm_core::cx::Cx,
+    config: &frankenterm_core::config::Config,
+    query: &str,
+    rows: Vec<T>,
+    document: for<'a> fn(&'a T) -> (i64, &'a str),
+) -> frankenterm_core::Result<(Vec<T>, Option<frankenterm_core::search::SearchRerankReport>)> {
+    frankenterm_core::search::rerank_search_results_with_cx(
+        cx,
+        &config.search,
+        query,
+        rows,
+        document,
+    )
+    .await
+    .map_err(|error| {
+        frankenterm_core::StorageError::Database(format!("Search reranking failed: {error}")).into()
+    })
+}
+
 fn effective_search_rrf_k(config: &frankenterm_core::config::Config) -> u32 {
     config.search.rrf_k.max(1)
 }
@@ -14734,6 +14754,8 @@ struct RobotSearchData {
     mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<RobotSearchMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank: Option<frankenterm_core::search::SearchRerankReport>,
 }
 
 /// Individual search hit for robot mode
@@ -53826,8 +53848,41 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 }
                             };
 
+                            // Rerank authorized candidates before presentation redaction.
+                            // Keep retrieval scores and hybrid diagnostics intact.
+                            let search_results = match search_results {
+                                Ok(RobotSearchExecution::Lexical(results)) => {
+                                    rerank_search_rows_for_output(
+                                        cx,
+                                        &config,
+                                        &canonical.query,
+                                        results,
+                                        |row| (row.segment.id, &row.segment.content),
+                                    )
+                                    .await
+                                    .map(|(rows, report)| {
+                                        (RobotSearchExecution::Lexical(rows), report)
+                                    })
+                                }
+                                Ok(RobotSearchExecution::Hybrid(mut bundle)) => {
+                                    rerank_search_rows_for_output(
+                                        cx,
+                                        &config,
+                                        &canonical.query,
+                                        std::mem::take(&mut bundle.results),
+                                        |hit| (hit.result.segment.id, &hit.result.segment.content),
+                                    )
+                                    .await
+                                    .map(|(rows, report)| {
+                                        bundle.results = rows;
+                                        (RobotSearchExecution::Hybrid(bundle), report)
+                                    })
+                                }
+                                Err(error) => Err(error),
+                            };
+
                             match search_results {
-                                Ok(RobotSearchExecution::Lexical(mut results)) => {
+                                Ok((RobotSearchExecution::Lexical(mut results), rerank)) => {
                                     redact_search_results_for_output(&mut results);
                                     let total_hits = results.len();
                                     let hits: Vec<RobotSearchHit> = results
@@ -53871,11 +53926,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         until_filter: canonical.until,
                                         mode: canonical.mode.as_str().to_string(),
                                         metrics: None,
+                                        rerank,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
                                 }
-                                Ok(RobotSearchExecution::Hybrid(bundle)) => {
+                                Ok((RobotSearchExecution::Hybrid(bundle), rerank)) => {
                                     let frankenterm_core::storage::HybridSearchBundle {
                                         mode: effective_mode,
                                         requested_mode,
@@ -53945,6 +54001,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         since_filter: canonical.since,
                                         until_filter: canonical.until,
                                         mode: effective_mode.clone(),
+                                        rerank,
                                         metrics: Some(RobotSearchMetrics {
                                             requested_mode,
                                             effective_mode,
@@ -63185,8 +63242,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         }
                     };
 
+                    let search_results = match search_results {
+                        Ok(results) => {
+                            rerank_search_rows_for_output(
+                                cx,
+                                &config,
+                                &canonical.query,
+                                results,
+                                |row| (row.segment.id, &row.segment.content),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     match search_results {
-                        Ok(mut results) => {
+                        Ok((mut results, rerank)) => {
                             redact_search_results_for_output(&mut results);
                             record_read_search_policy_audit(
                                 Some(&storage),
@@ -63207,6 +63277,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let output =
                                 SearchResultRenderer::render(&results, &display_query, &ctx);
                             print!("{output}");
+                            if let Some(report) = rerank
+                                && report.reranked
+                            {
+                                // Preserve the historical bare-array JSON schema.
+                                // Structured rerank scores are available in robot/MCP.
+                                eprintln!(
+                                    "Local cross-encoder reranked {} candidates ({} documents byte-truncated); displayed scores retain retrieval values.",
+                                    report.candidates_reranked, report.truncated_documents,
+                                );
+                            }
                         }
                         Err(e) => {
                             record_read_search_policy_audit(
@@ -134726,9 +134806,11 @@ printf x > "$MINISIGN_MARKER"
             until_filter: None,
             mode: "lexical".to_string(),
             metrics: None,
+            rerank: None,
         };
         let without_metrics_json = serde_json::to_value(&without_metrics).unwrap();
         assert!(without_metrics_json.get("metrics").is_none());
+        assert!(without_metrics_json.get("rerank").is_none());
 
         let with_metrics = RobotSearchData {
             query: "needle".to_string(),
@@ -134739,6 +134821,7 @@ printf x > "$MINISIGN_MARKER"
             since_filter: None,
             until_filter: None,
             mode: "lexical".to_string(),
+            rerank: None,
             metrics: Some(RobotSearchMetrics {
                 requested_mode: "hybrid".to_string(),
                 effective_mode: "lexical".to_string(),

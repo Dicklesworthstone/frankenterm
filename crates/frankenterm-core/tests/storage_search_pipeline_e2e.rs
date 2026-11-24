@@ -19,7 +19,8 @@
 //!     and retains the newest. Evicted segments' embeddings cascade-delete via
 //!     the `segment_embeddings` FK (`ON DELETE CASCADE`; the writer connection
 //!     runs `PRAGMA foreign_keys = ON`) — no orphans.
-//!   * ft-vyg9y — `Config::validate` fail-closes `search.reranker_enabled=true`.
+//!   * ft-vyg9y — `Config::validate` admits explicit reranking only when this
+//!     build includes semantic-search; the live stage validates the local model.
 //!
 //! Ungated so the default `cargo test` exercises it; the runtime harness mirrors
 //! `tests/web.rs`.
@@ -282,20 +283,21 @@ fn retention_size_eviction_honors_config_and_cascades_embeddings_e2e() {
 }
 
 // ===========================================================================
-// config honoring: reranker_enabled fail-closed (ft-vyg9y)
+// config honoring: reranker_enabled requires inference support (ft-vyg9y)
 // ===========================================================================
 
 #[test]
-fn config_honoring_reranker_enabled_fails_closed() {
+fn config_honoring_reranker_enabled_requires_inference_support() {
     use frankenterm_core::config::Config;
 
     let mut config = Config::default();
     config.search.reranker_enabled = true;
-    let err = config
-        .validate()
-        .expect_err("reranker_enabled=true must be rejected — no production reranker exists");
-    assert!(
-        err.to_string().contains("search.reranker_enabled"),
-        "the fail-closed rejection must name the key: {err}"
-    );
+    let result = config.validate();
+    if cfg!(feature = "semantic-search") {
+        result.expect("a supported build must admit explicit local reranking");
+    } else {
+        let error = result.expect_err("a build without inference support must fail closed");
+        assert!(error.to_string().contains("search.reranker_enabled"));
+        assert!(error.to_string().contains("semantic-search"));
+    }
 }

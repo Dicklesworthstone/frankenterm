@@ -4431,7 +4431,10 @@ impl ToolHandler for WaSearchTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("MCP runtime init failed: {e}")))?;
 
-        let result: std::result::Result<SearchExecution, McpToolError> =
+        let result: std::result::Result<
+            (SearchExecution, Option<crate::search::SearchRerankReport>),
+            McpToolError,
+        > =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP search storage open.
                 let search_open_cx = ctx.cx().clone();
@@ -4571,7 +4574,20 @@ impl ToolHandler for WaSearchTool {
                             .search_with_results(&query_for_storage, search_options)
                             .await
                             .map_err(McpToolError::from_error)?;
-                        Ok(SearchExecution::Lexical(results))
+                        let (results, rerank) = crate::search::rerank_search_results_with_cx(
+                            &search_open_cx,
+                            &config.search,
+                            &query_for_storage,
+                            results,
+                            |row| (row.segment.id, &row.segment.content),
+                        )
+                        .await
+                        .map_err(|error| McpToolError::new(
+                            MCP_ERR_STORAGE,
+                            format!("Search reranking failed: {error}"),
+                            Some("Provide the local search.models_dir/reranker bundle or disable search.reranker_enabled.".to_string()),
+                        ))?;
+                        Ok((SearchExecution::Lexical(results), rerank))
                     }
                     UnifiedSearchMode::Semantic | UnifiedSearchMode::Hybrid => {
                         let (embedder_id, query_vector) = semantic_query.ok_or_else(|| {
@@ -4583,7 +4599,7 @@ impl ToolHandler for WaSearchTool {
                             )
                         })?;
 
-                        let bundle = storage
+                        let mut bundle = storage
                             .hybrid_search_with_results(
                                 &query_for_storage,
                                 search_options,
@@ -4597,7 +4613,21 @@ impl ToolHandler for WaSearchTool {
                             )
                             .await
                             .map_err(McpToolError::from_error)?;
-                        Ok(SearchExecution::Hybrid(bundle))
+                        let (results, rerank) = crate::search::rerank_search_results_with_cx(
+                            &search_open_cx,
+                            &config.search,
+                            &query_for_storage,
+                            std::mem::take(&mut bundle.results),
+                            |hit| (hit.result.segment.id, &hit.result.segment.content),
+                        )
+                        .await
+                        .map_err(|error| McpToolError::new(
+                            MCP_ERR_STORAGE,
+                            format!("Search reranking failed: {error}"),
+                            Some("Provide the local search.models_dir/reranker bundle or disable search.reranker_enabled.".to_string()),
+                        ))?;
+                        bundle.results = results;
+                        Ok((SearchExecution::Hybrid(bundle), rerank))
                     }
                 }
             });
@@ -4605,7 +4635,7 @@ impl ToolHandler for WaSearchTool {
         let redacted_query = redact_mcp_output_secrets(&canonical.query);
 
         match result {
-            Ok(SearchExecution::Lexical(results)) => {
+            Ok((SearchExecution::Lexical(results), rerank)) => {
                 let total_hits = results.len();
                 let hits: Vec<McpSearchHit> = results
                     .into_iter()
@@ -4636,11 +4666,12 @@ impl ToolHandler for WaSearchTool {
                     until_filter: canonical.until,
                     mode: canonical.mode.as_str().to_string(),
                     metrics: None,
+                    rerank,
                 };
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
-            Ok(SearchExecution::Hybrid(bundle)) => {
+            Ok((SearchExecution::Hybrid(bundle), rerank)) => {
                 let crate::storage::HybridSearchBundle {
                     mode,
                     requested_mode,
@@ -4712,6 +4743,7 @@ impl ToolHandler for WaSearchTool {
                     until_filter: canonical.until,
                     mode: effective_mode,
                     metrics: Some(metrics),
+                    rerank,
                 };
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
@@ -29714,6 +29746,59 @@ exit 17",
                 let hit = &envelope["data"]["results"][0];
                 assert_eq!(hit["segment_id"], segment_id, "{envelope}");
                 assert!(hit["semantic_score"].is_number(), "{envelope}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_reranker_setting_changes_the_live_lexical_and_hybrid_handlers() {
+        let (directory, db) = temp_db_path();
+        let pane_id = 9_243;
+        seed_distributed_remote_pane(&db, pane_id, "distributed:reranker-config");
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let segment_id = runtime.block_on(async {
+            let storage = StorageHandle::new(&db.to_string_lossy()).await.unwrap();
+            let segment = storage
+                .append_segment(pane_id, "rerankneedle orbit", None)
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            segment.id
+        });
+        for mode in ["lexical", "semantic", "hybrid"] {
+            for enabled in [false, true] {
+                let mut cfg = Config::default();
+                cfg.search.reranker_enabled = enabled;
+                cfg.search.quality_timeout_ms = 10_000;
+                cfg.search.models_dir = directory
+                    .path()
+                    .join("private-model-path-canary")
+                    .to_string_lossy()
+                    .into_owned();
+                let tool = WaSearchTool::new(Arc::new(cfg), Arc::clone(&db));
+                let envelope = parse_json_content(
+                    tool.call(
+                        &test_mcp_context(),
+                        serde_json::json!({
+                            "query": "rerankneedle", "mode": mode,
+                        }),
+                    )
+                    .expect("live search returns an envelope"),
+                );
+                if enabled {
+                    // The actual handler must reach the configured inference
+                    // stage, not merely advertise that reranking is enabled.
+                    assert_eq!(envelope["ok"], false, "{mode}: {envelope}");
+                    assert_eq!(envelope["error_code"], MCP_ERR_STORAGE, "{envelope}");
+                    assert!(envelope["error"].as_str().unwrap().contains("rerank"));
+                    assert!(envelope["data"].is_null());
+                    assert!(!envelope.to_string().contains("private-model-path-canary"));
+                    assert!(!envelope.to_string().contains("rerankneedle"));
+                } else {
+                    assert_eq!(envelope["ok"], true, "{mode}: {envelope}");
+                    assert_eq!(envelope["data"]["results"][0]["segment_id"], segment_id);
+                    assert!(envelope["data"].get("rerank").is_none());
+                }
             }
         }
     }

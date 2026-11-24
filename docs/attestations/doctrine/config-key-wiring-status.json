@@ -64,11 +64,11 @@
     },
     {
       "key": "search.reranker_enabled",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "only advertised_embedder_tiers reads it (appends a 'cross-encoder' status-tier string); no production search dispatch reranks — the storage hybrid path has no rerank step, and rerank_fused_results/CrossEncoderReranker are a test-only orchestrator scaffold with an unimplemented ONNX stub",
+      "status": "consumed",
+      "consumer": "ft search, ft robot search, and wa.search -> rerank_search_results_with_cx",
+      "evidence": "authorized lexical and hybrid candidates are reranked by a bounded local fastembed cross-encoder; query text and original retrieval scores are preserved and model/inference failures are explicit",
       "tracking_bead": "ft-vyg9y",
-      "validation": "SearchConfig::validate_key_wiring rejects reranker_enabled=true as parsed but no-effect"
+      "validation": "SearchConfig::validate_key_wiring requires semantic-search build support and a nonempty models_dir; live searches validate the local ONNX/tokenizer bundle before inference"
     },
     {
       "key": "workflows.audit_steps",

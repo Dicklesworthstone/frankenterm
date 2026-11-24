@@ -327,6 +327,66 @@ Validation:
 - `max_limit >= 10`
 - `tantivy_writer_memory_bytes >= 10485760` (`10 MiB`)
 
+### Optional local cross-encoder reranking (`[search]`)
+
+The separate `[search]` section can enable a local cross-encoder after retrieval
+for `ft search`, `ft robot search`, and MCP `wa.search`. It works with lexical,
+semantic, and hybrid modes; `search.enabled` does not have to enable semantic
+retrieval for a lexical query to be reranked.
+
+```toml
+[search]
+reranker_enabled = true
+models_dir = "/absolute/path/to/models"
+```
+
+Use a build with the `semantic-search` feature and provision these files in
+`/absolute/path/to/models/reranker/`:
+
+- `model.onnx`: a self-contained cross-encoder with float32 `logits` shaped
+  `[batch, 1]`, at most 512 MiB.
+- `tokenizer.json`, `config.json`, `special_tokens_map.json`, and
+  `tokenizer_config.json`: the matching tokenizer files, each at most 8 MiB.
+
+This path never fetches model weights or tokenizer files. The first nonempty
+search initializes the supplied ONNX/tokenizer bundle and performs a real
+readiness inference. Missing, invalid, or incompatible files fail that search
+explicitly. Configuration validation checks build support and a nonempty
+`models_dir`; it does not claim the model has loaded. Set
+`reranker_enabled = false` to restore retrieval without inference.
+
+Inference reranks at most the first 100 already-retrieved candidates, with
+stable ties and the remaining candidates retained in their original order.
+It neither broadens pane/time filters nor retrieves additional rows. Each
+document contributes a UTF-8-safe prefix of at most 16 KiB, and the matching
+tokenizer limits the combined query/document sequence to 512 tokens. The
+original query is forwarded to the tokenizer; queries over 16 KiB fail
+explicitly. Returned text, segment identities, and retrieval/fusion scores
+remain intact, and normal output redaction still applies.
+
+Robot and MCP responses add an optional `rerank` object containing the
+backend, candidate count, byte-truncation count, bounds, and inference scores
+paired with each segment ID and original retrieval rank. Disabled searches
+omit this field. Human search prints a short inference summary to stderr;
+its existing JSON result array is preserved. Rank order reflects the
+cross-encoder; each result's existing `score` still describes retrieval.
+
+One inference stage is admitted per process, with batches of eight and two
+ONNX intra-operation threads. A concurrent inference request receives a
+retryable busy error instead of building an unbounded queue. One loaded
+model is cached; a different model path or changed file size/modification
+time reloads it. Loading and inference run off the async executor. Caller
+cancellation discards the response and is checked between batches; an
+already running native ONNX call finishes before releasing its admission
+slot.
+
+Maintainers can exercise positive native inference with the ignored
+`cross_encoder_local_model_native_smoke` test. Explicitly set
+`FT_TEST_RERANK_MODEL` to the provisioned `model.onnx` on the RCH worker
+and run that test with `--features semantic-search -- --ignored`; it performs
+real inference, validates finite distinct scores and sorted output, and never
+downloads a model.
+
 ## `[tuning.wire_protocol]`
 
 These keys live under `[tuning.wire_protocol]`.
