@@ -1436,7 +1436,7 @@ mod tests {
         );
 
         let mut deep = serde_json::json!(CUSTOM_SECRET);
-        for _ in 0..MCP_OUTPUT_REDACTION_MAX_DEPTH + 1 {
+        for _ in 0..=MCP_OUTPUT_REDACTION_MAX_DEPTH {
             deep = serde_json::Value::Array(vec![deep]);
         }
         for data in [serde_json::json!({(CUSTOM_SECRET): "value"}), deep] {
