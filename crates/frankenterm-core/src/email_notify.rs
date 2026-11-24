@@ -282,6 +282,9 @@ fn valid_smtp_host(value: &str) -> bool {
 pub struct EmailNotifier {
     config: EmailNotifyConfig,
     tls: Option<TlsConnector>,
+    /// Skips an unreachable relay during its cooldown, so each notification
+    /// does not wait out the full timeout inline.
+    breaker: Option<std::sync::Mutex<crate::circuit_breaker::CircuitBreaker>>,
 }
 
 #[derive(Debug)]
@@ -350,18 +353,23 @@ struct SmtpConnection<'a, S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> SmtpConnection<'_, S> {
+    /// Cancellation can surface through the I/O call before the outer
+    /// cancellation guard sees it; either way it is reported as cancellation.
+    fn io_failure(&self) -> SmtpFailure {
+        match self.cx.checkpoint() {
+            Err(error) => smtp_context_failure(self.cx, &error),
+            Ok(()) => SmtpFailure::new("email.transport_failed"),
+        }
+    }
+
     async fn write(&mut self, bytes: &[u8]) -> Result<(), SmtpFailure> {
         self.cx
             .checkpoint()
             .map_err(|error| smtp_context_failure(self.cx, &error))?;
-        self.stream
-            .write_all(bytes)
-            .await
-            .map_err(|_| SmtpFailure::new("email.transport_failed"))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|_| SmtpFailure::new("email.transport_failed"))
+        if self.stream.write_all(bytes).await.is_err() || self.stream.flush().await.is_err() {
+            return Err(self.io_failure());
+        }
+        Ok(())
     }
 
     async fn reply(&mut self) -> Result<SmtpReply, SmtpFailure> {
@@ -381,9 +389,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmtpConnection<'_, S> {
                 // Reading only through CRLF also makes the STARTTLS boundary
                 // exact: no prefetched plaintext can survive the TLS upgrade.
                 let mut byte = [0_u8; 1];
-                let read = crate::runtime_async::io::read(&mut self.stream, &mut byte)
-                    .await
-                    .map_err(|_| SmtpFailure::new("email.transport_failed"))?;
+                let Ok(read) = crate::runtime_async::io::read(&mut self.stream, &mut byte).await
+                else {
+                    return Err(self.io_failure());
+                };
                 if read == 0 {
                     return Err(SmtpFailure::new("email.transport_closed"));
                 }
@@ -464,7 +473,62 @@ impl EmailNotifier {
         } else {
             None
         };
-        Ok(Self { config, tls })
+        Ok(Self {
+            config,
+            tls,
+            breaker: None,
+        })
+    }
+
+    /// Put the relay behind a circuit breaker built from `config`. Only an
+    /// unreachable or unresponsive relay counts as a failure; any SMTP reply,
+    /// including a refusal, shows the relay is up.
+    #[must_use]
+    pub fn with_circuit_breaker(
+        mut self,
+        config: crate::circuit_breaker::CircuitBreakerConfig,
+    ) -> Self {
+        self.breaker = Some(std::sync::Mutex::new(
+            crate::circuit_breaker::CircuitBreaker::with_name("notifications.email", config),
+        ));
+        self
+    }
+
+    fn relay_admitted(&self) -> bool {
+        self.breaker.as_ref().is_none_or(|breaker| {
+            breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allow()
+        })
+    }
+
+    fn record_relay_health(&self, result: &Result<(), SmtpFailure>) {
+        let Some(breaker) = &self.breaker else {
+            return;
+        };
+        let mut breaker = breaker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Ok(()) => breaker.record_success(),
+            Err(failure)
+                if matches!(
+                    failure.code,
+                    "email.connect_failed"
+                        | "email.timeout"
+                        | "email.tls_failed"
+                        | "email.transport_failed"
+                        | "email.transport_closed"
+                ) =>
+            {
+                breaker.record_failure();
+            }
+            Err(failure) if failure.status != 0 => breaker.record_success(),
+            // Cancellation, local refusals and indeterminate delivery say
+            // nothing about the relay's health.
+            Err(_) => {}
+        }
     }
 
     async fn deliver(
@@ -478,6 +542,9 @@ impl EmailNotifier {
         if let Err(error) = cx.checkpoint() {
             return email_delivery(Err(smtp_context_failure(cx, &error)));
         }
+        if !self.relay_admitted() {
+            return email_delivery(Err(SmtpFailure::new("email.circuit_open")));
+        }
         let message = match self.render_message(payload) {
             Ok(message) => message,
             Err(error) => return email_delivery(Err(error)),
@@ -488,7 +555,8 @@ impl EmailNotifier {
             Duration::from_secs(self.config.timeout_secs),
             crate::runtime_async::until_cancelled(
                 cx,
-                self.transaction(cx, &message, &mut data_started),
+                // The SMTP/TLS session state is ~20 KiB; keep it off the stack.
+                Box::pin(self.transaction(cx, &message, &mut data_started)),
             ),
         )
         .await;
@@ -504,6 +572,7 @@ impl EmailNotifier {
                 failure
             }
         });
+        self.record_relay_health(&result);
         // A final 250 response is authoritative even if cancellation arrives
         // afterwards. There is no post-success checkpoint or automatic retry.
         email_delivery(result)
@@ -693,10 +762,18 @@ impl EmailNotifier {
         if body.len() > MAX_PAYLOAD_BYTES {
             return Err(SmtpFailure::new("email.payload_too_large"));
         }
+        // Some providers reject mail without a Message-ID, and not every
+        // submission relay adds one. The sender's validated domain scopes it.
+        let id_domain = self
+            .config
+            .from
+            .rsplit_once('@')
+            .map_or("frankenterm.invalid", |(_, domain)| domain);
         let mut message = format!(
-            "From: <{}>\r\nTo: <{}>\r\nDate: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+            "From: <{}>\r\nTo: <{}>\r\nDate: {}\r\nMessage-ID: <{:032x}@{}>\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
             self.config.from, self.config.to.join(">,\r\n <"),
-            chrono::Utc::now().to_rfc2822(), encoded_subject(&subject),
+            chrono::Utc::now().to_rfc2822(), rand::random::<u128>(), id_domain,
+            encoded_subject(&subject),
         ).into_bytes();
         let encoded = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
         for line in encoded.as_bytes().chunks(76) {
@@ -1420,6 +1497,9 @@ mod transport_tests {
                     Err(error) => panic!("SMTP fixture accept failed: {error}"),
                 }
             };
+            // BSD-derived systems (macOS) hand the accepted socket the
+            // listener's non-blocking mode; the fixture's reads must block.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(4)))
                 .unwrap();
@@ -1824,6 +1904,22 @@ mod transport_tests {
         let message = String::from_utf8(notifier.render_message(&payload).unwrap()).unwrap();
         assert!(!message.contains("\r\nBcc:"));
         assert!(!decoded_body(&message).contains(SENTINEL));
+        let message_id = |message: &str| {
+            let ids: Vec<String> = message
+                .split("\r\n")
+                .filter_map(|line| line.strip_prefix("Message-ID: "))
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(ids.len(), 1, "exactly one Message-ID header");
+            ids.into_iter().next().unwrap()
+        };
+        let first = message_id(&message);
+        assert!(
+            first.starts_with('<') && first.ends_with("@example.com>"),
+            "{first}"
+        );
+        let again = String::from_utf8(notifier.render_message(&payload).unwrap()).unwrap();
+        assert_ne!(first, message_id(&again), "each message gets its own ID");
         let subject = encoded_subject(&"Résumé".repeat(30));
         let decoded: Vec<u8> = subject
             .split("\r\n ")
@@ -1845,6 +1941,34 @@ mod transport_tests {
             notifier.render_message(&payload).unwrap_err().code,
             "email.payload_too_large"
         );
+    }
+
+    #[test]
+    fn ft_9b41l_only_an_unreachable_relay_opens_the_breaker() {
+        let (port, task) = fixture(|mut stream| reply(&mut stream, b"554 no service\r\n"));
+        let notifier = EmailNotifier::new(config(port, EmailTlsMode::None))
+            .unwrap()
+            .with_circuit_breaker(crate::circuit_breaker::CircuitBreakerConfig::new(
+                1,
+                1,
+                Duration::from_secs(300),
+            ));
+        run_smtp_test(async move {
+            let cx = crate::cx::for_testing();
+            let payload = payload();
+            // A refusal is an answer: the relay is up and the breaker stays
+            // closed even at a threshold of one.
+            let refused = notifier.deliver(&cx, &payload).await;
+            assert_eq!(refused.error.as_deref(), Some("email.greeting_rejected"));
+            task.join().unwrap();
+            // The fixture has closed its listener, so the relay is unreachable.
+            let unreachable = notifier.deliver(&cx, &payload).await;
+            assert_eq!(unreachable.error.as_deref(), Some("email.connect_failed"));
+            // Now open: skipped without connecting, until the cooldown ends.
+            let skipped = notifier.deliver(&cx, &payload).await;
+            assert_eq!(skipped.error.as_deref(), Some("email.circuit_open"));
+            assert!(!skipped.success);
+        });
     }
 
     #[cfg(feature = "distributed")]

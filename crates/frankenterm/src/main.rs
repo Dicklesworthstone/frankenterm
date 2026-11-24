@@ -501,8 +501,8 @@ SEE ALSO:
         #[arg(long, value_delimiter = ',')]
         notify_filter: Vec<String>,
 
-        /// Notification channels to use (comma-separated). `email` has no
-        /// sender yet and is rejected on its own (ft-9b41l).
+        /// Notification channels to use (comma-separated). `email` sends
+        /// through the configured SMTP relay.
         #[arg(long, value_delimiter = ',', value_enum)]
         notify_via: Vec<NotifyChannel>,
 
@@ -48799,10 +48799,19 @@ async fn run_watcher(
         }
 
         if config.notifications.email.enabled {
+            // Same breaker as webhooks: an unreachable relay is skipped for a
+            // cooldown instead of costing every notification its timeout.
             let email_notifier = frankenterm_core::email_notify::EmailNotifier::new(
                 config.notifications.email.clone(),
             )
-            .map_err(|error| anyhow::anyhow!("Email notification setup failed: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Email notification setup failed: {error}"))?
+            .with_circuit_breaker(
+                frankenterm_core::circuit_breaker::CircuitBreakerConfig::new(
+                    5,
+                    1,
+                    std::time::Duration::from_secs(300),
+                ),
+            );
             senders.push(Box::new(email_notifier));
             tracing::info!("Email notifications enabled");
         }
