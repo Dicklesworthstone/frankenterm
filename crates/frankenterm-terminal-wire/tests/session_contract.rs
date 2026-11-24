@@ -601,3 +601,239 @@ fn subscription_bound_and_explicit_incarnation_replacement_preserve_other_scopes
             .is_ok()
     );
 }
+
+#[test]
+fn retired_scopes_cannot_refund_ack_or_lease_fences() {
+    let (mut server, mut browser) = pair(capabilities());
+    bind(&mut server, &mut browser, 10);
+    let old = scope();
+    let old_ack = browser.encode_request(ack(10)).unwrap();
+    server.decode_request(&old_ack).unwrap();
+    server.record_lease(&old, WireU64(7), true).unwrap();
+    browser.record_lease(&old, WireU64(7), true).unwrap();
+    let old_input = browser
+        .encode_request(ClientMessage::Paste(PasteRequest {
+            effect: effect(old.clone(), 7),
+            text: Text::new("retired-input").unwrap(),
+        }))
+        .unwrap();
+    let old_grant = ServerMessage::LeaseState(LeaseState {
+        scope: old.clone(),
+        request_id: id("old-grant"),
+        disposition: LeaseDisposition::Granted,
+        fence: Some(WireU64(7)),
+        ttl_ms: 1000,
+    });
+    let delayed_grant = server.encode_response(old_grant.clone()).unwrap();
+    let old_offer = ServerMessage::Subscribed(Subscribed {
+        scope: old.clone(),
+        request_id: id("old-subscription"),
+        sequence: WireU64(10),
+        dimensions: dimensions(80),
+    });
+    let delayed_offer = server.encode_response(old_offer.clone()).unwrap();
+    server.record_lease(&old, WireU64(7), false).unwrap();
+    browser.record_lease(&old, WireU64(7), false).unwrap();
+    server.unbind_scope(&old).unwrap();
+    browser.unbind_scope(&old).unwrap();
+
+    for epoch in [old.epoch, WireU64(old.epoch.0 - 1), WireU64(0)] {
+        let mut retired = old.clone();
+        retired.epoch = epoch;
+        assert_eq!(
+            server.bind_scope(retired.clone(), dimensions(80), WireU64(0)),
+            Err(WireError::StaleScope)
+        );
+        assert_eq!(
+            browser.bind_scope(retired, dimensions(80), WireU64(0)),
+            Err(WireError::StaleScope)
+        );
+    }
+    assert_eq!(
+        server.record_lease(&old, WireU64(7), true),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        browser.record_lease(&old, WireU64(7), true),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        server.encode_response(old_grant),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        server.encode_response(old_offer),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        browser.decode_response(&delayed_offer),
+        Err(WireError::StaleScope)
+    );
+
+    // Resetting watermarks is valid only behind a fresh subscription epoch.
+    let mut next = old;
+    next.epoch = next.epoch.next().unwrap();
+    server
+        .bind_scope(next.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    browser
+        .bind_scope(next.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    server.record_lease(&next, WireU64(1), true).unwrap();
+    browser.record_lease(&next, WireU64(1), true).unwrap();
+    for stale in [&old_ack, &old_input] {
+        assert_eq!(server.decode_request(stale), Err(WireError::StaleScope));
+    }
+    assert_eq!(
+        browser.decode_response(&delayed_grant),
+        Err(WireError::StaleScope)
+    );
+    let current_ack = browser
+        .encode_request(ClientMessage::AppliedAck(AppliedAck {
+            scope: next.clone(),
+            sequence: WireU64(0),
+        }))
+        .unwrap();
+    server.decode_request(&current_ack).unwrap();
+    let current_input = browser
+        .encode_request(ClientMessage::Paste(PasteRequest {
+            effect: effect(next, 1),
+            text: Text::new("current-input").unwrap(),
+        }))
+        .unwrap();
+    server.decode_request(&current_input).unwrap();
+}
+
+#[test]
+fn retired_maximum_epoch_requires_a_new_incarnation() {
+    let (mut server, mut browser) = pair(capabilities());
+    let mut retired = scope();
+    retired.epoch = WireU64(u64::MAX);
+    server
+        .bind_scope(retired.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    browser
+        .bind_scope(retired.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    server.unbind_scope(&retired).unwrap();
+    browser.unbind_scope(&retired).unwrap();
+    for epoch in [WireU64(0), WireU64(u64::MAX)] {
+        let mut reused = retired.clone();
+        reused.epoch = epoch;
+        assert_eq!(
+            server.bind_scope(reused.clone(), dimensions(80), WireU64(0)),
+            Err(WireError::StaleScope)
+        );
+        assert_eq!(
+            browser.bind_scope(reused, dimensions(80), WireU64(0)),
+            Err(WireError::StaleScope)
+        );
+    }
+
+    // Incarnations are opaque identities, not ordered counters. An explicit
+    // replacement may begin its own epoch sequence without reviving the old one.
+    let mut replacement = retired.clone();
+    replacement.identity.incarnation = id("replacement-incarnation");
+    replacement.epoch = WireU64(1);
+    server
+        .bind_scope(replacement.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    browser
+        .bind_scope(replacement.clone(), dimensions(80), WireU64(0))
+        .unwrap();
+    let current_ack = browser
+        .encode_request(ClientMessage::AppliedAck(AppliedAck {
+            scope: replacement.clone(),
+            sequence: WireU64(0),
+        }))
+        .unwrap();
+    server.decode_request(&current_ack).unwrap();
+    server.unbind_scope(&replacement).unwrap();
+    browser.unbind_scope(&replacement).unwrap();
+    assert_eq!(
+        server.bind_scope(retired.clone(), dimensions(80), WireU64(0)),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        browser.bind_scope(retired, dimensions(80), WireU64(0)),
+        Err(WireError::StaleScope)
+    );
+}
+
+#[test]
+fn exhausted_retirement_history_stops_new_bindings_without_retaining_live_authority() {
+    let (mut server, mut browser) = pair(capabilities());
+    bind(&mut server, &mut browser, 10);
+    server.record_lease(&scope(), WireU64(7), true).unwrap();
+    browser.record_lease(&scope(), WireU64(7), true).unwrap();
+    let mut retired = scope();
+    retired.identity.pane = id("retirement-churn");
+
+    // The first 128 retirements fit the history; the next still removes the
+    // binding, but must stop future admissions instead of evicting a fence.
+    for epoch in 1..=129 {
+        retired.epoch = WireU64(epoch);
+        server
+            .bind_scope(retired.clone(), dimensions(80), WireU64(0))
+            .unwrap();
+        browser
+            .bind_scope(retired.clone(), dimensions(80), WireU64(0))
+            .unwrap();
+        server.record_lease(&retired, WireU64(1), true).unwrap();
+        browser.record_lease(&retired, WireU64(1), true).unwrap();
+        server.unbind_scope(&retired).unwrap();
+        browser.unbind_scope(&retired).unwrap();
+        // An invalid repeated retirement must not consume additional history.
+        assert_eq!(server.unbind_scope(&retired), Err(WireError::StaleScope));
+        assert_eq!(browser.unbind_scope(&retired), Err(WireError::StaleScope));
+        let stale_input = ClientMessage::Paste(PasteRequest {
+            effect: effect(retired.clone(), 1),
+            text: Text::new("retired-input").unwrap(),
+        });
+        assert_eq!(
+            server.decode_request(&request(stale_input.clone())),
+            Err(WireError::StaleScope)
+        );
+        assert_eq!(
+            browser.encode_request(stale_input),
+            Err(WireError::StaleScope)
+        );
+    }
+    let mut fresh = retired.clone();
+    fresh.identity.pane = id("fresh-pane");
+    for target in [retired.clone(), fresh] {
+        assert_eq!(
+            server.bind_scope(target.clone(), dimensions(80), WireU64(0)),
+            Err(WireError::LimitExceeded)
+        );
+        assert_eq!(
+            browser.bind_scope(target, dimensions(80), WireU64(0)),
+            Err(WireError::LimitExceeded)
+        );
+    }
+    retired.epoch = WireU64(1);
+    assert_eq!(
+        server.bind_scope(retired.clone(), dimensions(80), WireU64(0)),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(
+        browser.bind_scope(retired, dimensions(80), WireU64(0)),
+        Err(WireError::StaleScope)
+    );
+
+    // Saturation is local to new bindings. Unrelated existing streams remain
+    // usable and their lease can still be retired without a history slot.
+    let current = browser
+        .encode_request(ClientMessage::Paste(PasteRequest {
+            effect: effect(scope(), 7),
+            text: Text::new("unaffected-input").unwrap(),
+        }))
+        .unwrap();
+    server.decode_request(&current).unwrap();
+    server.unbind_scope(&scope()).unwrap();
+    browser.unbind_scope(&scope()).unwrap();
+    assert_eq!(
+        server.decode_request(&current),
+        Err(WireError::StaleScope)
+    );
+}

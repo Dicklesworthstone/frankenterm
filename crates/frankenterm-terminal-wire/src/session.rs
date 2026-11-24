@@ -5,6 +5,10 @@ use crate::{
     validate_capabilities,
 };
 
+// Retain only identities, never screen data. As in the browser model, a session
+// that can no longer remember retired scopes must be replaced before rebinding.
+const MAX_RETIRED_SCOPES: usize = 128;
+
 #[derive(Debug, Clone)]
 struct Binding {
     scope: Scope,
@@ -21,9 +25,17 @@ struct SessionState {
     session: Id,
     capabilities: Capabilities,
     bindings: Vec<Binding>,
+    retired: Vec<Scope>,
+    retirement_exhausted: bool,
 }
 
 impl SessionState {
+    fn is_retired(&self, scope: &Scope) -> bool {
+        self.retired
+            .iter()
+            .any(|old| old.identity == scope.identity && old.epoch >= scope.epoch)
+    }
+
     fn require(&self, capability: Option<Capability>) -> Result<(), WireError> {
         if capability.is_some_and(|value| !self.capabilities.as_slice().contains(&value)) {
             return Err(WireError::UnsupportedCapability);
@@ -67,10 +79,11 @@ impl SessionState {
             .bindings
             .iter()
             .any(|value| value.scope.identity.pane == scope.identity.pane)
+            || self.is_retired(&scope)
         {
             return Err(WireError::StaleScope);
         }
-        if self.bindings.len() >= MAX_SUBSCRIPTIONS {
+        if self.retirement_exhausted || self.bindings.len() >= MAX_SUBSCRIPTIONS {
             return Err(WireError::LimitExceeded);
         }
         self.bindings.push(Binding {
@@ -87,6 +100,15 @@ impl SessionState {
     fn unbind(&mut self, scope: &Scope) -> Result<(), WireError> {
         self.binding(scope)?;
         self.bindings.retain(|value| value.scope != *scope);
+        // Dropping the binding alone would refund its ACK and lease fences:
+        // rebinding the same scope could admit delayed grants or old requests.
+        // Retirement itself must still succeed when history is full, so stop
+        // future bindings rather than retain authority or evict a tombstone.
+        if self.retired.len() < MAX_RETIRED_SCOPES {
+            self.retired.push(scope.clone());
+        } else {
+            self.retirement_exhausted = true;
+        }
         Ok(())
     }
 
@@ -223,7 +245,8 @@ impl SessionState {
                 }
                 if self.bindings.iter().any(|value| {
                     value.scope.identity.pane == scope.identity.pane && value.scope != *scope
-                }) {
+                }) || self.is_retired(scope)
+                {
                     return Err(WireError::StaleScope);
                 }
             } else {
@@ -357,6 +380,8 @@ impl ServerSession {
             session: self.session.clone(),
             capabilities,
             bindings: Vec::new(),
+            retired: Vec::new(),
+            retirement_exhausted: false,
         });
         Ok(bytes)
     }
@@ -400,6 +425,8 @@ impl ServerSession {
             .bind(scope, dimensions, delivered)
     }
 
+    /// Retire this exact scope for the session. Rebinding the same incarnation
+    /// requires a newer epoch; exhausted retirement history requires a new session.
     pub fn unbind_scope(&mut self, scope: &Scope) -> Result<(), WireError> {
         self.state
             .as_mut()
@@ -513,6 +540,8 @@ impl BrowserSession {
             session: frame.session.ok_or(WireError::InvalidState)?,
             capabilities: welcome.capabilities,
             bindings: Vec::new(),
+            retired: Vec::new(),
+            retirement_exhausted: false,
         });
         Ok(())
     }
@@ -550,6 +579,8 @@ impl BrowserSession {
             .bind(scope, dimensions, delivered)
     }
 
+    /// Preserve retirement fences even when this codec is used without a
+    /// browser model. Unbinding does not make the old epoch reusable.
     pub fn unbind_scope(&mut self, scope: &Scope) -> Result<(), WireError> {
         self.state
             .as_mut()
