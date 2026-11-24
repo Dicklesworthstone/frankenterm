@@ -3487,6 +3487,13 @@ impl RusqliteEventReader {
         {
             return Err(sqlite_snapshot_unavailable("rusqlite_invalid_read_limit"));
         }
+        // SQLITE_OPEN_NOFOLLOW refuses a symlink anywhere in the filename, not
+        // only the leaf, so an ordinary ancestor alias (macOS's /tmp and /var,
+        // a symlinked home) failed every bounded read. Resolve the parent once;
+        // the leaf is still never followed, and a symlink raced into the
+        // resolved path still fails SQLite's open.
+        let db_path = recorder_path_with_resolved_parent(&db_path)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
         // SQLite's VFS open precedes its progress handler. Reject ordinary
         // FIFO/device/symlink inputs before that potentially blocking operation.
         let (directory, name) = recorder_parent(&db_path)
@@ -4286,6 +4293,29 @@ fn recorder_parent(path: &Path) -> std::result::Result<(CapDir, PathBuf), Record
         CapDir::open_ambient_dir(parent, cap_std::ambient_authority())?,
         PathBuf::from(name),
     ))
+}
+
+/// The recorder path with its parent directory resolved and its leaf left as
+/// named, so SQLITE_OPEN_NOFOLLOW applies to the leaf alone.
+fn recorder_path_with_resolved_parent(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recorder path needs a file name",
+            )
+        })?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Ok(std::fs::canonicalize(parent)?.join(name))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(path.to_path_buf())
+    }
 }
 
 fn open_directory_sync(directory: &CapDir) -> std::io::Result<File> {
@@ -8191,6 +8221,17 @@ recorder_backend = "frankensqlite"
                     .to_string()
                     .contains("rusqlite_nonregular_source")
             );
+            // An alias in the parent path (macOS's /tmp and /var, a symlinked
+            // home) still names a regular leaf, so it is accepted.
+            let parent_alias = dir.path().join("aliased-parent");
+            std::os::unix::fs::symlink(dir.path(), &parent_alias).unwrap();
+            let through_alias = RusqliteEventReader::open_bounded_with_cx(
+                &cx,
+                parent_alias.join("valid.sqlite3"),
+                4096,
+            )
+            .unwrap();
+            assert_eq!(through_alias.head_offset().unwrap().ordinal, 1);
         }
         let mut cursor = source.open_cursor_from_start().unwrap();
         cx.cancel_with(crate::outcome::CancelKind::User, Some("read cancelled"));
