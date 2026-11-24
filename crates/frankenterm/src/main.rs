@@ -47891,6 +47891,7 @@ async fn run_distributed_agent(
         patterns_root,
         channel_buffer: 1024,
         max_concurrent_captures: config.ingest.max_concurrent_captures,
+        ingest_backpressure_threshold: config.ingest.backpressure_threshold,
         max_segment_bytes: config.ingest.max_segment_bytes,
         retention_days: config.storage.retention_days,
         retention_policy: config
@@ -49009,6 +49010,7 @@ async fn run_watcher(
         patterns_root: patterns_root.clone(),
         channel_buffer: 1024,
         max_concurrent_captures: config.ingest.max_concurrent_captures,
+        ingest_backpressure_threshold: config.ingest.backpressure_threshold,
         max_segment_bytes: config.ingest.max_segment_bytes,
         retention_days: config.storage.retention_days,
         retention_policy: config

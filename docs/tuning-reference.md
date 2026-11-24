@@ -145,6 +145,26 @@ Validation:
 - `idle_window_secs >= 1`
 - `memory_trigger_cooldown_secs >= 1`
 
+## Ingest admission under storage pressure
+
+`[ingest].backpressure_threshold` is a positive count of queued storage writer
+commands. Its default is `1000`. New polling, vendored-stream and native-event
+captures pause when the writer queue depth reaches the smaller of this value
+and the actual writer queue capacity. Capture resumes below that effective
+threshold. Changing the threshold takes effect through watcher hot reload;
+changing `[storage].writer_queue_size` still requires a restart.
+
+The pause leaves already-admitted persistence work and pane retirement running
+so the queues can drain. Graceful shutdown drains admitted work without waiting
+for this admission threshold. Capture channels retain their existing bounds and
+explicit gap handling. The threshold does not change the tailer's separate
+consecutive-overflow counter or disable capture-gap recording.
+
+```toml
+[ingest]
+backpressure_threshold = 1000
+```
+
 ## `[tuning.ingest]`
 
 These keys live under `[tuning.ingest]`.

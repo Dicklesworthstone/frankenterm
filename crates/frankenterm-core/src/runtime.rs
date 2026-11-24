@@ -2338,6 +2338,9 @@ pub struct RuntimeConfig {
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
     pub max_concurrent_captures: u32,
+    /// Writer queue depth at which new capture admission pauses.
+    /// Clamped to the actual writer capacity; already-admitted work still drains.
+    pub ingest_backpressure_threshold: u32,
     /// Operator ceiling for persisted segments, combined with the tuning cap.
     pub max_segment_bytes: u32,
     /// Data retention period in days
@@ -2381,6 +2384,8 @@ impl Default for RuntimeConfig {
             patterns_root: None,
             channel_buffer: 1024,
             max_concurrent_captures: 10,
+            ingest_backpressure_threshold: crate::config::IngestConfig::default()
+                .backpressure_threshold,
             max_segment_bytes: crate::config::IngestConfig::default().max_segment_bytes,
             retention_days: 30,
             retention_policy: StorageConfig::default()
@@ -2403,6 +2408,7 @@ fn initial_hot_reloadable_config(config: &RuntimeConfig) -> HotReloadableConfig 
         poll_interval_ms: duration_ms_u64(config.capture_interval),
         min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
         max_concurrent_captures: config.max_concurrent_captures,
+        ingest_backpressure_threshold: config.ingest_backpressure_threshold,
         max_segment_bytes: config.max_segment_bytes,
         pane_priorities: config.pane_priorities.clone(),
         capture_budgets: config.capture_budgets.clone(),
@@ -2429,6 +2435,59 @@ fn effective_persist_segment_bytes(operator_limit: u32, tuning_limit: usize) -> 
         .unwrap_or(usize::MAX)
         .max(1)
         .min(tuning_limit.max(1))
+}
+
+/// Queue-depth admission is separate from the consecutive-overflow gap
+/// threshold. Even unchecked callers cannot disable it with zero or a limit
+/// above the bounded writer capacity. A zero-capacity writer admits nothing.
+fn effective_ingest_backpressure_threshold(configured: u32, capacity: usize) -> usize {
+    usize::try_from(configured)
+        .unwrap_or(usize::MAX)
+        .max(1)
+        .min(capacity)
+}
+
+/// Shared live admission input for polling, streamed and native capture.
+/// Never hold a capture producer guard, cursor lock, or writer reservation
+/// while waiting here: already-admitted persistence and retirement must drain.
+#[derive(Clone)]
+struct IngestBackpressureGate {
+    storage: StorageHandle,
+    config_tx: Arc<watch::Sender<HotReloadableConfig>>,
+    shutdown_flag: Arc<AtomicBool>,
+}
+
+impl IngestBackpressureGate {
+    fn is_paused(&self) -> bool {
+        // Graceful drains bypass admission pressure; owners stop new work.
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            return false;
+        }
+        let threshold = effective_ingest_backpressure_threshold(
+            self.config_tx.borrow().ingest_backpressure_threshold,
+            self.storage.write_queue_capacity(),
+        );
+        self.storage.write_queue_depth() >= threshold
+    }
+
+    /// Stream receivers can pause without acquiring producer authority.
+    /// Bounded sleeps observe cancellation, shutdown, queue drain and reload;
+    /// no persistence consumer waits on this gate.
+    #[cfg(any(test, all(feature = "vendored", unix)))]
+    async fn wait_with_cx(&self, cx: &RuntimeLoopCx) -> bool {
+        loop {
+            if cx.checkpoint().is_err() || self.shutdown_flag.load(Ordering::SeqCst) {
+                return false;
+            }
+            if !self.is_paused() {
+                return true;
+            }
+            if let Err(failure) = runtime_sleep(cx, Duration::from_millis(25)).await {
+                record_runtime_wait_failure("ingest_storage_pressure_wait", failure);
+                return false;
+            }
+        }
+    }
 }
 
 fn capture_concurrency_usize(value: u32) -> usize {
@@ -7886,6 +7945,14 @@ impl ObservationRuntime {
         })
     }
 
+    fn ingest_backpressure_gate(&self) -> IngestBackpressureGate {
+        IngestBackpressureGate {
+            storage: self.storage.clone(),
+            config_tx: Arc::clone(&self.config_tx),
+            shutdown_flag: Arc::clone(&self.shutdown_flag),
+        }
+    }
+
     /// Spawn the content capture task using adaptive polling plus vendored
     /// pane-delta streaming when direct mux sockets are configured.
     ///
@@ -7917,6 +7984,7 @@ impl ObservationRuntime {
         let capture_metadata = Arc::clone(&self.capture_metadata);
         let backpressure = Arc::clone(self.metrics.backpressure_metrics());
         let fleet_poll_pressure_level = Arc::clone(&self.fleet_poll_pressure_level);
+        let ingest_gate = self.ingest_backpressure_gate();
         let native_capture_enabled = self.config.native_event_socket.is_some();
         let transition_cache_capacity = self.config.channel_buffer.max(1);
         #[cfg(all(feature = "vendored", unix))]
@@ -8010,6 +8078,15 @@ impl ObservationRuntime {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Capture task: shutdown signal received");
                     break;
+                }
+
+                let ingest_backpressured = ingest_gate.is_paused();
+                if supervisor.set_storage_backpressure(ingest_backpressured)
+                    && !ingest_backpressured
+                {
+                    // Resume deferred identities/subscriptions promptly instead
+                    // of waiting for the ordinary discovery reconciliation tick.
+                    next_sync_tick = Instant::now();
                 }
 
                 #[cfg(all(feature = "vendored", unix))]
@@ -8485,6 +8562,12 @@ impl ObservationRuntime {
                             || pending_resync_bindings.contains_key(&pane_id)
                             || draining_bindings.contains_key(&pane_id)
                         {
+                            continue;
+                        }
+                        // A new identity may require an expensive full-pane
+                        // resync. Defer admission before cursor/authority changes;
+                        // existing receipts and predecessor drains above still run.
+                        if ingest_gate.is_paused() {
                             continue;
                         }
                         let desired_is_current = capture_publication_matches(
@@ -9013,6 +9096,12 @@ impl ObservationRuntime {
                                     }
                                 }
 
+                                // Revocation above must progress under pressure.
+                                // Only admission of a new subscription is paused.
+                                if ingest_gate.is_paused() {
+                                    continue;
+                                }
+
                                 // A failed source stays polling-only until its
                                 // retry backoff elapses. Reach this check only
                                 // after its retained stream lease has drained above.
@@ -9120,6 +9209,7 @@ impl ObservationRuntime {
                                 let identity_for_task = identity.clone();
                                 let identity_for_exit = identity.clone();
                                 let lease_for_task = streaming_lease.clone();
+                                let stream_ingest_gate = ingest_gate.clone();
                                 let stream_task_cx = loop_cx.clone();
                                 let handle = spawn_runtime_task(
                                     &stream_task_cx,
@@ -9131,6 +9221,7 @@ impl ObservationRuntime {
                                             capture_tx,
                                             lease_for_task,
                                             stream_cursors,
+                                            stream_ingest_gate,
                                         ))
                                         .await;
                                         let final_reason = if shutdown_flag.load(Ordering::SeqCst)
@@ -9303,6 +9394,12 @@ impl ObservationRuntime {
 
                 if now >= next_spawn_tick {
                     next_spawn_tick = now + tick_duration;
+                    // Reconciliation can await multiple pane reads; sample
+                    // pressure again at the actual polling admission boundary.
+                    let paused = ingest_gate.is_paused();
+                    if supervisor.set_storage_backpressure(paused) && !paused {
+                        next_sync_tick = Instant::now();
+                    }
                     supervisor.spawn_ready(&mut poll_tasks);
                     continue;
                 }
@@ -9427,6 +9524,7 @@ impl ObservationRuntime {
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
         let capture_authority = self.capture_authority.clone();
+        let ingest_gate = self.ingest_backpressure_gate();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -9567,6 +9665,18 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = Duration::from_nanos(next_flush.duration_since(now));
+                // Flush admitted coalescer output above before pausing new
+                // input. The bounded listener queue propagates pressure; its
+                // existing drop/gap reporting remains authoritative. Graceful
+                // shutdown bypasses this pause to drain already-queued events.
+                if !shutdown_flag.load(Ordering::SeqCst) && ingest_gate.is_paused() {
+                    let pressure_wait = flush_wait.min(Duration::from_millis(25));
+                    if let Err(failure) = runtime_sleep(&loop_cx, pressure_wait).await {
+                        record_runtime_wait_failure("native_ingest_storage_pressure", failure);
+                        break;
+                    }
+                    continue;
+                }
                 match runtime_timeout(&loop_cx, flush_wait, recv_event(&loop_cx, &mut event_rx))
                     .await
                 {
@@ -11066,8 +11176,16 @@ async fn run_vendored_streaming_capture(
     capture_tx: mpsc::Sender<CaptureEvent>,
     capture_lease: CaptureLease,
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    ingest_gate: IngestBackpressureGate,
 ) -> String {
     let runtime_cx = runtime_loop_cx();
+    if !ingest_gate.wait_with_cx(&runtime_cx).await {
+        return if ingest_gate.shutdown_flag.load(Ordering::SeqCst) {
+            "shutdown".to_string()
+        } else {
+            "cancelled".to_string()
+        };
+    }
 
     let mut bridge = StreamingBridge::new();
     let mut client_config =
@@ -11100,6 +11218,17 @@ async fn run_vendored_streaming_capture(
     );
 
     let exit_reason = loop {
+        // Await before taking a delta or producer guard. A delta admitted
+        // earlier still completes forwarding, so retirement/persistence never
+        // depend on a paused consumer. The subscription's bounded queue applies
+        // upstream pressure; pauses do not imply lossless terminal capture.
+        if !ingest_gate.wait_with_cx(&runtime_cx).await {
+            break if ingest_gate.shutdown_flag.load(Ordering::SeqCst) {
+                "shutdown".to_string()
+            } else {
+                "cancelled".to_string()
+            };
+        }
         match subscription.next_with_cx(&runtime_cx).await {
             Some(delta) => {
                 if let Some(reason) = forward_vendored_streaming_delta(
@@ -26570,6 +26699,201 @@ mod tests {
             capture_concurrency_usize(config.max_concurrent_captures),
             usize::try_from(u32::MAX).expect("supported target usize width")
         );
+    }
+
+    #[test]
+    fn ingest_backpressure_limits_are_capacity_bounded() {
+        assert_eq!(effective_ingest_backpressure_threshold(1000, 10_000), 1000);
+        assert_eq!(effective_ingest_backpressure_threshold(u32::MAX, 3), 3);
+        assert_eq!(effective_ingest_backpressure_threshold(0, 3), 1);
+        assert_eq!(effective_ingest_backpressure_threshold(1, 0), 0);
+    }
+
+    #[test]
+    fn ingest_backpressure_uses_live_writer_depth_and_hot_reload_for_poll_admission() {
+        struct ProbeSource(AtomicUsize);
+
+        impl PaneTextSource for ProbeSource {
+            type Fut<'a> = std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>,
+            >;
+
+            fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok("writer pressure capture".to_string()) })
+            }
+        }
+
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::with_config_with_cx(
+                &cx,
+                &db_path,
+                crate::storage::StorageConfig {
+                    write_queue_size: 3,
+                    ..crate::storage::StorageConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig {
+                    ingest_backpressure_threshold: 1,
+                    ..RuntimeConfig::default()
+                },
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            );
+            let gate = runtime.ingest_backpressure_gate();
+            let cloned_gate = gate.clone();
+            assert!(!gate.is_paused());
+
+            // Wake a parked writer after installing the barrier. It may finish
+            // this wake-up write before it observes the barrier; later writes
+            // are enqueued only after the writer acknowledges being paused.
+            let (entered, release) = storage.pause_writer_before_receive_for_test();
+            let mut wake = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(1)));
+            let wake_completed = match futures::poll!(wake.as_mut()) {
+                std::task::Poll::Ready(result) => {
+                    result.unwrap();
+                    true
+                }
+                std::task::Poll::Pending => false,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match entered.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        assert!(Instant::now() < deadline, "writer barrier was not reached");
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("writer barrier failed: {error}"),
+                }
+            }
+            let mut first = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(2)));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            let depth = storage.write_queue_depth();
+            assert!((1..3).contains(&depth));
+            assert_eq!(storage.write_queue_capacity(), 3);
+            assert!(gate.is_paused());
+
+            let mut hot = runtime.config_tx.borrow().clone();
+            hot.ingest_backpressure_threshold = u32::try_from(depth + 1).unwrap();
+            runtime.config_tx.send(hot.clone()).unwrap();
+            assert!(
+                !cloned_gate.is_paused(),
+                "reload must reach existing gate clones"
+            );
+
+            let source = Arc::new(ProbeSource(AtomicUsize::new(0)));
+            let (tx, mut rx) = mpsc::channel(4);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(7, PaneCursor::new(7))])));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let mut supervisor = TailerSupervisor::new(
+                TailerConfig {
+                    min_interval: Duration::ZERO,
+                    ..TailerConfig::default()
+                },
+                tx,
+                Arc::clone(&cursors),
+                registry,
+                Arc::clone(&runtime.shutdown_flag),
+                Arc::clone(&source),
+            );
+            supervisor.sync_tailers(&HashMap::from([(7, make_pane(7, "pressure"))]));
+            let mut tasks = TailerPollTaskSet::new();
+            supervisor.set_storage_backpressure(gate.is_paused());
+            supervisor.spawn_ready(&mut tasks);
+            let (pane_id, outcome) = runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
+                .await
+                .unwrap()
+                .expect("below-threshold capture must execute");
+            supervisor.handle_poll_result(pane_id, outcome);
+            let captured = rx.try_recv().expect("capture delivered");
+            assert_eq!(captured.segment.seq, 0);
+            drop(captured);
+            assert_eq!(source.0.load(Ordering::SeqCst), 1);
+
+            // Lowering to the exact observed queue depth blocks the next source
+            // read without consuming capture sequence or fabricating a gap.
+            hot.ingest_backpressure_threshold = u32::try_from(depth).unwrap();
+            runtime.config_tx.send(hot.clone()).unwrap();
+            assert!(gate.is_paused());
+            supervisor.set_storage_backpressure(gate.is_paused());
+            supervisor.spawn_ready(&mut tasks);
+            assert!(tasks.is_empty());
+            assert_eq!(source.0.load(Ordering::SeqCst), 1);
+            assert_eq!(cursors.read().await[&7].next_seq, 1);
+            assert!(rx.try_recv().is_err());
+
+            // The streaming wait observes a live increase, without requiring
+            // the writer to drain or recreating its gate.
+            let mut waiting = Box::pin(gate.wait_with_cx(&cx));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            hot.ingest_backpressure_threshold = u32::try_from(depth + 1).unwrap();
+            runtime.config_tx.send(hot.clone()).unwrap();
+            assert!(
+                runtime_timeout(&cx, Duration::from_secs(1), waiting)
+                    .await
+                    .unwrap()
+            );
+
+            hot.ingest_backpressure_threshold = 1;
+            runtime.config_tx.send(hot.clone()).unwrap();
+            let cancelled = crate::cx::for_testing();
+            let mut waiting = Box::pin(gate.wait_with_cx(&cancelled));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("pressure wait"));
+            assert!(
+                !runtime_timeout(&cx, Duration::from_secs(1), waiting)
+                    .await
+                    .unwrap()
+            );
+
+            // Native graceful drains bypass the pressure state. Stream waits
+            // stop instead of admitting another delta after shutdown.
+            runtime.shutdown_flag.store(true, Ordering::SeqCst);
+            assert!(!gate.is_paused());
+            assert!(!gate.wait_with_cx(&cx).await);
+            runtime.shutdown_flag.store(false, Ordering::SeqCst);
+
+            let mut second = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(3)));
+            let mut third = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(4)));
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert!(futures::poll!(third.as_mut()).is_pending());
+            assert_eq!(storage.write_queue_depth(), 3);
+            hot.ingest_backpressure_threshold = u32::MAX;
+            runtime.config_tx.send(hot).unwrap();
+            assert!(
+                gate.is_paused(),
+                "an oversized limit cannot bypass a full writer"
+            );
+
+            // Dropping release on a failing assertion also releases the test
+            // barrier, so a failing regression cannot strand the writer thread.
+            release.send(()).unwrap();
+            if !wake_completed {
+                wake.await.unwrap();
+            }
+            first.await.unwrap();
+            second.await.unwrap();
+            third.await.unwrap();
+            assert_eq!(storage.write_queue_depth(), 0);
+            assert!(!gate.is_paused());
+            supervisor.set_storage_backpressure(gate.is_paused());
+            supervisor.spawn_ready(&mut tasks);
+            let (pane_id, outcome) = runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
+                .await
+                .unwrap()
+                .expect("capture resumes after writer drain");
+            supervisor.handle_poll_result(pane_id, outcome);
+            assert_eq!(source.0.load(Ordering::SeqCst), 2);
+            assert_eq!(cursors.read().await[&7].next_seq, 1);
+            supervisor.shutdown().await;
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]

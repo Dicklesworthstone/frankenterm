@@ -1009,11 +1009,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "ingest.backpressure_threshold",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "overflow backpressure uses the fixed consecutive-event threshold in tailer.rs, not this queue-depth value",
-        tracking_bead: "ft-ta5as",
-        validation: "Config::validate rejects non-default values fail-closed",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::runtime::IngestBackpressureGate",
+        evidence: "polling, vendored streaming and native capture admission sample actual writer queue depth; configured thresholds are clamped to writer capacity while persistence and retirement continue draining",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate requires a positive threshold; HotReloadableConfig carries changes to the running capture gate without restarting the watcher",
     },
     ConfigKeyWiringRecord {
         key: "ingest.gap_detection",
@@ -1309,7 +1309,11 @@ pub struct IngestConfig {
     /// Maximum concurrent pane captures
     pub max_concurrent_captures: u32,
 
-    /// Backpressure threshold: pause ingest if storage queue exceeds this
+    /// Pause new captures when the storage writer queue reaches this depth.
+    ///
+    /// Must be positive. The runtime clamps the threshold to the actual bounded
+    /// writer capacity and resumes capture below that effective threshold.
+    /// Already-admitted persistence work continues draining during the pause.
     pub backpressure_threshold: u32,
 
     /// Enable gap detection (explicit discontinuity tracking)
@@ -5191,6 +5195,8 @@ pub struct HotReloadableConfig {
     pub min_poll_interval_ms: u64,
     /// Maximum concurrent captures
     pub max_concurrent_captures: u32,
+    /// Writer queue depth that pauses new capture admission.
+    pub ingest_backpressure_threshold: u32,
     /// Operator ceiling for each persisted capture segment.
     pub max_segment_bytes: u32,
     /// Pane priority overrides
@@ -5249,6 +5255,7 @@ impl HotReloadableConfig {
             poll_interval_ms: config.ingest.poll_interval_ms,
             min_poll_interval_ms: config.ingest.min_poll_interval_ms,
             max_concurrent_captures: config.ingest.max_concurrent_captures,
+            ingest_backpressure_threshold: config.ingest.backpressure_threshold,
             max_segment_bytes: config.ingest.max_segment_bytes,
             pane_priorities: config.ingest.priorities.clone(),
             capture_budgets: config.ingest.budgets.clone(),
@@ -5519,6 +5526,14 @@ impl Config {
                 name: "ingest.max_concurrent_captures".to_string(),
                 old_value: self.ingest.max_concurrent_captures.to_string(),
                 new_value: new_config.ingest.max_concurrent_captures.to_string(),
+            });
+        }
+
+        if self.ingest.backpressure_threshold != new_config.ingest.backpressure_threshold {
+            changes.push(HotReloadChange {
+                name: "ingest.backpressure_threshold".to_string(),
+                old_value: self.ingest.backpressure_threshold.to_string(),
+                new_value: new_config.ingest.backpressure_threshold.to_string(),
             });
         }
 
@@ -6409,24 +6424,18 @@ impl Config {
             .into());
         }
 
-        // ft-ta5as [reality-check][ingest]: these [ingest] fields are parsed,
-        // defaulted, and documented but have ZERO production consumers (verified):
-        // backpressure_threshold (overflow backpressure uses the hardcoded
-        // OVERFLOW_BACKPRESSURE_THRESHOLD consecutive-event const in tailer.rs,
-        // not this queue-depth value), gap_detection (capture-gap recording in
-        // ingest.rs is UNCONDITIONAL — disabling it would be a fail-open replay-
-        // fidelity regression, so it is intentionally not honorable),
-        // gap_detection_threshold_percent (no overlap/percentage heuristic reads
-        // it). Fail closed: reject a customized value so the operator gets a
-        // clear error instead of silently-ignored ingest tuning. Segment size is
-        // consumed by the persistence task and validated independently below.
+        // ft-ta5as: gap recording remains unconditional; disabling it would
+        // silently lose replay-fidelity information. No percentage heuristic
+        // consumes gap_detection_threshold_percent either. Keep both controls
+        // fail-closed while validating the live pressure and segment limits
+        // independently.
         let ingest_default = IngestConfig::default();
         let mut unhonored_ingest: Vec<&'static str> = Vec::new();
-        if self.ingest.backpressure_threshold != ingest_default.backpressure_threshold {
-            unhonored_ingest.push(
-                "ingest.backpressure_threshold (ignored — overflow backpressure uses a fixed \
-                 consecutive-event threshold in the tailer, not this queue-depth value)",
-            );
+        if self.ingest.backpressure_threshold == 0 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "ingest.backpressure_threshold must be > 0".to_string(),
+            )
+            .into());
         }
         if self.ingest.gap_detection != ingest_default.gap_detection {
             unhonored_ingest.push(
@@ -8566,13 +8575,52 @@ max_sender_id_len = 0
     // ── ft-ta5as: fail-closed rejection of unhonored [ingest] customizations ──
 
     #[test]
-    fn validate_rejects_customized_ingest_backpressure_threshold() {
-        let mut config = Config::default();
-        config.ingest.backpressure_threshold = config.ingest.backpressure_threshold.wrapping_add(1);
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("ft-ta5as") && err.contains("backpressure_threshold"),
-            "{err}"
+    fn validate_accepts_positive_ingest_backpressure_thresholds() {
+        for threshold in [1, 2, 1000, 1024, u32::MAX] {
+            let config = Config::from_toml(&format!(
+                "[ingest]\nbackpressure_threshold = {threshold}\n\
+                 [storage]\nwriter_queue_size = 8\n"
+            ))
+            .expect("positive thresholds are bounded by the live writer capacity");
+            assert_eq!(config.ingest.backpressure_threshold, threshold);
+            assert_eq!(
+                config
+                    .hot_reloadable()
+                    .expect("hot config")
+                    .ingest_backpressure_threshold,
+                threshold
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_ingest_backpressure_threshold() {
+        let error = Config::from_toml("[ingest]\nbackpressure_threshold = 0\n")
+            .expect_err("zero must not permanently pause all capture")
+            .to_string();
+        assert!(error.contains("ingest.backpressure_threshold must be > 0"));
+    }
+
+    #[test]
+    fn hot_reload_carries_ingest_backpressure_threshold() {
+        let current = Config::default();
+        let mut updated = current.clone();
+        updated.ingest.backpressure_threshold = 4;
+        let diff = current.diff_for_hot_reload(&updated);
+        assert!(diff.allowed);
+        let change = diff
+            .changes
+            .iter()
+            .find(|change| change.name == "ingest.backpressure_threshold")
+            .expect("pressure-only edits must reach the watcher");
+        assert_eq!(change.old_value, "1000");
+        assert_eq!(change.new_value, "4");
+        assert_eq!(
+            updated
+                .hot_reloadable()
+                .expect("hot config")
+                .ingest_backpressure_threshold,
+            4
         );
     }
 

@@ -207,6 +207,8 @@ pub enum CaptureSkipReason {
     GlobalByteBudgetExhausted,
     /// No concurrency permit was available for this ready pane.
     NoPermit,
+    /// New capture admission was deferred by the storage writer queue limit.
+    StorageBackpressure,
     /// Capture result could not be sent because downstream was backpressured.
     SendBackpressure,
     /// Backpressure threshold was reached and an overflow gap is pending.
@@ -245,6 +247,7 @@ impl CaptureSkipReason {
             Self::GlobalCaptureBudgetExhausted => "global_capture_budget_exhausted",
             Self::GlobalByteBudgetExhausted => "global_byte_budget_exhausted",
             Self::NoPermit => "no_permit",
+            Self::StorageBackpressure => "storage_backpressure",
             Self::SendBackpressure => "send_backpressure",
             Self::OverflowGapPending => "overflow_gap_pending",
             Self::OverflowGapEmitted => "overflow_gap_emitted",
@@ -763,6 +766,7 @@ impl PaneTailer {
                 CaptureSkipReason::GlobalCaptureBudgetExhausted
                 | CaptureSkipReason::GlobalByteBudgetExhausted
                 | CaptureSkipReason::NoPermit
+                | CaptureSkipReason::StorageBackpressure
                 | CaptureSkipReason::SendBackpressure
                 | CaptureSkipReason::CaptureTimeout
                 | CaptureSkipReason::CaptureCircuitOpen => {
@@ -1168,6 +1172,9 @@ where
     /// Without this, a stable `(priority, pane_id)` sort can permanently starve
     /// higher pane ids when ready panes recycle faster than the queue drains.
     priority_round_robin_offsets: HashMap<u32, usize>,
+    /// Live writer-pressure admission state supplied by the runtime.
+    /// Pausing never cancels already-admitted poll futures.
+    storage_backpressured: bool,
     /// Weighted capture scheduler with budget enforcement.
     scheduler: CaptureScheduler,
     /// Metrics
@@ -1327,6 +1334,7 @@ where
             pane_priorities: HashMap::new(),
             priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(CaptureBudgetConfig::default()),
+            storage_backpressured: false,
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
             standalone_capture_authority: CaptureAuthority::new(),
@@ -1365,12 +1373,25 @@ where
             pane_priorities: HashMap::new(),
             priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(budget),
+            storage_backpressured: false,
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
             standalone_capture_authority: CaptureAuthority::new(),
             standalone_capture_bindings: HashMap::new(),
             egress_tap: None,
         }
+    }
+
+    /// Pause only new polling admissions when the writer queue is congested.
+    /// Returns whether the state changed; the runtime uses recovery to retry
+    /// deferred identity/resync work promptly. Existing futures still settle.
+    pub(crate) fn set_storage_backpressure(&mut self, paused: bool) -> bool {
+        let changed = self.storage_backpressured != paused;
+        self.storage_backpressured = paused;
+        if changed {
+            debug!(paused, "Storage pressure changed polling admission");
+        }
+        changed
     }
 
     /// Set the optional egress observer used by a standalone supervisor.
@@ -1766,6 +1787,23 @@ where
             for tailer in self.tailers.values_mut() {
                 tailer.record_skip(CaptureSkipReason::Shutdown);
             }
+            return;
+        }
+
+        if self.storage_backpressured {
+            for (pane_id, tailer) in &mut self.tailers {
+                if self.capturing_panes.contains(pane_id) {
+                    tailer.record_skip(CaptureSkipReason::AlreadyCapturing);
+                } else if tailer.should_poll() {
+                    tailer.record_selection_opportunity();
+                    tailer.record_skip(CaptureSkipReason::StorageBackpressure);
+                } else {
+                    tailer.record_skip(CaptureSkipReason::NotDue);
+                }
+            }
+            // No permit, source read, cursor advance, budget debit or fabricated
+            // overflow gap. Existing poll futures remain owned by the caller;
+            // the next real snapshot still detects any actual overlap loss.
             return;
         }
 
@@ -3310,6 +3348,117 @@ mod tests {
                 assert_eq!(event.observed_agent_type(), expected);
                 assert_eq!(source.calls.load(Ordering::SeqCst), index + 1);
             }
+        });
+    }
+
+    #[test]
+    fn storage_pressure_defers_new_polls_without_cancelling_admitted_capture() {
+        struct ProbeSource(AtomicUsize);
+
+        impl PaneTextSource for ProbeSource {
+            type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+            fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(format!("pane-{pane_id}-output")) })
+            }
+        }
+
+        run_async_test(async {
+            let source = Arc::new(ProbeSource(AtomicUsize::new(0)));
+            let (tx, mut rx) = mpsc::channel(4);
+            let cursors = Arc::new(RwLock::new(HashMap::from([
+                (1, PaneCursor::new(1)),
+                (2, PaneCursor::new(2)),
+            ])));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut supervisor = TailerSupervisor::new(
+                TailerConfig {
+                    min_interval: Duration::ZERO,
+                    max_concurrent: 1,
+                    ..TailerConfig::default()
+                },
+                tx,
+                Arc::clone(&cursors),
+                registry,
+                Arc::clone(&shutdown),
+                Arc::clone(&source),
+            );
+            supervisor.sync_tailers(&HashMap::from([(1, make_pane(1)), (2, make_pane(2))]));
+            let mut tasks = TailerPollTaskSet::new();
+            let before_budget = supervisor.scheduler.global_captures_remaining;
+
+            assert!(supervisor.set_storage_backpressure(true));
+            for _ in 0..8 {
+                supervisor.spawn_ready(&mut tasks);
+            }
+            assert!(tasks.is_empty());
+            assert_eq!(source.0.load(Ordering::SeqCst), 0);
+            assert_eq!(supervisor.scheduler.global_captures_remaining, before_budget);
+            assert!(rx.try_recv().is_err());
+            for pane_id in [1, 2] {
+                let tailer = &supervisor.tailers[&pane_id];
+                assert_eq!(
+                    tailer.last_reason_code,
+                    CaptureSkipReason::StorageBackpressure
+                );
+                assert_eq!(tailer.consecutive_backpressure, 0);
+                assert!(!tailer.overflow_gap_pending);
+                assert_eq!(cursors.read().await[&pane_id].next_seq, 0);
+            }
+
+            // Admit one poll, then trip storage pressure before its future is
+            // polled. The owner must still drive it to a normal completion.
+            assert!(supervisor.set_storage_backpressure(false));
+            supervisor.spawn_ready(&mut tasks);
+            assert_eq!(tasks.len(), 1);
+            supervisor.set_storage_backpressure(true);
+            supervisor.spawn_ready(&mut tasks);
+            assert_eq!(tasks.len(), 1);
+            let (pane_id, outcome) = timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("admitted poll must drain")
+                .expect("one admitted poll");
+            assert_eq!(pane_id, 1);
+            assert!(matches!(outcome, PollOutcome::Changed { .. }));
+            supervisor.handle_poll_result(pane_id, outcome);
+            let event = rx.try_recv().expect("admitted capture reaches ingress");
+            assert_eq!(event.segment.seq, 0);
+            drop(event);
+            assert_eq!(source.0.load(Ordering::SeqCst), 1);
+            supervisor.spawn_ready(&mut tasks);
+            assert!(tasks.is_empty());
+
+            // Recovery schedules the deferred pane normally. Pausing did not
+            // advance its cursor or manufacture a gap.
+            supervisor.set_storage_backpressure(false);
+            supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 0)]));
+            supervisor.spawn_ready(&mut tasks);
+            let (pane_id, outcome) = timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("resumed poll must complete")
+                .expect("deferred poll resumes");
+            assert_eq!(pane_id, 2);
+            assert!(matches!(outcome, PollOutcome::Changed { .. }));
+            supervisor.handle_poll_result(pane_id, outcome);
+            let event = rx.try_recv().expect("resumed capture reaches ingress");
+            assert_eq!(event.segment.seq, 0);
+            assert_eq!(event.segment.content, "pane-2-output");
+            drop(event);
+            assert_eq!(source.0.load(Ordering::SeqCst), 2);
+            assert_eq!(supervisor.metrics().overflow_gaps_emitted, 0);
+
+            // Shutdown has precedence over pressure and does not start work.
+            supervisor.set_storage_backpressure(true);
+            shutdown.store(true, Ordering::SeqCst);
+            supervisor.spawn_ready(&mut tasks);
+            assert!(tasks.is_empty());
+            assert!(supervisor
+                .tailers
+                .values()
+                .all(|tailer| tailer.last_reason_code == CaptureSkipReason::Shutdown));
+            supervisor.shutdown().await;
         });
     }
 
@@ -4932,6 +5081,7 @@ mod tests {
                 "global_byte_budget_exhausted",
             ),
             (CaptureSkipReason::NoPermit, "no_permit"),
+            (CaptureSkipReason::StorageBackpressure, "storage_backpressure"),
             (CaptureSkipReason::SendBackpressure, "send_backpressure"),
             (
                 CaptureSkipReason::OverflowGapPending,

@@ -192,11 +192,11 @@
     },
     {
       "key": "ingest.backpressure_threshold",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "overflow backpressure uses the fixed consecutive-event threshold in tailer.rs, not this queue-depth value",
-      "tracking_bead": "ft-ta5as",
-      "validation": "Config::validate rejects non-default values fail-closed"
+      "status": "consumed",
+      "consumer": "crate::runtime::IngestBackpressureGate",
+      "evidence": "polling, vendored streaming and native capture admission sample actual writer queue depth; configured thresholds are clamped to writer capacity while persistence and retirement continue draining",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate requires a positive threshold; HotReloadableConfig carries changes to the running capture gate without restarting the watcher"
     },
     {
       "key": "ingest.gap_detection",

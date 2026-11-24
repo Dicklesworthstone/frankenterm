@@ -167,11 +167,14 @@ fn input_capability_config_changes_production_policy_decisions() {
 
 #[test]
 fn ingest_fields_are_not_silently_ignored() {
-    // These three ingest fields remain unconsumed: backpressure uses a fixed
-    // tailer threshold, gap recording is unconditional, and no percentage
-    // heuristic is wired. The segment ceiling is now consumed by persistence.
+    // Gap recording remains unconditional and no percentage heuristic is
+    // wired. Writer-pressure admission and persisted segment size have live
+    // consumers, so valid custom limits must reach the runtime.
+    assert_accepts("ingest.backpressure_threshold", |c| {
+        c.ingest.backpressure_threshold = 4;
+    });
     assert_rejects("ingest", "ingest.backpressure_threshold", |c| {
-        c.ingest.backpressure_threshold = c.ingest.backpressure_threshold.wrapping_add(1);
+        c.ingest.backpressure_threshold = 0;
     });
     assert_rejects("ingest", "ingest.gap_detection", |c| {
         c.ingest.gap_detection = !c.ingest.gap_detection;

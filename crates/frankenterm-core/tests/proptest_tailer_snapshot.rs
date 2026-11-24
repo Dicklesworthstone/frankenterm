@@ -44,6 +44,7 @@ fn arb_skip_reason() -> impl Strategy<Value = CaptureSkipReason> {
         CaptureSkipReason::GlobalCaptureBudgetExhausted,
         CaptureSkipReason::GlobalByteBudgetExhausted,
         CaptureSkipReason::NoPermit,
+        CaptureSkipReason::StorageBackpressure,
         CaptureSkipReason::SendBackpressure,
         CaptureSkipReason::OverflowGapPending,
         CaptureSkipReason::OverflowGapEmitted,
