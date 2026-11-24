@@ -2259,22 +2259,13 @@ impl GuardianRuntime {
         &mut self,
         request: &AuthenticatedGuardianRequest,
     ) -> Option<GuardianResponseEnvelope> {
-        if request.header().operation == GuardianOperation::Hello {
-            if self.rotation_admission_owner == Some(request.header().mux_incarnation) {
-                return Some(GuardianResponseEnvelope::rejection(
-                    request,
-                    GuardianRejectionCode::InvalidRequest,
-                ));
-            }
-            if let Some(connection) = self
-                .broker_connections
-                .get_mut(&request.header().mux_incarnation)
-            {
-                connection.retired_outer_owner = false;
-                connection.fully_retired_outer_owner = false;
-            }
-            self.checkpoint_settlement_retry_at
-                .remove(&request.header().mux_incarnation);
+        if request.header().operation == GuardianOperation::Hello
+            && self.rotation_admission_owner == Some(request.header().mux_incarnation)
+        {
+            return Some(GuardianResponseEnvelope::rejection(
+                request,
+                GuardianRejectionCode::InvalidRequest,
+            ));
         }
         // Hello is the one protocol-independent observation: its Hello
         // authority holds the immutable incarnation, so a mux can connect,
@@ -2671,16 +2662,31 @@ impl GuardianRuntime {
     /// authority alone: a build-bearing Hello must also authenticate a
     /// sealed build for Genesis.
     fn hello_reply(
-        &self,
+        &mut self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianRejectionCode> {
         if !request.payload().is_empty() {
             self.authenticate_genesis_connection(request)
                 .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))?;
         }
-        self.hello
+        let reply = self
+            .hello
             .reply(request)
-            .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))
+            .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))?;
+        // A valid wire envelope can still carry an unsealed build that is
+        // refused for Genesis. Only an accepted Hello reopens its mux: a
+        // rejected reconnect must leave successor admission and checkpoint
+        // settlement exactly as the final disconnect established them.
+        if let Some(connection) = self
+            .broker_connections
+            .get_mut(&request.header().mux_incarnation)
+        {
+            connection.retired_outer_owner = false;
+            connection.fully_retired_outer_owner = false;
+        }
+        self.checkpoint_settlement_retry_at
+            .remove(&request.header().mux_incarnation);
+        Ok(reply)
     }
 
     pub(crate) fn is_broker_control_request(&self, request: &AuthenticatedGuardianRequest) -> bool {
@@ -5835,10 +5841,10 @@ mod tests {
     use mux::guardian_output_journal::GuardianOutputAppendReceipt;
     use mux::guardian_protocol::{
         GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent,
-        GuardianCheckpointScopeV1, GuardianCheckpointStageRequestV1, GuardianReplayAckV1,
-        GuardianRequestEnvelope, GuardianRequestHeader, GuardianResponseEnvelope,
-        GuardianResponseStatus, GuardianSecret, decode_guardian_request, decode_guardian_response,
-        encode_guardian_request, encode_guardian_response,
+        GuardianCheckpointScopeV1, GuardianCheckpointStageRequestV1, GuardianHelloBuildIdentityV1,
+        GuardianReplayAckV1, GuardianRequestEnvelope, GuardianRequestHeader,
+        GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, decode_guardian_request,
+        decode_guardian_response, encode_guardian_request, encode_guardian_response,
     };
     use portable_pty::{CommandBuilder, PtySize};
     use sha2::{Digest as _, Sha256};
@@ -6395,6 +6401,14 @@ mod tests {
         request_id: Uuid,
         mux_incarnation: Uuid,
     ) -> AuthenticatedGuardianRequest {
+        authenticated_hello_request_with_payload(request_id, mux_incarnation, Vec::new())
+    }
+
+    fn authenticated_hello_request_with_payload(
+        request_id: Uuid,
+        mux_incarnation: Uuid,
+        payload: Vec<u8>,
+    ) -> AuthenticatedGuardianRequest {
         let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
                 GuardianOperation::Hello,
@@ -6405,9 +6419,9 @@ mod tests {
                 0,
                 0,
                 None,
-                &[],
+                &payload,
             ),
-            Vec::new(),
+            payload,
         );
         let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
         let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
@@ -8997,6 +9011,142 @@ mod tests {
             retired_outer_owner: fully_retired_outer_owner,
             fully_retired_outer_owner,
         }
+    }
+
+    fn assert_only_accepted_hello_reopens_mux(runtime: &mut GuardianRuntime) {
+        let mux = Uuid::from_u128(0x1501);
+        let other_mux = Uuid::from_u128(0x1502);
+        let retry_at = Instant::now() + CHECKPOINT_SETTLEMENT_RETRY;
+        runtime
+            .broker_connections
+            .insert(other_mux, broker_connection(true));
+        runtime
+            .checkpoint_settlement_retry_at
+            .insert(other_mux, retry_at);
+
+        // Both wire envelopes are valid and token-authenticated. Only the
+        // sealed identity passes the runtime's additional Genesis check.
+        let mut sealed = GuardianHelloBuildIdentityV1::for_compiled_mux()
+            .expect("test build identity")
+            .encode();
+        sealed[4] = 1;
+        sealed[8..].fill(0x5a);
+        let mut unsealed = sealed;
+        unsealed[4] = 0;
+        unsealed[8..].fill(0);
+
+        for fully_retired_outer_owner in [false, true] {
+            for accepted_payload in [Vec::new(), sealed.to_vec()] {
+                runtime.broker_connections.insert(
+                    mux,
+                    RuntimeBrokerConnection {
+                        fully_retired_outer_owner,
+                        ..broker_connection(true)
+                    },
+                );
+                runtime.checkpoint_settlement_retry_at.insert(mux, retry_at);
+                let refused = authenticated_hello_request_with_payload(
+                    Uuid::new_v4(),
+                    mux,
+                    unsealed.to_vec(),
+                );
+                let response = runtime
+                    .dispatch(&refused)
+                    .expect("unsealed Hello receives a typed rejection");
+                assert_eq!(
+                    response_rejection_code(&refused, &response),
+                    GuardianRejectionCode::InvalidRequest
+                );
+                assert!(
+                    runtime.retired_outer_owner(mux),
+                    "a rejected reconnect cannot bar the successor from settled panes"
+                );
+                assert_eq!(
+                    runtime.broker_connections[&mux].fully_retired_outer_owner,
+                    fully_retired_outer_owner
+                );
+                assert_eq!(
+                    runtime.checkpoint_settlement_retry_at.get(&mux),
+                    Some(&retry_at)
+                );
+
+                let accepted =
+                    authenticated_hello_request_with_payload(Uuid::new_v4(), mux, accepted_payload);
+                let response = runtime
+                    .dispatch(&accepted)
+                    .expect("plain and sealed reconnects are accepted");
+                assert_eq!(response.header().status, GuardianResponseStatus::Success);
+                assert_eq!(
+                    GuardianReply::decode_for_operation(
+                        GuardianOperation::Hello,
+                        response.payload(),
+                    )
+                    .expect("accepted Hello reply"),
+                    GuardianReply::Hello {
+                        guardian_incarnation: runtime.incarnation(),
+                    }
+                );
+                assert!(!runtime.retired_outer_owner(mux));
+                assert!(!runtime.broker_connections[&mux].fully_retired_outer_owner);
+                assert!(!runtime.checkpoint_settlement_retry_at.contains_key(&mux));
+                assert!(runtime.retired_outer_owner(other_mux));
+                assert!(runtime.broker_connections[&other_mux].fully_retired_outer_owner);
+                assert_eq!(
+                    runtime.checkpoint_settlement_retry_at.get(&other_mux),
+                    Some(&retry_at)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_genesis_hello_preserves_retirement_until_an_accepted_reconnect() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        assert_only_accepted_hello_reopens_mux(&mut runtime);
+    }
+
+    #[test]
+    fn rejected_genesis_hello_preserves_retirement_while_input_holds_protocol() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
+                calls: Arc::clone(&calls),
+                entered: entered_tx,
+                release: release_rx,
+            }));
+        // Drop the sender before the runtime on assertion failure, so the
+        // blocked worker can exit before the runtime joins it.
+        let release_input = release_tx;
+        let input = authenticated_input_request_for(
+            Uuid::from_u128(0x1510),
+            pane_id,
+            Uuid::from_u128(0x1511),
+            b"in-flight",
+        );
+        let route = input_route(7, 1, &input);
+        assert!(matches!(
+            runtime.submit_input(input, route),
+            GuardianInputSubmission::Pending
+        ));
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("input worker holds the protocol authority");
+        assert!(runtime.protocol.is_none());
+        assert_only_accepted_hello_reopens_mux(&mut runtime);
+
+        release_input.send(()).expect("release input worker");
+        let completion = wait_for_input_completion(&mut runtime);
+        assert_eq!(
+            completion
+                .response
+                .expect("input completed")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
