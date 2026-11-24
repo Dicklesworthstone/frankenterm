@@ -1366,6 +1366,7 @@ SEE ALSO:
     /// Notification utilities (test channels)
     #[command(after_help = r#"EXAMPLES:
     ft notify test --channel desktop
+    ft notify test --channel email --format json
     ft notify test --channel ops --format json
 
 SEE ALSO:
@@ -3206,9 +3207,9 @@ enum NotifyCommands {
     ft notify test --channel ops --format json
 
 NOTES:
-    Channel names match [notifications.webhooks].name or "desktop"."#)]
+    Channel names match [notifications.webhooks].name, "desktop", or "email"."#)]
     Test {
-        /// Channel name (webhook name or "desktop")
+        /// Channel name (webhook name, "desktop", or "email")
         #[arg(long)]
         channel: String,
 
@@ -10535,17 +10536,21 @@ enum NotifyChannel {
     Email,
 }
 
-/// `--notify-via email` on its own would leave the watcher with no working
-/// sender (there is no SMTP backend yet, ft-9b41l) while appearing to enable
-/// notifications. Refuse that instead of silently disabling notifications.
-fn email_only_notification_error(notify_via: &[NotifyChannel]) -> Option<String> {
-    let email_requested = notify_via.contains(&NotifyChannel::Email);
-    let working_channel = notify_via
-        .iter()
-        .any(|channel| matches!(channel, NotifyChannel::Webhook | NotifyChannel::Desktop));
-    (email_requested && !working_channel).then(|| {
-        "--notify-via email is not supported yet: FrankenTerm has no email sender (ft-9b41l), so no notifications would be delivered. Use --notify-via desktop and/or webhook.".to_string()
-    })
+/// Apply an explicit channel selection without discarding sender credentials.
+/// Validation still runs after the override, before any watcher task starts.
+fn apply_notification_channel_override(
+    notifications: &mut frankenterm_core::config::NotificationConfig,
+    notify_via: &[NotifyChannel],
+) {
+    if notify_via.is_empty() {
+        return;
+    }
+    notifications.enabled = true;
+    if !notify_via.contains(&NotifyChannel::Webhook) {
+        notifications.webhooks.clear();
+    }
+    notifications.desktop.enabled = notify_via.contains(&NotifyChannel::Desktop);
+    notifications.email.enabled = notify_via.contains(&NotifyChannel::Email);
 }
 
 #[cfg(feature = "sync")]
@@ -48546,21 +48551,10 @@ async fn run_watcher(
     }
 
     if !notify_via.is_empty() {
-        if !config.notifications.enabled {
-            config.notifications.enabled = true;
-        }
         let allow_webhook = notify_via.contains(&NotifyChannel::Webhook);
         let allow_desktop = notify_via.contains(&NotifyChannel::Desktop);
         let allow_email = notify_via.contains(&NotifyChannel::Email);
-        if let Some(message) = email_only_notification_error(&notify_via) {
-            anyhow::bail!("{message}");
-        }
-
-        if !allow_webhook {
-            config.notifications.webhooks.clear();
-        }
-        config.notifications.desktop.enabled = allow_desktop;
-        config.notifications.email.enabled = allow_email;
+        apply_notification_channel_override(&mut config.notifications, &notify_via);
 
         tracing::info!(
             webhook = allow_webhook,
@@ -48579,12 +48573,6 @@ async fn run_watcher(
         .alerts
         .validate()
         .map_err(|error| anyhow::anyhow!("Invalid usage alert configuration: {error}"))?;
-    if config.notifications.enabled && config.notifications.email.enabled {
-        tracing::warn!(
-            "Email notifications are enabled but not implemented; no email will be sent (ft-9b41l). Use desktop or webhook notifications."
-        );
-    }
-
     // Print resolved paths for diagnostic visibility
     tracing::info!(
         workspace = %layout.root.display(),
@@ -48808,6 +48796,15 @@ async fn run_watcher(
             senders.push(Box::new(desktop_notifier));
         } else if config.notifications.desktop.enabled {
             tracing::info!("Desktop notifications enabled but no backend is available");
+        }
+
+        if config.notifications.email.enabled {
+            let email_notifier = frankenterm_core::email_notify::EmailNotifier::new(
+                config.notifications.email.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("Email notification setup failed: {error}"))?;
+            senders.push(Box::new(email_notifier));
+            tracing::info!("Email notifications enabled");
         }
 
         if senders.is_empty() {
@@ -78476,6 +78473,8 @@ async fn handle_notify_command(
 
             let (channel_type, endpoint) = if channel.eq_ignore_ascii_case("desktop") {
                 ("desktop".to_string(), None)
+            } else if channel.eq_ignore_ascii_case("email") {
+                ("email".to_string(), None)
             } else {
                 let endpoint = config
                     .notifications
@@ -78485,7 +78484,7 @@ async fn handle_notify_command(
                 match endpoint {
                     Some(ep) => ("webhook".to_string(), Some(ep)),
                     None => {
-                        let mut available = vec!["desktop".to_string()];
+                        let mut available = vec!["desktop".to_string(), "email".to_string()];
                         available.extend(
                             config
                                 .notifications
@@ -78523,7 +78522,7 @@ async fn handle_notify_command(
                         std::process::exit(1);
                     }
                 }
-            } else if !config.notifications.desktop.enabled {
+            } else if channel_type == "desktop" && !config.notifications.desktop.enabled {
                 let response = NotifyTestResponse {
                     ok: false,
                     error: Some("Desktop notifications are disabled".to_string()),
@@ -78534,6 +78533,40 @@ async fn handle_notify_command(
                 emit_notify_test_response(&response, output_format);
                 std::process::exit(1);
             }
+
+            let email_notifier = if channel_type == "email" {
+                if !config.notifications.email.enabled {
+                    let response = NotifyTestResponse {
+                        ok: false,
+                        error: Some("Email notifications are disabled".to_string()),
+                        error_code: Some("E_CHANNEL_DISABLED".to_string()),
+                        hint: Some("Set [notifications.email].enabled = true to test.".to_string()),
+                        data: None,
+                    };
+                    emit_notify_test_response(&response, output_format);
+                    std::process::exit(1);
+                }
+                match frankenterm_core::email_notify::EmailNotifier::new(
+                    config.notifications.email.clone(),
+                ) {
+                    Ok(notifier) => Some(notifier),
+                    Err(error) => {
+                        let response = NotifyTestResponse {
+                            ok: false,
+                            error: Some(error),
+                            error_code: Some("E_NOTIFY_CONFIG".to_string()),
+                            hint: Some(
+                                "Check [notifications.email] SMTP and TLS settings.".to_string(),
+                            ),
+                            data: None,
+                        };
+                        emit_notify_test_response(&response, output_format);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
 
             let severity = match config
                 .notifications
@@ -78701,6 +78734,10 @@ async fn handle_notify_command(
                     config.notifications.desktop.clone(),
                 );
                 notifier.send(&output.payload).await
+            } else if let Some(notifier) = email_notifier {
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                notifier.send_with_cx(&cx, &output.payload).await
             } else {
                 let endpoint = endpoint.expect("endpoint exists for webhook channel");
                 let dispatcher = frankenterm_core::webhook::WebhookDispatcher::new(
@@ -78723,7 +78760,7 @@ async fn handle_notify_command(
                     ),
                     error_code: Some("E_DELIVERY_FAILED".to_string()),
                     hint: Some(
-                        "Check endpoint reachability, auth headers, or desktop backend."
+                        "Check endpoint reachability, SMTP/TLS settings, auth headers, or desktop backend."
                             .to_string(),
                     ),
                     data: Some(output),
@@ -107181,19 +107218,38 @@ mod tests {
     }
 
     #[test]
-    fn notify_via_email_alone_is_refused_but_mixed_channels_are_allowed() {
-        assert!(email_only_notification_error(&[NotifyChannel::Email]).is_some());
-        assert!(
-            email_only_notification_error(&[NotifyChannel::Email])
-                .unwrap_or_default()
-                .contains("ft-9b41l")
+    fn notify_via_email_validates_configuration_and_preserves_credentials() {
+        let mut notifications = frankenterm_core::config::NotificationConfig::default();
+        notifications.enabled = false;
+        notifications.desktop.enabled = true;
+        apply_notification_channel_override(&mut notifications, &[NotifyChannel::Email]);
+        assert!(notifications.enabled);
+        assert!(notifications.email.enabled);
+        assert!(!notifications.desktop.enabled);
+        assert!(notifications.validate().is_err());
+
+        notifications.email.smtp_host = "smtp.example.com".to_string();
+        notifications.email.from = "ft@example.com".to_string();
+        notifications.email.to = vec!["ops@example.com".to_string()];
+        notifications.email.username = Some("mailer".to_string());
+        notifications.email.password = Some("app-password".to_string());
+        apply_notification_channel_override(
+            &mut notifications,
+            &[NotifyChannel::Email, NotifyChannel::Desktop],
         );
-        assert!(
-            email_only_notification_error(&[NotifyChannel::Email, NotifyChannel::Desktop])
-                .is_none()
+        assert!(notifications.validate().is_ok());
+        assert!(notifications.email.enabled && notifications.desktop.enabled);
+        assert_eq!(notifications.email.username.as_deref(), Some("mailer"));
+        assert_eq!(
+            notifications.email.password.as_deref(),
+            Some("app-password")
         );
-        assert!(email_only_notification_error(&[NotifyChannel::Webhook]).is_none());
-        assert!(email_only_notification_error(&[]).is_none());
+
+        apply_notification_channel_override(&mut notifications, &[]);
+        assert!(notifications.email.enabled && notifications.desktop.enabled);
+        apply_notification_channel_override(&mut notifications, &[NotifyChannel::Desktop]);
+        assert!(!notifications.email.enabled);
+        assert!(notifications.desktop.enabled);
     }
 
     #[test]

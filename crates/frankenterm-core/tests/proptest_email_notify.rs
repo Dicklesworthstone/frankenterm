@@ -34,9 +34,14 @@ fn arb_valid_config() -> impl Strategy<Value = EmailNotifyConfig> {
         proptest::collection::vec(arb_valid_email(), 1..4), // to
         "[a-z]{3,10}",                                      // subject_prefix
         proptest::option::of("[a-z]{3,10}"),                // username
-        1_u64..3600,                                        // timeout_secs
+        1_u64..=120,                                        // timeout_secs
     )
         .prop_map(|(host, port, tls, from, to, prefix, username, timeout)| {
+            let username = if tls == EmailTlsMode::None {
+                None
+            } else {
+                username
+            };
             let password = username.as_ref().map(|_| "secret123".to_string());
             EmailNotifyConfig {
                 enabled: true,

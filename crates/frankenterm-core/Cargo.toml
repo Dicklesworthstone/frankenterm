@@ -158,7 +158,7 @@ fastapi = { workspace = true, optional = true }
 # migration fallback for legacy Cx-threading call sites. Keep the asupersync
 # constructor feature explicit so `--no-default-features` proof lanes do not
 # accidentally hide that dependency.
-asupersync = { workspace = true, features = ["test-internals", "tls"] }
+asupersync = { workspace = true, features = ["test-internals", "tls", "tls-webpki-roots"] }
 # Distributed mode (optional, behind feature)
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }

@@ -3033,17 +3033,55 @@ When tracking issue: the WASM execution path is part of the broader extension-sy
 
 ## Deep Dive: Notification Pipeline
 
-When detections fire, `ft watch` can notify operators through desktop notifications and webhooks.
+When detections fire, `ft watch` can notify operators through desktop notifications, email, and webhooks.
 
 ### Backends
 
 | Channel | File | When to use |
 |---|---|---|
 | Desktop notification | `desktop_notify.rs` | Interactive operator on a workstation |
-| Email | `email_notify.rs` (config only) | Not wired: no SMTP sender exists yet; `--notify-via email` on its own is rejected and an enabled email config logs a warning (ft-9b41l) |
+| Email | `email_notify.rs` | SMTP delivery with required STARTTLS, implicit TLS, or an explicitly configured unauthenticated plaintext relay |
 | Webhook | `webhook.rs` | Integrate with PagerDuty / Slack / custom routers |
 | Prometheus alert | via the metrics surface | Existing alerting infra |
 | In-app events | event bus | Other `ft` surfaces (web/SSE, MCP, robot events) |
+
+### Email delivery
+
+Configure an SMTP relay, then use `ft notify test --channel email --format json`
+to exercise the same filtering, redaction, and transport used by the watcher:
+
+```toml
+[notifications]
+enabled = true
+
+[notifications.email]
+enabled = true
+smtp_host = "smtp.example.com"
+smtp_port = 587
+tls = "start_tls"
+username = "mailer@example.com"
+password = "replace-with-your-app-password"
+from = "ft@example.com"
+to = ["ops@example.com"]
+subject_prefix = "[ft]"
+timeout_secs = 10
+```
+
+`ft watch --notify-via email` selects email alone; multiple `--notify-via`
+selections can enable other channels alongside it. Channel selection preserves
+the configured SMTP credentials and validates the configuration before startup.
+For implicit TLS, set `tls = "tls"` and the relay's SMTPS port (usually 465).
+`tls = "none"` is limited to relays without credentials. STARTTLS is mandatory
+when selected: a relay that cannot upgrade is rejected before authentication.
+TLS verifies the server certificate and hostname using public WebPKI roots.
+
+SMTP authentication supports PLAIN and LOGIN over TLS. A transaction accepts at
+most 32 recipients and has one total timeout of 1–120 seconds. All recipients
+must be accepted before the message body is submitted. Success means the relay
+acknowledged the completed DATA command; it does not establish inbox delivery.
+Connection loss or cancellation after DATA begins is reported as
+`email.delivery_indeterminate`. Email does not retry automatically, since an
+uncertain acknowledgement may follow a successfully accepted message.
 
 ### Alert manager (`alerts.rs`)
 
@@ -3076,7 +3114,7 @@ Use `cost`, `token_usage`, or `rate_limit_frequency` for upper limits: levels st
 
 Transitions are recorded as `usage.alert` and `usage.recovered` events. A restart retains the reminder deadline; a recorded recovery lets an identical later threshold breach notify again. Changes to severity emit immediately, while an unchanged alert repeats after `repeat_after_secs` (up to one day). Rule or cadence changes require a watcher restart.
 
-Desktop and webhook delivery use the existing `[notifications]` configuration, filters, redaction, deduplication, and mutes. With notifications disabled, the events remain available through ordinary event history, web/SSE, and MCP. An event being recorded does not guarantee external notification delivery across a process crash.
+Desktop, email, and webhook delivery use the existing `[notifications]` configuration, filters, redaction, deduplication, and mutes. With notifications disabled, the events remain available through ordinary event history, web/SSE, and MCP. An event being recorded does not guarantee external notification delivery across a process crash.
 
 ### Redaction before emission
 
