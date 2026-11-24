@@ -16,6 +16,7 @@
 #       companion release (`vX.Y.Z-appstore.N`), requiring prerelease=true (never
 #       hijacking GitHub Latest), and downloading and authenticating the Exporter
 #       DMG, optional app ZIP, checksum sidecars, and signed SHA256SUMS.
+#       Online checks also pin and recheck the release, assets, and resolved tag.
 #
 #   scripts/release/verify-release.sh [--channel stable] [--json] --manifest <path> --assets-dir <dir>
 #       Offline verification of the same closed asset set. The local manifest
@@ -243,6 +244,94 @@ if ! regular_file "$PUBKEY"; then
   exit 2
 fi
 
+release_metadata_is_bounded_json() {
+  local path="$1" size
+  regular_file "$path" || return 1
+  size="$(file_size "$path")"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le 1048576 ]] || return 1
+  python3 - "$path" <<'PY'
+import json
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+try:
+    with open(sys.argv[1], "rb") as source:
+        json.load(source, object_pairs_hook=unique_object)
+except (OSError, ValueError) as error:
+    sys.stderr.write(f"invalid release metadata: {error}\n")
+    sys.exit(1)
+PY
+}
+
+release_identity_is_unchanged() {
+  jq -en --slurpfile before "$1" --slurpfile after "$2" '
+    def identity:
+      {
+        id,
+        tag_name,
+        target_commitish,
+        draft,
+        prerelease,
+        assets: ([.assets[] |
+          {id, name, size, state, digest, browser_download_url}] | sort_by(.id, .name))
+      };
+    ($before[0] | identity) == ($after[0] | identity)
+  ' >/dev/null 2>&1
+}
+
+parse_remote_tag_object() {
+  python3 -c '
+import json
+import re
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate tag JSON key")
+        result[key] = value
+    return result
+
+try:
+    payload = sys.stdin.buffer.read(1048577)
+    if not 0 < len(payload) <= 1048576:
+        raise ValueError("tag response exceeds its byte bound")
+    response = json.loads(payload, object_pairs_hook=unique_object)
+    obj = response.get("object") if isinstance(response, dict) else None
+    if (not isinstance(obj, dict) or obj.get("type") not in ("commit", "tag") or
+            not isinstance(obj.get("sha"), str) or
+            re.fullmatch(r"[0-9a-f]{40}", obj["sha"]) is None):
+        raise ValueError("invalid tag object identity")
+except (OSError, TypeError, ValueError, RecursionError):
+    sys.exit(1)
+print(obj["type"] + "\t" + obj["sha"])
+'
+}
+
+resolve_remote_tag_sha() {
+  local ref_json object_type object_sha object_identity tag_json depth
+  ref_json="$(gh api --method GET "repos/$OWNER_REPO/git/ref/tags/$TAG" 2>/dev/null)" || return 1
+  object_identity="$(parse_remote_tag_object <<< "$ref_json")" || return 1
+  IFS=$'\t' read -r object_type object_sha <<< "$object_identity"
+  depth=0
+  while [[ "$object_type" == "tag" && $depth -lt 4 ]]; do
+    tag_json="$(gh api --method GET "repos/$OWNER_REPO/git/tags/$object_sha" 2>/dev/null)" || return 1
+    object_identity="$(parse_remote_tag_object <<< "$tag_json")" || return 1
+    IFS=$'\t' read -r object_type object_sha <<< "$object_identity"
+    depth=$((depth + 1))
+  done
+  [[ "$object_type" == "commit" && "$object_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$object_sha"
+}
+
 verify_companion_appstore_channel() {
   VERIFICATION_SCOPE="companion_artifact_integrity"
   if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+-appstore\.[0-9]+$ ]]; then
@@ -263,6 +352,7 @@ verify_companion_appstore_channel() {
   fi
   local rel_json=""
   local evidence_dir=""
+  local initial_tag_sha="" final_tag_sha=""
   if [[ -n "$RELEASE_JSON_FIXTURE" ]]; then
     if ! regular_file "$RELEASE_JSON_FIXTURE"; then
       FAIL_CODE="missing_release_json"
@@ -272,6 +362,10 @@ verify_companion_appstore_channel() {
     rel_json="$RELEASE_JSON_FIXTURE"
   else
     command -v gh >/dev/null 2>&1 || { echo "gh is required for online companion verification" >&2; exit 2; }
+    if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
+      echo "FT_RELEASE_REPO must be an owner/repository pair" >&2
+      exit 2
+    fi
     umask 077
     evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/ft-verify-companion.XXXXXX")" || exit 2
     rel_json="$evidence_dir/release.json"
@@ -283,35 +377,9 @@ verify_companion_appstore_channel() {
     fi
   fi
 
-  local metadata_size
-  metadata_size="$(file_size "$rel_json")"
-  if [[ ! "$metadata_size" =~ ^[0-9]+$ || "$metadata_size" -le 0 || "$metadata_size" -gt 1048576 ]]; then
+  if ! release_metadata_is_bounded_json "$rel_json"; then
     FAIL_CODE="invalid_companion_metadata"
-    bad "companion release metadata is empty or exceeds the 1 MiB bound"
-    finish_failed
-  fi
-  if ! python3 - "$rel_json" <<'PY'
-import json
-import sys
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-try:
-    with open(sys.argv[1], "rb") as source:
-        json.load(source, object_pairs_hook=unique_object)
-except (OSError, ValueError) as error:
-    sys.stderr.write(f"invalid companion metadata: {error}\n")
-    sys.exit(1)
-PY
-  then
-    FAIL_CODE="invalid_companion_metadata"
-    bad "companion release metadata is not duplicate-free JSON"
+    bad "companion release metadata is not bounded, duplicate-free JSON"
     finish_failed
   fi
   if ! jq -e --arg tag "$TAG" '
@@ -324,6 +392,20 @@ PY
   ' "$rel_json" >/dev/null 2>&1; then
     FAIL_CODE="invalid_companion_metadata"
     bad "companion release metadata has invalid or duplicate assets, is draft, or tag_name != $TAG"
+    finish_failed
+  fi
+  if [[ -z "$RELEASE_JSON_FIXTURE" ]] && ! jq -e '
+    def valid_id:
+      type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+    (.id | valid_id) and (.target_commitish | type == "string") and
+    all(.assets[];
+      (.id | valid_id) and .state == "uploaded" and
+      (.browser_download_url | type == "string") and
+      (.digest == null or (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))) and
+    ([.assets[].id] | unique | length) == (.assets | length)
+  ' "$rel_json" >/dev/null 2>&1; then
+    FAIL_CODE="invalid_companion_metadata"
+    bad "online companion metadata lacks distinct uploaded release/asset identities"
     finish_failed
   fi
   MANIFEST_SHA="$(jq -r '.target_commitish // "" | select(type == "string" and test("^[0-9a-f]{40}$"))' "$rel_json")"
@@ -353,12 +435,21 @@ PY
   done
   [[ $fail -eq 0 ]] || finish_failed
 
+  if [[ -z "$RELEASE_JSON_FIXTURE" ]]; then
+    # A branch name in target_commitish is not source identity. Resolve the
+    # actual tag before any lengthy downloads, then pin that commit through
+    # the final release snapshot check below.
+    if ! initial_tag_sha="$(resolve_remote_tag_sha)"; then
+      FAIL_CODE="companion_tag_unavailable"
+      bad "companion tag $TAG could not be resolved to one commit"
+      finish_failed
+    fi
+    MANIFEST_SHA="$initial_tag_sha"
+    good "companion tag $TAG resolves to $initial_tag_sha"
+  fi
+
   if [[ -z "$ASSETS_DIR" ]]; then
     command -v curl >/dev/null 2>&1 || { echo "curl is required for online companion verification" >&2; exit 2; }
-    if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
-      echo "FT_RELEASE_REPO must be an owner/repository pair" >&2
-      exit 2
-    fi
     ASSETS_DIR="$evidence_dir/assets"
     mkdir "$ASSETS_DIR" || exit 2
     local download_url expected_url declared_size max_size
@@ -459,6 +550,31 @@ PY
 
   if [[ $fail -gt 0 ]]; then
     finish_failed
+  fi
+  if [[ -z "$RELEASE_JSON_FIXTURE" ]]; then
+    # Signatures authenticate the downloaded bytes, not a mutable GitHub
+    # channel, asset inventory, or tag. A publication edit during verification
+    # must not turn an isolated prerelease into a successful Latest verdict.
+    if ! gh api --method GET "repos/$OWNER_REPO/releases/tags/$TAG" \
+        > "$evidence_dir/release-after.json" 2> "$evidence_dir/gh-after.err"; then
+      FAIL_CODE="companion_release_unavailable"
+      bad "companion release $TAG could not be re-read after byte verification"
+    elif ! release_metadata_is_bounded_json "$evidence_dir/release-after.json"; then
+      FAIL_CODE="invalid_companion_metadata"
+      bad "post-verification companion metadata is not bounded, duplicate-free JSON"
+    elif ! release_identity_is_unchanged "$rel_json" "$evidence_dir/release-after.json"; then
+      FAIL_CODE="companion_release_changed"
+      bad "companion release identity, channel, or asset set changed during verification"
+    fi
+    if ! final_tag_sha="$(resolve_remote_tag_sha)"; then
+      FAIL_CODE="${FAIL_CODE:-companion_tag_unavailable}"
+      bad "companion tag $TAG could not be re-resolved after byte verification"
+    elif [[ "$final_tag_sha" != "$initial_tag_sha" ]]; then
+      FAIL_CODE="${FAIL_CODE:-companion_tag_changed}"
+      bad "companion tag changed during verification"
+    fi
+    [[ $fail -eq 0 ]] || finish_failed
+    good "companion release identity, prerelease channel, assets, and tag stayed stable during verification"
   fi
   if [[ "$JSON_OUTPUT" -eq 1 ]]; then
     emit_json_verdict true
@@ -831,22 +947,6 @@ PY
   fi
 }
 
-resolve_remote_tag_sha() {
-  local ref_json object_type object_sha tag_json depth
-  ref_json="$(gh api --method GET "repos/$OWNER_REPO/git/ref/tags/$TAG" 2>/dev/null)" || return 1
-  object_type="$(jq -r '.object.type // empty' <<< "$ref_json")"
-  object_sha="$(jq -r '.object.sha // empty' <<< "$ref_json")"
-  depth=0
-  while [[ "$object_type" == "tag" && $depth -lt 4 ]]; do
-    tag_json="$(gh api --method GET "repos/$OWNER_REPO/git/tags/$object_sha" 2>/dev/null)" || return 1
-    object_type="$(jq -r '.object.type // empty' <<< "$tag_json")"
-    object_sha="$(jq -r '.object.sha // empty' <<< "$tag_json")"
-    depth=$((depth + 1))
-  done
-  [[ "$object_type" == "commit" && "$object_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  printf '%s\n' "$object_sha"
-}
-
 if [[ -n "$VERSION" ]]; then
   command -v gh >/dev/null 2>&1 || { echo "gh is required for online verification" >&2; exit 2; }
   command -v curl >/dev/null 2>&1 || { echo "curl is required for online verification" >&2; exit 2; }
@@ -1024,21 +1124,7 @@ if [[ -n "$VERSION" && $fail -eq 0 ]]; then
     release_metadata_size="$(file_size "$EVIDENCE_DIR/release-after.json")"
     if [[ ! "$release_metadata_size" =~ ^[0-9]+$ || "$release_metadata_size" -gt 1048576 ]]; then
       bad "post-verification release metadata exceeds the 1 MiB bound"
-    elif ! jq -en \
-      --slurpfile before "$EVIDENCE_DIR/release.json" \
-      --slurpfile after "$EVIDENCE_DIR/release-after.json" '
-        def identity:
-          {
-            id,
-            tag_name,
-            target_commitish,
-            draft,
-            prerelease,
-            assets: ([.assets[] |
-              {id, name, size, state, digest, browser_download_url}] | sort_by(.id))
-          };
-        ($before[0] | identity) == ($after[0] | identity)
-      ' >/dev/null 2>&1; then
+    elif ! release_identity_is_unchanged "$EVIDENCE_DIR/release.json" "$EVIDENCE_DIR/release-after.json"; then
       bad "release identity or asset set changed during verification"
     fi
   fi

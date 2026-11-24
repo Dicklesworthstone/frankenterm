@@ -95,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     tag = "v0.15.22-appstore.16"
     good_json = td_path / "companion_good.json"
     good_companion = {
+        "id": 42,
         "tag_name": tag,
         "draft": False,
         "prerelease": True,
@@ -104,10 +105,10 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
 
     def refresh_metadata():
         good_companion["assets"] = [
-            {"name": p.name, "size": p.stat().st_size,
+            {"id": index + 1, "state": "uploaded", "name": p.name, "size": p.stat().st_size,
              "digest": "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest(),
              "browser_download_url": f"https://github.com/Dicklesworthstone/frankenterm/releases/download/{tag}/{p.name}"}
-            for p in sorted(assets.iterdir())
+            for index, p in enumerate(sorted(assets.iterdir()))
         ]
         good_json.write_text(json.dumps(good_companion))
 
@@ -159,6 +160,16 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     # 3. Real signatures and canonical newline-terminated checksum sidecars.
     parsed = companion_case("pos_companion_signed_artifacts")
     assert parsed["verification_scope"] == "companion_artifact_integrity", parsed
+    # Captured offline fixtures authenticate their supplied bytes without
+    # claiming a live GitHub publication identity or making a network request.
+    offline_metadata = copy.deepcopy(good_companion)
+    offline_metadata.pop("id")
+    for asset in offline_metadata["assets"]:
+        asset.pop("id")
+        asset.pop("state")
+    offline_json = td_path / "companion_offline_minimal.json"
+    offline_json.write_text(json.dumps(offline_metadata))
+    companion_case("pos_offline_companion_without_live_ids", metadata=offline_json)
     companion_case("neg_companion_metadata_only", "missing_companion_assets", with_assets=False)
     companion_case("neg_companion_untrusted_signer", "minisig_invalid", verifier=verify_sh)
 
@@ -227,7 +238,20 @@ with tempfile.TemporaryDirectory(prefix="ft-rc4-g94a-test-") as td:
     # keeping the production digest and Minisign verification fully active.
     bin_dir = td_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "gh").write_text("#!/bin/sh\ncat \"$FT_TEST_RELEASE_JSON\"\n")
+    (bin_dir / "gh").write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+assert sys.argv[1:4] == ["api", "--method", "GET"], sys.argv
+resource = sys.argv[4]
+log = pathlib.Path(os.environ["FT_TEST_GH_LOG"])
+calls = log.read_text().splitlines()
+with log.open("a") as output:
+    output.write(resource + "\\n")
+responses = json.loads(pathlib.Path(os.environ["FT_TEST_GH_RESPONSES"]).read_text())
+response = responses[resource][calls.count(resource)]
+if response.get("status", 0):
+    raise SystemExit(response["status"])
+print(response["raw"] if "raw" in response else json.dumps(response["body"]))
+''')
     (bin_dir / "curl").write_text('''#!/usr/bin/env python3
 import os, pathlib, shutil, sys
 args = sys.argv[1:]
@@ -242,25 +266,167 @@ shutil.copyfile(source, target)
     for tool in bin_dir.iterdir():
         tool.chmod(0o755)
     download_log = td_path / "downloads.log"
+    gh_log = td_path / "gh-calls.log"
+    gh_responses = td_path / "gh-responses.json"
     env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
-               FT_TEST_RELEASE_JSON=str(good_json), FT_TEST_ASSETS=str(assets),
+               FT_TEST_GH_LOG=str(gh_log), FT_TEST_GH_RESPONSES=str(gh_responses),
+               FT_RELEASE_REPO="Dicklesworthstone/frankenterm",
+               FT_TEST_ASSETS=str(assets),
                FT_TEST_DOWNLOAD_LOG=str(download_log), TMPDIR=str(td_path))
-    p = subprocess.run(["bash", str(fixture_verify), "--channel", "companion-appstore", "--json", tag],
-                       env=env, capture_output=True, text=True)
-    parsed = json.loads(p.stdout)
-    assert parsed.get("ok") is True, (parsed, p.stderr)
-    assert sorted(download_log.read_text().splitlines()) == sorted(originals)
-    record("pos_online_companion_downloads_and_authenticates", "companion-appstore", "positive", 0, p)
+    release_resource = f"repos/Dicklesworthstone/frankenterm/releases/tags/{tag}"
+    tag_resource = f"repos/Dicklesworthstone/frankenterm/git/ref/tags/{tag}"
+    commit = good_companion["target_commitish"]
+    commit_ref = {"object": {"type": "commit", "sha": commit}}
+
+    def online_companion_case(case_id, expected_code=None, *, before=None, after=None,
+                              responses=None, complete_download=True, expected_calls=None):
+        replies = {
+            release_resource: [{"body": before or good_companion},
+                               {"body": after or good_companion}],
+            tag_resource: [{"body": commit_ref}, {"body": commit_ref}],
+        }
+        replies.update(responses or {})
+        gh_responses.write_text(json.dumps(replies))
+        gh_log.write_text("")
+        download_log.write_text("")
+        p = subprocess.run(
+            ["bash", str(fixture_verify), "--channel", "companion-appstore", "--json", tag],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        parsed = json.loads(p.stdout)
+        expected_rc = 0 if expected_code is None else 1
+        assert p.returncode == expected_rc, (case_id, parsed, p.stderr)
+        assert parsed.get("ok") is (expected_rc == 0), (case_id, parsed)
+        assert parsed.get("fail_code") == expected_code, (case_id, parsed, p.stderr)
+        if complete_download:
+            assert sorted(download_log.read_text().splitlines()) == sorted(originals), case_id
+        if expected_calls is not None:
+            assert gh_log.read_text().splitlines() == expected_calls, (case_id, gh_log.read_text())
+        record(case_id, "companion-appstore", "positive" if expected_rc == 0 else "negative",
+               expected_rc, p, {"fail_code": parsed.get("fail_code")})
+        return parsed
+
+    ordinary_calls = [release_resource, tag_resource, release_resource, tag_resource]
+    parsed = online_companion_case("pos_online_companion_downloads_and_authenticates",
+                                   expected_calls=ordinary_calls)
+    assert parsed["commit"] == commit, parsed
+
+    # target_commitish can be a branch. The returned source must be the actual
+    # resolved tag, and irrelevant presentation metadata must not cause drift.
+    branch_metadata = dict(good_companion, target_commitish="main")
+    reordered_metadata = dict(branch_metadata, body="updated release description",
+                              assets=list(reversed(good_companion["assets"])))
+    parsed = online_companion_case("pos_online_companion_resolves_branch_target",
+                                   before=branch_metadata, after=reordered_metadata,
+                                   expected_calls=ordinary_calls)
+    assert parsed["commit"] == commit, parsed
+
+    for suffix in ("missing_release_id", "zero_release_id", "unsafe_release_id",
+                   "missing_asset_id", "duplicate_asset_id", "unuploaded_asset",
+                   "invalid_asset_digest", "invalid_asset_url"):
+        invalid = copy.deepcopy(good_companion)
+        if suffix == "missing_release_id":
+            invalid.pop("id")
+        elif suffix == "zero_release_id":
+            invalid["id"] = 0
+        elif suffix == "unsafe_release_id":
+            invalid["id"] = 2 ** 53
+        elif suffix == "missing_asset_id":
+            invalid["assets"][0].pop("id")
+        elif suffix == "duplicate_asset_id":
+            invalid["assets"][0]["id"] = invalid["assets"][1]["id"]
+        elif suffix == "unuploaded_asset":
+            invalid["assets"][0]["state"] = "new"
+        elif suffix == "invalid_asset_digest":
+            invalid["assets"][0]["digest"] = "not-a-digest"
+        else:
+            invalid["assets"][0]["browser_download_url"] = None
+        online_companion_case("neg_companion_" + suffix, "invalid_companion_metadata",
+                              before=invalid, complete_download=False,
+                              expected_calls=[release_resource])
+        assert not download_log.read_text(), "invalid identity must stop before downloading"
+
+    # All byte/signature checks still succeed. Each refusal below must come
+    # from re-reading the actual publication after those checks, not from an
+    # invalid fixture archive or signature.
+    for field, replacement in [("prerelease", False), ("draft", True), ("id", 43),
+                               ("tag_name", "v0.15.22-appstore.17"),
+                               ("target_commitish", "b" * 40)]:
+        changed = dict(good_companion, **{field: replacement})
+        online_companion_case("neg_companion_release_drift_" + field,
+                              "companion_release_changed", after=changed,
+                              expected_calls=ordinary_calls)
+    for field, replacement in [("id", 900), ("name", "replacement.dmg"), ("size", 1),
+                               ("state", "new"), ("digest", "sha256:" + "0" * 64),
+                               ("browser_download_url", "https://untrusted.invalid/artifact")]:
+        changed = copy.deepcopy(good_companion)
+        changed["assets"][0][field] = replacement
+        online_companion_case("neg_companion_asset_drift_" + field,
+                              "companion_release_changed", after=changed,
+                              expected_calls=ordinary_calls)
+    for suffix, changed_assets in [("removed", good_companion["assets"][1:]),
+                                   ("duplicated", good_companion["assets"] + [good_companion["assets"][0]])]:
+        online_companion_case("neg_companion_asset_" + suffix, "companion_release_changed",
+                              after=dict(good_companion, assets=changed_assets),
+                              expected_calls=ordinary_calls)
+
+    for suffix, response, code in [
+        ("unavailable", {"status": 1}, "companion_release_unavailable"),
+        ("malformed", {"raw": "{broken"}, "invalid_companion_metadata"),
+        ("duplicate_key", {"raw": json.dumps(good_companion).replace(
+            '"prerelease": true', '"prerelease": false, "prerelease": true')},
+         "invalid_companion_metadata"),
+        ("oversized", {"raw": " " * (1024 * 1024 + 1)}, "invalid_companion_metadata"),
+    ]:
+        online_companion_case("neg_companion_reread_" + suffix, code,
+                              responses={release_resource: [{"body": good_companion}, response]},
+                              expected_calls=ordinary_calls)
+
+    online_companion_case("neg_companion_initial_tag_missing", "companion_tag_unavailable",
+                          responses={tag_resource: [{"status": 1}]}, complete_download=False,
+                          expected_calls=[release_resource, tag_resource])
+    assert not download_log.read_text(), "missing initial tag must stop before downloading"
+    for suffix, raw in [
+        ("trailing_bytes", json.dumps(commit_ref) + " invalid"),
+        ("multiple_values", json.dumps(commit_ref) + "\n{}"),
+        ("duplicate_key", json.dumps(commit_ref).replace(
+            '"type": "commit"', '"type": "commit", "type": "commit"')),
+        ("oversized", " " * (1024 * 1024 + 1)),
+    ]:
+        online_companion_case("neg_companion_tag_" + suffix, "companion_tag_unavailable",
+                              responses={tag_resource: [{"body": commit_ref}, {"raw": raw}]},
+                              expected_calls=ordinary_calls)
+    for suffix, response, code in [
+        ("removed", {"status": 1}, "companion_tag_unavailable"),
+        ("moved", {"body": {"object": {"type": "commit", "sha": "b" * 40}}}, "companion_tag_changed"),
+        ("not_commit", {"body": {"object": {"type": "tree", "sha": commit}}}, "companion_tag_unavailable"),
+    ]:
+        online_companion_case("neg_companion_tag_" + suffix, code,
+                              responses={tag_resource: [{"body": commit_ref}, response]},
+                              expected_calls=ordinary_calls)
+
+    annotated_sha = "c" * 40
+    annotated_resource = f"repos/Dicklesworthstone/frankenterm/git/tags/{annotated_sha}"
+    annotated_ref = {"object": {"type": "tag", "sha": annotated_sha}}
+    parsed = online_companion_case("pos_online_companion_annotated_tag", responses={
+        tag_resource: [{"body": annotated_ref}, {"body": annotated_ref}],
+        annotated_resource: [{"body": commit_ref}, {"body": commit_ref}],
+    }, expected_calls=[release_resource, tag_resource, annotated_resource,
+                       release_resource, tag_resource, annotated_resource])
+    assert parsed["commit"] == commit, parsed
+    online_companion_case("neg_companion_annotated_tag_cycle", "companion_tag_unavailable",
+                          responses={
+                              tag_resource: [{"body": annotated_ref}],
+                              annotated_resource: [{"body": annotated_ref}] * 4,
+                          }, complete_download=False,
+                          expected_calls=[release_resource, tag_resource] + [annotated_resource] * 4)
+    assert not download_log.read_text(), "unresolvable tag must stop before downloading"
 
     malformed = copy.deepcopy(good_companion)
     malformed["assets"][0]["browser_download_url"] = "https://untrusted.invalid/artifact"
-    malformed_json.write_text(json.dumps(malformed))
-    env["FT_TEST_RELEASE_JSON"] = str(malformed_json)
-    p = subprocess.run(["bash", str(fixture_verify), "--channel", "companion-appstore", "--json", tag],
-                       env=env, capture_output=True, text=True)
-    parsed = json.loads(p.stdout)
-    assert parsed.get("fail_code") == "invalid_companion_asset", (parsed, p.stderr)
-    record("neg_online_companion_foreign_download_url", "companion-appstore", "negative", 1, p)
+    online_companion_case("neg_online_companion_foreign_download_url", "invalid_companion_asset",
+                          before=malformed, complete_download=False,
+                          expected_calls=[release_resource, tag_resource])
 
     # 4. Negative: companion-appstore fixture with prerelease=false (hijacking GitHub Latest!)
     bad_companion = dict(good_companion, prerelease=False)
