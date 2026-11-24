@@ -195,6 +195,7 @@ export function createPaneOutput({
       return;
     }
     source = candidate;
+    let ready = false;
     const expected = generation;
     const selectedPane = pane;
     const current = () => eligible() && source === candidate && generation === expected;
@@ -215,6 +216,10 @@ export function createPaneOutput({
             || value.kind !== message.type || !value.data || typeof value.data !== "object"
             || Array.isArray(value.data)) throw new Error("invalid frame envelope");
         const data = value.data;
+        if (!ready && message.type !== "ready" && message.type !== "error") {
+          reconnect("output arrived before its replay boundary was confirmed");
+          return;
+        }
         if (message.type === "delta") {
           const segment = cursorFor(message.lastEventId, selectedPane);
           const sequence = unsigned(exact.data.seq, U64_MAX);
@@ -244,9 +249,6 @@ export function createPaneOutput({
             settleCapture(null, true);
             return;
           }
-          // A validated pane delta also establishes a working stream; unlike
-          // a ready frame, new delivered rows reset the retry backoff below.
-          clearReadyDeadline();
           // Reconnect may overlap with already admitted rows. Do not regress
           // the received cursor, append duplicates, or interpret ids as floats.
           if (received !== null && BigInt(segment) <= BigInt(received)) {
@@ -280,6 +282,20 @@ export function createPaneOutput({
           if (typeof data.pane_id !== "number" || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane) {
             throw new Error("wrong ready pane");
           }
+          // On native reconnect the browser can send Last-Event-ID even when
+          // the original URL had no since_id. The server echoes what it
+          // actually admitted. A missing resume starts at the live tail.
+          const expectedResume = received ?? url.searchParams.get("since_id");
+          const resume = unsigned(exact.data.resume_after_id, I64_MAX);
+          const safeResume = expectedResume === null
+            ? data.resume_after_id === null
+            : typeof data.resume_after_id === "number" && resume !== null
+              && (capture !== null ? resume === expectedResume : BigInt(resume) <= BigInt(expectedResume));
+          if (!safeResume) {
+            reconnect("output replay boundary changed; received cursor unchanged");
+            return;
+          }
+          ready = true;
           clearReadyDeadline();
           status = capture === null ? "connected" : "loading";
           // A ready frame does not establish delivery or complete replay.
@@ -310,6 +326,7 @@ export function createPaneOutput({
       else if (capture !== null) reconnect("Historical capture connection ended before delivery. Search again to retry.");
       else if (candidate.readyState === EventSourceImpl.CLOSED) reconnect("output disconnected; reconnecting");
       else {
+        ready = false;
         status = "connecting";
         if (received === null && !history) unanchored = true;
         dirty = true;

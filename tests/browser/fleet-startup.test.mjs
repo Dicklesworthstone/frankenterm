@@ -174,7 +174,12 @@ function fixture(t, options = {}) {
     assert.equal(frames.size, 1);
     const [id, fn] = frames.entries().next().value; frames.delete(id); fn();
   };
-  const openPane = (id = "7") => { get("pane-output-id").value = id; get("pane-output-form").requestSubmit(); };
+  const openPane = (id = "7") => {
+    get("pane-output-id").value = id;
+    get("pane-output-form").requestSubmit();
+    const source = sources.at(-1);
+    source.emit("ready", { data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${id},"resume_after_id":null}}` });
+  };
   return { app, doc, host, get, sources, requests, viewers, renderers, frames, timers, intervals, observers,
     selection, frame, openPane, notifications, Notification,
     visibility(state) { doc.visibilityState = state; doc.emit("visibilitychange"); },

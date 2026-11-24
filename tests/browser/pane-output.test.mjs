@@ -24,9 +24,11 @@ function fixture(options = {}) {
     }
     close() { this.closed = true; this.readyState = Source.CLOSED; }
     emit(type, data, lastEventId = "") {
+      if (type === "ready") this.serverReady = true;
       for (const handler of this.handlers.get(type) ?? []) handler({ type, data, lastEventId });
     }
     fail(permanent = true) {
+      this.serverReady = false;
       this.readyState = permanent ? Source.CLOSED : 0;
       this.emit("error");
     }
@@ -47,13 +49,29 @@ function fixture(options = {}) {
   };
 }
 
+// The server writes resume_after_id as an integer token, even above 2^53.
+function readyPayload(pane, resume) {
+  return `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${pane},"resume_after_id":${resume}}}`;
+}
+
 function control(source, kind, data = { pane_id: 7 }, inheritedId = "") {
+  if (kind === "ready") {
+    const after = source.lastDelta ?? source.url.searchParams.get("since_id");
+    source.emit(kind, readyPayload(data.pane_id, after ?? "null"), inheritedId);
+    return;
+  }
   source.emit(kind, JSON.stringify({ schema: "ft.stream.v1", stream: "deltas", kind, data }), inheritedId);
 }
 
+function beginDelivery(source) {
+  if (!source.serverReady) control(source, "ready", { pane_id: source.url.searchParams.get("pane_id") });
+}
+
 function delta(source, id, content, pane = "7", overrides = {}) {
+  beginDelivery(source);
   const payload = `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":` +
     `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id},"content":${JSON.stringify(content)}}}`;
+  source.lastDelta = id;
   source.emit("delta", overrides.payload ?? payload, overrides.cursor ?? `delta-v1:pane:${pane}:${id}`);
 }
 
@@ -114,7 +132,7 @@ test("native reconnect grace cannot be renewed by repeated errors and preserves 
   assert.equal(f.timers.size, 0);
 });
 
-test("valid ready or pane delta fences queued watchdogs without resetting retry evidence", () => {
+test("a confirmed replay boundary fences queued watchdogs before new or overlapping deltas", () => {
   for (const response of ["ready", "delta", "duplicate"]) {
     const f = fixture({ readyTimeoutMs: 25 });
     f.output.select("7");
@@ -547,6 +565,54 @@ test("transient EventSource reconnects do not create replacement owners", () => 
   assert.equal(f.timers.size, 0);
 });
 
+test("native reconnect must confirm the accepted replay boundary before returning to live output", () => {
+  const id = "9007199254740992", next = "9007199254740993";
+  for (const reported of ["null", next, `"${id}"`, "1.5"]) {
+    const f = fixture(); f.output.select("7");
+    const original = f.latest();
+    delta(original, id, "A"); original.fail(false);
+    original.emit("ready", readyPayload("7", reported));
+    assert.equal(original.closed, true, reported);
+    assert.equal(f.output.snapshot().status, "retrying");
+    delta(original, next, "stale");
+    f.retry();
+    assert.equal(f.latest().url.searchParams.get("since_id"), id);
+    f.latest().emit("ready", readyPayload("7", "9007199254740991"));
+    assert.equal(f.output.snapshot().status, "connected", "overlapping replay is safe");
+    delta(f.latest(), id, "duplicate"); delta(f.latest(), next, "B");
+    assert.equal(f.output.snapshot().text, "AB");
+    assert.equal(f.output.snapshot().cursor, next);
+  }
+});
+
+test("data before ready cannot enter a fresh, historical, or natively reconnecting transcript", () => {
+  for (const mode of ["fresh", "capture", "reconnecting"]) {
+    const f = fixture();
+    if (mode === "capture") f.output.selectCapture(captureHit());
+    else f.output.select("7");
+    const source = f.latest();
+    if (mode === "reconnecting") {
+      delta(source, "5", "A");
+      source.fail(false);
+    }
+    source.emit("delta", '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":7,"segment_id":12,"seq":1,"captured_at":1000,"content_len":90,"content":"B"}}', "delta-v1:pane:7:12");
+    assert.equal(source.closed, true, mode);
+    assert.equal(f.output.snapshot().cursor, mode === "reconnecting" ? "5" : null);
+    assert.equal(f.output.snapshot().text, mode === "reconnecting" ? "A" : "");
+    assert.equal(f.output.snapshot().status, mode === "capture" ? "unavailable" : "retrying");
+  }
+});
+
+test("retained history starting at zero cannot degrade into an empty live tail", () => {
+  const f = fixture(); f.output.select("7", { retainedHistory: true });
+  f.latest().emit("ready", readyPayload("7", "null"));
+  assert.equal(f.latest().closed, true);
+  f.retry();
+  assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  control(f.latest(), "ready");
+  assert.equal(f.output.snapshot().status, "connected");
+});
+
 test("reconnecting before the first fresh cursor reports the unanchored boundary", () => {
   const f = fixture(); f.output.select("7"); f.latest().fail(); f.retry();
   assert.equal(f.output.snapshot().unanchored, true);
@@ -831,6 +897,7 @@ function captureHit(overrides = {}) {
 }
 
 function capturedDelta(source, hit, content, overrides = {}) {
+  beginDelivery(source);
   const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +
     '{"pane_id":' + hit.paneId + ',"segment_id":' + hit.segmentId + ',"seq":' + (overrides.sequence ?? '0') +
     ',"captured_at":' + hit.capturedAt + ',"content_len":' + hit.contentLength +
@@ -838,6 +905,20 @@ function capturedDelta(source, hit, content, overrides = {}) {
   source.emit("delta", overrides.payload ?? payload,
     overrides.cursor ?? "delta-v1:pane:" + hit.paneId + ":" + hit.segmentId);
 }
+
+test("a single historical capture refuses both older and later replay starts", () => {
+  for (const resume of ["10", "12", "null"]) {
+    const f = fixture(); f.output.selectCapture(captureHit());
+    const source = f.latest();
+    assert.equal(source.url.searchParams.get("since_id"), "11");
+    source.emit("ready", readyPayload("7", resume));
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(source.closed, true);
+    capturedDelta(source, captureHit(), "late");
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.timers.size, 0);
+  }
+});
 
 test("historical inspection admits exactly one captured identity and never follows its pane", () => {
   const f = fixture();
