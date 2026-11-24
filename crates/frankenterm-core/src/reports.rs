@@ -4,7 +4,7 @@
 //! workflow executions with step logs, and output gaps.
 
 use crate::error::RuntimeOperationSource;
-use crate::policy::{Redactor, parse_serialized_decision_surface};
+use crate::policy::parse_serialized_decision_surface;
 use crate::storage::{AuditQuery, EventQuery, ExportQuery, StorageHandle};
 
 fn report_cancelled_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
@@ -76,10 +76,14 @@ pub async fn generate_session_report_with_cx(
         )
     })?;
 
-    let redactor = if opts.redact {
-        Some(Redactor::new())
-    } else {
-        None
+    // Reapply the workspace policy to historical rows as well as new writes.
+    // An explicit unredacted report retains its existing raw-output semantics.
+    let redactor = opts.redact.then(|| storage.redactor());
+    let redact_text = |text: &str| match redactor {
+        Some(redactor) => {
+            redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
+        }
+        None => text.to_string(),
     };
 
     let mut md = String::new();
@@ -129,14 +133,14 @@ pub async fn generate_session_report_with_cx(
         md.push_str("|----------|------|------|----------|--------|\n");
         for event in &events {
             let detail = match (&event.matched_text, &redactor) {
-                (Some(text), Some(r)) => r.redact(text),
+                (Some(text), Some(_)) => redact_text(text),
                 (Some(text), None) => truncate(text, 60),
                 (None, _) => "—".to_string(),
             };
             md.push_str(&format!(
                 "| {} | {} | {} | {} | {} |\n",
-                event.severity,
-                event.event_type,
+                redact_text(&event.severity),
+                redact_text(&event.event_type),
                 event.pane_id,
                 format_ts(event.detected_at),
                 detail.replace('|', "\\|"),
@@ -167,9 +171,10 @@ pub async fn generate_session_report_with_cx(
             };
             md.push_str(&format!(
                 "### {status_icon} {} (`{}`)\n\n",
-                wf.workflow_name, wf.id
+                redact_text(&wf.workflow_name),
+                redact_text(&wf.id)
             ));
-            md.push_str(&format!("- **Status:** {}\n", wf.status));
+            md.push_str(&format!("- **Status:** {}\n", redact_text(&wf.status)));
             md.push_str(&format!("- **Pane:** {}\n", wf.pane_id));
             md.push_str(&format!("- **Started:** {}\n", format_ts(wf.started_at)));
             if let Some(completed_at) = wf.completed_at {
@@ -181,10 +186,7 @@ pub async fn generate_session_report_with_cx(
                 ));
             }
             if let Some(ref error) = wf.error {
-                let err_text = match &redactor {
-                    Some(r) => r.redact(error),
-                    None => error.clone(),
-                };
+                let err_text = redact_text(error);
                 md.push_str(&format!("- **Error:** {err_text}\n"));
             }
 
@@ -197,8 +199,8 @@ pub async fn generate_session_report_with_cx(
                         md.push_str(&format!(
                             "| {} | {} | {} | {} |\n",
                             step.step_index,
-                            step.step_name,
-                            step.result_type,
+                            redact_text(&step.step_name),
+                            redact_text(&step.result_type),
                             format_duration(step.duration_ms),
                         ));
                     }
@@ -229,7 +231,7 @@ pub async fn generate_session_report_with_cx(
                 gap.pane_id,
                 gap.seq_before,
                 gap.seq_after,
-                gap.reason,
+                redact_text(&gap.reason),
                 format_ts(gap.detected_at),
             ));
         }
@@ -262,7 +264,7 @@ pub async fn generate_session_report_with_cx(
         md.push_str("|------|-------|--------|---------|----------|------|--------|\n");
         for d in &denials {
             let reason = match (&d.decision_reason, &redactor) {
-                (Some(r), Some(red)) => red.redact(r),
+                (Some(r), Some(_)) => redact_text(r),
                 (Some(r), None) => truncate(r, 60),
                 (None, _) => "—".to_string(),
             };
@@ -271,11 +273,11 @@ pub async fn generate_session_report_with_cx(
             md.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} |\n",
                 format_ts(d.ts),
-                d.actor_kind,
-                d.action_kind,
-                surface.replace('|', "\\|"),
-                d.policy_decision,
-                rule.replace('|', "\\|"),
+                redact_text(&d.actor_kind),
+                redact_text(&d.action_kind),
+                redact_text(&surface).replace('|', "\\|"),
+                redact_text(&d.policy_decision),
+                redact_text(rule).replace('|', "\\|"),
                 reason.replace('|', "\\|"),
             ));
         }
@@ -1105,6 +1107,133 @@ mod tests {
             assert!(report.contains("[REDACTED]"));
             // GitHub PAT in workflow error should be redacted
             assert!(!report.contains("ghp_"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn report_reapplies_workspace_redaction_to_historical_text() {
+        run_async_test(async {
+            let (storage, tmp) = test_db("workspace_redaction").await;
+            let secret = "PRIVATE_ORCHID";
+            let decorated = "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m";
+            assert_eq!(crate::policy::Redactor::new().redact(secret), secret);
+
+            storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "custom.secret".to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: "alert".to_string(),
+                    severity: "warning".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some(format!("event {decorated}")),
+                    segment_id: None,
+                    detected_at: 2000,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .unwrap();
+            storage
+                .upsert_workflow(crate::storage::WorkflowRecord {
+                    id: "wf-custom-redaction".to_string(),
+                    workflow_name: format!("workflow {secret}"),
+                    pane_id: 1,
+                    trigger_event_id: None,
+                    current_step: 0,
+                    status: "failed".to_string(),
+                    wait_condition: None,
+                    context: None,
+                    result: None,
+                    error: Some(format!("failure {decorated}")),
+                    started_at: 1000,
+                    updated_at: 2000,
+                    completed_at: Some(2000),
+                })
+                .await
+                .unwrap();
+            storage.append_segment(1, "before gap", None).await.unwrap();
+            storage.record_gap(1, &format!("gap {decorated}")).await.unwrap();
+            storage
+                .record_audit_action(crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts: 1500,
+                    actor_kind: "workflow".to_string(),
+                    actor_id: None,
+                    correlation_id: None,
+                    pane_id: Some(1),
+                    domain: None,
+                    action_kind: "send_text".to_string(),
+                    policy_decision: "deny".to_string(),
+                    decision_reason: Some(format!("denial {decorated}")),
+                    rule_id: Some("policy.custom".to_string()),
+                    input_summary: None,
+                    verification_summary: None,
+                    decision_context: None,
+                    result: "blocked".to_string(),
+                })
+                .await
+                .unwrap();
+
+            // Reopen with a new policy: the stored rows predate that policy.
+            storage.shutdown().await.unwrap();
+            {
+                // Preserve a terminal-decorated legacy row even when the
+                // current storage writer already normalizes new event text.
+                let conn = rusqlite::Connection::open(&tmp).unwrap();
+                conn.execute(
+                    "UPDATE events SET matched_text = ?1",
+                    [format!("event {decorated}")],
+                )
+                .unwrap();
+            }
+            let mut config = crate::config::Config::default();
+            config.safety.redaction.patterns = vec![secret.to_string()];
+            config.safety.redaction.placeholder = "[workspace-hidden]".to_string();
+            let storage = StorageHandle::with_config(
+                &tmp.to_string_lossy(),
+                crate::storage::StorageConfig {
+                    redaction_config: config.safety.redaction,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut opts = ReportOptions {
+                pane_id: Some(1),
+                since: None,
+                until: None,
+                limit: None,
+                redact: true,
+            };
+            let report = generate_session_report(&storage, &opts).await.unwrap();
+            for expected in [
+                "event [workspace-hidden]",
+                "workflow [workspace-hidden]",
+                "failure [workspace-hidden]",
+                "gap [workspace-hidden]",
+                "denial [workspace-hidden]",
+            ] {
+                assert!(report.contains(expected), "missing redacted field: {expected}");
+            }
+            assert!(!report.contains("PRIVATE_"));
+            assert!(!report.contains('\u{1b}'));
+            assert!(report.contains("wf-custom-redaction"));
+            assert!(report.contains("policy.custom"));
+
+            // The opt-out is explicit and must not silently inherit redaction.
+            opts.redact = false;
+            let raw_report = generate_session_report(&storage, &opts).await.unwrap();
+            assert!(raw_report.contains(secret));
+            assert!(raw_report.contains(decorated));
+            assert!(!raw_report.contains("**Redacted:** yes"));
 
             storage.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&tmp);

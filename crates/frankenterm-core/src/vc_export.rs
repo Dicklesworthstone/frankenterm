@@ -278,9 +278,13 @@ pub enum VcExportError {
     StorageFailed { phase: &'static str },
 }
 
+fn redact_text(redactor: &Redactor, text: &str) -> String {
+    redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
+}
+
 fn redact_json_value(redactor: &Redactor, value: serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::String(s) => serde_json::Value::String(redactor.redact(&s)),
+        serde_json::Value::String(s) => serde_json::Value::String(redact_text(redactor, &s)),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
@@ -303,7 +307,7 @@ fn stored_event_to_vc_record(
     redactor: &Redactor,
 ) -> VcExportRecord {
     let matched_text = if include_matched_text {
-        event.matched_text.map(|text| redactor.redact(&text))
+        event.matched_text.map(|text| redact_text(redactor, &text))
     } else {
         None
     };
@@ -322,7 +326,7 @@ fn stored_event_to_vc_record(
         segment_id: event.segment_id,
         dedupe_key: event.dedupe_key,
         handled_at: event.handled_at,
-        handled_status: event.handled_status,
+        handled_status: event.handled_status.map(|text| redact_text(redactor, &text)),
         matched_text,
         extracted,
     }
@@ -342,8 +346,10 @@ fn now_epoch_ms_i64() -> i64 {
 /// - **Monotone cursor**: records are strictly ascending by `event_id`;
 ///   `next_cursor.after_id` never moves backwards within an epoch.
 /// - **Bounded allocation**: `limit` is validated to `1..=VC_EXPORT_MAX_LIMIT`.
-/// - **Redaction**: `matched_text` and all string leaves inside `extracted`
-///   pass through [`Redactor`] before serialization.
+/// - **Redaction**: `matched_text`, `handled_status`, and all string leaves
+///   inside `extracted` are terminal-normalized and pass through the storage
+///   handle's configured [`Redactor`] before serialization, including history
+///   written before that policy was configured.
 /// - **Explicit restart/retention-gap reporting**: when resuming from a cursor,
 ///   epoch mismatches and cursor-ahead-of-high-water conditions fail closed
 ///   with zero fabricated records and an explicit [`VcExportGapState`], and
@@ -471,7 +477,7 @@ pub async fn export_events_page_with_cx(
                 });
             }
             EventRetentionStatus::Pruned { interval } => {
-                let redactor = Redactor::new();
+                let redactor = storage.redactor();
                 let next_after_id = events
                     .last()
                     .map_or(prev_cursor.after_id, |ev| ev.id.max(prev_cursor.after_id));
@@ -482,7 +488,7 @@ pub async fn export_events_page_with_cx(
                             ev,
                             &check.snapshot.cursor_epoch,
                             request.include_matched_text,
-                            &redactor,
+                            redactor,
                         )
                     })
                     .collect();
@@ -511,7 +517,7 @@ pub async fn export_events_page_with_cx(
             EventRetentionStatus::LegacyHistoryUnavailable {
                 evidence_from_event_id,
             } => {
-                let redactor = Redactor::new();
+                let redactor = storage.redactor();
                 let next_after_id = events
                     .last()
                     .map_or(prev_cursor.after_id, |ev| ev.id.max(prev_cursor.after_id));
@@ -522,7 +528,7 @@ pub async fn export_events_page_with_cx(
                             ev,
                             &check.snapshot.cursor_epoch,
                             request.include_matched_text,
-                            &redactor,
+                            redactor,
                         )
                     })
                     .collect();
@@ -550,7 +556,7 @@ pub async fn export_events_page_with_cx(
         }
     }
 
-    let redactor = Redactor::new();
+    let redactor = storage.redactor();
     let baseline_after_id = request.cursor.as_ref().map_or(0, |c| c.after_id);
     let next_after_id = events
         .last()
@@ -562,7 +568,7 @@ pub async fn export_events_page_with_cx(
                 ev,
                 &retention.cursor_epoch,
                 request.include_matched_text,
-                &redactor,
+                redactor,
             )
         })
         .collect();
@@ -1100,6 +1106,55 @@ mod tests {
     }
 
     #[test]
+    fn vc_record_normalizes_custom_secrets_without_changing_identity() {
+        let mut config = crate::config::Config::default();
+        config.safety.redaction.patterns = vec!["PRIVATE_ORCHID".to_string()];
+        config.safety.redaction.placeholder = "[workspace-hidden]".to_string();
+        let redactor = config.safety.redaction.build_redactor().unwrap();
+        let decorated = "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m";
+        let record = stored_event_to_vc_record(
+            StoredEvent {
+                id: 44,
+                pane_id: 7,
+                rule_id: "agent.secret_check".to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "alert".to_string(),
+                severity: "warning".to_string(),
+                confidence: 0.95,
+                extracted: Some(serde_json::json!({
+                    "nested": [{"value": decorated}, "PRIVATE_ORCHID"],
+                    "count": 3,
+                    "enabled": true,
+                })),
+                matched_text: Some(format!("matched {decorated}")),
+                segment_id: Some(9),
+                detected_at: 1000,
+                dedupe_key: Some("stable-dedupe-key".to_string()),
+                handled_at: Some(1001),
+                handled_by_workflow_id: Some("stable-workflow".to_string()),
+                handled_status: Some(format!("handled {decorated}")),
+            },
+            "epoch",
+            true,
+            &redactor,
+        );
+        assert_eq!(record.record_id, "ft-evt:epoch:44");
+        assert_eq!(record.event_id, 44);
+        assert_eq!(record.rule_id, "agent.secret_check");
+        assert_eq!(record.dedupe_key.as_deref(), Some("stable-dedupe-key"));
+        assert_eq!(record.matched_text.as_deref(), Some("matched [workspace-hidden]"));
+        assert_eq!(record.handled_status.as_deref(), Some("handled [workspace-hidden]"));
+        let extracted = record.extracted.as_ref().unwrap();
+        assert_eq!(extracted["nested"][0]["value"], "[workspace-hidden]");
+        assert_eq!(extracted["nested"][1], "[workspace-hidden]");
+        assert_eq!(extracted["count"], 3);
+        assert_eq!(extracted["enabled"], true);
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains("PRIVATE_"));
+        assert!(!serialized.contains("\\u001b"));
+    }
+
+    #[test]
     fn cursor_export_paginates_redacts_and_detects_retention_and_epoch_gaps() {
         use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
         use crate::storage::PaneRecord;
@@ -1139,6 +1194,8 @@ mod tests {
                 .unwrap();
 
             let secret_token = ["sk-", "ant-", "api03-", &"A".repeat(52)].concat();
+            let custom_secret = "PRIVATE_ORCHID";
+            assert_eq!(Redactor::new().redact(custom_secret), custom_secret);
             let mut ids = Vec::new();
             for i in 0..5i64 {
                 let id = storage
@@ -1154,9 +1211,14 @@ mod tests {
                             confidence: 0.95,
                             extracted: Some(serde_json::json!({
                                 "idx": i,
-                                "nested": { "token": format!("bearer {secret_token}") }
+                                "nested": {
+                                    "token": format!("bearer {secret_token} {custom_secret}"),
+                                    "decorated": "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m"
+                                }
                             })),
-                            matched_text: Some(format!("leaked {secret_token} #{i}")),
+                            matched_text: Some(format!(
+                                "leaked {secret_token} {custom_secret} #{i}"
+                            )),
                             segment_id: None,
                             detected_at: 10_000 + i * 1_000,
                             dedupe_key: None,
@@ -1169,6 +1231,23 @@ mod tests {
                     .unwrap();
                 ids.push(id);
             }
+
+            // Read-time policy must protect history written under the default
+            // policy, not merely rely on the configured persistence writer.
+            storage.shutdown().await.unwrap();
+            let mut config = crate::config::Config::default();
+            config.safety.redaction.patterns = vec![custom_secret.to_string()];
+            config.safety.redaction.placeholder = "[workspace-hidden]".to_string();
+            let storage_config = crate::storage::StorageConfig {
+                redaction_config: config.safety.redaction,
+                ..Default::default()
+            };
+            let storage = StorageHandle::with_config(
+                db_path.to_str().unwrap(),
+                storage_config.clone(),
+            )
+            .await
+            .unwrap();
 
             // Reject invalid limits (0 and > VC_EXPORT_MAX_LIMIT).
             assert_eq!(
@@ -1226,7 +1305,11 @@ mod tests {
                 !serialized_p1.contains(secret_token.as_str()),
                 "exported page must redact secrets in matched_text and extracted JSON"
             );
+            assert!(!serialized_p1.contains(custom_secret));
+            assert!(serialized_p1.contains("[workspace-hidden]"));
+            assert_eq!(page1.records[0].rule_id, "agent.secret_check");
             assert_eq!(page1.to_jsonl().unwrap().lines().count(), 2);
+            assert!(!page1.to_jsonl().unwrap().contains(custom_secret));
 
             // Page 2: resume from parsed cursor token.
             let c1 = VcExportCursor::parse(&page1.next_cursor_token).unwrap();
@@ -1343,6 +1426,66 @@ mod tests {
                 after_prune.gap
             );
 
+            assert_eq!(after_prune.records.len(), 2);
+            let serialized_pruned = serde_json::to_string(&after_prune).unwrap();
+            assert!(!serialized_pruned.contains(custom_secret));
+            assert!(serialized_pruned.contains("[workspace-hidden]"));
+
+            // Exercise the distinct legacy-history output branch after the
+            // same authorized ledger rotation used by storage's own tests.
+            storage.shutdown().await.unwrap();
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     INSERT INTO event_retention_rotation_authorizations (singleton) VALUES (1);
+                     UPDATE event_retention_state
+                     SET cursor_epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         legacy_history_complete = 0,
+                         evidence_from_event_id = max_event_id + 1
+                     WHERE singleton = 1;
+                     DELETE FROM event_retention_rotation_authorizations;
+                     COMMIT;",
+                )
+                .unwrap();
+            }
+            let storage =
+                StorageHandle::with_config(db_path.to_str().unwrap(), storage_config)
+                    .await
+                    .unwrap();
+            let legacy = export_events_page_with_cx(
+                &cx,
+                &storage,
+                &VcExportRequest {
+                    cursor: Some(VcExportCursor {
+                        cursor_epoch: "a".repeat(32),
+                        after_id: 0,
+                        generation: after_prune.retention.generation,
+                    }),
+                    limit: 10,
+                    include_matched_text: true,
+                    ..VcExportRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                legacy.gap,
+                VcExportGapState::LegacyHistoryUnavailable {
+                    evidence_from_event_id: ids[4] + 1,
+                }
+            );
+            assert_eq!(legacy.records.len(), 2);
+            assert_eq!(legacy.records[0].event_id, ids[3]);
+            assert_eq!(legacy.next_cursor.after_id, ids[4]);
+            assert_eq!(
+                legacy.records[0].record_id,
+                format!("ft-evt:{}:{}", "a".repeat(32), ids[3])
+            );
+            let serialized_legacy = serde_json::to_string(&legacy).unwrap();
+            assert!(!serialized_legacy.contains(custom_secret));
+            assert!(serialized_legacy.contains("[workspace-hidden]"));
+
             // Pre-cancelled Cx returns Cancelled.
             let cancelled = crate::cx::Cx::for_testing();
             cancelled.cancel_with(
@@ -1353,6 +1496,7 @@ mod tests {
                 export_events_page_with_cx(&cancelled, &storage, &VcExportRequest::default()).await,
                 Err(VcExportError::Cancelled)
             );
+            storage.shutdown().await.unwrap();
         });
     }
 }

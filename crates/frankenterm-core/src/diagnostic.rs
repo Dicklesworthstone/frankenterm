@@ -277,8 +277,8 @@ fn redact_events(
             severity: e.severity,
             confidence: e.confidence,
             detected_at: e.detected_at,
-            handled_status: e.handled_status,
-            matched_text: e.matched_text.map(|t| redactor.redact(&t)),
+            handled_status: e.handled_status.map(|text| redact_text(&text, redactor)),
+            matched_text: e.matched_text.map(|text| redact_text(&text, redactor)),
         })
         .collect()
 }
@@ -347,10 +347,16 @@ fn generate_rule_traces(
                 .and_then(|v| v.as_object())
                 .map(|obj| {
                     obj.iter()
-                        .map(|(key, value)| TraceEvidence {
-                            kind: "extracted_field".to_string(),
-                            label: Some(key.clone()),
-                            value: Some(redactor.redact(&value.to_string())),
+                        .map(|(key, value)| {
+                            // Normalize string leaves before JSON escaping can
+                            // obscure terminal control sequences from matching.
+                            let mut value = value.clone();
+                            redact_json_value(&mut value, redactor);
+                            TraceEvidence {
+                                kind: "extracted_field".to_string(),
+                                label: Some(redact_text(key, redactor)),
+                                value: Some(value.to_string()),
+                            }
                         })
                         .collect::<Vec<_>>()
                 })
@@ -362,7 +368,7 @@ fn generate_rule_traces(
                 agent_type: e.agent_type.clone(),
                 confidence: e.confidence,
                 severity: e.severity.clone(),
-                matched_text: e.matched_text.as_ref().map(|t| redactor.redact(t)),
+                matched_text: e.matched_text.as_ref().map(|t| redact_text(t, redactor)),
                 extracted_fields,
                 handled: e.handled_at.is_some(),
                 detected_at: e.detected_at,
@@ -400,9 +406,9 @@ struct RedactedStep {
 fn redact_step(step: crate::storage::WorkflowStepLogRecord, redactor: &Redactor) -> RedactedStep {
     RedactedStep {
         step_index: step.step_index,
-        step_name: step.step_name,
+        step_name: redact_text(&step.step_name, redactor),
         result_type: step.result_type,
-        policy_summary: step.policy_summary.map(|s| redactor.redact(&s)),
+        policy_summary: step.policy_summary.map(|s| redact_text(&s, redactor)),
         started_at: step.started_at,
         completed_at: step.completed_at,
     }
@@ -433,8 +439,8 @@ fn redact_reservation(
         id: res.id,
         pane_id: res.pane_id,
         owner_kind: res.owner_kind,
-        owner_id: redactor.redact(&res.owner_id),
-        reason: res.reason.map(|r| redactor.redact(&r)),
+        owner_id: redact_text(&res.owner_id, redactor),
+        reason: res.reason.map(|r| redact_text(&r, redactor)),
         status: res.status,
         created_at: res.created_at,
         expires_at: res.expires_at,
@@ -460,10 +466,14 @@ struct RedactedAudit {
     decision_context: Option<serde_json::Value>,
 }
 
+fn redact_text(text: &str, redactor: &Redactor) -> String {
+    redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
+}
+
 fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
     match value {
         serde_json::Value::String(text) => {
-            *text = redactor.redact(text);
+            *text = redact_text(text, redactor);
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -489,7 +499,7 @@ fn redact_decision_context(
             redact_json_value(&mut value, redactor);
             Some(value)
         }
-        Err(_) => Some(serde_json::Value::String(redactor.redact(&raw))),
+        Err(_) => Some(serde_json::Value::String(redact_text(&raw, redactor))),
     }
 }
 
@@ -498,7 +508,6 @@ fn redact_audit(
     redactor: &Redactor,
 ) -> RedactedAudit {
     let decision_context = redact_decision_context(action.decision_context.take(), redactor);
-    action.redact_fields(redactor);
     RedactedAudit {
         id: action.id,
         ts: action.ts,
@@ -507,8 +516,10 @@ fn redact_audit(
         policy_decision: action.policy_decision,
         result: action.result,
         pane_id: action.pane_id,
-        input_summary: action.input_summary,
-        decision_reason: action.decision_reason,
+        input_summary: action.input_summary.map(|text| redact_text(&text, redactor)),
+        decision_reason: action
+            .decision_reason
+            .map(|text| redact_text(&text, redactor)),
         decision_context,
     }
 }
@@ -563,7 +574,10 @@ pub async fn generate_bundle_with_cx(
     cx.checkpoint()
         .map_err(|err| diagnostic_cancelled_error("generate_bundle", err))?;
 
-    let redactor = Redactor::new();
+    // The caller's validated workspace policy also protects records written
+    // before custom patterns were configured. Fail before creating any files
+    // if a directly constructed configuration contains an invalid policy.
+    let redactor = config.safety.redaction.build_redactor()?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -587,11 +601,11 @@ pub async fn generate_bundle_with_cx(
     // [ft-lokam] cx-first path must honor include_full_cwd same as
     // the legacy generate_bundle above.
     let env_info = gather_environment(opts);
-    write_json_file(&output_dir, "environment.json", &env_info)?;
+    write_redacted_json_file(&output_dir, "environment.json", &env_info, &redactor)?;
     file_count += 1;
 
     let config_summary = summarize_config(config);
-    write_json_file(&output_dir, "config_summary.json", &config_summary)?;
+    write_redacted_json_file(&output_dir, "config_summary.json", &config_summary, &redactor)?;
     file_count += 1;
 
     let db_path = Path::new(storage.db_path());
@@ -604,7 +618,7 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to gather DB health: {e}"),
             });
-            write_json_file(&output_dir, "db_health.json", &error_info)?;
+            write_redacted_json_file(&output_dir, "db_health.json", &error_info, &redactor)?;
             file_count += 1;
         }
     }
@@ -635,7 +649,7 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to query events: {e}"),
             });
-            write_json_file(&output_dir, "recent_events.json", &error_info)?;
+            write_redacted_json_file(&output_dir, "recent_events.json", &error_info, &redactor)?;
             file_count += 1;
         }
     }
@@ -657,7 +671,7 @@ pub async fn generate_bundle_with_cx(
                 };
                 redacted_workflows.push(RedactedWorkflow {
                     id: wf.id.clone(),
-                    workflow_name: wf.workflow_name.clone(),
+                    workflow_name: redact_text(&wf.workflow_name, &redactor),
                     pane_id: wf.pane_id,
                     status: wf.status.clone(),
                     started_at: wf.started_at,
@@ -673,7 +687,7 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to query workflows: {e}"),
             });
-            write_json_file(&output_dir, "recent_workflows.json", &error_info)?;
+            write_redacted_json_file(&output_dir, "recent_workflows.json", &error_info, &redactor)?;
             file_count += 1;
         }
     }
@@ -691,7 +705,12 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to query reservations: {e}"),
             });
-            write_json_file(&output_dir, "active_reservations.json", &error_info)?;
+            write_redacted_json_file(
+                &output_dir,
+                "active_reservations.json",
+                &error_info,
+                &redactor,
+            )?;
             file_count += 1;
         }
     }
@@ -713,7 +732,12 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to query reservation history: {e}"),
             });
-            write_json_file(&output_dir, "reservation_history.json", &error_info)?;
+            write_redacted_json_file(
+                &output_dir,
+                "reservation_history.json",
+                &error_info,
+                &redactor,
+            )?;
             file_count += 1;
         }
     }
@@ -735,7 +759,7 @@ pub async fn generate_bundle_with_cx(
             let error_info = serde_json::json!({
                 "error": format!("Failed to query audit actions: {e}"),
             });
-            write_json_file(&output_dir, "recent_audit.json", &error_info)?;
+            write_redacted_json_file(&output_dir, "recent_audit.json", &error_info, &redactor)?;
             file_count += 1;
         }
     }
@@ -791,6 +815,24 @@ struct BundleManifest {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Redact unsanitized metadata and error sections while preserving JSON types.
+/// Record summaries already redacted field-by-field use `write_json_file`
+/// directly, so configured replacement markers are not processed twice.
+fn write_redacted_json_file<T: Serialize>(
+    dir: &Path,
+    name: &str,
+    value: &T,
+    redactor: &Redactor,
+) -> crate::Result<()> {
+    let mut value = serde_json::to_value(value).map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!(
+            "Failed to serialize {name}: {e}"
+        )))
+    })?;
+    redact_json_value(&mut value, redactor);
+    write_json_file(dir, name, &value)
+}
 
 fn write_json_file<T: Serialize>(dir: &Path, name: &str, value: &T) -> crate::Result<()> {
     let path = dir.join(name);
@@ -1423,6 +1465,156 @@ mod tests {
             let _ = fs::remove_file(&tmp);
             let _ = fs::remove_dir_all(&output_dir);
             let _ = fs::remove_dir_all(layout.root);
+        });
+    }
+
+    #[test]
+    fn bundle_reapplies_custom_policy_to_history_and_metadata() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("historical.db");
+            let secret = "PRIVATE_ORCHID";
+            let decorated = "PRIVATE_\u{1b}[31mORCHID\u{1b}[0m";
+            assert_eq!(Redactor::new().redact(secret), secret);
+            let storage = StorageHandle::new(db_path.to_str().unwrap()).await.unwrap();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1000,
+                    last_seen_at: 1000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let event_id = storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "custom.secret".to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: "alert".to_string(),
+                    severity: "warning".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some(secret.to_string()),
+                    segment_id: None,
+                    detected_at: 2000,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .unwrap();
+            storage
+                .record_audit_action(crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts: 2000,
+                    actor_kind: "workflow".to_string(),
+                    actor_id: None,
+                    correlation_id: None,
+                    pane_id: Some(1),
+                    domain: None,
+                    action_kind: "send_text".to_string(),
+                    policy_decision: "deny".to_string(),
+                    decision_reason: Some(format!("denied {decorated}")),
+                    rule_id: None,
+                    input_summary: Some(secret.to_string()),
+                    verification_summary: None,
+                    decision_context: Some(typed_decision_context_json(decorated)),
+                    result: "blocked".to_string(),
+                })
+                .await
+                .unwrap();
+            storage.shutdown().await.unwrap();
+            {
+                // Simulate old rows that predate terminal normalization as
+                // well as the newly configured custom redaction rule.
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute(
+                    "UPDATE events SET matched_text = ?1, extracted = ?2 WHERE id = ?3",
+                    rusqlite::params![
+                        format!("event {decorated}"),
+                        serde_json::json!({
+                            "nested": [{"token": decorated}, secret],
+                            "count": 3,
+                        })
+                        .to_string(),
+                        event_id,
+                    ],
+                )
+                .unwrap();
+            }
+            let storage = StorageHandle::new(db_path.to_str().unwrap()).await.unwrap();
+            let mut config = Config::default();
+            config.safety.redaction.patterns = vec![secret.to_string()];
+            config.safety.redaction.placeholder = "[workspace-hidden]".to_string();
+            config.patterns.packs = vec![format!("pack-{decorated}")];
+            let layout = WorkspaceLayout::new(
+                dir.path().join("workspace"),
+                &config.storage,
+                &config.ipc,
+            );
+            let output_dir = dir.path().join("bundle");
+            generate_bundle(
+                &config,
+                &layout,
+                &storage,
+                &DiagnosticOptions {
+                    output: Some(output_dir.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for name in [
+                "recent_events.json",
+                "traces/rule_traces.json",
+                "recent_audit.json",
+                "config_summary.json",
+            ] {
+                let text = fs::read_to_string(output_dir.join(name)).unwrap();
+                assert!(!text.contains("PRIVATE_"), "custom secret leaked in {name}");
+                assert!(!text.contains("\\u001b"), "terminal escape leaked in {name}");
+                assert!(text.contains("[workspace-hidden]"), "policy not applied in {name}");
+                let _: serde_json::Value = serde_json::from_str(&text).unwrap();
+            }
+            let events: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(output_dir.join("recent_events.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(events[0]["id"], event_id);
+            assert_eq!(events[0]["rule_id"], "custom.secret");
+            assert_eq!(events[0]["matched_text"], "event [workspace-hidden]");
+
+            // Invalid directly constructed policies fail before any bundle
+            // directory or partially sanitized output can be created.
+            config.safety.redaction.patterns = vec!["PRIVATE_[".to_string()];
+            let invalid_dir = dir.path().join("invalid-policy-bundle");
+            let error = generate_bundle(
+                &config,
+                &layout,
+                &storage,
+                &DiagnosticOptions {
+                    output: Some(invalid_dir.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE_"));
+            assert!(!invalid_dir.exists());
+            storage.shutdown().await.unwrap();
         });
     }
 
