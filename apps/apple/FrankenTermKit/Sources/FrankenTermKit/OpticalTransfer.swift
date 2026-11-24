@@ -415,6 +415,8 @@ public struct OpticalSender: Sendable {
     private let replayCyclePadding: [Int]
     private var sequences: [UInt32]
     private var repairPartsSinceReplay: [Int], nextSystematicReplay: [Int]
+    private var remainingFirstPassParts: Int
+    private var firstPassPosition = 0
     private var emitted = 0
     public init<C: AirGapCryptography>(envelope: Data, using crypto: C) throws {
         let header = try FTAGHeader(envelope: envelope)
@@ -428,6 +430,7 @@ public struct OpticalSender: Sendable {
             guard count > 1 else { return 0 }
             return (OpticalCadence.primeLength(atLeast: 9 * count, atMost: 10 * count) ?? 9 * count) - 9 * count
         }
+        remainingFirstPassParts = encoders.reduce(0) { $0 + $1.fragments.count }
         sequences = Array(repeating: 0, count: chunks.count)
         repairPartsSinceReplay = Array(repeating: 0, count: chunks.count)
         nextSystematicReplay = Array(repeating: 1, count: chunks.count)
@@ -444,7 +447,26 @@ public struct OpticalSender: Sendable {
         return text
     }
     public mutating func next<C: AirGapCryptography>(repairPage: Int? = nil, using crypto: C) throws -> String {
-        let page = repairPage ?? pageSchedule.page(at: emitted)
+        // During the first tour, skip visits to pages whose entire source has
+        // already aired. A tiny last page would otherwise consume the same
+        // airtime as a full page while the receiver still needs unseen parts.
+        // Every page occurs in the bounded schedule cycle. Use a local cursor
+        // so failed frame generation never consumes an emission.
+        var position = firstPassPosition
+        let page: Int
+        if let repairPage {
+            page = repairPage
+        } else if remainingFirstPassParts > 0 {
+            var candidate = pageSchedule.page(at: position)
+            while sequences[candidate] >= pages[candidate].fragments.count {
+                position = (position + 1) % pageSchedule.cycleLength
+                candidate = pageSchedule.page(at: position)
+            }
+            page = candidate
+            position = (position + 1) % pageSchedule.cycleLength
+        } else {
+            page = pageSchedule.page(at: emitted)
+        }
         guard pages.indices.contains(page), emitted < Int.max else { throw FTError.limit("qr.sequence") }
         let sourceCount = pages[page].fragments.count
         // After the first systematic pass, revisit a source fragment after
@@ -454,7 +476,7 @@ public struct OpticalSender: Sendable {
         // This is per page, including targeted repair; it never reseals bytes
         // or changes UR fragment selection, geometry or playback speed.
         let repairInterval = 8 + (nextSystematicReplay[page] <= replayCyclePadding[page] ? 1 : 0)
-        let replay = sourceCount == 1 || repairPartsSinceReplay[page] == repairInterval
+        let replay = sequences[page] >= sourceCount && (sourceCount == 1 || repairPartsSinceReplay[page] == repairInterval)
         let sequence: UInt32
         if replay { sequence = UInt32(nextSystematicReplay[page]) }
         else {
@@ -467,8 +489,10 @@ public struct OpticalSender: Sendable {
             nextSystematicReplay[page] = nextSystematicReplay[page] % sourceCount + 1
         } else {
             sequences[page] = sequence
-            if sequence > sourceCount { repairPartsSinceReplay[page] += 1 }
+            if sequence <= sourceCount { remainingFirstPassParts -= 1 }
+            else { repairPartsSinceReplay[page] += 1 }
         }
+        firstPassPosition = position
         emitted += 1
         return text
     }

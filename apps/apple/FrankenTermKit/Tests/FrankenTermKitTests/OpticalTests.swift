@@ -85,6 +85,42 @@ final class OpticalTests: XCTestCase {
         receiver.resetIncompletePage(1)
         XCTAssertEqual(receiver.verifiedBytes, 74)
     }
+    func testLosslessLiveFirstPassUsesEveryEmissionForNewCiphertext() throws {
+        // Single-part and multipart tails, including a full page before the tail.
+        for size in [32750, 40000, 65520, 70000] {
+            let envelope = try makeEnvelope(size: size)
+            var sender = try OpticalSender(envelope: envelope, using: crypto)
+            let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+            var receiver = OpticalReceiver(selecting: first)
+            for part in 1...sender.identity.sourcePartCount {
+                let frame = try OpticalFrame(text: sender.next(using: crypto))
+                try receiver.receive(frame, using: crypto)
+                XCTAssertEqual(receiver.receivedParts, part)
+            }
+            XCTAssertEqual(try receiver.envelope(using: crypto), envelope)
+        }
+    }
+
+    func testTargetedShortPageDoesNotConsumeOtherPagesFirstPass() throws {
+        let envelope = try makeEnvelope(size: 32750)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        let tail = try OpticalFrame(text: sender.next(repairPage: 1, using: crypto))
+        var receiver = OpticalReceiver(selecting: tail)
+        try receiver.receive(tail, using: crypto)
+        XCTAssertEqual(receiver.verifiedPages, 1)
+        // The operator can dwell on the one-part page for a late receiver.
+        for _ in 0..<12 {
+            let frame = try OpticalFrame(text: sender.next(repairPage: 1, using: crypto))
+            XCTAssertEqual(frame.pageIndex, 1)
+        }
+        for _ in 0..<(try sender.sourcePartCount(page: 0)) {
+            let frame = try OpticalFrame(text: sender.next(using: crypto))
+            XCTAssertEqual(frame.pageIndex, 0)
+            try receiver.receive(frame, using: crypto)
+        }
+        XCTAssertEqual(try receiver.envelope(using: crypto), envelope)
+    }
+
     func testWrapperRejectsAmbiguityAndNeverSwitchesSource() throws {
         let sender = try OpticalSender(envelope: makeEnvelope(size: 100), using: crypto)
         let text = try sender.frame(page: 0, sequence: 1, using: crypto)
@@ -234,7 +270,7 @@ final class OpticalTests: XCTestCase {
     }
 
     func testSenderSchedulingAndBounds() throws {
-        var sender = try OpticalSender(envelope: makeEnvelope(size: 40000), using: crypto)
+        var sender = try OpticalSender(envelope: makeEnvelope(size: 60000), using: crypto)
         let expectedPages = Array(repeating: 0, count: 8) + Array(repeating: 1, count: 16)
             + Array(repeating: 0, count: 8) + [0, 1, 0, 1, 0]
         for expected in expectedPages + expectedPages {
