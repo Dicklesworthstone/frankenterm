@@ -96,7 +96,7 @@ pub use mcp_bridge::{
     build_server, build_server_degraded, build_server_with_db,
     mcp_bridge_tools_skipped_no_db_count, run_stdio_server,
 };
-use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
+use mcp_middleware::AuditedToolHandler;
 #[cfg(test)]
 use mcp_middleware::{
     McpOutputFormat, augment_tool_schema_with_format, encode_mcp_contents,

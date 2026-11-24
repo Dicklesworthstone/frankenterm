@@ -222,7 +222,7 @@ use crate::mcp_framework::{
     FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 
-use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
+use super::mcp_middleware::{AuditedToolHandler, McpOutputPolicy};
 use crate::Result;
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_client::{
@@ -242,6 +242,7 @@ pub(super) async fn compose_proxy_tools(
     if !settings.proxy_enabled {
         return Ok(builder);
     }
+    let output = McpOutputPolicy::new(&config.safety.redaction)?;
 
     let fail_fast = settings.proxy_strict || !settings.proxy_fallback_to_local;
     if !settings.enabled {
@@ -544,7 +545,7 @@ pub(super) async fn compose_proxy_tools(
              the top of compose_proxy_tools",
         );
         for (exposed_name, handler) in mounted_handlers {
-            builder = builder.tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            builder = builder.tool(output.proxy_tool(AuditedToolHandler::new(
                 handler,
                 exposed_name,
                 Arc::clone(audit_path),

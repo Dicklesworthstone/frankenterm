@@ -3,11 +3,12 @@
 //! This stays as a thin extraction-only layer to reduce `mcp.rs` size while
 //! preserving behavior and registration order.
 
+use super::mcp_middleware::McpOutputPolicy;
 use super::mcp_tools::{
     MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
 };
 use super::{
-    AuditedToolHandler, Config, FormatAwareToolHandler, Result,
+    AuditedToolHandler, Config, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
     WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
     WaAttentionTool, WaAttestationRetractionsResource, WaAwaitEventTool, WaCassSearchTool,
@@ -295,6 +296,7 @@ async fn build_server_inner(
                 "MCP startup cancelled".to_string(),
             ),
         })?;
+    let output = McpOutputPolicy::new(&config.safety.redaction)?;
     let filter = config.ingest.panes.clone();
     let config = Arc::new(config.clone());
     let shared_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
@@ -324,27 +326,27 @@ async fn build_server_inner(
         .on_shutdown(|| {
             tracing::info!("MCP server shutting down");
         })
-        .tool(FormatAwareToolHandler::new(WaStateTool::new(
+        .tool(output.tool(WaStateTool::new(
             Arc::clone(&config),
             filter,
             db_path.clone(),
         )))
-        .tool(FormatAwareToolHandler::new(
+        .tool(output.tool(
             WaWaitForTool::new_with_shared_rate_limiter(
                 Arc::clone(&config),
                 db_path.clone(),
                 Arc::clone(&shared_rate_limiter),
             ),
         ))
-        .tool(FormatAwareToolHandler::new(WaRulesListTool))
-        .tool(FormatAwareToolHandler::new(WaSteerPlanTool::new(
+        .tool(output.tool(WaRulesListTool))
+        .tool(output.tool(WaSteerPlanTool::new(
             Arc::clone(&config),
         )))
-        .tool(FormatAwareToolHandler::new(WaRulesTestTool))
-        .tool(FormatAwareToolHandler::new(WaCassSearchTool))
-        .tool(FormatAwareToolHandler::new(WaCassViewTool))
-        .tool(FormatAwareToolHandler::new(WaCassStatusTool))
-        .tool(FormatAwareToolHandler::new(WaTxPlanTool::new(Arc::clone(
+        .tool(output.tool(WaRulesTestTool))
+        .tool(output.tool(WaCassSearchTool))
+        .tool(output.tool(WaCassViewTool))
+        .tool(output.tool(WaCassStatusTool))
+        .tool(output.tool(WaTxPlanTool::new(Arc::clone(
             &config,
         ))))
         // br-ft-p4y8d: WaTxRunTool, WaTxRollbackTool, WaMissionPauseTool,
@@ -356,12 +358,12 @@ async fn build_server_inner(
         // the audit stream was unavailable — violating the
         // br-ft-647cj degraded-mode contract. See
         // `DB_GATED_MUTATING_TOOL_NAMES` above.
-        .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
+        .tool(output.tool(WaTxShowTool::new(Arc::clone(
             &config,
         ))))
-        .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
-        .tool(FormatAwareToolHandler::new(WaOperatingEnvelopeTool))
-        .tool(FormatAwareToolHandler::new(
+        .tool(output.tool(WaMissionObjectivePlanTool))
+        .tool(output.tool(WaOperatingEnvelopeTool))
+        .tool(output.tool(
             WaAttentionTool::new(db_path.clone()).with_workspace_root(
                 mcp_attention_workspace_root(
                     config.as_ref(),
@@ -369,52 +371,52 @@ async fn build_server_inner(
                 ),
             ),
         ))
-        .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
+        .tool(output.tool(WaRehearsalScoreTool::new(
             Arc::clone(&config),
         )))
-        .tool(FormatAwareToolHandler::new(WaMissionStateTool::new(
+        .tool(output.tool(WaMissionStateTool::new(
             Arc::clone(&config),
         )))
-        .tool(FormatAwareToolHandler::new(WaMissionExplainTool::new(
+        .tool(output.tool(WaMissionExplainTool::new(
             Arc::clone(&config),
         )))
-        .legacy_resource(WaPanesResource::new(
+        .legacy_resource(output.resource(WaPanesResource::new(
             Arc::clone(&config),
             config.ingest.panes.clone(),
             db_path.clone(),
-        ))
-        .legacy_resource(WaWorkflowsResource::new(Arc::clone(&config)))
-        .legacy_resource(WaAgentMailOutboxResource::new(Arc::clone(&config)))
-        .legacy_resource(WaHerdWaveResource)
-        .legacy_resource(WaMissionObjectivePlanTemplateResource)
-        .legacy_resource(WaOperatingEnvelopeCurrentResource)
-        .legacy_resource(WaOperatingEnvelopeRunTemplateResource)
-        .legacy_resource(WaAttentionCurrentResource)
-        .legacy_resource(WaAttentionItemTemplateResource)
-        .legacy_resource(WaSwarmScentResource::new(
+        )))
+        .legacy_resource(output.resource(WaWorkflowsResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaAgentMailOutboxResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaHerdWaveResource))
+        .legacy_resource(output.resource(WaMissionObjectivePlanTemplateResource))
+        .legacy_resource(output.resource(WaOperatingEnvelopeCurrentResource))
+        .legacy_resource(output.resource(WaOperatingEnvelopeRunTemplateResource))
+        .legacy_resource(output.resource(WaAttentionCurrentResource))
+        .legacy_resource(output.resource(WaAttentionItemTemplateResource))
+        .legacy_resource(output.resource(WaSwarmScentResource::new(
             Arc::clone(&config),
             db_path.clone(),
-        ))
-        .legacy_resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))
-        .legacy_resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
-            &config,
         )))
-        .legacy_resource(WaSwarmCapacityCurrentResource)
-        .legacy_resource(WaSwarmCapacityRunTemplateResource)
-        .legacy_resource(WaRendererInputToPhotonResource)
-        .legacy_resource(WaRendererSsimParityResource)
-        .legacy_resource(WaProofHistoryResource::new(Arc::clone(&config)))
-        .legacy_resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
-            &config,
+        .legacy_resource(output.resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaRehearsalScoreSurfaceTemplateResource::new(
+            Arc::clone(&config),
         )))
-        .legacy_resource(WaProofHistoryTemplateResource::new(Arc::clone(&config)))
-        .legacy_resource(WaAttestationRetractionsResource::new(Arc::clone(&config)))
-        .legacy_resource(WaRulesResource)
-        .legacy_resource(WaRulesByAgentTemplateResource);
+        .legacy_resource(output.resource(WaSwarmCapacityCurrentResource))
+        .legacy_resource(output.resource(WaSwarmCapacityRunTemplateResource))
+        .legacy_resource(output.resource(WaRendererInputToPhotonResource))
+        .legacy_resource(output.resource(WaRendererSsimParityResource))
+        .legacy_resource(output.resource(WaProofHistoryResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaProofHistoryReleaseBlockingResource::new(
+            Arc::clone(&config),
+        )))
+        .legacy_resource(output.resource(WaProofHistoryTemplateResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaAttestationRetractionsResource::new(Arc::clone(&config))))
+        .legacy_resource(output.resource(WaRulesResource))
+        .legacy_resource(output.resource(WaRulesByAgentTemplateResource));
 
     if let Some(ref db_path) = db_path {
         builder = builder
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaGetTextTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Some(Arc::clone(db_path)),
@@ -423,7 +425,7 @@ async fn build_server_inner(
                 "wa.get_text",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaDomTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Some(Arc::clone(db_path)),
@@ -432,7 +434,7 @@ async fn build_server_inner(
                 "wa.dom",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaSearchTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -441,12 +443,12 @@ async fn build_server_inner(
                 "wa.search",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaEventsTool::new(Arc::clone(db_path)),
                 "wa.events",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new_with_response_delivery(
+            .tool(output.tool_with_response_delivery(
                 AuditedToolHandler::new(
                     WaAwaitEventTool::new_with_response_delivery(
                         Arc::clone(db_path),
@@ -457,7 +459,7 @@ async fn build_server_inner(
                 ),
                 Arc::clone(&response_delivery),
             ))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaEventsAnnotateTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -466,7 +468,7 @@ async fn build_server_inner(
                 "wa.events_annotate",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaEventsTriageTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -475,7 +477,7 @@ async fn build_server_inner(
                 "wa.events_triage",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaEventsLabelTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -484,12 +486,12 @@ async fn build_server_inner(
                 "wa.events_label",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaReservationsTool::new(Arc::clone(db_path)),
                 "wa.reservations",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaReserveTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -498,7 +500,7 @@ async fn build_server_inner(
                 "wa.reserve",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaReleaseTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -507,7 +509,7 @@ async fn build_server_inner(
                 "wa.release",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaSendTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -516,7 +518,7 @@ async fn build_server_inner(
                 "wa.send",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaWorkflowRunTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -525,17 +527,17 @@ async fn build_server_inner(
                 "wa.workflow_run",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaWorkflowStatusTool::new(Arc::clone(db_path)),
                 "wa.workflow_status",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaAccountsTool::new(Arc::clone(db_path)),
                 "wa.accounts",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaAccountsRefreshTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(db_path),
@@ -552,7 +554,7 @@ async fn build_server_inner(
             // `db_path` (their constructors take Config + rate
             // limiter), but AuditedToolHandler needs it to write
             // the audit records. See DB_GATED_MUTATING_TOOL_NAMES.
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaTxRunTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -560,7 +562,7 @@ async fn build_server_inner(
                 "wa.tx_run",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaTxRollbackTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -568,7 +570,7 @@ async fn build_server_inner(
                 "wa.tx_rollback",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaMissionPauseTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -576,7 +578,7 @@ async fn build_server_inner(
                 "wa.mission_pause",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaMissionResumeTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -584,7 +586,7 @@ async fn build_server_inner(
                 "wa.mission_resume",
                 Arc::clone(db_path),
             )))
-            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+            .tool(output.tool(AuditedToolHandler::new(
                 WaMissionAbortTool::new_with_shared_rate_limiter(
                     Arc::clone(&config),
                     Arc::clone(&shared_rate_limiter),
@@ -592,17 +594,19 @@ async fn build_server_inner(
                 "wa.mission_abort",
                 Arc::clone(db_path),
             )))
-            .legacy_resource(WaEventsResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaAccountsResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
-                db_path,
+            .legacy_resource(output.resource(WaEventsResource::new(Arc::clone(db_path))))
+            .legacy_resource(output.resource(WaEventsTemplateResource::new(Arc::clone(db_path))))
+            .legacy_resource(output.resource(WaEventsUnhandledTemplateResource::new(
+                Arc::clone(db_path),
             )))
-            .legacy_resource(WaContextHorizonResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaReservationsResource::new(Arc::clone(db_path)))
-            .legacy_resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
-                db_path,
+            .legacy_resource(output.resource(WaAccountsResource::new(Arc::clone(db_path))))
+            .legacy_resource(output.resource(WaAccountsByServiceTemplateResource::new(
+                Arc::clone(db_path),
+            )))
+            .legacy_resource(output.resource(WaContextHorizonResource::new(Arc::clone(db_path))))
+            .legacy_resource(output.resource(WaReservationsResource::new(Arc::clone(db_path))))
+            .legacy_resource(output.resource(WaReservationsByPaneTemplateResource::new(
+                Arc::clone(db_path),
             )));
     } else {
         // br-ft-647cj: db_path=None is the degraded-mode startup
@@ -631,7 +635,7 @@ async fn build_server_inner(
              Only the read-only/no-storage base catalog is registered. \
              Configure a database path to enable the full audited catalog."
         );
-        builder = builder.tool(FormatAwareToolHandler::new(
+        builder = builder.tool(output.tool(
             WaGetTextTool::new_with_shared_rate_limiter(
                 Arc::clone(&config),
                 None,
@@ -812,6 +816,43 @@ mod tests {
             ));
         });
         assert_eq!(mcp_bridge_tools_skipped_no_db_count(), before);
+    }
+
+    #[test]
+    fn configured_mcp_rejects_invalid_redaction_before_catalog_registration() {
+        let _guard = mcp_bridge_counter_test_lock();
+        let before = mcp_bridge_tools_skipped_no_db_count();
+        let mut invalid_regex = Config::default();
+        invalid_regex.safety.redaction.patterns = vec!["orchid-private-value[".to_string()];
+        let mut blank_placeholder = Config::default();
+        blank_placeholder.safety.redaction.placeholder = " \t ".to_string();
+        let mut disabled = Config::default();
+        disabled.safety.redaction.enabled = false;
+        let mut disabled_audit = Config::default();
+        disabled_audit.safety.redaction.redact_audit = false;
+        let mut disabled_segments = Config::default();
+        disabled_segments.safety.redaction.redact_segments = false;
+
+        for config in [
+            invalid_regex, blank_placeholder, disabled, disabled_audit, disabled_segments,
+        ] {
+            for result in [
+                build_server_degraded(&config),
+                build_server_with_db(&config, Some(PathBuf::from("/unused/mcp-redaction.db"))),
+            ] {
+                let message = match result {
+                    Ok(_) => panic!("invalid redaction policy must prevent MCP startup"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(message.contains("safety.redaction"));
+                assert!(!message.contains("orchid-private-value"));
+            }
+        }
+        assert_eq!(
+            mcp_bridge_tools_skipped_no_db_count(),
+            before,
+            "invalid safety policy must fail before registering the degraded catalog"
+        );
     }
 
     #[test]
