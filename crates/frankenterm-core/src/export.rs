@@ -470,10 +470,8 @@ pub fn redact_audit_stream_record(
         .decision_context
         .take()
         .map(|text| redact_json_text(&text, redactor));
-    let mut record = crate::storage::AuditStreamRecord::from_action(
-        action,
-        &AuditOutputRedactor(redactor),
-    );
+    let mut record =
+        crate::storage::AuditStreamRecord::from_action(action, &AuditOutputRedactor(redactor));
     record.decision_context = context;
     record
 }
@@ -550,7 +548,10 @@ mod tests {
         let mut raw_output = Vec::new();
         write_redacted_record(&mut raw_output, &record, false, None).expect("explicit raw export");
         let decoded_raw: serde_json::Value = serde_json::from_slice(&raw_output).unwrap();
-        assert_eq!(decoded_raw, record, "no-redact must preserve retained evidence");
+        assert_eq!(
+            decoded_raw, record,
+            "no-redact must preserve retained evidence"
+        );
     }
 
     #[test]
@@ -559,7 +560,8 @@ mod tests {
         config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
         config.placeholder = "<workspace-secret>".to_string();
         let redactor = config.build_redactor().unwrap();
-        let encoded = r#"{"ansi":"ORBIT\u001b[31mCANARY867530","escaped":"\u004fRBITCANARY867530"}"#;
+        let encoded =
+            r#"{"ansi":"ORBIT\u001b[31mCANARY867530","escaped":"\u004fRBITCANARY867530"}"#;
         let record = serde_json::json!({
             "decision_context": encoded,
             "wait_condition": encoded,
@@ -680,7 +682,11 @@ mod tests {
         let step = redact_step_log(step, &redactor);
         assert_eq!(step.step_name, "<workspace-secret>");
         assert_eq!(step.error_code.as_deref(), Some("<workspace-secret>"));
-        for text in [step.result_data, step.policy_summary, step.verification_refs] {
+        for text in [
+            step.result_data,
+            step.policy_summary,
+            step.verification_refs,
+        ] {
             let inner: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
             assert_eq!(inner["detail"], "<workspace-secret>");
         }

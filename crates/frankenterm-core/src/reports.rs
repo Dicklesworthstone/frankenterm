@@ -1160,7 +1160,10 @@ mod tests {
                 .await
                 .unwrap();
             storage.append_segment(1, "before gap", None).await.unwrap();
-            storage.record_gap(1, &format!("gap {decorated}")).await.unwrap();
+            storage
+                .record_gap(1, &format!("gap {decorated}"))
+                .await
+                .unwrap();
             storage
                 .record_audit_action(crate::storage::AuditActionRecord {
                     id: 0,
@@ -1221,7 +1224,10 @@ mod tests {
                 "gap [workspace-hidden]",
                 "denial [workspace-hidden]",
             ] {
-                assert!(report.contains(expected), "missing redacted field: {expected}");
+                assert!(
+                    report.contains(expected),
+                    "missing redacted field: {expected}"
+                );
             }
             assert!(!report.contains("PRIVATE_"));
             assert!(!report.contains('\u{1b}'));

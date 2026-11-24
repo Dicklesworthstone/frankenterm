@@ -2388,7 +2388,10 @@ fn an_unrelated_correlated_reply_cannot_silently_settle_negotiation() {
         let late_version = withhold_mux_reply(&mut harness, ident::GET_CODEC_VERSION);
         let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
         reader.push(&late_version);
-        let version = reader.next_frame().unwrap().expect("the real version reply");
+        let version = reader
+            .next_frame()
+            .unwrap()
+            .expect("the real version reply");
         assert_eq!(version.ident, ident::GET_CODEC_VERSION_RESPONSE);
         assert!(reader.next_frame().unwrap().is_none());
         let wrong = if unexpected == ident::UNIT_RESPONSE {
@@ -2404,8 +2407,10 @@ fn an_unrelated_correlated_reply_cannot_silently_settle_negotiation() {
             )
         };
         harness.session.receive(&wrong);
-        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
-            if reason.contains("protocol check") && reason.contains("unexpected reply")));
+        assert!(
+            matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains("protocol check") && reason.contains("unexpected reply"))
+        );
         assert!(!harness.session.is_ready());
         assert_eq!(harness.session.next_input_wake_ns(), None);
         assert!(harness.session.take_outgoing().is_empty());

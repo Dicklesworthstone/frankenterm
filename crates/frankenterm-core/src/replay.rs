@@ -2073,7 +2073,11 @@ mod tests {
             ),
             (100, FrameType::Marker, custom.as_bytes().to_vec()),
             (200, FrameType::Output, b"fixture-123".to_vec()),
-            (300, FrameType::Output, b"safe \x1b[32mgreen\x1b[0m".to_vec()),
+            (
+                300,
+                FrameType::Output,
+                b"safe \x1b[32mgreen\x1b[0m".to_vec(),
+            ),
         ]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {

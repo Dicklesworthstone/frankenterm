@@ -518,7 +518,9 @@ fn redact_audit(
         policy_decision: action.policy_decision,
         result: action.result,
         pane_id: action.pane_id,
-        input_summary: action.input_summary.map(|text| redact_text(&text, redactor)),
+        input_summary: action
+            .input_summary
+            .map(|text| redact_text(&text, redactor)),
         decision_reason: action
             .decision_reason
             .map(|text| redact_text(&text, redactor)),
@@ -607,7 +609,12 @@ pub async fn generate_bundle_with_cx(
     file_count += 1;
 
     let config_summary = summarize_config(config);
-    write_redacted_json_file(&output_dir, "config_summary.json", &config_summary, &redactor)?;
+    write_redacted_json_file(
+        &output_dir,
+        "config_summary.json",
+        &config_summary,
+        &redactor,
+    )?;
     file_count += 1;
 
     let db_path = Path::new(storage.db_path());
@@ -1561,11 +1568,8 @@ mod tests {
             config.safety.redaction.patterns = vec![secret.to_string()];
             config.safety.redaction.placeholder = "[workspace-hidden]".to_string();
             config.patterns.packs = vec![format!("pack-{decorated}")];
-            let layout = WorkspaceLayout::new(
-                dir.path().join("workspace"),
-                &config.storage,
-                &config.ipc,
-            );
+            let layout =
+                WorkspaceLayout::new(dir.path().join("workspace"), &config.storage, &config.ipc);
             let output_dir = dir.path().join("bundle");
             generate_bundle(
                 &config,
@@ -1587,8 +1591,14 @@ mod tests {
             ] {
                 let text = fs::read_to_string(output_dir.join(name)).unwrap();
                 assert!(!text.contains("PRIVATE_"), "custom secret leaked in {name}");
-                assert!(!text.contains("\\u001b"), "terminal escape leaked in {name}");
-                assert!(text.contains("[workspace-hidden]"), "policy not applied in {name}");
+                assert!(
+                    !text.contains("\\u001b"),
+                    "terminal escape leaked in {name}"
+                );
+                assert!(
+                    text.contains("[workspace-hidden]"),
+                    "policy not applied in {name}"
+                );
                 let _: serde_json::Value = serde_json::from_str(&text).unwrap();
             }
             let events: serde_json::Value = serde_json::from_str(

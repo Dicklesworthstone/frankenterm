@@ -326,7 +326,9 @@ fn stored_event_to_vc_record(
         segment_id: event.segment_id,
         dedupe_key: event.dedupe_key,
         handled_at: event.handled_at,
-        handled_status: event.handled_status.map(|text| redact_text(redactor, &text)),
+        handled_status: event
+            .handled_status
+            .map(|text| redact_text(redactor, &text)),
         matched_text,
         extracted,
     }
@@ -1142,8 +1144,14 @@ mod tests {
         assert_eq!(record.event_id, 44);
         assert_eq!(record.rule_id, "agent.secret_check");
         assert_eq!(record.dedupe_key.as_deref(), Some("stable-dedupe-key"));
-        assert_eq!(record.matched_text.as_deref(), Some("matched [workspace-hidden]"));
-        assert_eq!(record.handled_status.as_deref(), Some("handled [workspace-hidden]"));
+        assert_eq!(
+            record.matched_text.as_deref(),
+            Some("matched [workspace-hidden]")
+        );
+        assert_eq!(
+            record.handled_status.as_deref(),
+            Some("handled [workspace-hidden]")
+        );
         let extracted = record.extracted.as_ref().unwrap();
         assert_eq!(extracted["nested"][0]["value"], "[workspace-hidden]");
         assert_eq!(extracted["nested"][1], "[workspace-hidden]");
@@ -1242,12 +1250,10 @@ mod tests {
                 redaction_config: config.safety.redaction,
                 ..Default::default()
             };
-            let storage = StorageHandle::with_config(
-                db_path.to_str().unwrap(),
-                storage_config.clone(),
-            )
-            .await
-            .unwrap();
+            let storage =
+                StorageHandle::with_config(db_path.to_str().unwrap(), storage_config.clone())
+                    .await
+                    .unwrap();
 
             // Reject invalid limits (0 and > VC_EXPORT_MAX_LIMIT).
             assert_eq!(
@@ -1449,10 +1455,9 @@ mod tests {
                 )
                 .unwrap();
             }
-            let storage =
-                StorageHandle::with_config(db_path.to_str().unwrap(), storage_config)
-                    .await
-                    .unwrap();
+            let storage = StorageHandle::with_config(db_path.to_str().unwrap(), storage_config)
+                .await
+                .unwrap();
             let legacy = export_events_page_with_cx(
                 &cx,
                 &storage,

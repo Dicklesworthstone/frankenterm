@@ -84,8 +84,7 @@ impl McpOutputPolicy {
     }
 }
 
-const MCP_OUTPUT_REDACTION_MAX_BYTES: usize =
-    crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE;
+const MCP_OUTPUT_REDACTION_MAX_BYTES: usize = crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE;
 const MCP_OUTPUT_REDACTION_MAX_DEPTH: usize = 64;
 const MCP_OUTPUT_REDACTION_MAX_NODES: usize = 100_000;
 const MCP_OUTPUT_REDACTION_ERROR: &str = "MCP output could not be safely redacted";
@@ -114,10 +113,7 @@ fn output_checkpoint(ctx: &McpContext) -> McpResult<()> {
 
 /// Count actual serialized bytes, including escaping and all content blocks,
 /// without allocating another response-sized buffer.
-fn check_output_size<T: serde::Serialize + ?Sized>(
-    ctx: &McpContext,
-    value: &T,
-) -> McpResult<()> {
+fn check_output_size<T: serde::Serialize + ?Sized>(ctx: &McpContext, value: &T) -> McpResult<()> {
     struct BoundedWriter(usize);
 
     impl std::io::Write for BoundedWriter {
@@ -162,8 +158,7 @@ fn redact_output_text(text: &str, redactor: &Redactor) -> McpResult<String> {
 fn output_field_is_identity(key: &str) -> bool {
     matches!(
         key,
-        "id"
-            | "uri"
+        "id" | "uri"
             | "status"
             | "state"
             | "schema"
@@ -190,8 +185,20 @@ fn output_field_is_identity(key: &str) -> bool {
             | "final_cursor_scope"
             | "claim_delivery"
     ) || [
-        "_id", "_ids", "_uuid", "_uuids", "_status", "_state", "_version", "_type",
-        "_code", "_mode", "_cursor", "_cursor_epoch", "_cursor_scope", "_token",
+        "_id",
+        "_ids",
+        "_uuid",
+        "_uuids",
+        "_status",
+        "_state",
+        "_version",
+        "_type",
+        "_code",
+        "_mode",
+        "_cursor",
+        "_cursor_epoch",
+        "_cursor_scope",
+        "_token",
     ]
     .iter()
     .any(|suffix| key.ends_with(*suffix))
@@ -288,7 +295,15 @@ fn redact_output_json_text(
         Err(_) => return Err(output_redaction_error()),
     };
     let mut changed = false;
-    redact_output_json(ctx, &mut value, redactor, 0, remaining_nodes, false, &mut changed)?;
+    redact_output_json(
+        ctx,
+        &mut value,
+        redactor,
+        0,
+        remaining_nodes,
+        false,
+        &mut changed,
+    )?;
     if !changed && !value.is_object() && !value.is_array() {
         // Scalar JSON can retain its original spelling and whitespace. For
         // objects/arrays always serialize the inspected tree: serde discards
@@ -327,7 +342,13 @@ fn redact_output_error(ctx: &McpContext, mut error: McpError, redactor: &Redacto
         let mut remaining_nodes = MCP_OUTPUT_REDACTION_MAX_NODES;
         let mut changed = false;
         let safe = redact_output_json(
-            ctx, &mut data, redactor, 0, &mut remaining_nodes, false, &mut changed,
+            ctx,
+            &mut data,
+            redactor,
+            0,
+            &mut remaining_nodes,
+            false,
+            &mut changed,
         )
         .and_then(|()| check_output_size(ctx, &data));
         if safe.is_err() || message.is_err() {
@@ -636,20 +657,16 @@ impl<T: ToolHandler> ToolHandler for FormatAwareToolHandler<T> {
         // Redact decoded JSON before format conversion so escaped strings,
         // extension fields and error envelopes obey this server's policy in
         // both JSON and TOON. A refusal must release any prepared event lease.
-        let contents = match redact_tool_contents(
-            ctx,
-            contents,
-            &self.redactor,
-            self.allow_plain_text,
-        ) {
-            Ok(contents) => contents,
-            Err(error) => {
-                if let Some(response_delivery) = &self.response_delivery {
-                    response_delivery.fail_prepared();
+        let contents =
+            match redact_tool_contents(ctx, contents, &self.redactor, self.allow_plain_text) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    if let Some(response_delivery) = &self.response_delivery {
+                        response_delivery.fail_prepared();
+                    }
+                    return output_refusal_contents(error, elapsed_ms(start));
                 }
-                return output_refusal_contents(error, elapsed_ms(start));
-            }
-        };
+            };
         let (encoded, faithful) = encode_mcp_contents_with_delivery_status(contents, format);
         match encoded {
             Ok(contents) => {
@@ -1209,12 +1226,17 @@ mod tests {
             output_test_tool()
         }
 
-        fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
             if let Some((coordinator, completion)) = &self.delivery {
                 let completion = Arc::clone(completion);
                 let action = Box::new(move |outcome| {
-                    *completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(outcome);
+                    *completion
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
                 });
                 if let Err(action) = coordinator.try_prepare(action) {
                     action(FrameworkResponseDeliveryOutcome::Failed);
@@ -1232,7 +1254,11 @@ mod tests {
             output_test_tool()
         }
 
-        fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
             let mut error = McpError::internal_error("backend orchid-\x1b[31mprivate-value\x1b[0m");
             error.data = Some(self.0.clone());
             Err(error)
@@ -1291,7 +1317,10 @@ mod tests {
     #[test]
     fn configured_mcp_output_redacts_custom_secrets_before_json_and_toon() {
         let builtin = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
-        assert_eq!(crate::redactor::Redactor::new().redact(CUSTOM_SECRET), CUSTOM_SECRET);
+        assert_eq!(
+            crate::redactor::Redactor::new().redact(CUSTOM_SECRET),
+            CUSTOM_SECRET
+        );
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
         let payload = serde_json::json!({
             "ok": true,
@@ -1321,7 +1350,10 @@ mod tests {
             assert!(!text.contains(CUSTOM_SECRET));
             assert!(!text.contains(builtin));
             if format == "json" {
-                assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(), expected);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                    expected
+                );
             } else {
                 assert_eq!(text, toon_rust::encode(expected.clone(), None));
             }
@@ -1360,7 +1392,10 @@ mod tests {
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
         let contents = output
             .tool(super::super::mcp_tools::WaRulesListTool)
-            .call(&output_context(), serde_json::json!({"agent_type": CUSTOM_SECRET}))
+            .call(
+                &output_context(),
+                serde_json::json!({"agent_type": CUSTOM_SECRET}),
+            )
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(output_text(&contents)).unwrap();
         assert_eq!(value["ok"], false);
@@ -1395,7 +1430,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, McpError::internal_error("").code);
         assert_eq!(error.message, "backend $0");
-        assert_eq!(error.data, Some(serde_json::json!({"details": ["$0"], "pane_id": 42})));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"details": ["$0"], "pane_id": 42}))
+        );
 
         let mut deep = serde_json::json!(CUSTOM_SECRET);
         for _ in 0..MCP_OUTPUT_REDACTION_MAX_DEPTH + 1 {
@@ -1419,7 +1457,10 @@ mod tests {
             mime_type: "application/json; charset=utf-8".to_string(),
         });
         assert_eq!(handler.definition().uri, "wa://test/output");
-        assert_eq!(handler.template().unwrap().uri_template, "wa://test/output/{item}");
+        assert_eq!(
+            handler.template().unwrap().uri_template,
+            "wa://test/output/{item}"
+        );
         let expected = serde_json::json!({"data": {"text": "$0"}});
         let direct = handler.read(&output_context()).unwrap();
         assert_eq!(
@@ -1435,11 +1476,16 @@ mod tests {
             .unwrap();
         assert_eq!(templated[0].uri, "wa://test/output/1");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(templated[0].text.as_deref().unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(templated[0].text.as_deref().unwrap())
+                .unwrap(),
             expected
         );
         let error = handler
-            .read_with_uri(&output_context(), &format!("wa://test/{CUSTOM_SECRET}"), &params)
+            .read_with_uri(
+                &output_context(),
+                &format!("wa://test/{CUSTOM_SECRET}"),
+                &params,
+            )
             .unwrap_err();
         assert_eq!(error.message, MCP_OUTPUT_REDACTION_ERROR);
     }
@@ -1449,16 +1495,33 @@ mod tests {
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
         let mut cases = vec![serde_json::json!({(CUSTOM_SECRET): "safe", "$0": "other"})];
         for key in [
-            "workflow_id", "pane_uuids", "status", "schema_version", "schemaVersion",
-            "protocolVersion", "code", "cursor", "epoch", "scope", "cursor_epoch",
-            "cursor_scope", "dedupe_key", "record_key", "next_cursor_epoch",
-            "next_cursor_scope", "final_cursor_epoch", "final_cursor_scope", "claim_delivery",
+            "workflow_id",
+            "pane_uuids",
+            "status",
+            "schema_version",
+            "schemaVersion",
+            "protocolVersion",
+            "code",
+            "cursor",
+            "epoch",
+            "scope",
+            "cursor_epoch",
+            "cursor_scope",
+            "dedupe_key",
+            "record_key",
+            "next_cursor_epoch",
+            "next_cursor_scope",
+            "final_cursor_epoch",
+            "final_cursor_scope",
+            "claim_delivery",
         ] {
             cases.push(serde_json::json!({(key): CUSTOM_SECRET}));
         }
         for data in cases {
             let contents = output
-                .tool(OutputFixtureTool::json(serde_json::json!({"ok": true, "data": data})))
+                .tool(OutputFixtureTool::json(
+                    serde_json::json!({"ok": true, "data": data}),
+                ))
                 .call(&output_context(), serde_json::json!({}))
                 .unwrap();
             let value: serde_json::Value = serde_json::from_str(output_text(&contents)).unwrap();
@@ -1473,7 +1536,9 @@ mod tests {
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
         let safe = "\x1b[31mordinary text\x1b[0m";
         let contents = output
-            .tool(OutputFixtureTool::json(serde_json::json!({"data": {"text": safe}})))
+            .tool(OutputFixtureTool::json(
+                serde_json::json!({"data": {"text": safe}}),
+            ))
             .call(&output_context(), serde_json::json!({}))
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(output_text(&contents)).unwrap();
@@ -1491,7 +1556,9 @@ mod tests {
         wide.push(serde_json::json!(CUSTOM_SECRET));
         for data in [deep, serde_json::Value::Array(wide)] {
             let contents = output
-                .tool(OutputFixtureTool::json(serde_json::json!({"ok": true, "data": data})))
+                .tool(OutputFixtureTool::json(
+                    serde_json::json!({"ok": true, "data": data}),
+                ))
                 .call(&output_context(), serde_json::json!({}))
                 .unwrap();
             let value: serde_json::Value = serde_json::from_str(output_text(&contents)).unwrap();
@@ -1507,7 +1574,9 @@ mod tests {
         let text = "\0".repeat(MCP_OUTPUT_REDACTION_MAX_BYTES / 6 + 1);
         assert!(text.len() < MCP_OUTPUT_REDACTION_MAX_BYTES);
         assert_eq!(
-            check_output_size(&output_context(), &text).unwrap_err().message,
+            check_output_size(&output_context(), &text)
+                .unwrap_err()
+                .message,
             MCP_OUTPUT_REDACTION_ERROR
         );
     }
@@ -1518,7 +1587,9 @@ mod tests {
         let contents = output
             .proxy_tool(OutputFixtureTool {
                 contents: vec![
-                    Content::Text { text: "orchid-\x1b[31mprivate-value".to_string() },
+                    Content::Text {
+                        text: "orchid-\x1b[31mprivate-value".to_string(),
+                    },
                     Content::Resource {
                         resource: ResourceContent {
                             uri: "wa://remote/safe".to_string(),
@@ -1557,11 +1628,7 @@ mod tests {
     #[test]
     fn configured_mcp_output_preserves_unchanged_proxy_json_scalars_exactly() {
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
-        for text in [
-            "1.00",
-            " 42\n",
-            "\"ordinary text\"",
-        ] {
+        for text in ["1.00", " 42\n", "\"ordinary text\""] {
             let contents = output
                 .proxy_tool(OutputFixtureTool::text(text.to_string()))
                 .call(&output_context(), serde_json::json!({"format": "json"}))
@@ -1590,12 +1657,21 @@ mod tests {
         for (payload, expected) in cases {
             for proxy in [false, true] {
                 let inner = OutputFixtureTool::text(payload.to_string());
-                let handler = if proxy { output.proxy_tool(inner) } else { output.tool(inner) };
-                let contents = handler.call(&output_context(), serde_json::json!({})).unwrap();
+                let handler = if proxy {
+                    output.proxy_tool(inner)
+                } else {
+                    output.tool(inner)
+                };
+                let contents = handler
+                    .call(&output_context(), serde_json::json!({}))
+                    .unwrap();
                 let text = output_text(&contents);
                 assert!(!text.contains(CUSTOM_SECRET));
                 assert!(!text.contains("private-value"));
-                assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(), expected);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                    expected
+                );
             }
         }
     }
@@ -1627,16 +1703,25 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(output_text(&contents)).unwrap();
             if refused {
                 assert_eq!(value["ok"], false);
-                assert_eq!(*completion.lock().unwrap(), Some(FrameworkResponseDeliveryOutcome::Failed));
+                assert_eq!(
+                    *completion.lock().unwrap(),
+                    Some(FrameworkResponseDeliveryOutcome::Failed)
+                );
             } else {
-                assert_eq!(value, serde_json::json!({
-                    "ok": true, "data": {"final_cursor_epoch": "safe"}
-                }));
+                assert_eq!(
+                    value,
+                    serde_json::json!({
+                        "ok": true, "data": {"final_cursor_epoch": "safe"}
+                    })
+                );
                 assert_eq!(*completion.lock().unwrap(), None);
             }
             assert!(!coordinator.activate_prepared());
             coordinator.fail_all();
-            assert_eq!(*completion.lock().unwrap(), Some(FrameworkResponseDeliveryOutcome::Failed));
+            assert_eq!(
+                *completion.lock().unwrap(),
+                Some(FrameworkResponseDeliveryOutcome::Failed)
+            );
         }
     }
 
@@ -1661,9 +1746,8 @@ mod tests {
             expected["data"]["events"][0]["matched_text"] = serde_json::json!("$0");
             let contents = output
                 .tool_with_response_delivery(
-                    OutputFixtureTool::json(payload).with_delivery(
-                        Arc::clone(&coordinator), Arc::clone(&completion),
-                    ),
+                    OutputFixtureTool::json(payload)
+                        .with_delivery(Arc::clone(&coordinator), Arc::clone(&completion)),
                     Arc::clone(&coordinator),
                 )
                 .call(&output_context(), serde_json::json!({"format": format}))
@@ -1677,9 +1761,15 @@ mod tests {
                 assert_eq!(output_text(&contents), toon_rust::encode(expected, None));
             }
             assert_eq!(*completion.lock().unwrap(), None);
-            assert!(!coordinator.activate_prepared(), "delivery must already be armed");
+            assert!(
+                !coordinator.activate_prepared(),
+                "delivery must already be armed"
+            );
             coordinator.fail_all();
-            assert_eq!(*completion.lock().unwrap(), Some(FrameworkResponseDeliveryOutcome::Failed));
+            assert_eq!(
+                *completion.lock().unwrap(),
+                Some(FrameworkResponseDeliveryOutcome::Failed)
+            );
         }
     }
 
@@ -1687,8 +1777,14 @@ mod tests {
     fn configured_mcp_output_refusal_releases_prepared_delivery() {
         let output = configured_output_policy(CUSTOM_SECRET, "$0");
         for key in [
-            "final_cursor_epoch", "cursor", "cursor_epoch", "cursor_scope",
-            "epoch", "scope", "dedupe_key", "record_key",
+            "final_cursor_epoch",
+            "cursor",
+            "cursor_epoch",
+            "cursor_scope",
+            "epoch",
+            "scope",
+            "dedupe_key",
+            "record_key",
         ] {
             let coordinator = Arc::new(FrameworkResponseDeliveryCoordinator::default());
             let completion = Arc::new(Mutex::new(None));
@@ -1710,7 +1806,10 @@ mod tests {
                 *completion.lock().unwrap(),
                 Some(FrameworkResponseDeliveryOutcome::Failed)
             );
-            assert!(!coordinator.activate_prepared(), "{key}: refused output must release its lease");
+            assert!(
+                !coordinator.activate_prepared(),
+                "{key}: refused output must release its lease"
+            );
         }
     }
 
@@ -1732,7 +1831,10 @@ mod tests {
             .call(&McpContext::new(cx, 1), serde_json::json!({}))
             .unwrap_err();
         assert_eq!(error.code, McpError::request_cancelled().code);
-        assert_eq!(*completion.lock().unwrap(), Some(FrameworkResponseDeliveryOutcome::Failed));
+        assert_eq!(
+            *completion.lock().unwrap(),
+            Some(FrameworkResponseDeliveryOutcome::Failed)
+        );
         assert!(!coordinator.activate_prepared());
     }
 

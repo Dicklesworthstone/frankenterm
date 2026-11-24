@@ -8,20 +8,19 @@ use super::mcp_tools::{
     MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
 };
 use super::{
-    Config, Result,
-    WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
-    WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
-    WaAttentionTool, WaAttestationRetractionsResource, WaAwaitEventTool, WaCassSearchTool,
-    WaCassStatusTool, WaCassViewTool, WaContextHorizonResource, WaDomTool, WaEventsAnnotateTool,
-    WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource, WaEventsTool,
-    WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool, WaHerdWaveResource,
-    WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTemplateResource,
-    WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-    WaOperatingEnvelopeCurrentResource, WaOperatingEnvelopeRunTemplateResource,
-    WaOperatingEnvelopeTool, WaPanesResource, WaProofHistoryReleaseBlockingResource,
-    WaProofHistoryResource, WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
-    WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool, WaReleaseTool,
-    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    Config, Result, WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource,
+    WaAccountsTool, WaAgentMailOutboxResource, WaAttentionCurrentResource,
+    WaAttentionItemTemplateResource, WaAttentionTool, WaAttestationRetractionsResource,
+    WaAwaitEventTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaContextHorizonResource,
+    WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource,
+    WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool,
+    WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
+    WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool, WaMissionPauseTool,
+    WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeCurrentResource,
+    WaOperatingEnvelopeRunTemplateResource, WaOperatingEnvelopeTool, WaPanesResource,
+    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
+    WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool,
+    WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool,
@@ -331,24 +330,18 @@ async fn build_server_inner(
             filter,
             db_path.clone(),
         )))
-        .tool(output.tool(
-            WaWaitForTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                db_path.clone(),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
-        .tool(output.tool(WaRulesListTool))
-        .tool(output.tool(WaSteerPlanTool::new(
+        .tool(output.tool(WaWaitForTool::new_with_shared_rate_limiter(
             Arc::clone(&config),
+            db_path.clone(),
+            Arc::clone(&shared_rate_limiter),
         )))
+        .tool(output.tool(WaRulesListTool))
+        .tool(output.tool(WaSteerPlanTool::new(Arc::clone(&config))))
         .tool(output.tool(WaRulesTestTool))
         .tool(output.tool(WaCassSearchTool))
         .tool(output.tool(WaCassViewTool))
         .tool(output.tool(WaCassStatusTool))
-        .tool(output.tool(WaTxPlanTool::new(Arc::clone(
-            &config,
-        ))))
+        .tool(output.tool(WaTxPlanTool::new(Arc::clone(&config))))
         // br-ft-p4y8d: WaTxRunTool, WaTxRollbackTool, WaMissionPauseTool,
         // WaMissionResumeTool, WaMissionAbortTool moved to the
         // `if let Some(ref db_path)` branch below and wrapped in
@@ -358,28 +351,20 @@ async fn build_server_inner(
         // the audit stream was unavailable — violating the
         // br-ft-647cj degraded-mode contract. See
         // `DB_GATED_MUTATING_TOOL_NAMES` above.
-        .tool(output.tool(WaTxShowTool::new(Arc::clone(
-            &config,
-        ))))
+        .tool(output.tool(WaTxShowTool::new(Arc::clone(&config))))
         .tool(output.tool(WaMissionObjectivePlanTool))
         .tool(output.tool(WaOperatingEnvelopeTool))
-        .tool(output.tool(
-            WaAttentionTool::new(db_path.clone()).with_workspace_root(
+        .tool(
+            output.tool(WaAttentionTool::new(db_path.clone()).with_workspace_root(
                 mcp_attention_workspace_root(
                     config.as_ref(),
                     db_path.as_deref().map(PathBuf::as_path),
                 ),
-            ),
-        ))
-        .tool(output.tool(WaRehearsalScoreTool::new(
-            Arc::clone(&config),
-        )))
-        .tool(output.tool(WaMissionStateTool::new(
-            Arc::clone(&config),
-        )))
-        .tool(output.tool(WaMissionExplainTool::new(
-            Arc::clone(&config),
-        )))
+            )),
+        )
+        .tool(output.tool(WaRehearsalScoreTool::new(Arc::clone(&config))))
+        .tool(output.tool(WaMissionStateTool::new(Arc::clone(&config))))
+        .tool(output.tool(WaMissionExplainTool::new(Arc::clone(&config))))
         .legacy_resource(output.resource(WaPanesResource::new(
             Arc::clone(&config),
             config.ingest.panes.clone(),
@@ -398,19 +383,25 @@ async fn build_server_inner(
             db_path.clone(),
         )))
         .legacy_resource(output.resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config))))
-        .legacy_resource(output.resource(WaRehearsalScoreSurfaceTemplateResource::new(
-            Arc::clone(&config),
-        )))
+        .legacy_resource(
+            output.resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
+                &config,
+            ))),
+        )
         .legacy_resource(output.resource(WaSwarmCapacityCurrentResource))
         .legacy_resource(output.resource(WaSwarmCapacityRunTemplateResource))
         .legacy_resource(output.resource(WaRendererInputToPhotonResource))
         .legacy_resource(output.resource(WaRendererSsimParityResource))
         .legacy_resource(output.resource(WaProofHistoryResource::new(Arc::clone(&config))))
-        .legacy_resource(output.resource(WaProofHistoryReleaseBlockingResource::new(
-            Arc::clone(&config),
-        )))
+        .legacy_resource(
+            output.resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
+                &config,
+            ))),
+        )
         .legacy_resource(output.resource(WaProofHistoryTemplateResource::new(Arc::clone(&config))))
-        .legacy_resource(output.resource(WaAttestationRetractionsResource::new(Arc::clone(&config))))
+        .legacy_resource(
+            output.resource(WaAttestationRetractionsResource::new(Arc::clone(&config))),
+        )
         .legacy_resource(output.resource(WaRulesResource))
         .legacy_resource(output.resource(WaRulesByAgentTemplateResource));
 
@@ -596,13 +587,15 @@ async fn build_server_inner(
             )))
             .legacy_resource(output.resource(WaEventsResource::new(Arc::clone(db_path))))
             .legacy_resource(output.resource(WaEventsTemplateResource::new(Arc::clone(db_path))))
-            .legacy_resource(output.resource(WaEventsUnhandledTemplateResource::new(
-                Arc::clone(db_path),
-            )))
+            .legacy_resource(
+                output.resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path))),
+            )
             .legacy_resource(output.resource(WaAccountsResource::new(Arc::clone(db_path))))
-            .legacy_resource(output.resource(WaAccountsByServiceTemplateResource::new(
-                Arc::clone(db_path),
-            )))
+            .legacy_resource(
+                output.resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
+                    db_path,
+                ))),
+            )
             .legacy_resource(output.resource(WaContextHorizonResource::new(Arc::clone(db_path))))
             .legacy_resource(output.resource(WaReservationsResource::new(Arc::clone(db_path))))
             .legacy_resource(output.resource(WaReservationsByPaneTemplateResource::new(
@@ -635,13 +628,11 @@ async fn build_server_inner(
              Only the read-only/no-storage base catalog is registered. \
              Configure a database path to enable the full audited catalog."
         );
-        builder = builder.tool(output.tool(
-            WaGetTextTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                None,
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ));
+        builder = builder.tool(output.tool(WaGetTextTool::new_with_shared_rate_limiter(
+            Arc::clone(&config),
+            None,
+            Arc::clone(&shared_rate_limiter),
+        )));
     }
 
     #[cfg(feature = "mcp-client")]
@@ -834,7 +825,11 @@ mod tests {
         disabled_segments.safety.redaction.redact_segments = false;
 
         for config in [
-            invalid_regex, blank_placeholder, disabled, disabled_audit, disabled_segments,
+            invalid_regex,
+            blank_placeholder,
+            disabled,
+            disabled_audit,
+            disabled_segments,
         ] {
             for result in [
                 build_server_degraded(&config),

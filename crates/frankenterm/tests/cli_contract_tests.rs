@@ -4152,7 +4152,13 @@ placeholder = "<workspace-secret>"
             .unwrap();
         drop(connection);
         let output = command(dir.path(), &config)
-            .args(["analytics", "vc-export", "--include-text", "--format", "json"])
+            .args([
+                "analytics",
+                "vc-export",
+                "--include-text",
+                "--format",
+                "json",
+            ])
             .output()
             .unwrap();
         assert!(

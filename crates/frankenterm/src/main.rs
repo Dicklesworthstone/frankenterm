@@ -23847,22 +23847,24 @@ fn mux_dump_refuses_metadata_drift_hidden_by_custom_redaction() {
     let mut config = frankenterm_core::config::RedactionConfig::default();
     config.patterns = vec!["ORBITCANARY[0-9]{6}".to_string()];
     let redactor = config.build_redactor().unwrap();
-    let initial: frankenterm_core::wezterm::PaneInfo =
-        serde_json::from_value(serde_json::json!({
-            "pane_id": 1,
-            "tab_id": 2,
-            "window_id": 3,
-            "domain_name": "local",
-            "workspace": "ORBITCANARY111111",
-        }))
-        .unwrap();
+    let initial: frankenterm_core::wezterm::PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": 1,
+        "tab_id": 2,
+        "window_id": 3,
+        "domain_name": "local",
+        "workspace": "ORBITCANARY111111",
+    }))
+    .unwrap();
     let mut final_pane = initial.clone();
     final_pane.workspace = Some("ORBITCANARY222222".to_string());
     let initial_panes = [initial];
     let final_panes = [final_pane];
     let initial_public = mux_dump_topology_fingerprint(&initial_panes, &redactor).unwrap();
     let final_public = mux_dump_topology_fingerprint(&final_panes, &redactor).unwrap();
-    assert_eq!(initial_public, final_public, "redaction collapses these identities");
+    assert_eq!(
+        initial_public, final_public,
+        "redaction collapses these identities"
+    );
     let initial_private = mux_dump_topology_fingerprint_inner(&initial_panes, None).unwrap();
     let final_private = mux_dump_topology_fingerprint_inner(&final_panes, None).unwrap();
     assert_ne!(initial_private, final_private);
@@ -23873,7 +23875,11 @@ fn mux_dump_refuses_metadata_drift_hidden_by_custom_redaction() {
         &final_public,
     );
     let error = result.expect_err("capture must refuse before an artifact can be published");
-    assert!(error.to_string().contains("topology_changed_during_capture"));
+    assert!(
+        error
+            .to_string()
+            .contains("topology_changed_during_capture")
+    );
     assert!(!error.to_string().contains("ORBIT"));
     assert!(!error.to_string().contains(&initial_private));
     assert!(!error.to_string().contains(&final_private));
@@ -69106,9 +69112,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                     let record_count = page.records.len();
                     for action in page.records {
-                        let record = frankenterm_core::export::redact_audit_stream_record(
-                            action, &redactor,
-                        );
+                        let record =
+                            frankenterm_core::export::redact_audit_stream_record(action, &redactor);
                         if let Ok(line) = serde_json::to_string(&record) {
                             let _ = writeln!(stdout, "{line}");
                         }
@@ -92172,9 +92177,7 @@ fn mux_dump_topology_fingerprint_inner(
                         || std::borrow::Cow::Borrowed(workspace),
                         |policy| {
                             std::borrow::Cow::Owned(redact_pane_text_with_redactor(
-                                workspace,
-                                false,
-                                policy,
+                                workspace, false, policy,
                             ))
                         },
                     )
@@ -92350,12 +92353,14 @@ async fn capture_live_mux_dump(
 
     for pane in panes {
         let (domain_name, domain_identity_authority) = mux_dump_domain_identity(&pane);
-        domains.insert(redact_pane_text_with_redactor(&domain_name, false, &redactor));
+        domains.insert(redact_pane_text_with_redactor(
+            &domain_name,
+            false,
+            &redactor,
+        ));
         let text =
             match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false, 0).await {
-                Ok(pane_text) => {
-                    redact_pane_text_with_redactor(&pane_text.text, false, &redactor)
-                }
+                Ok(pane_text) => redact_pane_text_with_redactor(&pane_text.text, false, &redactor),
                 Err(err) => {
                     let detail = bounded_terminal_diagnostic_with_redactor(
                         &err.to_string(),

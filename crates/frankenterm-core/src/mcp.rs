@@ -839,12 +839,8 @@ async fn record_mcp_audit(
         tool_name,
         summary: input_summary,
         error_code,
-    }) = redact_mcp_audit_fields(
-        tool_name,
-        &input_summary,
-        error_code,
-        storage.redactor(),
-    ) else {
+    }) = redact_mcp_audit_fields(tool_name, &input_summary, error_code, storage.redactor())
+    else {
         record_mcp_audit_failure();
         tracing::warn!("MCP audit fields exceed bounded payload capacity");
         return;
@@ -852,10 +848,8 @@ async fn record_mcp_audit(
     let ts = i64::try_from(now_ms()).unwrap_or(0);
     // AuditFieldRedactor intentionally leaves routing metadata alone. Apply
     // the policy to the complete label too, including its generated prefix.
-    let Some(action_kind) = redact_mcp_audit_text(
-        &format!("mcp.{tool_name}"),
-        storage.redactor(),
-    ) else {
+    let Some(action_kind) = redact_mcp_audit_text(&format!("mcp.{tool_name}"), storage.redactor())
+    else {
         record_mcp_audit_failure();
         tracing::warn!("MCP audit action label exceeds bounded payload capacity");
         return;
@@ -993,7 +987,14 @@ fn record_mcp_audit_sync(
         }
     };
     record_mcp_audit_sync_with_policy(
-        &output, db_path, tool_name, args, ok, error_code, elapsed_ms, max_retry_duration,
+        &output,
+        db_path,
+        tool_name,
+        args,
+        ok,
+        error_code,
+        elapsed_ms,
+        max_retry_duration,
     );
 }
 
@@ -1013,7 +1014,8 @@ fn record_mcp_audit_sync_with_policy(
     let db_path_str = db_path.to_string_lossy().to_string();
     // Reject oversized key lists before joining them or running regexes.
     // Tool metadata occurs both separately and in the shape-only summary.
-    let mut raw_bytes = db_path_str.len()
+    let mut raw_bytes = db_path_str
+        .len()
         .saturating_add(tool_name.len().saturating_mul(2))
         .saturating_add(error_code.map_or(0, str::len))
         .saturating_add(64);
@@ -1030,12 +1032,17 @@ fn record_mcp_audit_sync_with_policy(
         tracing::warn!("MCP audit job exceeds bounded payload capacity");
         return;
     }
-    let Some(McpAuditFields { tool_name, summary, error_code }) = redact_mcp_audit_fields(
+    let Some(McpAuditFields {
+        tool_name,
+        summary,
+        error_code,
+    }) = redact_mcp_audit_fields(
         tool_name,
         &redact_mcp_args(tool_name, args),
         error_code,
         output.redactor(),
-    ) else {
+    )
+    else {
         record_mcp_audit_failure();
         tracing::warn!("MCP audit fields exceed bounded payload capacity");
         return;
@@ -2584,19 +2591,39 @@ mod tests {
         // first policy after the second must not adopt another server's rules.
         for (policy, db_path, suffix, marker, hidden, visible, expected_mixed) in [
             (
-                &first, &first_db, "first", orchid_marker, orchid_secret, violet_secret,
+                &first,
+                &first_db,
+                "first",
+                orchid_marker,
+                orchid_secret,
+                violet_secret,
                 format!("{orchid_marker} {violet_secret}"),
             ),
             (
-                &second, &second_db, "second", violet_marker, violet_secret, orchid_secret,
+                &second,
+                &second_db,
+                "second",
+                violet_marker,
+                violet_secret,
+                orchid_secret,
                 format!("{orchid_secret} {violet_marker}"),
             ),
             (
-                &first, &first_db, "again", orchid_marker, orchid_secret, violet_secret,
+                &first,
+                &first_db,
+                "again",
+                orchid_marker,
+                orchid_secret,
+                violet_secret,
                 format!("{orchid_marker} {violet_secret}"),
             ),
             (
-                &first, &first_db, "composed", orchid_marker, orchid_secret, violet_secret,
+                &first,
+                &first_db,
+                "composed",
+                orchid_marker,
+                orchid_secret,
+                violet_secret,
                 format!("{orchid_marker} {violet_secret}"),
             ),
         ] {
@@ -2610,7 +2637,9 @@ mod tests {
                 format!("mcp.{expected_tool}")
             };
             let handler = policy.proxy_tool(policy.audited_tool(
-                ConfiguredAuditErrorTool { error_code: format!("REMOTE_ERROR {mixed}") },
+                ConfiguredAuditErrorTool {
+                    error_code: format!("REMOTE_ERROR {mixed}"),
+                },
                 raw_tool,
                 Arc::new(db_path.clone()),
             ));
@@ -2656,7 +2685,10 @@ mod tests {
             let context: DecisionContext =
                 serde_json::from_str(audit.decision_context.as_deref().unwrap()).unwrap();
             assert_eq!(evidence(&context, "tool"), Some(expected_tool.as_str()));
-            assert_eq!(evidence(&context, "error_code"), Some(expected_code.as_str()));
+            assert_eq!(
+                evidence(&context, "error_code"),
+                Some(expected_code.as_str())
+            );
             let encoded = serde_json::to_string(&audit).unwrap();
             assert!(!encoded.contains(hidden));
             assert!(encoded.contains(visible));
@@ -2683,7 +2715,10 @@ mod tests {
         let oversized_key = "x".repeat(MCP_AUDIT_MAX_JOB_BYTES + 1);
         for (policy, args) in [
             (&normal, serde_json::json!({(oversized_key): null})),
-            (&expanding, serde_json::json!({"orchid-private-value": null})),
+            (
+                &expanding,
+                serde_json::json!({"orchid-private-value": null}),
+            ),
         ] {
             let before = mcp_audit_failure_count();
             record_mcp_audit_sync_with_policy(
