@@ -89537,10 +89537,102 @@ fn sync_capability_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()
     }
 }
 
+/// Opens one directory component of an artifact path without following a
+/// symlink that this process's user could have planted.
+///
+/// The only links followed are owned by root and sit in a root-owned
+/// directory that no group or other user can modify, and only while running
+/// as a non-root user, so nothing with this uid could create or replace them.
+/// That admits the system aliases macOS ships (`/tmp`, `/var` and `/etc` point
+/// into `/private`); every link an unprivileged process could plant is still
+/// refused.
 #[cfg(unix)]
-fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+fn open_directory_component_nofollow(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    let mut trusted_links_left = 8_u8;
+    open_directory_component_within_link_budget(parent, leaf, &mut trusted_links_left)
+}
+
+#[cfg(not(unix))]
+fn open_directory_component_nofollow(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+) -> std::io::Result<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt as _;
 
+    parent.open_dir_nofollow(leaf)
+}
+
+#[cfg(unix)]
+fn open_directory_component_within_link_budget(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+    trusted_links_left: &mut u8,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
+    let error = match parent.open_dir_nofollow(leaf) {
+        Ok(directory) => return Ok(directory),
+        Err(error) => error,
+    };
+    let Some(target) = trusted_system_symlink_target(parent, leaf) else {
+        return Err(error);
+    };
+    if *trusted_links_left == 0 {
+        return Err(std::io::Error::other(
+            "too many levels of root-owned system symlinks",
+        ));
+    }
+    *trusted_links_left -= 1;
+    let mut directory = if target.is_absolute() {
+        cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?
+    } else {
+        parent.try_clone()?
+    };
+    for component in target.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                directory = open_directory_component_within_link_budget(
+                    &directory,
+                    Path::new(name),
+                    trusted_links_left,
+                )?;
+            }
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "root-owned system symlink target leaves its directory",
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn trusted_system_symlink_target(parent: &cap_std::fs::Dir, leaf: &Path) -> Option<PathBuf> {
+    use cap_std::fs::MetadataExt as _;
+
+    if nix::unistd::geteuid().is_root() {
+        return None;
+    }
+    let link = parent.symlink_metadata(leaf).ok()?;
+    let holder = parent.dir_metadata().ok()?;
+    let trusted = link.file_type().is_symlink()
+        && link.uid() == 0
+        && holder.uid() == 0
+        && holder.mode() & 0o022 == 0;
+    if !trusted {
+        return None;
+    }
+    parent.read_link_contents(leaf).ok()
+}
+
+#[cfg(unix)]
+fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path_contains_parent_component(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -89566,7 +89658,7 @@ fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_st
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(err) => return Err(err),
     };
-    let directory = parent.open_dir_nofollow(leaf)?;
+    let directory = open_directory_component_nofollow(&parent, leaf)?;
     if created {
         sync_capability_directory(&parent)?;
     }
@@ -89574,8 +89666,6 @@ fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_st
 }
 
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
-    use cap_fs_ext::DirExt as _;
-
     if path_contains_parent_component(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -89595,7 +89685,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let parent = open_directory_tree_nofollow(parent_path)?;
-    parent.open_dir_nofollow(Path::new(leaf))
+    open_directory_component_nofollow(&parent, Path::new(leaf))
 }
 
 #[cfg(unix)]
@@ -114230,6 +114320,44 @@ recorder_backend = "rusqlite"
                 .to_string()
                 .contains("parent directory changed identity")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directory_walk_follows_only_root_owned_system_aliases() {
+        use cap_fs_ext::MetadataExt as _;
+
+        // On macOS /tmp and /var are root-owned aliases into /private; an
+        // artifact path written through them must reach the real directory.
+        for system_path in [Path::new("/tmp"), std::env::temp_dir().as_path()] {
+            let pinned = open_directory_tree_nofollow(system_path)
+                .unwrap_or_else(|error| panic!("pin {}: {error}", system_path.display()));
+            let pinned = pinned.dir_metadata().expect("pinned directory metadata");
+            let real = std::fs::metadata(system_path).expect("resolved directory metadata");
+            assert_eq!(
+                (pinned.dev(), pinned.ino()),
+                (real.dev(), real.ino()),
+                "{} must resolve to its real directory",
+                system_path.display()
+            );
+        }
+
+        // A link this user could plant is still refused, wherever it sits.
+        let dir = tempfile::tempdir().expect("symlink fixture");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("user-owned alias");
+        let error = open_directory_tree_nofollow(&alias)
+            .expect_err("a user-owned directory alias must not be followed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        let error = write_new_private_artifact(&alias.join("artifact.json"), b"{}\n")
+            .expect_err("an artifact must not be written through a user-owned alias");
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error:#}"
+        );
+        assert!(!real.join("artifact.json").exists());
     }
 
     #[test]
