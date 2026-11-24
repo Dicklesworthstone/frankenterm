@@ -129070,6 +129070,20 @@ printf x > "$MINISIGN_MARKER"
         )
         .expect("make post-switch rollback app destination private");
         plant_old(&rollback_destination);
+        // Rolling back exchanges the prior generation in as the atomic
+        // helper's stage, and the helper moves only a fully sealed stage, so
+        // only a sealed prior generation (as the installer publishes one) can
+        // be restored. Seal the planted one.
+        std::fs::set_permissions(
+            rollback_destination.join("FrankenTerm.app/old-generation.txt"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .expect("seal prior app bytes");
+        std::fs::set_permissions(
+            rollback_destination.join("FrankenTerm.app"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .expect("seal prior app directory");
         let rolled_back = run_installer_app_function(
             &installer,
             &family,
