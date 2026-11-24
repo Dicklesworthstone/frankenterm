@@ -26806,10 +26806,11 @@ mod tests {
             let mut tasks = TailerPollTaskSet::new();
             supervisor.set_storage_backpressure(gate.is_paused());
             supervisor.spawn_ready(&mut tasks);
-            let (pane_id, outcome) = runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
-                .await
-                .unwrap()
-                .expect("below-threshold capture must execute");
+            let (pane_id, outcome) =
+                runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .expect("below-threshold capture must execute");
             supervisor.handle_poll_result(pane_id, outcome);
             let captured = rx.try_recv().expect("capture delivered");
             assert_eq!(captured.segment.seq, 0);
@@ -26884,10 +26885,11 @@ mod tests {
             assert!(!gate.is_paused());
             supervisor.set_storage_backpressure(gate.is_paused());
             supervisor.spawn_ready(&mut tasks);
-            let (pane_id, outcome) = runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
-                .await
-                .unwrap()
-                .expect("capture resumes after writer drain");
+            let (pane_id, outcome) =
+                runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .expect("capture resumes after writer drain");
             supervisor.handle_poll_result(pane_id, outcome);
             assert_eq!(source.0.load(Ordering::SeqCst), 2);
             assert_eq!(cursors.read().await[&7].next_seq, 1);

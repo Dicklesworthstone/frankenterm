@@ -3395,7 +3395,10 @@ mod tests {
             }
             assert!(tasks.is_empty());
             assert_eq!(source.0.load(Ordering::SeqCst), 0);
-            assert_eq!(supervisor.scheduler.global_captures_remaining, before_budget);
+            assert_eq!(
+                supervisor.scheduler.global_captures_remaining,
+                before_budget
+            );
             assert!(rx.try_recv().is_err());
             for pane_id in [1, 2] {
                 let tailer = &supervisor.tailers[&pane_id];
@@ -3454,10 +3457,12 @@ mod tests {
             shutdown.store(true, Ordering::SeqCst);
             supervisor.spawn_ready(&mut tasks);
             assert!(tasks.is_empty());
-            assert!(supervisor
-                .tailers
-                .values()
-                .all(|tailer| tailer.last_reason_code == CaptureSkipReason::Shutdown));
+            assert!(
+                supervisor
+                    .tailers
+                    .values()
+                    .all(|tailer| tailer.last_reason_code == CaptureSkipReason::Shutdown)
+            );
             supervisor.shutdown().await;
         });
     }
@@ -5081,7 +5086,10 @@ mod tests {
                 "global_byte_budget_exhausted",
             ),
             (CaptureSkipReason::NoPermit, "no_permit"),
-            (CaptureSkipReason::StorageBackpressure, "storage_backpressure"),
+            (
+                CaptureSkipReason::StorageBackpressure,
+                "storage_backpressure",
+            ),
             (CaptureSkipReason::SendBackpressure, "send_backpressure"),
             (
                 CaptureSkipReason::OverflowGapPending,
