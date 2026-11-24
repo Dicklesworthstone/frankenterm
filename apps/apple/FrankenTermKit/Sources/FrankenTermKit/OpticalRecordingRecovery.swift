@@ -1,5 +1,20 @@
 import Foundation
 
+public enum OpticalRecordingRecoveryError: Error, Equatable, Sendable, LocalizedError {
+    case noProgress, recoveryExists, differentTransfer
+
+    public var errorDescription: String? {
+        switch self {
+        case .noProgress:
+            "No encrypted recovery pieces are available to save."
+        case .recoveryExists:
+            "Recovery already contains pieces from this transfer. Keep reading matching recordings, or explicitly discard this recovery before opening saved progress."
+        case .differentTransfer:
+            "Saved progress belongs to a different encrypted transfer. The current recovery was not replaced."
+        }
+    }
+}
+
 /// Reconstructs one encrypted transfer from explicitly selected recordings.
 /// This owns ciphertext and fountain equations only: it never accepts an
 /// unlock code, recipient secret, decoded archive, or destination workspace.
@@ -93,6 +108,38 @@ public struct OpticalRecordingRecovery: Sendable {
     /// equations. An obsolete reader's cleanup cannot retire a newer lease.
     public mutating func endRecording(_ lease: Recording) {
         if recording == lease { recording = nil }
+    }
+
+    /// A deliberate file save uses the same bounded FTDC format as phone scan
+    /// recovery. Native reader cleanup must finish before taking the snapshot.
+    /// It contains ciphertext, independent equations and public transfer
+    /// metadata only; no code, recipient key, plaintext archive or approval.
+    public func decoderCheckpoint<C: AirGapCryptography>(using crypto: C) throws -> Data {
+        try Task.checkCancellation()
+        guard recording == nil else { throw WorkspaceStoreError.busy }
+        guard let receiver, receiver.receivedParts > 0 else { throw OpticalRecordingRecoveryError.noProgress }
+        let data = try receiver.decoderCheckpoint(using: crypto)
+        try Task.checkCancellation()
+        return data
+    }
+
+    /// Resume only an explicitly selected saved file into an empty recovery.
+    /// Validate the entire FTDC snapshot before adopting it. Never merge saved
+    /// equations with current progress: they may predate a deliberate repair.
+    /// Existing progress survives malformed, foreign and same-source files.
+    /// A completed snapshot still has to pass full envelope/header checks, and
+    /// never restores an unlock code or a phone's recipient private key.
+    public mutating func resumeCheckpoint<C: AirGapCryptography>(_ data: Data, using crypto: C) throws {
+        try Task.checkCancellation()
+        guard recording == nil else { throw WorkspaceStoreError.busy }
+        let candidate = try OpticalReceiver(decoderCheckpoint: data, using: crypto)
+        guard candidate.receivedParts > 0 else { throw OpticalRecordingRecoveryError.noProgress }
+        if let receiver {
+            guard receiver.identity == candidate.identity else { throw OpticalRecordingRecoveryError.differentTransfer }
+            throw OpticalRecordingRecoveryError.recoveryExists
+        }
+        try Task.checkCancellation()
+        receiver = candidate
     }
 
     /// Raw bytes become available only after reader cleanup and all ordinary

@@ -79,6 +79,164 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(try recovery.envelope(using: crypto), bytes)
     }
 
+    func testSavedPartialCheckpointResumesExactEquationsAcrossRecoveryInstances() async throws {
+        let bytes = try envelope(size: 40_000)
+        let sender = try OpticalSender(envelope: bytes, using: crypto)
+        var original = OpticalRecordingRecovery()
+        let first = try original.beginRecording()
+        for sequence in 1...(try sender.sourcePartCount(page: 1)) {
+            try original.observe([sender.frame(page: 1, sequence: UInt32(sequence), using: crypto)],
+                                 recording: first, using: crypto)
+        }
+        for sequence in 2...7 {
+            try original.observe([sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)],
+                                 recording: first, using: crypto)
+        }
+        let sourceCount = try sender.sourcePartCount(page: 0)
+        var repair: String?
+        for sequence in (sourceCount + 1)...(sourceCount + 4096) {
+            let text = try sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)
+            guard case let .multipart(part) = try OpticalFrame(text: text).payload else { continue }
+            let indexes = try URDegree(count: part.count).indexes(sequence: part.sequence, checksum: part.checksum, using: crypto)
+            if indexes.contains(0), indexes.contains(where: { $0 >= 7 }) { repair = text; break }
+        }
+        // The missing first source part is present only in a mixed equation.
+        // Without restoring that equation, later source parts cannot finish.
+        try original.observe([XCTUnwrap(repair)], recording: first, using: crypto)
+        XCTAssertFalse(original.progress.isComplete)
+        original.endRecording(first)
+        let saved = try original.decoderCheckpoint(using: crypto)
+        XCTAssertTrue(saved.starts(with: Data("FTDC".utf8)))
+
+        // The exact phone checkpoint codec reads the same independent equations.
+        // No Mac-only wrapper, generated code or recipient secret is required.
+        var phone = try OpticalReceiver(decoderCheckpoint: saved, using: crypto)
+        XCTAssertEqual(try phone.decoderCheckpoint(using: crypto), saved)
+        var restarted = OpticalRecordingRecovery()
+        try restarted.resumeCheckpoint(saved, using: crypto)
+        XCTAssertEqual(restarted.progress, original.progress)
+        XCTAssertEqual(try restarted.decoderCheckpoint(using: crypto), saved)
+        let next = try restarted.beginRecording()
+        for sequence in (8...sourceCount).reversed() {
+            let text = try sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)
+            try restarted.observe([text], recording: next, using: crypto)
+            try phone.receive(OpticalFrame(text: text), using: crypto)
+        }
+        restarted.endRecording(next)
+        XCTAssertEqual(try restarted.envelope(using: crypto), bytes)
+        XCTAssertEqual(try phone.envelope(using: crypto), bytes)
+        XCTAssertEqual(try original.decoderCheckpoint(using: crypto), saved,
+                       "Saving and resuming cannot mutate the original recovery.")
+    }
+
+    func testCheckpointReplacementsNeverDiscardExistingEquations() async throws {
+        let a = try OpticalSender(envelope: envelope(marker: 55), using: crypto)
+        // A reused transfer ID still cannot stand in for the full identity.
+        let b = try OpticalSender(envelope: envelope(size: 150, marker: 55), using: crypto)
+        func partial(_ sender: OpticalSender, parts: Int) throws -> OpticalRecordingRecovery {
+            var result = OpticalRecordingRecovery()
+            let lease = try result.beginRecording()
+            for sequence in 1...parts {
+                try result.observe([sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)],
+                                   recording: lease, using: crypto)
+            }
+            result.endRecording(lease)
+            return result
+        }
+        var current = try partial(a, parts: 3)
+        let retained = try current.decoderCheckpoint(using: crypto)
+        let older = try partial(a, parts: 1).decoderCheckpoint(using: crypto)
+        let foreign = try partial(b, parts: 2).decoderCheckpoint(using: crypto)
+        var corrupted = retained
+        corrupted[corrupted.count - 1] ^= 1
+
+        XCTAssertThrowsError(try current.resumeCheckpoint(corrupted, using: crypto)) {
+            XCTAssertEqual($0 as? FTError, .checksum)
+        }
+        XCTAssertEqual(try current.decoderCheckpoint(using: crypto), retained)
+        XCTAssertThrowsError(try current.resumeCheckpoint(foreign, using: crypto)) {
+            XCTAssertEqual($0 as? OpticalRecordingRecoveryError, .differentTransfer)
+        }
+        XCTAssertEqual(try current.decoderCheckpoint(using: crypto), retained)
+        XCTAssertThrowsError(try current.resumeCheckpoint(older, using: crypto)) {
+            XCTAssertEqual($0 as? OpticalRecordingRecoveryError, .recoveryExists)
+        }
+        XCTAssertEqual(try current.decoderCheckpoint(using: crypto), retained)
+        XCTAssertThrowsError(try current.resumeCheckpoint(
+            Data(repeating: 0, count: OpticalReceiver.decoderCheckpointByteLimit + 1), using: crypto)) {
+            XCTAssertEqual($0 as? FTError, .limit("scan.bytes"))
+        }
+        XCTAssertEqual(try current.decoderCheckpoint(using: crypto), retained)
+        // Replacement is possible only after the user's explicit discard.
+        current.discard()
+        try current.resumeCheckpoint(foreign, using: crypto)
+        XCTAssertEqual(current.progress.identity, b.identity)
+        XCTAssertEqual(try current.decoderCheckpoint(using: crypto), foreign)
+    }
+
+    func testCheckpointSaveAndResumeRespectReaderOwnershipAndRetireOldCallbacks() async throws {
+        let sender = try OpticalSender(envelope: envelope(), using: crypto)
+        var recovery = OpticalRecordingRecovery()
+        let original = try recovery.beginRecording()
+        let first = try sender.frame(page: 0, sequence: 1, using: crypto)
+        try recovery.observe([first], recording: original, using: crypto)
+        XCTAssertThrowsError(try recovery.decoderCheckpoint(using: crypto)) {
+            XCTAssertEqual($0 as? WorkspaceStoreError, .busy)
+        }
+        recovery.endRecording(original)
+        let saved = try recovery.decoderCheckpoint(using: crypto)
+        let held = try recovery.beginRecording()
+        XCTAssertThrowsError(try recovery.resumeCheckpoint(saved, using: crypto)) {
+            XCTAssertEqual($0 as? WorkspaceStoreError, .busy)
+        }
+        recovery.endRecording(held)
+        XCTAssertEqual(try recovery.decoderCheckpoint(using: crypto), saved)
+        recovery.discard()
+        try recovery.resumeCheckpoint(saved, using: crypto)
+        let second = try sender.frame(page: 0, sequence: 2, using: crypto)
+        XCTAssertThrowsError(try recovery.observe([second], recording: original, using: crypto)) {
+            XCTAssertEqual($0 as? FTError, .stale)
+        }
+        let active = try recovery.beginRecording()
+        recovery.endRecording(held)
+        try recovery.observe([second], recording: active, using: crypto)
+        recovery.endRecording(active)
+        var expected = try OpticalReceiver(decoderCheckpoint: saved, using: crypto)
+        try expected.receive(OpticalFrame(text: second), using: crypto)
+        XCTAssertEqual(try recovery.decoderCheckpoint(using: crypto), try expected.decoderCheckpoint(using: crypto))
+    }
+
+    func testEmptyAndCancelledCheckpointsNeverBecomeNewRecovery() async throws {
+        let sender = try OpticalSender(envelope: envelope(), using: crypto)
+        let frame = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        let empty = try OpticalReceiver(selecting: frame).decoderCheckpoint(using: crypto)
+        var recovery = OpticalRecordingRecovery()
+        XCTAssertThrowsError(try recovery.decoderCheckpoint(using: crypto)) {
+            XCTAssertEqual($0 as? OpticalRecordingRecoveryError, .noProgress)
+        }
+        XCTAssertThrowsError(try recovery.resumeCheckpoint(empty, using: crypto)) {
+            XCTAssertEqual($0 as? OpticalRecordingRecoveryError, .noProgress)
+        }
+        XCTAssertNil(recovery.progress.identity)
+
+        let lease = try recovery.beginRecording()
+        try recovery.observe([sender.frame(page: 0, sequence: 1, using: crypto)], recording: lease, using: crypto)
+        recovery.endRecording(lease)
+        let saved = try recovery.decoderCheckpoint(using: crypto)
+        let task = Task {
+            var replacement = OpticalRecordingRecovery()
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                try replacement.resumeCheckpoint(saved, using: TestCryptography())
+                return (false, replacement)
+            } catch { return (error is CancellationError, replacement) }
+        }
+        let result = await task.value
+        XCTAssertTrue(result.0)
+        XCTAssertNil(result.1.progress.identity)
+        XCTAssertEqual(try recovery.decoderCheckpoint(using: crypto), saved)
+    }
+
     func testCorruptInnerURFramesDoNotSelectASourceOrDiscardPartialRecording() async throws {
         func corruptChecksum(_ text: String) -> String {
             // Replace one valid Bytewords pair in the CRC, keeping the wrapper
@@ -302,7 +460,11 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
             }
         }
         recovery.endRecording(recording)
-        let recovered = try recovery.envelope(using: crypto)
+        let saved = try recovery.decoderCheckpoint(using: crypto)
+        var restarted = OpticalRecordingRecovery()
+        try restarted.resumeCheckpoint(saved, using: crypto)
+        XCTAssertEqual(restarted.progress, recovery.progress)
+        let recovered = try restarted.envelope(using: crypto)
         XCTAssertEqual(recovered, bytes)
         var replay = try OpticalExportSession(envelope: recovered, using: crypto)
         XCTAssertEqual(replay.mode, .recipient)

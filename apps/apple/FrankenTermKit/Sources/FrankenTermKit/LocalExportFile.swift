@@ -14,7 +14,7 @@ public enum LocalExportFileError: Error, Equatable, Sendable, LocalizedError {
         case .invalidDestination:
             "Choose a local destination and a new filename for this export."
         case .invalidPayload:
-            "The export is empty or exceeds the supported workspace-file size."
+            "The export is empty or exceeds its supported file size."
         case .destinationExists:
             "A file already exists at this destination. Choose a new filename; the existing file was not replaced."
         case .writeFailed:
@@ -27,12 +27,20 @@ public enum LocalExportFileError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
-/// Publishes already-prepared public workspace or encrypted FTAG bytes under an
-/// explicitly selected new filename. Partial writes never use the final name.
+/// Publishes already-prepared public workspace, encrypted FTAG or FTDC recovery
+/// bytes under an explicitly selected new filename. Partial writes never use the final name.
 /// The caller owns security-scoped URL access for the duration of this call.
 public enum LocalExportFile {
     public static func write(_ bytes: Data, to destination: URL) throws {
         try write(bytes, to: destination, operations: .system)
+    }
+
+    /// Save an already validated ciphertext-only FTDC snapshot. Its bounded
+    /// equation metadata may exceed the envelope cap; ordinary workspace and
+    /// FTAG exports keep their existing, smaller admission limit.
+    public static func writeDecoderCheckpoint(_ bytes: Data, to destination: URL) throws {
+        try write(bytes, to: destination, maximumBytes: OpticalReceiver.decoderCheckpointByteLimit,
+                  operations: .system)
     }
 
     enum Synchronization { case file, directory }
@@ -72,7 +80,12 @@ public enum LocalExportFile {
     }
 
     static func write(_ bytes: Data, to destination: URL, operations: Operations) throws {
-        guard !bytes.isEmpty, bytes.count <= FTLimit.envelope else { throw LocalExportFileError.invalidPayload }
+        try write(bytes, to: destination, maximumBytes: FTLimit.envelope, operations: operations)
+    }
+
+    private static func write(_ bytes: Data, to destination: URL, maximumBytes: Int,
+                              operations: Operations) throws {
+        guard !bytes.isEmpty, bytes.count <= maximumBytes else { throw LocalExportFileError.invalidPayload }
         let name = destination.lastPathComponent
         guard destination.isFileURL, !name.isEmpty, name != ".", name != "..",
               !destination.path.utf8.contains(0) else { throw LocalExportFileError.invalidDestination }

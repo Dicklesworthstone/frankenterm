@@ -204,6 +204,36 @@ final class LocalExportFileTests: XCTestCase {
         }
     }
 
+    func testDecoderCheckpointPublicationHasItsOwnBoundWithoutWideningWorkspaceExports() throws {
+        try withDestination { directory, destination in
+            // Equation metadata can put a valid bounded checkpoint above the
+            // envelope ceiling. This writer publishes already prepared bytes;
+            // OpticalReceiver performs FTDC validation when a file is opened.
+            let bytes = Data(repeating: 0x42, count: FTLimit.envelope + 1)
+            XCTAssertLessThan(bytes.count, OpticalReceiver.decoderCheckpointByteLimit)
+            XCTAssertThrowsError(try LocalExportFile.write(bytes, to: destination)) {
+                XCTAssertEqual($0 as? LocalExportFileError, .invalidPayload)
+            }
+            try assertEmpty(directory)
+            let checkpoint = directory.appendingPathComponent("recovery.ftqrprogress")
+            try LocalExportFile.writeDecoderCheckpoint(bytes, to: checkpoint)
+            XCTAssertEqual(try Data(contentsOf: checkpoint), bytes)
+            let attributes = try FileManager.default.attributesOfItem(atPath: checkpoint.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            XCTAssertThrowsError(try LocalExportFile.writeDecoderCheckpoint(Data([1]), to: checkpoint)) {
+                XCTAssertEqual($0 as? LocalExportFileError, .destinationExists)
+            }
+            XCTAssertEqual(try Data(contentsOf: checkpoint), bytes)
+            for rejected in [Data(), Data(repeating: 0, count: OpticalReceiver.decoderCheckpointByteLimit + 1)] {
+                XCTAssertThrowsError(try LocalExportFile.writeDecoderCheckpoint(rejected, to: destination)) {
+                    XCTAssertEqual($0 as? LocalExportFileError, .invalidPayload)
+                }
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path),
+                           [checkpoint.lastPathComponent])
+        }
+    }
+
     func testPayloadAndDestinationBoundsRejectBeforeCreatingFiles() throws {
         try withDestination { directory, destination in
             for bytes in [Data(), Data(repeating: 0, count: FTLimit.envelope + 1)] {

@@ -492,6 +492,21 @@ private actor MacExportEngine {
         try recordingRecovery.observe(texts, recording: lease, using: crypto)
     }
     func recordingRecoveryProgress() -> OpticalRecordingRecovery.Progress { recordingRecovery.progress }
+    func openRecordingCheckpoint(_ url: URL) throws -> Reopened {
+        let bytes = try SelectedLocalFile.read(url, limit: OpticalReceiver.decoderCheckpointByteLimit)
+        try recordingRecovery.resumeCheckpoint(bytes, using: crypto)
+        guard recordingRecovery.progress.isComplete else {
+            return .partial(recordingRecovery.progress)
+        }
+        return .ready(try recoveredRecordingTransfer())
+    }
+    func saveRecordingCheckpoint(to url: URL) throws {
+        let bytes = try recordingRecovery.decoderCheckpoint(using: crypto)
+        guard url.isFileURL else { throw FTError.stale }
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        try LocalExportFile.writeDecoderCheckpoint(bytes, to: url)
+    }
     func discardRecordingRecovery() { recordingRecovery.discard() }
     func recoveredRecordingTransfer() throws -> OpticalExportSession {
         try OpticalExportSession(envelope: recordingRecovery.envelope(using: crypto), using: crypto)
@@ -1239,7 +1254,7 @@ private final class MacExportModel {
                     recordingRecovery = progress
                     message = progress.identity == nil
                         ? "No usable FrankenTerm transfer symbols were found. Choose another local recording or the original .ftairgap file."
-                        : "The recording ended before the encrypted transfer was complete. Accepted ciphertext pieces remain in this window. Read another recording of the same transfer, or discard this recovery to select a different one."
+                        : "The recording ended before the encrypted transfer was complete. Read another recording of the same transfer, or choose Save Recovery Progress to keep these encrypted pieces across app restarts. Discard this recovery before selecting a different one."
                 }
             } catch {
                 guard recording else { throw error }
@@ -1248,6 +1263,61 @@ private final class MacExportModel {
                 recordingRecovery = retained
                 reportRecordingRecovery(error)
             }
+        }
+    }
+    func chooseRecordingCheckpoint() {
+        guard !busy, sourceSheet == nil else { return }
+        cancelRecipientScan()
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.data]
+        panel.message = "Open saved .ftqrprogress recovery to continue reading recordings of the same transfer. Saved progress contains encrypted pieces only; its original code or matching iPhone request key is still required. Discard any current recovery before opening a saved one."
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
+        retireSourceKeyPrompt(); retireSSHSelection(); pause()
+        perform { [self] operation in
+            do {
+                let result = try await engine.openRecordingCheckpoint(url)
+                try requireCurrentWork(operation)
+                switch result {
+                case let .ready(candidate):
+                    try await adoptReopenedTransfer(candidate, operation: operation)
+                case let .partial(progress):
+                    recordingRecovery = progress; recordingReadProgress = nil
+                    message = "Saved encrypted progress opened. Read another recording of this transfer to continue reconstruction. Save Recovery Progress again to keep newly accepted pieces before closing this window."
+                }
+            } catch {
+                // A cancellation can arrive after the actor has accepted the
+                // snapshot. Keep that real progress visible, while closure's
+                // joined cleanup owns removal of any old window's material.
+                let retained = await engine.recordingRecoveryProgress()
+                guard windowOpen, workOperationID == operation else { return }
+                if retained.identity != recordingRecovery?.identity { recordingReadProgress = nil }
+                recordingRecovery = retained
+                if error is CancellationError || error as? FTError == .cancelled {
+                    message = retained.identity == nil
+                        ? "Opening saved progress stopped."
+                        : "Opening saved progress stopped. Accepted encrypted pieces remain available in this window."
+                } else {
+                    message = "Saved recovery could not be opened: \(error.localizedDescription) "
+                        + (retained.identity != nil
+                            ? "Current recovery remains available; save it or continue reading matching recordings."
+                            : "Choose a valid saved recovery file, a recording, or the original .ftairgap file.")
+                }
+            }
+        }
+    }
+    func saveRecordingCheckpoint() {
+        guard !busy, sourceSheet == nil, let recovered = recordingRecovery, recovered.receivedParts > 0 else { return }
+        let resume = playing
+        pause()
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "FrankenTerm-Recovery.ftqrprogress"
+        panel.message = "Save encrypted recovery pieces for another session. This file cannot restore a workspace until all pieces are recovered and its original code or matching iPhone request key is available. Choose a new filename."
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else {
+            if resume { play() }; return
+        }
+        perform(resumingPlayback: resume) { [self] operation in
+            try await engine.saveRecordingCheckpoint(to: url)
+            try requireCurrentWork(operation)
+            message = "Encrypted recovery progress saved. Choose Open Saved Recovery to continue after closing this window. Later progress requires another explicit save; the transfer code and phone's private request key are never included."
         }
     }
     private func receiveRecordingProgress(_ recovered: OpticalRecordingRecovery.Progress,
@@ -1298,7 +1368,7 @@ private final class MacExportModel {
             if recordingRecovery?.isComplete == true {
                 message = "Reading stopped after ciphertext reconstruction. Choose Use Recovered Transfer to open those verified bytes."
             } else if recordingRecovery?.identity != nil {
-                message = "Reading stopped. Accepted ciphertext pieces remain in this window; another recording of the same transfer can continue recovery."
+                message = "Reading stopped. Continue with another recording of the same transfer, or choose Save Recovery Progress to keep accepted encrypted pieces after closing this window."
             } else {
                 message = "Reading stopped before any usable transfer pieces were recovered."
             }
@@ -1790,6 +1860,8 @@ private final class MacExportModel {
             message = error.localizedDescription
         } else if let error = error as? LocalExportFileError {
             message = error.localizedDescription
+        } else if let error = error as? OpticalRecordingRecoveryError {
+            message = error.localizedDescription
         } else if let error = error as? OpenSSHSourceKeyError {
             message = error.localizedDescription
         } else if let error = error as? FTError {
@@ -1878,6 +1950,7 @@ private struct MacExportView: View {
                                 Button("Import SSH Config…") { model.chooseSSHConfiguration() }
                                 Button("Open Workspace…") { model.chooseWorkspace() }
                                 Button("Open Encrypted Transfer or Recording…") { model.chooseEncryptedTransfer() }
+                                Button("Open Saved Recovery…") { model.chooseRecordingCheckpoint() }
                             }.fixedSize().disabled(model.busy || enrollment.busy)
                         }
                         if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
@@ -2083,7 +2156,10 @@ private struct MacExportView: View {
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Open Transfer…") { model.chooseEncryptedTransfer() }.disabled(model.busy || enrollment.busy)
+                        Menu("Open Transfer") {
+                            Button("Encrypted File or Recording…") { model.chooseEncryptedTransfer() }
+                            Button("Saved Recovery…") { model.chooseRecordingCheckpoint() }
+                        }.disabled(model.busy || enrollment.busy)
                         Button("Done") { model.stopSending() }.disabled(model.busy)
                     }
                     if let code = model.revealedTransferCode, let image = model.revealedCodeSymbol {
@@ -2168,7 +2244,7 @@ private struct MacExportView: View {
                     Text("\(ByteCountFormatter.string(fromByteCount: Int64(recovered.verifiedBytes), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(recovered.totalBytes), countStyle: .file)) verified")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("These are encrypted pieces recovered on this Mac. A complete envelope can generate fresh repair symbols without its code or the phone’s private request key. Partial pieces stay only in this window; closing it discards them.")
+                Text("Save Recovery Progress to keep encrypted pieces across app restarts, then choose Open Saved Recovery and read more recordings of the same transfer. Unsaved progress is lost when this window closes. A complete envelope can generate fresh repair symbols; restoring on the iPhone still requires its original code or matching request key.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     if model.isReadingRecording {
@@ -2181,6 +2257,8 @@ private struct MacExportView: View {
                             Button("Read Another Recording…") { model.chooseEncryptedTransfer() }
                                 .disabled(model.busy || enrollment.busy)
                         }
+                        Button("Save Recovery Progress…") { model.saveRecordingCheckpoint() }
+                            .disabled(model.busy || enrollment.busy || (model.recordingRecovery?.receivedParts ?? 0) == 0)
                         Button("Discard Recovery", role: .destructive) { model.discardRecordingRecovery() }
                             .disabled(model.busy || enrollment.busy)
                     }
