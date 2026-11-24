@@ -4413,13 +4413,15 @@ pub mod process {
         command: &mut std::process::Command,
         overall_deadline: Instant,
     ) -> std::io::Result<ExitStatus> {
-        if Instant::now() >= overall_deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "process signal helper deadline elapsed before spawn",
-            ));
-        }
-        let mut helper = spawn_without_unmarked_descriptors(command)?;
+        let mut helper = spawn_without_unmarked_descriptors(command, || {
+            if Instant::now() >= overall_deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "process signal helper deadline elapsed before spawn",
+                ));
+            }
+            Ok(())
+        })?;
         let completion_deadline =
             process_deadline_after(PROCESS_SIGNAL_HELPER_TIMEOUT).min(overall_deadline);
         match reap_signal_helper_until(&mut helper, completion_deadline) {
@@ -5186,7 +5188,7 @@ pub mod process {
         // pool. Observe that state before allocating descriptors or spawning a
         // process, so a cancelled operation cannot launch after its caller has
         // already gone away.
-        check_output_command_abort(&cancel, deadline)?;
+        check_output_command_abort(&cancel, deadline, spec.request_cx.as_ref())?;
 
         let OutputCommandSpec {
             program,
@@ -5201,11 +5203,6 @@ pub mod process {
             execution_probe,
             request_cx,
         } = spec;
-
-        if let Some(cx) = &request_cx {
-            cx.checkpoint()
-                .map_err(|_| CommandCancelled.into_io_error())?;
-        }
 
         if let Some(error) = stdin_configuration_error {
             return Err(error.into_io_error());
@@ -5268,13 +5265,13 @@ pub mod process {
         // Close the remaining queue/setup window. Cancellation can still race
         // the spawn itself, but the first worker-loop iteration will then
         // terminate that process tree promptly.
-        if let Some(cx) = &request_cx {
-            cx.checkpoint()
-                .map_err(|_| CommandCancelled.into_io_error())?;
-        }
-        check_output_command_abort(&cancel, deadline)?;
-
-        let mut child = spawn_output_child(&mut cmd, &exec_busy_retry_delays, &cancel, deadline)?;
+        let mut child = spawn_output_child(
+            &mut cmd,
+            &exec_busy_retry_delays,
+            &cancel,
+            deadline,
+            request_cx.as_ref(),
+        )?;
         if let Some(probe) = execution_probe {
             probe.spawned_pid.store(child.id(), Ordering::SeqCst);
             tracing::debug!(
@@ -5585,13 +5582,24 @@ pub mod process {
     }
 
     /// Spawns `command` while no capture descriptor is still inheritable.
+    /// Admission is rechecked while waiting for descriptor creation and once
+    /// more under the shared lock, immediately before the actual spawn.
     fn spawn_without_unmarked_descriptors(
         command: &mut std::process::Command,
+        mut admit: impl FnMut() -> std::io::Result<()>,
     ) -> std::io::Result<std::process::Child> {
         #[cfg(all(unix, not(target_os = "linux")))]
-        let _all_marked = CAPTURE_DESCRIPTOR_INHERITANCE
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _all_marked = loop {
+            admit()?;
+            match CAPTURE_DESCRIPTOR_INHERITANCE.try_read() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+            }
+        };
+        admit()?;
         command.spawn()
     }
 
@@ -5622,8 +5630,9 @@ pub mod process {
     fn check_output_command_abort(
         cancel: &AtomicBool,
         deadline: Option<OutputCommandDeadline>,
+        request_cx: Option<&crate::cx::Cx>,
     ) -> std::io::Result<()> {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::SeqCst) || request_cx.is_some_and(|cx| cx.checkpoint().is_err()) {
             return Err(process_command_cancelled_error());
         }
         if let Some(deadline) = deadline
@@ -5646,17 +5655,24 @@ pub mod process {
         exec_busy_retry_delays: &[Duration],
         cancel: &AtomicBool,
         deadline: Option<OutputCommandDeadline>,
+        request_cx: Option<&crate::cx::Cx>,
     ) -> std::io::Result<std::process::Child> {
         let mut retry_delays = exec_busy_retry_delays.iter().copied();
         loop {
-            check_output_command_abort(cancel, deadline)?;
-            match spawn_without_unmarked_descriptors(command) {
+            match spawn_without_unmarked_descriptors(command, || {
+                check_output_command_abort(cancel, deadline, request_cx)
+            }) {
                 Ok(child) => return Ok(child),
                 Err(error) if is_exec_busy_error(&error) => {
                     let Some(delay) = retry_delays.next() else {
                         return Err(error);
                     };
-                    wait_for_output_retry(delay, cancel, deadline)?;
+                    tracing::debug!(
+                        name: "command_exec_busy_retry",
+                        event = "command_exec_busy_retry",
+                        "Executable is busy; retry remains subject to caller admission"
+                    );
+                    wait_for_output_retry(delay, cancel, deadline, request_cx)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -5678,10 +5694,11 @@ pub mod process {
         delay: Duration,
         cancel: &AtomicBool,
         deadline: Option<OutputCommandDeadline>,
+        request_cx: Option<&crate::cx::Cx>,
     ) -> std::io::Result<()> {
         let retry_deadline = process_deadline_after(delay);
         loop {
-            check_output_command_abort(cancel, deadline)?;
+            check_output_command_abort(cancel, deadline, request_cx)?;
             let remaining = retry_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
@@ -6233,7 +6250,7 @@ pub mod process {
             let (reader, writer) = process_capture_socketpair("test").unwrap();
             drop((reader, writer));
             let mut command = std::process::Command::new("/usr/bin/true");
-            let status = spawn_without_unmarked_descriptors(&mut command)
+            let status = spawn_without_unmarked_descriptors(&mut command, || Ok(()))
                 .unwrap()
                 .wait()
                 .unwrap();
@@ -6542,15 +6559,175 @@ pub mod process {
         #[test]
         fn exec_busy_retry_wait_checks_cancel_and_deadline_before_sleeping() {
             let cancelled = AtomicBool::new(true);
-            let error = wait_for_output_retry(Duration::MAX, &cancelled, None)
+            let error = wait_for_output_retry(Duration::MAX, &cancelled, None, None)
                 .expect_err("pre-cancelled retry wait must not sleep");
             assert!(CommandCancelled::from_io_error(&error).is_some());
 
             let active = AtomicBool::new(false);
             let deadline = OutputCommandDeadline::new(Duration::ZERO);
-            let error = wait_for_output_retry(Duration::MAX, &active, Some(deadline))
+            let error = wait_for_output_retry(Duration::MAX, &active, Some(deadline), None)
                 .expect_err("elapsed command deadline must stop retry wait");
             assert!(CommandTimedOut::from_io_error(&error).is_some());
+        }
+
+        #[test]
+        fn exec_busy_retry_wait_observes_request_context_without_cancel_bridge() {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("caller cancelled before executable retry"),
+            );
+            let active = AtomicBool::new(false);
+            let error = wait_for_output_retry(Duration::MAX, &active, None, Some(&cx))
+                .expect_err("the authentic caller must stop retry without a bridge task");
+            assert!(CommandCancelled::from_io_error(&error).is_some());
+            assert!(!active.load(Ordering::SeqCst));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn exec_busy_retry_does_not_launch_after_caller_cancellation() {
+            use tracing_subscriber::prelude::*;
+
+            struct RetryBarrier {
+                entered: std::sync::mpsc::SyncSender<()>,
+                release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            }
+
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RetryBarrier {
+                fn on_event(
+                    &self,
+                    event: &tracing::Event<'_>,
+                    _context: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    if event.metadata().name() == "command_exec_busy_retry" {
+                        self.entered
+                            .send(())
+                            .expect("observe the real busy executable");
+                        self.release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release the retry after cancelling its caller");
+                    }
+                }
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let executable = dir.path().join("owned-shell");
+            let marker = dir.path().join("effect");
+            std::fs::copy("/bin/sh", &executable).unwrap();
+            // Linux refuses to exec an image while a writable descriptor is
+            // held. This produces real ETXTBSY, not an injected spawn error.
+            let held_writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&executable)
+                .unwrap();
+            let mut command = Command::new(&executable);
+            command
+                .args([
+                    "-c",
+                    "printf committed > \"$1\"",
+                    "exec-busy-admission-test",
+                ])
+                .arg(&marker);
+            let cx = crate::cx::for_testing();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancel);
+            let probe = Arc::new(CommandExecutionProbe::default());
+            let mut spec = command.output_spec();
+            spec.request_cx = Some(cx.clone());
+            spec.execution_probe = Some(Arc::clone(&probe));
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            // Keep a second dispatch alive so concurrent callsite registration
+            // cannot cache this thread-scoped observer as globally disabled.
+            let _ambient = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let dispatch =
+                tracing::Dispatch::new(tracing_subscriber::registry().with(RetryBarrier {
+                    entered: entered_tx,
+                    release: std::sync::Mutex::new(release_rx),
+                }));
+            let worker = std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    run_output_command(
+                        spec,
+                        worker_cancel,
+                        Some(OutputCommandDeadline::new(Duration::from_secs(10))),
+                    )
+                })
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("production supervisor must reach an actual ETXTBSY retry");
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("caller cancelled after the first actual spawn refusal"),
+            );
+            drop(held_writer);
+            release_tx.send(()).unwrap();
+            let error = worker
+                .join()
+                .unwrap()
+                .expect_err("cancellation must prevent the now-executable retry");
+            assert!(CommandCancelled::from_io_error(&error).is_some());
+            assert!(
+                !cancel.load(Ordering::SeqCst),
+                "no external cancellation bridge"
+            );
+            assert_eq!(probe.spawned_pid.load(Ordering::SeqCst), 0, "no late child");
+            assert!(
+                !marker.exists(),
+                "the cancelled operation admitted no effect"
+            );
+
+            // Positive control: the same executable and command really work
+            // after the writer closes when the caller still authorizes spawn.
+            let output = command.output_blocking(Duration::from_secs(3)).unwrap();
+            assert!(output.status.success());
+            assert_eq!(std::fs::read(&marker).unwrap(), b"committed");
+        }
+
+        #[cfg(all(unix, not(target_os = "linux")))]
+        #[test]
+        fn spawn_admission_cancels_while_descriptor_creation_holds_the_lock() {
+            let cx = crate::cx::for_testing();
+            let worker_cx = cx.clone();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+            let (completion, worker) = while_no_command_spawns(|| {
+                let worker = std::thread::spawn(move || {
+                    let mut command = std::process::Command::new("/usr/bin/true");
+                    let active = AtomicBool::new(false);
+                    let mut first_admission = true;
+                    let outcome = spawn_without_unmarked_descriptors(&mut command, || {
+                        check_output_command_abort(&active, None, Some(&worker_cx))?;
+                        if first_admission {
+                            first_admission = false;
+                            entered_tx.send(()).unwrap();
+                        }
+                        Ok(())
+                    })
+                    .and_then(|mut child| child.wait().map(|_| ()));
+                    completed_tx.send(outcome).unwrap();
+                });
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("first admission must occur before cancellation");
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancelled while capture descriptors are being created"),
+                );
+                // Keep the exclusive lock held throughout the cancellation
+                // observation. A blocking read lock cannot satisfy this.
+                let completion = completed_rx.recv_timeout(Duration::from_secs(2));
+                (completion, worker)
+            });
+            worker.join().unwrap();
+            let error = completion
+                .expect("admission must stop without waiting for descriptor creation")
+                .expect_err("a cancelled caller cannot launch a child");
+            assert!(CommandCancelled::from_io_error(&error).is_some());
         }
 
         #[test]
@@ -7221,11 +7398,10 @@ pub mod net {
     pub use asupersync::net::{TcpListener, TcpStream};
 }
 
-/// Canonical distributed TLS transport surface.
+/// Canonical TLS transport surface for distributed connections and notifications.
 ///
 /// Keeping these constructors behind the project-owned async module prevents
 /// first-party callers from coupling directly to asupersync's module layout.
-#[cfg(feature = "distributed")]
 pub mod tls {
     pub use asupersync::tls::{TlsAcceptor, TlsConnector};
 }
