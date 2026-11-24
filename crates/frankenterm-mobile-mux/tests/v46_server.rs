@@ -2380,6 +2380,44 @@ fn withhold_mux_reply(harness: &mut Harness, expected: u64) -> Vec<u8> {
 }
 
 #[test]
+fn an_unrelated_correlated_reply_cannot_silently_settle_negotiation() {
+    use frankenterm_mobile_mux::wire::ident;
+
+    for unexpected in [ident::UNIT_RESPONSE, ident::LIVENESS_RESPONSE] {
+        let mut harness = Harness::new(4, 20);
+        let late_version = withhold_mux_reply(&mut harness, ident::GET_CODEC_VERSION);
+        let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+        reader.push(&late_version);
+        let version = reader.next_frame().unwrap().expect("the real version reply");
+        assert_eq!(version.ident, ident::GET_CODEC_VERSION_RESPONSE);
+        assert!(reader.next_frame().unwrap().is_none());
+        let wrong = if unexpected == ident::UNIT_RESPONSE {
+            canonical_frame(unexpected, version.serial, &codec::UnitResponse {})
+        } else {
+            canonical_frame(
+                unexpected,
+                version.serial,
+                &codec::LivenessResponse {
+                    pane_id: 7,
+                    is_alive: true,
+                },
+            )
+        };
+        harness.session.receive(&wrong);
+        assert!(matches!(harness.session.next_event(), Some(Event::Failed { reason })
+            if reason.contains("protocol check") && reason.contains("unexpected reply")));
+        assert!(!harness.session.is_ready());
+        assert_eq!(harness.session.next_input_wake_ns(), None);
+        assert!(harness.session.take_outgoing().is_empty());
+        harness.session.receive(&late_version);
+        assert!(!harness.session.is_ready());
+        assert!(harness.session.next_event().is_none());
+        assert!(harness.session.take_outgoing().is_empty());
+        assert!(harness.server.client_ids.is_empty());
+    }
+}
+
+#[test]
 fn every_initial_handshake_stage_has_its_own_bounded_reply() {
     use frankenterm_mobile_mux::session::REQUIRED_REPLY_DEADLINE_NS;
     use frankenterm_mobile_mux::wire::ident;

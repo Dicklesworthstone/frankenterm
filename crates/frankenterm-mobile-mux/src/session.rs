@@ -2344,6 +2344,19 @@ impl Session {
             // An unmatched receipt also cannot settle any current operation.
             return Ok(());
         }
+        if matches!(&request, Some(Request::Version))
+            && !matches!(
+                frame.ident,
+                ident::GET_CODEC_VERSION_RESPONSE | ident::ERROR_RESPONSE
+            )
+        {
+            // A matching serial alone cannot settle negotiation. Otherwise a
+            // no-op response could consume its deadline without making this
+            // connection ready or failed.
+            return Err(crate::Error::Frame(
+                "the mux protocol check received an unexpected reply",
+            ));
+        }
         if matches!(&request, Some(Request::CreateShell)) {
             return self.settle_shell_creation(&frame);
         }
