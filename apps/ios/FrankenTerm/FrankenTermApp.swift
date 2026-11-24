@@ -473,6 +473,14 @@ final class MobileWorkspaceModel {
             && epoch == observation.epoch && cameraGeneration == observation.cameraGeneration
     }
 
+    /// Once the receiver has taken a frame in, its result is saved and shown
+    /// even if the camera stopped meanwhile. Otherwise a receiver reset could
+    /// stay unsaved, with pre-reset equations left on disk. Only a new restore
+    /// epoch or an inactive scene discards it.
+    private func acceptsObservationResult(_ observation: CameraObservation) -> Bool {
+        !Task.isCancelled && active && epoch == observation.epoch
+    }
+
     /// Cache at most one successfully admitted text. The camera can then report
     /// that a held duplicate remains visible without reparsing it on MainActor,
     /// enqueueing it again, or allowing unrelated QR text to mask a stalled scan.
@@ -2565,11 +2573,11 @@ final class MobileWorkspaceModel {
                 guard self.acceptsCameraObservation(observation) else { continue }
                 do {
                     let next = try await restore.observe(observation.text, generation: observation.generation)
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     await self.saveScanSnapshot(next, restore: restore, epoch: observation.epoch)
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     let latest = await restore.status()
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     if latest.generation != next.generation { self.lastObservation = nil }
                     self.state = latest
                     self.recordAcceptedOpticalObservation(observation, status: latest)
@@ -2579,7 +2587,7 @@ final class MobileWorkspaceModel {
                 catch is CancellationError { break }
                 catch {
                     var latest = await restore.status()
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     // Only receiver resets need an immediate write. Malformed
                     // framing/checksums leave it unchanged and use the normal
                     // cadence. Join even a manual writer so a reset cannot be
@@ -2587,13 +2595,15 @@ final class MobileWorkspaceModel {
                     let repaired = before.generation == latest.generation
                         && (latest.receivedParts < before.receivedParts || latest.verifiedPages < before.verifiedPages)
                     await self.saveScanSnapshot(latest, restore: restore, epoch: observation.epoch, force: repaired)
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     latest = await restore.status()
-                    guard self.acceptsCameraObservation(observation) else { continue }
+                    guard self.acceptsObservationResult(observation) else { continue }
                     if self.state?.generation != latest.generation { self.lastObservation = nil }
                     self.state = latest
+                    // A frame from a camera that has since stopped is stale advice.
+                    let current = self.acceptsCameraObservation(observation)
                     if ![.idle, .candidate, .collecting].contains(latest.phase) { self.cameraRequested = false }
-                    self.report(error)
+                    if current { self.report(error) }
                 }
             }
         }
