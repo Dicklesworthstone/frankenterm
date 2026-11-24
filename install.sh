@@ -16,7 +16,7 @@
 #   --verify           Run `ft doctor` after install
 #   --with-font        Also install the bundled Pragmasevka Nerd Font
 #   --no-app           macOS: skip the FrankenTerm.app GUI bundle install
-#   --with-app         macOS: force the FrankenTerm.app GUI bundle install
+#   --with-app         macOS arm64 prebuilt: require a verified FrankenTerm.app candidate
 #   --app-dest DIR     macOS: install FrankenTerm.app to DIR (default /Applications)
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
@@ -3757,6 +3757,18 @@ finalize_app_receipt_state() {
   fi
 }
 
+# A verified candidate may be pending activation. The receipt describes that
+# state independently from whether the requested app was successfully staged.
+finish_app_install() {
+  local selected="$1"
+  finalize_app_receipt_state
+  emit_app_receipt || return 1
+  if [ "$selected" -eq 1 ] && [ "$INSTALL_APP" -eq 1 ] && [ "$APP_RECEIPT_RESULT" != verified ]; then
+    err "--with-app did not stage a verified FrankenTerm.app ($APP_RECEIPT_REASON)."
+    return 1
+  fi
+}
+
 check_write_permissions() {
   if [ ! -d "$DEST" ]; then
     if ! mkdir -p "$DEST" 2>/dev/null; then
@@ -6711,7 +6723,7 @@ Options:
   --verify           Run \`ft doctor\` after install
   --with-font        Also install the bundled Pragmasevka Nerd Font
   --no-app           macOS: skip the FrankenTerm.app GUI bundle install
-  --with-app         macOS: force the FrankenTerm.app GUI bundle install
+  --with-app         macOS arm64 prebuilt: require a verified FrankenTerm.app candidate
   --app-dest DIR     macOS: install FrankenTerm.app to DIR (default /Applications)
   --from-source      Build from source (slow; requires Rust + git)
   --quiet, -q        Suppress non-error output
@@ -6971,8 +6983,7 @@ if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] 
       exit 1
     fi
   fi
-  finalize_app_receipt_state
-  emit_app_receipt || exit 1
+  finish_app_install "$app_wanted" || exit 1
   exit 0
 fi
 
@@ -7159,7 +7170,9 @@ if [ "$WITH_FONT" -eq 1 ]; then
   install_pragmasevka
 fi
 
+app_wanted=0
 if should_install_app; then
+  app_wanted=1
   if ! install_macos_app; then
     if [ "$APP_RECEIPT_RESULT" != failed ] && \
        [ "$APP_RECEIPT_TRANSACTION_STATE" != prepared ]; then
@@ -7315,5 +7328,4 @@ fi
 # Automation must branch on `activation`; exit zero alone never means that a
 # selector or live mux was changed.
 emit_process_family_receipt || exit 1
-finalize_app_receipt_state
-emit_app_receipt || exit 1
+finish_app_install "$app_wanted" || exit 1

@@ -834,6 +834,50 @@ sys.exit(response.get("status", 0))
         **fallback, redirect_url: {"body": "https://github.com/fixture/frankenterm/releases/tag/v0.15.22-appstore.15"},
     }, fallback_requests, error="non-stable companion/prerelease tag")
 
+    # Check the exit status and the receipt together when the optional default
+    # and explicit --with-app encounter the same real staging refusal.
+    app_finish_script = r"""
+set -euo pipefail
+export FT_INSTALL_TEST_LIBRARY_ONLY=1
+source "$1"
+INSTALL_APP=$2 OS=$3 ARCH=aarch64 FROM_SOURCE=$4 OFFLINE_TARBALL=$5
+QUIET=1 HAS_GUM=0
+app_wanted=0
+if should_install_app; then
+  app_wanted=1
+  if [[ $6 = pending ]]; then
+    # Model the result after staging. emit_app_receipt validates its schema.
+    APP_RECEIPT_RESULT=verified
+    APP_RECEIPT_REASON=verified_candidate
+    APP_RECEIPT_MANIFEST_ID="sha256:$(printf '%064d' 0)"
+    APP_RECEIPT_CANDIDATE_PATH="$1.candidate"
+    APP_ACTIVATION_STATE=pending
+    APP_RECEIPT_TRANSACTION_STATE=pending
+    APP_RECEIPT_PENDING_REASON=lifetime_qualification
+  else
+    # No authorized process family: install_macos_app takes its early skip
+    # before any file or network operation.
+    install_macos_app
+  fi
+fi
+finish_app_install "$app_wanted"
+"""
+    for suffix, force, os_name, source, offline, stage, code, result, reason in [
+        ("required_skip", "1", "darwin", "0", "", "", 1, "skipped", "published_family_authority_unavailable"),
+        ("default_skip", "-1", "darwin", "0", "", "", 0, "skipped", "published_family_authority_unavailable"),
+        ("verified_pending", "1", "darwin", "0", "", "pending", 0, "verified", "verified_candidate"),
+        ("opt_out", "0", "darwin", "0", "", "", 0, "not_requested", "explicit_opt_out"),
+        ("unsupported", "1", "linux", "0", "", "", 0, "skipped", "unsupported_platform"),
+        ("source", "1", "darwin", "1", "", "", 0, "skipped", "source_build_has_no_app_asset"),
+        ("offline", "1", "darwin", "0", "archive", "", 0, "skipped", "offline_mode_has_no_app_asset"),
+    ]:
+        p = subprocess.run(["bash", "-c", app_finish_script, "app-outcome", str(install_sh),
+                            force, os_name, source, offline, stage], capture_output=True, text=True)
+        prefix = "FT_INSTALL_APP_RECEIPT_V2="
+        receipts = [json.loads(line[len(prefix):]) for line in p.stdout.splitlines() if line.startswith(prefix)]
+        assert len(receipts) == 1 and (receipts[0]["result"], receipts[0]["reason"]) == (result, reason), (suffix, p)
+        record("app_outcome_" + suffix, "stable", "negative" if code else "positive", code, p)
+
     # 9. Negative: 1-byte tamper in offline archive fails closed with zero mutation to --dest
     import hashlib, tarfile
     dest_dir = td_path / "dest_bin"
