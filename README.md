@@ -1133,6 +1133,8 @@ The viewer checks `/auth/status` before starting any data requests. Sign-in exch
 
 Authentication is opt-in. Without `FT_WEB_HTTPS_ORIGIN`, either token flag limits Host and Origin checks to the actual loopback listener address and port. Sessions stay bound to the exact origin used at sign-in.
 
+Without a token, every request's `Host` must still be a loopback IP literal or exactly `localhost`, on any port, so an SSH `-L` tunnel to another local port works. Any other hostname, including one a DNS-rebinding page has pointed at 127.0.0.1, gets 403 `web_origin_refused`. A presented `Origin` must name the same host, and a browser request marked cross-site is refused unless it is a top-level page navigation.
+
 For authenticated access from your other devices through [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve), or another trusted HTTPS reverse proxy, set `FT_WEB_HTTPS_ORIGIN` to the browser's exact canonical HTTPS origin. Use a lower-case hostname and omit a trailing slash, path, query, fragment, credentials and the default `:443` port. A non-default HTTPS port is allowed. The setting requires the existing token flag; missing authentication or an invalid origin stops startup before the listener binds.
 
 ```bash
@@ -1148,7 +1150,7 @@ tailscale serve --https=443 off     # stop sharing
 
 The same setting applies to `ft watch --web --web-auth-token-env FT_BROWSER_TOKEN`. In HTTPS mode the startup announcement names the browser origin and the internal HTTP proxy upstream. The listener remains loopback-only: the proxy must terminate HTTPS and preserve the original `Host` and `Origin` headers. Forwarded headers and Tailscale identity headers never establish application authority. Sign-in and sign-out cookies include `Secure`; sign-out and expiry retain the same live-stream revocation and session-epoch fencing as local mode. Use the configured HTTPS URL in this mode, because local HTTP aliases are refused.
 
-This is one operator's read-only session authority over the existing data routes, not per-user or per-pane sharing. Tailnet access rules control who can reach the sign-in page; the operator token is still required to read captured output, history and live streams. Omitting both token authentication and `FT_WEB_HTTPS_ORIGIN` preserves the unauthenticated local mode. Do not forward that mode when application sign-in is required, and do not use `tailscale funnel` to publish the viewer to the internet.
+This is one operator's read-only session authority over the existing data routes, not per-user or per-pane sharing. Tailnet access rules control who can reach the sign-in page; the operator token is still required to read captured output, history and live streams. Omitting both token authentication and `FT_WEB_HTTPS_ORIGIN` preserves the unauthenticated local mode. That mode refuses a proxy that preserves the browser's hostname, as the HTTPS setup above requires; use token authentication for access from other devices. Do not use `tailscale funnel` to publish the viewer to the internet.
 
 The backend socket tests exercise authenticated proxy requests and stream revocation; they do not establish live TLS/Tailscale or device qualification. The pinned HTTP substrate still collapses duplicate raw header lines and does not provide a cancellation deadline for a blocked socket write; those transport requirements remain part of `ft-xxfwy.55.3`. Live tailnet qualification, terminal attach, controller leases and DSR packaging remain open in the browser campaign.
 

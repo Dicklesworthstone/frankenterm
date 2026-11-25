@@ -299,7 +299,12 @@ curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz
 curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
 ```
 
-The server binds loopback only. To require browser sign-in, put a randomly
+The server binds loopback only. Without authentication, a request's `Host`
+must be a loopback IP literal or exactly `localhost` (any port, so SSH `-L`
+tunnels work); any other hostname, as a DNS-rebinding page would send, gets
+403 `web_origin_refused`. A presented `Origin` must name the same host, and
+browser requests marked cross-site are refused except top-level navigations.
+To require browser sign-in, put a randomly
 generated 32–256 character visible ASCII access token in an environment
 variable and pass its name with `--auth-token-env` (or
 `--web-auth-token-env` on `watch`). Missing or invalid values fail startup;

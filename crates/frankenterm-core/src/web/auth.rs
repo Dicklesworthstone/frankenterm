@@ -537,6 +537,7 @@ impl SessionAuthMiddleware {
 
     fn check_request(&self, req: &Request) -> Result<Option<SessionGrant>, Response> {
         let Some(auth) = self.auth.as_ref() else {
+            check_unauthenticated_boundary(req)?;
             return Ok(None);
         };
         let origin = check_browser_boundary_for_route(
@@ -676,17 +677,9 @@ fn check_browser_boundary(
     check_browser_boundary_for_route(req, listener_port, false, https_origin)
 }
 
-fn check_browser_boundary_for_route(
-    req: &Request,
-    listener_port: u16,
-    public_navigation: bool,
-    https_origin: Option<&str>,
-) -> Result<String, Response> {
-    // No forwarded header establishes authority. Host must name the exact
-    // configured HTTPS origin, or a canonical loopback origin in local mode.
-    // The listener itself remains loopback in both modes.
-    let host = req
-        .headers()
+/// The request's Host header, if it is one plausible authority.
+fn request_host(req: &Request) -> Result<&str, Response> {
+    req.headers()
         .get("host")
         .and_then(|value| std::str::from_utf8(value).ok())
         .filter(|host| {
@@ -698,7 +691,76 @@ fn check_browser_boundary_for_route(
                         || matches!(byte, b'/' | b'\\' | b'@' | b',' | b'#' | b'?')
                 })
         })
-        .ok_or_else(boundary_error)?;
+        .ok_or_else(boundary_error)
+}
+
+/// `http://{host}` and its effective port, if `host` is a loopback IP literal
+/// or exactly `localhost` in canonical syntax: no shorthand integer or octal
+/// IP authority, trailing dot, empty port, userinfo or URL parser
+/// normalization.
+fn canonical_loopback_origin(host: &str) -> Option<(String, u16)> {
+    let origin = format!("http://{host}");
+    let parsed = url::Url::parse(&origin).ok()?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
+        None => false,
+    };
+    if !loopback || parsed.origin().ascii_serialization() != origin {
+        return None;
+    }
+    let port = parsed.port_or_known_default()?;
+    Some((origin, port))
+}
+
+/// Fetch Metadata: refuse a request a browser marks as coming from another
+/// site, except a top-level document navigation where the caller allows one.
+fn check_fetch_site(req: &Request, navigation_allowed: bool) -> Result<(), Response> {
+    if let Some(site) = req.headers().get("sec-fetch-site")
+        && site != b"same-origin"
+        && site != b"none"
+        && !(navigation_allowed
+            && req.method() == Method::Get
+            && req.headers().get("sec-fetch-mode") == Some(b"navigate".as_slice())
+            && req.headers().get("sec-fetch-dest") == Some(b"document".as_slice()))
+    {
+        return Err(boundary_error());
+    }
+    Ok(())
+}
+
+/// Unauthenticated mode has no credential, so Host is its defence against
+/// DNS rebinding: a page whose hostname later resolves to 127.0.0.1 reaches
+/// the loopback listener as same-origin, and names itself in Host. Admit
+/// only a loopback IP literal or exactly `localhost`. Any port is accepted,
+/// so an SSH `-L` tunnel to a different local port keeps working; the
+/// listener itself is loopback-only. A presented Origin must name the same
+/// host. Cross-site subresource requests cannot read a response, but they
+/// could hold the anonymous stream budget, so Fetch Metadata refuses them.
+fn check_unauthenticated_boundary(req: &Request) -> Result<(), Response> {
+    let host = request_host(req)?;
+    let (origin, _port) = canonical_loopback_origin(host).ok_or_else(boundary_error)?;
+    if req
+        .headers()
+        .get("origin")
+        .is_some_and(|presented| presented != origin.as_bytes())
+    {
+        return Err(boundary_error());
+    }
+    check_fetch_site(req, true)
+}
+
+fn check_browser_boundary_for_route(
+    req: &Request,
+    listener_port: u16,
+    public_navigation: bool,
+    https_origin: Option<&str>,
+) -> Result<String, Response> {
+    // No forwarded header establishes authority. Host must name the exact
+    // configured HTTPS origin, or a canonical loopback origin in local mode.
+    // The listener itself remains loopback in both modes.
+    let host = request_host(req)?;
     if listener_port == 0 {
         return Err(boundary_error());
     }
@@ -710,23 +772,10 @@ fn check_browser_boundary_for_route(
         }
         configured.to_owned()
     } else {
-        let origin = format!("http://{host}");
-        let parsed = url::Url::parse(&origin).map_err(|_| boundary_error())?;
-        let loopback = match parsed.host() {
-            Some(url::Host::Domain(name)) => name == "localhost",
-            Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
-            Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
-            None => false,
-        };
-        // Require canonical syntax (no shorthand integer/octal IP authorities,
-        // trailing dot, empty port, userinfo or URL parser normalization).
-        if !loopback
-            || parsed.port_or_known_default() != Some(listener_port)
-            || parsed.origin().ascii_serialization() != origin
-        {
-            return Err(boundary_error());
+        match canonical_loopback_origin(host) {
+            Some((origin, port)) if port == listener_port => origin,
+            _ => return Err(boundary_error()),
         }
-        origin
     };
     if let Some(presented) = req.headers().get("origin") {
         if presented != origin.as_bytes() {
@@ -737,16 +786,7 @@ fn check_browser_boundary_for_route(
         // prevents a form POST or opaque/null origin from minting a session.
         return Err(boundary_error());
     }
-    if let Some(site) = req.headers().get("sec-fetch-site")
-        && site != b"same-origin"
-        && site != b"none"
-        && !(public_navigation
-            && req.method() == Method::Get
-            && req.headers().get("sec-fetch-mode") == Some(b"navigate".as_slice())
-            && req.headers().get("sec-fetch-dest") == Some(b"document".as_slice()))
-    {
-        return Err(boundary_error());
-    }
+    check_fetch_site(req, public_navigation)?;
     // This surface has no bearer-token mode; accepting a second credential
     // channel would make request authority ambiguous.
     if req.headers().contains("authorization") {
@@ -1572,6 +1612,91 @@ mod tests {
         req.headers_mut()
             .insert("authorization", b"Bearer second-credential".to_vec());
         assert!(check_browser_boundary(&req, 4321, None).is_err());
+    }
+
+    #[test]
+    fn unauthenticated_mode_admits_only_loopback_hosts_on_any_port() {
+        // ft-mgy5t2.27.1: with no credential, Host is the DNS-rebinding
+        // boundary. A rebound page is same-origin and names itself in Host.
+        let guard = SessionAuthMiddleware::new(None, std::iter::empty());
+        let host_request = |host: &str| {
+            let mut req = Request::new(Method::Get, "/panes");
+            req.headers_mut().insert("host", host.as_bytes().to_vec());
+            req
+        };
+        for host in [
+            "localhost",
+            "localhost:4321",
+            "localhost:8080",
+            "127.0.0.1:9999",
+            "127.1.2.3:9999",
+            "[::1]:9999",
+        ] {
+            assert!(guard.check_request(&host_request(host)).is_ok(), "{host}");
+        }
+        for host in [
+            "attacker.example",
+            "attacker.example:4321",
+            "localhost.attacker.example:4321",
+            "localhost.:4321",
+            "LOCALHOST:4321",
+            "127.1:4321",
+            "2130706433:4321",
+            "0x7f.0.0.1:4321",
+            "192.168.1.5:4321",
+            "[::ffff:127.0.0.1]:4321",
+            "user@localhost:4321",
+            "localhost:4321,attacker.example",
+            "localhost:4321/",
+            "",
+        ] {
+            let refused = guard.check_request(&host_request(host)).unwrap_err();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{host}");
+            assert_eq!(body(&refused)["error_code"], "web_origin_refused", "{host}");
+        }
+        let missing = Request::new(Method::Get, "/panes");
+        assert!(guard.check_request(&missing).is_err(), "Host is required");
+
+        let mut req = host_request("localhost:4321");
+        for origin in [
+            "null",
+            "http://attacker.example",
+            "http://localhost:4322",
+            "http://127.0.0.1:4321",
+            "http://localhost:4321/",
+        ] {
+            req.headers_mut()
+                .insert("origin", origin.as_bytes().to_vec());
+            assert!(guard.check_request(&req).is_err(), "{origin}");
+        }
+        req.headers_mut()
+            .insert("origin", b"http://localhost:4321".to_vec());
+        assert!(guard.check_request(&req).is_ok());
+
+        // A cross-site subresource cannot read the response but could hold
+        // the anonymous stream budget. A top-level navigation still loads.
+        req.headers_mut().remove("origin");
+        req.headers_mut()
+            .insert("sec-fetch-site", b"cross-site".to_vec());
+        assert!(guard.check_request(&req).is_err());
+        req.headers_mut()
+            .insert("sec-fetch-mode", b"navigate".to_vec());
+        req.headers_mut()
+            .insert("sec-fetch-dest", b"document".to_vec());
+        assert!(guard.check_request(&req).is_ok());
+        req.headers_mut()
+            .insert("sec-fetch-site", b"same-origin".to_vec());
+        req.headers_mut().insert("sec-fetch-mode", b"cors".to_vec());
+        req.headers_mut()
+            .insert("sec-fetch-dest", b"empty".to_vec());
+        assert!(guard.check_request(&req).is_ok());
+
+        // The pre-body validator applies the same boundary and closes.
+        let refused = guard
+            .validate(&host_request("attacker.example:4321"))
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(header(&refused, "connection"), Some(b"close".as_slice()));
     }
 
     #[test]

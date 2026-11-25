@@ -201,7 +201,7 @@ PY
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-s.sendall(f"GET /stream/deltas?pane_id={sys.argv[2]}&max_hz=100 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+s.sendall(f"GET /stream/deltas?pane_id={sys.argv[2]}&max_hz=100 HTTP/1.1\r\nHost: 127.0.0.1:{sys.argv[1]}\r\n\r\n".encode())
 time.sleep(float(sys.argv[3]))
 ' "$PORT" "$PANE" 20 &
         local slow=$!

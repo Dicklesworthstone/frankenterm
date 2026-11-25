@@ -368,6 +368,45 @@ mod web_tests {
         });
     }
 
+    #[test]
+    fn unauthenticated_listener_refuses_a_rebound_host_and_admits_loopback_tunnels() {
+        // ft-mgy5t2.27.1: a DNS-rebound page reaches the loopback listener
+        // as same-origin, with its own hostname in Host.
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let port = addr.port();
+            let mut responses = Vec::new();
+            for (path, host) in [
+                ("/panes", format!("attacker.example:{port}")),
+                ("/health", format!("attacker.example:{port}")),
+                ("/health", addr.to_string()),
+                // An SSH -L tunnel's local port differs from the listener's.
+                ("/health", "localhost:8080".to_owned()),
+            ] {
+                let request =
+                    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+                responses.push(fetch_raw(addr, request.as_bytes()).await);
+            }
+            let shutdown = server.shutdown().await;
+            let responses = responses
+                .into_iter()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            shutdown.unwrap();
+
+            for rebound in &responses[..2] {
+                assert_eq!(extract_status(rebound), 403, "{rebound}");
+                assert!(rebound.contains("web_origin_refused"), "{rebound}");
+            }
+            for local in &responses[2..] {
+                assert_eq!(extract_status(local), 200, "{local}");
+            }
+        });
+    }
+
     fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
         let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
         head.lines().skip(1).find_map(|line| {
