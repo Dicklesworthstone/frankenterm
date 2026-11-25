@@ -751,9 +751,10 @@ fn read_windows_disk_space(path: &Path) -> Option<(u64, u64)> {
             return None;
         }
     };
+    // sysinfo 0.40 dropped Disks::list(); Disks derefs to [Disk].
     select_disk_space_for_path(
         path,
-        disks.list().iter().map(|disk| DiskSpaceCandidate {
+        disks.iter().map(|disk| DiskSpaceCandidate {
             mount_point: disk.mount_point().to_path_buf(),
             available_bytes: disk.available_space(),
             total_bytes: disk.total_space(),
