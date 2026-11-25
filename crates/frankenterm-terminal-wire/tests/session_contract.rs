@@ -832,8 +832,5 @@ fn exhausted_retirement_history_stops_new_bindings_without_retaining_live_author
     server.decode_request(&current).unwrap();
     server.unbind_scope(&scope()).unwrap();
     browser.unbind_scope(&scope()).unwrap();
-    assert_eq!(
-        server.decode_request(&current),
-        Err(WireError::StaleScope)
-    );
+    assert_eq!(server.decode_request(&current), Err(WireError::StaleScope));
 }
