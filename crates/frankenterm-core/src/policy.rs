@@ -11155,15 +11155,13 @@ mod tests {
             );
             let cx = crate::cx::for_request();
             let caps = unreserved(PaneCapabilities::prompt());
-            for (completed, action) in [
+            let actions = [
                 ActionKind::SendText,
                 ActionKind::SendCtrlC,
                 ActionKind::SendCtrlD,
                 ActionKind::SendCtrlZ,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            for (completed, action) in actions.into_iter().enumerate() {
                 let held =
                     acquire_kill_switch_fence(std::path::Path::new(storage.db_path())).unwrap();
                 let before = mock.pane_state(42).await.unwrap().content;
@@ -11217,23 +11215,49 @@ mod tests {
 
                 drop(held);
                 let result = pending.await.unwrap();
-                assert!(
-                    matches!(
-                        result,
-                        InjectionResult::Allowed {
-                            audit_action_id: Some(_),
-                            ..
-                        }
-                    ),
-                    "{result:?}"
-                );
+                // Once the fence is released the send reaches policy
+                // admission. A workflow is not a trusted actor, so the
+                // destructive controls stop there at approval.
+                if action.is_destructive() {
+                    assert!(
+                        matches!(
+                            result,
+                            InjectionResult::RequiresApproval {
+                                audit_action_id: Some(_),
+                                ..
+                            }
+                        ),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            InjectionResult::Allowed {
+                                audit_action_id: Some(_),
+                                ..
+                            }
+                        ),
+                        "{result:?}"
+                    );
+                }
             }
             let rows = storage
                 .get_audit_actions_with_cx(&cx, crate::storage::AuditQuery::default())
                 .await
                 .unwrap();
-            assert_eq!(rows.len(), 4);
-            assert!(rows.iter().all(|row| row.policy_decision == "allow"));
+            assert_eq!(rows.len(), actions.len());
+            let count = |decision: &str| {
+                rows.iter()
+                    .filter(|row| row.policy_decision == decision)
+                    .count()
+            };
+            let destructive = actions
+                .iter()
+                .filter(|action| action.is_destructive())
+                .count();
+            assert_eq!(count("require_approval"), destructive);
+            assert_eq!(count("allow"), actions.len() - destructive);
             storage.shutdown_with_cx(&cx).await.unwrap();
         });
     }
