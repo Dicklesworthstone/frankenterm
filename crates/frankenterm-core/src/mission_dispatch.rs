@@ -14,10 +14,191 @@
 use crate::events::EventBus;
 use crate::mission_events::{MissionEvent, MissionEventKind, MissionPhase};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::plan::MissionDispatchContract;
+use crate::plan::{
+    ApprovalState, AssignmentId, Mission, MissionActorRole, MissionDispatchContract,
+    MissionLifecycleState, MissionTxContract, MissionTxState, StepAction, TxId, TxIntent,
+    TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId, WaitCondition,
+};
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 use crate::workflows::{WorkflowRunner, WorkflowStartResult};
 use serde::{Deserialize, Serialize};
+
+/// A refusal while compiling one explicitly selected mission assignment.
+///
+/// These errors precede transaction publication and external effects. Compiling
+/// a contract is not policy approval: the live transaction executor must still
+/// check policy, target liveness, reservations, and any required approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssignmentDispatchError {
+    #[error("mission contract is invalid")]
+    InvalidMission,
+    #[error("mission must be running or executing before an assignment can be dispatched")]
+    NotRunning,
+    #[error("assignment does not exist in this mission")]
+    AssignmentNotFound,
+    #[error("assignment already has a terminal outcome")]
+    AlreadySettled,
+    #[error("assignment approval is pending, denied, or expired")]
+    ApprovalBlocked,
+    #[error("assignment requires a file reservation that this dispatch path cannot verify")]
+    ReservationUnsupported,
+    #[error("assignment dispatch supports explicit pane sends and pane waits only")]
+    ActionUnsupported,
+    #[error("assignment wait does not identify a target pane")]
+    TargetUnspecified,
+    #[error("assignment wait identifies conflicting target panes")]
+    TargetConflict,
+    #[error("assignment timestamp precedes mission creation")]
+    InvalidTimestamp,
+}
+
+impl AssignmentDispatchError {
+    /// Stable machine-readable refusal code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidMission => "mission.dispatch.invalid_mission",
+            Self::NotRunning => "mission.dispatch.not_running",
+            Self::AssignmentNotFound => "mission.dispatch.assignment_not_found",
+            Self::AlreadySettled => "mission.dispatch.already_settled",
+            Self::ApprovalBlocked => "mission.dispatch.approval_blocked",
+            Self::ReservationUnsupported => "mission.dispatch.reservation_unsupported",
+            Self::ActionUnsupported => "mission.dispatch.action_unsupported",
+            Self::TargetUnspecified => "mission.dispatch.target_unspecified",
+            Self::TargetConflict => "mission.dispatch.target_conflict",
+            Self::InvalidTimestamp => "mission.dispatch.invalid_timestamp",
+        }
+    }
+}
+
+/// Compile one assignment into a transaction for the existing durable executor.
+///
+/// The full action and explicit pane target are preserved. Unlike the workflow
+/// notification bridge below, this does not synthesize a detection on pane 0.
+/// The durable identity names the mission incarnation, workspace and exact
+/// assignment. Mutable revisions, timestamps and action changes cannot create
+/// a fresh slot that bypasses an earlier attempt's idempotency evidence.
+/// The immutable intent and plan bind the assignee, candidate and full action;
+/// publication must reject a different contract already occupying that slot.
+///
+/// Callers must hold the mission mutation guard through publication, execution,
+/// and outcome persistence. An assignment's Approved metadata is only an
+/// eligibility condition; it never replaces the executor's live approval gate.
+pub fn compile_assignment_dispatch(
+    mission: &Mission,
+    assignment_id: &AssignmentId,
+) -> Result<MissionTxContract, AssignmentDispatchError> {
+    use sha2::{Digest as _, Sha256};
+
+    mission
+        .validate()
+        .map_err(|_| AssignmentDispatchError::InvalidMission)?;
+    if !matches!(
+        mission.lifecycle_state,
+        MissionLifecycleState::Running | MissionLifecycleState::Executing
+    ) || mission.pause_resume_state.is_paused()
+    {
+        return Err(AssignmentDispatchError::NotRunning);
+    }
+    let assignment = mission
+        .assignments
+        .iter()
+        .find(|assignment| assignment.assignment_id == *assignment_id)
+        .ok_or(AssignmentDispatchError::AssignmentNotFound)?;
+    if assignment.outcome.is_some() {
+        return Err(AssignmentDispatchError::AlreadySettled);
+    }
+    if !matches!(
+        assignment.approval_state,
+        ApprovalState::NotRequired | ApprovalState::Approved { .. }
+    ) {
+        return Err(AssignmentDispatchError::ApprovalBlocked);
+    }
+    if assignment.reservation_intent.is_some() {
+        return Err(AssignmentDispatchError::ReservationUnsupported);
+    }
+    if assignment.created_at_ms < mission.created_at_ms {
+        return Err(AssignmentDispatchError::InvalidTimestamp);
+    }
+    let candidate = mission
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == assignment.candidate_id)
+        .ok_or(AssignmentDispatchError::InvalidMission)?;
+    match &candidate.action {
+        StepAction::SendText { .. } => {}
+        StepAction::WaitFor {
+            pane_id, condition, ..
+        } => {
+            let condition_pane = match condition {
+                WaitCondition::Pattern { pane_id, .. }
+                | WaitCondition::PaneIdle { pane_id, .. }
+                | WaitCondition::StableTail { pane_id, .. } => *pane_id,
+                WaitCondition::External { .. } => {
+                    return Err(AssignmentDispatchError::ActionUnsupported);
+                }
+            };
+            if let (Some(outer), Some(inner)) = (pane_id, condition_pane)
+                && *outer != inner
+            {
+                return Err(AssignmentDispatchError::TargetConflict);
+            }
+            if pane_id.or(condition_pane).is_none() {
+                return Err(AssignmentDispatchError::TargetUnspecified);
+            }
+        }
+        _ => return Err(AssignmentDispatchError::ActionUnsupported),
+    }
+
+    // Structured encoding prevents delimiter ambiguity in caller-owned IDs.
+    // Retain the full digest in the durable filename and ledger identities.
+    let identity = serde_json::to_vec(&(
+        "frankenterm.mission.assignment-dispatch.v1",
+        &mission.mission_id,
+        &mission.generation,
+        &mission.workspace_id,
+        &assignment.assignment_id,
+    ))
+    .map_err(|_| AssignmentDispatchError::InvalidMission)?;
+    let digest = hex::encode(Sha256::digest(&identity));
+    let summary = serde_json::to_string(&(
+        "frankenterm.mission.assignment-binding.v1",
+        &assignment.assignment_id,
+        &assignment.assignee,
+        &candidate.candidate_id,
+    ))
+    .map_err(|_| AssignmentDispatchError::InvalidMission)?;
+    let tx_id = TxId(format!("mission-tx:{digest}"));
+    let contract = MissionTxContract {
+        tx_version: crate::plan::MISSION_TX_SCHEMA_VERSION,
+        intent: TxIntent {
+            tx_id: tx_id.clone(),
+            requested_by: MissionActorRole::Dispatcher,
+            summary,
+            correlation_id: format!("mission-dispatch:{digest}"),
+            created_at_ms: assignment.created_at_ms,
+        },
+        plan: TxPlan {
+            plan_id: TxPlanId(format!("mission-plan:{digest}")),
+            tx_id,
+            steps: vec![TxStep {
+                step_id: TxStepId(format!("assignment:{digest}")),
+                ordinal: 0,
+                action: candidate.action.clone(),
+                description: "Execute the assignment's explicit pane action".to_string(),
+            }],
+            preconditions: Vec::new(),
+            compensations: Vec::new(),
+        },
+        lifecycle_state: MissionTxState::Planned,
+        outcome: TxOutcome::Pending,
+        receipts: Vec::new(),
+    };
+    contract
+        .validate()
+        .map_err(|_| AssignmentDispatchError::InvalidMission)?;
+    Ok(contract)
+}
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -581,6 +762,317 @@ mod tests {
             rationale: "mission dispatch test contract".to_string(),
             approval_state: Some(crate::plan::ApprovalState::NotRequired),
         }
+    }
+
+    fn dispatch_mission() -> Mission {
+        let mut mission = Mission::new(
+            crate::plan::MissionId("mission:dispatch-test".to_string()),
+            "Explicit assignment dispatch",
+            "workspace:dispatch-test",
+            crate::plan::MissionOwnership {
+                planner: "planner".to_string(),
+                dispatcher: "dispatcher".to_string(),
+                operator: "operator".to_string(),
+            },
+            1_000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.updated_at_ms = Some(1_003);
+        mission.candidates.push(crate::plan::CandidateAction {
+            candidate_id: crate::plan::CandidateActionId("candidate:send".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 42,
+                text: "printf 'mission-dispatch\\n'\n".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "Selected explicit pane".to_string(),
+            score: None,
+            created_at_ms: 1_001,
+        });
+        mission.assignments.push(crate::plan::Assignment {
+            assignment_id: AssignmentId("assignment:send".to_string()),
+            candidate_id: mission.candidates[0].candidate_id.clone(),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-42".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_002,
+            updated_at_ms: None,
+        });
+        mission
+    }
+
+    fn compile_selected(mission: &Mission) -> Result<MissionTxContract, AssignmentDispatchError> {
+        compile_assignment_dispatch(mission, &mission.assignments[0].assignment_id)
+    }
+
+    #[test]
+    fn assignment_dispatch_preserves_the_full_action_and_real_target() {
+        let mission = dispatch_mission();
+        let contract = compile_selected(&mission).unwrap();
+        contract.validate().unwrap();
+        assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+        assert_eq!(contract.outcome, TxOutcome::Pending);
+        assert_eq!(contract.plan.steps.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&contract.plan.steps[0].action).unwrap(),
+            serde_json::to_value(&mission.candidates[0].action).unwrap()
+        );
+        assert_eq!(
+            contract.referenced_pane_ids().into_iter().collect::<Vec<_>>(),
+            [42]
+        );
+        assert!(contract.plan.compensations.is_empty());
+        assert!(contract.receipts.is_empty());
+        assert_eq!(contract.intent.created_at_ms, 1_002);
+    }
+
+    #[test]
+    fn assignment_dispatch_identity_survives_lifecycle_revision_changes() {
+        let mut mission = dispatch_mission();
+        let original = compile_selected(&mission).unwrap();
+        mission
+            .pause_mission("operator", "review", 2_000, None)
+            .unwrap();
+        mission.revision = 1;
+        assert_eq!(
+            compile_selected(&mission).unwrap_err(),
+            AssignmentDispatchError::NotRunning
+        );
+        mission
+            .resume_mission("operator", "continue", 3_000, None)
+            .unwrap();
+        mission.revision = 2;
+        mission.title = "Renamed mission".to_string();
+        mission.candidates[0].rationale = "Updated explanation".to_string();
+        let resumed = compile_selected(&mission).unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(resumed).unwrap()
+        );
+    }
+
+    #[test]
+    fn assignment_dispatch_identity_binds_incarnation_workspace_and_assignment() {
+        let mission = dispatch_mission();
+        let mut variants = vec![mission.clone()];
+        let mut changed = mission.clone();
+        changed.generation = if mission.generation == "f".repeat(32) {
+            "e".repeat(32)
+        } else {
+            "f".repeat(32)
+        };
+        variants.push(changed);
+        let mut changed = mission.clone();
+        changed.mission_id = crate::plan::MissionId("mission:other".to_string());
+        variants.push(changed);
+        let mut changed = mission.clone();
+        changed.workspace_id = "workspace:other".to_string();
+        variants.push(changed);
+        let mut changed = mission;
+        changed.assignments[0].assignment_id = AssignmentId("assignment:other".to_string());
+        variants.push(changed);
+        let identities = variants
+            .iter()
+            .map(|mission| compile_selected(mission).unwrap().intent.tx_id.0)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), variants.len());
+    }
+
+    #[test]
+    fn assignment_dispatch_payload_changes_keep_the_same_slot_with_different_binding() {
+        let mission = dispatch_mission();
+        let original = compile_selected(&mission).unwrap();
+        let mut changed = mission.clone();
+        changed.candidates[0].action = StepAction::SendText {
+            pane_id: 43,
+            text: "different action".to_string(),
+            paste_mode: None,
+        };
+        let different_action = compile_selected(&changed).unwrap();
+        assert_eq!(original.intent.tx_id, different_action.intent.tx_id);
+        assert_ne!(
+            serde_json::to_value(&original.plan).unwrap(),
+            serde_json::to_value(&different_action.plan).unwrap()
+        );
+        let mut changed = mission;
+        changed.assignments[0].assignee = "agent-other".to_string();
+        let different_assignee = compile_selected(&changed).unwrap();
+        assert_eq!(original.intent.tx_id, different_assignee.intent.tx_id);
+        assert_ne!(original.intent.summary, different_assignee.intent.summary);
+    }
+
+    #[test]
+    fn assignment_dispatch_selects_the_requested_assignment_for_shared_candidate() {
+        let mut mission = dispatch_mission();
+        let mut second = mission.assignments[0].clone();
+        second.assignment_id = AssignmentId("assignment:second".to_string());
+        second.assignee = "agent-second".to_string();
+        second.created_at_ms = 1_003;
+        mission.assignments.push(second);
+        let first = compile_selected(&mission).unwrap();
+        let selected =
+            compile_assignment_dispatch(&mission, &mission.assignments[1].assignment_id)
+                .unwrap();
+        assert_ne!(first.intent.tx_id, selected.intent.tx_id);
+        assert_eq!(selected.intent.created_at_ms, 1_003);
+        assert_eq!(
+            compile_assignment_dispatch(&mission, &AssignmentId("absent".to_string()))
+                .unwrap_err(),
+            AssignmentDispatchError::AssignmentNotFound
+        );
+    }
+
+    #[test]
+    fn assignment_dispatch_refuses_settled_or_unapproved_work() {
+        let mission = dispatch_mission();
+        for approval in [
+            ApprovalState::Pending {
+                requested_by: "dispatcher".to_string(),
+                requested_at_ms: 1_003,
+            },
+            ApprovalState::Denied {
+                denied_by: "operator".to_string(),
+                denied_at_ms: 1_003,
+                reason_code: "denied".to_string(),
+            },
+            ApprovalState::Expired {
+                expired_at_ms: 1_003,
+                reason_code: "expired".to_string(),
+            },
+        ] {
+            let mut blocked = mission.clone();
+            blocked.assignments[0].approval_state = approval;
+            assert_eq!(
+                compile_selected(&blocked).unwrap_err(),
+                AssignmentDispatchError::ApprovalBlocked
+            );
+        }
+        let mut settled = mission;
+        settled.assignments[0].outcome = Some(crate::plan::Outcome::Success {
+            reason_code: "dispatched".to_string(),
+            completed_at_ms: 1_003,
+        });
+        assert_eq!(
+            compile_selected(&settled).unwrap_err(),
+            AssignmentDispatchError::AlreadySettled
+        );
+    }
+
+    #[test]
+    fn assignment_dispatch_never_drops_a_file_reservation_requirement() {
+        let mut mission = dispatch_mission();
+        mission.assignments[0].reservation_intent = Some(crate::plan::ReservationIntent {
+            reservation_id: crate::plan::ReservationIntentId("reservation:edit".to_string()),
+            requested_by: MissionActorRole::Dispatcher,
+            paths: vec!["src/**".to_string()],
+            exclusive: true,
+            reason: None,
+            requested_at_ms: 1_002,
+            expires_at_ms: None,
+        });
+        assert_eq!(
+            compile_selected(&mission).unwrap_err(),
+            AssignmentDispatchError::ReservationUnsupported
+        );
+    }
+
+    #[test]
+    fn assignment_dispatch_wait_requires_one_unambiguous_explicit_pane() {
+        let mut mission = dispatch_mission();
+        for (outer, inner, error) in [
+            (None, None, Some(AssignmentDispatchError::TargetUnspecified)),
+            (
+                Some(42),
+                Some(43),
+                Some(AssignmentDispatchError::TargetConflict),
+            ),
+            (Some(42), None, None),
+            (None, Some(42), None),
+            (Some(42), Some(42), None),
+        ] {
+            mission.candidates[0].action = StepAction::WaitFor {
+                pane_id: outer,
+                condition: WaitCondition::Pattern {
+                    pane_id: inner,
+                    rule_id: "codex.done".to_string(),
+                },
+                timeout_ms: 5_000,
+            };
+            let result = compile_selected(&mission);
+            if let Some(expected) = error {
+                assert_eq!(result.unwrap_err(), expected);
+            } else {
+                let contract = result.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&contract.plan.steps[0].action).unwrap(),
+                    serde_json::to_value(&mission.candidates[0].action).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assignment_dispatch_refuses_actions_without_a_live_pane_executor() {
+        let mut mission = dispatch_mission();
+        for action in [
+            StepAction::WaitFor {
+                pane_id: Some(42),
+                condition: WaitCondition::External {
+                    key: "ready".to_string(),
+                },
+                timeout_ms: 5_000,
+            },
+            StepAction::RunWorkflow {
+                workflow_id: "workflow".to_string(),
+                params: None,
+            },
+            StepAction::StoreData {
+                key: "state".to_string(),
+                value: serde_json::json!(true),
+            },
+            StepAction::Custom {
+                action_type: "unknown".to_string(),
+                payload: serde_json::Value::Null,
+            },
+        ] {
+            mission.candidates[0].action = action;
+            assert_eq!(
+                compile_selected(&mission).unwrap_err(),
+                AssignmentDispatchError::ActionUnsupported
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_dispatch_refuses_unstarted_and_invalid_missions() {
+        let mut mission = dispatch_mission();
+        for state in [
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Planned,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::RetryPending,
+        ] {
+            mission.lifecycle_state = state;
+            assert_eq!(
+                compile_selected(&mission).unwrap_err(),
+                AssignmentDispatchError::NotRunning
+            );
+        }
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.assignments[0].created_at_ms = 999;
+        assert_eq!(
+            compile_selected(&mission).unwrap_err(),
+            AssignmentDispatchError::InvalidTimestamp
+        );
+        mission.generation.clear();
+        assert_eq!(
+            compile_selected(&mission).unwrap_err(),
+            AssignmentDispatchError::InvalidMission
+        );
     }
 
     #[test]
