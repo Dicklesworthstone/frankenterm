@@ -22348,14 +22348,22 @@ fn robot_fleet_reassign_work(
 struct RobotFleetMuxExecutor {
     mux: frankenterm_core::wezterm::MuxHandle,
     db_path: String,
+    /// The workspace this command resolved (`--workspace`, `FT_WORKSPACE`, or
+    /// the current directory); profile working directories must stay in it.
+    workspace_root: PathBuf,
     spawned_by_step: BTreeMap<String, u64>,
 }
 
 impl RobotFleetMuxExecutor {
-    fn new(mux: frankenterm_core::wezterm::MuxHandle, db_path: impl Into<String>) -> Self {
+    fn new(
+        mux: frankenterm_core::wezterm::MuxHandle,
+        db_path: impl Into<String>,
+        workspace_root: &Path,
+    ) -> Self {
         Self {
             mux,
             db_path: db_path.into(),
+            workspace_root: workspace_root.to_path_buf(),
             spawned_by_step: BTreeMap::new(),
         }
     }
@@ -22392,16 +22400,18 @@ impl RobotFleetMuxExecutor {
         // so canonicalize + contain it to the workspace root here, at the real
         // spawn sink, before it reaches mux.spawn. Reject any path that escapes
         // the workspace (../ traversal, absolute-outside, or symlink escape).
-        if let Some(requested_cwd) = cwd {
-            if !requested_cwd.trim().is_empty() {
-                let workspace_root = std::env::var_os("FT_WORKSPACE")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                if !frankenterm_core::robot_profile_handler::spawn_cwd_is_contained(
-                    &workspace_root,
+        // The root is the one this command resolved, and the spawn uses the
+        // checked absolute path: a relative spelling would otherwise resolve
+        // against the spawning process's directory instead.
+        let contained_cwd = match cwd.filter(|requested| !requested.trim().is_empty()) {
+            None => None,
+            Some(requested_cwd) => {
+                let contained = frankenterm_core::robot_profile_handler::contained_spawn_cwd(
+                    &self.workspace_root,
                     requested_cwd,
-                ) {
+                )
+                .and_then(|path| path.to_str().map(str::to_owned));
+                let Some(contained) = contained else {
                     return Err(
                         frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
                             "robot.fleet.spawn_cwd_denied",
@@ -22411,14 +22421,15 @@ impl RobotFleetMuxExecutor {
                             ),
                         ),
                     );
-                }
+                };
+                Some(contained)
             }
-        }
+        };
 
         let launch = robot_fleet_launch_script(program, env)?;
         let runtime = Self::runtime()?;
         let pane_id = runtime
-            .block_on(self.mux.spawn(cwd, domain))
+            .block_on(self.mux.spawn(contained_cwd.as_deref(), domain))
             .map_err(|err| {
                 frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
                     "robot.fleet.spawn_failed",
@@ -22941,6 +22952,7 @@ async fn robot_fleet_command_response(
     db_path: &str,
     config: &frankenterm_core::config::Config,
     ipc_socket_path: &Path,
+    workspace_root: &Path,
     command: &RobotFleetCommands,
     elapsed_ms: u64,
 ) -> RobotResponse<serde_json::Value> {
@@ -22994,7 +23006,7 @@ async fn robot_fleet_command_response(
             let (claimed_work_by_pane, work_queue_error) =
                 robot_fleet_claimed_work_counts(db_path, &running_agents);
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
-            let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
+            let mut executor = RobotFleetMuxExecutor::new(mux, db_path, workspace_root);
             let (mut data, plan) = robot_fleet_scale_plan(
                 program,
                 *target_count,
@@ -23103,7 +23115,7 @@ async fn robot_fleet_command_response(
                 robot_fleet_load_running_agents(db_path, config).await;
             let (work_rows, work_queue_error) = robot_fleet_rebalance_work_rows(db_path);
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
-            let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
+            let mut executor = RobotFleetMuxExecutor::new(mux, db_path, workspace_root);
             let (mut data, plan) = robot_fleet_rebalance_plan(
                 strategy,
                 *dry_run,
@@ -61133,6 +61145,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 &ctx.effective.paths.db_path,
                                 &config,
                                 Path::new(&ctx.effective.paths.ipc_socket_path),
+                                &layout.root,
                                 &command,
                                 elapsed_ms(start),
                             )
