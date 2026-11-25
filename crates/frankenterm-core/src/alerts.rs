@@ -210,7 +210,11 @@ pub struct WatcherAlertRule {
     pub id: String,
     pub metric: AlertMetric,
     pub threshold: f64,
-    pub period: AlertPeriod,
+    /// The rolling window a cost, token or rate-limit total covers. Required
+    /// for those metrics and refused for `account_balance`, which reads the
+    /// account's current remaining percentage. Being part of the rule's
+    /// config hash, an ignored period would re-emit an active alert on edit.
+    pub period: Option<AlertPeriod>,
     pub agent_type: Option<String>,
     pub account_id: Option<String>,
     pub service: Option<String>,
@@ -228,7 +232,9 @@ impl WatcherAlertRule {
             id: self.id.clone(),
             metric: self.metric.clone(),
             threshold: self.threshold,
-            period: self.period,
+            // Only account_balance has no period, and it never reads one; this
+            // matches AlertRule::account_balance.
+            period: self.period.unwrap_or(AlertPeriod::Day),
             agent_type: self.agent_type.clone(),
             account_id: self.account_id.clone(),
             service: self.service.clone(),
@@ -342,15 +348,31 @@ impl WatcherAlertConfig {
                         rule.id
                     ));
                 }
-            } else if rule.service.is_some() || rule.account_id.is_some() {
-                // Pane-scoped usage rows are recorded without an account, and
-                // account-attributed rows have no pane, so an account filter on
-                // a pane total could never match and the rule would never fire.
-                return Err(format!(
-                    "alerts rule {} service and account_id are only supported for \
-                     account_balance; recorded pane usage carries no account",
-                    rule.id
-                ));
+                if rule.period.is_some() {
+                    return Err(format!(
+                        "alerts rule {} account_balance does not accept period: it checks \
+                         the account's current remaining percentage",
+                        rule.id
+                    ));
+                }
+            } else {
+                if rule.period.is_none() {
+                    return Err(format!(
+                        "alerts rule {} requires period = \"day\", \"week\" or \"month\"",
+                        rule.id
+                    ));
+                }
+                if rule.service.is_some() || rule.account_id.is_some() {
+                    // Pane-scoped usage rows are recorded without an account,
+                    // and account-attributed rows have no pane, so an account
+                    // filter on a pane total could never match and the rule
+                    // would never fire.
+                    return Err(format!(
+                        "alerts rule {} service and account_id are only supported for \
+                         account_balance; recorded pane usage carries no account",
+                        rule.id
+                    ));
+                }
             }
         }
         Ok(())
@@ -918,7 +940,7 @@ impl WatcherAlertMonitor {
             "metric": rule.metric.as_str(),
             "current_value": current_value,
             "threshold": rule.threshold,
-            "period": rule.period.as_str(),
+            "period": configured.period.map(AlertPeriod::as_str),
             "previous_event_id": previous_id,
             "alert_state": state,
         });
@@ -1006,7 +1028,7 @@ mod tests {
                 id: "build-budget".to_string(),
                 metric: AlertMetric::Cost,
                 threshold: 100.0,
-                period: AlertPeriod::Day,
+                period: Some(AlertPeriod::Day),
                 agent_type: Some("claude_code".to_string()),
                 account_id: None,
                 service: None,
@@ -1120,6 +1142,14 @@ period = "day"
         invalid.rules[0].service = Some("anthropic".to_string());
         invalid.rules[0].agent_type = None;
         invalid.rules[0].account_id = Some("build".to_string());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("does not accept period"),
+            "a balance has no window, so a period would only perturb its config hash"
+        );
+        invalid.rules[0].period = None;
         assert!(invalid.validate().is_ok());
         invalid.rules[0].account_id = None;
         assert!(invalid.validate().is_err(), "account ID must be explicit");
@@ -1127,6 +1157,41 @@ period = "day"
         invalid = watcher_config();
         invalid.rules[0].account_id = Some("build".to_string());
         assert!(invalid.validate().is_err(), "a pane total takes no account");
+        invalid = watcher_config();
+        invalid.rules[0].period = None;
+        assert!(
+            invalid.validate().unwrap_err().contains("requires period"),
+            "a pane total needs its window"
+        );
+    }
+
+    /// A balance rule is written without `period`, and a total keeps the exact
+    /// serialized form it had when `period` was not optional, so the config
+    /// hash of an already-recorded alert does not change.
+    #[test]
+    fn watcher_alert_period_is_optional_only_where_it_is_unused() {
+        let text = r#"
+[alerts]
+enabled = true
+[[alerts.rules]]
+id = "balance"
+pane_id = 7
+metric = "account_balance"
+threshold = 20.0
+service = "anthropic"
+account_id = "my-account"
+"#;
+        let config = crate::config::Config::from_toml(text).unwrap();
+        assert_eq!(config.alerts.rules[0].period, None);
+        let with_period = text.replace("threshold = 20.0", "threshold = 20.0\nperiod = \"day\"");
+        assert!(crate::config::Config::from_toml(&with_period).is_err());
+
+        let total = serde_json::to_value(&watcher_config().rules[0]).unwrap();
+        assert_eq!(
+            total["period"],
+            serde_json::to_value(AlertPeriod::Day).unwrap(),
+            "Some(period) must hash exactly as the bare period did"
+        );
     }
 
     #[test]
@@ -1292,6 +1357,7 @@ period = "day"
             let mut config = watcher_config();
             config.rules[0].metric = AlertMetric::AccountBalance;
             config.rules[0].threshold = 20.0;
+            config.rules[0].period = None;
             config.rules[0].agent_type = None;
             config.rules[0].service = Some("anthropic".to_string());
             config.rules[0].account_id = Some("build".to_string());
