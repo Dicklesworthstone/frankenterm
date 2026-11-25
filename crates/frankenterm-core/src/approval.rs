@@ -2463,7 +2463,7 @@ mod tests {
                     .is_some()
             );
 
-            let plan_token = planned
+            let plan_bound_token = planned
                 .issue_for_plan_with_cx(&cx, &input, "plan-hash", Some(1), None)
                 .await
                 .unwrap();
@@ -2473,7 +2473,7 @@ mod tests {
                 planned
                     .consume_for_plan_with_cx(
                         &cx,
-                        &plan_token.allow_once_code,
+                        &plan_bound_token.allow_once_code,
                         &input,
                         "plan-hash",
                     )
