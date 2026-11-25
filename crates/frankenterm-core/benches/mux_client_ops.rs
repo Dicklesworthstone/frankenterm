@@ -5,30 +5,46 @@
 // Mux connection setup traverses the owner-Cx and transport future layers.
 #![recursion_limit = "256"]
 
+// DirectMuxClient and its mock server are unix-only, so each item is
+// cfg(unix) and other platforms get an empty main.
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::hint::black_box;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use frankenterm_core::runtime_async::CompatRuntime;
 
+#[cfg(unix)]
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse, Pdu,
     StreamingPduBuffer, UnitResponse,
 };
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt as CompatAsyncWriteExt;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{
     Mutex as CompatMutex, Runtime, RuntimeBuilder, io, task, timeout, unix,
 };
+#[cfg(unix)]
 use frankenterm_core::vendored::{
     DirectMuxClient, DirectMuxClientConfig, SubscriptionConfig, subscribe_pane_output,
 };
+#[cfg(unix)]
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "mux_client_ops/pdu_encode_write",
@@ -52,12 +68,14 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct MockServerConfig {
     list_window_titles: usize,
     list_title_len: usize,
 }
 
+#[cfg(unix)]
 fn compat_runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -65,6 +83,7 @@ fn compat_runtime() -> Runtime {
         .expect("create compat runtime")
 }
 
+#[cfg(unix)]
 fn socket_path(prefix: &str) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -73,6 +92,7 @@ fn socket_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("frankenterm-bench-mux-client-{prefix}-{ts}.sock"))
 }
 
+#[cfg(unix)]
 fn build_list_panes_response(config: MockServerConfig) -> ListPanesResponse {
     let mut window_titles = HashMap::with_capacity(config.list_window_titles);
     let title_prefix = "x".repeat(config.list_title_len.max(1));
@@ -87,12 +107,14 @@ fn build_list_panes_response(config: MockServerConfig) -> ListPanesResponse {
     }
 }
 
+#[cfg(unix)]
 fn approx_list_payload_bytes(config: MockServerConfig) -> usize {
     // Rough proxy used only for benchmark throughput labels.
     // Includes title bytes plus a small per-entry overhead for map framing.
     config.list_window_titles * (config.list_title_len + 16)
 }
 
+#[cfg(unix)]
 fn build_render_changes_response(pane_id: usize, seqno: usize) -> GetPaneRenderChangesResponse {
     GetPaneRenderChangesResponse {
         pane_id,
@@ -120,6 +142,7 @@ fn build_render_changes_response(pane_id: usize, seqno: usize) -> GetPaneRenderC
     }
 }
 
+#[cfg(unix)]
 async fn spawn_mock_mux_server(
     socket_path: PathBuf,
     config: MockServerConfig,
@@ -190,6 +213,7 @@ async fn spawn_mock_mux_server(
     })
 }
 
+#[cfg(unix)]
 async fn connect_client(socket_path: &Path) -> DirectMuxClient {
     Box::pin(DirectMuxClient::connect(
         DirectMuxClientConfig::default().with_socket_path(socket_path),
@@ -198,6 +222,7 @@ async fn connect_client(socket_path: &Path) -> DirectMuxClient {
     .expect("connect DirectMuxClient")
 }
 
+#[cfg(unix)]
 fn bench_pdu_encode_write(c: &mut Criterion) {
     let compat_rt = compat_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_encode_write");
@@ -241,6 +266,7 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_pdu_read_decode(c: &mut Criterion) {
     let compat_rt = compat_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_read_decode");
@@ -297,6 +323,7 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_pdu_roundtrip(c: &mut Criterion) {
     let compat_rt = compat_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_roundtrip");
@@ -337,6 +364,7 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_subscription_setup(c: &mut Criterion) {
     let compat_rt = compat_runtime();
     let mut group = c.benchmark_group("mux_client_ops/subscription_setup");
@@ -376,6 +404,7 @@ fn bench_subscription_setup(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_render_changes_poll(c: &mut Criterion) {
     let compat_rt = compat_runtime();
     let mut group = c.benchmark_group("mux_client_ops/render_changes_poll");
@@ -416,6 +445,7 @@ fn bench_render_changes_poll(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_suite(c: &mut Criterion) {
     bench_pdu_encode_write(c);
     bench_pdu_read_decode(c);
@@ -425,5 +455,10 @@ fn bench_suite(c: &mut Criterion) {
     bench_common::emit_bench_artifacts("mux_client_ops", BUDGETS);
 }
 
+#[cfg(unix)]
 criterion_group!(benches, bench_suite);
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}

@@ -15627,6 +15627,7 @@ mod tests {
         Error,
         /// Takes nothing and fails with a bare error of this kind, as a
         /// guardian transport timeout or a full tmux command queue does.
+        #[cfg(unix)]
         RefuseForNow(std::io::ErrorKind),
         /// Takes nothing and fails as a guardian lease does while it holds
         /// new input back, before any guardian call.
@@ -15667,6 +15668,7 @@ mod tests {
                 FakePaneWriteBehavior::Error => {
                     return Err(std::io::Error::other("injected pane-writer rejection"));
                 }
+                #[cfg(unix)]
                 FakePaneWriteBehavior::RefuseForNow(kind) => {
                     return Err(std::io::Error::new(kind, "injected pane-writer refusal"));
                 }

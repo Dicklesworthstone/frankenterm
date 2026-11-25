@@ -96,16 +96,18 @@ impl TestHarness {
     }
 }
 
+#[cfg(unix)]
 fn make_executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(path)
-            .expect("metadata for executable")
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("chmod executable");
-    }
+    let mut perms = fs::metadata(path)
+        .expect("metadata for executable")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod executable");
 }
+
+/// Windows has no exec bit to set.
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
 
 fn fake_wezterm_script() -> &'static str {
     r#"#!/usr/bin/env python3

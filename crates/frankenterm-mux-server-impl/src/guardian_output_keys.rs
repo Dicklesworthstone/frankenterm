@@ -253,14 +253,15 @@ impl AuthorityFingerprint {
 }
 
 /// Never produced off unix: every refresh there takes the full inventory.
+/// The Infallible field makes it uninhabited without an empty enum.
 #[cfg(not(unix))]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AuthorityFingerprint {}
+struct AuthorityFingerprint(std::convert::Infallible);
 
 #[cfg(not(unix))]
 impl AuthorityFingerprint {
-    fn settled(&self, _now: std::time::SystemTime) -> bool {
-        match *self {}
+    fn settled(self, _now: std::time::SystemTime) -> bool {
+        match self.0 {}
     }
 }
 
@@ -281,6 +282,13 @@ fn authority_fingerprint(_directory: &CapDir, _active: Activation) -> Option<Aut
 }
 
 /// What a lookup's full validation of the active authority found.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::large_enum_variant,
+        reason = "short-lived return value; the fingerprint is empty off unix"
+    )
+)]
 enum ActiveAuthority {
     /// The latest activation and key on disk are still the keyring's, so the
     /// in-memory active key is the key the inventory would load. Carries the
@@ -1778,7 +1786,7 @@ fn atomic_publish_noreplace(
     Err(GuardianOutputKeyringError::UnsupportedAtomicPublication)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn publish_key(
     directory: &CapDir,
     key: &GuardianOutputKey,
@@ -3226,6 +3234,7 @@ mod tests {
             .expect("retain exact reconciled authority");
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
     enum IntentCrashCut {
         KeyStageCreated,

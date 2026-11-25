@@ -2,16 +2,26 @@
 //!
 //! Bead: wa-q8vj3
 
+// Unix sockets throughout, so each item is cfg(unix) and other platforms get
+// an empty main.
+#[cfg(unix)]
 use std::hint::black_box;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder, unix};
+#[cfg(unix)]
 use unix::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "socket_throughput/roundtrip_latency",
@@ -31,6 +41,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 fn runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -38,6 +49,7 @@ fn runtime() -> Runtime {
         .expect("create compat runtime")
 }
 
+#[cfg(unix)]
 fn socket_path(prefix: &str) -> std::path::PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -46,6 +58,7 @@ fn socket_path(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("frankenterm-bench-{prefix}-{ts}.sock"))
 }
 
+#[cfg(unix)]
 async fn roundtrip_once(payload_size: usize) -> io::Result<usize> {
     let socket_path = socket_path("roundtrip");
     let listener = unix::bind(&socket_path).await?;
@@ -70,6 +83,7 @@ async fn roundtrip_once(payload_size: usize) -> io::Result<usize> {
     Ok(server_len)
 }
 
+#[cfg(unix)]
 async fn connect_accept_once() -> io::Result<()> {
     let socket_path = socket_path("connect");
     let listener = unix::bind(&socket_path).await?;
@@ -84,6 +98,7 @@ async fn connect_accept_once() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn stream_throughput_once(
     payload_size: usize,
     frame_count: usize,
@@ -128,6 +143,7 @@ async fn stream_throughput_once(
     read_task.await.expect("reader join")
 }
 
+#[cfg(unix)]
 fn bench_roundtrip_latency(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("socket_throughput/roundtrip_latency");
@@ -151,6 +167,7 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_streaming_throughput(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("socket_throughput/streaming_throughput");
@@ -177,6 +194,7 @@ fn bench_streaming_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_pdu_framing_overhead(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("socket_throughput/pdu_framing_overhead");
@@ -203,6 +221,7 @@ fn bench_pdu_framing_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_connect_accept_latency(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("socket_throughput/connect_accept_latency");
@@ -219,6 +238,7 @@ fn bench_connect_accept_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_suite(c: &mut Criterion) {
     bench_roundtrip_latency(c);
     bench_streaming_throughput(c);
@@ -227,5 +247,10 @@ fn bench_suite(c: &mut Criterion) {
     bench_common::emit_bench_artifacts("socket_throughput", BUDGETS);
 }
 
+#[cfg(unix)]
 criterion_group!(benches, bench_suite);
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}

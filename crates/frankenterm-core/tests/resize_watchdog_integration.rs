@@ -7,8 +7,6 @@ use frankenterm_core::resize_scheduler::{
     SubmitOutcome,
 };
 use frankenterm_core::runtime::{ResizeWatchdogSeverity, evaluate_resize_watchdog};
-use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-use std::future::Future;
 use std::sync::Mutex;
 
 /// Tests in this file share a process-global resize scheduler debug snapshot.
@@ -27,10 +25,14 @@ fn intent(pane_id: u64, intent_seq: u64, submitted_at_ms: u64) -> ResizeIntent {
     }
 }
 
+/// Only the unix IPC status test runs async.
+#[cfg(unix)]
 fn run_async_test<F>(future: F)
 where
-    F: Future<Output = ()>,
+    F: std::future::Future<Output = ()>,
 {
+    use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
+
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("failed to build runtime_async current-thread runtime");

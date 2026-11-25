@@ -15733,9 +15733,11 @@ mod tests {
         with_mcp_tx_cx,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
+    #[cfg(unix)]
+    use crate::mcp_error::MCP_ERR_CASS;
     use crate::mcp_error::{
-        MCP_ERR_CASS, MCP_ERR_CONFIG, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY,
-        MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WORKFLOW,
+        MCP_ERR_CONFIG, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+        MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WORKFLOW,
     };
     use crate::pane_capability_resolution::{IpcPaneState, set_test_pane_state_override};
     use crate::plan::{

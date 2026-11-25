@@ -1128,6 +1128,7 @@ fn seed_committed_tx(harness: &mut TestHarness) {
     }
 }
 
+#[cfg(all(unix, feature = "vendored"))]
 fn read_tx_contract(workspace: &Path) -> MissionTxContract {
     serde_json::from_str(
         &fs::read_to_string(tx_file_path(workspace)).expect("read persisted tx contract"),
@@ -1135,6 +1136,7 @@ fn read_tx_contract(workspace: &Path) -> MissionTxContract {
     .expect("parse persisted tx contract")
 }
 
+#[cfg(all(unix, feature = "vendored"))]
 fn log_tx_roundtrip_phase(phase: &str, envelope: &Value, persisted: &MissionTxContract) {
     eprintln!(
         "{}",

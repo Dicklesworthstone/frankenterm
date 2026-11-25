@@ -786,7 +786,9 @@ mod tests {
                     rng.random_range(0..=1024),
                 ];
                 for (row, len) in lengths.into_iter().enumerate() {
-                    let original: Vec<u8> = (0..len).map(|_| rng.random()).collect();
+                    // Turbofish: on Windows, encode_unicode adds
+                    // FromIterator<Utf8Char> for Vec<u8>, so u8 isn't inferred.
+                    let original: Vec<u8> = (0..len).map(|_| rng.random::<u8>()).collect();
                     let input_hash = hex::encode(Sha256::digest(&original));
                     let encoded = super::encode_row(cfg, &original).unwrap();
                     let serialized: Vec<Vec<u8>> = encoded

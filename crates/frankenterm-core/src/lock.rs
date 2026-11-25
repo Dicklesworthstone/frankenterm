@@ -2558,6 +2558,7 @@ mod tests {
 
         let mut created = open_or_create_exclusively(&directory, "shared.lock", &options).unwrap();
         created.write_all(b"held").unwrap();
+        #[cfg(unix)]
         let created_metadata = created.metadata().unwrap();
         #[cfg(unix)]
         assert_eq!(created_metadata.mode() & 0o777, 0o600);

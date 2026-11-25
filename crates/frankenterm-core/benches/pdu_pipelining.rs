@@ -9,24 +9,37 @@
 // Mux connection setup traverses the owner-Cx and transport future layers.
 #![recursion_limit = "256"]
 
+// DirectMuxClient and its mock server are unix-only, so each item is
+// cfg(unix) and other platforms get an empty main.
+#[cfg(unix)]
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, StreamingPduBuffer,
     UnitResponse,
 };
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{
     CompatRuntime, Mutex, Runtime, RuntimeBuilder, io, sleep, task, unix,
 };
+#[cfg(unix)]
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "pipeline_vs_sequential_throughput",
@@ -46,6 +59,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 fn make_runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -53,6 +67,7 @@ fn make_runtime() -> Runtime {
         .expect("runtime")
 }
 
+#[cfg(unix)]
 fn render_changes_response(pane_id: usize) -> GetPaneRenderChangesResponse {
     GetPaneRenderChangesResponse {
         pane_id,
@@ -80,6 +95,7 @@ fn render_changes_response(pane_id: usize) -> GetPaneRenderChangesResponse {
     }
 }
 
+#[cfg(unix)]
 async fn setup_client(
     response_batch_delay: Duration,
     reverse_batch_responses: bool,
@@ -171,6 +187,7 @@ async fn setup_client(
 // allocation to every measured iteration and contaminate the comparison with
 // benchmark-driver overhead that the real call path does not require.
 #[allow(clippy::large_futures)]
+#[cfg(unix)]
 fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_vs_sequential_throughput");
     group.throughput(Throughput::Elements(50));
@@ -223,6 +240,7 @@ fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
 // See `bench_pipeline_vs_sequential_throughput`: allocation-free future
 // construction is part of this latency measurement's fidelity contract.
 #[allow(clippy::large_futures)]
+#[cfg(unix)]
 fn bench_pipeline_batch_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_batch_latency");
     let rt = make_runtime();
@@ -259,6 +277,7 @@ fn bench_pipeline_batch_latency(c: &mut Criterion) {
 // See `bench_pipeline_vs_sequential_throughput`: boxing here would charge one
 // unrelated allocation to every depth sample.
 #[allow(clippy::large_futures)]
+#[cfg(unix)]
 fn bench_pipeline_depth_saturation(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_depth_saturation");
     let rt = make_runtime();
@@ -288,6 +307,7 @@ fn bench_pipeline_depth_saturation(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> Option<usize> {
     let pos = in_flight
         .iter()
@@ -295,6 +315,7 @@ fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> O
     in_flight.remove(pos).map(|(idx, _)| idx)
 }
 
+#[cfg(unix)]
 fn bench_sequence_number_matching(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/sequence_number_matching");
 
@@ -315,11 +336,13 @@ fn bench_sequence_number_matching(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("pdu_pipelining", BUDGETS);
     Criterion::default().configure_from_args()
 }
 
+#[cfg(unix)]
 criterion_group!(
     name = benches;
     config = bench_config();
@@ -328,4 +351,8 @@ criterion_group!(
         bench_pipeline_depth_saturation,
         bench_sequence_number_matching
 );
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}

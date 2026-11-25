@@ -572,8 +572,6 @@ mod socket_transport {
         use std::io;
         use std::time::Duration;
 
-        #[cfg(test)]
-        pub use asupersync::io::AsyncWriteExt;
         pub use asupersync::io::{AsyncRead, BufReader};
         pub use frankenterm_uds::UnixStream;
 

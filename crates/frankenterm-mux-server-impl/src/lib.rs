@@ -7938,18 +7938,18 @@ fn filesystem_metadata_changed(
         return Ok(true);
     }
     #[cfg(unix)]
-    {
+    let identity_changed = {
         use std::os::unix::fs::MetadataExt as _;
 
-        if before.dev() != after.dev()
+        before.dev() != after.dev()
             || before.ino() != after.ino()
             || before.ctime() != after.ctime()
             || before.ctime_nsec() != after.ctime_nsec()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    };
+    // No portable file identity here; ft-8r43i.16 tracks Windows identity.
+    #[cfg(not(unix))]
+    let identity_changed = false;
+    Ok(identity_changed)
 }
 
 impl LiveScrollbackSpillSink {
@@ -13362,6 +13362,8 @@ mod scrollback_crash_points {
         static RECORDING: std::cell::RefCell<Recording> = const { std::cell::RefCell::new(None) };
     }
 
+    /// Only the unix SIGKILL crash tests arm a point.
+    #[cfg(unix)]
     pub fn arm(step: &'static str) {
         *ARMED.lock().unwrap() = Some(step);
     }
@@ -22850,11 +22852,16 @@ mod tests {
         assert!(refused > 0, "single-bit corruption is detected");
     }
 
+    // The SIGKILL crash tests that use these constants are unix-only.
+    #[cfg(unix)]
     const CRASH_CHILD_STEP: &str = "FT_TEST_SCROLLBACK_CRASH_STEP";
+    #[cfg(unix)]
     const CRASH_CHILD_BASE: &str = "FT_TEST_SCROLLBACK_CRASH_BASE";
+    #[cfg(unix)]
     const CRASH_TEST: &str = "tests::scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix";
     /// Every named crash point of a batch transaction, in order, and whether
     /// the killed transaction's batch is rolled forward on reopen.
+    #[cfg(unix)]
     const CRASH_STEPS: [(&str, bool); 8] = [
         ("rows_appended", false),
         ("wal_staged", true),
@@ -23793,10 +23800,12 @@ mod tests {
         assert_rows_read_back_from(&reopened, 6, &again.iter().collect::<Vec<_>>());
     }
 
+    #[cfg(unix)]
     const TAIL_CRASH_TEST: &str =
         "tests::a_tail_killed_between_window_sync_and_publication_recovers_every_window_row";
     /// The crash points between a window's sync and the publication that
     /// names its rows, in order.
+    #[cfg(unix)]
     const TAIL_CRASH_STEPS: [&str; 8] = [
         "window_rows_synced",
         "wal_staged",
@@ -25070,6 +25079,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     const GAP_CRASH_TEST: &str =
         "tests::a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count";
 

@@ -6026,6 +6026,7 @@ mod tests {
         let lock1 = store.acquire_publication_lock().unwrap();
 
         // Simulate lock file replacement while lock was held/blocking
+        #[cfg(unix)]
         let lock_path = temp.path().join(".publication.lock");
         #[cfg(unix)]
         {

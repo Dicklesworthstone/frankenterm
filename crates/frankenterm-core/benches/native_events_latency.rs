@@ -8,21 +8,35 @@
 // Listener I/O and cancellation wrappers form a finite, deeply nested Send proof.
 #![recursion_limit = "256"]
 
+// The native listener and every baseline here are unix-only (unix sockets,
+// the `true` binary), so each item is cfg(unix) and other platforms get an
+// empty main.
+#[cfg(unix)]
 use std::hint::black_box;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(unix)]
 use frankenterm_core::native_events::{NativeEvent, NativeEventListener};
+#[cfg(unix)]
 use frankenterm_core::runtime_async::mpsc;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{
     CompatRuntime, Runtime, RuntimeBuilder, ShutdownSignal, mpsc_recv_option, task, timeout,
 };
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "native_events_latency/bench_native_first_message_latency",
@@ -46,11 +60,16 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 const PANE_OUTPUT_LINE: &str = r#"{"type":"pane_output","pane_id":1,"data_b64":"aGVsbG8=","ts":1}"#;
+#[cfg(unix)]
 const NATIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const BACKPRESSURE_EVENTS_PER_BATCH: u64 = 256;
+#[cfg(unix)]
 const BACKPRESSURE_DRAIN_DELAY: Duration = Duration::from_micros(250);
 
+#[cfg(unix)]
 fn runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -58,6 +77,7 @@ fn runtime() -> Runtime {
         .expect("create compat runtime")
 }
 
+#[cfg(unix)]
 async fn recv_event_or_panic(event_rx: &mut mpsc::Receiver<NativeEvent>) -> NativeEvent {
     timeout(NATIVE_EVENT_TIMEOUT, mpsc_recv_option(event_rx))
         .await
@@ -65,6 +85,7 @@ async fn recv_event_or_panic(event_rx: &mut mpsc::Receiver<NativeEvent>) -> Nati
         .expect("event channel closed unexpectedly")
 }
 
+#[cfg(unix)]
 fn bench_native_first_message_latency(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("native_events_latency");
@@ -104,6 +125,7 @@ fn bench_native_first_message_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_native_batch_throughput(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("native_events_latency");
@@ -166,6 +188,7 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_native_parse_dispatch_latency(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("native_events_latency");
@@ -218,6 +241,7 @@ fn bench_native_parse_dispatch_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_native_backpressure_impact(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("native_events_latency");
@@ -289,6 +313,7 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_legacy_process_spawn_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("native_events_latency");
     group.bench_function("bench_legacy_process_spawn_baseline", |b| {
@@ -301,6 +326,7 @@ fn bench_legacy_process_spawn_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_suite(c: &mut Criterion) {
     bench_native_first_message_latency(c);
     bench_native_batch_throughput(c);
@@ -310,5 +336,10 @@ fn bench_suite(c: &mut Criterion) {
     bench_common::emit_bench_artifacts("native_events_latency", BUDGETS);
 }
 
+#[cfg(unix)]
 criterion_group!(benches, bench_suite);
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}

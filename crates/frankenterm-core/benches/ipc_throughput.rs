@@ -19,6 +19,8 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer};
+// Only the raw connect/drop bench dials the socket directly (unix only).
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix as compat_unix;
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder, mpsc, task};
 
@@ -102,6 +104,7 @@ async fn ping_once(socket_path: &Path) -> IpcResponse {
     response
 }
 
+#[cfg(unix)]
 async fn connect_drop_once(socket_path: &Path) -> io::Result<()> {
     let stream = compat_unix::connect(socket_path).await?;
     drop(stream);
@@ -242,6 +245,7 @@ fn bench_json_serde_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_connection_establishment_latency(c: &mut Criterion) {
     let rt = runtime();
     let compat_socket = socket_path("ipc-connect-compat");
@@ -276,6 +280,7 @@ fn bench_suite(c: &mut Criterion) {
     bench_roundtrip_latency(c);
     bench_multi_client_throughput(c);
     bench_json_serde_overhead(c);
+    #[cfg(unix)]
     bench_connection_establishment_latency(c);
     bench_common::emit_bench_artifacts("ipc_throughput", BUDGETS);
 }

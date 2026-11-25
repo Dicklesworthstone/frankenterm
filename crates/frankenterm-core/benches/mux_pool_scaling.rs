@@ -10,28 +10,43 @@
 // Mux acquisition and cancellation wrappers form a finite, deeply nested Send proof.
 #![recursion_limit = "256"]
 
+// MuxPool, DirectMuxClient and the mock server are unix-only, so each item
+// is cfg(unix) and other platforms get an empty main.
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::hint::black_box;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, StreamingPduBuffer,
     UnitResponse,
 };
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-#[cfg(feature = "asupersync-runtime")]
+#[cfg(all(unix, feature = "asupersync-runtime"))]
 use frankenterm_core::cx;
+#[cfg(unix)]
 use frankenterm_core::pool::PoolConfig;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{
     CompatRuntime, Runtime, RuntimeBuilder, io, sleep, task, unix,
 };
+#[cfg(unix)]
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig, MuxPool, MuxPoolConfig};
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "acquire_release_cycle",
@@ -63,6 +78,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 fn make_runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -70,6 +86,7 @@ fn make_runtime() -> Runtime {
         .expect("runtime")
 }
 
+#[cfg(unix)]
 async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duration) -> PathBuf {
     let socket_path = temp_dir.path().join("mux-pool-scaling.sock");
     let listener = unix::bind(&socket_path).await.expect("bind mock listener");
@@ -137,6 +154,7 @@ async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duratio
     socket_path
 }
 
+#[cfg(unix)]
 fn mux_pool_config(socket_path: PathBuf, max_size: usize, idle_timeout: Duration) -> MuxPoolConfig {
     MuxPoolConfig {
         pool: PoolConfig {
@@ -149,6 +167,7 @@ fn mux_pool_config(socket_path: PathBuf, max_size: usize, idle_timeout: Duration
     }
 }
 
+#[cfg(unix)]
 async fn prime_connections(pool: Arc<MuxPool>, concurrent: usize) {
     let mut joins = Vec::with_capacity(concurrent);
     for _ in 0..concurrent {
@@ -162,6 +181,7 @@ async fn prime_connections(pool: Arc<MuxPool>, concurrent: usize) {
     }
 }
 
+#[cfg(unix)]
 fn bench_acquire_release_cycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/acquire_release_cycle");
     let rt = make_runtime();
@@ -191,6 +211,7 @@ fn bench_acquire_release_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_health_check_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/health_check_overhead");
     let rt = make_runtime();
@@ -234,6 +255,7 @@ fn bench_health_check_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_throughput_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/throughput_scaling");
     let rt = make_runtime();
@@ -275,6 +297,7 @@ fn bench_throughput_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_idle_eviction_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/idle_eviction_scan");
     let rt = make_runtime();
@@ -314,6 +337,7 @@ fn bench_idle_eviction_scan(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_connection_factory_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/connection_factory_overhead");
     let rt = make_runtime();
@@ -353,11 +377,13 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("mux_pool_scaling", BUDGETS);
     Criterion::default().configure_from_args()
 }
 
+#[cfg(unix)]
 criterion_group!(
     name = benches;
     config = bench_config();
@@ -368,4 +394,8 @@ criterion_group!(
         bench_idle_eviction_scan,
         bench_connection_factory_overhead
 );
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}

@@ -603,6 +603,8 @@ fn test_ci_gate_script_exists() {
     );
 }
 
+// Windows has no exec bit.
+#[cfg(unix)]
 #[test]
 fn test_ci_gate_script_executable() {
     use std::os::unix::fs::PermissionsExt;

@@ -996,9 +996,9 @@ fn escape_json_pointer_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::robot_ntm_surface::{
-        ProfileCommand, ProfileShowRequest, ProfileValidateRequest, RobotNtmCommand,
-    };
+    #[cfg(unix)]
+    use crate::robot_ntm_surface::ProfileShowRequest;
+    use crate::robot_ntm_surface::{ProfileCommand, ProfileValidateRequest, RobotNtmCommand};
     use serde_json::json;
     #[cfg(unix)]
     use std::fs;

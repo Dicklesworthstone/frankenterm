@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use asupersync::channel::mpsc as asup_mpsc;
 use asupersync::combinator::Select;
+// Only the unix-stream PDU bench needs these; the rest run everywhere.
+#[cfg(unix)]
 use asupersync::io::{AsyncReadExt as AsupAsyncReadExt, AsyncWriteExt as AsupAsyncWriteExt};
+#[cfg(unix)]
 use asupersync::net::unix::UnixStream as AsupUnixStream;
 use asupersync::runtime::RuntimeBuilder as AsupRuntimeBuilder;
 use asupersync::sync::{Mutex as AsupMutex, Semaphore as AsupSemaphore};
@@ -39,6 +42,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 async fn asup_write_pdu(stream: &mut AsupUnixStream, payload: &[u8]) {
     let len = u32::try_from(payload.len()).expect("payload length fits");
     stream
@@ -48,6 +52,7 @@ async fn asup_write_pdu(stream: &mut AsupUnixStream, payload: &[u8]) {
     stream.write_all(payload).await.expect("write payload");
 }
 
+#[cfg(unix)]
 async fn asup_read_pdu(stream: &mut AsupUnixStream) -> Vec<u8> {
     let mut header = [0_u8; 4];
     stream.read_exact(&mut header).await.expect("read header");
@@ -64,6 +69,11 @@ async fn asup_sleep_once(duration: Duration) {
     asupersync::time::sleep(now, duration).await;
 }
 
+/// Unix sockets only; elsewhere the group entry measures nothing.
+#[cfg(not(unix))]
+fn bench_unixstream_pdu(_c: &mut Criterion) {}
+
+#[cfg(unix)]
 fn bench_unixstream_pdu(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/unix_pdu");
     let asup_rt = AsupRuntimeBuilder::current_thread()

@@ -1174,18 +1174,22 @@ mod tests {
         assert_eq!(classify_tier(100.0, thresholds), DiskPressureTier::Black);
     }
 
+    // The df parsers exist only where df is the probe (not on Windows).
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_line_rejects_missing_percent_column() {
         let line = "/dev/disk3s1 100000 70000 30000 mounted_at_root";
         assert!(parse_df_data_line(line).is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_line_rejects_too_few_columns() {
         let line = "/dev/disk3s1 100000 70%";
         assert!(parse_df_data_line(line).is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_output_uses_last_valid_line() {
         let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n\
@@ -1196,6 +1200,7 @@ mod tests {
         assert_eq!(parsed.0, 20 * 1024);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_output_ignores_blank_lines() {
         let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n\n\
@@ -1205,6 +1210,7 @@ mod tests {
         assert_eq!(parsed.0, 60 * 1024);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_output_without_data_returns_none() {
         let output = "Filesystem 512-blocks Used Available Capacity Mounted on\n";

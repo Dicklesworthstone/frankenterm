@@ -13061,8 +13061,11 @@ recorder_backend = "frankensqlite"
         let err = ensure_durable_parent_chain(&target_nested).unwrap_err();
         match err {
             RecorderStorageError::Io(io_err) => {
+                // Windows reports its own code for a file used as a directory.
                 #[cfg(unix)]
                 assert_eq!(io_err.raw_os_error(), Some(libc::ENOTDIR));
+                #[cfg(not(unix))]
+                let _ = io_err;
             }
             RecorderStorageError::InvalidRequest { message } => {
                 assert!(message.contains("not a directory"));
@@ -13077,6 +13080,8 @@ recorder_backend = "frankensqlite"
             RecorderStorageError::Io(io_err) => {
                 #[cfg(unix)]
                 assert_eq!(io_err.raw_os_error(), Some(libc::ENOTDIR));
+                #[cfg(not(unix))]
+                let _ = io_err;
             }
             RecorderStorageError::InvalidRequest { message } => {
                 assert!(message.contains("not a directory"));

@@ -4,6 +4,8 @@
 //! with a minimal RPC handler so the generated client surface is backed by a
 //! concrete control-plane transport rather than a render-time stub.
 
+// Every test here drives the unix-socket IPC server.
+#![cfg(unix)]
 // IPC I/O and cancellation wrappers form a finite, deeply nested Send proof.
 #![recursion_limit = "256"]
 

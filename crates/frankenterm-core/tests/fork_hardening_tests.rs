@@ -14,6 +14,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use frankenterm_core::differential_snapshot::{BaseSnapshot, DiffSnapshotEngine};
+// Only the Linux and macOS memory-budget tests use these.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use frankenterm_core::memory_budget::{
     MemoryBudgetConfig, MemoryBudgetManager, cgroups_v2_available,
 };

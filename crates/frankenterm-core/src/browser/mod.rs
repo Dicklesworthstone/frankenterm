@@ -1488,6 +1488,7 @@ impl ProfileMetadataFileSnapshot {
 
     #[cfg(test)]
     fn synthetic(byte_len: u64, version: u64) -> Self {
+        #[cfg(unix)]
         let seconds = i64::try_from(version).unwrap_or(i64::MAX);
         Self {
             byte_len,

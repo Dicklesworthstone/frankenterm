@@ -10643,12 +10643,22 @@ mod tests {
         assert_eq!(WeztermClient::parse_pane_id("  123  \n").unwrap(), 123);
     }
 
-    #[cfg(unix)]
     fn synthetic_cli_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
-        use std::os::unix::process::ExitStatusExt as _;
+        // A unix wait status keeps the exit code in its high byte; Windows
+        // takes the exit code itself.
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 })
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(u32::from(!success))
+        };
 
         std::process::Output {
-            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            status,
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }

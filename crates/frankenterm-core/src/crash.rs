@@ -10344,6 +10344,10 @@ mod tests {
 
         let bundle_path = write_crash_bundle(&crash_dir, &report, None, None).unwrap();
 
+        // Windows has no mode bits to check; the report must still be written.
+        #[cfg(not(unix))]
+        assert!(bundle_path.join("crash_report.json").is_file());
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

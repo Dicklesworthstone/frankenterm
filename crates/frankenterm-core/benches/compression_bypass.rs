@@ -9,24 +9,37 @@
 // Mux connection setup traverses the owner-Cx and transport future layers.
 #![recursion_limit = "256"]
 
+// DirectMuxClient and the handshake server are unix-only, so each item is
+// cfg(unix) and other platforms get an empty main.
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use codec::{
     CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, StreamingPduBuffer, UnitResponse,
     WriteToPane,
 };
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(unix)]
 use frankenterm_core::config::VendoredCompressionMode;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+#[cfg(unix)]
 use frankenterm_core::runtime_async::{
     CompatRuntime, Runtime, RuntimeBuilder, io, task, timeout, unix,
 };
+#[cfg(unix)]
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
+#[cfg(unix)]
 use std::hint::black_box;
 
+#[cfg(unix)]
 mod bench_common;
 
+#[cfg(unix)]
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "local_socket_overhead_savings",
@@ -46,10 +59,14 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+#[cfg(unix)]
 const COMPRESSED_MASK: u64 = 1 << 63;
+#[cfg(unix)]
 const BENCH_SERIAL: u64 = 77;
+#[cfg(unix)]
 const BENCH_PANE_ID: usize = 11;
 
+#[cfg(unix)]
 fn make_runtime() -> Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
@@ -57,12 +74,14 @@ fn make_runtime() -> Runtime {
         .expect("runtime")
 }
 
+#[cfg(unix)]
 fn make_payload(size: usize) -> Vec<u8> {
     (0..size)
         .map(|idx| (((idx * 31) + 7) % 251) as u8)
         .collect()
 }
 
+#[cfg(unix)]
 fn roundtrip_write_to_pane(mode: CompressionMode, payload_size: usize) -> usize {
     let pdu = Pdu::WriteToPane(WriteToPane {
         pane_id: BENCH_PANE_ID,
@@ -79,6 +98,7 @@ fn roundtrip_write_to_pane(mode: CompressionMode, payload_size: usize) -> usize 
     }
 }
 
+#[cfg(unix)]
 fn decode_u64_leb128_prefix(bytes: &[u8]) -> Option<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
@@ -97,10 +117,12 @@ fn decode_u64_leb128_prefix(bytes: &[u8]) -> Option<u64> {
     None
 }
 
+#[cfg(unix)]
 fn frame_marked_compressed(bytes: &[u8]) -> Option<bool> {
     decode_u64_leb128_prefix(bytes).map(|length| (length & COMPRESSED_MASK) != 0)
 }
 
+#[cfg(unix)]
 async fn serve_handshake(stream: &mut unix::UnixStream, reject_uncompressed_first_frame: bool) {
     let mut read_buf = StreamingPduBuffer::new();
     let mut first_frame_checked = false;
@@ -152,6 +174,7 @@ async fn serve_handshake(stream: &mut unix::UnixStream, reject_uncompressed_firs
     }
 }
 
+#[cfg(unix)]
 async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let socket_path = temp_dir.path().join("compression-bypass-negotiation.sock");
@@ -188,6 +211,7 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn connect_with_auto_fallback() -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let socket_path = temp_dir.path().join("compression-bypass-fallback.sock");
@@ -226,6 +250,7 @@ async fn connect_with_auto_fallback() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn bench_local_socket_overhead_savings(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression_bypass/local_socket_overhead_savings");
 
@@ -250,6 +275,7 @@ fn bench_local_socket_overhead_savings(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_compression_bypass_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression_bypass/compression_bypass_latency");
 
@@ -273,6 +299,7 @@ fn bench_compression_bypass_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_negotiation_overhead(c: &mut Criterion) {
     let rt = make_runtime();
     let mut group = c.benchmark_group("compression_bypass/negotiation_overhead");
@@ -291,6 +318,7 @@ fn bench_negotiation_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_fallback_detection_latency(c: &mut Criterion) {
     let rt = make_runtime();
     let mut group = c.benchmark_group("compression_bypass/fallback_detection_latency");
@@ -307,11 +335,13 @@ fn bench_fallback_detection_latency(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("compression_bypass", BUDGETS);
     Criterion::default().configure_from_args()
 }
 
+#[cfg(unix)]
 criterion_group!(
     name = benches;
     config = bench_config();
@@ -320,4 +350,8 @@ criterion_group!(
         bench_negotiation_overhead,
         bench_fallback_detection_latency
 );
+#[cfg(unix)]
 criterion_main!(benches);
+
+#[cfg(not(unix))]
+fn main() {}
