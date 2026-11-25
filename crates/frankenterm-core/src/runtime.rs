@@ -1949,6 +1949,42 @@ enum RecvEvent<T> {
     Cancelled,
 }
 
+/// The tasks that own capture-ingress senders: the capture supervisor and,
+/// when enabled, the native event listener. The supervisor hands sender
+/// copies to vendored streaming subscriptions, which it aborts at shutdown
+/// and waits on for a bounded time. One that misses that settlement keeps
+/// its copy, so the ingress channel never reports closed. Once every owner
+/// has exited, any sender still alive is such an orphan, and the capture
+/// relay stops waiting for it to drop.
+#[derive(Debug, Default)]
+struct CaptureProducerOwners {
+    live: AtomicUsize,
+    all_exited: ShutdownSignal,
+}
+
+impl CaptureProducerOwners {
+    fn register(self: &Arc<Self>) -> CaptureProducerOwnerGuard {
+        self.live.fetch_add(1, Ordering::AcqRel);
+        CaptureProducerOwnerGuard {
+            owners: Arc::clone(self),
+        }
+    }
+}
+
+/// Held by an owner task for its whole life. Dropping the last one, on
+/// return, abort or cancellation alike, releases the relay.
+struct CaptureProducerOwnerGuard {
+    owners: Arc<CaptureProducerOwners>,
+}
+
+impl Drop for CaptureProducerOwnerGuard {
+    fn drop(&mut self) {
+        if self.owners.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.owners.all_exited.request();
+        }
+    }
+}
+
 async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> RecvEvent<T> {
     match rx.recv(runtime_cx).await {
         Ok(value) => RecvEvent::Item(value),
@@ -5101,6 +5137,9 @@ pub struct ObservationRuntime {
     pane_activity_tracker: Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     /// Sticky shutdown state that wakes every parked runtime task.
     shutdown_flag: Arc<ShutdownSignal>,
+    /// Owners of capture-ingress senders; the relay stops waiting for
+    /// orphaned sender copies once all of them have exited.
+    capture_producer_owners: Arc<CaptureProducerOwners>,
     /// Idle-pane poll pressure (`FLEET_POLL_PRESSURE_*`) set by the
     /// maintenance task from the fleet coordinator's actions; the capture
     /// task lets idle panes back off to a longer ceiling accordingly.
@@ -5180,6 +5219,7 @@ impl ObservationRuntime {
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             pane_activity_tracker: Arc::new(RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(ShutdownSignal::new()),
+            capture_producer_owners: Arc::new(CaptureProducerOwners::default()),
             fleet_poll_pressure_level: Arc::new(AtomicU8::new(FLEET_POLL_PRESSURE_NONE)),
             metrics,
             backpressure_manager,
@@ -8088,8 +8128,12 @@ impl ObservationRuntime {
             capture_timeout: Duration::from_secs(2),
         };
 
+        let producer_owner = self.capture_producer_owners.register();
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
+            // Dropped when this task ends, after its streaming subtasks were
+            // settled or given up on.
+            let _producer_owner = producer_owner;
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
             let resync_source = Arc::clone(&source);
             let capture_tx_for_supervisor = capture_tx.clone();
@@ -9725,8 +9769,12 @@ impl ObservationRuntime {
         let coalesce_max_delay_ms = self.tuning.runtime.output_coalesce_max_delay_ms;
         let coalesce_max_bytes = self.tuning.runtime.output_coalesce_max_bytes;
 
+        let producer_owner = self.capture_producer_owners.register();
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
+            // Dropped when this task ends, after its connection tasks were
+            // drained or given up on.
+            let _producer_owner = producer_owner;
             let listener =
                 match NativeEventListener::bind_with_cx(&loop_cx, socket_path.clone()).await {
                     Ok(listener) => {
@@ -10226,6 +10274,7 @@ impl ObservationRuntime {
         capture_ring_tx: SpscProducer<CaptureEvent>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let producer_owners = Arc::clone(&self.capture_producer_owners);
         let metrics = Arc::clone(&self.metrics);
 
         let loop_cx = runtime_loop_cx();
@@ -10242,7 +10291,24 @@ impl ObservationRuntime {
                 // tailers and native listener may still flush admitted output;
                 // wait for their final sender to drop before closing the ring.
                 // recv_event registers both channel and cancellation wakers.
-                match recv_event(&loop_cx, &mut capture_ingress_rx).await {
+                // Once every owner task has exited, a sender still open
+                // belongs to a subtask that missed its bounded settlement and
+                // would hold the ring open forever. The select is left-biased,
+                // so already-queued ingress still drains first.
+                let received = crate::runtime_async::select! {
+                    event = recv_event(&loop_cx, &mut capture_ingress_rx) => Some(event),
+                    exited = producer_owners.all_exited.wait(&loop_cx) => match exited {
+                        Ok(()) => None,
+                        Err(_) => Some(RecvEvent::Cancelled),
+                    },
+                };
+                let Some(received) = received else {
+                    debug!(
+                        "Capture relay: every producer owner exited; closing past orphaned senders"
+                    );
+                    break;
+                };
+                match received {
                     RecvEvent::Item(event) => {
                         if loop_cx.checkpoint().is_err() {
                             break;
@@ -16318,6 +16384,54 @@ mod tests {
                 0,
                 "shutdown drops the armed deadline"
             );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// A subtask that misses its bounded settlement keeps a capture sender.
+    /// Once every owner task has exited, the relay must stop waiting for it,
+    /// after relaying what was already queued, so persistence can finish
+    /// inside the shutdown budget instead of being force-cancelled.
+    #[test]
+    fn capture_relay_closes_past_orphaned_senders_once_every_owner_exits() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            );
+            let owner = runtime.capture_producer_owners.register();
+            let (ingress_tx, ingress_rx) = mpsc::channel(4);
+            let (ring_tx, ring_rx) = spsc_channel(4);
+            ingress_tx
+                .try_send(test_capture_event(0))
+                .expect("queue admitted output");
+            let orphaned_tx = ingress_tx.clone();
+            drop(ingress_tx);
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+
+            // While an owner lives, an open sender is a live producer.
+            sleep(Duration::from_millis(50)).await;
+            assert!(
+                !relay.is_finished(),
+                "the relay waits while an owner is alive"
+            );
+            assert!(!ring_rx.is_closed());
+
+            drop(owner);
+            crate::runtime_async::timeout(Duration::from_secs(5), relay)
+                .await
+                .expect("the relay closes once every owner has exited")
+                .expect("capture relay task");
+            assert!(
+                ring_rx.try_recv().is_some(),
+                "queued ingress is relayed before closing"
+            );
+            assert!(ring_rx.try_recv().is_none());
+            assert!(ring_rx.is_closed());
+            drop(orphaned_tx);
             storage.shutdown().await.unwrap();
         });
     }
