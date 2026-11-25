@@ -148702,8 +148702,15 @@ A  docs/new-proof.md\n";
 
     fn doctor_render_canonical(checks: &[DiagnosticCheck]) -> String {
         let value = doctor_build_envelope(checks);
-        serde_json::to_string_pretty(&doctor_canonicalize(&value))
-            .expect("canonical pretty serialize")
+        let rendered = serde_json::to_string_pretty(&doctor_canonicalize(&value))
+            .expect("canonical pretty serialize");
+        // The scenarios derive the database detail from SCHEMA_VERSION. Scrub
+        // that number like the crate version, so a schema bump is not golden
+        // drift: hardcoded numbers broke these goldens at v51 and again at v52.
+        let schema = frankenterm_core::storage::SCHEMA_VERSION;
+        rendered
+            .replace(&format!("\"schema v{schema}, "), "\"schema v<scrubbed>, ")
+            .replace(&format!("expected v{schema})"), "expected v<scrubbed>)")
     }
 
     fn doctor_assert_matches_golden(scenario: &str, checks: &[DiagnosticCheck]) {

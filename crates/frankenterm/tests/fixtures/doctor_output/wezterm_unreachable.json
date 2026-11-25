@@ -17,7 +17,7 @@
       "status": "error"
     },
     {
-      "detail": "schema v51, wal mode",
+      "detail": "schema v<scrubbed>, wal mode",
       "name": "database",
       "status": "ok"
     }
