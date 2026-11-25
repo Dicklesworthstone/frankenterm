@@ -846,6 +846,9 @@ pub struct WatcherControlRequest {
     pub expected_instance_id: String,
 }
 
+// This classifier runs before the CLI parser and before the RPC handler is
+// invoked. Read authority is an explicit allowlist: a command family may also
+// contain mutations, and global flags can precede its subcommand.
 fn rpc_required_scope(args: &[String]) -> IpcScope {
     let Some(cmd) = args.first().map(|value| value.trim().to_ascii_lowercase()) else {
         return IpcScope::Write;
@@ -853,31 +856,41 @@ fn rpc_required_scope(args: &[String]) -> IpcScope {
     let subcmd = args.get(1).map(|value| value.trim().to_ascii_lowercase());
 
     match cmd.as_str() {
-        "send" | "approve" => IpcScope::Write,
-        "help" | "quickstart" | "quick-start" | "state" | "get-text" | "gettext" | "wait-for"
-        | "waitfor" | "search" | "search-explain" | "searchexplain" | "cass" | "why" | "rules"
-        | "agents" | "health" => IpcScope::Read,
-        "events" => match subcmd.as_deref() {
-            Some("annotate" | "triage" | "label") => IpcScope::Write,
-            _ => IpcScope::Read,
+        "help" | "quickstart" | "quick-start" | "state" | "status" | "panes" | "get-text"
+        | "gettext" | "read" | "tail" | "wait-for" | "waitfor" | "watch" | "search" | "find"
+        | "grep" | "search-explain" | "searchexplain" | "why" | "health" => IpcScope::Read,
+        "events" | "event-log" | "eventlog" => {
+            if rpc_events_query_is_read_only(&args[1..]) {
+                IpcScope::Read
+            } else {
+                IpcScope::Write
+            }
+        }
+        "agents" => match subcmd.as_deref() {
+            // Detection refresh only replaces the child's in-memory cache.
+            // Configure writes project/global integration files, including
+            // through this otherwise read-oriented command family.
+            Some("list" | "running" | "detect") => IpcScope::Read,
+            _ => IpcScope::Write,
+        },
+        "cass" => match subcmd.as_deref() {
+            Some("search" | "view" | "status") => IpcScope::Read,
+            _ => IpcScope::Write,
+        },
+        "rules" => match subcmd.as_deref() {
+            Some("list" | "test" | "show" | "lint") => IpcScope::Read,
+            _ => IpcScope::Write,
         },
         "workflow" => match subcmd.as_deref() {
-            Some("run" | "abort") => IpcScope::Write,
             Some("status" | "list") => IpcScope::Read,
             _ => IpcScope::Write,
         },
-        "accounts" => match subcmd.as_deref() {
-            Some("refresh") => IpcScope::Write,
-            Some("list") => IpcScope::Read,
-            _ => IpcScope::Write,
-        },
-        "reservations" => match subcmd.as_deref() {
-            Some("reserve" | "release") => IpcScope::Write,
+        "accounts" | "reservations" => match subcmd.as_deref() {
             Some("list") => IpcScope::Read,
             _ => IpcScope::Write,
         },
         "mission" => match subcmd.as_deref() {
-            Some("status" | "state" | "explain") => IpcScope::Read,
+            Some("state" | "decisions") => IpcScope::Read,
             _ => IpcScope::Write,
         },
         "tx" => match subcmd.as_deref() {
@@ -886,6 +899,43 @@ fn rpc_required_scope(args: &[String]) -> IpcScope {
         },
         _ => IpcScope::Write,
     }
+}
+
+/// Recognize only the finite event-query shape. The CLI remains responsible
+/// for value validation. Any positional token or unknown option requires
+/// write authority rather than hiding a mutation behind an intervening flag.
+fn rpc_events_query_is_read_only(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--verbose"
+            || arg
+                .strip_prefix('-')
+                .is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|flag| flag == b'v'))
+        {
+            continue;
+        }
+        let (option, inline_value) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        match option {
+            "--unhandled" | "--unhandled-only" | "--start-at-tail" | "--would-handle"
+            | "--dry-run"
+                if inline_value.is_none() => {}
+            "--limit" | "--pane" | "--rule-id" | "--event-type" | "--triage-state" | "--label"
+            | "--since" | "--cursor" | "--cursor-epoch" | "--cursor-scope" | "--replay-limit" => {
+                // Missing values are not a read-only command shape. Do not
+                // reinterpret a consumed value as a subcommand: filters may
+                // legitimately equal "annotate", "triage", or "label".
+                if inline_value.is_none() && args.next().is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Response message from server to client.
@@ -6069,6 +6119,56 @@ mod tests {
     }
 
     #[test]
+    fn ipc_read_token_rejects_rpc_mutations_before_handler_dispatch() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("rpc-scope.sock");
+            let auth = build_auth("reader", vec![IpcScope::Read], None);
+            let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+            let client = IpcClient::with_token(&socket_path, "reader");
+
+            for args in [
+                vec!["agents", "configure", "--scope", "global"],
+                vec!["agents", "configure", "--dry-run"],
+                vec!["events", "-v", "annotate", "7", "--note", "note"],
+                vec!["events", "--verbose", "triage", "7", "--state", "closed"],
+                vec!["eventlog", "-vv", "label", "7", "--add", "reviewed"],
+            ] {
+                let response = client
+                    .call_rpc(args.iter().map(|arg| (*arg).to_string()).collect(), None)
+                    .await
+                    .unwrap();
+                assert!(!response.ok, "{args:?}");
+                assert!(
+                    response
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("insufficient scope"),
+                    "RPC must be refused at authorization: {args:?} {response:?}"
+                );
+                assert!(response.rpc.is_none(), "no child was admitted");
+            }
+
+            // A read operation passes authorization and reaches the absent
+            // handler. This distinguishes the scope gate from a server that
+            // rejects all RPCs or failed to start.
+            let response = client
+                .call_rpc(vec!["agents".to_string(), "list".to_string()], None)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.error.as_deref(),
+                Some("rpc handler not configured")
+            );
+            assert!(client.ping().await.unwrap().ok);
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
     fn ipc_roundtrip() {
         run_async_test(async {
             let temp_dir = TempDir::new().unwrap();
@@ -6879,6 +6979,139 @@ mod tests {
     fn rpc_required_scope_known_read_command_remains_read() {
         let args = vec!["events".to_string()];
         assert_eq!(rpc_required_scope(&args), IpcScope::Read);
+    }
+
+    #[test]
+    fn rpc_scope_read_families_require_explicit_read_operations() {
+        for (family, read_operations) in [
+            ("agents", &["list", "running", "detect"][..]),
+            ("cass", &["search", "view", "status"][..]),
+            ("rules", &["list", "test", "show", "lint"][..]),
+            ("workflow", &["list", "status"][..]),
+            ("accounts", &["list"][..]),
+            ("reservations", &["list"][..]),
+            ("mission", &["state", "decisions"][..]),
+            ("tx", &["plan", "show"][..]),
+        ] {
+            for operation in read_operations {
+                let args = vec![family.to_string(), (*operation).to_string()];
+                assert_eq!(rpc_required_scope(&args), IpcScope::Read, "{args:?}");
+            }
+            for tail in [
+                vec![],
+                vec!["future-mutation"],
+                vec!["--verbose", "future-mutation"],
+            ] {
+                let args = std::iter::once(family)
+                    .chain(tail)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                assert_eq!(rpc_required_scope(&args), IpcScope::Write, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_scope_event_queries_consume_only_known_read_options() {
+        for family in ["events", "event-log", "eventlog"] {
+            for tail in [
+                vec![],
+                vec!["--verbose", "-vv", "--unhandled", "--would-handle"],
+                vec!["--limit", "10", "--pane=7", "--since", "-1"],
+                vec![
+                    "--label",
+                    "annotate",
+                    "--rule-id=triage",
+                    "--event-type",
+                    "label",
+                ],
+                vec!["--triage-state", "open", "--dry-run", "--unhandled-only"],
+                vec![
+                    "--cursor",
+                    "7",
+                    "--cursor-epoch=e",
+                    "--cursor-scope",
+                    "s",
+                    "--replay-limit=2",
+                ],
+                vec!["--start-at-tail"],
+            ] {
+                let args = std::iter::once(family)
+                    .chain(tail)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                assert_eq!(rpc_required_scope(&args), IpcScope::Read, "{args:?}");
+            }
+            for tail in [
+                vec!["annotate", "7", "--note", "note"],
+                vec!["-v", "annotate", "7", "--note", "note"],
+                vec!["--verbose", "triage", "7", "--state", "closed"],
+                vec!["-vv", "label", "7", "--add", "reviewed"],
+                vec!["--future-mutation"],
+                vec!["--limit"],
+                vec!["--", "annotate", "7"],
+            ] {
+                let args = std::iter::once(family)
+                    .chain(tail)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                assert_eq!(rpc_required_scope(&args), IpcScope::Write, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_scope_read_tokens_cannot_authorize_configuration_or_event_mutations() {
+        let reader = build_auth("scope-test", vec![IpcScope::Read], None);
+        let writer = build_auth("scope-test", vec![IpcScope::Write], None);
+        for args in [
+            vec!["agents", "configure", "--scope", "global"],
+            vec!["agents", "configure", "--dry-run"],
+            vec!["agents", "--verbose", "configure", "--all"],
+            vec!["events", "-v", "annotate", "7", "--note", "note"],
+            vec!["events", "--verbose", "triage", "7", "--state", "closed"],
+            vec!["event-log", "-vv", "label", "7", "--add", "reviewed"],
+        ] {
+            let envelope = serde_json::to_vec(&serde_json::json!({
+                "token": "scope-test",
+                "type": "rpc",
+                "args": args,
+            }))
+            .unwrap();
+            assert_eq!(
+                __fuzz_parse_envelope_and_authorize(&envelope, &reader),
+                "scope",
+                "{args:?}"
+            );
+            assert_eq!(
+                __fuzz_parse_envelope_and_authorize(&envelope, &writer),
+                "allowed",
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["agents", "list"],
+            vec!["agents", "running"],
+            vec!["agents", "detect", "--refresh"],
+            vec!["events", "--label", "annotate"],
+            vec!["events", "--verbose", "--limit=10"],
+            vec!["mission", "state"],
+            vec!["mission", "decisions"],
+            vec!["tx", "plan"],
+            vec!["tx", "show"],
+        ] {
+            let envelope = serde_json::to_vec(&serde_json::json!({
+                "token": "scope-test",
+                "type": "rpc",
+                "args": args,
+            }))
+            .unwrap();
+            assert_eq!(
+                __fuzz_parse_envelope_and_authorize(&envelope, &reader),
+                "allowed",
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
