@@ -1169,6 +1169,7 @@ enum WriteCommand {
     /// Insert an approval token
     InsertApprovalToken {
         token: ApprovalTokenRecord,
+        max_active_tokens: Option<u32>,
         respond: oneshot::Sender<Result<i64>>,
     },
     /// Consume (use) an approval token if it matches scope
@@ -7750,9 +7751,42 @@ impl StorageHandle {
         Self::checkpoint_storage_operation(cx, "insert_approval_token")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send_with_cx(cx, WriteCommand::InsertApprovalToken { token, respond: tx })
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertApprovalToken {
+                    token,
+                    max_active_tokens: None,
+                    respond: tx,
+                },
+            )
             .await
             .map_err(|error| Self::writer_send_error("insert_approval_token", error))?;
+        Self::recv_writer_response_with_cx(cx, rx).await
+    }
+
+    /// Issue a token while atomically reserving workspace approval capacity.
+    ///
+    /// The writer counts active tokens and inserts under one immediate
+    /// transaction, including against other storage handles and processes.
+    pub(crate) async fn issue_approval_token_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        token: ApprovalTokenRecord,
+        max_active_tokens: u32,
+    ) -> Result<i64> {
+        Self::checkpoint_storage_operation(cx, "issue_approval_token")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertApprovalToken {
+                    token,
+                    max_active_tokens: Some(max_active_tokens),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("issue_approval_token", error))?;
         Self::recv_writer_response_with_cx(cx, rx).await
     }
 
@@ -16579,6 +16613,127 @@ mod writer_io_scheduler_tests {
             .collect()
     }
 
+    fn approval_quota_token(code: &str, workspace: &str) -> ApprovalTokenRecord {
+        ApprovalTokenRecord {
+            id: 0,
+            code_hash: code.to_string(),
+            created_at: now_ms(),
+            expires_at: i64::MAX,
+            used_at: None,
+            workspace_id: workspace.to_string(),
+            action_kind: "spawn".to_string(),
+            pane_id: None,
+            action_fingerprint: "approval-quota-fixture".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        }
+    }
+
+    #[test]
+    fn approval_capacity_is_reserved_atomically_across_independent_writers() {
+        let dir = tempfile::tempdir().expect("create approval contention directory");
+        let db_path = dir.path().join("approvals.sqlite3");
+        let first = RusqliteStorageBackendProvider::default()
+            .open_writer_backend(StorageWriterOpenRequest {
+                db_path: db_path.to_string_lossy().into_owned(),
+                db_existed: false,
+                defer_fts_triggers: false,
+                cx: None,
+            })
+            .expect("open first approval writer");
+        let second = RusqliteStorageBackendProvider::default()
+            .open_writer_backend(StorageWriterOpenRequest {
+                db_path: db_path.to_string_lossy().into_owned(),
+                db_existed: true,
+                defer_fts_triggers: false,
+                cx: None,
+            })
+            .expect("open independent approval writer");
+        // Both independent issuers see the last free slot before either
+        // admission starts. That stale observation cannot authorize a write.
+        for backend in [&first, &second] {
+            assert_eq!(
+                query_active_approvals_count_backend(backend.as_ref(), "shared", now_ms())
+                    .unwrap(),
+                0
+            );
+        }
+        let ready = std::sync::Barrier::new(2);
+        let winners = std::thread::scope(|threads| {
+            let attempts: Vec<_> = [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(index, backend)| {
+                    let ready = &ready;
+                    threads.spawn(move || {
+                        ready.wait();
+                        let token = approval_quota_token(&format!("attempt-{index}"), "shared");
+                        match issue_approval_token_backend(backend.as_ref(), &token, 1) {
+                            Ok(_) => 1,
+                            Err(crate::error::Error::Policy(message)) => {
+                                assert_eq!(message, "Approval token limit reached (1/1)");
+                                0
+                            }
+                            Err(error) => panic!("unexpected approval admission error: {error}"),
+                        }
+                    })
+                })
+                .collect();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("join approval issuer"))
+                .sum::<usize>()
+        });
+        assert_eq!(winners, 1, "only the last free approval slot may be issued");
+        let persisted = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = persisted
+            .query_row("SELECT COUNT(*) FROM approval_tokens", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "a refused issuer must persist no token");
+    }
+
+    #[test]
+    fn approval_capacity_excludes_used_expired_and_other_workspace_tokens() {
+        let backend = real_writer_backend_with_panes(&[]);
+        let mut expired = approval_quota_token("expired", "shared");
+        expired.expires_at = now_ms().saturating_sub(1);
+        insert_approval_token_backend(&backend, &expired).unwrap();
+        let mut used = approval_quota_token("used", "shared");
+        used.used_at = Some(now_ms());
+        insert_approval_token_backend(&backend, &used).unwrap();
+        let other = approval_quota_token("other", "other-workspace");
+        issue_approval_token_backend(&backend, &other, 1).unwrap();
+
+        let active = approval_quota_token("active", "shared");
+        let refused = issue_approval_token_backend(&backend, &active, 0).unwrap_err();
+        assert!(matches!(refused, crate::error::Error::Policy(_)));
+        assert!(
+            query_approval_token_by_hash_backend(&backend, "active")
+                .unwrap()
+                .is_none()
+        );
+
+        issue_approval_token_backend(&backend, &active, 1).unwrap();
+        let extra = approval_quota_token("extra", "shared");
+        let refused = issue_approval_token_backend(&backend, &extra, 1).unwrap_err();
+        assert!(matches!(refused, crate::error::Error::Policy(_)));
+        assert!(
+            query_approval_token_by_hash_backend(&backend, "extra")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            query_active_approvals_count_backend(&backend, "shared", now_ms()).unwrap(),
+            1
+        );
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit,
+            "quota refusal must release its transaction without poisoning the writer"
+        );
+    }
+
     #[test]
     fn singleton_append_waits_for_external_writer_before_reading_sequence() {
         let dir = tempfile::tempdir().expect("create writer contention directory");
@@ -19881,9 +20036,16 @@ fn dispatch_write_command_raw(
             );
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::InsertApprovalToken { token, respond } => {
+        WriteCommand::InsertApprovalToken {
+            token,
+            max_active_tokens,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
-            let result = insert_approval_token_backend(backend, &token);
+            let result = match max_active_tokens {
+                Some(limit) => issue_approval_token_backend(backend, &token, limit),
+                None => insert_approval_token_backend(backend, &token),
+            };
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalToken {
@@ -31026,6 +31188,31 @@ fn expire_stale_reservations_backend(backend: &dyn StorageBackend) -> Result<usi
         .map_err(|err| storage_backend_error("Failed to expire reservations", err))?;
 
     Ok(expired_rows.len())
+}
+
+/// Count and reserve workspace token capacity in the same write transaction.
+fn issue_approval_token_backend(
+    backend: &dyn StorageBackend,
+    token: &ApprovalTokenRecord,
+    max_active_tokens: u32,
+) -> Result<i64> {
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "issue approval token",
+        || {
+            // Sample time only after acquiring the writer lock: tokens that
+            // expired while this command waited no longer occupy capacity.
+            let active =
+                query_active_approvals_count_backend(backend, &token.workspace_id, now_ms())?;
+            if active >= max_active_tokens {
+                return Err(crate::error::Error::Policy(format!(
+                    "Approval token limit reached ({active}/{max_active_tokens})"
+                )));
+            }
+            insert_approval_token_backend(backend, token)
+        },
+    )
 }
 
 /// Insert an approval token through the storage backend.

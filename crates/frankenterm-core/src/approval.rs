@@ -330,15 +330,11 @@ impl<'a> ApprovalStore<'a> {
         self.issue_with_cx(&cx, input, summary).await
     }
 
-    /// Cx-first [`Self::issue`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through BOTH storage calls via their cx-first
-    /// siblings (tick 127 deepened this from pre-flight-only
-    /// checkpoints to full cx-aware storage).
+    /// Cx-first [`Self::issue`] with atomic workspace capacity admission.
     ///
-    /// Cancellation-safety contract: the token is inserted
-    /// AFTER both explicit checkpoints, AND both underlying
-    /// storage calls now honor caller cancellation at their own
-    /// pre-flight boundaries.
+    /// The writer reserves capacity and inserts the token in one transaction.
+    /// Cancellation is checked before admission; cancellation after enqueue
+    /// may leave a committed token, as with other durable storage writes.
     ///
     /// Semantics identical to [`Self::issue`] for uncancelled cx.
     pub async fn issue_with_cx(
@@ -353,24 +349,6 @@ impl<'a> ApprovalStore<'a> {
         self.require_registered_pane(cx, input).await?;
 
         let now = now_ms();
-        let active = self
-            .storage
-            .count_active_approvals_with_cx(cx, &self.workspace_id, now)
-            .await?;
-        if active >= self.config.max_active_tokens {
-            return Err(Error::Policy(format!(
-                "Approval token limit reached ({active}/{})",
-                self.config.max_active_tokens
-            )));
-        }
-
-        cx.checkpoint().map_err(|err| {
-            approval_cancelled_error(
-                "approval.issue",
-                format!("between count and insert (active={active}): {err}"),
-            )
-        })?;
-
         let code = generate_allow_once_code(DEFAULT_CODE_LEN);
         let code_hash = hash_allow_once_code(&code);
         let fingerprint = fingerprint_for_input(input);
@@ -391,7 +369,7 @@ impl<'a> ApprovalStore<'a> {
             risk_summary: None,
         };
         self.storage
-            .insert_approval_token_with_cx(cx, approval_record)
+            .issue_approval_token_with_cx(cx, approval_record, self.config.max_active_tokens)
             .await?;
 
         let summary = summary.unwrap_or_else(|| summary_for_input(input));
@@ -421,13 +399,9 @@ impl<'a> ApprovalStore<'a> {
             .await
     }
 
-    /// Cx-first [`Self::issue_for_plan`] (ft-xbnl0.2.3). Parallel
-    /// of tick-59's `issue_with_cx` for the plan-bound variant.
-    /// Tick 127 deepened this to route both storage calls
-    /// (count_active_approvals + insert_approval_token) through
-    /// their cx-first siblings. The plan_hash/plan_version/
-    /// risk_summary semantics are identical to the legacy
-    /// `issue_for_plan`.
+    /// Cx-first [`Self::issue_for_plan`]. Plain and plan-bound tokens share
+    /// the same atomically enforced workspace capacity. Plan binding and
+    /// cancellation semantics match [`Self::issue_with_cx`].
     pub async fn issue_for_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -442,24 +416,6 @@ impl<'a> ApprovalStore<'a> {
         self.require_registered_pane(cx, input).await?;
 
         let now = now_ms();
-        let active = self
-            .storage
-            .count_active_approvals_with_cx(cx, &self.workspace_id, now)
-            .await?;
-        if active >= self.config.max_active_tokens {
-            return Err(Error::Policy(format!(
-                "Approval token limit reached ({active}/{})",
-                self.config.max_active_tokens
-            )));
-        }
-
-        cx.checkpoint().map_err(|err| {
-            approval_cancelled_error(
-                "approval.issue_for_plan",
-                format!("between count and insert (active={active}): {err}"),
-            )
-        })?;
-
         let code = generate_allow_once_code(DEFAULT_CODE_LEN);
         let code_hash = hash_allow_once_code(&code);
         let fingerprint = fingerprint_for_input(input);
@@ -484,7 +440,7 @@ impl<'a> ApprovalStore<'a> {
             risk_summary: risk_summary.clone(),
         };
         self.storage
-            .insert_approval_token_with_cx(cx, approval_record)
+            .issue_approval_token_with_cx(cx, approval_record, self.config.max_active_tokens)
             .await?;
 
         Ok(ApprovalRequest {
@@ -2470,6 +2426,68 @@ mod tests {
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
             let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        });
+    }
+
+    #[test]
+    fn plain_and_plan_issuance_share_capacity_across_storage_handles() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("approval-capacity.db");
+            let first = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let second = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let config = ApprovalConfig {
+                max_active_tokens: 1,
+                ..ApprovalConfig::default()
+            };
+            let plain = ApprovalStore::new(&first, config.clone(), "shared");
+            let planned = ApprovalStore::new(&second, config, "shared");
+            let input = PolicyInput::new(ActionKind::Spawn, ActorKind::Robot);
+            let cx = crate::cx::for_testing();
+
+            let plain_token = plain.issue_with_cx(&cx, &input, None).await.unwrap();
+            let refused = planned
+                .issue_for_plan_with_cx(&cx, &input, "plan-hash", Some(1), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(refused, Error::Policy(_)));
+            assert!(
+                plain
+                    .consume_with_cx(&cx, &plain_token.allow_once_code, &input)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            let plan_token = planned
+                .issue_for_plan_with_cx(&cx, &input, "plan-hash", Some(1), None)
+                .await
+                .unwrap();
+            let refused = plain.issue_with_cx(&cx, &input, None).await.unwrap_err();
+            assert!(matches!(refused, Error::Policy(_)));
+            assert!(
+                planned
+                    .consume_for_plan_with_cx(
+                        &cx,
+                        &plan_token.allow_once_code,
+                        &input,
+                        "plan-hash",
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            plain.issue_with_cx(&cx, &input, None).await.unwrap();
+            assert_eq!(
+                first
+                    .count_active_approvals_with_cx(&cx, "shared", now_ms())
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            first.shutdown().await.unwrap();
+            second.shutdown().await.unwrap();
         });
     }
 
