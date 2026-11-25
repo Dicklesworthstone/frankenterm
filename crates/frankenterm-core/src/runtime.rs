@@ -5555,6 +5555,11 @@ impl ObservationRuntime {
 
         let native_socket = self.config.native_event_socket.clone();
 
+        // Hold a producer-owner slot until every owner task below has
+        // registered, so an owner that exits at once cannot release the
+        // relay while a later owner is still being spawned.
+        let _registering_producer_owners = self.capture_producer_owners.register();
+
         // Always spawn the capture task. It owns the polling supervisor and,
         // when vendored direct-mux sockets are configured, per-pane streaming
         // subscriptions. Native push events can still feed the same ingress
