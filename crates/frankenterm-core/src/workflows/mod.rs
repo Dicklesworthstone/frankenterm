@@ -273,24 +273,16 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
-        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
-        let fut = {
-            let mut injector = self
-                .inner
-                .lock_with_cx(cx)
-                .await
-                .map_err(|error| injector_lock_error("workflow.injector.send_text", error))?;
-            injector.inject_with_cx_detached(
-                cx,
-                pane_id,
-                text,
-                crate::policy::ActionKind::SendText,
-                actor,
-                &resolved_capabilities,
-                workflow_id,
-            )
-        };
-        Ok(fut.await)
+        self.inject(
+            cx,
+            pane_id,
+            text,
+            crate::policy::ActionKind::SendText,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
     }
 
     pub(crate) async fn send_ctrl_c(
@@ -301,24 +293,16 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
-        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
-        let fut = {
-            let mut injector = self
-                .inner
-                .lock_with_cx(cx)
-                .await
-                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_c", error))?;
-            injector.inject_with_cx_detached(
-                cx,
-                pane_id,
-                crate::wezterm::control::CTRL_C,
-                crate::policy::ActionKind::SendCtrlC,
-                actor,
-                &resolved_capabilities,
-                workflow_id,
-            )
-        };
-        Ok(fut.await)
+        self.inject(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_C,
+            crate::policy::ActionKind::SendCtrlC,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
     }
 
     pub(crate) async fn send_ctrl_d(
@@ -329,24 +313,16 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
-        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
-        let fut = {
-            let mut injector = self
-                .inner
-                .lock_with_cx(cx)
-                .await
-                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_d", error))?;
-            injector.inject_with_cx_detached(
-                cx,
-                pane_id,
-                crate::wezterm::control::CTRL_D,
-                crate::policy::ActionKind::SendCtrlD,
-                actor,
-                &resolved_capabilities,
-                workflow_id,
-            )
-        };
-        Ok(fut.await)
+        self.inject(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_D,
+            crate::policy::ActionKind::SendCtrlD,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
     }
 
     pub(crate) async fn send_ctrl_z(
@@ -357,21 +333,65 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
+        self.inject(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_Z,
+            crate::policy::ActionKind::SendCtrlZ,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn inject(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        action: crate::policy::ActionKind,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> crate::Result<InjectionResult> {
+        let operation = match action {
+            crate::policy::ActionKind::SendText => "workflow.injector.send_text",
+            crate::policy::ActionKind::SendCtrlC => "workflow.injector.send_ctrl_c",
+            crate::policy::ActionKind::SendCtrlD => "workflow.injector.send_ctrl_d",
+            crate::policy::ActionKind::SendCtrlZ => "workflow.injector.send_ctrl_z",
+            _ => "workflow.injector.send_control",
+        };
+        let storage_path = {
+            let injector = self
+                .inner
+                .lock_with_cx(cx)
+                .await
+                .map_err(|error| injector_lock_error(operation, error))?;
+            injector.injection_storage_path().map(str::to_owned)
+        };
+        // Ordinary concurrent sends must queue before policy evaluation, not
+        // turn a momentary workspace lock into a kill-switch denial. Waiting
+        // outside the injector mutex also lets an admitted send finish. The
+        // owned fence survives re-admission and remains held through dispatch.
+        let fence = crate::policy::DetachedInjectionFence::acquire_with_cx(cx, storage_path).await;
         let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
         let fut = {
             let mut injector = self
                 .inner
                 .lock_with_cx(cx)
                 .await
-                .map_err(|error| injector_lock_error("workflow.injector.send_ctrl_z", error))?;
+                .map_err(|error| injector_lock_error(operation, error))?;
             injector.inject_with_cx_detached(
                 cx,
                 pane_id,
-                crate::wezterm::control::CTRL_Z,
-                crate::policy::ActionKind::SendCtrlZ,
+                text,
+                action,
                 actor,
                 &resolved_capabilities,
                 workflow_id,
+                Some(fence),
             )
         };
         Ok(fut.await)

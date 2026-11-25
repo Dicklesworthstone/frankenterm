@@ -8105,6 +8105,63 @@ pub struct PolicyGatedInjector<C = crate::wezterm::WeztermClient> {
     test_before_effect: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
+/// A detached admission's workspace authority, acquired before taking the
+/// shared injector mutex. The captured path is checked again at admission so
+/// replacing an injector's storage cannot reuse another workspace's fence.
+pub(crate) struct DetachedInjectionFence {
+    storage_path: Option<String>,
+    fence: Result<
+        Option<crate::policy_kill_switch_state::KillSwitchFence>,
+        crate::policy_kill_switch_state::KillSwitchStateError,
+    >,
+}
+
+impl DetachedInjectionFence {
+    fn try_acquire(storage_path: Option<String>) -> Self {
+        let fence = storage_path
+            .as_deref()
+            .map(|path| {
+                crate::policy_kill_switch_state::acquire_kill_switch_fence(std::path::Path::new(path))
+            })
+            .transpose();
+        Self { storage_path, fence }
+    }
+
+    pub(crate) async fn acquire_with_cx(
+        cx: &crate::cx::Cx,
+        storage_path: Option<String>,
+    ) -> Self {
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_FENCE_WAIT, acquire_kill_switch_fence_within_with_cx,
+        };
+
+        let fence = match storage_path.as_deref() {
+            Some(path) => acquire_kill_switch_fence_within_with_cx(
+                cx,
+                std::path::Path::new(path),
+                KILL_SWITCH_FENCE_WAIT,
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
+        };
+        Self { storage_path, fence }
+    }
+
+    fn into_guard(
+        self,
+        storage_path: Option<&str>,
+    ) -> Result<
+        Option<crate::policy_kill_switch_state::KillSwitchFence>,
+        crate::policy_kill_switch_state::KillSwitchStateError,
+    > {
+        if self.storage_path.as_deref() != storage_path {
+            return Err(crate::policy_kill_switch_state::KillSwitchStateError::FenceFailed);
+        }
+        self.fence
+    }
+}
+
 impl<C> PolicyGatedInjector<C>
 where
     C: crate::wezterm::WeztermInterface,
@@ -8155,6 +8212,10 @@ where
     /// Set the storage handle for audit trail emission
     pub fn set_storage(&mut self, storage: crate::storage::StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    pub(crate) fn injection_storage_path(&self) -> Option<&str> {
+        self.storage.as_ref().map(|storage| storage.db_path())
     }
 
     /// Set the ingress tap for flight recorder capture.
@@ -8637,33 +8698,37 @@ where
         actor: ActorKind,
         capabilities: &'a PaneCapabilities,
         workflow_id: Option<&'a str>,
+        admission: Option<DetachedInjectionFence>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InjectionResult> + Send + 'a>>
     where
         C: Clone + 'a,
     {
-        let mut transient_switch = None;
-        let effect_fence = if let Some(storage) = self.storage.as_ref() {
-            use crate::policy_kill_switch_state::{
-                KillSwitchStateError, acquire_kill_switch_fence,
-                load_kill_switch_state_from_path_with_cx,
-            };
-            let fence = acquire_kill_switch_fence(std::path::Path::new(storage.db_path()));
-            if matches!(&fence, Err(KillSwitchStateError::FencePending)) {
-                transient_switch = Some(self.engine.kill_switch_state().clone());
-            }
-            let loaded = match &fence {
-                Ok(guard) => self
-                    .kill_switch_freshness
-                    .bind(guard)
-                    .and_then(|()| load_kill_switch_state_from_path_with_cx(cx, storage.db_path())),
-                Err(error) => Err(error.clone()),
-            };
-            self.kill_switch_freshness
-                .apply(&mut self.engine, loaded, checked_now_ms_u64());
-            fence.ok()
-        } else {
-            None
+        use crate::policy_kill_switch_state::{
+            KillSwitchStateError, load_kill_switch_state_from_path_with_cx,
         };
+
+        // Async callers wait for this authority outside the injector mutex.
+        // A synchronous caller retains the immediate, fail-closed admission.
+        let admission = admission.unwrap_or_else(|| {
+            DetachedInjectionFence::try_acquire(self.injection_storage_path().map(str::to_owned))
+        });
+        let mut transient_switch = None;
+        let fence = admission.into_guard(self.injection_storage_path());
+        if matches!(&fence, Err(KillSwitchStateError::FencePending)) {
+            transient_switch = Some(self.engine.kill_switch_state().clone());
+        }
+        let loaded = match (&fence, self.storage.as_ref()) {
+            (Ok(Some(guard)), Some(storage)) => self
+                .kill_switch_freshness
+                .bind(guard)
+                .and_then(|()| load_kill_switch_state_from_path_with_cx(cx, storage.db_path())),
+            (Ok(None), None) => Ok(None),
+            (Err(error), _) => Err(error.clone()),
+            _ => Err(KillSwitchStateError::FenceFailed),
+        };
+        self.kill_switch_freshness
+            .apply(&mut self.engine, loaded, checked_now_ms_u64());
+        let effect_fence = fence.ok().flatten();
         let summary = self.engine.redact_secrets(text);
         let tap_summary = self.ingress_tap.as_ref().map(|_| summary.clone());
         let mut capabilities = capabilities.clone();
@@ -11071,6 +11136,244 @@ mod tests {
     }
 
     #[test]
+    fn workflow_injector_waits_for_workspace_fence_before_policy_admission() {
+        run_async_test(async {
+            use crate::policy_kill_switch_state::acquire_kill_switch_fence;
+            use std::future::{Future, poll_fn};
+            use std::task::Poll;
+
+            let (_directory, storage, direct) = persisted_stop_injector().await;
+            let mock = Arc::new(direct.client);
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let injector = crate::workflows::CxPolicyInjector::new(
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone()),
+            );
+            let cx = crate::cx::for_request();
+            let caps = unreserved(PaneCapabilities::prompt());
+            for (completed, action) in [
+                ActionKind::SendText,
+                ActionKind::SendCtrlC,
+                ActionKind::SendCtrlD,
+                ActionKind::SendCtrlZ,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let held =
+                    acquire_kill_switch_fence(std::path::Path::new(storage.db_path())).unwrap();
+                let before = mock.pane_state(42).await.unwrap().content;
+                let mut pending = Box::pin(async {
+                    match action {
+                        ActionKind::SendText => {
+                            injector
+                                .send_text(&cx, 42, "echo queued\n", ActorKind::Workflow, &caps, None)
+                                .await
+                        }
+                        ActionKind::SendCtrlC => {
+                            injector
+                                .send_ctrl_c(&cx, 42, ActorKind::Workflow, &caps, None)
+                                .await
+                        }
+                        ActionKind::SendCtrlD => {
+                            injector
+                                .send_ctrl_d(&cx, 42, ActorKind::Workflow, &caps, None)
+                                .await
+                        }
+                        ActionKind::SendCtrlZ => {
+                            injector
+                                .send_ctrl_z(&cx, 42, ActorKind::Workflow, &caps, None)
+                                .await
+                        }
+                        _ => unreachable!("only injection actions in this test"),
+                    }
+                });
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let rows = storage
+                    .get_audit_actions_with_cx(&cx, crate::storage::AuditQuery::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.len(),
+                    completed,
+                    "contention must not emit a policy denial"
+                );
+                assert_eq!(mock.pane_state(42).await.unwrap().content, before);
+
+                drop(held);
+                let result = pending.await.unwrap();
+                assert!(
+                    matches!(
+                        result,
+                        InjectionResult::Allowed {
+                            audit_action_id: Some(_),
+                            ..
+                        }
+                    ),
+                    "{result:?}"
+                );
+            }
+            let rows = storage
+                .get_audit_actions_with_cx(&cx, crate::storage::AuditQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 4);
+            assert!(rows.iter().all(|row| row.policy_decision == "allow"));
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_injector_cancellation_while_waiting_drops_admission_without_effect() {
+        run_async_test(async {
+            use crate::policy_kill_switch_state::acquire_kill_switch_fence;
+            use std::future::{Future, poll_fn};
+            use std::task::Poll;
+
+            let (_directory, storage, direct) = persisted_stop_injector().await;
+            let mock = Arc::new(direct.client);
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let injector = crate::workflows::CxPolicyInjector::new(
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone()),
+            );
+            let cx = crate::cx::for_request();
+            let cancelled = crate::cx::for_request();
+            let caps = unreserved(PaneCapabilities::prompt());
+            let held = acquire_kill_switch_fence(std::path::Path::new(storage.db_path())).unwrap();
+            let mut pending = Box::pin(injector.send_text(
+                &cancelled,
+                42,
+                "echo cancelled\n",
+                ActorKind::Workflow,
+                &caps,
+                None,
+            ));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("cancel waiting send"));
+            assert!(pending.await.is_err());
+            assert!(mock.pane_state(42).await.unwrap().content.is_empty());
+            assert!(
+                storage
+                    .get_audit_actions_with_cx(&cx, crate::storage::AuditQuery::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(held);
+            let recovered = injector
+                .send_text(&cx, 42, "echo fresh\n", ActorKind::Workflow, &caps, None)
+                .await
+                .unwrap();
+            assert!(recovered.is_allowed(), "{recovered:?}");
+            assert_eq!(mock.pane_state(42).await.unwrap().content, "echo fresh\n");
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_injector_observes_a_trip_before_waiting_send_is_admitted() {
+        run_async_test(async {
+            use crate::policy_kill_switch_state::acquire_kill_switch_fence;
+            use crate::policy_kill_switch_state::tests::transition_in_test_process;
+            use std::future::{Future, poll_fn};
+            use std::task::Poll;
+
+            let (_directory, storage, direct) = persisted_stop_injector().await;
+            let mock = Arc::new(direct.client);
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let injector = crate::workflows::CxPolicyInjector::new(
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone()),
+            );
+            let cx = crate::cx::for_request();
+            let caps = unreserved(PaneCapabilities::prompt());
+            let path = std::path::Path::new(storage.db_path());
+            let held = acquire_kill_switch_fence(path).unwrap();
+            let mut pending = Box::pin(injector.send_text(
+                &cx,
+                42,
+                "echo must-not-run\n",
+                ActorKind::Workflow,
+                &caps,
+                None,
+            ));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(held);
+            transition_in_test_process(path, "trip");
+            let result = pending.await.unwrap();
+            assert!(
+                matches!(result, InjectionResult::Denied { ref decision, audit_action_id: Some(_), .. }
+                    if decision.rule_id() == Some("policy.kill_switch")),
+                "{result:?}"
+            );
+            assert!(mock.pane_state(42).await.unwrap().content.is_empty());
+            let rows = storage
+                .get_audit_actions_with_cx(&cx, crate::storage::AuditQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].policy_decision, "deny");
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn detached_admission_rejects_fence_for_replaced_storage() {
+        run_async_test(async {
+            let (_directory, storage, direct) = persisted_stop_injector().await;
+            let (_other_directory, other_storage, _other_injector) = persisted_stop_injector().await;
+            let mock = Arc::new(direct.client);
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let mut injector =
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
+            let cx = crate::cx::for_request();
+            let caps = unreserved(PaneCapabilities::prompt());
+            let admission = DetachedInjectionFence::acquire_with_cx(
+                &cx,
+                Some(storage.db_path().to_string()),
+            )
+            .await;
+            injector.set_storage(other_storage.clone());
+            let result = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo wrong-workspace\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                    Some(admission),
+                )
+                .await;
+            assert!(
+                matches!(result, InjectionResult::Denied { ref decision, .. }
+                    if decision.rule_id() == Some("policy.kill_switch")),
+                "{result:?}"
+            );
+            assert!(mock.pane_state(42).await.unwrap().content.is_empty());
+            drop(
+                crate::policy_kill_switch_state::acquire_kill_switch_fence(std::path::Path::new(
+                    storage.db_path(),
+                ))
+                .expect("rejected admission releases old workspace authority"),
+            );
+            storage.shutdown_with_cx(&cx).await.unwrap();
+            other_storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn persisted_stop_injector_detached_queue_owns_fence_and_pending_is_not_latched() {
         run_async_test(async {
             use crate::policy_kill_switch_state::tests::transition_in_test_process;
@@ -11089,6 +11392,7 @@ mod tests {
                 ActorKind::Workflow,
                 &caps,
                 None,
+                None,
             );
             assert!(
                 transition_in_test_process(std::path::Path::new(storage.db_path()), "pending")
@@ -11104,6 +11408,7 @@ mod tests {
                     ActionKind::SendText,
                     ActorKind::Workflow,
                     &caps,
+                    None,
                     None,
                 )
                 .await;
@@ -11129,6 +11434,7 @@ mod tests {
                     ActorKind::Workflow,
                     &caps,
                     None,
+                    None,
                 )
                 .await;
             assert!(
@@ -11151,6 +11457,7 @@ mod tests {
                     ActionKind::SendText,
                     ActorKind::Workflow,
                     &caps,
+                    None,
                     None,
                 )
                 .await;
@@ -11187,6 +11494,7 @@ mod tests {
                 ActorKind::Workflow,
                 &caps,
                 None,
+                None,
             );
             let pending = crate::runtime_async::timeout_with_cx(
                 &cx,
@@ -11214,6 +11522,7 @@ mod tests {
                     ActorKind::Workflow,
                     &caps,
                     None,
+                    None,
                 )
                 .await;
             assert!(
@@ -11232,6 +11541,7 @@ mod tests {
                     ActionKind::SendText,
                     ActorKind::Workflow,
                     &caps,
+                    None,
                     None,
                 )
                 .await;
@@ -11562,6 +11872,7 @@ mod tests {
                             ActionKind::SendText,
                             ActorKind::Mcp,
                             &caps,
+                            None,
                             None,
                         )
                         .await
@@ -12184,7 +12495,7 @@ mod tests {
                     "{direct:?}"
                 );
                 let detached = injector
-                    .inject_with_cx_detached(&cx, 42, text, action, actor, &caps, workflow)
+                    .inject_with_cx_detached(&cx, 42, text, action, actor, &caps, workflow, None)
                     .await;
                 assert!(
                     matches!(detached, InjectionResult::Denied { .. }),
