@@ -16238,7 +16238,7 @@ mod tests {
             let clock = Arc::new(asupersync::time::VirtualClock::new());
             let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
             let identity = crate::cx::for_testing();
-            let capture_cx = crate::cx::Cx::new_with_drivers(
+            let virtual_clock_cx = crate::cx::Cx::new_with_drivers(
                 identity.region_id(),
                 identity.task_id(),
                 asupersync::Budget::INFINITE,
@@ -16260,7 +16260,7 @@ mod tests {
             // Spawn the production supervisor on an isolated, frozen clock.
             // Test harness waits retain their ordinary runtime clock.
             let task = {
-                let _current = crate::cx::Cx::set_current(Some(capture_cx));
+                let _current = crate::cx::Cx::set_current(Some(virtual_clock_cx));
                 runtime.spawn_capture_task(
                     capture_tx,
                     publication_rx,
@@ -23753,7 +23753,7 @@ mod tests {
             let clock = Arc::new(asupersync::time::VirtualClock::new());
             let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
             let identity = crate::cx::for_testing();
-            let capture_cx = crate::cx::Cx::new_with_drivers(
+            let virtual_clock_cx = crate::cx::Cx::new_with_drivers(
                 identity.region_id(),
                 identity.task_id(),
                 asupersync::Budget::INFINITE,
@@ -23766,7 +23766,7 @@ mod tests {
             let socket_path = dir.path().join("native-deadline.sock");
             let (capture_tx, mut capture_rx) = mpsc::channel(4);
             let task = {
-                let _current = crate::cx::Cx::set_current(Some(capture_cx));
+                let _current = crate::cx::Cx::set_current(Some(virtual_clock_cx));
                 runtime.spawn_native_event_task(socket_path.clone(), capture_tx)
             };
             crate::runtime_async::timeout(Duration::from_secs(5), async {
