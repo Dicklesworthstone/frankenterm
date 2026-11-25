@@ -892,11 +892,11 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
     },
     ConfigKeyWiringRecord {
         key: "general.workspace",
-        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
-        consumer: "none",
-        evidence: "workspace_layout resolves the workspace from --workspace, FT_WORKSPACE, or the current directory; nothing reads this field",
-        tracking_bead: "ft-l3m07",
-        validation: "Config::validate rejects a set value as parsed but no-effect",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::config::Config::resolve_workspace_root",
+        evidence: "resolve_workspace_root uses it when neither --workspace nor FT_WORKSPACE names a root, with the same tilde expansion and operator-symlink resolution; workspace_resolution_uses_configured_workspace_below_cli_and_env covers precedence and both transforms",
+        tracking_bead: "ft-mgy5t2.17",
+        validation: "Config::validate accepts an absolute or ~/ path and rejects a relative or empty one",
     },
     ConfigKeyWiringRecord {
         key: "sync.targets[].default_direction",
@@ -1244,7 +1244,10 @@ pub struct GeneralConfig {
     /// Default: ~/.local/share/ft (Linux) or ~/Library/Application Support/ft (macOS)
     pub data_dir: String,
 
-    /// Workspace identifier (optional, for multi-workspace setups)
+    /// Default workspace root, used when neither `--workspace` nor
+    /// `FT_WORKSPACE` names one (instead of the current directory). An
+    /// absolute path or one starting with `~/`. It selects the workspace's
+    /// state, database and socket; config discovery is unchanged.
     pub workspace: Option<String>,
 }
 
@@ -6482,19 +6485,23 @@ impl Config {
             .into());
         }
 
-        // ft-l3m07: three more parsed-but-inert keys fail closed when
-        // customized, so an operator is never misled into thinking they took
-        // effect. Defaults stay accepted.
-        if self.general.workspace.is_some() {
-            return Err(crate::error::ConfigError::ValidationError(
-                parsed_but_unconsumed_config_key_message(
-                    "general.workspace",
-                    "the workspace is resolved from --workspace, FT_WORKSPACE, or the current \
-                     directory",
-                ),
-            )
+        // ft-mgy5t2.17: general.workspace replaces the current directory as
+        // the last-resort workspace root. A relative value would still depend
+        // on where ft was started, which is what the setting exists to avoid.
+        if let Some(workspace) = self.general.workspace.as_deref()
+            && !(workspace == "~"
+                || workspace.starts_with("~/")
+                || Path::new(workspace).is_absolute())
+        {
+            return Err(crate::error::ConfigError::ValidationError(format!(
+                "general.workspace must be an absolute path or start with ~/ (got {workspace:?})"
+            ))
             .into());
         }
+
+        // ft-l3m07: parsed-but-inert keys fail closed when customized, so an
+        // operator is never misled into thinking they took effect. Defaults
+        // stay accepted.
         if let Some(target) = self
             .sync
             .targets
@@ -6539,10 +6546,15 @@ impl Config {
         expand_tilde(&self.general.data_dir)
     }
 
-    /// Resolve the workspace root (CLI override > FT_WORKSPACE > current dir)
+    /// Resolve the workspace root (CLI override > FT_WORKSPACE >
+    /// general.workspace > current dir)
     pub fn resolve_workspace_root(&self, explicit: Option<&Path>) -> crate::Result<PathBuf> {
         let env_path = std::env::var("FT_WORKSPACE").ok();
-        resolve_workspace_root_with_env(explicit, env_path.as_deref())
+        resolve_workspace_root_with_env(
+            explicit,
+            env_path.as_deref(),
+            self.general.workspace.as_deref(),
+        )
     }
 
     /// Resolve workspace layout paths for a given workspace root
@@ -6911,6 +6923,7 @@ fn ensure_dir(path: &Path) -> crate::Result<()> {
 fn resolve_workspace_root_with_env(
     explicit: Option<&Path>,
     env_path: Option<&str>,
+    configured: Option<&str>,
 ) -> crate::Result<PathBuf> {
     if let Some(path) = explicit {
         return resolve_path(path).map(physical_operator_root);
@@ -6918,6 +6931,10 @@ fn resolve_workspace_root_with_env(
 
     if let Some(env_path) = env_path {
         return resolve_path(Path::new(env_path)).map(physical_operator_root);
+    }
+
+    if let Some(configured) = configured {
+        return resolve_path(Path::new(configured)).map(physical_operator_root);
     }
 
     std::env::current_dir().map_err(|e| {
@@ -6928,7 +6945,8 @@ fn resolve_workspace_root_with_env(
     })
 }
 
-/// A workspace root the operator named (`--workspace`, `FT_WORKSPACE`), as
+/// A workspace root the operator named (`--workspace`, `FT_WORKSPACE`,
+/// `general.workspace`), as
 /// its physical path when a symlink of the operator's own leads to it
 /// (ft-bzu2o), as the current directory already is. The no-follow walkers
 /// refuse a link they cannot tell from repository content, so the root must
@@ -7596,6 +7614,7 @@ disabled_rules = ["codex.usage_warning"]
         let root = resolve_workspace_root_with_env(
             Some(Path::new("cli-workspace")),
             Some("env-workspace"),
+            Some("/configured-workspace"),
         )
         .expect("resolve");
         assert_eq!(root, cwd.join("cli-workspace"));
@@ -7604,8 +7623,78 @@ disabled_rules = ["codex.usage_warning"]
     #[test]
     fn workspace_resolution_prefers_env_over_cwd() {
         let cwd = std::env::current_dir().expect("cwd");
-        let root = resolve_workspace_root_with_env(None, Some("env-workspace")).expect("resolve");
+        let root =
+            resolve_workspace_root_with_env(None, Some("env-workspace"), None).expect("resolve");
         assert_eq!(root, cwd.join("env-workspace"));
+    }
+
+    /// ft-mgy5t2.17: general.workspace is the root when neither the CLI nor
+    /// FT_WORKSPACE names one, and gets the same tilde expansion and
+    /// operator-symlink resolution they do.
+    #[test]
+    fn workspace_resolution_uses_configured_workspace_below_cli_and_env() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("configured");
+        let configured = configured.to_str().expect("utf8");
+
+        let resolve = |explicit: Option<&Path>, env: Option<&str>| {
+            resolve_workspace_root_with_env(explicit, env, Some(configured)).expect("resolve")
+        };
+        assert_eq!(
+            resolve(Some(Path::new("cli-workspace")), Some("env-workspace")),
+            cwd.join("cli-workspace")
+        );
+        assert_eq!(
+            resolve(None, Some("env-workspace")),
+            cwd.join("env-workspace")
+        );
+        assert_eq!(resolve(None, None), PathBuf::from(configured));
+
+        if let Some(home) = dirs::home_dir() {
+            let from_tilde = resolve_workspace_root_with_env(None, None, Some("~/ft-mgy5t2-17"))
+                .expect("resolve");
+            assert_eq!(
+                from_tilde,
+                physical_operator_root(home.join("ft-mgy5t2-17"))
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).expect("real dir");
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("link");
+            let through_link =
+                resolve_workspace_root_with_env(None, None, link.to_str()).expect("resolve");
+            assert_eq!(
+                through_link,
+                std::fs::canonicalize(&real).expect("canonical")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_absolute_or_home_workspace_and_rejects_relative() {
+        let absolute = std::env::temp_dir().join("agents");
+        let absolute = absolute.to_str().expect("utf8");
+        for accepted in [absolute, "~/agents", "~"] {
+            let mut config = Config::default();
+            config.general.workspace = Some(accepted.to_string());
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{accepted:?} should validate: {err}"));
+        }
+        for rejected in ["", " ", "agents", "./agents", "~agents"] {
+            let mut config = Config::default();
+            config.general.workspace = Some(rejected.to_string());
+            let err = config
+                .validate()
+                .expect_err("relative workspace must be rejected")
+                .to_string();
+            assert!(err.contains("general.workspace"), "{rejected:?}: {err}");
+        }
     }
 
     /// ft-bzu2o: a root named through the operator's own symlink resolves to
@@ -7623,7 +7712,7 @@ disabled_rules = ["codex.usage_warning"]
         let physical = std::fs::canonicalize(&real).expect("canonical");
 
         let resolve = |explicit: Option<&Path>, env: Option<&str>| {
-            resolve_workspace_root_with_env(explicit, env).expect("resolve")
+            resolve_workspace_root_with_env(explicit, env, None).expect("resolve")
         };
         assert_eq!(resolve(Some(&link), None), physical);
         assert_eq!(
@@ -7651,7 +7740,7 @@ disabled_rules = ["codex.usage_warning"]
     #[test]
     fn workspace_resolution_defaults_to_cwd() {
         let cwd = std::env::current_dir().expect("cwd");
-        let root = resolve_workspace_root_with_env(None, None).expect("resolve");
+        let root = resolve_workspace_root_with_env(None, None, None).expect("resolve");
         assert_eq!(root, cwd);
     }
 
@@ -11118,27 +11207,32 @@ retention_tiers = []
     #[test]
     fn resolve_workspace_root_with_explicit_path() {
         let result =
-            resolve_workspace_root_with_env(Some(Path::new("/tmp/test-workspace")), None).unwrap();
+            resolve_workspace_root_with_env(Some(Path::new("/tmp/test-workspace")), None, None)
+                .unwrap();
         assert_eq!(result, PathBuf::from("/tmp/test-workspace"));
     }
 
     #[test]
     fn resolve_workspace_root_with_env_path() {
-        let result = resolve_workspace_root_with_env(None, Some("/tmp/env-workspace")).unwrap();
+        let result =
+            resolve_workspace_root_with_env(None, Some("/tmp/env-workspace"), None).unwrap();
         assert_eq!(result, PathBuf::from("/tmp/env-workspace"));
     }
 
     #[test]
     fn resolve_workspace_root_explicit_overrides_env() {
-        let result =
-            resolve_workspace_root_with_env(Some(Path::new("/tmp/explicit")), Some("/tmp/env"))
-                .unwrap();
+        let result = resolve_workspace_root_with_env(
+            Some(Path::new("/tmp/explicit")),
+            Some("/tmp/env"),
+            None,
+        )
+        .unwrap();
         assert_eq!(result, PathBuf::from("/tmp/explicit"));
     }
 
     #[test]
     fn resolve_workspace_root_fallback_to_cwd() {
-        let result = resolve_workspace_root_with_env(None, None).unwrap();
+        let result = resolve_workspace_root_with_env(None, None, None).unwrap();
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(result, cwd);
     }

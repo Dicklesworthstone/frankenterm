@@ -80,11 +80,11 @@
     },
     {
       "key": "general.workspace",
-      "status": "parsed_but_unconsumed",
-      "consumer": "none",
-      "evidence": "workspace_layout resolves the workspace from --workspace, FT_WORKSPACE, or the current directory; nothing reads this field",
-      "tracking_bead": "ft-l3m07",
-      "validation": "Config::validate rejects a set value as parsed but no-effect"
+      "status": "consumed",
+      "consumer": "crate::config::Config::resolve_workspace_root",
+      "evidence": "resolve_workspace_root uses it when neither --workspace nor FT_WORKSPACE names a root, with the same tilde expansion and operator-symlink resolution; workspace_resolution_uses_configured_workspace_below_cli_and_env covers precedence and both transforms",
+      "tracking_bead": "ft-mgy5t2.17",
+      "validation": "Config::validate accepts an absolute or ~/ path and rejects a relative or empty one"
     },
     {
       "key": "sync.targets[].default_direction",

@@ -4566,7 +4566,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `<workspace>/.ft/ft.db` (the workspace is `FT_WORKSPACE` or the current directory; relocate it with an absolute `storage.db_path` or `general.data_dir`). Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `<workspace>/.ft/ft.db` (the workspace is `--workspace`, then `FT_WORKSPACE`, then `general.workspace`, then the current directory; relocate it with an absolute `storage.db_path` or `general.data_dir`). Long-running watchers periodically sample SQLite page statistics and report when an explicit operator-run `VACUUM` may be useful; they do not automatically monopolize the single writer with a full database rewrite. Backup and restore is supported via `ft backup export` / `ft backup import`.
 
 ### Does ft send data anywhere?
 

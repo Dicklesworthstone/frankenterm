@@ -55,17 +55,27 @@ fn doctrine_artifact_matches_inventory() {
 
 #[test]
 fn validate_report_lists_every_unconsumed_key() {
+    // A key leaves the unconsumed list only by naming its production consumer
+    // and the test that proves it; an unconsumed key names neither.
+    for record in config_key_wiring_inventory() {
+        match record.status {
+            ConfigKeyWiringStatus::Consumed => assert!(
+                !matches!(record.consumer, "" | "none") && !record.evidence.is_empty(),
+                "consumed key {} must name its consumer and evidence",
+                record.key
+            ),
+            ConfigKeyWiringStatus::ParsedButUnconsumed => assert_eq!(
+                record.consumer, "none",
+                "unconsumed key {} must not claim a consumer",
+                record.key
+            ),
+        }
+    }
     let unconsumed_keys: Vec<&str> = config_key_wiring_inventory()
         .iter()
         .filter(|record| record.status == ConfigKeyWiringStatus::ParsedButUnconsumed)
         .map(|record| record.key)
         .collect();
-    assert!(
-        unconsumed_keys.len() >= 16,
-        "inventory shrank unexpectedly ({} unconsumed keys) — dead keys must be \
-         removed only when they gain a production consumer",
-        unconsumed_keys.len()
-    );
 
     let report = config_key_wiring_validate_report();
     assert_eq!(
