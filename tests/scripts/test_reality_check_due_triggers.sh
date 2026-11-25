@@ -68,29 +68,44 @@ assert_clean_cli_error() {
 # Trigger 1: calendar (quarterly minimum, default 90 days)
 # ----------------------------------------------------------------------------
 
+# Calendar ages are measured from the latest reality-check artifact, so every
+# --as-of date below is derived from it. Fixed calendar dates go stale (and the
+# "does not fire" cases pass vacuously) as soon as a newer check is filed.
+LATEST_RC_DATE=$("$SUT" --json | jq -r '.latest_reality_check_date')
+[[ "$LATEST_RC_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+  echo "error: expected a YYYY-MM-DD latest_reality_check_date, got: $LATEST_RC_DATE" >&2
+  exit 2
+}
+
+# add_days YYYY-MM-DD N -> the date N days later (GNU date, else BSD date).
+add_days() {
+  if date -u -d "$1 + $2 days" +%F >/dev/null 2>&1; then
+    date -u -d "$1 + $2 days" +%F
+  else
+    date -u -j -v+"$2"d -f "%Y-%m-%d" "$1" +%F
+  fi
+}
+
 t_calendar_fires_past_threshold() {
-  # The script reads the LATEST reality-check artifact date from the repo.
-  # Forcing a calendar-days threshold of 1 means any age past today's date
-  # fires the trigger as long as a prior reality-check artifact exists.
   local out
-  out=$("$SUT" --json --as-of "2027-01-01" --calendar-days 90)
+  out=$("$SUT" --json --as-of "$(add_days "$LATEST_RC_DATE" 230)" --calendar-days 90)
   assert_json "calendar fires when 230 days > 90 days" "$out" '.signals.calendar.triggered' 'true'
 }
 
 t_calendar_does_not_fire_under_threshold() {
   local out
-  out=$("$SUT" --json --as-of "2026-05-12" --calendar-days 90)
+  out=$("$SUT" --json --as-of "$LATEST_RC_DATE" --calendar-days 90)
   assert_json "calendar does NOT fire when 0 days < 90 days" "$out" '.signals.calendar.triggered' 'false'
 }
 
 t_calendar_off_by_one() {
   # 89 days < 90 days threshold -> no fire
   local out
-  out=$("$SUT" --json --as-of "2026-08-09" --calendar-days 90)
+  out=$("$SUT" --json --as-of "$(add_days "$LATEST_RC_DATE" 89)" --calendar-days 90)
   assert_json "calendar does NOT fire at 89 days" "$out" '.signals.calendar.triggered' 'false'
   # 91 days > 90 days threshold -> fire
   local out2
-  out2=$("$SUT" --json --as-of "2026-08-11" --calendar-days 90)
+  out2=$("$SUT" --json --as-of "$(add_days "$LATEST_RC_DATE" 91)" --calendar-days 90)
   assert_json "calendar fires at 91 days" "$out2" '.signals.calendar.triggered' 'true'
 }
 
@@ -152,7 +167,7 @@ t_due_false_when_no_trigger_fires() {
   # date matching the latest reality-check. The minor-version signal is
   # intentionally unthresholded, so assert whatever the live repo reports.
   local out
-  out=$("$SUT" --json --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
+  out=$("$SUT" --json --as-of "$LATEST_RC_DATE" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
   local minor_due
   minor_due=$(printf '%s' "$out" | jq -r '.signals.minor_version.triggered')
   if [[ "$minor_due" == "true" ]]; then
@@ -180,14 +195,14 @@ t_strict_exits_nonzero_when_due() {
 
 t_strict_exits_zero_when_not_due() {
   local out expected_rc
-  out=$("$SUT" --json --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
+  out=$("$SUT" --json --as-of "$LATEST_RC_DATE" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
   if [[ "$(printf '%s' "$out" | jq -r '.due')" == "true" ]]; then
     expected_rc=1
   else
     expected_rc=0
   fi
   set +e
-  "$SUT" --strict --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000 >/dev/null 2>&1
+  "$SUT" --strict --as-of "$LATEST_RC_DATE" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000 >/dev/null 2>&1
   local rc=$?
   set -e
   if [[ $rc -eq $expected_rc ]]; then
