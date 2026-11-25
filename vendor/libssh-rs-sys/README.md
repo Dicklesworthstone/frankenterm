@@ -28,6 +28,12 @@ ship the same fix. `build.rs` declares `rerun-if-changed` for itself and
 `vendored/`; before, its `rerun-if-env-changed` lines alone stopped Cargo from
 recompiling the C sources after they were edited.
 
+The published `build.rs` stamped `libssh_version.h` as 0.8.90, so the client
+banner said `SSH-2.0-libssh_0.8.90` and `ssh_version()` reported 0.8.90 for
+0.11.4 sources. It now reads the version from `vendored/CMakeLists.txt`'s
+`project(libssh VERSION ...)` line and fails the build if that line is missing
+or malformed.
+
 FrankenTerm release and validation receipts come from DSR and RCH, respectively.
 Upstream workflow badges are not qualification evidence for this import.
 

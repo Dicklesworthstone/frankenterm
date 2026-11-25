@@ -138,11 +138,15 @@ fn main() {
 
     std::fs::write(include.join("config.h"), "// nothing").unwrap();
 
+    // Stamp the bundled sources' own version. The published crate wrote
+    // 0.8.90 here, which reached the SSH client banner, ssh_version() and
+    // ssh_copyright() although the bundled sources are libssh 0.11.4.
+    let (major, minor, patch) = vendored_libssh_version();
     let version = std::fs::read_to_string("vendored/include/libssh/libssh_version.h.cmake")
         .unwrap()
-        .replace("@libssh_VERSION_MAJOR@", "0")
-        .replace("@libssh_VERSION_MINOR@", "8")
-        .replace("@libssh_VERSION_PATCH@", "90");
+        .replace("@libssh_VERSION_MAJOR@", &major)
+        .replace("@libssh_VERSION_MINOR@", &minor)
+        .replace("@libssh_VERSION_PATCH@", &patch);
 
     std::fs::create_dir_all(include.join("libssh")).unwrap();
     std::fs::write(include.join("libssh/libssh_version.h"), version).unwrap();
@@ -273,5 +277,26 @@ fn main() {
     // The non-vendored fallback has no libz-sys dependency to supply this.
     if std::env::var_os("CARGO_FEATURE_VENDORED").is_none() {
         println!("cargo:rustc-link-lib=z");
+    }
+}
+
+/// The version in the bundled `project(libssh VERSION x.y.z ...)` line.
+fn vendored_libssh_version() -> (String, String, String) {
+    let cmake = std::fs::read_to_string("vendored/CMakeLists.txt").unwrap();
+    let version = cmake
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("project(libssh VERSION "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("vendored/CMakeLists.txt declares project(libssh VERSION x.y.z ...)");
+    let parts: Vec<&str> = version.split('.').collect();
+    match parts.as_slice() {
+        [major, minor, patch]
+            if parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            (major.to_string(), minor.to_string(), patch.to_string())
+        }
+        _ => panic!("vendored libssh version {:?} is not x.y.z", version),
     }
 }
