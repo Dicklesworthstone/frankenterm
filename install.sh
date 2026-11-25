@@ -377,6 +377,9 @@ prepare_process_family_archive() {
 # (explicit `--version <tag>` still works).
 # Exit 1: no stable release ships them all. Exit 2: the input holds no stable
 # release at all (API unreachable, rate-limited, companion-only, or not JSON).
+# With `--companion` as the first argument it considers only published,
+# non-prerelease companion tags such as `v0.15.22-appstore.15` instead. That
+# mode never selects a version; it names one for an operator to request.
 release_tag_with_assets() {
   python3 -c '
 import json, re, sys
@@ -385,12 +388,17 @@ try:
     data = json.load(sys.stdin)
 except ValueError:
     sys.exit(2)
-STABLE_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+companion = sys.argv[1:2] == ["--companion"]
+if companion:
+    del sys.argv[1]
+TAG_RE = re.compile(
+    r"^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*$" if companion
+    else r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 releases = [
     release for release in (data if isinstance(data, list) else [data])
     if isinstance(release, dict) and not release.get("draft")
     and not release.get("prerelease")
-    and STABLE_TAG_RE.match(str(release.get("tag_name") or ""))
+    and TAG_RE.match(str(release.get("tag_name") or ""))
 ]
 if not releases:
     sys.exit(2)
@@ -451,6 +459,12 @@ except Exception:
     pass
 ' 2>/dev/null || true)
   latest_tag=$(printf '%s' "$latest_json" | release_tag_with_assets) || latest_tag=""
+  # A signed companion release is never chosen automatically, but when no
+  # stable release fits it is the verifiable install to name.
+  local companion_tag=""
+  if [ -n "${needed[0]:-}" ]; then
+    companion_tag=$(printf '%s' "$latest_json" | release_tag_with_assets --companion "${needed[@]}") || companion_tag=""
+  fi
   if [ -n "$latest_tag" ]; then
     if [ -z "${needed[0]:-}" ]; then
       VERSION="$latest_tag"
@@ -515,6 +529,9 @@ print(len(releases))
     if [ "$requested_app" -eq 0 ] && [ -n "${needed[0]:-}" ] && [ -z "$archive_only_tag" ]; then
       archive_only_tag=$(printf '%s' "$releases_json" | release_tag_with_assets "$ASSET") || archive_only_tag=""
     fi
+    if [ -n "${needed[0]:-}" ] && [ -z "$companion_tag" ]; then
+      companion_tag=$(printf '%s' "$releases_json" | release_tag_with_assets --companion "${needed[@]}") || companion_tag=""
+    fi
     if [ "$page_count" -lt 100 ]; then
       list_complete=1
       break
@@ -529,9 +546,17 @@ print(len(releases))
     if [ "$requested_app" -eq 1 ]; then
       err "No published stable release supplies all files required by --with-app: ${needed[*]}"
       err "Nothing was installed. Use --no-app to select a CLI-only release."
+      if [ -n "$companion_tag" ]; then
+        err "Companion release $companion_tag ships all of them, signed. To install it, rerun with:  --version $companion_tag"
+      fi
     elif [ -n "${needed[0]:-}" ]; then
       err "No published stable release ships a verifiable $ASSET for ${OS:-this OS}/${ARCH:-this arch} yet"
       err "(GitHub latest tag $display_latest is not a verifiable stable release for this target). Nothing was installed. Options:"
+      if [ -n "$companion_tag" ]; then
+        err "  * companion release $companion_tag ships a signed $ASSET that this installer verifies."
+        err "    Companion releases are not selected automatically. To install it, rerun with:"
+        err "      --version $companion_tag"
+      fi
       if [ -n "$archive_only_tag" ]; then
         err "  * $archive_only_tag ships $ASSET but not every file this installer requires"
         err "    (${needed[*]}). The installer published with that release can install it:"
@@ -5551,7 +5576,7 @@ install_pragmasevka() {
   local font_manifest="$PUBLISHED_PROCESS_FAMILY_ROOT/process-family.component-manifest.json"
   local font_receipt="" font_checksum="" font_bytes="" font_identity=""
   local downloaded_bytes="" tree_receipt="" extracted_receipt=""
-  local helper="" stage_id="" target_id="" txid="" operation=""
+  local helper="" stage_id="" target_id="" txid="" operation="" prior_was_sealed=0
   case "$OS" in
     linux)  font_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/pragmasevka" ;;
     darwin) font_dir="$HOME/Library/Fonts/pragmasevka" ;;
@@ -5680,6 +5705,7 @@ install_pragmasevka() {
     # An exchange renames the prior generation too; reopen a sealed one.
     if [ "$(installer_stage_mode "$font_dir" 2>/dev/null)" = 0555 ]; then
       chmod 0700 "$font_dir" || return 0
+      prior_was_sealed=1
     fi
     target_id=$(atomic_path_content_id "$helper" "$font_parent" "$(basename "$font_dir")") || return 0
     operation=exchange
@@ -5693,7 +5719,19 @@ install_pragmasevka() {
   if ! atomic_path_transition "$helper" "$font_parent" "$font_stage_name" \
       "$(basename "$font_dir")" "$txid" "$stage_id" "$target_id" "$operation"; then
     warn "Pragmasevka atomic generation publication failed; prior font tree was retained"
+    if [ "$prior_was_sealed" -eq 1 ] &&
+        [ "$(installer_stage_mode "$font_dir" 2>/dev/null)" = 0700 ]; then
+      chmod 0555 "$font_dir" || true
+    fi
     return 0
+  fi
+  # The exchange left the prior generation under this archive's stage name.
+  # Seal it again: an owner-writable stage of that name is what a later
+  # install resumes into, and resuming into a complete older generation fails
+  # its extraction and skips the fonts.
+  if [ "$operation" = exchange ] && [ "$prior_was_sealed" -eq 1 ]; then
+    chmod 0555 "$font_stage" ||
+      warn "Could not reseal the prior Pragmasevka generation at $font_stage"
   fi
   installer_failpoint after-font-publication
   if ! seal_font_generation_stage "$font_dir" "$tree_receipt" ||

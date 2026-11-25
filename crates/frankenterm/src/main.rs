@@ -126210,6 +126210,65 @@ with tarfile.open(path, "w") as archive:
             retained_old,
             "atomic exchange did not retain the prior font generation"
         );
+
+        // The retained generation carries this archive's stage name. Unless it
+        // is sealed again, a later install takes it for a resumable partial,
+        // fails to extract over the older bytes, and skips the fonts.
+        let retained_modes: Vec<u32> = std::fs::read_dir(data_root.join("fonts"))
+            .expect("inspect retained font generation modes")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pragmasevka-")
+            })
+            .map(|entry| {
+                use std::os::unix::fs::PermissionsExt as _;
+                entry
+                    .metadata()
+                    .expect("read retained generation metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            })
+            .collect();
+        assert_eq!(
+            retained_modes,
+            vec![0o555],
+            "the retained prior generation must be sealed again"
+        );
+        let published_regular = std::fs::read(old_target.join("pragmasevka-nf-regular.ttf"))
+            .expect("read published regular font");
+        // The operator moves the installed fonts away; a reinstall restores them.
+        std::fs::rename(
+            &old_target,
+            data_root.join("fonts").join("moved-by-operator"),
+        )
+        .expect("move the published font tree away");
+        let reinstall = run_installer_font_function(
+            &installer,
+            &published,
+            &family.verifier,
+            &font_archive,
+            &data_root,
+            &fixture.path().join("scratch-reinstall"),
+            &fake_tools,
+            None,
+            false,
+        );
+        assert!(
+            reinstall.status.success()
+                && String::from_utf8_lossy(&reinstall.stdout)
+                    .contains(&format!("FONT_RESULT={}", old_target.display())),
+            "reinstall after the fonts were moved away did not publish them: {}",
+            String::from_utf8_lossy(&reinstall.stderr)
+        );
+        assert_eq!(
+            std::fs::read(old_target.join("pragmasevka-nf-regular.ttf"))
+                .expect("read reinstalled regular font"),
+            published_regular
+        );
     }
 
     #[cfg(unix)]
@@ -126547,6 +126606,26 @@ grep -q 'cannot provide required file ft-linux-amd64.tar.xz' "$errors"
 download_status=0
 pick ft-darwin-arm64.tar.xz
 test "$VERSION" = v0.16.0
+# Only a companion release ships the signed macOS set, as on GitHub today.
+# It is never selected automatically; the refusal names it as the verifiable
+# choice ahead of the older release's own installer.
+api_status=0
+list_status=0
+download_status=22
+latest='{"tag_name":"v0.16.3-appstore.2","draft":false,"prerelease":false,"created_at":"2026-11-12T00:00:00Z","assets":[{"name":"ft-darwin-arm64.tar.xz"},{"name":"ft-darwin-arm64.tar.xz.sha256"},{"name":"ft-darwin-arm64.tar.xz.minisig"}]}'
+releases='[{"tag_name":"v0.15.1","draft":false,"prerelease":false,"created_at":"2026-08-21T00:00:00Z","assets":[{"name":"ft-darwin-arm64.tar.xz"},{"name":"ft-darwin-arm64.tar.xz.sha256"}]},'"$latest"']'
+if pick ft-darwin-arm64.tar.xz; then exit 95; fi
+test -z "$VERSION"
+grep -qF 'companion release v0.16.3-appstore.2 ships a signed ft-darwin-arm64.tar.xz' "$errors"
+grep -qF -- '--version v0.16.3-appstore.2' "$errors"
+grep -qF 'v0.15.1/install.sh | bash -s -- --version v0.15.1' "$errors"
+# The same companion is found on a release-list page when /latest is another release.
+latest='{"tag_name":"v0.15.1","draft":false,"prerelease":false,"created_at":"2026-08-21T00:00:00Z","assets":[]}'
+if pick ft-darwin-arm64.tar.xz; then exit 96; fi
+grep -qF -- '--version v0.16.3-appstore.2' "$errors"
+# A companion without this platform's signed archive is not named.
+if pick ft-linux-arm64.tar.xz; then exit 97; fi
+if grep -q 'companion release' "$errors"; then exit 98; fi
 "#
         .replace("@INSTALLER@", &shell_single_quote(&installer.to_string_lossy()))
         .replace("@ERRORS@", &shell_single_quote(&errors.to_string_lossy()));
