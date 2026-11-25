@@ -17,9 +17,10 @@
 //! Fail-closed rules:
 //!
 //! - a missing key is the genuine "never armed" state (`Disarmed`);
-//! - a value that cannot be read or decoded arms **HardStop** in the engine
-//!   being restored and is reported as [`KillSwitchRestore::FailedClosed`];
-//!   a corrupt blob must never silently disarm the switch;
+//! - a value that cannot be read or decoded arms at least **HardStop** in the
+//!   engine being restored and is reported as [`KillSwitchRestore::FailedClosed`];
+//!   an existing EmergencyHalt is preserved, and a corrupt blob must never
+//!   silently weaken the switch;
 //! - JSON arrays and non-objects are rejected explicitly (an all-default
 //!   struct would otherwise deserialize positionally from an array);
 //! - restore never touches the engine's audit chain or telemetry: it is
@@ -162,7 +163,8 @@ pub enum KillSwitchRestore {
         /// Whether the auto-disarm deadline lapsed during restore.
         auto_disarmed: bool,
     },
-    /// The row could not be read or decoded: HardStop was armed instead.
+    /// The row could not be read or decoded: at least HardStop was armed instead,
+    /// preserving an existing EmergencyHalt.
     FailedClosed {
         /// The persistence error that caused the fail-closed arm.
         error: KillSwitchStateError,
@@ -377,7 +379,7 @@ impl KillSwitchFreshness {
 /// Install the persisted tier into `engine`.
 ///
 /// `loaded` is the raw `config` row read (`Ok(None)` = never written). Any
-/// read or decode failure arms HardStop; see the module docs.
+/// read or decode failure arms at least HardStop; see the module docs.
 pub fn apply_persisted_kill_switch(
     engine: &mut PolicyEngine,
     loaded: Result<Option<String>, KillSwitchStateError>,
@@ -408,9 +410,14 @@ pub fn apply_persisted_kill_switch(
 }
 
 fn fail_closed(engine: &mut PolicyEngine, error: &KillSwitchStateError, now_ms: u64) {
+    // Failure to refresh cannot authorize a weaker tier. In particular,
+    // replacing EmergencyHalt with HardStop would reopen read-only actions.
+    // Do not carry an old auto-disarm deadline into this failure state: only
+    // a successfully validated refresh may restore timeout authority.
+    let level = engine.kill_switch_state().level.max(KillSwitchLevel::HardStop);
     let mut state = KillSwitch::disarmed();
     state.trip(
-        KillSwitchLevel::HardStop,
+        level,
         FAIL_CLOSED_ACTOR,
         &format!("persisted kill switch unreadable, failing closed ({error})"),
         now_ms,
@@ -1375,6 +1382,90 @@ pub(crate) mod tests {
         );
         assert!(matches!(outcome, KillSwitchRestore::FailedClosed { .. }));
         assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::HardStop);
+    }
+
+    #[test]
+    fn failed_refresh_never_weakens_the_active_tier_or_reuses_its_timeout() {
+        use crate::policy::{ActionKind, ActorKind, PolicyInput};
+
+        for initial_level in [
+            KillSwitchLevel::Disarmed,
+            KillSwitchLevel::SoftStop,
+            KillSwitchLevel::HardStop,
+            KillSwitchLevel::EmergencyHalt,
+        ] {
+            for failed_refresh in [
+                Err(KillSwitchStateError::LoadFailed("unreadable".into())),
+                Err(KillSwitchStateError::FenceFailed),
+                Err(KillSwitchStateError::FencePending),
+                Ok(Some("{broken".into())),
+            ] {
+                let mut engine = PolicyEngine::permissive();
+                let mut initial = armed(initial_level);
+                initial.auto_disarm_at_ms = 2_000;
+                engine.restore_kill_switch(initial);
+                let audit_before = engine.audit_chain().len();
+
+                let outcome = apply_persisted_kill_switch(&mut engine, failed_refresh, 3_000);
+                assert!(matches!(outcome, KillSwitchRestore::FailedClosed { .. }));
+                let expected = if initial_level == KillSwitchLevel::EmergencyHalt {
+                    KillSwitchLevel::EmergencyHalt
+                } else {
+                    KillSwitchLevel::HardStop
+                };
+                assert_eq!(engine.kill_switch_state().level, expected);
+                assert_eq!(engine.kill_switch_state().auto_disarm_at_ms, 0);
+                assert_eq!(engine.audit_chain().len(), audit_before);
+
+                for action in [ActionKind::ReadOutput, ActionKind::SearchOutput] {
+                    let decision = engine.authorize(&PolicyInput::new(action, ActorKind::Robot));
+                    if initial_level == KillSwitchLevel::EmergencyHalt {
+                        assert!(decision.is_denied());
+                        assert_eq!(decision.rule_id(), Some("policy.kill_switch"));
+                    } else {
+                        assert!(decision.is_allowed(), "{decision:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_refresh_failure_requires_valid_revision_authority_to_recover() {
+        use crate::policy::{ActionKind, ActorKind, PolicyInput};
+
+        let mut emergency = PersistedKillSwitch::from(&armed(KillSwitchLevel::EmergencyHalt));
+        emergency.revision = 2;
+        let raw = serde_json::to_string(&emergency).unwrap();
+        let mut stale_reset = PersistedKillSwitch::from(&KillSwitch::disarmed());
+        stale_reset.revision = 1;
+        let mut equal_revision_reset = stale_reset.clone();
+        equal_revision_reset.revision = 2;
+
+        for failed_refresh in [
+            Ok(Some(serde_json::to_string(&stale_reset).unwrap())),
+            Ok(Some(serde_json::to_string(&equal_revision_reset).unwrap())),
+            Ok(None),
+            Err(KillSwitchStateError::LoadFailed("unreadable".into())),
+        ] {
+            let mut engine = PolicyEngine::permissive();
+            let mut freshness = KillSwitchFreshness::default();
+            freshness.apply(&mut engine, Ok(Some(raw.clone())), 3_000);
+            let outcome = freshness.apply(&mut engine, failed_refresh, 4_000);
+            assert!(matches!(outcome, KillSwitchRestore::FailedClosed { .. }));
+            let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+
+            let mut reset = PersistedKillSwitch::from(&KillSwitch::disarmed());
+            reset.revision = 3;
+            let restored = freshness.apply(
+                &mut engine,
+                Ok(Some(serde_json::to_string(&reset).unwrap())),
+                5_000,
+            );
+            assert!(matches!(restored, KillSwitchRestore::Restored { .. }));
+            assert!(engine.authorize(&input).is_allowed());
+        }
     }
 
     #[test]
