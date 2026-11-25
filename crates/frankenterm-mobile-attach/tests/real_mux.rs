@@ -39,13 +39,30 @@ fn mux_server_binary() -> PathBuf {
         );
         return path;
     }
-    // <target>/<profile>/deps/<this test> -> <target>/<profile>
-    let exe = std::env::current_exe().expect("test executable path");
+    // Cargo puts this test at <target>/<profile>/deps/<exe>, or, with the
+    // newer build-dir layout of the pinned nightly, at
+    // <target>/<profile>/build/<package>/<hash>/out/<exe>. Both sit under
+    // the profile directory, the ancestor directly inside the target
+    // directory; CARGO_TARGET_TMPDIR is <target>/tmp. Both paths are
+    // canonicalized, since a target dir under /tmp is /private/tmp on macOS.
+    let target_dir = std::fs::canonicalize(
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .parent()
+            .expect("CARGO_TARGET_TMPDIR has a target dir"),
+    )
+    .expect("canonical target dir");
+    let exe = std::fs::canonicalize(std::env::current_exe().expect("test executable path"))
+        .expect("canonical test executable path");
     let profile_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("test executable lives in <target>/<profile>/deps");
-    let target_dir = profile_dir.parent().expect("profile dir has a target dir");
+        .ancestors()
+        .find(|dir| dir.parent() == Some(target_dir.as_path()))
+        .unwrap_or_else(|| {
+            panic!(
+                "test executable {} is not under the target dir {}",
+                exe.display(),
+                target_dir.display()
+            )
+        });
     let profile = match profile_dir.file_name().and_then(|name| name.to_str()) {
         Some("debug") | None => "dev",
         Some(name) => name,
