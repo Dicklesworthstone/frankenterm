@@ -525,7 +525,6 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
 
 /// Canonical recovery authority for the non-Unix vendored stub.
 #[cfg(all(feature = "vendored", not(unix)))]
-#[must_use]
 pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecoveryDecision {
     use crate::vendored::DirectMuxError;
 

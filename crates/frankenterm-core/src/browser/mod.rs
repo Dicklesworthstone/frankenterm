@@ -1831,31 +1831,31 @@ fn open_private_file_nofollow(
 }
 
 fn std_file_metadata_is_private(metadata: &std::fs::Metadata) -> bool {
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o777 != 0o600 {
-            return false;
-        }
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.permissions().mode() & 0o777 == 0o600
     }
-    true
+    // Windows ACL privacy is unchecked; ft-8r43i.16 tracks it.
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 fn cap_file_metadata_is_private(metadata: &cap_std::fs::Metadata) -> bool {
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use cap_fs_ext::OsMetadataExt as _;
-        if metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 {
-            return false;
-        }
+        metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600
     }
-    true
+    // Windows ACL privacy is unchecked; ft-8r43i.16 tracks it.
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 fn private_file_is_safely_accessible(

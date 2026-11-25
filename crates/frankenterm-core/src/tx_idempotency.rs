@@ -2752,7 +2752,7 @@ fn open_directory_sync_file(dir: &Dir, display_path: &Path) -> Result<File, Idem
     #[cfg(windows)]
     {
         let _ = dir;
-        return Err(windows_durable_rename_unsupported(display_path));
+        Err(windows_durable_rename_unsupported(display_path))
     }
 
     #[cfg(not(windows))]

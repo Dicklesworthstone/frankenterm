@@ -1054,26 +1054,30 @@ impl NativeEventListener {
     /// Returns a finite security error when an authenticated local transport
     /// cannot be established, or [`NativeEventError::Io`] for cancellation and
     /// filesystem/transport faults.
+    #[cfg(unix)]
     pub async fn bind_with_cx(
         cx: &crate::cx::Cx,
         socket_path: PathBuf,
     ) -> Result<Self, NativeEventError> {
-        #[cfg(windows)]
-        {
-            let _ = (cx, socket_path);
-            return Err(NativeEventSecurityError::PeerCredentialsUnavailable.into());
-        }
+        Self::bind_secure_unix_with_cx(cx, socket_path).await
+    }
 
-        #[cfg(unix)]
-        {
-            return Self::bind_secure_unix_with_cx(cx, socket_path).await;
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (cx, socket_path);
-            Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
-        }
+    /// ft-xbnl0.2.3 Cx-first sibling of [`bind`]. Without peer credentials
+    /// there is no authenticated local transport, so this refuses at once
+    /// with a ready future; callers still `.await` it as on Unix.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`NativeEventSecurityError::PeerCredentialsUnavailable`].
+    #[cfg(not(unix))]
+    pub fn bind_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: PathBuf,
+    ) -> impl std::future::Future<Output = Result<Self, NativeEventError>> {
+        let _ = (cx, socket_path);
+        let refused: Result<Self, NativeEventError> =
+            Err(NativeEventSecurityError::PeerCredentialsUnavailable.into());
+        std::future::ready(refused)
     }
 
     #[cfg(unix)]

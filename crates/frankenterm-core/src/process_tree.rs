@@ -708,9 +708,8 @@ fn find_children(provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u3
     system
         .processes()
         .iter()
-        .filter_map(|(child_pid, process)| {
-            (process.parent().map(sysinfo::Pid::as_u32) == Some(pid)).then(|| child_pid.as_u32())
-        })
+        .filter(|(_, process)| process.parent().map(sysinfo::Pid::as_u32) == Some(pid))
+        .map(|(child_pid, _)| child_pid.as_u32())
         .collect()
 }
 

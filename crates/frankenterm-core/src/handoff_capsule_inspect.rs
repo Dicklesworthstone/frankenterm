@@ -432,7 +432,9 @@ pub enum CapsuleValidateError {
     },
     Validation {
         path: std::path::PathBuf,
-        source: CapsuleValidationError,
+        // Boxed: two integrity tags plus a Windows PathBuf (32 bytes there)
+        // made the error 128 bytes, which clippy's result_large_err refuses.
+        source: Box<CapsuleValidationError>,
     },
 }
 
@@ -463,7 +465,7 @@ impl std::error::Error for CapsuleValidateError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Decode { source, .. } => Some(source),
-            Self::Validation { source, .. } => Some(source),
+            Self::Validation { source, .. } => Some(&**source),
         }
     }
 }
@@ -602,7 +604,7 @@ pub fn load_and_validate_capsule(
         .validate_for_destination(destination_passport)
         .map_err(|source| CapsuleValidateError::Validation {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
     let mut out = CapsuleInspector::at(now_ms).inspect_text(&capsule);
     out.push_str(&render_validation_outcome_text(&outcome));
@@ -636,7 +638,7 @@ pub fn load_and_validate_capsule_json(
         .validate_for_destination(destination_passport)
         .map_err(|source| CapsuleValidateError::Validation {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
     let inspection = CapsuleInspector::at(now_ms).inspect(&capsule);
     let document = ValidatedCapsuleDocument {
@@ -686,7 +688,8 @@ pub enum CapsuleApplyError {
     },
     Validation {
         path: std::path::PathBuf,
-        source: CapsuleValidationError,
+        // Boxed for the same reason as CapsuleValidateError::Validation.
+        source: Box<CapsuleValidationError>,
     },
     Render {
         source: serde_json::Error,
@@ -748,7 +751,7 @@ impl std::error::Error for CapsuleApplyError {
             Self::Read { source, .. } => Some(source),
             Self::Decode { source, .. } => Some(source),
             Self::Store { source, .. } => Some(source),
-            Self::Validation { source, .. } => Some(source),
+            Self::Validation { source, .. } => Some(&**source),
             Self::Render { source } => Some(source),
             Self::DestinationPassportMissing { .. } | Self::DestinationPassportMismatch { .. } => {
                 None
@@ -910,7 +913,7 @@ pub fn load_and_apply_capsule_to_durable_store(
         .validate_for_destination(Some(&actor_passport))
         .map_err(|source| CapsuleApplyError::Validation {
             path: capsule_path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
 
     let mut passport_excerpt_applies = Vec::new();
@@ -1834,10 +1837,8 @@ mod tests {
         let err = load_and_validate_capsule(tmp.path(), None, 2_000)
             .expect_err("integrity mismatch must error");
         match err {
-            CapsuleValidateError::Validation {
-                source: CapsuleValidationError::IntegrityMismatch { .. },
-                ..
-            } => {}
+            CapsuleValidateError::Validation { source, .. }
+                if matches!(*source, CapsuleValidationError::IntegrityMismatch { .. }) => {}
             other => panic!("expected IntegrityMismatch, got {other:?}"),
         }
     }

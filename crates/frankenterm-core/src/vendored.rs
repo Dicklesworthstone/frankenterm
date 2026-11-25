@@ -36,7 +36,6 @@ pub enum DirectMuxError {
 #[cfg(all(feature = "vendored", not(unix)))]
 impl DirectMuxError {
     /// Return the canonical recovery decision for the non-Unix stub error.
-    #[must_use]
     pub fn recovery_decision(&self) -> crate::protocol_recovery::MuxRecoveryDecision {
         crate::protocol_recovery::mux_recovery_decision(self)
     }
@@ -76,12 +75,13 @@ impl DirectMuxClient {
         Self::connect_with_cx(&cx, _config).await
     }
 
-    /// ft-tr5a0 Cx-first sibling of [`Self::connect`].
-    pub async fn connect_with_cx(
+    /// ft-tr5a0 Cx-first sibling of [`Self::connect`]. It refuses at once, so
+    /// it returns a ready future; callers still `.await` it as on Unix.
+    pub fn connect_with_cx(
         _cx: &crate::cx::Cx,
         _config: DirectMuxClientConfig,
-    ) -> Result<Self, DirectMuxError> {
-        Err(DirectMuxError::UnsupportedPlatform)
+    ) -> impl std::future::Future<Output = Result<Self, DirectMuxError>> {
+        std::future::ready(Err(DirectMuxError::UnsupportedPlatform))
     }
 }
 

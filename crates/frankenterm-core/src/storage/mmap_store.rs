@@ -1439,18 +1439,18 @@ impl PaneFile {
             return Ok(true);
         }
         #[cfg(unix)]
-        {
+        let identity_changed = {
             use std::os::unix::fs::MetadataExt as _;
 
-            if before.dev() != after.dev()
+            before.dev() != after.dev()
                 || before.ino() != after.ino()
                 || before.ctime() != after.ctime()
                 || before.ctime_nsec() != after.ctime_nsec()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        };
+        // No portable file identity here; ft-8r43i.16 tracks Windows identity.
+        #[cfg(not(unix))]
+        let identity_changed = false;
+        Ok(identity_changed)
     }
 
     fn open_append_file(path: &Path) -> Result<(File, bool), MmapStoreError> {
