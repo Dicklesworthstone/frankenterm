@@ -16654,8 +16654,7 @@ mod writer_io_scheduler_tests {
         // admission starts. That stale observation cannot authorize a write.
         for backend in [&first, &second] {
             assert_eq!(
-                query_active_approvals_count_backend(backend.as_ref(), "shared", now_ms())
-                    .unwrap(),
+                query_active_approvals_count_backend(backend.as_ref(), "shared", now_ms()).unwrap(),
                 0
             );
         }

@@ -2249,15 +2249,6 @@ pub fn append_captured_segment_to_mmap_scrollback(
     )
 }
 
-/// Apply secret-pattern redaction to segment content before persistence.
-///
-/// ft-gd4za: production scrollback persistence (SQLite output_segments +
-/// mmap mirror) was bypassing redaction entirely. Applying the redactor
-/// here is the single chokepoint that covers both downstream sinks.
-fn redact_segment_for_persist(content: &str) -> String {
-    crate::redactor::Redactor::new().redact(content)
-}
-
 fn ingest_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
@@ -2271,12 +2262,13 @@ fn ingest_cancelled_error(operation: &'static str, err: impl std::fmt::Display) 
 ///
 /// # Redaction (ft-gd4za)
 ///
-/// Segment content is passed through [`crate::redactor::Redactor`] before
-/// the storage write so that the SQLite `output_segments.content` column
-/// and the per-pane mmap log file never contain unredacted credentials,
-/// API keys, or other matched secret patterns. The bytes returned to
-/// callers in [`PersistedCapture::segment.content`] are likewise the
-/// redacted form, since `append_segment` returns the content it stored.
+/// The storage writer applies its configured, stateful redactor before writing
+/// SQLite, the mmap mirror, or recorder deliveries. Pass the original bounded
+/// capture into that boundary: redacting each chunk here first would erase the
+/// raw lookback needed to mask a credential continued by the next capture and
+/// would replace the operator's configured marker with the default marker.
+/// [`PersistedCapture::segment.content`] contains the redacted bytes returned
+/// by storage, never the raw capture.
 ///
 /// # Gap Recording
 ///
@@ -2486,7 +2478,9 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
         CapturedSegmentKind::Delta => None,
     };
 
-    let redacted_content = redact_segment_for_persist(&bounded_segment.content);
+    // Storage must see the original bytes to preserve cross-capture secret
+    // context. Its writer redacts before every durable sink and returns only
+    // the persisted, redacted content.
     let stored_zone_type = match &bounded_segment.kind {
         CapturedSegmentKind::Delta => zone_type,
         CapturedSegmentKind::Gap { .. } => None,
@@ -2495,7 +2489,7 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
         cx,
         storage,
         bounded_segment.pane_id,
-        &redacted_content,
+        &bounded_segment.content,
         stored_zone_type,
         recorder_delivery,
         guard,
@@ -5820,6 +5814,134 @@ mod tests {
                 "SQLite output_segments.content missing [REDACTED] marker: {:?}",
                 segments[0].content
             );
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn persist_captured_segment_masks_continued_secret_after_detectable_prefix() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            let prefix = "prefix sk-abcdefghijklmnopqrstuvwxyz";
+            let continuation = "ABCDEFGHIJKLMN suffix\n";
+
+            // Exercise both polling snapshots and native streaming deltas.
+            // The first chunk already matches the built-in key regex. Batch
+            // redaction before storage would erase its raw prefix and leave
+            // the second chunk's credential suffix unrecognizable.
+            for (pane_id, snapshots) in [(1, true), (2, false)] {
+                handle.upsert_pane(test_pane_record(pane_id)).await.unwrap();
+                let mut cursor = PaneCursor::new(pane_id);
+                let first = if snapshots {
+                    cursor.capture_snapshot(prefix, 4096, None).unwrap()
+                } else {
+                    cursor.capture_delta(prefix.to_string(), 1)
+                };
+                let first =
+                    persist_captured_segment(&handle, &first, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                        .await
+                        .unwrap();
+                assert_eq!(first.segment.content, "prefix [REDACTED]");
+
+                let second = if snapshots {
+                    cursor
+                        .capture_snapshot(&format!("{prefix}{continuation}"), 4096, None)
+                        .unwrap()
+                } else {
+                    cursor.capture_delta(continuation.to_string(), 2)
+                };
+                let second =
+                    persist_captured_segment(&handle, &second, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                        .await
+                        .unwrap();
+                assert!(second.gap.is_none());
+                assert_eq!(second.segment.content, "[REDACTED] suffix\n");
+
+                let mut stored = handle.get_segments(pane_id, 10).await.unwrap();
+                stored.sort_by_key(|segment| segment.seq);
+                assert_eq!(stored.len(), 2);
+                assert_eq!(stored[0].content, first.segment.content);
+                assert_eq!(stored[1].content, second.segment.content);
+                assert!(!stored.iter().any(|segment| {
+                    segment.content.contains("abcdefghijklmnopqrstuvwxyz")
+                        || segment.content.contains("ABCDEFGHIJKLMN")
+                }));
+            }
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn persist_captured_segment_honors_configured_redaction_for_builtin_and_custom_secrets() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let mut config = crate::config::Config::default();
+            config.safety.redaction.patterns = vec![r"ACME_[A-Z]{12}".to_string()];
+            config.safety.redaction.placeholder = "$0".to_string();
+            let handle =
+                StorageHandle::with_config(&db_path, crate::storage::StorageConfig::from(&config))
+                    .await
+                    .unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let mut cursor = PaneCursor::new(1);
+            let captured = cursor.capture_delta(
+                "before ACME_ABCDEFGHIJKL sk-abcdefghijklmnopqrstuvwxyz012345 after\n".to_string(),
+                1,
+            );
+            let persisted =
+                persist_captured_segment(&handle, &captured, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                    .await
+                    .unwrap();
+            assert_eq!(persisted.segment.content, "before $0 $0 after\n");
+            let stored = handle.get_segments(1, 10).await.unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].content, persisted.segment.content);
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn persist_captured_segment_secret_context_is_pane_local_and_stops_at_gaps() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            for pane_id in [1, 2] {
+                handle.upsert_pane(test_pane_record(pane_id)).await.unwrap();
+            }
+
+            let mut cursor = PaneCursor::new(1);
+            let head = cursor.capture_delta("sk-abcdefghijklmnopqrstuvwxyz".to_string(), 1);
+            persist_captured_segment(&handle, &head, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                .await
+                .unwrap();
+
+            let suffix = "ABCDEFGHIJKLMN suffix\n";
+            let mut other_cursor = PaneCursor::new(2);
+            let other = other_cursor.capture_delta(suffix.to_string(), 2);
+            let other = persist_captured_segment(&handle, &other, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(other.segment.content, suffix);
+
+            let gap = cursor.emit_gap("transport_gap");
+            let gap = persist_captured_segment(&handle, &gap, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                .await
+                .unwrap();
+            assert!(gap.gap.is_some());
+            let after_gap = cursor.capture_delta(suffix.to_string(), 3);
+            let after_gap =
+                persist_captured_segment(&handle, &after_gap, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                    .await
+                    .unwrap();
+            assert_eq!(after_gap.segment.content, suffix);
 
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);

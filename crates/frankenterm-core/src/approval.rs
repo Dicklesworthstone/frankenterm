@@ -2434,8 +2434,12 @@ mod tests {
         run_async_test(async {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("approval-capacity.db");
-            let first = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
-            let second = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let first = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let second = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let config = ApprovalConfig {
                 max_active_tokens: 1,
                 ..ApprovalConfig::default()
