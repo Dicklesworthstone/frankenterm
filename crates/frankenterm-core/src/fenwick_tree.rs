@@ -371,9 +371,8 @@ impl Default for FenwickTree {
 /// For a number like 12 (0b1100), this returns 4 (0b0100).
 #[inline]
 fn lowest_set_bit(x: usize) -> usize {
-    // Two's complement trick: x & (-x)
-    // In Rust with usize, we use wrapping_neg.
-    x & x.wrapping_neg()
+    // The two's complement trick x & x.wrapping_neg(); 0 stays 0.
+    x.isolate_lowest_one()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

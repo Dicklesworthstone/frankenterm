@@ -140,7 +140,9 @@ default-members = [
 [workspace.package]
 version = "0.15.21"
 edition = "2024"
-rust-version = "1.95"
+# The highest rust-version in the locked graph: the pinned fastmcp crates,
+# which the default `ft` build reaches through its mcp feature.
+rust-version = "1.100"
 authors = ["Dicklesworthstone"]
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankenterm"
