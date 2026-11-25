@@ -140,7 +140,13 @@ fn new_harness() -> TestHarness {
     let original_cwd = std::env::current_dir().expect("capture current cwd");
     std::env::set_current_dir(&workspace).expect("enter temp workspace");
     let cwd_guard = CwdGuard { original_cwd };
-    let client = spawn_client(Some(workspace.join("mcp.sqlite3")));
+    // Serve the workspace database, as `ft mcp` does. Mission mutations take
+    // their kill-switch fence from that database, which must exist.
+    let db_path = Config::default()
+        .workspace_layout(None)
+        .expect("workspace layout")
+        .db_path;
+    let client = spawn_client(Some(db_path));
     TestHarness {
         workspace,
         client,
