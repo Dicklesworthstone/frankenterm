@@ -822,7 +822,10 @@ mod tests {
             serde_json::to_value(&mission.candidates[0].action).unwrap()
         );
         assert_eq!(
-            contract.referenced_pane_ids().into_iter().collect::<Vec<_>>(),
+            contract
+                .referenced_pane_ids()
+                .into_iter()
+                .collect::<Vec<_>>(),
             [42]
         );
         assert!(contract.plan.compensations.is_empty());
@@ -915,13 +918,11 @@ mod tests {
         mission.assignments.push(second);
         let first = compile_selected(&mission).unwrap();
         let selected =
-            compile_assignment_dispatch(&mission, &mission.assignments[1].assignment_id)
-                .unwrap();
+            compile_assignment_dispatch(&mission, &mission.assignments[1].assignment_id).unwrap();
         assert_ne!(first.intent.tx_id, selected.intent.tx_id);
         assert_eq!(selected.intent.created_at_ms, 1_003);
         assert_eq!(
-            compile_assignment_dispatch(&mission, &AssignmentId("absent".to_string()))
-                .unwrap_err(),
+            compile_assignment_dispatch(&mission, &AssignmentId("absent".to_string())).unwrap_err(),
             AssignmentDispatchError::AssignmentNotFound
         );
     }
