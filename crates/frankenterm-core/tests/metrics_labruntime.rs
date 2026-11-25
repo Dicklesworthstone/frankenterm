@@ -14,13 +14,11 @@ mod common;
 use common::fixtures::RuntimeFixture;
 
 use frankenterm_core::metrics::{FixedMetricsCollector, MetricsServer, MetricsSnapshot};
+use frankenterm_core::runtime_async::ShutdownSignal;
 use frankenterm_core::runtime_async::io::{AsyncReadExt, AsyncWriteExt};
 use frankenterm_core::runtime_async::net::TcpStream;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 // ===========================================================================
 // render_prometheus_includes_prefix
@@ -93,7 +91,7 @@ fn metrics_server_serves_metrics() {
             cost_attribution_estimates: Vec::new(),
         };
 
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::new(ShutdownSignal::new());
         let collector = Arc::new(FixedMetricsCollector::new(snapshot));
         let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
         let handle = server.start().await.expect("metrics server start");
@@ -112,7 +110,7 @@ fn metrics_server_serves_metrics() {
         assert!(response.contains("200 OK"));
         assert!(response.contains("wa_segments_persisted_total"));
 
-        shutdown_flag.store(true, Ordering::SeqCst);
+        shutdown_flag.request();
         handle.wait().await;
     });
 }
@@ -125,7 +123,7 @@ fn metrics_server_serves_metrics() {
 fn metrics_server_refuses_public_bind_without_opt_in() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::new(ShutdownSignal::new());
         let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
         let server = MetricsServer::new("0.0.0.0:0", "wa", collector, shutdown_flag);
 
@@ -149,7 +147,7 @@ fn metrics_server_refuses_public_bind_without_opt_in() {
 fn metrics_server_allows_public_bind_with_opt_in() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::new(ShutdownSignal::new());
         let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
         let server = MetricsServer::new("0.0.0.0:0", "wa", collector, Arc::clone(&shutdown_flag))
             .with_dangerous_public_bind();
@@ -158,7 +156,7 @@ fn metrics_server_allows_public_bind_with_opt_in() {
             .start()
             .await
             .expect("public bind allowed with opt-in");
-        shutdown_flag.store(true, Ordering::SeqCst);
+        shutdown_flag.request();
         handle.wait().await;
     });
 }

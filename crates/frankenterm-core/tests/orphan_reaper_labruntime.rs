@@ -18,10 +18,9 @@ use common::fixtures::RuntimeFixture;
 
 use frankenterm_core::config::CliConfig;
 use frankenterm_core::orphan_reaper::{ReapReport, reap_orphans, run_orphan_reaper};
-use frankenterm_core::runtime_async;
+use frankenterm_core::runtime_async::{self, ShutdownSignal};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +65,7 @@ fn run_orphan_reaper_disabled_returns_immediately() {
             orphan_reap_interval_seconds: 0, // disabled
             ..CliConfig::default()
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
 
         // Should return immediately when interval is 0
         let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown));
@@ -87,7 +86,7 @@ fn run_orphan_reaper_nonzero_setting_returns_without_waiting() {
             orphan_reap_interval_seconds: 1, // 1 second interval
             ..CliConfig::default()
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let shutdown_clone = Arc::clone(&shutdown);
 
         let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown_clone));
@@ -96,6 +95,6 @@ fn run_orphan_reaper_nonzero_setting_returns_without_waiting() {
             result.is_ok(),
             "inert cleanup surface should return immediately"
         );
-        assert!(!shutdown.load(Ordering::Relaxed));
+        assert!(!shutdown.is_requested());
     });
 }

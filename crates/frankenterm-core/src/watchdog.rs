@@ -21,8 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::runtime_async::{
-    RuntimeTime,
-    notify::Notify,
+    RuntimeTime, ShutdownSignal,
     task::{self, JoinErrorKind, JoinHandle, JoinSet, JoinSetSettlement},
 };
 use serde::{Deserialize, Serialize};
@@ -343,8 +342,7 @@ impl HealthReport {
 #[must_use = "watchdog tasks must be signalled and joined to prove terminal settlement"]
 pub struct WatchdogHandle {
     tasks: JoinSet<()>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    shutdown_notify: Arc<Notify>,
+    shutdown: Arc<ShutdownSignal>,
     #[cfg(test)]
     wait_entered: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -371,35 +369,17 @@ pub enum WatchdogJoinError {
 }
 
 impl WatchdogHandle {
-    /// Adopt a task governed by the supplied shared shutdown flag.
+    /// Adopt a task governed by the supplied shared shutdown signal.
     ///
     /// This is used by top-level monitoring loops that already observe an
-    /// application-owned flag but still need the watchdog handle's bounded,
+    /// application-owned signal but still need the watchdog handle's bounded,
     /// trusted terminal-drain contract.
-    pub fn adopt_shutdown_task(
-        task: JoinHandle<()>,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self::adopt_shutdown_task_with_notify(task, shutdown, Arc::new(Notify::new()))
-    }
-
-    /// Adopt a task whose cooperative shutdown wait uses the supplied notify.
-    ///
-    /// The task and this handle must share both `shutdown` and
-    /// `shutdown_notify`. [`Self::signal_shutdown`] then changes the durable
-    /// predicate before waking the task, avoiding both lost wakes and a polling
-    /// delay during bounded graceful settlement.
-    pub fn adopt_shutdown_task_with_notify(
-        task: JoinHandle<()>,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-        shutdown_notify: Arc<Notify>,
-    ) -> Self {
+    pub fn adopt_shutdown_task(task: JoinHandle<()>, shutdown: Arc<ShutdownSignal>) -> Self {
         let mut tasks = JoinSet::new();
         tasks.insert_handle(task);
         Self {
             tasks,
             shutdown,
-            shutdown_notify,
             #[cfg(test)]
             wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -407,8 +387,7 @@ impl WatchdogHandle {
 
     /// Signal the watchdog to stop.
     pub fn signal_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown.request();
     }
 
     #[cfg(test)]
@@ -523,8 +502,7 @@ impl WatchdogHandle {
 
 impl Drop for WatchdogHandle {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown.request();
         self.tasks.abort_all();
         if let JoinSetSettlement::Incomplete {
             active_tasks,
@@ -557,12 +535,10 @@ pub fn spawn_watchdog(
     cx: &crate::cx::Cx,
     heartbeats: Arc<HeartbeatRegistry>,
     config: WatchdogConfig,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) -> WatchdogHandle {
-    let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let internal_shutdown = Arc::new(ShutdownSignal::new());
     let internal_flag = Arc::clone(&internal_shutdown);
-    let internal_shutdown_notify = Arc::new(Notify::new());
-    let internal_notify = Arc::clone(&internal_shutdown_notify);
     #[cfg(test)]
     let wait_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(test)]
@@ -572,7 +548,7 @@ pub fn spawn_watchdog(
     let task = {
         task::spawn_with_cx(cx, move |watchdog_cx| async move {
             loop {
-                if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() || internal_flag.is_requested() {
                     info!("Watchdog: shutdown signal received");
                     break;
                 }
@@ -621,9 +597,12 @@ pub fn spawn_watchdog(
 
                 #[cfg(test)]
                 task_wait_entered.store(true, Ordering::SeqCst);
-                let shutdown_wait = std::pin::pin!(
-                    internal_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) })
-                );
+                let shutdown_wait = std::pin::pin!(async {
+                    crate::runtime_async::select! {
+                        _ = internal_flag.wait(&watchdog_cx) => {},
+                        _ = shutdown_flag.wait(&watchdog_cx) => {},
+                    }
+                });
                 let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                     &watchdog_cx,
                     check_interval,
@@ -648,7 +627,6 @@ pub fn spawn_watchdog(
     WatchdogHandle {
         tasks,
         shutdown: internal_shutdown,
-        shutdown_notify: internal_shutdown_notify,
         #[cfg(test)]
         wait_entered,
     }
@@ -1006,14 +984,12 @@ pub fn spawn_mux_watchdog(
     cx: &crate::cx::Cx,
     config: MuxWatchdogConfig,
     wezterm: crate::wezterm::WeztermHandle,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) -> WatchdogHandle {
     let check_interval = config.check_interval;
     let failure_threshold = config.failure_threshold;
-    let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let internal_shutdown = Arc::new(ShutdownSignal::new());
     let internal_flag = Arc::clone(&internal_shutdown);
-    let shutdown_notify = Arc::new(Notify::new());
-    let task_notify = Arc::clone(&shutdown_notify);
 
     let task = task::spawn_with_cx(cx, move |mux_watchdog_cx| async move {
         let mut watchdog = MuxWatchdog::new(config, wezterm);
@@ -1021,7 +997,7 @@ pub fn spawn_mux_watchdog(
         info!("Mux watchdog started");
 
         loop {
-            if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+            if shutdown_flag.is_requested() || internal_flag.is_requested() {
                 info!("Mux watchdog shutting down");
                 break;
             }
@@ -1091,8 +1067,12 @@ pub fn spawn_mux_watchdog(
             }
 
             use futures::future::{Either, select};
-            let shutdown_wait =
-                std::pin::pin!(task_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) }));
+            let shutdown_wait = std::pin::pin!(async {
+                crate::runtime_async::select! {
+                    _ = internal_flag.wait(&mux_watchdog_cx) => {},
+                    _ = shutdown_flag.wait(&mux_watchdog_cx) => {},
+                }
+            });
             let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                 &mux_watchdog_cx,
                 check_interval,
@@ -1116,7 +1096,6 @@ pub fn spawn_mux_watchdog(
     WatchdogHandle {
         tasks,
         shutdown: internal_shutdown,
-        shutdown_notify,
         #[cfg(test)]
         wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
@@ -1241,7 +1220,6 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
     /// Test-only convenience surfaces. Production callers must pass their
     /// governing `Cx` directly to the explicit APIs.
@@ -1604,7 +1582,7 @@ mod tests {
             heartbeats.record_persistence();
             heartbeats.record_maintenance();
 
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let config = WatchdogConfig {
                 check_interval: Duration::from_millis(10),
                 ..WatchdogConfig::default()
@@ -1617,7 +1595,7 @@ mod tests {
             // Let it run a few ticks.
             crate::runtime_async::sleep(Duration::from_millis(50)).await;
 
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             handle.join().await;
             // If we get here, shutdown worked.
         });
@@ -1636,7 +1614,7 @@ mod tests {
             heartbeats.record_persistence();
             heartbeats.record_maintenance();
 
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let config = WatchdogConfig {
                 check_interval: Duration::from_secs(60),
                 ..WatchdogConfig::default()
@@ -1685,7 +1663,7 @@ mod tests {
             heartbeats.record_persistence();
             heartbeats.record_maintenance();
 
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let config = WatchdogConfig {
                 check_interval: Duration::from_secs(60),
                 ..WatchdogConfig::default()
@@ -1727,7 +1705,7 @@ mod tests {
     #[test]
     fn watchdog_grace_timeout_falls_back_to_bounded_abort_settlement() {
         run_async_test(async {
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
             let handle = WatchdogHandle::adopt_shutdown_task(task, Arc::clone(&shutdown));
             let cx = crate::cx::for_testing();
@@ -1740,7 +1718,7 @@ mod tests {
                     "a task that ignores cooperative shutdown must settle after fallback abort",
                 );
 
-            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(shutdown.is_requested());
             assert!(
                 started.elapsed() < Duration::from_millis(500),
                 "test-sized graceful timeout must transition promptly to abort settlement"
@@ -1751,7 +1729,7 @@ mod tests {
     #[test]
     fn watchdog_join_trusted_drains_persistent_registration_failure() {
         run_async_test(async {
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
             let handle = WatchdogHandle::adopt_shutdown_task(task, shutdown);
             handle.force_registration_failure_for_test();
@@ -2157,7 +2135,7 @@ mod tests {
             heartbeats.record_persistence();
             heartbeats.record_maintenance();
 
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let config = WatchdogConfig {
                 check_interval: Duration::from_millis(10),
                 ..WatchdogConfig::default()

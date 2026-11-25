@@ -22,10 +22,9 @@ use frankenterm_core::native_events::{
 };
 use frankenterm_core::runtime_async::mpsc;
 use frankenterm_core::runtime_async::unix::{self as event_socket, AsyncWriteExt};
-use frankenterm_core::runtime_async::{self, CompatRuntime, RuntimeBuilder, task};
+use frankenterm_core::runtime_async::{self, CompatRuntime, RuntimeBuilder, ShutdownSignal, task};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
@@ -106,7 +105,7 @@ fn listener_decodes_wire_events_and_ignores_hello() {
             .await
             .expect("bind listener");
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let mut stream = event_socket::connect(&socket_path)
@@ -159,7 +158,7 @@ fn listener_decodes_wire_events_and_ignores_hello() {
         }
 
         drop(stream);
-        shutdown.store(true, Ordering::SeqCst);
+        shutdown.request();
         assert_listener_shutdown(handle).await;
     });
 }
@@ -173,7 +172,7 @@ fn listener_reports_truncated_output_as_recoverable_gap() {
             .await
             .expect("bind listener");
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let raw = vec![b'a'; MAX_OUTPUT_BYTES + 1234];
@@ -199,7 +198,7 @@ fn listener_reports_truncated_output_as_recoverable_gap() {
             other => fail(format!("unexpected truncated event: {other:?}")),
         }
 
-        shutdown.store(true, Ordering::SeqCst);
+        shutdown.request();
         assert_listener_shutdown(handle).await;
     });
 }
@@ -213,7 +212,7 @@ fn listener_skips_invalid_and_oversized_lines_then_recovers() {
             .await
             .expect("bind listener");
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         let mut stream = event_socket::connect(&socket_path)
@@ -245,7 +244,7 @@ fn listener_skips_invalid_and_oversized_lines_then_recovers() {
         ));
 
         drop(stream);
-        shutdown.store(true, Ordering::SeqCst);
+        shutdown.request();
         assert_listener_shutdown(handle).await;
     });
 }
@@ -259,7 +258,7 @@ fn listener_accepts_reconnect_and_rapid_events() {
             .await
             .expect("bind listener");
         let (event_tx, mut event_rx) = mpsc::channel(512);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
         write_line(
@@ -306,7 +305,7 @@ fn listener_accepts_reconnect_and_rapid_events() {
         assert_eq!(received, event_count);
 
         drop(stream);
-        shutdown.store(true, Ordering::SeqCst);
+        shutdown.request();
         assert_listener_shutdown(handle).await;
     });
 }

@@ -81,6 +81,7 @@ use frankenterm_core::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
     RehearsalVerdict,
 };
+use frankenterm_core::runtime_async::ShutdownSignal;
 #[cfg(feature = "distributed")]
 use frankenterm_core::runtime_async::{io as runtime_io, net as runtime_net};
 use frankenterm_core::runtime_telemetry::{
@@ -45838,7 +45839,7 @@ async fn distributed_handle_connection<S>(
     ingest_state: Arc<DistributedIngestState>,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) where
     S: runtime_io::AsyncRead + runtime_io::AsyncWrite + Unpin,
 {
@@ -45980,9 +45981,7 @@ async fn distributed_handle_connection<S>(
     let mut pinned_connection_sender = normalized_handshake_agent.clone();
 
     loop {
-        use std::sync::atomic::Ordering;
-
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
 
@@ -46181,10 +46180,9 @@ async fn spawn_distributed_listener(
     wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) -> anyhow::Result<frankenterm_core::runtime_async::task::JoinHandle<()>> {
     use runtime_net::TcpListener;
-    use std::sync::atomic::Ordering;
 
     let expected_token =
         match frankenterm_core::distributed::resolve_expected_token(&distributed_config) {
@@ -46223,7 +46221,7 @@ async fn spawn_distributed_listener(
                 }
             }
 
-            if shutdown_flag.load(Ordering::SeqCst) {
+            if shutdown_flag.is_requested() {
                 break;
             }
 
@@ -47358,11 +47356,10 @@ async fn distributed_agent_stream_session(
     session_id: &str,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     gap_cursors: &mut std::collections::HashMap<u64, i64>,
-    shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: &Arc<ShutdownSignal>,
     wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<()> {
     use runtime_io::AsyncWriteExt;
-    use std::sync::atomic::Ordering;
 
     let mut stream = runtime_io::BufReader::new(io);
     let handshake = DistributedHandshake {
@@ -47479,7 +47476,7 @@ async fn distributed_agent_stream_session(
     let mut lag_repair_count = 0_u64;
 
     loop {
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             tracing::info!(
                 agent_id = %agent_id,
                 session_id = %session_id,
@@ -47621,32 +47618,17 @@ fn distributed_agent_mark_session_established(
 
 #[cfg(feature = "distributed")]
 async fn distributed_agent_sleep_with_shutdown(
-    shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: &Arc<ShutdownSignal>,
     duration: Duration,
 ) -> bool {
-    use std::sync::atomic::Ordering;
-
-    // ft-xbnl0.2.3 tick 282: cx-first distributed agent shutdown-sleep.
     let sleep_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let started = Instant::now();
-    while started.elapsed() < duration {
-        if shutdown_flag.load(Ordering::SeqCst) {
-            return true;
-        }
-        let remaining = duration.saturating_sub(started.elapsed());
-        if frankenterm_core::runtime_async::sleep_with_cx(
-            &sleep_cx,
-            remaining.min(Duration::from_millis(250)),
-        )
-        .await
-        .is_err()
-        {
-            // Cx cancelled during backoff — treat as shutdown signal.
-            return true;
+    frankenterm_core::runtime_async::select! {
+        _ = shutdown_flag.wait(&sleep_cx) => true,
+        result = frankenterm_core::runtime_async::sleep_with_cx(&sleep_cx, duration) => {
+            result.is_err() || shutdown_flag.is_requested()
         }
     }
-    shutdown_flag.load(Ordering::SeqCst)
 }
 
 #[cfg(feature = "distributed")]
@@ -47666,13 +47648,11 @@ async fn distributed_agent_stream_forever(
     wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
     agent_id: String,
     session_id: String,
     token: Option<String>,
 ) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-
     let mut streamer = frankenterm_core::wire_protocol::AgentStreamer::new(agent_id.clone());
     let mut segment_cursors: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
     let mut gap_cursors: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
@@ -47680,7 +47660,7 @@ async fn distributed_agent_stream_forever(
     distributed_agent_seed_gap_cursors(&storage, &mut gap_cursors).await?;
 
     loop {
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
 
@@ -47723,7 +47703,7 @@ async fn distributed_agent_stream_forever(
                 )
                 .await
                 {
-                    if shutdown_flag.load(Ordering::SeqCst) {
+                    if shutdown_flag.is_requested() {
                         break;
                     }
                     tracing::warn!(
@@ -47739,7 +47719,7 @@ async fn distributed_agent_stream_forever(
                 }
             }
             Err(err) => {
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     break;
                 }
                 tracing::warn!(
@@ -47755,7 +47735,7 @@ async fn distributed_agent_stream_forever(
             }
         }
 
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
         let backoff_ms = distributed_agent_next_reconnect_backoff_ms(&mut streamer);
@@ -48991,7 +48971,7 @@ async fn run_watcher(
             Some(
                 frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
                     handle,
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    Arc::new(ShutdownSignal::new()),
                 ),
             )
         }
@@ -49148,30 +49128,22 @@ async fn run_watcher(
         let workflow_subscriber = workflow_runner
             .subscribe_with_cx(&frankenterm_core::cx::for_request(), &event_bus)
             .await?;
-        let workflow_shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workflow_shutdown_flag = Arc::new(ShutdownSignal::new());
         let task_shutdown_flag = Arc::clone(&workflow_shutdown_flag);
-        let workflow_shutdown_notify =
-            Arc::new(frankenterm_core::runtime_async::notify::Notify::new());
-        let task_shutdown_notify = Arc::clone(&workflow_shutdown_notify);
         let runner_handle = frankenterm_core::runtime_async::task::spawn(async move {
             tracing::info!("Workflow runner started, listening for detection events");
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
             workflow_runner
-                .run_subscribed_with_cx(
-                    &cx,
-                    workflow_subscriber,
-                    Some((&task_shutdown_flag, &task_shutdown_notify)),
-                )
+                .run_subscribed_with_cx(&cx, workflow_subscriber, Some(&task_shutdown_flag))
                 .await;
             tracing::info!("Workflow runner stopped");
         });
 
         Some(
-            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task_with_notify(
+            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
                 runner_handle,
                 workflow_shutdown_flag,
-                workflow_shutdown_notify,
             ),
         )
     } else {
@@ -49450,7 +49422,7 @@ async fn run_watcher(
                         shutdown_tx,
                         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
                             ipc_task,
-                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            Arc::new(ShutdownSignal::new()),
                         ),
                     ))
                 }
@@ -49949,10 +49921,8 @@ async fn run_usage_alert_monitor(
     config: frankenterm_core::alerts::WatcherAlertConfig,
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) {
-    use std::sync::atomic::Ordering;
-
     let interval = Duration::from_secs(config.check_interval_secs);
     let monitor = match frankenterm_core::alerts::WatcherAlertMonitor::new(config) {
         Ok(monitor) => monitor,
@@ -49961,7 +49931,7 @@ async fn run_usage_alert_monitor(
             return;
         }
     };
-    while !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok() {
+    while !shutdown_flag.is_requested() && cx.checkpoint().is_ok() {
         frankenterm_core::runtime_async::select! {
             result = monitor.evaluate_with_cx(cx, &storage, &event_bus) => {
                 match result {
@@ -50100,10 +50070,8 @@ async fn run_verified_submit_drift_monitor(
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     idempotency_store_dir: Option<std::path::PathBuf>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) {
-    use std::sync::atomic::Ordering;
-
     use frankenterm_core::events::Event;
     use frankenterm_core::storage::{AuditQuery, StoredEvent};
 
@@ -50118,7 +50086,7 @@ async fn run_verified_submit_drift_monitor(
             () = frankenterm_core::runtime_async::sleep(VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL) => {}
             () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
         }
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
         let now = i64::try_from(
@@ -50204,9 +50172,8 @@ async fn run_verified_submit_drift_monitor(
 async fn run_saved_search_scheduler(
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 ) {
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use frankenterm_core::events::Event;
@@ -50276,7 +50243,7 @@ async fn run_saved_search_scheduler(
     let mut last_alert_at_by_id: HashMap<String, i64> = HashMap::new();
 
     loop {
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
 
@@ -50317,7 +50284,7 @@ async fn run_saved_search_scheduler(
         let mut next_wake_at = now.saturating_add(DEFAULT_IDLE_SLEEP_MS);
 
         for search in searches {
-            if shutdown_flag.load(Ordering::SeqCst) {
+            if shutdown_flag.is_requested() {
                 break;
             }
             if !search.enabled {
@@ -50575,10 +50542,9 @@ async fn run_scheduled_backups(
     workspace_root: PathBuf,
     db_path: PathBuf,
     storage: Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
     notify_config: frankenterm_core::desktop_notify::DesktopNotifyConfig,
 ) {
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     let schedule = match frankenterm_core::backup::BackupSchedule::parse(&config.schedule) {
@@ -50599,7 +50565,7 @@ async fn run_scheduled_backups(
     let notifier = frankenterm_core::desktop_notify::DesktopNotifier::new(notify_config);
 
     loop {
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
 
@@ -50632,7 +50598,7 @@ async fn run_scheduled_backups(
             () = wait_for_shutdown(shutdown_flag.clone()) => break,
         }
 
-        if shutdown_flag.load(Ordering::SeqCst) {
+        if shutdown_flag.is_requested() {
             break;
         }
 
@@ -50642,7 +50608,7 @@ async fn run_scheduled_backups(
 
         while attempt < 3 {
             attempt += 1;
-            if shutdown_flag.load(Ordering::SeqCst) {
+            if shutdown_flag.is_requested() {
                 break;
             }
 
@@ -50796,22 +50762,11 @@ async fn run_single_scheduled_backup(
     Ok(export_result)
 }
 
-async fn wait_for_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    // ft-xbnl0.2.3 tick 289: cx-first shutdown-signal wait loop.
+async fn wait_for_shutdown(flag: Arc<ShutdownSignal>) {
     let wait_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    while !flag.load(Ordering::SeqCst) {
-        if frankenterm_core::runtime_async::sleep_with_cx(&wait_cx, Duration::from_millis(250))
-            .await
-            .is_err()
-        {
-            // Cx cancelled — treat as shutdown-equivalent and return.
-            return;
-        }
-    }
+    // Capability cancellation is shutdown-equivalent for these background tasks.
+    let _ = flag.wait(&wait_cx).await;
 }
 
 fn format_local_datetime(value: chrono::DateTime<chrono::Local>) -> String {
@@ -117602,13 +117557,12 @@ recorder_backend = "rusqlite"
         use runtime_io::AsyncWriteExt;
         use runtime_net::TcpStream;
         use frankenterm_core::wire_protocol::{PaneDelta, PaneMeta, WireEnvelope, WirePayload};
-        use std::sync::atomic::Ordering;
 
         let (storage_handle, db_path) = setup_storage("distributed_listener_stream_path").await;
         let storage =
             std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
         let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-        let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
         let bind_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
         let bind_addr = bind_probe.local_addr().expect("probe listener addr");
@@ -117781,7 +117735,7 @@ recorder_backend = "rusqlite"
             "remote panes persisted through listener should be visible in status/query merge path"
         );
 
-        shutdown_flag.store(true, Ordering::SeqCst);
+        shutdown_flag.request();
         let _ = listener_handle.await;
 
         {
@@ -117806,7 +117760,6 @@ recorder_backend = "rusqlite"
                 use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_sender_case_normalized").await;
@@ -117814,7 +117767,7 @@ recorder_backend = "rusqlite"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -117972,7 +117925,7 @@ recorder_backend = "rusqlite"
                     );
                 }
 
-                shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = listener_handle.await;
 
                 {
@@ -118010,7 +117963,7 @@ recorder_backend = "rusqlite"
                     distributed_token_config(bind_addr, "dist-case-session-token");
                 let expected_token = distributed_config.token.clone();
                 let allow_agent_ids = std::sync::Arc::new(std::collections::HashSet::new());
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let canonical_sender = "agent-case";
                 let first_peer_addr = "127.0.0.1:49152".parse().expect("valid test peer addr");
@@ -118353,7 +118306,7 @@ recorder_backend = "rusqlite"
                 let distributed_config = distributed_token_config(bind_addr, "dist-pin-token");
                 let expected_token = distributed_config.token.clone();
                 let allow_agent_ids = std::sync::Arc::new(std::collections::HashSet::new());
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let first_sender = "victim-a";
                 let spoofed_sender = "victim-b";
@@ -118480,7 +118433,6 @@ recorder_backend = "rusqlite"
             .block_on(async {
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_invalid_token_rejected").await;
@@ -118488,7 +118440,7 @@ recorder_backend = "rusqlite"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -118572,7 +118524,7 @@ recorder_backend = "rusqlite"
                     "invalid-token session must not persist remote pane metadata"
                 );
 
-                shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = listener_handle.await;
 
                 {
@@ -118597,7 +118549,6 @@ recorder_backend = "rusqlite"
                 use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_invalid_wire_recovery").await;
@@ -118605,7 +118556,7 @@ recorder_backend = "rusqlite"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -118777,7 +118728,7 @@ recorder_backend = "rusqlite"
                     );
                 }
 
-                shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = listener_handle.await;
 
                 {
@@ -118801,7 +118752,6 @@ recorder_backend = "rusqlite"
             .block_on(async {
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_missing_version_rejected").await;
@@ -118809,7 +118759,7 @@ recorder_backend = "rusqlite"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -118893,7 +118843,7 @@ recorder_backend = "rusqlite"
                     "missing-version session must not persist remote pane metadata"
                 );
 
-                shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = listener_handle.await;
 
                 {
@@ -118917,7 +118867,6 @@ recorder_backend = "rusqlite"
             .block_on(async {
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_version_mismatch_rejected").await;
@@ -118925,7 +118874,7 @@ recorder_backend = "rusqlite"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -119011,7 +118960,7 @@ recorder_backend = "rusqlite"
                     "version-mismatched session must not persist remote pane metadata"
                 );
 
-                shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = listener_handle.await;
 
                 {
@@ -139538,7 +139487,7 @@ printf x > "$MINISIGN_MARKER"
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(16));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = std::sync::Arc::new(ShutdownSignal::new());
                 let mut streamer =
                     frankenterm_core::wire_protocol::AgentStreamer::new("agent-handshake-reject");
                 let mut segment_cursors = std::collections::HashMap::new();
@@ -146153,7 +146102,7 @@ A  docs/new-proof.md\n";
 
                 let (storage, db_path) = setup_storage("saved_search_scheduler_alert").await;
                 let bus = Arc::new(frankenterm_core::events::EventBus::new(256));
-                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = Arc::new(ShutdownSignal::new());
 
                 // Register pane 1 so the foreign key constraint is satisfied.
                 let now = now_ms();
@@ -146266,7 +146215,7 @@ A  docs/new-proof.md\n";
                     "expected cooldown to suppress second alert"
                 );
 
-                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = scheduler_handle.await;
                 cleanup_storage(storage, &db_path).await;
             });
@@ -146285,7 +146234,7 @@ A  docs/new-proof.md\n";
 
                 let (storage, db_path) = setup_storage("saved_search_scheduler_invalid").await;
                 let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
-                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = Arc::new(ShutdownSignal::new());
 
                 let mut record = SavedSearchRecord::new(
                     "invalid".to_string(),
@@ -146327,7 +146276,7 @@ A  docs/new-proof.md\n";
                 assert_eq!(second.last_run_at, Some(first_run_at));
                 assert!(second.last_error.is_some());
 
-                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = scheduler_handle.await;
                 cleanup_storage(storage, &db_path).await;
             });
@@ -146346,7 +146295,7 @@ A  docs/new-proof.md\n";
 
                 let (storage, db_path) = setup_storage("saved_search_scheduler_interval").await;
                 let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
-                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag = Arc::new(ShutdownSignal::new());
 
                 let now = now_ms();
                 let mut record = SavedSearchRecord::new(
@@ -146377,7 +146326,7 @@ A  docs/new-proof.md\n";
                     .unwrap();
                 assert_eq!(fetched.last_run_at, Some(now));
 
-                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown_flag.request();
                 let _ = scheduler_handle.await;
                 cleanup_storage(storage, &db_path).await;
             });

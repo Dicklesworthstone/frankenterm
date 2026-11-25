@@ -88,7 +88,7 @@ use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
-use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
+use crate::runtime_async::{RuntimeTime, RwLock, ShutdownSignal, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, try_decode_sharded_pane_id};
@@ -1348,8 +1348,6 @@ async fn runtime_sleep(
     runtime_checkpoint_failure(runtime_cx).map_or(Ok(()), Err)
 }
 
-const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 fn runtime_time_elapsed_at_least(now: RuntimeTime, since: RuntimeTime, duration: Duration) -> bool {
     u128::from(now.duration_since(since)) >= duration.as_nanos()
 }
@@ -1363,29 +1361,23 @@ enum ShutdownAwareSleepOutcome {
 
 async fn runtime_sleep_until_shutdown(
     runtime_cx: &RuntimeLoopCx,
-    shutdown_flag: &AtomicBool,
+    shutdown_flag: &ShutdownSignal,
     duration: Duration,
 ) -> ShutdownAwareSleepOutcome {
-    let deadline = crate::runtime_async::timer_now_with_cx(runtime_cx) + duration;
-    loop {
-        if shutdown_flag.load(Ordering::SeqCst) {
-            return ShutdownAwareSleepOutcome::ShutdownRequested;
-        }
-
-        let now = crate::runtime_async::timer_now_with_cx(runtime_cx);
-        if now >= deadline {
-            return ShutdownAwareSleepOutcome::Elapsed;
-        }
-
-        let remaining = Duration::from_nanos(deadline.duration_since(now));
-        if let Err(failure) = runtime_sleep(
-            runtime_cx,
-            remaining.min(SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL),
-        )
-        .await
-        {
-            return ShutdownAwareSleepOutcome::WaitFailed(failure);
-        }
+    if shutdown_flag.is_requested() {
+        return ShutdownAwareSleepOutcome::ShutdownRequested;
+    }
+    crate::runtime_async::select! {
+        requested = shutdown_flag.wait(runtime_cx) => match requested {
+            Ok(()) => ShutdownAwareSleepOutcome::ShutdownRequested,
+            Err(error) => ShutdownAwareSleepOutcome::WaitFailed(
+                runtime_context_error_kind(runtime_cx, &error),
+            ),
+        },
+        elapsed = runtime_sleep(runtime_cx, duration) => match elapsed {
+            Ok(()) => ShutdownAwareSleepOutcome::Elapsed,
+            Err(failure) => ShutdownAwareSleepOutcome::WaitFailed(failure),
+        },
     }
 }
 
@@ -1812,6 +1804,13 @@ impl NativeEventShutdownDrainState {
     const fn producer_closed(self) -> bool {
         matches!(self, Self::ProducerClosed)
     }
+
+    const fn deadline(self) -> Option<RuntimeTime> {
+        match self {
+            Self::Graceful { deadline } | Self::Forced { deadline } => Some(deadline),
+            Self::Running | Self::ProducerClosed | Self::Abandoned => None,
+        }
+    }
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -2125,19 +2124,6 @@ async fn forward_vendored_streaming_delta(
 // - output is flushed once the window elapses (or sooner on state transitions)
 // - a max delay guard exists for safety when misconfigured
 
-// Output coalesce defaults — canonical values in TuningConfig::RuntimeTuning.
-// These consts exist for use in contexts without runtime access.
-// To override: set [tuning.runtime] in ft.toml.
-#[cfg(feature = "native-wezterm")]
-const NATIVE_OUTPUT_COALESCE_WINDOW_MS: u64 =
-    crate::tuning_config::RuntimeTuning::DEFAULT_OUTPUT_COALESCE_WINDOW_MS;
-#[cfg(feature = "native-wezterm")]
-const NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS: u64 =
-    crate::tuning_config::RuntimeTuning::DEFAULT_OUTPUT_COALESCE_MAX_DELAY_MS;
-#[cfg(feature = "native-wezterm")]
-const NATIVE_OUTPUT_COALESCE_MAX_BYTES: usize =
-    crate::tuning_config::RuntimeTuning::DEFAULT_OUTPUT_COALESCE_MAX_BYTES;
-
 #[cfg(feature = "native-wezterm")]
 #[derive(Debug)]
 struct PendingNativeOutput {
@@ -2165,6 +2151,7 @@ struct NativeOutputCoalescer {
     max_delay_ms: u64,
     max_bytes: usize,
     pending: HashMap<u64, PendingNativeOutput>,
+    next_deadline_ms: Option<u64>,
 }
 
 #[cfg(feature = "native-wezterm")]
@@ -2175,7 +2162,43 @@ impl NativeOutputCoalescer {
             max_delay_ms,
             max_bytes,
             pending: HashMap::new(),
+            next_deadline_ms: None,
         }
+    }
+
+    fn next_deadline_ms(&self) -> Option<u64> {
+        self.next_deadline_ms
+    }
+
+    fn next_deadline(&self, start: RuntimeTime) -> Option<RuntimeTime> {
+        self.next_deadline_ms()
+            .map(|deadline| start + Duration::from_millis(deadline))
+    }
+
+    fn drain_due_at(&mut self, start: RuntimeTime, now: RuntimeTime) -> Vec<CoalescedNativeOutput> {
+        let Some(deadline_ms) = self.next_deadline_ms else {
+            return Vec::new();
+        };
+        if self
+            .next_deadline(start)
+            .is_some_and(|deadline| now < deadline)
+        {
+            return Vec::new();
+        }
+        // RuntimeTime's absolute deadline can saturate before a relative
+        // millisecond deadline. At that boundary flush the oldest pending
+        // batch rather than repeatedly arming an already-elapsed timer.
+        let now_ms = (now.duration_since(start) / 1_000_000).max(deadline_ms);
+        self.drain_due(now_ms)
+    }
+
+    fn refresh_deadline(&mut self) {
+        let delay_ms = self.window_ms.min(self.max_delay_ms);
+        self.next_deadline_ms = self
+            .pending
+            .values()
+            .map(|pending| pending.first_seen_ms.saturating_add(delay_ms))
+            .min();
     }
 
     fn push(
@@ -2190,7 +2213,10 @@ impl NativeOutputCoalescer {
             return None;
         }
 
-        match self.pending.entry(pane_id) {
+        let delay_ms = self.window_ms.min(self.max_delay_ms);
+        let deadline_ms = now_ms.saturating_add(delay_ms);
+        let mut refresh_deadline = false;
+        let flushed = match self.pending.entry(pane_id) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(PendingNativeOutput {
                     first_seen_ms: now_ms,
@@ -2199,6 +2225,10 @@ impl NativeOutputCoalescer {
                     bytes,
                     producer_guard,
                 });
+                self.next_deadline_ms = Some(
+                    self.next_deadline_ms
+                        .map_or(deadline_ms, |current| current.min(deadline_ms)),
+                );
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -2209,6 +2239,8 @@ impl NativeOutputCoalescer {
                     || (!pending.bytes.is_empty()
                         && pending.bytes.len().saturating_add(bytes.len()) > self.max_bytes)
                 {
+                    refresh_deadline = self.next_deadline_ms
+                        == Some(pending.first_seen_ms.saturating_add(delay_ms));
                     let flushed = CoalescedNativeOutput {
                         pane_id,
                         bytes: std::mem::take(&mut pending.bytes),
@@ -2224,25 +2256,40 @@ impl NativeOutputCoalescer {
                     pending.last_timestamp_ms = timestamp_ms;
                     pending.input_events = 1;
                     pending.bytes = bytes;
-
-                    return Some(flushed);
+                    if !refresh_deadline {
+                        self.next_deadline_ms = Some(
+                            self.next_deadline_ms
+                                .map_or(deadline_ms, |current| current.min(deadline_ms)),
+                        );
+                    }
+                    Some(flushed)
+                } else {
+                    pending.input_events = pending.input_events.saturating_add(1);
+                    pending.last_timestamp_ms = timestamp_ms;
+                    pending.bytes.extend(bytes);
+                    None
                 }
-
-                pending.input_events = pending.input_events.saturating_add(1);
-                pending.last_timestamp_ms = timestamp_ms;
-                pending.bytes.extend(bytes);
-                None
             }
+        };
+        if refresh_deadline {
+            self.refresh_deadline();
         }
+        flushed
     }
 
     fn drain_due(&mut self, now_ms: u64) -> Vec<CoalescedNativeOutput> {
+        if self
+            .next_deadline_ms
+            .is_none_or(|deadline| deadline > now_ms)
+        {
+            return Vec::new();
+        }
         let mut due = Vec::new();
         let mut due_ids = Vec::new();
+        let delay_ms = self.window_ms.min(self.max_delay_ms);
 
         for (&pane_id, pending) in &self.pending {
-            let age_ms = now_ms.saturating_sub(pending.first_seen_ms);
-            if age_ms >= self.window_ms || age_ms >= self.max_delay_ms {
+            if now_ms >= pending.first_seen_ms.saturating_add(delay_ms) {
                 due_ids.push(pane_id);
             }
         }
@@ -2259,22 +2306,32 @@ impl NativeOutputCoalescer {
             }
         }
 
+        self.refresh_deadline();
         due
     }
 
     fn flush_pane(&mut self, pane_id: u64) -> Option<CoalescedNativeOutput> {
-        self.pending
-            .remove(&pane_id)
-            .map(|pending| CoalescedNativeOutput {
-                pane_id,
-                bytes: pending.bytes,
-                timestamp_ms: pending.last_timestamp_ms,
-                input_events: pending.input_events,
-                producer_guard: pending.producer_guard,
-            })
+        let pending = self.pending.remove(&pane_id)?;
+        if self.next_deadline_ms
+            == Some(
+                pending
+                    .first_seen_ms
+                    .saturating_add(self.window_ms.min(self.max_delay_ms)),
+            )
+        {
+            self.refresh_deadline();
+        }
+        Some(CoalescedNativeOutput {
+            pane_id,
+            bytes: pending.bytes,
+            timestamp_ms: pending.last_timestamp_ms,
+            input_events: pending.input_events,
+            producer_guard: pending.producer_guard,
+        })
     }
 
     fn drain_all(&mut self) -> Vec<CoalescedNativeOutput> {
+        self.next_deadline_ms = None;
         let mut out = Vec::with_capacity(self.pending.len());
         for (pane_id, pending) in self.pending.drain() {
             out.push(CoalescedNativeOutput {
@@ -2454,13 +2511,13 @@ fn effective_ingest_backpressure_threshold(configured: u32, capacity: usize) -> 
 struct IngestBackpressureGate {
     storage: StorageHandle,
     config_tx: Arc<watch::Sender<HotReloadableConfig>>,
-    shutdown_flag: Arc<AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
 }
 
 impl IngestBackpressureGate {
     fn is_paused(&self) -> bool {
         // Graceful drains bypass admission pressure; owners stop new work.
-        if self.shutdown_flag.load(Ordering::SeqCst) {
+        if self.shutdown_flag.is_requested() {
             return false;
         }
         let threshold = effective_ingest_backpressure_threshold(
@@ -2470,20 +2527,41 @@ impl IngestBackpressureGate {
         self.storage.write_queue_depth() >= threshold
     }
 
-    /// Stream receivers can pause without acquiring producer authority.
-    /// Bounded sleeps observe cancellation, shutdown, queue drain and reload;
+    /// Wait for admission pressure to clear, a policy update, or shutdown.
+    /// Subscribe before reading policy so a concurrent reload cannot be lost.
+    async fn wait_for_change(
+        &self,
+        cx: &RuntimeLoopCx,
+    ) -> std::result::Result<(), Box<crate::runtime_async::ContextError>> {
+        let mut config_rx = self.config_tx.subscribe();
+        let threshold = effective_ingest_backpressure_threshold(
+            config_rx.borrow().ingest_backpressure_threshold,
+            self.storage.write_queue_capacity(),
+        );
+        crate::runtime_async::select! {
+            result = self.shutdown_flag.wait(cx) => result,
+            result = self.storage.wait_for_write_queue_below_with_cx(cx, threshold) => result,
+            _ = config_rx.changed(cx) => cx.checkpoint().map_err(Box::new),
+        }
+    }
+
+    /// Stream receivers pause without acquiring producer authority. Writer
+    /// dequeue, config reload and shutdown wake them without periodic timers;
     /// no persistence consumer waits on this gate.
     #[cfg(any(test, all(feature = "vendored", unix)))]
     async fn wait_with_cx(&self, cx: &RuntimeLoopCx) -> bool {
         loop {
-            if cx.checkpoint().is_err() || self.shutdown_flag.load(Ordering::SeqCst) {
+            if cx.checkpoint().is_err() || self.shutdown_flag.is_requested() {
                 return false;
             }
             if !self.is_paused() {
                 return true;
             }
-            if let Err(failure) = runtime_sleep(cx, Duration::from_millis(25)).await {
-                record_runtime_wait_failure("ingest_storage_pressure_wait", failure);
+            if let Err(error) = self.wait_for_change(cx).await {
+                record_runtime_wait_failure(
+                    "ingest_storage_pressure_wait",
+                    runtime_context_error_kind(cx, &error),
+                );
                 return false;
             }
         }
@@ -5021,8 +5099,8 @@ pub struct ObservationRuntime {
     /// Best-effort per-pane output activity tracker for health snapshots.
     /// Lock-order rank 3 (acquire last).
     pane_activity_tracker: Arc<RwLock<HashMap<u64, PaneActivityState>>>,
-    /// Shutdown flag for signaling tasks
-    shutdown_flag: Arc<AtomicBool>,
+    /// Sticky shutdown state that wakes every parked runtime task.
+    shutdown_flag: Arc<ShutdownSignal>,
     /// Idle-pane poll pressure (`FLEET_POLL_PRESSURE_*`) set by the
     /// maintenance task from the fleet coordinator's actions; the capture
     /// task lets idle panes back off to a longer ceiling accordingly.
@@ -5101,7 +5179,7 @@ impl ObservationRuntime {
             cursors: Arc::new(RwLock::new(HashMap::new())),
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             pane_activity_tracker: Arc::new(RwLock::new(HashMap::new())),
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_flag: Arc::new(ShutdownSignal::new()),
             fleet_poll_pressure_level: Arc::new(AtomicU8::new(FLEET_POLL_PRESSURE_NONE)),
             metrics,
             backpressure_manager,
@@ -5425,8 +5503,8 @@ impl ObservationRuntime {
             self.config.channel_buffer.max(1),
         )));
 
-        // Clone ingress sender for queue depth instrumentation before moving it.
-        let capture_tx_probe = capture_ingress_tx.clone();
+        // Retain capacity, not a sender: producer closure must wake the relay
+        // after their final admitted output has drained during shutdown.
         let capture_queue_capacity = capture_ingress_tx
             .capacity()
             .saturating_add(capture_ring_tx.capacity())
@@ -5492,7 +5570,7 @@ impl ObservationRuntime {
             let loop_cx = runtime_loop_cx();
             Some(spawn_runtime_task(&loop_cx, move |cx| async move {
                 let mut consecutive_failures = 0_u64;
-                while !shutdown.load(Ordering::SeqCst) && cx.checkpoint().is_ok() {
+                while !shutdown.is_requested() && cx.checkpoint().is_ok() {
                     if session.tick(&cx).await.is_err() {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures.is_power_of_two() {
@@ -5657,7 +5735,6 @@ impl ObservationRuntime {
             event_bus: self.event_bus.clone(),
             connector_inbound_bridge: self.connector_inbound_bridge.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
-            capture_tx: capture_tx_probe,
             capture_queue_capacity,
             wezterm_handle: Arc::clone(&self.wezterm_handle),
             native_events: native_handle,
@@ -5695,7 +5772,7 @@ impl ObservationRuntime {
             let mut event_source_failed = false;
 
             let acknowledged = loop {
-                if shutdown_flag.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                if shutdown_flag.is_requested() || *shutdown_rx.borrow() {
                     break true;
                 }
                 if loop_cx.checkpoint().is_err() {
@@ -5730,7 +5807,7 @@ impl ObservationRuntime {
                     };
                     match receive {
                         Ok(recv) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
+                            if shutdown_flag.is_requested() {
                                 break true;
                             }
                             if loop_cx.checkpoint().is_err() {
@@ -5811,7 +5888,7 @@ impl ObservationRuntime {
                     }
                 }
 
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     break true;
                 }
                 if loop_cx.checkpoint().is_err() {
@@ -5920,7 +5997,7 @@ impl ObservationRuntime {
             use tracing::instrument::WithSubscriber;
             async move {
             loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     break;
                 }
                 if loop_cx.checkpoint().is_err() {
@@ -5939,7 +6016,7 @@ impl ObservationRuntime {
                 .await
                 {
                     Ok(Ok(event)) => {
-                        if shutdown_flag.load(Ordering::SeqCst) {
+                        if shutdown_flag.is_requested() {
                             break;
                         }
                         if loop_cx.checkpoint().is_err() {
@@ -5952,7 +6029,7 @@ impl ObservationRuntime {
                         let now_ms = epoch_ms_u64();
                         match bridge.lock() {
                             Ok(mut guard) => {
-                                if shutdown_flag.load(Ordering::SeqCst) {
+                                if shutdown_flag.is_requested() {
                                     break;
                                 }
                                 if loop_cx.checkpoint().is_err() {
@@ -6107,7 +6184,7 @@ impl ObservationRuntime {
                 first_tick = false;
                 heartbeats.record_maintenance();
 
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     break;
                 }
                 if loop_cx.checkpoint().is_err() {
@@ -7171,25 +7248,19 @@ impl ObservationRuntime {
                 if first_tick {
                     first_tick = false;
                 } else {
-                    // Wait for interval, checking shutdown periodically to ensure responsiveness
-                    let deadline = crate::runtime_async::timer_now_with_cx(&loop_cx)
-                        + discovery_backoff_interval(
+                    match runtime_sleep_until_shutdown(
+                        &loop_cx,
+                        &shutdown_flag,
+                        discovery_backoff_interval(
                             current_interval,
                             consecutive_discovery_failures,
-                        );
-                    loop {
-                        if shutdown_flag.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
-                        if now >= deadline {
-                            break;
-                        }
-                        // Sleep in short bursts to remain responsive to shutdown signals
-                        let remaining = Duration::from_nanos(deadline.duration_since(now));
-                        if let Err(failure) =
-                            runtime_sleep(&loop_cx, remaining.min(Duration::from_millis(100))).await
-                        {
+                        ),
+                    )
+                    .await
+                    {
+                        ShutdownAwareSleepOutcome::Elapsed => {}
+                        ShutdownAwareSleepOutcome::ShutdownRequested => break,
+                        ShutdownAwareSleepOutcome::WaitFailed(failure) => {
                             record_runtime_wait_failure("discovery_interval", failure);
                             break 'discovery;
                         }
@@ -7197,7 +7268,7 @@ impl ObservationRuntime {
                 }
 
                 // Check shutdown flag
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     debug!("Discovery task: shutdown signal received");
                     break;
                 }
@@ -7248,7 +7319,7 @@ impl ObservationRuntime {
                                 error = %error,
                                 "Discovery cannot install the post-list capture barrier; stopping the runtime fail-closed"
                             );
-                            shutdown_flag.store(true, Ordering::SeqCst);
+                            shutdown_flag.request();
                             break;
                         }
                         remember_withheld_barrier_predecessors(
@@ -7319,7 +7390,7 @@ impl ObservationRuntime {
                                         pane_id,
                                         "Cannot rotate replacement capture identity; stopping the runtime"
                                     );
-                                    shutdown_flag.store(true, Ordering::SeqCst);
+                                    shutdown_flag.request();
                                     break 'discovery;
                                 }
                             }
@@ -7499,7 +7570,7 @@ impl ObservationRuntime {
                                 error = %error,
                                 "Discovery cannot install the transition barrier; stopping the runtime fail-closed"
                             );
-                            shutdown_flag.store(true, Ordering::SeqCst);
+                            shutdown_flag.request();
                             break;
                         }
 
@@ -7669,7 +7740,7 @@ impl ObservationRuntime {
                                         // Preparation may already have committed.
                                         // Retrying an unidentified UUID must not
                                         // manufacture proof of restart continuity.
-                                        shutdown_flag.store(true, Ordering::SeqCst);
+                                        shutdown_flag.request();
                                         break 'discovery;
                                     }
                                     continue;
@@ -7887,7 +7958,7 @@ impl ObservationRuntime {
                                 error = %error,
                                 "Discovery cannot publish the ready capture view; stopping the runtime fail-closed"
                             );
-                            shutdown_flag.store(true, Ordering::SeqCst);
+                            shutdown_flag.request();
                             break;
                         }
                     }
@@ -7909,7 +7980,7 @@ impl ObservationRuntime {
                 }
             }
 
-            if shutdown_flag.load(Ordering::SeqCst) {
+            if shutdown_flag.is_requested() {
                 // The later StorageHandle flush cannot see discovery's
                 // in-memory debounce queue. Drain the latest record for each
                 // still-current pane while the graceful task-join timeout owns
@@ -8045,6 +8116,8 @@ impl ObservationRuntime {
             #[cfg(all(feature = "vendored", unix))]
             let (stream_exit_tx, mut stream_exit_rx) =
                 mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
+            #[cfg(all(feature = "vendored", unix))]
+            let mut received_stream_exit = None;
             // Per-pane vendored streaming subtasks. Normal removal transfers
             // handles into a settlement set; clean shutdown bounded-drains it.
             // Dropping the capture future remains an abort-and-telemetry fallback
@@ -8066,16 +8139,29 @@ impl ObservationRuntime {
             // Sync tailers periodically with discovery interval.
             // Keep the first sync immediate to preserve prior interval behavior.
             let mut next_sync_tick = Instant::now();
-            let tick_duration = Duration::from_millis(10);
-            let mut next_spawn_tick =
-                runtime_deadline_after(Instant::now(), tick_duration, "tailer spawn tick");
+            let mut config_changed = false;
+            let mut discovery_publication_closed = false;
+            let mut config_closed = false;
             let mut poll_tasks = TailerPollTaskSet::new();
+
+            enum SupervisorWake {
+                Deadline,
+                Shutdown,
+                Discovery,
+                Config,
+                StoragePressure,
+                Poll(Option<(u64, crate::tailer::PollOutcome)>),
+                #[cfg(all(feature = "vendored", unix))]
+                Stream(RecvEvent<StreamingTaskExit>),
+                WaitFailed(&'static str, RuntimeWaitFailureKind),
+                WatchClosed(&'static str),
+            }
 
             loop {
                 #[cfg(all(feature = "vendored", unix))]
                 streaming_tasks.reap_completed();
 
-                if shutdown_flag.load(Ordering::SeqCst) {
+                if shutdown_flag.is_requested() {
                     debug!("Capture task: shutdown signal received");
                     break;
                 }
@@ -8090,7 +8176,10 @@ impl ObservationRuntime {
                 }
 
                 #[cfg(all(feature = "vendored", unix))]
-                while let Ok(exit) = stream_exit_rx.try_recv() {
+                while let Some(exit) = received_stream_exit
+                    .take()
+                    .or_else(|| stream_exit_rx.try_recv().ok())
+                {
                     let pane_id = exit.identity.global_pane_id;
                     let is_current_exit = streaming_tasks
                         .get(&pane_id)
@@ -8216,11 +8305,13 @@ impl ObservationRuntime {
 
                 let now = Instant::now();
                 if capture_sync_due(now, next_sync_tick, &discovery_publication_rx) {
-                    next_sync_tick = now + discovery_interval;
+                    next_sync_tick =
+                        runtime_deadline_after(now, discovery_interval, "capture reconciliation");
                     heartbeats.record_capture();
 
                     // Check for config updates
-                    if config_update_pending(&config_rx) {
+                    if config_changed || config_update_pending(&config_rx) {
+                        config_changed = false;
                         let new_config = config_take_update(&mut config_rx);
                         let new_tailer_config = TailerConfig {
                             min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
@@ -9224,7 +9315,7 @@ impl ObservationRuntime {
                                             stream_ingest_gate,
                                         ))
                                         .await;
-                                        let final_reason = if shutdown_flag.load(Ordering::SeqCst)
+                                        let final_reason = if shutdown_flag.is_requested()
                                             && exit_reason == "capture ingress closed"
                                         {
                                             "shutdown".to_string()
@@ -9392,8 +9483,10 @@ impl ObservationRuntime {
                     continue;
                 }
 
-                if now >= next_spawn_tick {
-                    next_spawn_tick = now + tick_duration;
+                if supervisor
+                    .next_poll_deadline(now)
+                    .is_some_and(|deadline| deadline <= now)
+                {
                     // Reconciliation can await multiple pane reads; sample
                     // pressure again at the actual polling admission boundary.
                     let paused = ingest_gate.is_paused();
@@ -9404,34 +9497,137 @@ impl ObservationRuntime {
                     continue;
                 }
 
-                let next_deadline = if next_sync_tick <= next_spawn_tick {
-                    next_sync_tick
-                } else {
-                    next_spawn_tick
-                };
+                let next_deadline = supervisor
+                    .next_poll_deadline(Instant::now())
+                    .map_or(next_sync_tick, |deadline| deadline.min(next_sync_tick));
                 let wait_duration = next_deadline.saturating_duration_since(Instant::now());
                 if wait_duration.is_zero() {
                     continue;
                 }
 
-                if !poll_tasks.is_empty() {
-                    match runtime_timeout(&loop_cx, wait_duration, poll_tasks.join_next()).await {
-                        Ok(Some((pane_id, outcome))) => {
-                            supervisor.handle_poll_result(pane_id, outcome);
+                // A single timer covers the next actual reconciliation,
+                // transition retry, budget refill or pane polling deadline.
+                // All earlier state changes register their own wakeups. In
+                // particular an empty/streaming-only fleet has no spawn timer.
+                let wake = crate::runtime_async::select! {
+                    shutdown = shutdown_flag.wait(&loop_cx) => match shutdown {
+                        Ok(()) => SupervisorWake::Shutdown,
+                        Err(_) => SupervisorWake::WaitFailed(
+                            "capture_shutdown_wait",
+                            runtime_context_failure_kind(&loop_cx),
+                        ),
+                    },
+                    changed = async {
+                        crate::runtime_async::select! {
+                            changed = async {
+                                if discovery_publication_closed {
+                                    std::future::pending().await
+                                } else {
+                                    discovery_publication_rx.changed(&loop_cx).await
+                                }
+                            } => {
+                                match changed {
+                                    Ok(()) => SupervisorWake::Discovery,
+                                    Err(_) => SupervisorWake::WatchClosed("discovery"),
+                                }
+                            },
+                            changed = async {
+                                if config_closed {
+                                    std::future::pending().await
+                                } else {
+                                    config_rx.changed(&loop_cx).await
+                                }
+                            } => {
+                                match changed {
+                                    Ok(()) => SupervisorWake::Config,
+                                    Err(_) => SupervisorWake::WatchClosed("config"),
+                                }
+                            },
+                            changed = async {
+                                if ingest_backpressured {
+                                    ingest_gate.wait_for_change(&loop_cx).await
+                                } else {
+                                    std::future::pending().await
+                                }
+                            } => match changed {
+                                Ok(()) => SupervisorWake::StoragePressure,
+                                Err(_) => SupervisorWake::WaitFailed(
+                                    "capture_pressure_wait",
+                                    runtime_context_failure_kind(&loop_cx),
+                                ),
+                            },
                         }
-                        Ok(None) => {}
+                    } => changed,
+                    work = runtime_timeout(&loop_cx, wait_duration, async {
+                        let poll = async {
+                            if poll_tasks.is_empty() {
+                                std::future::pending().await
+                            } else {
+                                poll_tasks.join_next_with_cx(&loop_cx).await
+                            }
+                        };
+                        #[cfg(all(feature = "vendored", unix))]
+                        {
+                            crate::runtime_async::select! {
+                                outcome = poll => SupervisorWake::Poll(outcome),
+                                exit = recv_event(&loop_cx, &mut stream_exit_rx) => {
+                                    SupervisorWake::Stream(exit)
+                                },
+                            }
+                        }
+                        #[cfg(not(all(feature = "vendored", unix)))]
+                        {
+                            SupervisorWake::Poll(poll.await)
+                        }
+                    }) => match work {
+                        Ok(wake) => wake,
+                        Err(RuntimeTimeoutFailure::Elapsed) => SupervisorWake::Deadline,
                         Err(RuntimeTimeoutFailure::Context(failure)) => {
-                            record_runtime_wait_failure("capture_poll_wait", failure);
-                            break;
+                            SupervisorWake::WaitFailed("capture_scheduler_wait", failure)
                         }
-                        // The bounded wait expiring is the normal scheduler
-                        // wakeup: keep the in-flight poll futures owned and
-                        // let the next loop iteration run sync/spawn work.
-                        Err(RuntimeTimeoutFailure::Elapsed) => {}
+                    },
+                };
+                match wake {
+                    SupervisorWake::Deadline => {}
+                    SupervisorWake::Shutdown => break,
+                    SupervisorWake::Config => {
+                        // watch.changed() consumes the observed version; keep
+                        // its reload obligation through the next sync pass.
+                        config_changed = true;
+                        next_sync_tick = Instant::now();
                     }
-                } else if let Err(failure) = runtime_sleep(&loop_cx, wait_duration).await {
-                    record_runtime_wait_failure("capture_scheduler_wait", failure);
-                    break;
+                    SupervisorWake::Discovery | SupervisorWake::StoragePressure => {
+                        next_sync_tick = Instant::now();
+                    }
+                    SupervisorWake::Poll(Some((pane_id, outcome))) => {
+                        supervisor.handle_poll_result(pane_id, outcome);
+                    }
+                    SupervisorWake::Poll(None) => {}
+                    #[cfg(all(feature = "vendored", unix))]
+                    SupervisorWake::Stream(RecvEvent::Item(exit)) => {
+                        received_stream_exit = Some(exit);
+                    }
+                    #[cfg(all(feature = "vendored", unix))]
+                    SupervisorWake::Stream(RecvEvent::Closed | RecvEvent::Cancelled) => break,
+                    SupervisorWake::WaitFailed(operation, failure) => {
+                        record_runtime_wait_failure(operation, failure);
+                        break;
+                    }
+                    SupervisorWake::WatchClosed(source) => {
+                        // Retain the last coherent view and normal deadline
+                        // reconciliation, as before notification-driven waits.
+                        // A closed watch is permanently ready, so disable only
+                        // that notification branch after observing it once.
+                        if source == "discovery" {
+                            discovery_publication_closed = true;
+                        } else {
+                            config_closed = true;
+                        }
+                        warn!(
+                            source,
+                            "Capture scheduler watch closed; retaining last view"
+                        );
+                    }
                 }
             }
 
@@ -9525,6 +9721,9 @@ impl ObservationRuntime {
         let pane_filter = self.config.pane_filter.clone();
         let capture_authority = self.capture_authority.clone();
         let ingest_gate = self.ingest_backpressure_gate();
+        let coalesce_window_ms = self.tuning.runtime.output_coalesce_window_ms;
+        let coalesce_max_delay_ms = self.tuning.runtime.output_coalesce_max_delay_ms;
+        let coalesce_max_bytes = self.tuning.runtime.output_coalesce_max_bytes;
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -9588,26 +9787,29 @@ impl ObservationRuntime {
             ));
 
             let mut coalescer = NativeOutputCoalescer::new(
-                NATIVE_OUTPUT_COALESCE_WINDOW_MS,
-                NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS,
-                NATIVE_OUTPUT_COALESCE_MAX_BYTES,
+                coalesce_window_ms,
+                coalesce_max_delay_ms,
+                coalesce_max_bytes,
             );
             // Keep coalescing deadlines in the same clock domain as the Cx
             // timer used by runtime_timeout. Mixing std::Instant with a lab
             // timer can turn an elapsed virtual timeout into a wall-clock spin.
             let start = crate::runtime_async::timer_now_with_cx(&loop_cx);
-            let flush_interval = Duration::from_millis(NATIVE_OUTPUT_COALESCE_WINDOW_MS / 2)
-                .max(Duration::from_millis(5));
-            let mut next_flush = start + flush_interval;
             let mut drain_pending_output_on_shutdown = false;
             let mut shutdown_drain_state = NativeEventShutdownDrainState::Running;
+
+            enum NativeWake {
+                Event(RecvEvent<NativeEvent>),
+                StateChanged,
+                WaitFailed(RuntimeWaitFailureKind),
+            }
 
             'native_events: loop {
                 if loop_cx.checkpoint().is_err() {
                     break;
                 }
                 let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
-                match shutdown_drain_state.advance(now, shutdown_flag.load(Ordering::SeqCst)) {
+                match shutdown_drain_state.advance(now, shutdown_flag.is_requested()) {
                     NativeEventShutdownDrainAction::None => {}
                     NativeEventShutdownDrainAction::BeginGraceful => {
                         // Stop admitting new work through the shared shutdown
@@ -9640,10 +9842,11 @@ impl ObservationRuntime {
                         break;
                     }
                 }
-                if now >= next_flush {
-                    next_flush = now + flush_interval;
-                    let now_ms = now.duration_since(start) / 1_000_000;
-                    for item in coalescer.drain_due(now_ms) {
+                if coalescer
+                    .next_deadline(start)
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    for item in coalescer.drain_due_at(start, now) {
                         if loop_cx.checkpoint().is_err() {
                             break 'native_events;
                         }
@@ -9664,23 +9867,65 @@ impl ObservationRuntime {
                     continue;
                 }
 
-                let flush_wait = Duration::from_nanos(next_flush.duration_since(now));
                 // Flush admitted coalescer output above before pausing new
                 // input. The bounded listener queue propagates pressure; its
                 // existing drop/gap reporting remains authoritative. Graceful
                 // shutdown bypasses this pause to drain already-queued events.
-                if !shutdown_flag.load(Ordering::SeqCst) && ingest_gate.is_paused() {
-                    let pressure_wait = flush_wait.min(Duration::from_millis(25));
-                    if let Err(failure) = runtime_sleep(&loop_cx, pressure_wait).await {
-                        record_runtime_wait_failure("native_ingest_storage_pressure", failure);
+                let running =
+                    matches!(shutdown_drain_state, NativeEventShutdownDrainState::Running);
+                let paused = running && !shutdown_flag.is_requested() && ingest_gate.is_paused();
+                let next_deadline = coalescer
+                    .next_deadline(start)
+                    .into_iter()
+                    .chain(shutdown_drain_state.deadline())
+                    .min();
+                let receive = async {
+                    crate::runtime_async::select! {
+                        state = async {
+                            if !running {
+                                // Shutdown is sticky: once draining, listening
+                                // to it again would make this branch always ready.
+                                // Direct capability cancellation still wakes
+                                // the bounded drain without waiting for its timer.
+                                crate::runtime_async::wait_for_cancellation(&loop_cx).await
+                            } else if paused {
+                                ingest_gate.wait_for_change(&loop_cx).await
+                            } else {
+                                shutdown_flag.wait(&loop_cx).await
+                            }
+                        } => match state {
+                            Ok(()) => NativeWake::StateChanged,
+                            Err(_) => NativeWake::WaitFailed(runtime_context_failure_kind(&loop_cx)),
+                        },
+                        event = async {
+                            if paused {
+                                std::future::pending().await
+                            } else {
+                                recv_event(&loop_cx, &mut event_rx).await
+                            }
+                        } => NativeWake::Event(event),
+                    }
+                };
+                // No pending output and no shutdown drain means no timer.
+                // Otherwise the one wait ends at the earliest actual batch or
+                // bounded-drain deadline, even while storage admission pauses.
+                let received = if let Some(deadline) = next_deadline {
+                    runtime_timeout(
+                        &loop_cx,
+                        Duration::from_nanos(deadline.duration_since(now)),
+                        receive,
+                    )
+                    .await
+                } else {
+                    Ok(receive.await)
+                };
+                match received {
+                    Ok(NativeWake::StateChanged) => continue,
+                    Ok(NativeWake::WaitFailed(failure)) => {
+                        record_runtime_wait_failure("native_event_state_wait", failure);
                         break;
                     }
-                    continue;
-                }
-                match runtime_timeout(&loop_cx, flush_wait, recv_event(&loop_cx, &mut event_rx))
-                    .await
-                {
-                    Ok(RecvEvent::Item(event)) => {
+                    Ok(NativeWake::Event(RecvEvent::Item(event))) => {
                         if loop_cx.checkpoint().is_err() {
                             break;
                         }
@@ -9874,7 +10119,7 @@ impl ObservationRuntime {
                             }
                         }
                     }
-                    Ok(RecvEvent::Closed) => {
+                    Ok(NativeWake::Event(RecvEvent::Closed)) => {
                         // Producer completion is a clean terminal boundary;
                         // preserve already-coalesced bytes before exit.
                         let producer_closed = shutdown_drain_state.mark_producer_closed();
@@ -9885,7 +10130,7 @@ impl ObservationRuntime {
                         drain_pending_output_on_shutdown = true;
                         break;
                     }
-                    Ok(RecvEvent::Cancelled) => {
+                    Ok(NativeWake::Event(RecvEvent::Cancelled)) => {
                         debug!("Native event coalescer recv cancelled");
                         break;
                     }
@@ -9991,14 +10236,12 @@ impl ObservationRuntime {
                     break;
                 }
                 record_capture_pipeline_depth(&metrics, &capture_ingress_rx, &capture_ring_tx, 0);
-                match runtime_timeout(
-                    &loop_cx,
-                    Duration::from_millis(25),
-                    recv_event(&loop_cx, &mut capture_ingress_rx),
-                )
-                .await
-                {
-                    Ok(RecvEvent::Item(event)) => {
+                // Producer ownership is the drain barrier. On shutdown the
+                // tailers and native listener may still flush admitted output;
+                // wait for their final sender to drop before closing the ring.
+                // recv_event registers both channel and cancellation wakers.
+                match recv_event(&loop_cx, &mut capture_ingress_rx).await {
+                    RecvEvent::Item(event) => {
                         if loop_cx.checkpoint().is_err() {
                             break;
                         }
@@ -10008,7 +10251,7 @@ impl ObservationRuntime {
                             &capture_ring_tx,
                             1,
                         );
-                        if shutdown_flag.load(Ordering::SeqCst) {
+                        if shutdown_flag.is_requested() {
                             debug!(
                                 "Capture relay: shutdown signal received, draining remaining events"
                             );
@@ -10036,19 +10279,10 @@ impl ObservationRuntime {
                             0,
                         );
                     }
-                    Ok(RecvEvent::Closed) => break,
-                    Ok(RecvEvent::Cancelled) => {
+                    RecvEvent::Closed => break,
+                    RecvEvent::Cancelled => {
                         debug!("Capture relay recv cancelled");
                         break;
-                    }
-                    Err(RuntimeTimeoutFailure::Context(failure)) => {
-                        record_runtime_wait_failure("capture_relay_recv", failure);
-                        break;
-                    }
-                    Err(RuntimeTimeoutFailure::Elapsed) => {
-                        if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
-                            break;
-                        }
                     }
                 }
             }
@@ -10118,7 +10352,7 @@ impl ObservationRuntime {
                         error = %error,
                         "Selected recorder recovery drain failed; refusing new capture"
                     );
-                    shutdown_flag.store(true, Ordering::SeqCst);
+                    shutdown_flag.request();
                     return;
                 }
             } else {
@@ -10129,7 +10363,7 @@ impl ObservationRuntime {
                             pending_deliveries = pending.len(),
                             "Primary storage has pending recorder deliveries but no recorder backend is selected"
                         );
-                        shutdown_flag.store(true, Ordering::SeqCst);
+                        shutdown_flag.request();
                         return;
                     }
                     Err(error) => {
@@ -10137,7 +10371,7 @@ impl ObservationRuntime {
                             error = %error,
                             "Failed to inspect recorder delivery ledger before capture"
                         );
-                        shutdown_flag.store(true, Ordering::SeqCst);
+                        shutdown_flag.request();
                         return;
                     }
                 }
@@ -10174,7 +10408,7 @@ impl ObservationRuntime {
                                     error = %error,
                                     "Capture authority snapshot failed during persistence retirement"
                                 );
-                                shutdown_flag.store(true, Ordering::SeqCst);
+                                shutdown_flag.request();
                                 record_retirement_backlog(
                                     &metrics,
                                     &retirement_rx,
@@ -10250,7 +10484,7 @@ impl ObservationRuntime {
                     metrics.record_capture_queue_depth(capture_rx.depth());
                     heartbeats.record_persistence();
                     // Check shutdown flag - if set, drain remaining events quickly
-                    if shutdown_flag.load(Ordering::SeqCst) {
+                    if shutdown_flag.is_requested() {
                         debug!(
                             "Persistence task: shutdown signal received, draining remaining events"
                         );
@@ -10335,7 +10569,7 @@ impl ObservationRuntime {
                                 if let Some(decision) = resync_decision.as_mut() {
                                     decision.finish(Err(error.to_string()));
                                 }
-                                shutdown_flag.store(true, Ordering::SeqCst);
+                                shutdown_flag.request();
                                 continue;
                             }
                         },
@@ -10511,7 +10745,7 @@ impl ObservationRuntime {
                                     if let Some(decision) = resync_decision.as_mut() {
                                         decision.finish(Err(error.to_string()));
                                     }
-                                    shutdown_flag.store(true, Ordering::SeqCst);
+                                    shutdown_flag.request();
                                     continue;
                                 }
                             }
@@ -10827,7 +11061,7 @@ impl ObservationRuntime {
 
     /// Signal tasks to begin shutdown.
     pub fn signal_shutdown(&self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_flag.request();
     }
 
     /// Take ownership of the storage handle for external shutdown.
@@ -11180,7 +11414,7 @@ async fn run_vendored_streaming_capture(
 ) -> String {
     let runtime_cx = runtime_loop_cx();
     if !ingest_gate.wait_with_cx(&runtime_cx).await {
-        return if ingest_gate.shutdown_flag.load(Ordering::SeqCst) {
+        return if ingest_gate.shutdown_flag.is_requested() {
             "shutdown".to_string()
         } else {
             "cancelled".to_string()
@@ -11223,7 +11457,7 @@ async fn run_vendored_streaming_capture(
         // depend on a paused consumer. The subscription's bounded queue applies
         // upstream pressure; pauses do not imply lossless terminal capture.
         if !ingest_gate.wait_with_cx(&runtime_cx).await {
-            break if ingest_gate.shutdown_flag.load(Ordering::SeqCst) {
+            break if ingest_gate.shutdown_flag.is_requested() {
                 "shutdown".to_string()
             } else {
                 "cancelled".to_string()
@@ -11318,8 +11552,8 @@ pub struct RuntimeHandle {
     /// widen it so a starved full-suite worker cannot fail the clean mark
     /// (ft-fbngg) while every other shutdown phase keeps its budget.
     terminal_checkpoint_timeout: Option<Duration>,
-    /// Shutdown flag for signaling tasks
-    pub shutdown_flag: Arc<AtomicBool>,
+    /// Shared shutdown state; requesting it also wakes parked runtime tasks.
+    pub shutdown_flag: Arc<ShutdownSignal>,
     /// Storage handle for external access
     pub storage: StorageHandle,
     /// Runtime metrics
@@ -11342,8 +11576,6 @@ pub struct RuntimeHandle {
     connector_inbound_bridge: Option<Arc<StdMutex<ConnectorInboundBridge>>>,
     /// Heartbeat registry for watchdog monitoring
     pub heartbeats: Arc<HeartbeatRegistry>,
-    /// Capture ingress sender retained for runtime-handle lifetime and capacity checks.
-    capture_tx: mpsc::Sender<CaptureEvent>,
     /// Combined capacity of the capture ingress queue, relay slot, and persistence ring.
     capture_queue_capacity: usize,
     /// WezTerm interface handle for health/warning probes.
@@ -12764,6 +12996,7 @@ fn observe_backpressure_tier(
     Some(manager.current_tier().to_string())
 }
 
+#[cfg(test)]
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
     tx.capacity()
 }
@@ -12832,7 +13065,6 @@ impl RuntimeHandle {
     /// Maximum capture channel capacity.
     #[must_use]
     pub fn capture_queue_capacity(&self) -> usize {
-        debug_assert!(self.capture_queue_capacity >= mpsc_max_capacity(&self.capture_tx));
         self.capture_queue_capacity
     }
 
@@ -12993,7 +13225,7 @@ impl RuntimeHandle {
         let mut clean = true;
 
         // Signal shutdown
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_flag.request();
         if let Some(requested) = self.snapshot_shutdown_requested.as_ref() {
             requested.store(true, Ordering::Release);
         }
@@ -13541,7 +13773,7 @@ impl RuntimeHandle {
 
     /// Signal shutdown without waiting.
     pub fn signal_shutdown(&self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_flag.request();
         if let Some(requested) = self.snapshot_shutdown_requested.as_ref() {
             requested.store(true, Ordering::Release);
         }
@@ -13819,8 +14051,8 @@ impl Drop for RuntimeHandle {
     /// storage; operators who need a clean summary MUST still call
     /// the explicit shutdown methods. What we *can* do, defensively:
     ///
-    ///   - Flip `shutdown_flag` so any background task that is
-    ///     still polling it observes cancellation on its next tick.
+    ///   - Request `shutdown_flag` so every parked background task wakes
+    ///     and observes shutdown without waiting for a timer.
     ///   - Send the snapshot-shutdown wake-up so the snapshot task
     ///     breaks out of any pending `watch` / `select` wait.
     ///   - Call `JoinHandle::abort` on every wrapper handle, signalling the
@@ -13831,7 +14063,7 @@ impl Drop for RuntimeHandle {
     /// A `tracing::warn` records the unclean exit so the leak shows
     /// up in operator logs instead of failing silently.
     fn drop(&mut self) {
-        let already_signalled = self.shutdown_flag.swap(true, Ordering::SeqCst);
+        let already_signalled = self.shutdown_flag.request();
         if !already_signalled {
             tracing::warn!(
                 target: "ft.runtime",
@@ -15040,6 +15272,7 @@ mod tests {
         let graceful_deadline = start + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT;
         let forced_deadline = graceful_deadline + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT;
         let mut drain_state = NativeEventShutdownDrainState::Running;
+        assert_eq!(drain_state.deadline(), None);
 
         assert_eq!(
             drain_state.advance(start, false),
@@ -15049,10 +15282,12 @@ mod tests {
             drain_state.advance(start, true),
             NativeEventShutdownDrainAction::BeginGraceful,
         );
+        assert_eq!(drain_state.deadline(), Some(graceful_deadline));
         assert_eq!(
             drain_state.advance(graceful_deadline, true),
             NativeEventShutdownDrainAction::AbortProducer,
         );
+        assert_eq!(drain_state.deadline(), Some(forced_deadline));
         assert_eq!(
             drain_state.advance(
                 graceful_deadline + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT / 2,
@@ -15066,6 +15301,7 @@ mod tests {
             NativeEventShutdownDrainAction::Abandon,
         );
         assert_eq!(drain_state, NativeEventShutdownDrainState::Abandoned,);
+        assert_eq!(drain_state.deadline(), None);
         assert_eq!(
             drain_state.mark_producer_closed(),
             NativeEventShutdownDrainAction::None,
@@ -15980,6 +16216,108 @@ mod tests {
             "a closed publication channel must retain timer fallback without busy-spin"
         );
         assert!(capture_sync_due(deadline, deadline, &rx));
+    }
+
+    #[test]
+    fn idle_capture_supervisor_waits_for_deadline_publication_and_shutdown() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig {
+                    discovery_interval: Duration::from_secs(60),
+                    capture_interval: Duration::from_secs(5),
+                    ..RuntimeConfig::default()
+                },
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let identity = crate::cx::for_testing();
+            let capture_cx = crate::cx::Cx::new_with_drivers(
+                identity.region_id(),
+                identity.task_id(),
+                asupersync::Budget::INFINITE,
+                None,
+                None,
+                None,
+                Some(timer.clone()),
+                None,
+            );
+            let (capture_tx, _capture_rx) = mpsc::channel(4);
+            let (publication_tx, publication_rx) =
+                watch::channel(DiscoveryCapturePublication::default());
+            let (retirement_tx, _retirement_rx) = spsc_channel(1);
+            let publisher = CaptureRetirementPublisher {
+                tx: retirement_tx,
+                metrics: Arc::clone(&runtime.metrics),
+                backlog_gate: Arc::new(StdMutex::new(())),
+            };
+            // Spawn the production supervisor on an isolated, frozen clock.
+            // Test harness waits retain their ordinary runtime clock.
+            let task = {
+                let _current = crate::cx::Cx::set_current(Some(capture_cx));
+                runtime.spawn_capture_task(
+                    capture_tx,
+                    publication_rx,
+                    Arc::new(StdMutex::new(LruCache::new(4))),
+                    publisher,
+                )
+            };
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                while timer.pending_count() == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("capture supervisor must reach its idle wait");
+            assert_eq!(timer.pending_count(), 1);
+            let initial_deadline = timer.next_deadline().expect("reconciliation deadline");
+            assert!(
+                initial_deadline > asupersync::Time::from_secs(1),
+                "an empty fleet must not arm a 10 ms spawn timer"
+            );
+            clock.advance_to(asupersync::Time::from_millis(500));
+            assert_eq!(
+                timer.process_timers(),
+                0,
+                "an idle supervisor must remain parked before its real deadline"
+            );
+
+            publication_tx
+                .send(discovery_publication(1))
+                .expect("publish while supervisor is parked");
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                loop {
+                    if timer
+                        .next_deadline()
+                        .is_some_and(|next| next > initial_deadline)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("discovery publication must wake capture without firing a timer");
+            assert_eq!(timer.now(), asupersync::Time::from_millis(500));
+            assert_eq!(timer.pending_count(), 1);
+
+            runtime.shutdown_flag.request();
+            crate::runtime_async::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("shutdown must wake a parked supervisor")
+                .expect("capture task must settle");
+            assert_eq!(timer.now(), asupersync::Time::from_millis(500));
+            assert_eq!(
+                timer.pending_count(),
+                0,
+                "shutdown drops the armed deadline"
+            );
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]
@@ -17412,7 +17750,7 @@ mod tests {
                     );
                     sleep(Duration::from_millis(1)).await;
                 }
-                runtime.shutdown_flag.store(true, Ordering::SeqCst);
+                runtime.shutdown_flag.request();
                 runtime_timeout(&runtime_loop_cx(), Duration::from_secs(5), task)
                     .await
                     .unwrap()
@@ -18347,7 +18685,7 @@ mod tests {
                 "idempotent retries must not grow the selected append log"
             );
             assert_eq!(runtime.metrics.segments_persisted(), 1);
-            assert!(!runtime.shutdown_flag.load(Ordering::SeqCst));
+            assert!(!runtime.shutdown_flag.is_requested());
 
             storage.shutdown().await.expect("shutdown test storage");
         });
@@ -18673,7 +19011,7 @@ mod tests {
                     &recorder_config,
                 );
                 if fail_ack {
-                    assert!(runtime.shutdown_flag.load(Ordering::SeqCst));
+                    assert!(runtime.shutdown_flag.is_requested());
                     assert_eq!(runtime.metrics.segments_persisted(), 0);
                     assert!(
                         events.is_empty(),
@@ -19986,7 +20324,7 @@ mod tests {
                 tx,
                 cursors,
                 registry,
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(ShutdownSignal::new()),
                 Arc::new(CountedSource(Arc::clone(&reads))),
             );
             // Reproduce the exit -> due discovery sync -> spawn ordering.
@@ -21018,7 +21356,6 @@ mod tests {
             storage,
             Arc::new(RwLock::new(engine)),
         );
-        let (capture_tx, _capture_rx) = mpsc::channel(1);
         let dropped = (0..4)
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect::<Vec<_>>();
@@ -21052,7 +21389,6 @@ mod tests {
             event_bus: None,
             connector_inbound_bridge: None,
             heartbeats: Arc::clone(&runtime.heartbeats),
-            capture_tx,
             capture_queue_capacity: 1,
             wezterm_handle: runtime.wezterm_handle.clone(),
             scheduler_snapshot: Arc::clone(&runtime.scheduler_snapshot),
@@ -22109,7 +22445,7 @@ mod tests {
             };
             let telemetry = engine.telemetry().snapshot();
             // Settle both real tasks even for the pre-fix negative control.
-            runtime.shutdown_flag.store(true, Ordering::SeqCst);
+            runtime.shutdown_flag.request();
             shutdown_tx.send(true).unwrap();
             let cleanup_cx = crate::cx::for_testing();
             runtime_timeout(&cleanup_cx, Duration::from_secs(5), bridge)
@@ -23229,6 +23565,7 @@ mod tests {
     fn native_output_coalescer_batches_within_window() {
         let mut c = NativeOutputCoalescer::new(50, 200, 1024 * 1024);
         let lease = test_capture_lease(1, CaptureSourceKind::NativePush);
+        assert_eq!(c.next_deadline_ms(), None);
 
         for (bytes, timestamp_ms, now_ms) in [
             (b"a".to_vec(), 1_000, 0),
@@ -23239,6 +23576,11 @@ mod tests {
                 .try_acquire_producer(lease.stamp(), 1)
                 .expect("native producer guard");
             assert!(c.push(1, bytes, timestamp_ms, now_ms, guard).is_none());
+            assert_eq!(
+                c.next_deadline_ms(),
+                Some(50),
+                "additional chunks must not move a batch's first-seen deadline"
+            );
         }
 
         // Not due until >= window.
@@ -23250,6 +23592,7 @@ mod tests {
         assert_eq!(drained[0].bytes, b"abc");
         assert_eq!(drained[0].timestamp_ms, 1002);
         assert_eq!(drained[0].input_events, 3);
+        assert_eq!(c.next_deadline_ms(), None);
     }
 
     #[cfg(feature = "native-wezterm")]
@@ -23261,12 +23604,252 @@ mod tests {
             .try_acquire_producer(lease.stamp(), 7)
             .expect("native producer guard");
         c.push(7, b"x".to_vec(), 555, 0, guard);
+        assert_eq!(c.next_deadline_ms(), Some(200));
 
         // Not due by window, but due by max_delay.
         assert!(c.drain_due(199).is_empty());
         let drained = c.drain_due(200);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].pane_id, 7);
+        assert_eq!(c.next_deadline_ms(), None);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_recomputes_earliest_deadline_on_flush_and_replace() {
+        let mut coalescer = NativeOutputCoalescer::new(50, 200, 3);
+        let lease1 = test_capture_lease(1, CaptureSourceKind::NativePush);
+        let lease2 = test_capture_lease(2, CaptureSourceKind::NativePush);
+        for (pane_id, lease, now_ms) in [(1, &lease1, 0), (2, &lease2, 10)] {
+            let guard = lease
+                .try_acquire_producer(lease.stamp(), pane_id)
+                .expect("native producer guard");
+            assert!(
+                coalescer
+                    .push(pane_id, b"abc".to_vec(), 1, now_ms, guard)
+                    .is_none()
+            );
+        }
+        assert_eq!(coalescer.next_deadline_ms(), Some(50));
+
+        let guard = lease1
+            .try_acquire_producer(lease1.stamp(), 1)
+            .expect("native producer guard");
+        let overflow = coalescer
+            .push(1, b"d".to_vec(), 2, 20, guard)
+            .expect("size boundary flushes the preceding batch");
+        assert_eq!(overflow.bytes, b"abc");
+        assert_eq!(coalescer.next_deadline_ms(), Some(60));
+        assert!(coalescer.flush_pane(2).is_some());
+        assert_eq!(coalescer.next_deadline_ms(), Some(70));
+        assert!(coalescer.drain_due(69).is_empty());
+        assert_eq!(coalescer.drain_due(70)[0].bytes, b"d");
+        assert_eq!(coalescer.next_deadline_ms(), None);
+
+        let guard = lease1
+            .try_acquire_producer(lease1.stamp(), 1)
+            .expect("native producer guard");
+        assert!(coalescer.push(1, b"e".to_vec(), 3, 100, guard).is_none());
+        assert_eq!(coalescer.next_deadline_ms(), Some(150));
+        assert_eq!(coalescer.drain_all().len(), 1);
+        assert_eq!(coalescer.next_deadline_ms(), None);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_saturated_deadline_drains_without_spin() {
+        let mut coalescer = NativeOutputCoalescer::new(50, 200, 1024);
+        let lease = test_capture_lease(1, CaptureSourceKind::NativePush);
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 1)
+            .expect("native producer guard");
+        coalescer.push(1, b"x".to_vec(), 1, u64::MAX - 10, guard);
+        assert_eq!(coalescer.next_deadline_ms(), Some(u64::MAX));
+        assert!(coalescer.drain_due(u64::MAX - 1).is_empty());
+        assert_eq!(coalescer.drain_due(u64::MAX).len(), 1);
+        assert_eq!(coalescer.next_deadline_ms(), None);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_preserves_long_configured_deadlines() {
+        let one_day_ms = duration_ms_u64(Duration::from_hours(24));
+        let mut coalescer = NativeOutputCoalescer::new(one_day_ms * 2, one_day_ms * 3, 1024);
+        let lease = test_capture_lease(1, CaptureSourceKind::NativePush);
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 1)
+            .expect("native producer guard");
+        coalescer.push(1, b"x".to_vec(), 1, 0, guard);
+        assert_eq!(coalescer.next_deadline_ms(), Some(one_day_ms * 2));
+        assert!(coalescer.drain_due(one_day_ms).is_empty());
+        assert_eq!(coalescer.drain_due(one_day_ms * 2).len(), 1);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_flushes_at_saturated_absolute_clock() {
+        let mut coalescer = NativeOutputCoalescer::new(50, 200, 1024);
+        let lease = test_capture_lease(1, CaptureSourceKind::NativePush);
+        let guard = lease
+            .try_acquire_producer(lease.stamp(), 1)
+            .expect("native producer guard");
+        coalescer.push(1, b"x".to_vec(), 1, 0, guard);
+        let start = RuntimeTime::from_nanos(u64::MAX - 10);
+        assert_eq!(
+            coalescer.next_deadline(start),
+            Some(RuntimeTime::from_nanos(u64::MAX))
+        );
+        assert!(
+            coalescer
+                .drain_due_at(start, RuntimeTime::from_nanos(u64::MAX - 1))
+                .is_empty()
+        );
+        assert_eq!(
+            coalescer
+                .drain_due_at(start, RuntimeTime::from_nanos(u64::MAX))
+                .len(),
+            1
+        );
+        assert_eq!(coalescer.next_deadline_ms(), None);
+    }
+
+    #[cfg(all(
+        feature = "native-wezterm",
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        )
+    ))]
+    #[test]
+    fn native_capture_arms_only_pending_output_and_honors_operator_window() {
+        use crate::runtime_async::unix::AsyncWriteExt;
+
+        run_async_test_isolated(|| async {
+            let (dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let mut tuning = crate::tuning_config::TuningConfig::default();
+            tuning.runtime.output_coalesce_window_ms = 80;
+            tuning.runtime.output_coalesce_max_delay_ms = 400;
+            tuning.runtime.output_coalesce_max_bytes = 4096;
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_tuning(tuning);
+            let pane = runtime.capture_authority.activate_pane(1).unwrap();
+            let _lease = runtime
+                .capture_authority
+                .issue_source(pane, CaptureSourceKind::NativePush)
+                .unwrap();
+            runtime.cursors.write().await.insert(1, PaneCursor::new(1));
+
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let identity = crate::cx::for_testing();
+            let capture_cx = crate::cx::Cx::new_with_drivers(
+                identity.region_id(),
+                identity.task_id(),
+                asupersync::Budget::INFINITE,
+                None,
+                None,
+                None,
+                Some(timer.clone()),
+                None,
+            );
+            let socket_path = dir.path().join("native-deadline.sock");
+            let (capture_tx, mut capture_rx) = mpsc::channel(4);
+            let task = {
+                let _current = crate::cx::Cx::set_current(Some(capture_cx));
+                runtime.spawn_native_event_task(socket_path.clone(), capture_tx)
+            };
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                while !socket_path.exists() {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("native listener must bind");
+            let mut stream = crate::runtime_async::unix::connect(&socket_path)
+                .await
+                .unwrap();
+            stream
+                .write_all(
+                    b"{\"type\":\"pane_output\",\"pane_id\":1,\"data_b64\":\"YQ==\",\"ts\":1000}\n",
+                )
+                .await
+                .unwrap();
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                while runtime.metrics.native_output_input_events() != 1
+                    || timer.pending_count() != 1
+                {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("one output batch must arm one deadline");
+            assert_eq!(
+                timer.next_deadline(),
+                Some(asupersync::Time::from_millis(80))
+            );
+            clock.advance_to(asupersync::Time::from_millis(79));
+            assert_eq!(timer.process_timers(), 0);
+            assert!(capture_rx.try_recv().is_err());
+            clock.advance_to(asupersync::Time::from_millis(80));
+            assert_eq!(timer.process_timers(), 1);
+            let cx = crate::cx::for_request();
+            let captured =
+                crate::runtime_async::timeout(Duration::from_secs(5), capture_rx.recv(&cx))
+                    .await
+                    .expect("coalescer must flush at the configured deadline")
+                    .expect("native capture event");
+            assert_eq!(captured.segment.content, "a");
+            assert_eq!(
+                timer.pending_count(),
+                0,
+                "an empty coalescer disarms its timer"
+            );
+            clock.advance_to(asupersync::Time::from_millis(500));
+            assert_eq!(
+                timer.process_timers(),
+                0,
+                "idle native capture has no polling timer"
+            );
+
+            stream
+                .write_all(
+                    b"{\"type\":\"pane_output\",\"pane_id\":1,\"data_b64\":\"Yg==\",\"ts\":1001}\n",
+                )
+                .await
+                .unwrap();
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                while runtime.metrics.native_output_input_events() != 2
+                    || timer.pending_count() != 1
+                {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("second batch must be admitted before shutdown");
+            assert_eq!(
+                timer.next_deadline(),
+                Some(asupersync::Time::from_millis(580))
+            );
+            runtime.shutdown_flag.request();
+            drop(stream);
+            crate::runtime_async::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("native capture shutdown must not wait for the flush timer")
+                .expect("native capture task settles");
+            assert_eq!(capture_rx.try_recv().unwrap().segment.content, "b");
+            assert_eq!(timer.now(), asupersync::Time::from_millis(500));
+            assert_eq!(timer.pending_count(), 0);
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]
@@ -26853,13 +27436,6 @@ mod tests {
                     .unwrap()
             );
 
-            // Native graceful drains bypass the pressure state. Stream waits
-            // stop instead of admitting another delta after shutdown.
-            runtime.shutdown_flag.store(true, Ordering::SeqCst);
-            assert!(!gate.is_paused());
-            assert!(!gate.wait_with_cx(&cx).await);
-            runtime.shutdown_flag.store(false, Ordering::SeqCst);
-
             let mut second = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(3)));
             let mut third = Box::pin(storage.upsert_pane_with_cx(&cx, test_pane_record(4)));
             assert!(futures::poll!(second.as_mut()).is_pending());
@@ -26871,6 +27447,8 @@ mod tests {
                 gate.is_paused(),
                 "an oversized limit cannot bypass a full writer"
             );
+            let mut pressure_wait = Box::pin(gate.wait_with_cx(&cx));
+            assert!(futures::poll!(pressure_wait.as_mut()).is_pending());
 
             // Dropping release on a failing assertion also releases the test
             // barrier, so a failing regression cannot strand the writer thread.
@@ -26881,6 +27459,11 @@ mod tests {
             first.await.unwrap();
             second.await.unwrap();
             third.await.unwrap();
+            assert!(
+                runtime_timeout(&cx, Duration::from_secs(1), pressure_wait)
+                    .await
+                    .expect("writer drainage must wake parked capture admission")
+            );
             assert_eq!(storage.write_queue_depth(), 0);
             assert!(!gate.is_paused());
             supervisor.set_storage_backpressure(gate.is_paused());
@@ -26893,6 +27476,12 @@ mod tests {
             supervisor.handle_poll_result(pane_id, outcome);
             assert_eq!(source.0.load(Ordering::SeqCst), 2);
             assert_eq!(cursors.read().await[&7].next_seq, 1);
+
+            // Shutdown is sticky: test graceful admission bypass only after
+            // exercising normal writer-drain recovery, without resetting it.
+            runtime.shutdown_flag.request();
+            assert!(!gate.is_paused());
+            assert!(!gate.wait_with_cx(&cx).await);
             supervisor.shutdown().await;
             storage.shutdown().await.unwrap();
         });
@@ -28784,7 +29373,7 @@ mod tests {
     mod labruntime_observation {
         use super::*;
         use crate::test_fixtures::lab_runtime::{LabConfig, lab_runtime_test_with_config};
-        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        use std::sync::atomic::AtomicUsize;
 
         /// Helper: build a LabRuntime, create a root region and a task, run to
         /// quiescence via auto-advance. Asserts termination is clean.
@@ -28844,12 +29433,12 @@ mod tests {
             });
         }
 
-        /// 3. Adaptive sleep interval: verify virtual time advances correctly
-        ///    during the discovery task's short-burst sleep pattern.
+        /// Discovery and maintenance arm their real interval once, without
+        /// intermediate timer completions just to inspect shutdown.
         #[test]
-        fn adaptive_sleep_advances_virtual_time() {
-            let iterations = Arc::new(AtomicU64::new(0));
-            let iterations_task = Arc::clone(&iterations);
+        fn shutdown_aware_sleep_arms_only_the_real_deadline() {
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_task = Arc::clone(&completed);
 
             let mut runtime = asupersync::LabRuntime::new(
                 asupersync::LabConfig::new(103)
@@ -28864,85 +29453,121 @@ mod tests {
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
-                    // Simulate the discovery loop's 100ms short-burst sleep pattern
-                    for _ in 0..5 {
-                        let _ =
-                            crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(100))
-                                .await;
-                        iterations_task.fetch_add(1, Ordering::SeqCst);
-                    }
+                    let shutdown = crate::runtime_async::ShutdownSignal::new();
+                    assert_eq!(
+                        runtime_sleep_until_shutdown(&cx, &shutdown, Duration::from_secs(5)).await,
+                        ShutdownAwareSleepOutcome::Elapsed,
+                    );
+                    completed_task.store(true, Ordering::SeqCst);
                 })
                 .expect("spawn task");
             runtime.scheduler.lock().schedule(task_id, 0);
 
+            runtime.run_until_idle();
+            assert!(!completed.load(Ordering::SeqCst));
+            assert_eq!(runtime.pending_timer_count(), 1);
+
             let report = runtime.run_with_auto_advance();
-            assert_eq!(iterations.load(Ordering::SeqCst), 5);
-            // Virtual time should have advanced by at least 500ms
-            assert!(
-                runtime.now() >= asupersync::Time::from_millis(500),
-                "virtual time should advance to at least 500ms, got {:?}; termination: {:?}",
-                runtime.now(),
-                report.termination,
+            assert!(completed.load(Ordering::SeqCst));
+            assert_eq!(
+                report.auto_advances, 1,
+                "an idle interval must not be sliced into shutdown polls",
             );
+            assert_eq!(runtime.now(), asupersync::Time::from_secs(5));
+            assert_eq!(runtime.pending_timer_count(), 0);
         }
 
-        /// 4. Shutdown propagation: setting AtomicBool flag causes task to exit.
+        /// Shutdown is sticky before registration and wakes an already parked
+        /// discovery/maintenance wait without advancing its interval timer.
         #[test]
-        fn shutdown_flag_propagation_under_labruntime() {
+        fn shutdown_aware_sleep_wakes_without_advancing_time() {
+            for request_before_registration in [true, false] {
+                let exited = Arc::new(AtomicBool::new(false));
+                let exited_task = Arc::clone(&exited);
+                let shutdown = Arc::new(crate::runtime_async::ShutdownSignal::new());
+                let task_shutdown = Arc::clone(&shutdown);
+                let mut runtime = asupersync::LabRuntime::new(
+                    asupersync::LabConfig::new(104)
+                        .worker_count(2)
+                        .max_steps(100_000),
+                );
+                let region = runtime
+                    .state
+                    .create_root_region(asupersync::Budget::INFINITE);
+                let (task, _handle) = runtime
+                    .state
+                    .create_task(region, asupersync::Budget::INFINITE, async move {
+                        let cx = asupersync::Cx::current().expect("lab Cx");
+                        assert_eq!(
+                            runtime_sleep_until_shutdown(
+                                &cx,
+                                &task_shutdown,
+                                Duration::from_secs(3_600),
+                            )
+                            .await,
+                            ShutdownAwareSleepOutcome::ShutdownRequested,
+                        );
+                        exited_task.store(true, Ordering::SeqCst);
+                    })
+                    .expect("spawn shutdown-aware wait");
+                runtime.scheduler.lock().schedule(task, 0);
+
+                if !request_before_registration {
+                    runtime.run_until_idle();
+                    assert!(!exited.load(Ordering::SeqCst));
+                    assert_eq!(runtime.pending_timer_count(), 1);
+                }
+                shutdown.request();
+                runtime.run_until_idle();
+                assert!(exited.load(Ordering::SeqCst));
+                assert_eq!(runtime.now(), asupersync::Time::ZERO);
+                assert_eq!(runtime.pending_timer_count(), 0);
+            }
+        }
+
+        #[test]
+        fn shutdown_aware_sleep_preserves_capability_cancellation() {
             let exited = Arc::new(AtomicBool::new(false));
             let exited_task = Arc::clone(&exited);
-
+            let context = Arc::new(StdMutex::new(None));
+            let task_context = Arc::clone(&context);
             let mut runtime = asupersync::LabRuntime::new(
-                asupersync::LabConfig::new(104)
-                    .with_auto_advance()
+                asupersync::LabConfig::new(114)
                     .worker_count(2)
                     .max_steps(100_000),
             );
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
-            let shutdown_flag_loop = Arc::clone(&shutdown_flag);
-            let shutdown_flag_trigger = Arc::clone(&shutdown_flag);
-
-            // Task that loops until shutdown, simulating observation loop
-            let (t1, _h1) = runtime
+            let (task, _handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
-                    let mut ticks = 0u32;
-                    loop {
-                        if shutdown_flag_loop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let _ = crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
-                            .await;
-                        ticks += 1;
-                        assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
-                    }
+                    *task_context.lock().expect("record context") = Some(cx.clone());
+                    let shutdown = crate::runtime_async::ShutdownSignal::new();
+                    assert_eq!(
+                        runtime_sleep_until_shutdown(&cx, &shutdown, Duration::from_secs(60)).await,
+                        ShutdownAwareSleepOutcome::WaitFailed(
+                            RuntimeWaitFailureKind::ContextCancelled,
+                        ),
+                    );
                     exited_task.store(true, Ordering::SeqCst);
                 })
-                .expect("spawn loop task");
-            runtime.scheduler.lock().schedule(t1, 0);
-
-            // Task that fires shutdown after 50ms
-            let (t2, _h2) = runtime
-                .state
-                .create_task(region, asupersync::Budget::INFINITE, async move {
-                    let cx = asupersync::Cx::current().expect("lab Cx");
-                    let _ =
-                        crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(50)).await;
-                    shutdown_flag_trigger.store(true, Ordering::SeqCst);
-                })
-                .expect("spawn trigger task");
-            runtime.scheduler.lock().schedule(t2, 0);
-
-            let _report = runtime.run_with_auto_advance();
-            assert!(
-                exited.load(Ordering::SeqCst),
-                "observation loop should exit after shutdown flag set"
-            );
+                .expect("spawn cancellable shutdown-aware wait");
+            runtime.scheduler.lock().schedule(task, 0);
+            runtime.run_until_idle();
+            assert!(!exited.load(Ordering::SeqCst));
+            assert_eq!(runtime.pending_timer_count(), 1);
+            context
+                .lock()
+                .expect("task context")
+                .as_ref()
+                .expect("wait registered")
+                .cancel_with(crate::outcome::CancelKind::User, Some("test cancellation"));
+            runtime.run_until_idle();
+            assert!(exited.load(Ordering::SeqCst));
+            assert_eq!(runtime.now(), asupersync::Time::ZERO);
+            assert_eq!(runtime.pending_timer_count(), 0);
         }
 
         /// 5. RwLock concurrent readers + writer: verify no deadlocks under
@@ -29111,83 +29736,72 @@ mod tests {
             });
         }
 
-        /// 10. Timeout wrapping recv: simulates the relay task's
-        ///     timeout(25ms, recv_event) pattern.
+        /// The production relay remains alive through graceful shutdown until
+        /// capture producers finish, including output flushed after the signal.
         #[test]
-        fn timeout_recv_pattern_under_labruntime() {
-            let timed_out_count = Arc::new(AtomicU64::new(0));
-            let received_count = Arc::new(AtomicU64::new(0));
-            let timed_out_task = Arc::clone(&timed_out_count);
-            let received_task = Arc::clone(&received_count);
+        fn capture_relay_drains_late_producer_output_after_shutdown() {
+            run_async_test(async {
+                let (_dir, db_path) = temp_db_path();
+                let storage = StorageHandle::new(&db_path).await.expect("test storage");
+                let runtime = ObservationRuntime::new(
+                    RuntimeConfig::default(),
+                    storage.clone(),
+                    Arc::new(RwLock::new(PatternEngine::new())),
+                );
+                let lease = test_capture_lease(7, CaptureSourceKind::Polling);
+                let (ingress_tx, ingress_rx) = mpsc::channel(4);
+                let (ring_tx, ring_rx) = spsc_channel(4);
+                let cx = runtime_loop_cx();
+                let timer = cx.timer_driver().expect("runtime timer driver");
+                let timers_before_relay = timer.pending_count();
+                ingress_tx
+                    .try_send(test_capture_event_for_lease(7, 0, &lease))
+                    .expect("queue first event");
+                ingress_tx
+                    .try_send(test_capture_event_for_lease(7, 1, &lease))
+                    .expect("queue second event");
+                let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
 
-            let mut runtime = asupersync::LabRuntime::new(
-                asupersync::LabConfig::new(110)
-                    .with_auto_advance()
-                    .worker_count(2)
-                    .max_steps(100_000),
-            );
-            let region = runtime
-                .state
-                .create_root_region(asupersync::Budget::INFINITE);
+                let first = runtime_timeout(&cx, Duration::from_secs(5), ring_rx.recv())
+                    .await
+                    .expect("relay must forward admitted output")
+                    .expect("first relayed event");
+                assert_eq!(first.segment.seq, 0);
+                runtime.signal_shutdown();
 
-            let (tx, mut rx) = asupersync::channel::mpsc::channel::<u32>(16);
-            let tx_send = tx.clone();
-
-            // Consumer: timeout-based recv loop using timeout_with_cx
-            let (t1, _h1) = runtime
-                .state
-                .create_task(region, asupersync::Budget::INFINITE, async move {
-                    let cx = asupersync::Cx::current().expect("lab Cx");
-                    for _ in 0..4 {
-                        let recv_fut = rx.recv(&cx);
-                        match crate::runtime_async::timeout_with_cx(
-                            &cx,
-                            Duration::from_millis(25),
-                            recv_fut,
-                        )
+                // Represents native coalescer output whose producer was
+                // already admitted when graceful shutdown began.
+                ingress_tx
+                    .try_send(test_capture_event_for_lease(7, 2, &lease))
+                    .expect("a draining producer retains its ingress");
+                for expected in [1, 2] {
+                    let event = runtime_timeout(&cx, Duration::from_secs(5), ring_rx.recv())
                         .await
-                        {
-                            Ok(Ok(val)) => {
-                                let _ = val;
-                                received_task.fetch_add(1, Ordering::SeqCst);
-                            }
-                            _ => {
-                                timed_out_task.fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                })
-                .expect("spawn consumer");
-            runtime.scheduler.lock().schedule(t1, 0);
+                        .expect("relay must drain through producer completion")
+                        .expect("relayed event");
+                    assert_eq!(event.segment.seq, expected, "preserve ingress FIFO");
+                }
+                assert!(
+                    !relay.is_finished(),
+                    "an empty ingress with a live producer is not end of stream",
+                );
+                assert_eq!(
+                    timer.pending_count(),
+                    timers_before_relay,
+                    "an idle relay must not arm a receive timeout",
+                );
 
-            // Producer: send 2 events with delays, causing some timeouts
-            let (t2, _h2) = runtime
-                .state
-                .create_task(region, asupersync::Budget::INFINITE, async move {
-                    let cx = asupersync::Cx::current().expect("lab Cx");
-                    // Send immediately (consumer should receive)
-                    tx_send.send(&cx, 1).await.expect("send 1");
-                    // Wait longer than timeout (consumer should timeout once)
-                    let _ =
-                        crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(50)).await;
-                    tx_send.send(&cx, 2).await.expect("send 2");
-                })
-                .expect("spawn producer");
-            runtime.scheduler.lock().schedule(t2, 0);
-
-            let _report = runtime.run_with_auto_advance();
-
-            let received = received_count.load(Ordering::SeqCst);
-            let timed_out = timed_out_count.load(Ordering::SeqCst);
-            assert!(
-                received >= 1,
-                "should receive at least 1 event, got {received}"
-            );
-            assert!(
-                timed_out >= 1,
-                "should timeout at least once, got {timed_out}"
-            );
-            assert_eq!(received + timed_out, 4, "total iterations should be 4");
+                drop(ingress_tx);
+                runtime_timeout(&cx, Duration::from_secs(5), relay)
+                    .await
+                    .expect("last producer drop must wake the relay")
+                    .expect("relay task");
+                assert!(
+                    ring_rx.recv().await.is_none(),
+                    "relay closes the drained ring"
+                );
+                storage.shutdown().await.expect("shutdown test storage");
+            });
         }
     }
 }

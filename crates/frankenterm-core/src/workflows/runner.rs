@@ -470,30 +470,24 @@ async fn wait_for_workflow_runner_activity(
     cx: &crate::cx::Cx,
     subscriber: &mut crate::events::EventSubscriber,
     child_tasks: &mut crate::runtime_async::task::JoinSet<()>,
-    shutdown: Option<(
-        &std::sync::atomic::AtomicBool,
-        &crate::runtime_async::notify::Notify,
-    )>,
+    shutdown: Option<&crate::runtime_async::ShutdownSignal>,
 ) -> WorkflowRunnerWake {
     use futures::future::{Either, select};
 
     if child_tasks.is_empty() {
-        if let Some((shutdown_flag, shutdown_notify)) = shutdown {
-            let shutdown_wait = std::pin::pin!(
-                shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
-            );
+        if let Some(shutdown) = shutdown {
+            let shutdown_wait = std::pin::pin!(shutdown.wait(cx));
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             return match select(shutdown_wait, event_wait).await {
-                Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+                Either::Left((_, _)) => WorkflowRunnerWake::Shutdown,
                 Either::Right((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
             };
         }
         return WorkflowRunnerWake::Event(Box::new(subscriber.recv_cx(cx).await));
     }
 
-    if let Some((shutdown_flag, shutdown_notify)) = shutdown {
-        let shutdown_wait =
-            std::pin::pin!(shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) }));
+    if let Some(shutdown) = shutdown {
+        let shutdown_wait = std::pin::pin!(shutdown.wait(cx));
         let activity_wait = std::pin::pin!(async {
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
@@ -503,7 +497,7 @@ async fn wait_for_workflow_runner_activity(
             }
         });
         return match select(shutdown_wait, activity_wait).await {
-            Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+            Either::Left((_, _)) => WorkflowRunnerWake::Shutdown,
             Either::Right((wake, _)) => wake,
         };
     }
@@ -3916,8 +3910,7 @@ impl WorkflowRunner {
 
     /// Run the event loop with an explicit cooperative shutdown channel.
     ///
-    /// The atomic flag is the durable predicate and `shutdown_notify` is its
-    /// wake accelerator. They must be the same pair owned by the surrounding
+    /// The sticky signal must be the same one owned by the surrounding
     /// [`crate::watchdog::WatchdogHandle`]. On shutdown, the runner stops
     /// admitting detections, aborts every owned per-workflow task, and performs
     /// a bounded trusted terminal drain before returning.
@@ -3925,17 +3918,12 @@ impl WorkflowRunner {
         &self,
         cx: &crate::cx::Cx,
         event_bus: &crate::events::EventBus,
-        shutdown_flag: &std::sync::atomic::AtomicBool,
-        shutdown_notify: &crate::runtime_async::notify::Notify,
+        shutdown: &crate::runtime_async::ShutdownSignal,
     ) {
         match self.subscribe_with_cx(cx, event_bus).await {
             Ok(subscription) => {
-                self.run_subscribed_with_cx(
-                    cx,
-                    subscription,
-                    Some((shutdown_flag, shutdown_notify)),
-                )
-                .await;
+                self.run_subscribed_with_cx(cx, subscription, Some(shutdown))
+                    .await;
             }
             Err(error) => tracing::error!(
                 error = %error,
@@ -3991,22 +3979,19 @@ impl WorkflowRunner {
     /// bounded sweeps revisit temporary admission failures without blocking
     /// other panes. Newly recovered admissions expire five minutes after
     /// detection; they do not replay pre-boundary history after a crash.
-    /// When supplied, the shutdown flag and notification must be the pair
-    /// owned by the surrounding [`crate::watchdog::WatchdogHandle`].
+    /// When supplied, the shutdown signal must be the one owned by the
+    /// surrounding [`crate::watchdog::WatchdogHandle`].
     pub async fn run_subscribed_with_cx(
         &self,
         cx: &crate::cx::Cx,
         subscription: WorkflowEventSubscription,
-        shutdown: Option<(
-            &std::sync::atomic::AtomicBool,
-            &crate::runtime_async::notify::Notify,
-        )>,
+        shutdown: Option<&crate::runtime_async::ShutdownSignal>,
     ) {
         let WorkflowEventSubscription {
             mut subscriber,
             mut replay,
         } = subscription;
-        if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+        if shutdown.is_some_and(crate::runtime_async::ShutdownSignal::is_requested) {
             tracing::info!(
                 explicit_cx = true,
                 "Workflow runner shutdown was already requested before resume"
@@ -4034,7 +4019,7 @@ impl WorkflowRunner {
                 );
                 break;
             }
-            if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+            if shutdown.is_some_and(crate::runtime_async::ShutdownSignal::is_requested) {
                 tracing::info!(
                     explicit_cx = true,
                     "Workflow runner received shutdown signal"
@@ -7817,17 +7802,11 @@ mod tests {
                     .subscribe_with_cx(&runner_cx, &event_bus)
                     .await
                     .unwrap();
-                let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stopped = Arc::new(crate::runtime_async::ShutdownSignal::new());
                 let child_stopped = Arc::clone(&stopped);
-                let notify = Arc::new(crate::runtime_async::notify::Notify::new());
-                let child_notify = Arc::clone(&notify);
                 let task = crate::runtime_async::task::spawn(async move {
                     runner
-                        .run_subscribed_with_cx(
-                            &child_cx,
-                            subscription,
-                            Some((&child_stopped, &child_notify)),
-                        )
+                        .run_subscribed_with_cx(&child_cx, subscription, Some(&child_stopped))
                         .await;
                 });
                 let observer_cx = crate::cx::for_testing();
@@ -7874,8 +7853,7 @@ mod tests {
                         Some("cancel while restored step is pending"),
                     );
                 } else {
-                    stopped.store(true, Ordering::SeqCst);
-                    notify.notify_waiters();
+                    stopped.request();
                 }
                 crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
                     .await
@@ -8221,10 +8199,8 @@ mod tests {
             None
         };
         let task_event_bus = Arc::clone(&event_bus);
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::new(crate::runtime_async::ShutdownSignal::new());
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
-        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
-        let task_shutdown_notify = Arc::clone(&shutdown_notify);
         let runner_cx = crate::cx::for_testing();
         let task_cx = runner_cx.clone();
         let runner_task = crate::runtime_async::task::spawn(async move {
@@ -8232,12 +8208,7 @@ mod tests {
                 StartupRunnerEntry::Cx => runner.run_with_cx(&task_cx, &task_event_bus).await,
                 StartupRunnerEntry::Shutdown => {
                     runner
-                        .run_with_shutdown_with_cx(
-                            &task_cx,
-                            &task_event_bus,
-                            &task_shutdown_flag,
-                            &task_shutdown_notify,
-                        )
+                        .run_with_shutdown_with_cx(&task_cx, &task_event_bus, &task_shutdown_flag)
                         .await;
                 }
                 StartupRunnerEntry::Subscribed => {
@@ -8245,7 +8216,7 @@ mod tests {
                         .run_subscribed_with_cx(
                             &task_cx,
                             subscriber.expect("watcher must subscribe before spawning"),
-                            Some((&task_shutdown_flag, &task_shutdown_notify)),
+                            Some(&task_shutdown_flag),
                         )
                         .await;
                 }
@@ -8295,8 +8266,7 @@ mod tests {
                 Some("startup ingress regression complete"),
             );
         } else {
-            shutdown_flag.store(true, Ordering::SeqCst);
-            shutdown_notify.notify_waiters();
+            shutdown_flag.request();
         }
         crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(1), runner_task)
             .await
@@ -8342,8 +8312,10 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
-                let shutdown_flag = std::sync::atomic::AtomicBool::new(!cancelled);
-                let shutdown_notify = crate::runtime_async::notify::Notify::new();
+                let shutdown_flag = crate::runtime_async::ShutdownSignal::new();
+                if !cancelled {
+                    shutdown_flag.request();
+                }
                 let runner_cx = crate::cx::for_testing();
                 if cancelled {
                     runner_cx.cancel_with(
@@ -8355,11 +8327,7 @@ mod tests {
                 Box::pin(crate::runtime_async::timeout_with_cx(
                     &observer_cx,
                     Duration::from_secs(1),
-                    runner.run_subscribed_with_cx(
-                        &runner_cx,
-                        subscriber,
-                        Some((&shutdown_flag, &shutdown_notify)),
-                    ),
+                    runner.run_subscribed_with_cx(&runner_cx, subscriber, Some(&shutdown_flag)),
                 ))
                 .await
                 .expect("pre-stopped runner must return without resuming or dispatching");
@@ -8446,10 +8414,8 @@ mod tests {
         let task_probe = Arc::clone(&probe);
         let event_bus = Arc::new(crate::events::EventBus::new(8));
         let task_event_bus = Arc::clone(&event_bus);
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::new(crate::runtime_async::ShutdownSignal::new());
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
-        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
-        let task_shutdown_notify = Arc::clone(&shutdown_notify);
         let runner_cx = crate::cx::for_testing();
         let cancel_cx = runner_cx.clone();
         let (ready_tx, ready_rx) = crate::runtime_async::oneshot::channel();
@@ -8459,7 +8425,6 @@ mod tests {
                 &runner_cx,
                 &task_event_bus,
                 &task_shutdown_flag,
-                &task_shutdown_notify,
             ));
             let mut ready_tx = Some(ready_tx);
             let mut readiness_published = false;
@@ -8510,8 +8475,7 @@ mod tests {
                 Some("cancel idle workflow runner"),
             );
         } else {
-            shutdown_flag.store(true, Ordering::SeqCst);
-            shutdown_notify.notify_waiters();
+            shutdown_flag.request();
         }
         let join_cx = crate::cx::for_testing();
         crate::runtime_async::timeout_with_cx(&join_cx, Duration::from_secs(1), runner_task)

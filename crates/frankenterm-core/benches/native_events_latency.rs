@@ -11,7 +11,6 @@
 use std::hint::black_box;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -19,7 +18,7 @@ use frankenterm_core::native_events::{NativeEvent, NativeEventListener};
 use frankenterm_core::runtime_async::mpsc;
 use frankenterm_core::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
 use frankenterm_core::runtime_async::{
-    CompatRuntime, Runtime, RuntimeBuilder, mpsc_recv_option, task, timeout,
+    CompatRuntime, Runtime, RuntimeBuilder, ShutdownSignal, mpsc_recv_option, task, timeout,
 };
 
 mod bench_common;
@@ -80,7 +79,7 @@ fn bench_native_first_message_latency(c: &mut Criterion) {
                     .await
                     .expect("bind native listener");
                 let (event_tx, mut event_rx) = mpsc::channel(32);
-                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown = Arc::new(ShutdownSignal::new());
 
                 let shutdown_for_task = Arc::clone(&shutdown);
                 let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
@@ -96,7 +95,7 @@ fn bench_native_first_message_latency(c: &mut Criterion) {
                 let event = recv_event_or_panic(&mut event_rx).await;
                 black_box(event);
 
-                shutdown.store(true, Ordering::SeqCst);
+                shutdown.request();
                 let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
             });
         });
@@ -125,7 +124,7 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
                             .await
                             .expect("bind native listener");
                         let (event_tx, mut event_rx) = mpsc::channel(2048);
-                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let shutdown = Arc::new(ShutdownSignal::new());
 
                         let shutdown_for_task = Arc::clone(&shutdown);
                         let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
@@ -156,7 +155,7 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
                             }
                         }
 
-                        shutdown.store(true, Ordering::SeqCst);
+                        shutdown.request();
                         let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
                     });
                 });
@@ -187,7 +186,7 @@ fn bench_native_parse_dispatch_latency(c: &mut Criterion) {
                             .await
                             .expect("bind native listener");
                         let (event_tx, mut event_rx) = mpsc::channel(512);
-                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let shutdown = Arc::new(ShutdownSignal::new());
 
                         let shutdown_for_task = Arc::clone(&shutdown);
                         let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
@@ -208,7 +207,7 @@ fn bench_native_parse_dispatch_latency(c: &mut Criterion) {
                             black_box(event);
                         }
 
-                        shutdown.store(true, Ordering::SeqCst);
+                        shutdown.request();
                         let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
                     });
                 });
@@ -239,7 +238,7 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
                             .await
                             .expect("bind native listener");
                         let (event_tx, mut event_rx) = mpsc::channel(channel_capacity);
-                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let shutdown = Arc::new(ShutdownSignal::new());
 
                         let shutdown_for_task = Arc::clone(&shutdown);
                         let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
@@ -274,7 +273,7 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
                                 .expect("write pane output event");
                         }
 
-                        shutdown.store(true, Ordering::SeqCst);
+                        shutdown.request();
                         let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
                         let drained_events = match timeout(NATIVE_EVENT_TIMEOUT, consumer).await {
                             Ok(Ok(count)) => count,

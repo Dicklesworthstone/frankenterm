@@ -7,13 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::runtime_async::mpsc;
 use crate::runtime_async::timeout;
-use crate::runtime_async::{RwLock, Semaphore};
+use crate::runtime_async::{RwLock, Semaphore, ShutdownSignal};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt};
 use tracing::{debug, trace, warn};
@@ -1145,7 +1144,7 @@ where
     /// Pane registry (for authoritative state like alt-screen)
     registry: Arc<RwLock<PaneRegistry>>,
     /// Shutdown flag
-    shutdown_flag: Arc<AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
     /// Pane text source (WezTerm client or test double)
     source: Arc<S>,
     /// Circuit breaker for capture pipeline reliability.
@@ -1232,8 +1231,9 @@ impl TailerPollTaskSet {
     /// poll task happened to complete. This now mirrors
     /// [`crate::runtime_async`]'s `JoinSet::join_next_with_cx`: a pre-flight
     /// `checkpoint()` gates entry and a per-poll `checkpoint()` inside the poll
-    /// loop surfaces a mid-flight cancel within the same tick instead of waiting
-    /// for the next task completion.
+    /// loop surfaces a mid-flight cancel before consuming a completion.
+    /// `until_cancelled` registers the cancellation waker, so a pending task
+    /// set needs neither a timer nor a producer completion to observe cancel.
     ///
     /// # Cancellation semantics
     ///
@@ -1251,15 +1251,19 @@ impl TailerPollTaskSet {
         if cx.checkpoint().is_err() {
             return None;
         }
-        std::future::poll_fn(|poll_cx| {
-            // Per-poll: observe a cancel that arrives while we await a pending
-            // poll task so it surfaces within the tick rather than hanging.
-            if cx.checkpoint().is_err() {
-                return std::task::Poll::Ready(None);
-            }
-            Pin::new(&mut self.inner).poll_next(poll_cx)
-        })
+        crate::runtime_async::until_cancelled(
+            cx,
+            std::future::poll_fn(|poll_cx| {
+                // Preserve cancellation precedence before consuming an outcome.
+                if cx.checkpoint().is_err() {
+                    return std::task::Poll::Ready(None);
+                }
+                Pin::new(&mut self.inner).poll_next(poll_cx)
+            }),
+        )
         .await
+        .ok()
+        .flatten()
     }
 
     /// Poll the task set once without waiting for an outcome.
@@ -1311,7 +1315,7 @@ where
         tx: mpsc::Sender<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
         source: Arc<S>,
     ) -> Self {
         let max_concurrent = config.max_concurrent.max(1);
@@ -1349,7 +1353,7 @@ where
         tx: mpsc::Sender<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
         source: Arc<S>,
         budget: CaptureBudgetConfig,
     ) -> Self {
@@ -1403,6 +1407,47 @@ where
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.tailers.len()
+    }
+
+    /// Earliest deadline at which a new polling task can be admitted.
+    ///
+    /// In-flight work wakes its owner through `TailerPollTaskSet`; pressure,
+    /// configuration, and discovery changes have separate notifications. None
+    /// of those conditions needs a periodic scheduler timer. Exhausted global
+    /// budgets delay admission until the actual window refill, so an overdue
+    /// pane cannot turn budget throttling into a busy loop.
+    #[must_use]
+    pub(crate) fn next_poll_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.shutdown_flag.is_requested()
+            || self.storage_backpressured
+            || self.semaphore.available_permits() == 0
+        {
+            return None;
+        }
+
+        let pane_deadline = self
+            .tailers
+            .iter()
+            .filter(|(pane_id, _)| {
+                !self.capturing_panes.contains(*pane_id)
+                    && self.capture_leases.contains_key(*pane_id)
+            })
+            .filter_map(|(_, tailer)| tailer.last_poll.checked_add(tailer.current_interval))
+            .min()?;
+        let budget_exhausted = (self.scheduler.budget.max_captures_per_sec > 0
+            && self.scheduler.global_captures_remaining == 0)
+            || (self.scheduler.budget.max_bytes_per_sec > 0
+                && self.scheduler.global_bytes_remaining == 0);
+        let deadline = if budget_exhausted {
+            let refill = self
+                .scheduler
+                .global_window_start
+                .checked_add(Duration::from_secs(1))?;
+            pane_deadline.max(refill)
+        } else {
+            pane_deadline
+        };
+        Some(deadline.max(now))
     }
 
     /// Sync tailers with exact polling leases issued by the runtime authority.
@@ -1629,6 +1674,15 @@ where
                 max = ?config.max_interval,
                 "Tailer intervals updated"
             );
+            // Recompute real deadlines against the last completed poll. An
+            // idle pane must not retain an obsolete multi-second ceiling after
+            // a reload asks for a shorter interval (or violate a raised floor).
+            for tailer in self.tailers.values_mut() {
+                tailer.current_interval = tailer
+                    .current_interval
+                    .max(config.min_interval)
+                    .min(config.max_interval);
+            }
         }
 
         self.config = config;
@@ -1783,7 +1837,7 @@ where
     where
         T: PollTaskSet,
     {
-        if self.shutdown_flag.load(Ordering::SeqCst) {
+        if self.shutdown_flag.is_requested() {
             for tailer in self.tailers.values_mut() {
                 tailer.record_skip(CaptureSkipReason::Shutdown);
             }
@@ -2900,6 +2954,46 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pending_poll_join_wakes_on_cancellation_without_a_timer() {
+        struct WakeProbe(AtomicUsize);
+
+        impl std::task::Wake for WakeProbe {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut tasks = TailerPollTaskSet::new();
+        tasks.spawn_poll_task(std::future::pending::<(u64, PollOutcome)>());
+        let cx = crate::cx::for_testing();
+        let probe = Arc::new(WakeProbe(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&probe));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let mut join = Box::pin(tasks.join_next_with_cx(&cx));
+        assert!(join.as_mut().poll(&mut task_cx).is_pending());
+        let before_cancel = probe.0.load(Ordering::SeqCst);
+
+        cx.cancel_with(
+            crate::outcome::CancelKind::Shutdown,
+            Some("cancel pending poll join"),
+        );
+        assert!(
+            probe.0.load(Ordering::SeqCst) > before_cancel,
+            "cancellation must wake the pending join without a timer or poll completion"
+        );
+        assert!(matches!(
+            join.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(None)
+        ));
+        drop(join);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "cancelling a join preserves its owned poll tasks"
+        );
+    }
+
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
         let cx = crate::cx::for_testing();
         rx.recv(&cx).await.ok()
@@ -3268,7 +3362,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             let mut supervisor =
@@ -3289,6 +3383,160 @@ mod tests {
             supervisor.sync_tailers(&panes);
             assert_eq!(supervisor.active_count(), 1);
         });
+    }
+
+    #[test]
+    fn supervisor_poll_deadline_arms_only_for_admissible_panes() {
+        let (tx, _rx) = mpsc::channel(10);
+        let mut supervisor = TailerSupervisor::new(
+            TailerConfig::default(),
+            tx,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(PaneRegistry::new())),
+            Arc::new(ShutdownSignal::new()),
+            Arc::new(StaticSource),
+        );
+        let now = Instant::now();
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+
+        supervisor.sync_tailers(&HashMap::from([(1, make_pane(1)), (2, make_pane(2))]));
+        for (pane_id, interval) in [(1, Duration::from_secs(5)), (2, Duration::from_secs(2))] {
+            let tailer = supervisor.tailers.get_mut(&pane_id).unwrap();
+            tailer.last_poll = now;
+            tailer.current_interval = interval;
+        }
+        assert_eq!(
+            supervisor.next_poll_deadline(now),
+            Some(now + Duration::from_secs(2))
+        );
+
+        supervisor.capturing_panes.insert(2);
+        assert_eq!(
+            supervisor.next_poll_deadline(now),
+            Some(now + Duration::from_secs(5))
+        );
+        supervisor.capturing_panes.insert(1);
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+
+        supervisor.capturing_panes.remove(&1);
+        supervisor.capture_leases.remove(&1);
+        assert_eq!(
+            supervisor.next_poll_deadline(now + Duration::from_secs(10)),
+            None,
+            "a tailer without authority must not repeatedly arm an overdue timer"
+        );
+    }
+
+    #[test]
+    fn supervisor_poll_deadline_waits_for_capacity_pressure_and_shutdown_events() {
+        let (tx, _rx) = mpsc::channel(10);
+        let shutdown = Arc::new(ShutdownSignal::new());
+        let mut supervisor = TailerSupervisor::new(
+            TailerConfig {
+                min_interval: Duration::ZERO,
+                max_concurrent: 1,
+                ..TailerConfig::default()
+            },
+            tx,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(PaneRegistry::new())),
+            Arc::clone(&shutdown),
+            Arc::new(StaticSource),
+        );
+        supervisor.sync_tailers(&HashMap::from([(1, make_pane(1))]));
+        let now = Instant::now();
+        assert_eq!(supervisor.next_poll_deadline(now), Some(now));
+
+        let permit = Arc::clone(&supervisor.semaphore)
+            .try_acquire_owned()
+            .expect("available capture slot");
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+        drop(permit);
+        assert_eq!(supervisor.next_poll_deadline(now), Some(now));
+
+        supervisor.set_storage_backpressure(true);
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+        supervisor.set_storage_backpressure(false);
+        assert_eq!(supervisor.next_poll_deadline(now), Some(now));
+        shutdown.request();
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+    }
+
+    #[test]
+    fn supervisor_poll_deadline_uses_actual_budget_refill() {
+        let (tx, _rx) = mpsc::channel(10);
+        let mut supervisor = TailerSupervisor::with_budget(
+            TailerConfig {
+                min_interval: Duration::ZERO,
+                ..TailerConfig::default()
+            },
+            tx,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(PaneRegistry::new())),
+            Arc::new(ShutdownSignal::new()),
+            Arc::new(StaticSource),
+            CaptureBudgetConfig {
+                max_captures_per_sec: 1,
+                max_bytes_per_sec: 100,
+            },
+        );
+        supervisor.sync_tailers(&HashMap::from([(1, make_pane(1))]));
+        let now = Instant::now();
+        supervisor.scheduler.global_window_start = now;
+        supervisor.scheduler.global_captures_remaining = 0;
+        let refill = now + Duration::from_secs(1);
+        assert_eq!(supervisor.next_poll_deadline(now), Some(refill));
+
+        supervisor.scheduler.global_captures_remaining = 1;
+        supervisor.scheduler.global_bytes_remaining = 0;
+        assert_eq!(supervisor.next_poll_deadline(now), Some(refill));
+        assert_eq!(
+            supervisor.next_poll_deadline(refill + Duration::from_secs(2)),
+            Some(refill + Duration::from_secs(2)),
+            "an expired budget window must let admission replenish immediately"
+        );
+
+        supervisor.update_budget(CaptureBudgetConfig::default());
+        assert_eq!(supervisor.next_poll_deadline(now), Some(now));
+        supervisor.sync_tailers(&HashMap::new());
+        assert_eq!(supervisor.next_poll_deadline(now), None);
+    }
+
+    #[test]
+    fn supervisor_config_reload_recomputes_existing_poll_deadline() {
+        let (tx, _rx) = mpsc::channel(10);
+        let mut config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(5),
+            ..TailerConfig::default()
+        };
+        let mut supervisor = TailerSupervisor::new(
+            config.clone(),
+            tx,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(PaneRegistry::new())),
+            Arc::new(ShutdownSignal::new()),
+            Arc::new(StaticSource),
+        );
+        supervisor.sync_tailers(&HashMap::from([(1, make_pane(1))]));
+        let now = Instant::now();
+        let tailer = supervisor.tailers.get_mut(&1).unwrap();
+        tailer.last_poll = now;
+        tailer.current_interval = config.max_interval;
+
+        config.max_interval = Duration::from_millis(200);
+        supervisor.update_config(config.clone());
+        assert_eq!(
+            supervisor.next_poll_deadline(now),
+            Some(now + Duration::from_millis(200))
+        );
+        config.min_interval = Duration::from_millis(500);
+        config.max_interval = Duration::from_secs(1);
+        supervisor.update_config(config);
+        assert_eq!(
+            supervisor.next_poll_deadline(now),
+            Some(now + Duration::from_millis(500))
+        );
     }
 
     #[test]
@@ -3329,7 +3577,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(4);
             let cursors = Arc::new(RwLock::new(HashMap::from([(1, PaneCursor::new(1))])));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let mut supervisor =
                 TailerSupervisor::new(config, tx, cursors, registry, shutdown, Arc::clone(&source));
             supervisor.sync_tailers(&HashMap::from([(1, make_pane(1))]));
@@ -3372,7 +3620,7 @@ mod tests {
                 (2, PaneCursor::new(2)),
             ])));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let mut supervisor = TailerSupervisor::new(
                 TailerConfig {
                     min_interval: Duration::ZERO,
@@ -3454,7 +3702,7 @@ mod tests {
 
             // Shutdown has precedence over pressure and does not start work.
             supervisor.set_storage_backpressure(true);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             supervisor.spawn_ready(&mut tasks);
             assert!(tasks.is_empty());
             assert!(
@@ -3489,7 +3737,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             {
                 let mut cursor_guard = cursors.write().await;
@@ -3538,7 +3786,7 @@ mod tests {
             let _keep_rx_alive = rx;
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             {
@@ -3586,7 +3834,7 @@ mod tests {
             let _keep_rx_alive = rx;
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             {
@@ -3653,7 +3901,7 @@ mod tests {
             let _keep_rx_alive = rx; // Prevent receiver from being dropped
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             {
                 let mut cursor_guard = cursors.write().await;
@@ -3705,7 +3953,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             {
                 let mut cursor_guard = cursors.write().await;
@@ -3842,7 +4090,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -3879,7 +4127,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -3919,7 +4167,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -3953,7 +4201,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -3983,7 +4231,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -4026,7 +4274,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             {
                 let mut cursor_guard = cursors.write().await;
@@ -4091,7 +4339,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             {
                 let mut cursor_guard = cursors.write().await;
@@ -4754,7 +5002,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
@@ -4825,7 +5073,7 @@ mod tests {
             let _keep_rx_alive = rx;
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(FixedSource);
 
             let mut panes = HashMap::new();
@@ -5129,7 +5377,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
@@ -5159,7 +5407,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
             let mut supervisor =
                 TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -5241,7 +5489,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
             let mut supervisor = TailerSupervisor::with_budget(
                 config, tx, cursors, registry, shutdown, source, budget,
@@ -5288,7 +5536,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
@@ -5324,7 +5572,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             {
@@ -5543,7 +5791,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             let budget = CaptureBudgetConfig {
@@ -5579,7 +5827,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let budget = CaptureBudgetConfig {
@@ -6554,7 +6802,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6584,7 +6832,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6607,7 +6855,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6630,7 +6878,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6654,7 +6902,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6677,7 +6925,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6696,7 +6944,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6715,7 +6963,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6735,7 +6983,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(10);
             let cursors = Arc::new(RwLock::new(HashMap::new()));
             let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let source = Arc::new(StaticSource);
 
             let mut supervisor =
@@ -6760,7 +7008,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6789,7 +7037,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
@@ -6821,7 +7069,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
@@ -6853,7 +7101,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
@@ -6916,7 +7164,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let budget = CaptureBudgetConfig {
@@ -6941,7 +7189,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(StaticSource);
 
         let supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);

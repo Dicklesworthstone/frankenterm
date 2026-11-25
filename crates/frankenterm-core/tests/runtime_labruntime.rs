@@ -534,8 +534,6 @@ fn labruntime_channel_dispatch_delivers_capture_events() {
 
 #[test]
 fn labruntime_shutdown_propagation_drains_all_tasks() {
-    use std::sync::atomic::Ordering;
-
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (_dir, db_path) = temp_db();
@@ -558,8 +556,8 @@ fn labruntime_shutdown_propagation_drains_all_tasks() {
         // Let runtime run briefly
         sleep(Duration::from_millis(30)).await;
 
-        // Signal shutdown via the flag
-        handle.shutdown_flag.store(true, Ordering::SeqCst);
+        // Signal shutdown and wake the background tasks.
+        handle.signal_shutdown();
 
         // shutdown_with_summary should complete promptly
         let summary = handle.shutdown_with_summary().await;

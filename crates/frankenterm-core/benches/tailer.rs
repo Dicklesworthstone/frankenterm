@@ -13,13 +13,13 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::cx;
 use frankenterm_core::ingest::{PaneCursor, PaneRegistry};
-use frankenterm_core::runtime_async::{self, CompatRuntime, RwLock, mpsc};
+use frankenterm_core::runtime_async::{self, CompatRuntime, RwLock, ShutdownSignal, mpsc};
 use frankenterm_core::tailer::{TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -163,7 +163,7 @@ async fn run_capture_round(payload: Arc<String>, pane_count: u64, max_concurrent
     let (tx, mut rx) = mpsc::channel((pane_count as usize).saturating_mul(2).max(8));
     let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(ShutdownSignal::new());
 
     {
         let mut guard = cursors.write().await;
@@ -219,7 +219,7 @@ async fn run_capture_cadence_workload(pane_count: u64, rounds: usize) -> Cadence
     let (tx, mut rx) = mpsc::channel((pane_count as usize).saturating_mul(4).max(64));
     let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(ShutdownSignal::new());
 
     {
         let mut guard = cursors.write().await;
@@ -405,7 +405,7 @@ fn bench_spawn_ready_scan_only(c: &mut Criterion) {
             let (tx, _rx) = mpsc::channel((pane_count as usize).saturating_mul(2).max(8));
             let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
             let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             {
                 let mut guard = cursors.write().await;
                 for pane_id in 1..=pane_count {

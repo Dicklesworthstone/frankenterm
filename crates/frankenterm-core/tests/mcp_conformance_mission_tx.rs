@@ -294,7 +294,7 @@ impl LiveTxFixture {
             });
             let ipc_task = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
                 ipc_task,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(frankenterm_core::runtime_async::ShutdownSignal::new()),
             );
             (observer, ipc_task, ipc_shutdown, pane_ids)
         });

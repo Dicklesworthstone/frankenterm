@@ -10,14 +10,14 @@ mod common;
 use asupersync::{Budget, LabRuntime, TaskId};
 use common::lab::{ExplorationTestConfig, LabTestConfig, run_exploration_test, run_lab_test};
 use frankenterm_core::ingest::{PaneCursor, PaneRegistry};
-use frankenterm_core::runtime_async::{self, RwLock, mpsc};
+use frankenterm_core::runtime_async::{self, RwLock, ShutdownSignal, mpsc};
 use frankenterm_core::tailer::{TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 type PaneFuture<'a> = Pin<Box<dyn Future<Output = frankenterm_core::Result<String>> + Send + 'a>>;
@@ -120,7 +120,7 @@ fn dpor_tailer_max_concurrent_limit_respected() {
         let (tx, rx) = mpsc::channel(64);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
 
         let mut panes = HashMap::new();
         for pane_id in 1..=6_u64 {
@@ -211,7 +211,7 @@ fn dpor_tailer_event_delivery_under_concurrent_load() {
         let (tx, mut rx) = mpsc::channel(128);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
 
         let pane_count = 8_u64;
         let mut panes = HashMap::new();
@@ -314,7 +314,7 @@ fn dpor_tailer_requeues_after_join_without_stale_capture_state() {
         let (tx, rx) = mpsc::channel(64);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
 
         let mut panes = HashMap::new();
         for pane_id in 1..=4_u64 {
@@ -416,7 +416,7 @@ fn lab_tailer_shutdown_prevents_follow_up_spawns() {
             let (tx, rx) = mpsc::channel(64);
             let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
             let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let mut panes = HashMap::new();
             for pane_id in 1..=5_u64 {
@@ -467,7 +467,7 @@ fn lab_tailer_shutdown_prevents_follow_up_spawns() {
                     );
                     assert_eq!(initial_tasks.len(), 3);
 
-                    task_shutdown.store(true, Ordering::SeqCst);
+                    task_shutdown.request();
 
                     while let Some((pane_id, outcome)) = initial_tasks.join_next().await {
                         supervisor.handle_poll_result(pane_id, outcome);
@@ -517,7 +517,7 @@ fn lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane() {
             let (tx, mut rx) = mpsc::channel(64);
             let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
             let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let task_source = Arc::clone(&source);
             let task_cursors = Arc::clone(&cursors);

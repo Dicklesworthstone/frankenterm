@@ -1803,6 +1803,8 @@ fn storage_env_flag_enabled(name: &str) -> bool {
 struct WriterWakeup {
     lock: Mutex<()>,
     condvar: std::sync::Condvar,
+    /// Async capture admission waits on actual queue drainage, not a timer.
+    depth_changed: crate::runtime_async::notify::Notify,
     /// Set by [`WriterDisconnectWake`] once the last sender is gone. The last
     /// sender can drop after the writer's empty `try_recv` but before it takes
     /// `lock`; that notification finds no waiter, so `park_for_work` re-checks
@@ -1822,6 +1824,7 @@ impl WriterWakeup {
         Self {
             lock: Mutex::new(()),
             condvar: std::sync::Condvar::new(),
+            depth_changed: crate::runtime_async::notify::Notify::new(),
             senders_gone: AtomicBool::new(false),
             #[cfg(test)]
             parks: AtomicUsize::new(0),
@@ -2370,6 +2373,7 @@ impl Drop for WriterQueueAdmission<'_> {
         if !self.transferred_to_receiver {
             WriteCommandSender::mark_command_dequeued(self.queued_depth);
             self.terminal_drain_wakeup.notify();
+            self.terminal_drain_wakeup.depth_changed.notify_waiters();
         }
     }
 }
@@ -7483,6 +7487,37 @@ impl StorageHandle {
     /// is idle; approaching `write_queue_size` means backpressure.
     pub fn write_queue_depth(&self) -> usize {
         self.write_tx.max_capacity() - self.write_tx.capacity()
+    }
+
+    /// Park capture admission until the writer drains below its live limit.
+    /// Registration precedes the second depth check so a dequeue racing this
+    /// wait cannot be missed. Cancellation is notification-driven as well.
+    pub(crate) async fn wait_for_write_queue_below_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        threshold: usize,
+    ) -> std::result::Result<(), Box<crate::runtime_async::ContextError>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        cx.checkpoint().map_err(Box::new)?;
+        let threshold = threshold.max(1);
+        crate::runtime_async::until_cancelled(cx, async {
+            while self.write_queue_depth() >= threshold {
+                let mut notified =
+                    std::pin::pin!(self.write_tx.terminal_drain_wakeup.depth_changed.notified());
+                std::future::poll_fn(|task_cx| {
+                    let notification = notified.as_mut().poll(task_cx);
+                    if notification.is_ready() || self.write_queue_depth() < threshold {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        })
+        .await
     }
 
     /// Maximum write queue capacity (from `StorageConfig.write_queue_size`).
@@ -14499,6 +14534,7 @@ fn close_and_drain_writer_queue(
         match rx.try_recv() {
             Ok(command) => {
                 WriteCommandSender::mark_command_dequeued(queued_depth);
+                terminal_drain_wakeup.depth_changed.notify_waiters();
                 let _ = fail_undispatched_write_command_recovering(command, failure);
             }
             Err(mpsc::RecvError::Empty) => {
@@ -14633,6 +14669,7 @@ fn writer_loop(
                     linger_blocked |= !is_linger_eligible(&cmd);
                     batch.push_back(cmd);
                 }
+                terminal_drain_wakeup.depth_changed.notify_waiters();
 
                 // [round-4 M8] Adaptive linger: only when the queue drained below
                 // the model's batch target and the whole batch is linger-eligible
@@ -14649,6 +14686,7 @@ fn writer_loop(
                             match rx.try_recv() {
                                 Ok(cmd) => {
                                     WriteCommandSender::mark_command_dequeued(queued_depth);
+                                    terminal_drain_wakeup.depth_changed.notify_waiters();
                                     let eligible = is_linger_eligible(&cmd);
                                     batch.push_back(cmd);
                                     if !eligible {

@@ -14,12 +14,12 @@
 //! implemented.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::config::CliConfig;
+use crate::runtime_async::ShutdownSignal;
 
 /// Historical short-lived `wezterm cli` classifier retained only in tests.
 ///
@@ -70,7 +70,7 @@ struct ProcessEntry {
 /// Enter the fail-closed orphan-cleanup surface.
 ///
 /// The function always returns without inspecting or signalling any process.
-pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>) {
+pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<ShutdownSignal>) {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
 }
@@ -82,7 +82,7 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
 pub async fn run_orphan_reaper_with_cx(
     cx: &crate::cx::Cx,
     config: CliConfig,
-    _shutdown_flag: Arc<AtomicBool>,
+    _shutdown_flag: Arc<ShutdownSignal>,
 ) {
     if cx.is_cancel_requested() {
         debug!("orphan reaper aborted before first cycle: capability context already cancelled");
@@ -201,7 +201,6 @@ fn parse_ps_line_if_reapable(line: &str) -> Option<ProcessEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn default_configuration_disables_global_reaping() {
@@ -446,7 +445,7 @@ mod tests {
         fn run_orphan_reaper_with_cx_pre_cancelled_exits_immediately() {
             run_lab(0x0_1FEA_BED5_0505, || async move {
                 let config = CliConfig::default();
-                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown = Arc::new(ShutdownSignal::new());
 
                 let budget = crate::cx::Budget::new().with_poll_quota(0);
                 let cx = crate::cx::Cx::for_testing_with_budget(budget);
@@ -458,7 +457,7 @@ mod tests {
                 run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;
 
                 assert!(
-                    !shutdown.load(Ordering::SeqCst),
+                    !shutdown.is_requested(),
                     "run_with_cx must return via the Cx path, not the shutdown flag"
                 );
             });
@@ -472,13 +471,13 @@ mod tests {
                     orphan_reap_interval_seconds: 0,
                     ..Default::default()
                 };
-                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown = Arc::new(ShutdownSignal::new());
                 let cx = crate::cx::for_request();
 
                 run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;
 
                 assert!(
-                    !shutdown.load(Ordering::SeqCst),
+                    !shutdown.is_requested(),
                     "interval=0 must not touch the shutdown flag"
                 );
             });
@@ -491,7 +490,7 @@ mod tests {
                     orphan_reap_interval_seconds: 1,
                     ..Default::default()
                 };
-                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown = Arc::new(ShutdownSignal::new());
                 let cx = crate::cx::for_request();
 
                 run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;

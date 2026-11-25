@@ -12,7 +12,6 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 #[cfg(any(unix, windows))]
 use std::sync::atomic::AtomicU64;
 #[cfg(any(unix, windows))]
@@ -26,11 +25,11 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 
-use crate::runtime_async::mpsc;
 #[cfg(any(unix, windows))]
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 #[cfg(any(unix, windows))]
 use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
+use crate::runtime_async::{ShutdownSignal, mpsc};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -40,8 +39,6 @@ use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-#[cfg(any(unix, windows))]
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(unix, windows))]
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 #[cfg(any(unix, windows))]
@@ -1157,7 +1154,7 @@ impl NativeEventListener {
     pub async fn run(
         self,
         event_tx: mpsc::Sender<NativeEvent>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
     ) -> Result<(), NativeEventError> {
         let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
         self.run_with_cx(&cx, event_tx, shutdown_flag).await
@@ -1168,13 +1165,11 @@ impl NativeEventListener {
     ///
     /// Short-circuits before entering the loop if `cx` is already cancelled
     /// or budget-exhausted — an operator who has abandoned the watch should not
-    /// bind subscribers or spawn per-connection tasks. While the loop
-    /// runs each accept poll is bounded via
-    /// [`crate::runtime_async::timeout_with_cx`]. The loop checks the caller's
-    /// context before each accept and again after a successful accept, so it
-    /// cannot spawn a connection task after observed cancellation. Direct
-    /// mid-wait cancellation is observed on a subsequent poll; it is not by
-    /// itself a wakeup source. Matches the
+    /// bind subscribers or spawn per-connection tasks. Accept and capacity
+    /// waits race the shared shutdown signal, whose waiter also registers a
+    /// capability-cancellation wakeup. The loop checks the caller's context
+    /// before each accept and again after a successful accept, so it cannot
+    /// spawn a connection task after observed cancellation. Matches the
     /// Cx-first pattern landed by `EventWaiter::wait_with_cx`
     /// (event_stream.rs), `WorkflowRunner::handle_detection_with_cx`,
     /// and `SurvivalModel::run_cx`.
@@ -1195,8 +1190,10 @@ impl NativeEventListener {
         self,
         cx: &crate::cx::Cx,
         event_tx: mpsc::Sender<NativeEvent>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
     ) -> Result<(), NativeEventError> {
+        use futures::future::{Either, select};
+
         if cx.checkpoint().is_err() {
             debug!(
                 path = %self.socket_path.display(),
@@ -1216,7 +1213,7 @@ impl NativeEventListener {
         let anomaly_counters = Arc::new(NativeListenerAnomalyCounters::default());
 
         loop {
-            if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
+            if shutdown_flag.is_requested() || cx.checkpoint().is_err() {
                 break;
             }
 
@@ -1236,24 +1233,21 @@ impl NativeEventListener {
                             "native event listener waiting for bounded connection capacity"
                         );
                     }
-                    match crate::runtime_async::timeout_with_cx(
-                        cx,
-                        ACCEPT_POLL_INTERVAL,
-                        Arc::clone(&connection_permits).acquire_owned_with_cx(cx),
-                    )
-                    .await
-                    {
-                        Ok(Ok(permit)) => permit,
-                        Ok(Err(AcquireError::Closed)) => {
+                    let shutdown_wait = std::pin::pin!(shutdown_flag.wait(cx));
+                    let capacity_wait =
+                        std::pin::pin!(Arc::clone(&connection_permits).acquire_owned_with_cx(cx));
+                    match select(shutdown_wait, capacity_wait).await {
+                        Either::Left(_) => break,
+                        Either::Right((Ok(permit), _)) => permit,
+                        Either::Right((Err(AcquireError::Closed), _)) => {
                             listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
                             break;
                         }
-                        Ok(Err(_)) if cx.checkpoint().is_err() => break,
-                        Ok(Err(_)) => {
+                        Either::Right((Err(_), _)) if cx.checkpoint().is_err() => break,
+                        Either::Right((Err(_), _)) => {
                             listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
                             break;
                         }
-                        Err(_) => continue,
                     }
                 }
                 Err(TryAcquireError::Closed) => {
@@ -1262,7 +1256,8 @@ impl NativeEventListener {
                 }
             };
 
-            match crate::runtime_async::timeout_with_cx(cx, ACCEPT_POLL_INTERVAL, async {
+            let shutdown_wait = std::pin::pin!(shutdown_flag.wait(cx));
+            let accept_wait = std::pin::pin!(async {
                 #[cfg(unix)]
                 {
                     self.listener.accept().await
@@ -1271,10 +1266,13 @@ impl NativeEventListener {
                 {
                     self.listener.accept_with_cx(cx).await
                 }
-            })
-            .await
-            {
-                Ok(Ok((stream, _addr))) => {
+            });
+            let accept_result = match select(shutdown_wait, accept_wait).await {
+                Either::Left(_) => break,
+                Either::Right((result, _)) => result,
+            };
+            match accept_result {
+                Ok((stream, _addr)) => {
                     accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
                     consecutive_accept_errors = 0;
                     // The accept future can become ready in the same scheduler
@@ -1351,7 +1349,7 @@ impl NativeEventListener {
                             connection_tasks.insert_handle(handle);
                         }
                         Err(error) => {
-                            let shutdown_observed = shutdown_flag.load(Ordering::SeqCst)
+                            let shutdown_observed = shutdown_flag.is_requested()
                                 || (native_spawn_error_may_be_shutdown_race(error.code())
                                     && cx.checkpoint().is_err());
                             match classify_native_spawn_failure(
@@ -1405,7 +1403,7 @@ impl NativeEventListener {
                         }
                     }
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     if native_accept_error_is_permanent(&err) {
                         warn!(
                             error = %err,
@@ -1439,12 +1437,6 @@ impl NativeEventListener {
                         .saturating_mul(2)
                         .min(ACCEPT_ERROR_MAX_BACKOFF);
                 }
-                // `timeout_with_cx` returns Err on either the poll
-                // interval elapsing OR the Cx being cancelled. Either
-                // way we want to loop and re-evaluate shutdown /
-                // cancellation on the next iteration — no need to
-                // disambiguate here.
-                Err(_) => {}
             }
 
             while let Some(join_result) = connection_tasks.try_join_next() {
@@ -1576,7 +1568,7 @@ impl NativeEventListener {
     pub async fn run(
         self,
         event_tx: mpsc::Sender<NativeEvent>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
     ) -> Result<(), NativeEventError> {
         let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
         self.run_with_cx(&cx, event_tx, shutdown_flag).await
@@ -1587,7 +1579,7 @@ impl NativeEventListener {
         self,
         _cx: &crate::cx::Cx,
         _event_tx: mpsc::Sender<NativeEvent>,
-        _shutdown_flag: Arc<AtomicBool>,
+        _shutdown_flag: Arc<ShutdownSignal>,
     ) -> Result<(), NativeEventError> {
         let _ = self;
         Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
@@ -1595,8 +1587,8 @@ impl NativeEventListener {
 }
 
 #[cfg(any(unix, windows))]
-fn native_connection_spawn_allowed(cx: &crate::cx::Cx, shutdown_flag: &AtomicBool) -> bool {
-    !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok()
+fn native_connection_spawn_allowed(cx: &crate::cx::Cx, shutdown_flag: &ShutdownSignal) -> bool {
+    !shutdown_flag.is_requested() && cx.checkpoint().is_ok()
 }
 
 #[cfg(any(unix, windows))]
@@ -2566,10 +2558,7 @@ mod transport_roundtrip_tests {
     use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
 
     fn run_async_test<F>(future: F)
     where
@@ -2611,7 +2600,7 @@ mod transport_roundtrip_tests {
                 .await
                 .expect("bind native event listener");
             let (event_tx, mut event_rx) = mpsc::channel(4);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let handle =
                 crate::runtime_async::task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -2653,7 +2642,7 @@ mod transport_roundtrip_tests {
                 other => fail(format!("unexpected native event: {other:?}")),
             }
 
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             crate::runtime_async::timeout(Duration::from_secs(2), handle)
                 .await
                 .expect("native event listener shutdown timed out")
@@ -2707,7 +2696,6 @@ mod tests {
     use crate::runtime_async::task;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use proptest::prelude::*;
-    use std::sync::atomic::AtomicBool;
 
     fn fail(message: impl Into<String>) -> ! {
         std::panic::panic_any(message.into())
@@ -3340,13 +3328,13 @@ mod tests {
     #[test]
     fn accepted_connection_requires_live_context_and_open_shutdown_gate() {
         let active_cx = crate::cx::for_testing();
-        let shutdown = AtomicBool::new(false);
+        let shutdown = ShutdownSignal::new();
         assert!(native_connection_spawn_allowed(&active_cx, &shutdown));
 
-        shutdown.store(true, Ordering::SeqCst);
+        shutdown.request();
         assert!(!native_connection_spawn_allowed(&active_cx, &shutdown));
 
-        shutdown.store(false, Ordering::SeqCst);
+        let shutdown = ShutdownSignal::new();
         let cancelled_cx = crate::cx::for_testing();
         cancelled_cx.cancel_with(
             crate::outcome::CancelKind::User,
@@ -3522,7 +3510,7 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `run_with_cx` must return promptly when the
     /// caller's capability context is already cancelled on entry. A
     /// pre-cancelled wait should not enter the accept loop, spawn any
-    /// connection tasks, or consume a real `ACCEPT_POLL_INTERVAL` tick.
+    /// connection tasks, or wait for a connection.
     ///
     /// This mirrors the short-circuit contract landed for
     /// `EventWaiter::wait_with_cx` (event_stream.rs) — operators who have
@@ -3536,10 +3524,10 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, _event_rx) = mpsc::channel::<NativeEvent>(4);
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
 
             // Pre-cancel the Cx. No shutdown flag will ever be set, so a
-            // Cx-unaware run loop would block forever on the accept poll.
+            // Cx-unaware run loop would block forever on socket acceptance.
             let budget = crate::cx::Budget::new().with_poll_quota(0);
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
             cx.cancel_with(
@@ -3560,7 +3548,7 @@ mod tests {
                 wall_start.elapsed()
             );
             assert!(
-                !shutdown_flag.load(Ordering::SeqCst),
+                !shutdown_flag.is_requested(),
                 "run_with_cx must return via Cx cancellation path, not \
                  shutdown flag"
             );
@@ -3578,7 +3566,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(8);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -3606,7 +3594,7 @@ mod tests {
             }
 
             drop(stream);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }
@@ -3620,7 +3608,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(16);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -3647,7 +3635,7 @@ mod tests {
             assert!(matches!(ev2, NativeEvent::PaneDestroyed { pane_id: 1, .. }));
 
             drop(stream);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }
@@ -3661,7 +3649,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(16);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -3690,7 +3678,7 @@ mod tests {
             ));
 
             drop(stream);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }
@@ -3704,7 +3692,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(16);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -3752,7 +3740,7 @@ mod tests {
             ));
 
             drop(stream_two);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }
@@ -3766,7 +3754,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(16);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -3793,7 +3781,7 @@ mod tests {
             ));
 
             drop(stream);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }
@@ -3807,13 +3795,13 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, _event_rx) = mpsc::channel(8);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let shutdown_clone = Arc::clone(&shutdown);
             let handle = task::spawn(listener.run(event_tx, shutdown_clone));
 
             // Set shutdown flag
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
 
             // Listener should exit within a few poll intervals
             assert_listener_shutdown(handle).await;
@@ -3834,7 +3822,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(8);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
             let mut stream = event_socket::connect(socket_path)
@@ -3861,7 +3849,7 @@ mod tests {
 
             // Keep `stream` open and silent. Without explicit child abort the
             // listener's join drain blocks forever in the next line read.
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
             drop(stream);
         });
@@ -4331,7 +4319,7 @@ mod tests {
             assert!(MAX_EVENT_LINE_BYTES > 0);
             assert!(MAX_OUTPUT_BYTES > 0);
         };
-        assert!(!ACCEPT_POLL_INTERVAL.is_zero());
+        assert!(!ACCEPT_ERROR_INITIAL_BACKOFF.is_zero());
         assert!(!EVENT_SEND_TIMEOUT.is_zero());
     }
 
@@ -4635,7 +4623,7 @@ mod tests {
                 .await
                 .expect("bind listener");
             let (event_tx, mut event_rx) = mpsc::channel(4096);
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownSignal::new());
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
@@ -4676,7 +4664,7 @@ mod tests {
             );
 
             drop(stream);
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.request();
             assert_listener_shutdown(handle).await;
         });
     }

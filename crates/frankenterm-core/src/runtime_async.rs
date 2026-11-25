@@ -2411,6 +2411,87 @@ pub mod notify {
     pub use asupersync::sync::Notify;
 }
 
+/// Sticky, notification-driven shutdown shared by a runtime and its tasks.
+///
+/// Reads use an atomic fast path. Requesting shutdown publishes the state
+/// before waking every registered waiter, and late waiters observe the same
+/// request without needing another notification. A signal cannot be reset;
+/// a new runtime must create a new signal.
+pub struct ShutdownSignal {
+    requested: std::sync::atomic::AtomicBool,
+    notification: notify::Notify,
+}
+
+impl ShutdownSignal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+            notification: notify::Notify::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Request shutdown and wake all tasks waiting for it.
+    ///
+    /// Returns whether shutdown had already been requested.
+    pub fn request(&self) -> bool {
+        let already_requested = self
+            .requested
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        if !already_requested {
+            self.notification.notify_waiters();
+        }
+        already_requested
+    }
+
+    /// Wait without a timer until shutdown or capability cancellation.
+    ///
+    /// A request racing waiter registration cannot be missed: after polling
+    /// the notification future to register its waker, check the sticky state
+    /// again before returning `Pending`. As with [`until_cancelled`], an
+    /// already-ready shutdown request wins over simultaneous cancellation.
+    pub async fn wait(&self, cx: &crate::cx::Cx) -> Result<(), Box<ContextError>> {
+        use std::task::Poll;
+
+        let mut notified = std::pin::pin!(self.notification.notified());
+        until_cancelled(
+            cx,
+            std::future::poll_fn(|task_cx| {
+                if self.is_requested() {
+                    return Poll::Ready(());
+                }
+                let notification = notified.as_mut().poll(task_cx);
+                if notification.is_ready() || self.is_requested() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+    }
+}
+
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ShutdownSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShutdownSignal")
+            .field("requested", &self.is_requested())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Task primitives for the asupersync runtime.
 ///
 /// Provides API-compatible wrappers around asupersync's spawn/join
@@ -15036,6 +15117,99 @@ mod tests {
     // ========================================================================
     // Notify tests
     // ========================================================================
+
+    #[test]
+    fn shutdown_signal_observes_requests_before_waiter_registration() {
+        let cx = crate::cx::for_testing();
+        let signal = ShutdownSignal::new();
+        let mut waiter = std::pin::pin!(signal.wait(&cx));
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+
+        assert!(!signal.request());
+        assert!(signal.is_requested());
+        assert!(matches!(
+            waiter.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(probe.count(), 0, "a late waiter must not self-wake");
+
+        let mut late_waiter = std::pin::pin!(signal.wait(&cx));
+        assert!(matches!(
+            late_waiter.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn shutdown_signal_wakes_every_waiter_once_and_stays_requested() {
+        let cx = crate::cx::for_testing();
+        let signal = ShutdownSignal::default();
+        let (first_probe, first_waker) = probe_waker(false);
+        let (second_probe, second_waker) = probe_waker(false);
+        let mut first_context = std::task::Context::from_waker(&first_waker);
+        let mut second_context = std::task::Context::from_waker(&second_waker);
+        let mut first = Box::pin(signal.wait(&cx));
+        let mut second = Box::pin(signal.wait(&cx));
+
+        assert!(!signal.is_requested());
+        assert!(first.as_mut().poll(&mut first_context).is_pending());
+        assert!(second.as_mut().poll(&mut second_context).is_pending());
+        assert_eq!(first_probe.count(), 0, "idle wait must not self-wake");
+        assert_eq!(second_probe.count(), 0, "idle wait must not self-wake");
+
+        assert!(!signal.request());
+        assert_eq!(first_probe.count(), 1);
+        assert_eq!(second_probe.count(), 1);
+        assert!(signal.request(), "the request must be sticky");
+        assert_eq!(first_probe.count(), 1, "repeat requests must not broadcast");
+        assert_eq!(second_probe.count(), 1);
+        assert!(matches!(
+            first.as_mut().poll(&mut first_context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            second.as_mut().poll(&mut second_context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn shutdown_signal_dropped_waiter_does_not_receive_a_wake() {
+        let cx = crate::cx::for_testing();
+        let signal = ShutdownSignal::new();
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiter = Box::pin(signal.wait(&cx));
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        drop(waiter);
+
+        signal.request();
+        assert_eq!(probe.count(), 0, "dropped waiters must be unregistered");
+    }
+
+    #[test]
+    fn shutdown_signal_wait_observes_capability_cancellation() {
+        let cx = crate::cx::for_testing();
+        let signal = ShutdownSignal::new();
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiter = Box::pin(signal.wait(&cx));
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("shutdown wait proof"),
+        );
+        assert_eq!(probe.count(), 1, "cancellation must wake the waiter");
+        let std::task::Poll::Ready(Err(error)) = waiter.as_mut().poll(&mut context) else {
+            panic!("capability cancellation must end the pending shutdown wait");
+        };
+        assert_eq!(error.kind(), ContextErrorKind::Cancelled);
+        assert!(
+            !signal.is_requested(),
+            "cancelling one wait is not shutdown"
+        );
+    }
 
     #[test]
     fn notify_one_wakes_waiter() {

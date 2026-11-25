@@ -6,10 +6,9 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
@@ -18,9 +17,10 @@ use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
 use crate::runtime_async::io::AsyncWriteExt;
 use crate::runtime_async::net::{TcpListener, TcpStream};
+#[cfg(all(test, feature = "metrics"))]
 use crate::runtime_async::notify::Notify;
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement, SpawnError};
-use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
+use crate::runtime_async::{AcquireError, Semaphore, ShutdownSignal, TryAcquireError};
 use tracing::{debug, warn};
 
 /// Boxed future for async trait-like APIs without additional dependencies.
@@ -726,7 +726,7 @@ pub struct MetricsServer {
     bind: String,
     prefix: String,
     collector: Arc<dyn MetricsCollector>,
-    shutdown_flag: Arc<AtomicBool>,
+    shutdown_flag: Arc<ShutdownSignal>,
     /// Must be set to `true` to bind on non-localhost addresses.
     allow_public_bind: bool,
     #[cfg(all(test, feature = "metrics"))]
@@ -741,7 +741,7 @@ impl MetricsServer {
         bind: impl Into<String>,
         prefix: impl Into<String>,
         collector: Arc<dyn MetricsCollector>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown_flag: Arc<ShutdownSignal>,
     ) -> Self {
         Self {
             bind: bind.into(),
@@ -783,13 +783,9 @@ impl MetricsServer {
     /// Start the metrics server bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.3 Cx-first entry point).
     ///
-    /// Clones `cx` into the spawned accept-loop task so budget-driven
-    /// cancellation from the outer scope propagates through to the
-    /// accept-poll timeout via
-    /// [`crate::runtime_async::timeout_with_cx`]. Both the
-    /// `shutdown_flag` and `cx.is_cancel_requested()` are checked each
-    /// loop iteration so either cancellation path terminates the server
-    /// promptly without waiting on the 250ms accept poll.
+    /// Clones `cx` into the spawned accept-loop task. Socket acceptance and
+    /// connection-capacity waits race the shared shutdown signal, whose waiter
+    /// also observes capability cancellation. An idle server arms no poll timer.
     ///
     /// Pre-flight: if `cx` is already cancelled on entry, the method
     /// returns `Err(Error::RuntimeOperation { .. })` without attempting to bind
@@ -829,8 +825,6 @@ impl MetricsServer {
         let collector = Arc::clone(&self.collector);
         let handle_shutdown_flag = Arc::clone(&self.shutdown_flag);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        let shutdown_notify = Arc::new(Notify::new());
-        let task_shutdown_notify = Arc::clone(&shutdown_notify);
         #[cfg(all(test, feature = "metrics"))]
         let connection_test_probe = self.connection_test_probe.clone();
         #[cfg(all(test, feature = "metrics"))]
@@ -840,7 +834,6 @@ impl MetricsServer {
         let join = crate::runtime_async::task::spawn_with_cx(cx, move |accept_cx| async move {
             use futures::future::{Either, select};
 
-            let accept_poll_interval = Duration::from_millis(250);
             let mut connection_tasks = JoinSet::new();
             // Do not let stalled scrapers consume the runtime's global task
             // admission budget. Each connection also carries an I/O deadline
@@ -860,7 +853,7 @@ impl MetricsServer {
                     }
                 }
 
-                if shutdown_flag.load(Ordering::SeqCst) || accept_cx.checkpoint().is_err() {
+                if shutdown_flag.is_requested() || accept_cx.checkpoint().is_err() {
                     break;
                 }
 
@@ -868,8 +861,7 @@ impl MetricsServer {
                 // all scrapers are stalled, leaving clients in the kernel
                 // backlog applies backpressure without an accept/drop/log hot
                 // loop on the runtime thread. The contended path wakes as soon
-                // as a permit is released and polls shutdown at most every
-                // accept interval.
+                // as a permit is released or shutdown/cancellation is requested.
                 let connection_permit = match Arc::clone(&connection_permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(TryAcquireError::NoPermits) => {
@@ -885,26 +877,20 @@ impl MetricsServer {
                                 "Metrics listener waiting for bounded connection capacity"
                             );
                         }
-                        let shutdown_wait = std::pin::pin!(
-                            task_shutdown_notify
-                                .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+                        let shutdown_wait = std::pin::pin!(shutdown_flag.wait(&accept_cx));
+                        let capacity_wait = std::pin::pin!(
+                            Arc::clone(&connection_permits).acquire_owned_with_cx(&accept_cx)
                         );
-                        let capacity_wait = std::pin::pin!(crate::runtime_async::timeout_with_cx(
-                            &accept_cx,
-                            accept_poll_interval,
-                            Arc::clone(&connection_permits).acquire_owned_with_cx(&accept_cx),
-                        ));
                         match select(shutdown_wait, capacity_wait).await {
-                            Either::Left(((), _)) => break,
-                            Either::Right((Ok(Ok(permit)), _)) => permit,
-                            Either::Right((Ok(Err(AcquireError::Closed)), _)) => {
+                            Either::Left(_) => break,
+                            Either::Right((Ok(permit), _)) => permit,
+                            Either::Right((Err(AcquireError::Closed), _)) => {
                                 warn!(
                                     "Metrics connection admission semaphore closed; stopping listener"
                                 );
                                 break;
                             }
-                            Either::Right((Ok(Err(_)), _)) => break,
-                            Either::Right((Err(_), _)) => continue,
+                            Either::Right((Err(_), _)) => break,
                         }
                     }
                     Err(TryAcquireError::Closed) => {
@@ -913,23 +899,17 @@ impl MetricsServer {
                     }
                 };
 
-                let shutdown_wait = std::pin::pin!(
-                    task_shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
-                );
-                let accept_wait = std::pin::pin!(crate::runtime_async::timeout_with_cx(
-                    &accept_cx,
-                    accept_poll_interval,
-                    listener.accept(),
-                ));
+                let shutdown_wait = std::pin::pin!(shutdown_flag.wait(&accept_cx));
+                let accept_wait = std::pin::pin!(listener.accept());
                 let accept_result = match select(shutdown_wait, accept_wait).await {
-                    Either::Left(((), _)) => break,
+                    Either::Left(_) => break,
                     Either::Right((result, _)) => result,
                 };
 
                 match accept_result {
-                    Ok(Ok((socket, peer))) => {
+                    Ok((socket, peer)) => {
                         accept_error_backoff.reset();
-                        if shutdown_flag.load(Ordering::SeqCst) || accept_cx.checkpoint().is_err() {
+                        if shutdown_flag.is_requested() || accept_cx.checkpoint().is_err() {
                             drop(socket);
                             break;
                         }
@@ -972,15 +952,12 @@ impl MetricsServer {
                                         "Metrics connection task region is at capacity; applying bounded retry backoff"
                                     );
                                 }
-                                let shutdown_wait = std::pin::pin!(
-                                    task_shutdown_notify
-                                        .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
-                                );
+                                let shutdown_wait = std::pin::pin!(shutdown_flag.wait(&accept_cx));
                                 let retry_wait = std::pin::pin!(
                                     crate::runtime_async::sleep_with_cx(&accept_cx, retry_delay,)
                                 );
                                 match select(shutdown_wait, retry_wait).await {
-                                    Either::Left(((), _)) | Either::Right((Err(_), _)) => break,
+                                    Either::Left(_) | Either::Right((Err(_), _)) => break,
                                     Either::Right((Ok(()), _)) => {}
                                 }
                             }
@@ -993,7 +970,7 @@ impl MetricsServer {
                             }
                         }
                     }
-                    Ok(Err(err)) => {
+                    Err(err) => {
                         if metrics_accept_error_is_permanent(&err) {
                             warn!(
                                 error = %err,
@@ -1016,24 +993,16 @@ impl MetricsServer {
                                 "Metrics listener accept failed; applying bounded retry backoff"
                             );
                         }
-                        let shutdown_wait = std::pin::pin!(
-                            task_shutdown_notify
-                                .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
-                        );
+                        let shutdown_wait = std::pin::pin!(shutdown_flag.wait(&accept_cx));
                         let retry_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                             &accept_cx,
                             retry_delay,
                         ));
                         match select(shutdown_wait, retry_wait).await {
-                            Either::Left(((), _)) | Either::Right((Err(_), _)) => break,
+                            Either::Left(_) | Either::Right((Err(_), _)) => break,
                             Either::Right((Ok(()), _)) => {}
                         }
                     }
-                    // `timeout_with_cx` returns Err on either the poll
-                    // interval elapsing OR the Cx being cancelled. Loop
-                    // and re-evaluate shutdown / cancellation on the
-                    // next iteration.
-                    Err(_) => {}
                 }
             }
 
@@ -1083,11 +1052,7 @@ impl MetricsServer {
         });
 
         Ok(MetricsServerHandle {
-            task: crate::watchdog::WatchdogHandle::adopt_shutdown_task_with_notify(
-                join,
-                handle_shutdown_flag,
-                shutdown_notify,
-            ),
+            task: crate::watchdog::WatchdogHandle::adopt_shutdown_task(join, handle_shutdown_flag),
             local_addr,
         })
     }
@@ -1620,6 +1585,7 @@ fn escape_prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn metrics_accept_error_classifier_stops_permanent_failures() {
@@ -2575,10 +2541,10 @@ mod tests {
     }
 
     async fn stop_metrics_test_server(
-        shutdown_flag: &Arc<AtomicBool>,
+        shutdown_flag: &Arc<ShutdownSignal>,
         handle: MetricsServerHandle,
     ) {
-        shutdown_flag.store(true, Ordering::SeqCst);
+        shutdown_flag.request();
         crate::runtime_async::timeout(Duration::from_secs(5), handle.wait())
             .await
             .expect("metrics test server must settle before the safety timeout");
@@ -2678,7 +2644,7 @@ mod tests {
                 cost_attribution_estimates: Vec::new(),
             };
 
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(snapshot));
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
             let handle = server.start().await.expect("metrics server start");
@@ -2697,7 +2663,7 @@ mod tests {
             assert!(response.contains("200 OK"));
             assert!(response.contains("wa_segments_persisted_total"));
 
-            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_flag.request();
             handle.wait().await;
         });
     }
@@ -2719,7 +2685,7 @@ mod tests {
     fn metrics_server_start_with_cx_pre_cancelled_refuses_to_bind() {
         run_async_test(async {
             let snapshot = MetricsSnapshot::default();
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(snapshot));
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
 
@@ -2742,7 +2708,7 @@ mod tests {
                 "pre-cancelled start_with_cx must surface a cancellation-shaped error, got: {msg}"
             );
             assert!(
-                !shutdown_flag.load(Ordering::SeqCst),
+                !shutdown_flag.is_requested(),
                 "Cx-cancelled start must not touch the shutdown flag"
             );
         });
@@ -2759,7 +2725,7 @@ mod tests {
                 observed_panes: 42,
                 ..MetricsSnapshot::default()
             };
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(snapshot));
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
             let cx = crate::cx::for_request();
@@ -2783,7 +2749,7 @@ mod tests {
             assert!(response.contains("200 OK"));
             assert!(response.contains("wa_observed_panes"));
 
-            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_flag.request();
             handle.wait().await;
         });
     }
@@ -2791,7 +2757,7 @@ mod tests {
     #[test]
     fn metrics_server_caps_stalled_connections_and_admits_waiter_after_release() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
             let server =
@@ -2861,7 +2827,7 @@ mod tests {
     #[test]
     fn metrics_server_shutdown_wakes_capacity_wait_and_settles_stalled_tasks() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
             let server =
@@ -2901,7 +2867,7 @@ mod tests {
     #[test]
     fn metrics_server_drops_silent_connection_after_real_io_timeout() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
             let server =
@@ -2956,7 +2922,7 @@ mod tests {
     #[test]
     fn metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
             let cx = crate::cx::for_request();
@@ -2972,7 +2938,7 @@ mod tests {
                 Some("mid-flight cancel of metrics accept loop"),
             );
             assert!(
-                !shutdown_flag.load(Ordering::SeqCst),
+                !shutdown_flag.is_requested(),
                 "cx cancellation must not directly mutate the shutdown flag"
             );
 
@@ -2994,7 +2960,7 @@ mod tests {
             // Joining owns terminal settlement and deliberately latches the
             // shared flag even when the task already observed cx cancellation.
             assert!(
-                shutdown_flag.load(Ordering::SeqCst),
+                shutdown_flag.is_requested(),
                 "handle settlement must latch the shutdown flag"
             );
         });
@@ -3006,7 +2972,7 @@ mod tests {
     #[test]
     fn metrics_server_wait_with_precancelled_cx_returns_quickly() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
 
@@ -3028,7 +2994,7 @@ mod tests {
             );
 
             assert!(
-                shutdown_flag.load(Ordering::SeqCst),
+                shutdown_flag.is_requested(),
                 "wait_with_cx must signal the shared shutdown flag before joining"
             );
         });
@@ -3037,7 +3003,7 @@ mod tests {
     #[test]
     fn metrics_server_refuses_public_bind_without_opt_in() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let server = MetricsServer::new("0.0.0.0:0", "wa", collector, shutdown_flag);
 
@@ -3056,7 +3022,7 @@ mod tests {
     #[test]
     fn metrics_server_allows_public_bind_with_opt_in() {
         run_async_test(async {
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::new(ShutdownSignal::new());
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let server =
                 MetricsServer::new("0.0.0.0:0", "wa", collector, Arc::clone(&shutdown_flag))
@@ -3066,7 +3032,7 @@ mod tests {
                 .start()
                 .await
                 .expect("public bind allowed with opt-in");
-            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_flag.request();
             handle.wait().await;
         });
     }

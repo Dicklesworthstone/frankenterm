@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +14,9 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc};
+use frankenterm_core::runtime_async::{
+    CompatRuntime, RuntimeBuilder, RwLock, ShutdownSignal, mpsc,
+};
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -133,7 +134,7 @@ fn egress_tap_fires_on_delta_capture() {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
 
         source.set_text(1, "$ prompt\nline1\nline2\n").await;
@@ -199,7 +200,7 @@ fn egress_tap_captures_gap_segments() {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
 
         source.set_text(1, "initial content").await;
@@ -261,7 +262,7 @@ fn egress_tap_multi_pane() {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
 
         source.set_text(10, "pane ten content").await;
@@ -312,7 +313,7 @@ fn independent_supervisors_emit_deterministic_pane_local_sequences() {
         let right_cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let left_registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let right_registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
         let left_pane = 101;
         let right_pane = 202;
@@ -392,7 +393,7 @@ fn egress_tap_not_set_still_works() {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
 
         source.set_text(1, "some text").await;
@@ -433,7 +434,7 @@ fn egress_monotonic_sequence() {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(ShutdownSignal::new());
         let source = Arc::new(FakePaneSource::new());
 
         source.set_text(1, "aaaa\nbbbb\ncccc\ndddd\neeee\n").await;
