@@ -17,7 +17,7 @@ use crate::policy::Redactor;
 use crate::storage::{SecretScanReportRecord, Segment, SegmentScanQuery, StorageHandle};
 
 /// Current report schema version for secret scans.
-pub const SECRET_SCAN_REPORT_VERSION: u32 = 1;
+pub const SECRET_SCAN_REPORT_VERSION: u32 = 2;
 
 fn secret_scan_cancelled_error(
     operation: &'static str,
@@ -80,7 +80,10 @@ impl SecretScanScope {
     }
 }
 
-/// Compute a stable scope hash for secret scan reports.
+/// Compute a stable identity for a secret scan's filters.
+///
+/// Incremental checkpoints also depend on the redaction policy. Use
+/// [`SecretScanEngine::checkpoint_key`] when looking up a persisted report.
 pub fn scope_hash(options: &SecretScanOptions) -> Result<String> {
     let scope = SecretScanScope::from_options(options);
     let scope_json = serde_json::to_string(&scope)?;
@@ -109,6 +112,8 @@ pub struct SecretScanSample {
 pub struct SecretScanReport {
     /// Report schema version.
     pub report_version: u32,
+    /// Fingerprint of the effective built-in and configured secret policy.
+    pub catalog_version: String,
     /// Scan scope (filters).
     pub scope: SecretScanScope,
     /// When the scan started (epoch ms).
@@ -132,10 +137,11 @@ pub struct SecretScanReport {
 }
 
 impl SecretScanReport {
-    fn new(scope: SecretScanScope, resume_after_id: Option<i64>) -> Self {
+    fn new(scope: SecretScanScope, resume_after_id: Option<i64>, catalog_version: String) -> Self {
         let now = now_ms();
         Self {
             report_version: SECRET_SCAN_REPORT_VERSION,
+            catalog_version,
             scope,
             started_at: now,
             completed_at: now,
@@ -151,18 +157,45 @@ impl SecretScanReport {
 }
 
 /// Secret scanning engine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SecretScanEngine {
     redactor: Redactor,
+    catalog_version: String,
+}
+
+impl Default for SecretScanEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SecretScanEngine {
     /// Create a new scanner using the default redaction patterns.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_redactor(Redactor::new())
+    }
+
+    /// Create a scanner with the same immutable policy as the workspace's
+    /// persistence and outbound reads. Built-in protections remain enabled.
+    #[must_use]
+    pub fn with_redactor(redactor: Redactor) -> Self {
         Self {
-            redactor: Redactor::new(),
+            catalog_version: redactor.policy_version(),
+            redactor,
         }
+    }
+
+    /// Identify an incremental checkpoint by filters, effective policy, and
+    /// scan semantics. A policy update starts a fresh scan over historical
+    /// rows instead of skipping them using an earlier catalog's cursor.
+    pub fn checkpoint_key(&self, options: &SecretScanOptions) -> Result<String> {
+        let identity = serde_json::to_string(&(
+            SECRET_SCAN_REPORT_VERSION,
+            scope_hash(options)?,
+            &self.catalog_version,
+        ))?;
+        Ok(hash_bytes(identity.as_bytes()))
     }
 
     /// Scan stored segments for secrets using the redaction patterns.
@@ -229,7 +262,7 @@ impl SecretScanEngine {
 
         let scope = SecretScanScope::from_options(&options);
         let scope_json = serde_json::to_string(&scope)?;
-        let scope_hash = hash_bytes(scope_json.as_bytes());
+        let scope_hash = self.checkpoint_key(&options)?;
         let checkpoint = storage
             .latest_secret_scan_report_with_cx(cx, &scope_hash)
             .await?;
@@ -273,7 +306,7 @@ impl SecretScanEngine {
         }
 
         let scope = SecretScanScope::from_options(&options);
-        let mut report = SecretScanReport::new(scope, resume_after_id);
+        let mut report = SecretScanReport::new(scope, resume_after_id, self.catalog_version.clone());
         let mut after_id = resume_after_id;
 
         loop {
@@ -418,7 +451,7 @@ mod tests {
     fn make_report() -> SecretScanReport {
         let options = SecretScanOptions::default();
         let scope = SecretScanScope::from_options(&options);
-        SecretScanReport::new(scope, None)
+        SecretScanReport::new(scope, None, Redactor::new().policy_version())
     }
 
     fn make_pane(pane_id: u64) -> PaneRecord {
@@ -651,7 +684,7 @@ mod tests {
     #[test]
     fn new_report_with_resume_preserves_resume_id() {
         let scope = SecretScanScope::default();
-        let report = SecretScanReport::new(scope, Some(42));
+        let report = SecretScanReport::new(scope, Some(42), Redactor::new().policy_version());
         assert_eq!(report.resume_after_id, Some(42));
     }
 
@@ -1313,6 +1346,95 @@ mod tests {
         });
     }
 
+    #[test]
+    fn configured_secret_scan_rescans_history_after_policy_changes() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("configured_policy").await;
+            let blue = "internal-blue-314159";
+            let green = "internal-green-271828";
+            assert!(!Redactor::new().contains_secrets(blue));
+            assert!(!Redactor::new().contains_secrets(green));
+            insert_raw_secret_scan_fixture(&db_path, 1, blue);
+            insert_raw_secret_scan_fixture(&db_path, 1, green);
+            storage.upsert_pane(make_pane(2)).await.unwrap();
+            insert_raw_secret_scan_fixture(&db_path, 2, blue);
+
+            let options = SecretScanOptions {
+                pane_id: Some(1),
+                batch_size: 1,
+                ..Default::default()
+            };
+            let builtin = SecretScanEngine::new();
+            let initial = builtin
+                .scan_storage_incremental(&storage, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(initial.scanned_segments, 2);
+            assert_eq!(initial.matches_total, 0);
+
+            let mut config = crate::config::RedactionConfig {
+                patterns: vec!["internal-blue-[0-9]+".to_string()],
+                placeholder: "[PRIVATE]".to_string(),
+                ..Default::default()
+            };
+            let blue_engine = SecretScanEngine::with_redactor(config.build_redactor().unwrap());
+            let first = blue_engine
+                .scan_storage_incremental(&storage, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(first.resume_after_id, None);
+            assert_eq!(first.scanned_segments, 2);
+            assert_eq!(first.matches_total, 1);
+            assert_eq!(first.samples[0].pane_id, 1);
+            assert_eq!(first.samples[0].secret_hash, hash_secret(blue));
+            assert_ne!(first.catalog_version, initial.catalog_version);
+            let serialized = serde_json::to_string(&first).unwrap();
+            assert!(!serialized.contains(blue));
+            assert!(!serialized.contains("internal-blue-[0-9]+"));
+
+            // Reusing the same policy keeps the cursor; operational page/sample
+            // controls are not a new scope and must not restart a full scan.
+            let mut smaller = options.clone();
+            smaller.batch_size = 2;
+            smaller.sample_limit = 0;
+            assert_eq!(
+                blue_engine.checkpoint_key(&options).unwrap(),
+                blue_engine.checkpoint_key(&smaller).unwrap()
+            );
+            let resumed = blue_engine
+                .scan_storage_incremental(&storage, smaller)
+                .await
+                .unwrap();
+            assert_eq!(resumed.resume_after_id, first.last_segment_id);
+            assert_eq!(resumed.scanned_segments, 0);
+
+            config.patterns.push("internal-green-[0-9]+".to_string());
+            let both = SecretScanEngine::with_redactor(config.build_redactor().unwrap());
+            let rescanned = both
+                .scan_storage_incremental(&storage, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(rescanned.resume_after_id, None);
+            assert_eq!(rescanned.scanned_segments, 2);
+            assert_eq!(rescanned.matches_total, 2);
+            assert_ne!(rescanned.catalog_version, first.catalog_version);
+            assert!(rescanned.samples.iter().all(|sample| sample.pane_id == 1));
+
+            // The report command uses this same policy-bound lookup. A report
+            // for the previous policy remains separate from the current one.
+            let saved = storage
+                .latest_secret_scan_report(&both.checkpoint_key(&options).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let saved_report: SecretScanReport = serde_json::from_str(&saved.report_json).unwrap();
+            assert_eq!(saved_report.catalog_version, rescanned.catalog_version);
+            assert_eq!(saved_report.matches_total, 2);
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
     // ========================================================================
     // Report serialization
     // ========================================================================
@@ -1930,8 +2052,8 @@ mod tests {
     // ── Constants ──
 
     #[test]
-    fn secret_scan_report_version_is_one() {
-        assert_eq!(SECRET_SCAN_REPORT_VERSION, 1);
+    fn secret_scan_report_version_identifies_policy_bound_reports() {
+        assert_eq!(SECRET_SCAN_REPORT_VERSION, 2);
     }
 
     // ── scope_hash edge cases ──

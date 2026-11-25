@@ -69615,8 +69615,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         Some(Commands::Secrets { command }) => {
             use frankenterm_core::output::{OutputFormat, detect_format};
             use frankenterm_core::secrets::{
-                SecretScanEngine, SecretScanOptions, SecretScanReport, scope_hash,
+                SecretScanEngine, SecretScanOptions, SecretScanReport,
             };
+
+            let engine = SecretScanEngine::with_redactor(config.safety.redaction.build_redactor()?);
 
             let layout = match config.workspace_layout(Some(&workspace_root)) {
                 Ok(l) => l,
@@ -69628,10 +69630,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             };
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -69673,7 +69676,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         sample_limit,
                     };
 
-                    let engine = SecretScanEngine::new();
                     // ft-xbnl0.2.3 tick 253: cx-first secret scan.
                     let secret_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -69703,7 +69705,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         until,
                         ..Default::default()
                     };
-                    let scope = match scope_hash(&options) {
+                    let scope = match engine.checkpoint_key(&options) {
                         Ok(value) => value,
                         Err(e) => {
                             eprintln!("Error: Failed to compute scope hash: {e}");
@@ -69728,7 +69730,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let record = match record {
                         Some(record) => record,
                         None => {
-                            eprintln!("No secret scan report found for this scope.");
+                            eprintln!(
+                                "No secret scan report found for this scope and redaction policy."
+                            );
                             eprintln!("Hint: run `ft secrets scan` first.");
                             std::process::exit(1);
                         }
@@ -69779,6 +69783,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     pretty,
                 } => {
                     let cfg = RedactBackfillConfig {
+                        redactor: config.safety.redaction.build_redactor()?,
                         batch_size,
                         dry_run,
                         resume_after_id: resume_after,
@@ -69846,6 +69851,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     pretty,
                 } => {
                     let cfg = RedactBackfillConfig {
+                        redactor: config.safety.redaction.build_redactor()?,
                         batch_size,
                         dry_run,
                         resume_after_id: resume_after,
@@ -73956,10 +73962,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             use std::time::Duration;
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -74007,10 +74014,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             use std::time::Duration;
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -74062,10 +74070,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             tracing::info!(%backend, "TUI rollout mode — backend selected");
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+            let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
                 &frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request),
                 &db_path,
+                frankenterm_core::storage::StorageConfig::from(&config),
             )
             .await
             {
@@ -75921,6 +75930,7 @@ fn render_secret_scan_report_plain(report: &frankenterm_core::secrets::SecretSca
 
     println!("Secret scan report");
     println!("Report version: {}", report.report_version);
+    println!("Redaction policy: {}", report.catalog_version);
     println!("Scope: pane_id={pane}, since={since}, until={until}");
     println!(
         "Started: {}  Completed: {}",

@@ -52,6 +52,91 @@ pub enum QueryError {
     QueryFailed(String),
 }
 
+/// Inspect the complete value before presentation can split a secret. Oversized
+/// historical values are omitted, never prefix-scanned into a partial leak.
+const MAX_TUI_REDACTION_INPUT_BYTES: usize = 1024 * 1024;
+
+pub(super) fn redact_tui_text(redactor: &crate::redactor::Redactor, text: &str) -> String {
+    if text.len() > MAX_TUI_REDACTION_INPUT_BYTES {
+        return "[content omitted: TUI display limit]".to_string();
+    }
+    redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
+}
+
+fn redact_tui_optional_text(
+    redactor: &crate::redactor::Redactor,
+    text: Option<String>,
+) -> Option<String> {
+    text.map(|value| redact_tui_text(redactor, &value))
+}
+
+/// IDs, saved queries, profile names, and suggested commands can become action
+/// inputs. Refuse protected values instead of changing what an action targets.
+fn require_visible_tui_identity(
+    redactor: &crate::redactor::Redactor,
+    identity: &str,
+) -> Result<(), QueryError> {
+    if redact_tui_text(redactor, identity) != identity {
+        return Err(QueryError::QueryFailed(
+            "TUI action data is protected by the redaction policy".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_visible_tui_optional_identity(
+    redactor: &crate::redactor::Redactor,
+    identity: Option<&str>,
+) -> Result<(), QueryError> {
+    if let Some(identity) = identity {
+        require_visible_tui_identity(redactor, identity)?;
+    }
+    Ok(())
+}
+
+fn redact_tui_triage_items(
+    redactor: &crate::redactor::Redactor,
+    items: &mut [TriageItemView],
+) -> Result<(), QueryError> {
+    for item in items {
+        require_visible_tui_optional_identity(redactor, item.workflow_id.as_deref())?;
+        item.section = redact_tui_text(redactor, &item.section);
+        item.severity = redact_tui_text(redactor, &item.severity);
+        item.title = redact_tui_text(redactor, &item.title);
+        item.detail = crate::output::truncate_bounded(
+            &redact_tui_text(redactor, &item.detail),
+            120,
+            480,
+        );
+        for action in &mut item.actions {
+            require_visible_tui_identity(redactor, &action.command)?;
+            action.label = redact_tui_text(redactor, &action.label);
+        }
+    }
+    Ok(())
+}
+
+fn redact_tui_search_snippet(
+    redactor: &crate::redactor::Redactor,
+    result: &crate::storage::SearchResult,
+) -> String {
+    let content = &result.segment.content;
+    if content.len() > MAX_TUI_REDACTION_INPUT_BYTES {
+        return redact_tui_text(redactor, content);
+    }
+    let normalized = crate::output::normalize_terminal_text_for_redaction(content);
+    let redacted = redactor.redact(&normalized);
+    // A database snippet can clip a secret or insert highlighting inside it.
+    // If the full source contains protected text, build the excerpt only from
+    // the protected source, never from the already-clipped database snippet.
+    let excerpt = if redacted != normalized {
+        redacted
+    } else {
+        redact_tui_text(redactor, result.snippet.as_deref().unwrap_or(content))
+    };
+    crate::output::truncate_bounded(&excerpt, 300, 1200)
+}
+
 /// Pane information for TUI display
 #[derive(Debug, Clone)]
 pub struct PaneView {
@@ -441,6 +526,18 @@ impl ProductionQueryClient {
     fn db_exists(&self) -> bool {
         self.db_path().exists()
     }
+
+    fn output_redactor(&self) -> &crate::redactor::Redactor {
+        static DEFAULT_REDACTOR: std::sync::LazyLock<crate::redactor::Redactor> =
+            std::sync::LazyLock::new(crate::redactor::Redactor::new);
+        self.storage
+            .as_ref()
+            .map_or(&*DEFAULT_REDACTOR, StorageHandle::redactor)
+    }
+
+    fn storage_error(&self, error: &impl std::fmt::Display) -> QueryError {
+        QueryError::StorageError(redact_tui_text(self.output_redactor(), &error.to_string()))
+    }
 }
 
 impl QueryClient for ProductionQueryClient {
@@ -455,8 +552,19 @@ impl QueryClient for ProductionQueryClient {
             let panes = wezterm
                 .list_panes()
                 .await
-                .map_err(|e| QueryError::WeztermError(e.to_string()))?;
+                .map_err(|e| {
+                    QueryError::WeztermError(redact_tui_text(
+                        self.output_redactor(),
+                        &e.to_string(),
+                    ))
+                })?;
             let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();
+            let redactor = self.output_redactor();
+            for pane in &mut pane_views {
+                pane.title = redact_tui_text(redactor, &pane.title);
+                pane.domain = redact_tui_text(redactor, &pane.domain);
+                pane.cwd = redact_tui_optional_text(redactor, pane.cwd.take());
+            }
 
             if let Some(storage) = storage {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI pane-aggregation reads.
@@ -542,7 +650,7 @@ impl QueryClient for ProductionQueryClient {
             let events = storage
                 .get_events_with_cx(&query_cx, query)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(|e| self.storage_error(&e))?;
 
             let event_ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
             let mut annotations_by_event =
@@ -593,23 +701,32 @@ impl QueryClient for ProductionQueryClient {
             Ok::<_, QueryError>(rows)
         })?;
 
-        Ok(rows
+        let redactor = self.output_redactor();
+        rows
             .into_iter()
-            .map(|(e, annotations)| EventView {
-                id: e.id,
-                rule_id: e.rule_id,
-                pane_id: e.pane_id,
-                severity: e.severity,
-                message: e
-                    .matched_text
-                    .unwrap_or_else(|| "Pattern matched".to_string()),
-                timestamp: e.detected_at,
-                handled: e.handled_at.is_some(),
-                triage_state: annotations.triage_state,
-                labels: annotations.labels,
-                note: annotations.note,
+            .map(|(e, annotations)| {
+                require_visible_tui_identity(redactor, &e.rule_id)?;
+                Ok(EventView {
+                    id: e.id,
+                    rule_id: e.rule_id,
+                    pane_id: e.pane_id,
+                    severity: redact_tui_text(redactor, &e.severity),
+                    message: redact_tui_text(
+                        redactor,
+                        e.matched_text.as_deref().unwrap_or("Pattern matched"),
+                    ),
+                    timestamp: e.detected_at,
+                    handled: e.handled_at.is_some(),
+                    triage_state: redact_tui_optional_text(redactor, annotations.triage_state),
+                    labels: annotations
+                        .labels
+                        .iter()
+                        .map(|label| redact_tui_text(redactor, label))
+                        .collect(),
+                    note: redact_tui_optional_text(redactor, annotations.note),
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError> {
@@ -633,6 +750,7 @@ impl QueryClient for ProductionQueryClient {
         }
 
         let mut items: Vec<TriageItemView> = Vec::new();
+        let redactor = self.output_redactor();
 
         // Health diagnostics (in-process snapshot)
         if let Some(snapshot) = HealthSnapshot::get_global() {
@@ -663,21 +781,23 @@ impl QueryClient for ProductionQueryClient {
         if let Some(bundle) = latest_crash_bundle(&self.workspace_layout.crash_dir) {
             let detail = if let Some(ref report) = bundle.report {
                 let message = sanitize_historical_crash_text(
-                    &report.message,
+                    &redact_tui_text(redactor, &report.message),
                     MAX_HISTORICAL_CRASH_MESSAGE_WIDTH,
                     MAX_HISTORICAL_CRASH_MESSAGE_BYTES,
                 );
                 let location = report
                     .location
                     .as_deref()
-                    .map(sanitize_historical_crash_location)
+                    .map(|location| {
+                        sanitize_historical_crash_location(&redact_tui_text(redactor, location))
+                    })
                     .unwrap_or_else(|| "unknown".to_string());
                 format!("{message} (at {location})")
             } else if let Some(ref manifest) = bundle.manifest {
                 format!(
                     "crash at {}",
                     sanitize_historical_crash_text(
-                        &manifest.created_at,
+                        &redact_tui_text(redactor, &manifest.created_at),
                         MAX_HISTORICAL_CRASH_TIMESTAMP_WIDTH,
                         MAX_HISTORICAL_CRASH_TIMESTAMP_BYTES,
                     )
@@ -719,6 +839,7 @@ impl QueryClient for ProductionQueryClient {
                 workflow_id: None,
             });
             items.sort_by_key(|item| std::cmp::Reverse(severity_rank(&item.severity)));
+            redact_tui_triage_items(redactor, &mut items)?;
             return Ok(items);
         };
 
@@ -738,7 +859,7 @@ impl QueryClient for ProductionQueryClient {
             storage
                 .get_events(query)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })?;
         for event in events {
             items.push(TriageItemView {
@@ -748,12 +869,7 @@ impl QueryClient for ProductionQueryClient {
                     "[pane {}] {}: {}",
                     event.pane_id, event.event_type, event.rule_id
                 ),
-                detail: event
-                    .matched_text
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect(),
+                detail: event.matched_text.unwrap_or_default(),
                 actions: vec![
                     action(
                         "List unhandled events",
@@ -776,7 +892,7 @@ impl QueryClient for ProductionQueryClient {
             storage
                 .find_incomplete_workflows()
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })?;
         for wf in workflows {
             items.push(TriageItemView {
@@ -807,6 +923,7 @@ impl QueryClient for ProductionQueryClient {
             sb.cmp(&sa).then_with(|| a.title.cmp(&b.title))
         });
 
+        redact_tui_triage_items(redactor, &mut items)?;
         Ok(items)
     }
 
@@ -821,8 +938,9 @@ impl QueryClient for ProductionQueryClient {
             limit: Some(limit),
             include_snippets: Some(true),
             snippet_max_tokens: Some(30),
-            highlight_prefix: Some(">>".to_string()),
-            highlight_suffix: Some("<<".to_string()),
+            // Inserting markup inside a token can defeat whole-token redaction.
+            highlight_prefix: Some(String::new()),
+            highlight_suffix: Some(String::new()),
             ..Default::default()
         };
 
@@ -832,7 +950,7 @@ impl QueryClient for ProductionQueryClient {
             storage
                 .search_with_results(&query, options)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })?;
 
         Ok(results
@@ -840,7 +958,7 @@ impl QueryClient for ProductionQueryClient {
             .map(|r| SearchResultView {
                 pane_id: r.segment.pane_id,
                 timestamp: r.segment.captured_at,
-                snippet: r.snippet.unwrap_or(r.segment.content),
+                snippet: redact_tui_search_snippet(self.output_redactor(), &r),
                 rank: r.score,
             })
             .collect())
@@ -896,13 +1014,13 @@ impl QueryClient for ProductionQueryClient {
                 storage
                     .add_event_mute_with_cx(&mute_cx, record)
                     .await
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(|e| self.storage_error(&e))?;
             }
 
             storage
                 .mark_event_handled_with_cx(&mute_cx, event_id, None, "muted")
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })
     }
 
@@ -915,27 +1033,29 @@ impl QueryClient for ProductionQueryClient {
             storage
                 .find_incomplete_workflows()
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })?;
 
-        Ok(workflows
+        let redactor = self.output_redactor();
+        workflows
             .into_iter()
             .map(|wf| {
+                require_visible_tui_identity(redactor, &wf.id)?;
                 // Estimate total steps: at least current_step + 1 for incomplete
                 let total_steps = (wf.current_step + 1).max(2);
-                WorkflowProgressView {
+                Ok(WorkflowProgressView {
                     id: wf.id,
-                    workflow_name: wf.workflow_name,
+                    workflow_name: redact_tui_text(redactor, &wf.workflow_name),
                     pane_id: wf.pane_id,
                     current_step: wf.current_step,
                     total_steps,
-                    status: wf.status,
-                    error: wf.error,
+                    status: redact_tui_text(redactor, &wf.status),
+                    error: redact_tui_optional_text(redactor, wf.error),
                     started_at: wf.started_at,
                     updated_at: wf.updated_at,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn list_action_history(&self, limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
@@ -952,12 +1072,15 @@ impl QueryClient for ProductionQueryClient {
             storage
                 .get_action_history(query)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| self.storage_error(&e))
         })?;
 
-        Ok(records
+        let redactor = self.output_redactor();
+        records
             .into_iter()
             .map(|row| {
+                require_visible_tui_optional_identity(redactor, row.workflow_id.as_deref())?;
+                require_visible_tui_optional_identity(redactor, row.rule_id.as_deref())?;
                 let summary = row
                     .input_summary
                     .clone()
@@ -965,24 +1088,24 @@ impl QueryClient for ProductionQueryClient {
                     .or_else(|| row.decision_reason.clone())
                     .unwrap_or_default();
 
-                HistoryEntryView {
+                Ok(HistoryEntryView {
                     audit_id: row.id,
                     timestamp: row.ts,
                     pane_id: row.pane_id,
                     workflow_id: row.workflow_id,
-                    action_kind: row.action_kind,
-                    result: row.result,
-                    actor_kind: row.actor_kind,
-                    step_name: row.step_name,
+                    action_kind: redact_tui_text(redactor, &row.action_kind),
+                    result: redact_tui_text(redactor, &row.result),
+                    actor_kind: redact_tui_text(redactor, &row.actor_kind),
+                    step_name: redact_tui_optional_text(redactor, row.step_name),
                     undoable: row.undoable.unwrap_or(false) && row.undone_at.is_none(),
                     undone: row.undone_at.is_some(),
-                    undo_strategy: row.undo_strategy,
-                    undo_hint: row.undo_hint,
+                    undo_strategy: redact_tui_optional_text(redactor, row.undo_strategy),
+                    undo_hint: redact_tui_optional_text(redactor, row.undo_hint),
                     rule_id: row.rule_id,
-                    summary,
-                }
+                    summary: redact_tui_text(redactor, &summary),
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkView>, QueryError> {
@@ -990,11 +1113,20 @@ impl QueryClient for ProductionQueryClient {
             return Ok(Vec::new());
         };
         let storage = storage.clone();
-        self.runtime.block_on(async {
+        let mut bookmarks = self.runtime.block_on(async {
             crate::ui_query::list_pane_bookmarks(&storage)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
-        })
+                .map_err(|e| self.storage_error(&e))
+        })?;
+        let redactor = self.output_redactor();
+        for bookmark in &mut bookmarks {
+            bookmark.alias = redact_tui_text(redactor, &bookmark.alias);
+            for tag in &mut bookmark.tags {
+                *tag = redact_tui_text(redactor, tag);
+            }
+            bookmark.description = redact_tui_optional_text(redactor, bookmark.description.take());
+        }
+        Ok(bookmarks)
     }
 
     fn list_saved_searches(&self) -> Result<Vec<SavedSearchView>, QueryError> {
@@ -1002,16 +1134,34 @@ impl QueryClient for ProductionQueryClient {
             return Ok(Vec::new());
         };
         let storage = storage.clone();
-        self.runtime.block_on(async {
+        let mut searches = self.runtime.block_on(async {
             crate::ui_query::list_saved_searches(&storage)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
-        })
+                .map_err(|e| self.storage_error(&e))
+        })?;
+        let redactor = self.output_redactor();
+        for search in &mut searches {
+            require_visible_tui_identity(redactor, &search.id)?;
+            // Both TUI backends build run/enable/disable commands from the name.
+            require_visible_tui_identity(redactor, &search.name)?;
+            require_visible_tui_identity(redactor, &search.query)?;
+            search.since_mode = redact_tui_text(redactor, &search.since_mode);
+            search.last_error = redact_tui_optional_text(redactor, search.last_error.take());
+        }
+        Ok(searches)
     }
 
     fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
-        crate::ui_query::resolve_ruleset_profile_state(self.config_path.as_deref())
-            .map_err(|e| QueryError::QueryFailed(e.to_string()))
+        let redactor = self.output_redactor();
+        let mut state = crate::ui_query::resolve_ruleset_profile_state(self.config_path.as_deref())
+            .map_err(|e| QueryError::QueryFailed(redact_tui_text(redactor, &e.to_string())))?;
+        require_visible_tui_identity(redactor, &state.active_profile)?;
+        for profile in &mut state.profiles {
+            require_visible_tui_identity(redactor, &profile.name)?;
+            profile.description = redact_tui_optional_text(redactor, profile.description.take());
+            profile.path = redact_tui_optional_text(redactor, profile.path.take());
+        }
+        Ok(state)
     }
 
     fn get_timeline(
@@ -1037,13 +1187,38 @@ impl QueryClient for ProductionQueryClient {
         let query = crate::storage::TimelineQuery::new()
             .with_range(start, now)
             .with_pagination(limit, 0);
-        self.runtime
+        let mut timeline = self.runtime
             .block_on(async {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI timeline read.
                 let timeline_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 storage.get_timeline_with_cx(&timeline_cx, query).await
             })
-            .map_err(|e| QueryError::StorageError(e.to_string()))
+            .map_err(|e| self.storage_error(&e))?;
+        let redactor = self.output_redactor();
+        for event in &mut timeline.events {
+            require_visible_tui_identity(redactor, &event.rule_id)?;
+            require_visible_tui_optional_identity(redactor, event.pane_info.pane_uuid.as_deref())?;
+            event.pane_info.agent_type =
+                redact_tui_optional_text(redactor, event.pane_info.agent_type.take());
+            event.pane_info.domain = redact_tui_text(redactor, &event.pane_info.domain);
+            event.pane_info.cwd = redact_tui_optional_text(redactor, event.pane_info.cwd.take());
+            event.pane_info.title = redact_tui_optional_text(redactor, event.pane_info.title.take());
+            event.event_type = redact_tui_text(redactor, &event.event_type);
+            event.severity = redact_tui_text(redactor, &event.severity);
+            event.summary = redact_tui_optional_text(redactor, event.summary.take());
+            if let Some(handled) = &mut event.handled {
+                require_visible_tui_optional_identity(redactor, handled.workflow_id.as_deref())?;
+                handled.status = redact_tui_text(redactor, &handled.status);
+            }
+            for correlation in &event.correlations {
+                require_visible_tui_identity(redactor, &correlation.id)?;
+            }
+        }
+        for correlation in &mut timeline.correlations {
+            require_visible_tui_identity(redactor, &correlation.id)?;
+            correlation.description = redact_tui_text(redactor, &correlation.description);
+        }
+        Ok(timeline)
     }
 
     fn dashboard_state(&self) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
@@ -1052,8 +1227,29 @@ impl QueryClient for ProductionQueryClient {
         };
         let mut guard = mgr
             .lock()
-            .map_err(|e| QueryError::QueryFailed(format!("dashboard lock poisoned: {e}")))?;
-        Ok(Some(guard.snapshot()))
+            .map_err(|_| QueryError::QueryFailed("dashboard lock poisoned".to_string()))?;
+        let mut state = guard.snapshot();
+        drop(guard);
+        let redactor = self.output_redactor();
+        for (provider_id, provider) in &mut state.costs.providers {
+            require_visible_tui_identity(redactor, provider_id)?;
+            provider.agent_type = redact_tui_text(redactor, &provider.agent_type);
+        }
+        for alert in &mut state.costs.alerts {
+            alert.agent_type = redact_tui_text(redactor, &alert.agent_type);
+            alert.severity = redact_tui_text(redactor, &alert.severity);
+        }
+        for estimate in &mut state.costs.attribution_estimates {
+            require_visible_tui_identity(redactor, &estimate.attribution_id)?;
+            estimate.estimate_label = redact_tui_text(redactor, &estimate.estimate_label);
+            estimate.methodology = redact_tui_text(redactor, &estimate.methodology);
+        }
+        for provider in &mut state.rate_limits.providers {
+            provider.agent_type = redact_tui_text(redactor, &provider.agent_type);
+            provider.status = redact_tui_text(redactor, &provider.status);
+        }
+        state.backpressure.tier = redact_tui_text(redactor, &state.backpressure.tier);
+        Ok(Some(state))
     }
 }
 
@@ -1069,9 +1265,9 @@ impl ProductionQueryClient {
                 storage.count_events_with_cx(&health_cx),
                 storage.get_segment_time_range_with_cx(&health_cx)
             );
-            let event_count = event_count.map_err(|e| QueryError::StorageError(e.to_string()))?;
+            let event_count = event_count.map_err(|e| self.storage_error(&e))?;
             let (_, last_capture_ts) =
-                segment_range.map_err(|e| QueryError::StorageError(e.to_string()))?;
+                segment_range.map_err(|e| self.storage_error(&e))?;
             Ok::<_, QueryError>((event_count, last_capture_ts))
         });
 
@@ -1196,6 +1392,213 @@ fn sanitize_historical_crash_location(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tui_test_redaction_config() -> crate::config::RedactionConfig {
+        crate::config::RedactionConfig {
+            patterns: vec![r"ORBITCANARY[0-9]{6}".to_string()],
+            placeholder: "[PRIVATE]".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tui_redaction_normalizes_complete_values_and_refuses_protected_identities() {
+        let redactor = tui_test_redaction_config().build_redactor().unwrap();
+        let raw = "ORBIT\x1b[31mCANARY867530\x1b[0m sk-abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(redact_tui_text(&redactor, raw), "[PRIVATE] [PRIVATE]");
+        assert!(require_visible_tui_identity(&redactor, "wf-42").is_ok());
+        assert!(require_visible_tui_identity(&redactor, "ORBITCANARY867530").is_err());
+        assert!(require_visible_tui_identity(&redactor, "wf-\x1b[31m42").is_err());
+        let oversized = format!("ORBITCANARY867530{}", "x".repeat(MAX_TUI_REDACTION_INPUT_BYTES));
+        assert_eq!(
+            redact_tui_text(&redactor, &oversized),
+            "[content omitted: TUI display limit]"
+        );
+    }
+
+    #[test]
+    fn tui_search_redacts_source_before_highlighting_or_snippet_clipping() {
+        let redactor = tui_test_redaction_config().build_redactor().unwrap();
+        let content = "needle ORBIT\x1b[31mCANARY867530 tail";
+        let mut result = crate::storage::SearchResult {
+            segment: crate::storage::Segment {
+                id: 7,
+                pane_id: 42,
+                seq: 0,
+                content: content.to_string(),
+                content_len: content.len(),
+                content_hash: None,
+                captured_at: 1,
+            },
+            snippet: Some("... >>CANARY<<867530 tail".to_string()),
+            highlight: None,
+            score: -1.0,
+        };
+        assert_eq!(
+            redact_tui_search_snippet(&redactor, &result),
+            "needle [PRIVATE] tail"
+        );
+        result.segment.content = "safe needle context".to_string();
+        result.snippet = Some("needle context".to_string());
+        assert_eq!(redact_tui_search_snippet(&redactor, &result), "needle context");
+    }
+
+    #[test]
+    fn production_tui_applies_current_policy_to_legacy_rows_and_live_metadata() {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build redaction test runtime");
+        let temp = tempfile::tempdir().unwrap();
+        let secret = "ORBITCANARY867530";
+        let (layout, storage, event_id, wezterm) = runtime.block_on(async {
+            let layout = WorkspaceLayout::new(
+                temp.path().to_path_buf(),
+                &crate::config::StorageConfig::default(),
+                &crate::config::IpcConfig::default(),
+            );
+            std::fs::create_dir_all(&layout.ft_dir).unwrap();
+            let db_path = layout.db_path.to_string_lossy().to_string();
+            // These rows predate the custom policy, so persistence cannot have
+            // protected them. The production read boundary must do that work.
+            let legacy = StorageHandle::new(&db_path).await.unwrap();
+            let now = epoch_ms();
+            legacy.upsert_pane(crate::storage::PaneRecord {
+                pane_id: 42,
+                pane_uuid: None,
+                domain: secret.to_string(),
+                window_id: Some(0),
+                tab_id: Some(0),
+                title: Some(secret.to_string()),
+                cwd: Some(format!("/workspace/{secret}")),
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            }).await.unwrap();
+            let segment = legacy.append_segment(42, &format!("needle {secret}"), None)
+                .await.unwrap();
+            assert!(segment.content.contains(secret));
+            let event_id = legacy.record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id: 42,
+                rule_id: "safe.rule".to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "usage".to_string(),
+                severity: "warning".to_string(),
+                confidence: 0.9,
+                extracted: None,
+                matched_text: Some(format!("{} {secret}", "context".repeat(20))),
+                segment_id: Some(segment.id),
+                detected_at: segment.captured_at,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            }).await.unwrap();
+            legacy.set_event_note(event_id, Some(secret.to_string()), None).await.unwrap();
+            legacy.add_event_label(event_id, secret.to_string(), None).await.unwrap();
+            legacy.insert_pane_bookmark(crate::storage::PaneBookmarkRecord {
+                id: 0,
+                pane_id: 42,
+                alias: secret.to_string(),
+                tags: Some(vec![secret.to_string()]),
+                description: Some(secret.to_string()),
+                created_at: now,
+                updated_at: now,
+            }).await.unwrap();
+            let mut search = crate::storage::SavedSearchRecord::new(
+                "safe-search".to_string(), "needle".to_string(), Some(42), 10,
+                "last_run".to_string(), None,
+            );
+            search.last_error = Some(secret.to_string());
+            legacy.insert_saved_search(search).await.unwrap();
+            legacy.upsert_workflow(crate::storage::WorkflowRecord {
+                id: "wf-safe".to_string(),
+                workflow_name: secret.to_string(),
+                pane_id: 42,
+                trigger_event_id: Some(event_id),
+                current_step: 0,
+                status: "running".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: Some(secret.to_string()),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+            }).await.unwrap();
+            legacy.shutdown().await.unwrap();
+            drop(legacy);
+
+            let mut config = crate::config::Config::default();
+            config.safety.redaction = tui_test_redaction_config();
+            let storage = StorageHandle::with_config(
+                &db_path, crate::storage::StorageConfig::from(&config),
+            ).await.unwrap();
+            let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_pane(crate::wezterm::MockPane {
+                pane_id: 42, window_id: 0, tab_id: 0,
+                title: format!("{secret} sk-abcdefghijklmnopqrstuvwxyz012345"),
+                domain: secret.to_string(), cwd: format!("/workspace/{secret}"),
+                is_active: true, is_zoomed: false, cols: 80, rows: 24,
+                content: String::new(),
+            }).await;
+            let wezterm: WeztermHandle = mock;
+            (layout, storage, event_id, wezterm)
+        });
+        let client = ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
+        let panes = client.list_panes().unwrap();
+        assert_eq!(panes[0].pane_id, 42);
+        assert_eq!(panes[0].title, "[PRIVATE] [PRIVATE]");
+        assert_eq!(panes[0].domain, "[PRIVATE]");
+        assert_eq!(panes[0].cwd.as_deref(), Some("/workspace/[PRIVATE]"));
+        let events = client.list_events(&EventFilters {
+            limit: 10,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(events[0].id, event_id);
+        assert_eq!(events[0].rule_id, "safe.rule");
+        assert!(events[0].message.contains("[PRIVATE]"));
+        assert_eq!(events[0].note.as_deref(), Some("[PRIVATE]"));
+        assert_eq!(events[0].labels, vec!["[PRIVATE]".to_string()]);
+        let results = client.search("needle", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].snippet, "needle [PRIVATE]");
+        let bookmarks = client.list_pane_bookmarks().unwrap();
+        assert_eq!(bookmarks[0].pane_id, 42);
+        assert_eq!(bookmarks[0].alias, "[PRIVATE]");
+        assert_eq!(bookmarks[0].tags, vec!["[PRIVATE]".to_string()]);
+        assert_eq!(bookmarks[0].description.as_deref(), Some("[PRIVATE]"));
+        let searches = client.list_saved_searches().unwrap();
+        assert_eq!(searches[0].query, "needle");
+        assert_eq!(searches[0].name, "safe-search");
+        assert_eq!(searches[0].last_error.as_deref(), Some("[PRIVATE]"));
+        let workflows = client.list_active_workflows().unwrap();
+        assert_eq!(workflows[0].id, "wf-safe");
+        assert_eq!(workflows[0].workflow_name, "[PRIVATE]");
+        assert_eq!(workflows[0].error.as_deref(), Some("[PRIVATE]"));
+        let triage = client.list_triage_items().unwrap();
+        assert!(!format!("{triage:?}").contains(secret));
+        assert!(triage.iter().any(|item| item.actions.iter()
+            .any(|action| action.command == "ft workflow status wf-safe")));
+        let timeline = client.get_timeline(60_000, 10).unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].id, event_id);
+        assert!(!format!("{timeline:?}").contains(secret));
+        assert_eq!(timeline.events[0].pane_info.title.as_deref(), Some("[PRIVATE]"));
+        runtime.block_on(storage.insert_saved_search(crate::storage::SavedSearchRecord::new(
+            secret.to_string(), "needle".to_string(), Some(42), 10,
+            "last_run".to_string(), None,
+        ))).unwrap();
+        let error = client.list_saved_searches().unwrap_err();
+        assert!(matches!(&error, QueryError::QueryFailed(_)));
+        assert!(!error.to_string().contains(secret));
+        drop(client);
+        runtime.block_on(storage.shutdown()).unwrap();
+    }
 
     /// Mock query client for testing
     struct MockQueryClient {

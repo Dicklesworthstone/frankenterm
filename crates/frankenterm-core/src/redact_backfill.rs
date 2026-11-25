@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::redactor::{Redactor, secret_pattern_names};
+use crate::redactor::Redactor;
 use crate::{Error, Result};
 
 /// Schema tag for the backfill receipt envelope.
@@ -55,6 +55,9 @@ const EMBEDDING_DELETE_CHUNK: usize = 500;
 /// Configuration for a single redaction-backfill pass.
 #[derive(Debug, Clone)]
 pub struct RedactBackfillConfig {
+    /// Compiled workspace policy, including custom expressions and the marker.
+    /// CLI callers build this from `[safety.redaction]` before maintenance.
+    pub redactor: Redactor,
     /// Segments read per batch. Clamped to 1..=DEFAULT_BACKFILL_BATCH_SIZE.
     pub batch_size: u32,
     /// Scan and count, but never mutate the database.
@@ -71,6 +74,7 @@ pub struct RedactBackfillConfig {
 impl Default for RedactBackfillConfig {
     fn default() -> Self {
         Self {
+            redactor: Redactor::new(),
             batch_size: DEFAULT_BACKFILL_BATCH_SIZE,
             dry_run: false,
             resume_after_id: 0,
@@ -90,7 +94,7 @@ pub struct RedactBackfillReceipt {
     pub dry_run: bool,
     /// Fingerprint of the active detection expressions and replacement policy.
     pub catalog_version: String,
-    /// Number of pattern families evaluated.
+    /// Number of built-in and configured expressions evaluated.
     pub patterns_checked: usize,
     /// Exclusive starting cursor; a resumed receipt does not cover earlier rows.
     pub resume_after_id: i64,
@@ -111,12 +115,12 @@ pub struct RedactBackfillReceipt {
 }
 
 impl RedactBackfillReceipt {
-    fn new(dry_run: bool, resume_after_id: i64) -> Self {
+    fn new(dry_run: bool, resume_after_id: i64, redactor: &Redactor) -> Self {
         Self {
             schema_version: REDACT_BACKFILL_SCHEMA_VERSION.to_string(),
             dry_run,
-            catalog_version: catalog_version(),
-            patterns_checked: secret_pattern_names().count(),
+            catalog_version: redactor.policy_version(),
+            patterns_checked: redactor.pattern_count(),
             resume_after_id,
             segments_scanned: 0,
             segments_rewritten: 0,
@@ -194,10 +198,10 @@ fn run_redact_backfill_transaction(
     conn: &Connection,
     config: &RedactBackfillConfig,
 ) -> Result<RedactBackfillReceipt> {
-    let redactor = Redactor::new();
+    let redactor = &config.redactor;
     let batch = i64::from(config.batch_size.clamp(1, DEFAULT_BACKFILL_BATCH_SIZE));
     let mut cursor = config.resume_after_id;
-    let mut receipt = RedactBackfillReceipt::new(config.dry_run, config.resume_after_id);
+    let mut receipt = RedactBackfillReceipt::new(config.dry_run, config.resume_after_id, redactor);
     let mut rewritten_ids: Vec<i64> = Vec::new();
 
     // secure_delete keeps overwritten secret bytes out of freed pages. Harmless
@@ -365,11 +369,11 @@ pub struct RedactPurgeReceipt {
 }
 
 impl RedactPurgeReceipt {
-    fn new(dry_run: bool, secret_hash: &str, resume_after_id: i64) -> Self {
+    fn new(dry_run: bool, secret_hash: &str, resume_after_id: i64, redactor: &Redactor) -> Self {
         Self {
             schema_version: REDACT_PURGE_SCHEMA_VERSION.to_string(),
             dry_run,
-            catalog_version: catalog_version(),
+            catalog_version: redactor.policy_version(),
             resume_after_id,
             secret_hash: secret_hash.to_string(),
             segments_scanned: 0,
@@ -457,12 +461,12 @@ fn run_redact_purge_transaction(
         ))));
     }
 
-    let redactor = Redactor::new();
+    let redactor = &config.redactor;
     let batch = i64::from(config.batch_size.clamp(1, DEFAULT_BACKFILL_BATCH_SIZE));
     let mut cursor = config.resume_after_id;
-    let mut receipt = RedactPurgeReceipt::new(config.dry_run, &secret_hash, config.resume_after_id);
+    let mut receipt =
+        RedactPurgeReceipt::new(config.dry_run, &secret_hash, config.resume_after_id, redactor);
     let mut rewritten_ids: Vec<i64> = Vec::new();
-    let catalog_version = current_catalog_version();
 
     if !config.dry_run {
         conn.execute_batch("PRAGMA secure_delete=ON")
@@ -515,7 +519,7 @@ fn run_redact_purge_transaction(
                 .map_err(|e| db_err(&format!("purging output_segments id {id}"), &e))?;
                 conn.execute(
                     "UPDATE output_segments SET redaction_catalog_version = ?1 WHERE id = ?2",
-                    rusqlite::params![catalog_version, id],
+                    rusqlite::params![receipt.catalog_version, id],
                 )
                 .map_err(|error| db_err("stamping purge catalog version", &error))?;
                 rewritten_ids.push(*id);
@@ -874,6 +878,132 @@ mod tests {
             )
             .unwrap();
         assert_eq!(logged, 2);
+    }
+
+    #[test]
+    fn configured_policy_backfill_scrubs_history_and_derived_stores() {
+        let conn = setup_db();
+        let custom_secret = "internal-blue-314159";
+        assert!(!Redactor::new().contains_secrets(custom_secret));
+        insert_segment(&conn, 1, 0, 0, custom_secret);
+        insert_segment(&conn, 2, 0, 1, SECRET);
+        insert_segment(&conn, 3, 0, 2, "ordinary output");
+        let configured = crate::config::RedactionConfig {
+            patterns: vec!["internal-blue-[0-9]+".to_string()],
+            placeholder: "[PRIVATE]".to_string(),
+            ..Default::default()
+        };
+        let mut cfg = RedactBackfillConfig {
+            redactor: configured.build_redactor().unwrap(),
+            dry_run: true,
+            batch_size: 1,
+            ..Default::default()
+        };
+        let dry_run = run_redact_backfill(&conn, &cfg).unwrap();
+        assert_eq!(dry_run.segments_scanned, 3);
+        assert_eq!(dry_run.segments_rewritten, 2);
+        assert_eq!(dry_run.family_counts.get("custom_pattern"), Some(&1));
+        assert_eq!(dry_run.catalog_version, cfg.redactor.policy_version());
+        assert_ne!(dry_run.catalog_version, catalog_version());
+        assert_eq!(dry_run.patterns_checked, Redactor::new().pattern_count() + 1);
+        let original: String = conn
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original, custom_secret);
+
+        cfg.dry_run = false;
+        let receipt = run_redact_backfill(&conn, &cfg).unwrap();
+        assert_eq!(receipt.segments_rewritten, 2);
+        assert_eq!(receipt.embeddings_invalidated, 2);
+        assert!(receipt.fts_rebuilt);
+        assert_eq!(receipt.catalog_version, dry_run.catalog_version);
+        for id in [1, 2] {
+            let (content, len, version): (String, i64, String) = conn
+                .query_row(
+                    "SELECT content, content_len, redaction_catalog_version FROM output_segments WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(content, "[PRIVATE]");
+            assert_eq!(len, content.len() as i64);
+            assert_eq!(version, receipt.catalog_version);
+        }
+        let stale_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM output_segments_fts WHERE output_segments_fts MATCH '\"internal-blue-314159\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_hits, 0);
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains(custom_secret));
+        assert!(!serialized.contains(&configured.patterns[0]));
+        assert_eq!(run_redact_backfill(&conn, &cfg).unwrap().segments_rewritten, 0);
+    }
+
+    #[test]
+    fn configured_policy_purge_targets_custom_secret_hash_and_preserves_other_rows() {
+        let conn = setup_db();
+        let target = "internal-blue-314159";
+        let other = "internal-blue-271828";
+        insert_segment(&conn, 1, 0, 0, &format!("{target} {SECRET}"));
+        insert_segment(&conn, 2, 0, 1, other);
+        let configured = crate::config::RedactionConfig {
+            patterns: vec!["internal-blue-[0-9]+".to_string()],
+            placeholder: "[PRIVATE]".to_string(),
+            ..Default::default()
+        };
+        let mut cfg = RedactBackfillConfig {
+            redactor: configured.build_redactor().unwrap(),
+            dry_run: true,
+            ..Default::default()
+        };
+        let target_hash = crate::secrets::hash_secret(target);
+        let preview = run_redact_purge(&conn, &target_hash, &cfg).unwrap();
+        assert_eq!(preview.segments_purged, 1);
+        assert_eq!(preview.occurrences_purged, 1);
+        assert_eq!(preview.family_counts.get("custom_pattern"), Some(&1));
+
+        cfg.dry_run = false;
+        let receipt = run_redact_purge(&conn, &target_hash, &cfg).unwrap();
+        assert_eq!(receipt.segments_purged, 1);
+        assert_eq!(receipt.embeddings_invalidated, 1);
+        assert_eq!(receipt.catalog_version, cfg.redactor.policy_version());
+        assert_eq!(receipt.catalog_version, preview.catalog_version);
+        assert!(receipt.fts_rebuilt);
+        assert!(receipt.backups_review_required);
+        let (scrubbed, version): (String, String) = conn
+            .query_row(
+                "SELECT content, redaction_catalog_version FROM output_segments WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scrubbed, "[PRIVATE] [PRIVATE]");
+        assert_eq!(version, receipt.catalog_version);
+        let untouched: String = conn
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, other);
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains(target));
+        assert!(!serialized.contains(&configured.patterns[0]));
+        assert_eq!(
+            run_redact_purge(&conn, &target_hash, &cfg)
+                .unwrap()
+                .segments_purged,
+            0
+        );
     }
 
     #[test]

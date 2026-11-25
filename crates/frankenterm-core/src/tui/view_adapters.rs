@@ -58,7 +58,7 @@ pub struct PaneRow {
 /// Adapt a PaneView from QueryClient into a render-ready PaneRow.
 #[must_use]
 pub fn adapt_pane(pane: &PaneView) -> PaneRow {
-    let agent_label = pane.agent_type.as_deref().unwrap_or("unknown").to_string();
+    let agent_label = redact_secrets(pane.agent_type.as_deref().unwrap_or("unknown"));
 
     let agent_style = match pane.agent_type.as_deref() {
         Some("codex") => StyleSpec::new().fg(ColorSpec::Green),
@@ -67,7 +67,7 @@ pub fn adapt_pane(pane: &PaneView) -> PaneRow {
         _ => StyleSpec::new().fg(ColorSpec::DarkGray),
     };
 
-    let state_label = pane.pane_state.clone();
+    let state_label = redact_secrets(&pane.pane_state);
     let state_style = match pane.pane_state.as_str() {
         "AltScreen" => StyleSpec::new().fg(ColorSpec::Yellow),
         "CommandRunning" => StyleSpec::new().fg(ColorSpec::Cyan),
@@ -92,9 +92,9 @@ pub fn adapt_pane(pane: &PaneView) -> PaneRow {
 
     PaneRow {
         pane_id: pane.pane_id.to_string(),
-        title: truncate(&pane.title, 40),
-        domain: pane.domain.clone(),
-        cwd: pane.cwd.clone().unwrap_or_default(),
+        title: truncate(&redact_secrets(&pane.title), 40),
+        domain: redact_secrets(&pane.domain),
+        cwd: redact_secrets(pane.cwd.as_deref().unwrap_or_default()),
         last_activity_label,
         agent_label,
         state_label,
@@ -142,7 +142,7 @@ pub fn adapt_event(event: &EventView) -> EventRow {
         StyleSpec::new().fg(ColorSpec::Yellow).bold()
     };
 
-    let triage_label = event.triage_state.as_deref().unwrap_or("").to_string();
+    let triage_label = redact_secrets(event.triage_state.as_deref().unwrap_or(""));
     let triage_style = match event.triage_state.as_deref() {
         Some("escalated") => StyleSpec::new().fg(ColorSpec::Red).bold(),
         Some("deferred") => StyleSpec::new().fg(ColorSpec::Yellow),
@@ -154,21 +154,26 @@ pub fn adapt_event(event: &EventView) -> EventRow {
     let labels_label = if event.labels.is_empty() {
         String::new()
     } else {
-        event.labels.join(", ")
+        event
+            .labels
+            .iter()
+            .map(|label| redact_secrets(label))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let note_preview = event
         .note
         .as_deref()
-        .map(|n| truncate(n, 40))
+        .map(|n| truncate(&redact_secrets(n), 40))
         .unwrap_or_default();
 
     EventRow {
         id: event.id.to_string(),
         rule_id: event.rule_id.clone(),
         pane_id: event.pane_id.to_string(),
-        severity_label: event.severity.clone(),
-        message: redact_secrets(&truncate(&event.message, 80)),
+        severity_label: redact_secrets(&event.severity),
+        message: truncate(&redact_secrets(&event.message), 80),
         timestamp: format_epoch_ms(event.timestamp),
         handled_label,
         triage_label,
@@ -206,12 +211,23 @@ pub fn adapt_triage(item: &TriageItemView) -> TriageRow {
     let severity_style = severity_to_style(&item.severity);
 
     TriageRow {
-        section: item.section.clone(),
-        severity_label: item.severity.clone(),
-        title: truncate(&item.title, 60),
-        detail: redact_secrets(&truncate(&item.detail, 120)),
-        action_labels: item.actions.iter().map(|a| a.label.clone()).collect(),
-        action_commands: item.actions.iter().map(|a| a.command.clone()).collect(),
+        section: redact_secrets(&item.section),
+        severity_label: redact_secrets(&item.severity),
+        title: truncate(&redact_secrets(&item.title), 60),
+        detail: truncate(&redact_secrets(&item.detail), 120),
+        action_labels: item.actions.iter().map(|a| redact_secrets(&a.label)).collect(),
+        action_commands: item
+            .actions
+            .iter()
+            .map(|a| {
+                // A copied command must remain exact, never retarget a redacted ID.
+                if redact_secrets(&a.command) == a.command {
+                    a.command.clone()
+                } else {
+                    String::new()
+                }
+            })
+            .collect(),
         severity_style,
         event_id: item.event_id.map(|id| id.to_string()).unwrap_or_default(),
         pane_id: item.pane_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -273,19 +289,19 @@ pub fn adapt_history(entry: &HistoryEntryView) -> HistoryRow {
     HistoryRow {
         audit_id: entry.audit_id.to_string(),
         timestamp: format_epoch_ms(entry.timestamp),
-        action_kind: entry.action_kind.clone(),
-        result_label: entry.result.clone(),
-        actor_kind: entry.actor_kind.clone(),
-        summary: redact_secrets(&truncate(&entry.summary, 60)),
+        action_kind: redact_secrets(&entry.action_kind),
+        result_label: redact_secrets(&entry.result),
+        actor_kind: redact_secrets(&entry.actor_kind),
+        summary: truncate(&redact_secrets(&entry.summary), 60),
         undo_label,
         result_style,
         undo_style,
         pane_id: entry.pane_id.map(|id| id.to_string()).unwrap_or_default(),
         workflow_id: entry.workflow_id.clone().unwrap_or_default(),
-        step_name: entry.step_name.clone().unwrap_or_default(),
+        step_name: redact_secrets(entry.step_name.as_deref().unwrap_or_default()),
         rule_id: entry.rule_id.clone().unwrap_or_default(),
-        undo_strategy: entry.undo_strategy.clone().unwrap_or_default(),
-        undo_hint: entry.undo_hint.clone().unwrap_or_default(),
+        undo_strategy: redact_secrets(entry.undo_strategy.as_deref().unwrap_or_default()),
+        undo_hint: redact_secrets(entry.undo_hint.as_deref().unwrap_or_default()),
     }
 }
 
@@ -343,11 +359,11 @@ pub fn adapt_workflow(wf: &WorkflowProgressView) -> WorkflowRow {
 
     WorkflowRow {
         id: wf.id.clone(),
-        name: wf.workflow_name.clone(),
+        name: redact_secrets(&wf.workflow_name),
         pane_id: wf.pane_id.to_string(),
         progress_label: format!("{}/{}", wf.current_step, wf.total_steps),
-        status_label: wf.status.clone(),
-        error: wf.error.clone(),
+        status_label: redact_secrets(&wf.status),
+        error: wf.error.as_deref().map(redact_secrets),
         status_style,
         started_at: format_epoch_ms(wf.started_at),
         updated_at: format_epoch_ms(wf.updated_at),
@@ -380,12 +396,7 @@ pub struct TimelineRow {
 #[must_use]
 pub fn adapt_timeline_event(event: &TimelineEvent) -> TimelineRow {
     let severity_style = severity_to_style(&event.severity);
-    let agent_label = event
-        .pane_info
-        .agent_type
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
+    let agent_label = redact_secrets(event.pane_info.agent_type.as_deref().unwrap_or("unknown"));
 
     let agent_style = match event.pane_info.agent_type.as_deref() {
         Some("codex") => StyleSpec::new().fg(ColorSpec::Green),
@@ -415,7 +426,7 @@ pub fn adapt_timeline_event(event: &TimelineEvent) -> TimelineRow {
     let summary = event
         .summary
         .as_deref()
-        .map(|s| truncate(s, 60))
+        .map(|s| truncate(&redact_secrets(s), 60))
         .unwrap_or_default();
 
     let pane_label = format!("P{}", event.pane_info.pane_id);
@@ -425,8 +436,8 @@ pub fn adapt_timeline_event(event: &TimelineEvent) -> TimelineRow {
         timestamp: format_epoch_ms(event.timestamp),
         pane_label,
         agent_label,
-        event_type: event.event_type.clone(),
-        severity_label: event.severity.clone(),
+        event_type: redact_secrets(&event.event_type),
+        severity_label: redact_secrets(&event.severity),
         handled_label,
         correlation_label,
         summary,
@@ -621,7 +632,7 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
                 _ => StyleSpec::new().fg(ColorSpec::DarkGray),
             };
             DashboardCostRow {
-                agent_type: pv.agent_type.clone(),
+                agent_type: redact_secrets(&pv.agent_type),
                 cost_label: format!("${:.2}", pv.cost_usd),
                 tokens_label: format_tokens(pv.tokens),
                 budget_label,
@@ -645,13 +656,13 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
                 StyleSpec::new().fg(ColorSpec::Yellow)
             };
             DashboardAlertRow {
-                agent_type: a.agent_type.clone(),
+                agent_type: redact_secrets(&a.agent_type),
                 message: format!(
                     "${:.2} / ${:.2} ({:.0}%) — {}",
                     a.current_cost_usd,
                     a.budget_limit_usd,
                     a.usage_fraction * 100.0,
-                    a.severity,
+                    redact_secrets(&a.severity),
                 ),
                 style,
             }
@@ -675,8 +686,8 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
                 "—".to_string()
             };
             DashboardRateLimitRow {
-                agent_type: p.agent_type.clone(),
-                status_label: p.status.clone(),
+                agent_type: redact_secrets(&p.agent_type),
+                status_label: redact_secrets(&p.status),
                 status_style,
                 limited_label: format!("{}/{}", p.limited_pane_count, p.total_pane_count),
                 clear_label,
@@ -705,12 +716,12 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
         alert_rows,
         rate_limit_rows,
         limited_provider_label,
-        bp_tier_label: state.backpressure.tier.clone(),
+        bp_tier_label: redact_secrets(&state.backpressure.tier),
         bp_tier_style,
         bp_capture_label,
         bp_write_label,
         bp_paused_label,
-        summary_line: state.summary_line(),
+        summary_line: redact_secrets(&state.summary_line()),
     }
 }
 
@@ -771,12 +782,17 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// - Password-like assignments (`password=...`, `secret=...`, `token=...`)
 /// - AWS-style access keys
 ///
-/// This is a best-effort defense-in-depth measure. The primary redaction
-/// boundary is at the storage/capture layer; this provides a second pass
-/// before values reach the render surface.
+/// ProductionQueryClient applies the configured policy to complete values,
+/// including historical data. This canonical built-in pass also protects
+/// adapters used with other query clients, before presentation can split tokens.
+/// The additional display-only rules retain conservative masking of short
+/// assignments and token prefixes used by older clients.
 fn redact_secrets(s: &str) -> String {
     use regex::Regex;
     use std::sync::LazyLock;
+
+    static REDACTOR: LazyLock<crate::redactor::Redactor> =
+        LazyLock::new(crate::redactor::Redactor::new);
 
     static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
         // Order: longer patterns first to avoid partial matches.
@@ -796,7 +812,8 @@ fn redact_secrets(s: &str) -> String {
         .expect("redact_secrets regex is valid")
     });
 
-    SECRET_RE.replace_all(s, "[REDACTED]").into_owned()
+    let protected = super::query::redact_tui_text(&REDACTOR, s);
+    SECRET_RE.replace_all(&protected, "[REDACTED]").into_owned()
 }
 
 /// Format epoch milliseconds as a human-readable relative or absolute timestamp.
@@ -1233,6 +1250,73 @@ mod tests {
     }
 
     // ----- Redaction tests -----
+
+    #[test]
+    fn redaction_precedes_every_bounded_preview() {
+        let token = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let mut event = sample_event();
+        event.message = format!("{} {token}", "x".repeat(70));
+        event.note = Some(format!("{} {token}", "x".repeat(30)));
+        let event_row = adapt_event(&event);
+        let mut history = sample_history();
+        history.summary = format!("{} {token}", "x".repeat(50));
+        let history_row = adapt_history(&history);
+        let mut triage = sample_triage();
+        triage.detail = format!("{} {token}", "x".repeat(110));
+        triage.title = format!("{} {token}", "x".repeat(50));
+        let triage_row = adapt_triage(&triage);
+        let mut pane = sample_pane();
+        pane.title = format!("{} {token}", "x".repeat(30));
+        let pane_row = adapt_pane(&pane);
+        let mut timeline = sample_timeline_event();
+        timeline.summary = Some(format!("{} {token}", "x".repeat(50)));
+        let timeline_row = adapt_timeline_event(&timeline);
+        for preview in [
+            &event_row.message, &event_row.note_preview, &history_row.summary,
+            &triage_row.detail, &triage_row.title, &pane_row.title, &timeline_row.summary,
+        ] {
+            assert!(!preview.contains("sk-"), "secret prefix survived clipping: {preview}");
+            assert!(preview.ends_with("..."));
+        }
+        assert_eq!(event_row.id, "100");
+        assert_eq!(pane_row.pane_id, "42");
+    }
+
+    #[test]
+    fn display_metadata_uses_canonical_redaction_after_terminal_normalization() {
+        let token = "sk-abcdefghijkl\x1b[31mmnopqrstuvwxyz012345\x1b[0m";
+        let mut pane = sample_pane();
+        pane.domain = token.to_string();
+        pane.cwd = Some(token.to_string());
+        let pane_row = adapt_pane(&pane);
+        assert_eq!(pane_row.domain, "[REDACTED]");
+        assert_eq!(pane_row.cwd, "[REDACTED]");
+        let mut event = sample_event();
+        event.labels = vec![token.to_string()];
+        event.note = Some(token.to_string());
+        let event_row = adapt_event(&event);
+        assert_eq!(event_row.labels_label, "[REDACTED]");
+        assert_eq!(event_row.note_preview, "[REDACTED]");
+        let mut workflow = sample_workflow();
+        workflow.workflow_name = token.to_string();
+        workflow.error = Some(token.to_string());
+        let workflow_row = adapt_workflow(&workflow);
+        assert_eq!(workflow_row.id, "wf-001");
+        assert_eq!(workflow_row.name, "[REDACTED]");
+        assert_eq!(workflow_row.error.as_deref(), Some("[REDACTED]"));
+        let mut history = sample_history();
+        history.undo_hint = Some(token.to_string());
+        assert_eq!(adapt_history(&history).undo_hint, "[REDACTED]");
+    }
+
+    #[test]
+    fn protected_triage_commands_are_suppressed_without_retargeting() {
+        let mut item = sample_triage();
+        assert_eq!(adapt_triage(&item).action_commands[0], "ft why --recent --pane 42");
+        item.actions[0].command =
+            "ft workflow status sk-abcdefghijklmnopqrstuvwxyz012345".to_string();
+        assert!(adapt_triage(&item).action_commands[0].is_empty());
+    }
 
     #[test]
     fn redact_bearer_token() {

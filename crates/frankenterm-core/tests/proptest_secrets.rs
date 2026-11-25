@@ -136,6 +136,7 @@ fn arb_scan_report() -> impl Strategy<Value = SecretScanReport> {
             )| {
                 SecretScanReport {
                     report_version: SECRET_SCAN_REPORT_VERSION,
+                    catalog_version: frankenterm_core::redactor::Redactor::new().policy_version(),
                     scope,
                     started_at,
                     completed_at,
@@ -429,6 +430,8 @@ proptest! {
         let back: SecretScanReport = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.report_version, report.report_version,
             "report_version mismatch");
+        prop_assert_eq!(&back.catalog_version, &report.catalog_version,
+            "catalog_version mismatch");
         prop_assert_eq!(back.started_at, report.started_at,
             "started_at mismatch");
         prop_assert_eq!(back.completed_at, report.completed_at,
@@ -502,7 +505,7 @@ proptest! {
         let val: serde_json::Value = serde_json::to_value(&report).unwrap();
         let map = val.as_object().unwrap();
         let required = [
-            "report_version", "scope", "started_at", "completed_at",
+            "report_version", "catalog_version", "scope", "started_at", "completed_at",
             "scanned_segments", "scanned_bytes", "matches_total",
             "matches_by_pattern", "samples",
         ];
@@ -531,6 +534,7 @@ proptest! {
     fn prop_scan_report_empty_samples_array(scope in arb_scan_scope()) {
         let report = SecretScanReport {
             report_version: SECRET_SCAN_REPORT_VERSION,
+            catalog_version: frankenterm_core::redactor::Redactor::new().policy_version(),
             scope,
             started_at: 1_000_000_000_000,
             completed_at: 1_000_000_000_001,

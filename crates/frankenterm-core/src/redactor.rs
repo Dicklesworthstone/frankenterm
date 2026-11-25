@@ -923,6 +923,45 @@ impl Redactor {
         self.placeholder.as_deref().unwrap_or(REDACTED_MARKER)
     }
 
+    /// Fingerprint the effective built-in and configured redaction policy.
+    ///
+    /// Incremental scans and maintenance receipts must distinguish two
+    /// workspaces with different custom expressions, or an updated policy
+    /// could reuse a checkpoint that never inspected its new secrets. The
+    /// fingerprint contains no pattern text or replacement marker.
+    #[must_use]
+    pub fn policy_version(&self) -> String {
+        let catalog = secret_catalog_version();
+        if self.custom_patterns.is_empty()
+            && self.placeholder.is_none()
+            && !self.include_pattern_names
+        {
+            return catalog;
+        }
+
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"frankenterm-redaction-policy-v1\0sequential-regex-replace-all\0");
+        hash.update([u8::from(self.include_pattern_names)]);
+        for field in [catalog.as_str(), self.marker()]
+            .into_iter()
+            .chain(self.custom_patterns.iter().map(Regex::as_str))
+        {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        format!(
+            "configured-secret-policy-v1-sha256:{}",
+            hex::encode(hash.finalize())
+        )
+    }
+
+    /// Number of built-in and configured expressions evaluated by this policy.
+    #[must_use]
+    pub fn pattern_count(&self) -> usize {
+        SECRET_PATTERNS.len() + self.custom_patterns.len()
+    }
+
     /// Redact all detected secrets from the input text.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
@@ -2147,6 +2186,47 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn configured_policy_identity_covers_patterns_order_and_literal_marker() {
+        let base = Redactor::new();
+        assert_eq!(base.policy_version(), secret_catalog_version());
+        assert_eq!(base.pattern_count(), secret_pattern_names().count());
+
+        let patterns = vec![
+            "internal-blue-[0-9]+".to_string(),
+            "internal-green-[0-9]+".to_string(),
+        ];
+        let configured =
+            Redactor::with_custom_patterns_and_placeholder(&patterns, Some("[PRIVATE]")).unwrap();
+        assert_eq!(configured.pattern_count(), base.pattern_count() + 2);
+        assert_eq!(
+            configured.policy_version(),
+            configured.clone().policy_version()
+        );
+        assert_ne!(configured.policy_version(), base.policy_version());
+        assert!(!configured.policy_version().contains("internal-blue"));
+        assert!(!configured.policy_version().contains("PRIVATE"));
+
+        let reordered = vec![patterns[1].clone(), patterns[0].clone()];
+        for changed in [
+            Redactor::with_custom_patterns_and_placeholder(&reordered, Some("[PRIVATE]")).unwrap(),
+            Redactor::with_custom_patterns_and_placeholder(&patterns[..1], Some("[PRIVATE]"))
+                .unwrap(),
+            Redactor::with_custom_patterns_and_placeholder(&patterns, Some("$0")).unwrap(),
+            Redactor::with_custom_patterns_and_placeholder(
+                &["internal-blue-[a-z]+".to_string()],
+                Some("[PRIVATE]"),
+            )
+            .unwrap(),
+        ] {
+            assert_ne!(configured.policy_version(), changed.policy_version());
+        }
+        assert_ne!(
+            base.policy_version(),
+            Redactor::with_debug_markers().policy_version()
+        );
+    }
 
     #[test]
     fn contextual_source_spans_follow_replacements_and_preserve_suffix_context() {

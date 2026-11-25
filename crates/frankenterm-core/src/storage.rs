@@ -14602,10 +14602,7 @@ fn writer_loop(
     io_summary: Option<&Arc<Mutex<Option<StorageIoOperatorSummary>>>>,
     redactor: Arc<Redactor>,
 ) {
-    let mut segment_redactors = SegmentRedactionState {
-        redactor,
-        panes: HashMap::new(),
-    };
+    let mut segment_redactors = SegmentRedactionState::with_redactor(redactor);
     let mut io_gate = StorageIoWriterGate::default();
     io_gate.summary_slot = io_summary.cloned();
 
@@ -16612,7 +16609,17 @@ mod writer_io_scheduler_tests {
             backend.as_ref(),
             WriterTransactionBeginMode::Deferred,
             "deferred capture negative control",
-            || append_segment_backend(backend.as_ref(), 71, "must not commit", None, None, None),
+            || {
+                append_segment_backend(
+                    backend.as_ref(),
+                    71,
+                    "must not commit",
+                    None,
+                    None,
+                    None,
+                    crate::redact_backfill::current_catalog_version(),
+                )
+            },
         )
         .expect_err("the deferred read-to-write upgrade must fail under contention");
         assert!(
@@ -20373,10 +20380,29 @@ struct SegmentPersistRedactor {
 /// A writer owns one compiled policy and independent per-pane lookbacks.
 /// Transaction rollback restores only the affected lookbacks; gaps clear pane
 /// history without discarding the writer's immutable operator configuration.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct SegmentRedactionState {
     redactor: Arc<Redactor>,
+    /// Cached identity of this writer's immutable compiled policy. Segment
+    /// receipts must name the policy that actually protected their contents.
+    catalog_version: String,
     panes: HashMap<u64, SegmentPersistRedactor>,
+}
+
+impl SegmentRedactionState {
+    fn with_redactor(redactor: Arc<Redactor>) -> Self {
+        Self {
+            catalog_version: redactor.policy_version(),
+            redactor,
+            panes: HashMap::new(),
+        }
+    }
+}
+
+impl Default for SegmentRedactionState {
+    fn default() -> Self {
+        Self::with_redactor(Arc::new(Redactor::new()))
+    }
 }
 
 #[cfg(test)]
@@ -21241,6 +21267,7 @@ fn append_segment_backend(
     content_hash: Option<&str>,
     zone_type: Option<&str>,
     recorder_delivery: Option<&RecorderDeliverySeed>,
+    redaction_catalog_version: &str,
 ) -> Result<Segment> {
     let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
     let now = now_ms();
@@ -21252,7 +21279,7 @@ fn append_segment_backend(
         content_hash,
         zone_type,
         now,
-        crate::redact_backfill::current_catalog_version(),
+        redaction_catalog_version,
     )?;
     // ft-xx5cl parity: the batched group-commit path embeds every persisted
     // segment, but the writer routes a lone queued append (group.len() == 1)
@@ -21500,6 +21527,7 @@ fn append_segment_commit_with_capture_backend(
                 persisted_hash,
                 zone_type,
                 recorder_delivery,
+                &segment_redactors.catalog_version,
             )?;
             capture_identity::record_segment_capture_backend(backend, &segment, capture_uuid)?;
             Ok(CommittedAppendSegment {
@@ -21577,7 +21605,6 @@ fn append_segment_group_commit_inner(
 ) -> Result<Vec<CommittedAppendSegment>> {
     let mut next_seq_by_pane = HashMap::new();
     let now = now_ms();
-    let catalog_version = crate::redact_backfill::current_catalog_version();
     let mut committed_segments = Vec::with_capacity(writes.len());
 
     // ft-xx5cl: embed each persisted segment under the SAME embedder the query
@@ -21615,7 +21642,7 @@ fn append_segment_group_commit_inner(
             content_hash,
             write.zone_type.as_deref(),
             now,
-            catalog_version,
+            &segment_redactors.catalog_version,
         )?;
         // ft-xx5cl: best-effort semantic embedding over the REDACTED content,
         // on this same writer transaction. `segment.id` is read before the move.
@@ -37979,30 +38006,60 @@ fn append_segment_assigns_gapless_monotonic_independent_seqs() {
 
     // Pane 1: the first five appends must return seq 0,1,2,3,4 in order.
     for expected in 0u64..5 {
-        let seg =
-            append_segment_backend(&backend, 1, &format!("p1-{expected}"), None, None, None)
-                .unwrap();
+        let seg = append_segment_backend(
+            &backend,
+            1,
+            &format!("p1-{expected}"),
+            None,
+            None,
+            None,
+            crate::redact_backfill::current_catalog_version(),
+        )
+        .unwrap();
         assert_eq!(seg.seq, expected, "pane 1 seq must be gapless and start at 0");
         assert_eq!(seg.pane_id, 1);
     }
     // Pane 2 is independent — its sequence also starts at 0.
     for expected in 0u64..3 {
-        let seg =
-            append_segment_backend(&backend, 2, &format!("p2-{expected}"), None, None, None)
-                .unwrap();
+        let seg = append_segment_backend(
+            &backend,
+            2,
+            &format!("p2-{expected}"),
+            None,
+            None,
+            None,
+            crate::redact_backfill::current_catalog_version(),
+        )
+        .unwrap();
         assert_eq!(seg.seq, expected, "pane 2 seq is independent of pane 1");
     }
     // Interleaving resumes each pane's own counter.
     assert_eq!(
-        append_segment_backend(&backend, 1, "p1-5", None, None, None)
-            .unwrap()
-            .seq,
+        append_segment_backend(
+            &backend,
+            1,
+            "p1-5",
+            None,
+            None,
+            None,
+            crate::redact_backfill::current_catalog_version(),
+        )
+        .unwrap()
+        .seq,
         5
     );
     assert_eq!(
-        append_segment_backend(&backend, 2, "p2-3", None, None, None)
-            .unwrap()
-            .seq,
+        append_segment_backend(
+            &backend,
+            2,
+            "p2-3",
+            None,
+            None,
+            None,
+            crate::redact_backfill::current_catalog_version(),
+        )
+        .unwrap()
+        .seq,
         3
     );
 
@@ -38055,6 +38112,7 @@ fn append_segment_backend_writes_semantic_embedding_like_group_path() {
         None,
         None,
         None,
+        crate::redact_backfill::current_catalog_version(),
     )
     .unwrap();
 
@@ -38075,7 +38133,16 @@ fn append_segment_backend_writes_semantic_embedding_like_group_path() {
 
     // Empty content is skipped by contract (nothing to embed) — and must not
     // error out the append itself.
-    let empty = append_segment_backend(&backend, 1, "", None, None, None).unwrap();
+    let empty = append_segment_backend(
+        &backend,
+        1,
+        "",
+        None,
+        None,
+        None,
+        crate::redact_backfill::current_catalog_version(),
+    )
+    .unwrap();
     let empty_row = backend
         .query_row_typed(
             "SELECT COUNT(*) FROM segment_embeddings WHERE segment_id = ?1",
@@ -38084,6 +38151,69 @@ fn append_segment_backend_writes_semantic_embedding_like_group_path() {
         .unwrap()
         .unwrap();
     assert_eq!(RowReader::new(&empty_row).i64(0).unwrap(), 0);
+}
+
+#[test]
+fn configured_redaction_stamps_singleton_and_group_commit_policy() {
+    let input = "hello ACME_ABCDEFGHIJKL sk-abcdefghijklmnopqrstuvwxyz012345 world\n";
+    let policies = [
+        (Redactor::new(), "hello ACME_ABCDEFGHIJKL [REDACTED] world\n"),
+        (
+            Redactor::with_custom_patterns_and_placeholder(
+                &[r"ACME_[A-Z]{12}".to_string()],
+                Some("[PRIVATE]"),
+            )
+            .unwrap(),
+            "hello [PRIVATE] [PRIVATE] world\n",
+        ),
+        (
+            Redactor::with_custom_patterns_and_placeholder(
+                &[r"ACME_[A-Z]{12}".to_string()],
+                Some("$0"),
+            )
+            .unwrap(),
+            "hello $0 $0 world\n",
+        ),
+    ];
+    let mut versions = std::collections::HashSet::new();
+    for (redactor, expected) in policies {
+        let backend = memory_backend();
+        seed_pane_backend(&backend, 1, 1_000);
+        let version = redactor.policy_version();
+        assert!(versions.insert(version.clone()));
+        let mut state = SegmentRedactionState::with_redactor(Arc::new(redactor));
+        let singleton = append_segment_commit_backend(
+            &backend, 1, input, None, None, None, &mut state,
+        )
+        .unwrap();
+        let (first_tx, _first_rx) = oneshot::channel();
+        let (second_tx, _second_rx) = oneshot::channel();
+        let writes = [first_tx, second_tx].map(|respond| PendingAppendSegmentWrite {
+            pane_id: 1,
+            content: input.to_string(),
+            content_hash: None,
+            zone_type: None,
+            capture_uuid: None,
+            recorder_delivery: None,
+            capture_hold: None,
+            respond: WriterResultResponder::new(respond),
+        });
+        let grouped = append_segment_group_commit_backend(&backend, &writes, &mut state).unwrap();
+        assert_eq!(grouped.len(), 2);
+        for committed in std::iter::once(&singleton).chain(grouped.iter()) {
+            assert_eq!(committed.segment.content, expected);
+            let row = backend
+                .query_row_typed(
+                    "SELECT content, redaction_catalog_version FROM output_segments WHERE id = ?1",
+                    &[ToSqlValue::Integer(committed.segment.id)],
+                )
+                .unwrap()
+                .unwrap();
+            let row = RowReader::new(&row);
+            assert_eq!(row.string(0).unwrap(), expected);
+            assert_eq!(row.string(1).unwrap(), version);
+        }
+    }
 }
 
 fn seed_pane_with_last_seen_backend(
@@ -47865,6 +47995,16 @@ fn configured_redaction_protects_full_and_split_tokens_in_actual_writer() {
             .unwrap();
         assert_eq!(full.content, "plain $0 builtin $0 end");
         assert_eq!(e8hd7_persisted_concat(&storage, 1).await, full.content);
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let stamped_policy: String = connection
+            .query_row(
+                "SELECT redaction_catalog_version FROM output_segments WHERE id = ?1",
+                [full.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped_policy, storage.redactor().policy_version());
+        assert_ne!(stamped_policy, crate::redact_backfill::current_catalog_version());
         assert!(storage.search("ACME_ABCDEFGHIJKL").await.unwrap().is_empty());
         assert_eq!(storage.search("plain").await.unwrap().len(), 1);
 
