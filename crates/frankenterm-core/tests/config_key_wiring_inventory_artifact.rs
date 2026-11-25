@@ -56,7 +56,8 @@ fn doctrine_artifact_matches_inventory() {
 #[test]
 fn validate_report_lists_every_unconsumed_key() {
     // A key leaves the unconsumed list only by naming its production consumer
-    // and the test that proves it; an unconsumed key names neither.
+    // and the test that proves it. An unconsumed key names no consumer, or
+    // only a surface that displays the value without acting on it.
     for record in config_key_wiring_inventory() {
         match record.status {
             ConfigKeyWiringStatus::Consumed => assert!(
@@ -64,10 +65,11 @@ fn validate_report_lists_every_unconsumed_key() {
                 "consumed key {} must name its consumer and evidence",
                 record.key
             ),
-            ConfigKeyWiringStatus::ParsedButUnconsumed => assert_eq!(
-                record.consumer, "none",
-                "unconsumed key {} must not claim a consumer",
-                record.key
+            ConfigKeyWiringStatus::ParsedButUnconsumed => assert!(
+                record.consumer == "none" || record.consumer.ends_with("(display only)"),
+                "unconsumed key {} must not claim a consumer that acts on it (got {:?})",
+                record.key,
+                record.consumer
             ),
         }
     }
