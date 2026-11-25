@@ -297,5 +297,120 @@ HAS_GUM=0
         self.assertIn("ft doctor --json", self.log.read_text())
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX installer archive staging")
+class InstallerArchiveSelection(unittest.TestCase):
+    """A failed binary download must not become a source installation.
+
+    Run the production staging function with a controlled transport, including
+    a partial destination on failure. The existing generation and selector are
+    independent sentinels; none of these cases may publish or activate bytes.
+    """
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="ft-archive-", dir="/tmp"))
+        self.destination = self.root / "installed"
+        self.generation = self.destination / "generation"
+        self.generation.mkdir(parents=True)
+        for role in ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian"):
+            (self.generation / role).write_bytes(b"retained installed generation\n")
+        self.selector = self.destination / "current"
+        self.selector.symlink_to("generation")
+        self.stage = self.root / "stage"
+        self.stage.mkdir(mode=0o700)
+        self.calls = self.root / "download.log"
+        self.archive_name = "ft-linux-amd64.tar.xz"
+
+    def prepare(self, *, status=0, url="https://fixture.invalid/release.tar.xz",
+                source=False, offline=""):
+        script = r'''source "$1"
+TMP="$2" DEST="$3" URL="$4" FROM_SOURCE="$5" OFFLINE_TARBALL="$6"
+TAR=ft-linux-amd64.tar.xz QUIET=1 HAS_GUM=0
+CHECKSUM=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+CHECKSUM_URL=https://fixture.invalid/release.sha256
+MINISIGN_SIGNATURE_URL=https://fixture.invalid/release.minisig
+download_https_bounded() {
+  printf '%s\n' "$@" >> "$FT_TEST_DOWNLOAD_LOG"
+  printf 'fixture archive bytes\n' > "$2"
+  return "$FT_TEST_DOWNLOAD_STATUS"
+}
+run_with_spinner() { shift; "$@"; }
+prepare_process_family_archive || exit 1
+printf 'admitted:%s\n' "$FROM_SOURCE"
+'''
+        env = os.environ.copy()
+        env.update(
+            FT_INSTALL_TEST_LIBRARY_ONLY="1",
+            FT_TEST_DOWNLOAD_LOG=str(self.calls),
+            FT_TEST_DOWNLOAD_STATUS=str(status),
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "installer-archive-test", str(INSTALLER),
+             str(self.stage), str(self.destination), url, "1" if source else "0",
+             str(offline)],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(os.readlink(self.selector), "generation")
+        self.assertEqual(sorted(p.name for p in self.destination.iterdir()),
+                         ["current", "generation"])
+        for role in ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian"):
+            self.assertEqual((self.generation / role).read_bytes(),
+                             b"retained installed generation\n")
+        return result
+
+    def test_failed_release_download_never_admits_source_or_partial_bytes(self):
+        # HTTP failure, timeout, byte-limit refusal, and a generic transport
+        # rejection all leave partial bytes staged and must stop before build
+        # or archive verification/extraction can be admitted.
+        for status in (22, 28, 63, 1):
+            with self.subTest(status=status):
+                result = self.prepare(status=status)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Release archive download failed", result.stderr)
+                self.assertIn("--from-source explicitly", result.stderr)
+                self.assertEqual((self.stage / self.archive_name).read_bytes(),
+                                 b"fixture archive bytes\n")
+
+    def test_missing_archive_url_fails_before_transfer(self):
+        result = self.prepare(url="")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("No release archive URL was resolved", result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse((self.stage / self.archive_name).exists())
+
+    def test_successful_archive_retains_binary_verification_path(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "admitted:0\n")
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "https://fixture.invalid/release.tar.xz", str(self.stage / self.archive_name),
+            "1073741824", "300", "1", "268435456",
+        ])
+
+    def test_source_choice_does_not_require_or_download_a_release_archive(self):
+        result = self.prepare(source=True, url="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "admitted:1\n")
+        self.assertFalse(self.calls.exists())
+
+    def test_offline_archive_is_staged_without_network(self):
+        archive = self.root / self.archive_name
+        archive.write_bytes(b"offline archive bytes\n")
+        result = self.prepare(offline=archive, url="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "admitted:0\n")
+        self.assertFalse(self.calls.exists())
+        self.assertEqual((self.stage / self.archive_name).read_bytes(),
+                         b"offline archive bytes\n")
+
+    def test_unreadable_offline_archive_is_not_replaced_with_source(self):
+        result = self.prepare(offline=self.root / "missing.tar.xz", url="")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.calls.exists())
+        self.assertIn("Offline archive is not one stable bounded", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

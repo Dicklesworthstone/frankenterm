@@ -341,6 +341,34 @@ set_artifact_url() {
   fi
 }
 
+prepare_process_family_archive() {
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    info "Using offline tarball: $OFFLINE_TARBALL"
+    ensure_exact_staged_file "$OFFLINE_TARBALL" "$TMP/$TAR" 0400 || {
+      err "Offline archive is not one stable bounded no-follow regular file"
+      return 1
+    }
+  elif [ "$FROM_SOURCE" -eq 0 ]; then
+    if [ -z "$URL" ]; then
+      err "No release archive URL was resolved. Nothing was installed."
+      err "Select a published release with --version vX.Y.Z or request --from-source explicitly."
+      return 1
+    fi
+    info "Downloading $URL"
+    # Download refusal, a resource limit, and a transient network failure all
+    # retain the selected release's verification contract. None authorizes
+    # installing a toolchain or replacing the signed archive with local bytes.
+    if ! run_with_spinner "Downloading $TAR" \
+        download_https_bounded "$URL" "$TMP/$TAR" \
+          "$MAX_PROCESS_ARCHIVE_BYTES" 300 1 "$PREFLIGHT_PROCESS_ARCHIVE_BYTES"; then
+      err "Release archive download failed. Nothing was installed."
+      err "Retry the download or request --from-source explicitly to build the release locally."
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # Prints the tag of the newest published, non-prerelease STABLE release in the
 # GitHub releases JSON on stdin (one release object or a list of them) that
 # ships every asset named in the arguments; with no arguments, the newest
@@ -7007,30 +7035,7 @@ fi
 # ───────────────────────────────────────────────────────────────────────────
 # Download / source build / offline-tarball selection
 # ───────────────────────────────────────────────────────────────────────────
-if [ -n "$OFFLINE_TARBALL" ]; then
-  info "Using offline tarball: $OFFLINE_TARBALL"
-  ensure_exact_staged_file "$OFFLINE_TARBALL" "$TMP/$TAR" 0400 || {
-    err "Offline archive is not one stable bounded no-follow regular file"
-    exit 1
-  }
-elif [ "$FROM_SOURCE" -eq 0 ]; then
-  if [ -z "$URL" ]; then
-    warn "No artifact URL resolved; falling back to source build"
-    FROM_SOURCE=1
-  else
-    info "Downloading $URL"
-    # --retry 3 with exponential backoff (curl default) absorbs transient
-    # CDN blips and connection resets. --retry-connrefused covers the
-    # common "GitHub CDN just woke up" 5s window. The 300s max-time still
-    # caps the whole transfer.
-    if ! run_with_spinner "Downloading $TAR" \
-        download_https_bounded "$URL" "$TMP/$TAR" \
-          "$MAX_PROCESS_ARCHIVE_BYTES" 300 1 "$PREFLIGHT_PROCESS_ARCHIVE_BYTES"; then
-      warn "Artifact download failed; falling back to build-from-source"
-      FROM_SOURCE=1
-    fi
-  fi
-fi
+prepare_process_family_archive || exit 1
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
   PROCESS_FAMILY_RELEASE_VERIFICATION_STATE="source-build"
