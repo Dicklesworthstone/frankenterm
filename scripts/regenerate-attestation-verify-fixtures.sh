@@ -16,9 +16,9 @@
 #
 # Workflow:
 #   1. Build a fresh positive-control fixture from current HEAD via
-#      scripts/attestation-build.sh --version all_sections_present_valid
-#      --channel dev --sign unsigned --allow-partial, writing directly into
-#      the fixture directory.
+#      scripts/attestation-build.sh --version 0.0.0-dev.selftest
+#      --channel dev --sign unsigned --allow-partial into the fixture
+#      directory, then rename it to all_sections_present_valid.json.
 #   2. Apply the documented jq mutations to derive the tampered variants.
 #   3. Refresh the unsigned canonical hash for every tamper whose expected
 #      failure is not itself a signature/canonical-hash failure.
@@ -60,12 +60,21 @@ refresh_unsigned_canonical_sha() {
 }
 
 echo "1/3: Building fresh positive-control fixture from current HEAD..." >&2
+# attestation-build.sh requires a semver --version and names its unsigned
+# output <version>.json, so build under a placeholder semver and rename it
+# onto the positive control. Only release-policy verification reads the
+# version, and the self-test does not use that mode.
+SELFTEST_VERSION="0.0.0-dev.selftest"
 FT_ATTESTATION_OUT_DIR="${FIX}" \
   ./scripts/attestation-build.sh \
-    --version all_sections_present_valid \
+    --version "${SELFTEST_VERSION}" \
     --channel dev \
     --sign unsigned \
     --allow-partial >/dev/null
+[[ -f "${FIX}/${SELFTEST_VERSION}.json" ]] || {
+  echo "build did not produce ${FIX}/${SELFTEST_VERSION}.json" >&2; exit 1;
+}
+mv "${FIX}/${SELFTEST_VERSION}.json" "${POSITIVE}"
 
 [[ -f "$POSITIVE" ]] || { echo "build did not produce $POSITIVE" >&2; exit 1; }
 
