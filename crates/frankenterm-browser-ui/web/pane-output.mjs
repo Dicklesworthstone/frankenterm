@@ -500,11 +500,21 @@ export function mountPaneOutput({
     if (node.textContent !== value) node.textContent = value;
   };
 
-  function render() {
-    const state = output.takeUpdate();
+  function render(force = false) {
+    let state = output.takeUpdate() ?? (force ? output.snapshot() : null);
     if (!state) return;
     const opened = state.paneId !== null;
     const historical = state.capture !== null;
+    const holdingSelection = opened && !historical
+      && transcript.selectionStart !== transcript.selectionEnd;
+    if (holdingSelection) {
+      // The displayed buffer can lag an admitted frame. Preserve the exact
+      // selected text even if that frame already evicted its prefix; offsets
+      // into the newer bounded buffer would identify different diagnostics.
+      output.pause();
+      state = output.takeUpdate() ?? state;
+      follow.checked = false;
+    }
     panel.hidden = !opened;
     workspace.dataset.outputOpen = String(opened);
     setText(title, historical ? `Pane ${state.paneId} — captured segment ${state.capture.segmentId}`
@@ -517,6 +527,7 @@ export function mountPaneOutput({
     setText(pause, state.paused ? "Resume" : "Pause");
     pause.setAttribute("aria-pressed", String(state.paused));
     const notices = [];
+    if (holdingSelection) notices.push("Output is paused to keep selected text stable. Clear the selection to show any newer received text; Resume continues the stream.");
     if (state.discardedChars) notices.push(historical
       ? "This captured segment exceeds the view limit; only its bounded suffix is shown."
       : "Older text was discarded from this bounded view.");
@@ -528,7 +539,7 @@ export function mountPaneOutput({
     if (state.error) notices.push(state.error);
     setText(warnings, notices.join(" "));
     warnings.hidden = notices.length === 0;
-    if (transcript.value !== state.text) {
+    if (!holdingSelection && transcript.value !== state.text) {
       const scrollTop = transcript.scrollTop;
       const selectionStart = transcript.selectionStart;
       const selectionEnd = transcript.selectionEnd;
@@ -544,6 +555,7 @@ export function mountPaneOutput({
   }
 
   function presentSelection(message, followLive) {
+    transcript.setSelectionRange(0, 0);
     paneInput.value = output.snapshot().paneId;
     hint.textContent = message;
     follow.checked = followLive;
@@ -587,6 +599,7 @@ export function mountPaneOutput({
   }
 
   function close() {
+    transcript.setSelectionRange(0, 0);
     output.close();
     matchAt = -1;
     matchQuery = matchText = "";
@@ -640,8 +653,10 @@ export function mountPaneOutput({
     show(paneInput.value.trim());
   });
   pause.addEventListener("click", () => {
-    if (output.snapshot().paused) output.resume();
-    else output.pause();
+    if (output.snapshot().paused) {
+      transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
+      output.resume();
+    } else output.pause();
     render();
   });
   historyButton.addEventListener("click", () => {
@@ -650,8 +665,15 @@ export function mountPaneOutput({
   });
   closeButton.addEventListener("click", close);
   follow.addEventListener("change", () => {
-    if (follow.checked) transcript.scrollTop = transcript.scrollHeight;
+    if (follow.checked) {
+      transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
+      render(true);
+      transcript.scrollTop = transcript.scrollHeight;
+    }
   });
+  // Native selection/copy owns the displayed text until the selection is
+  // cleared. Also check it in render() in case a frame precedes this event.
+  transcript.addEventListener("select", () => render(true));
   transcript.addEventListener("scroll", () => {
     if (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight > 8) follow.checked = false;
   });

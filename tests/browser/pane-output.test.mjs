@@ -812,6 +812,101 @@ test("manual scrolling disables follow and updates preserve the viewport", () =>
   assert.equal(area.scrollTop, area.scrollHeight);
 });
 
+test("native selection pauses before later output can replace copied diagnostics", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "1", "first diagnostic"); f.panel.render();
+  const source = f.latest();
+  const area = f.nodes["pane-output-text"];
+  area.setSelectionRange(0, 5);
+  area.emit("select");
+  assert.equal(f.output.snapshot().paused, true);
+  assert.equal(source.closed, true);
+  assert.equal(f.nodes["pane-output-follow"].checked, false);
+  assert.equal(f.nodes["pane-output-pause"].textContent, "Resume");
+  delta(source, "2", "late private output");
+  f.panel.render();
+  assert.equal(area.value, "first diagnostic");
+  assert.equal(area.value.slice(area.selectionStart, area.selectionEnd), "first");
+  assert.equal(f.output.snapshot().cursor, "1");
+  assert.equal(f.timers.size, 0);
+});
+
+test("native copying preserves the displayed selection when an admitted frame evicts its prefix", () => {
+  const f = panelFixture({ maxChars: 11 }); f.panel.openSelected();
+  delta(f.latest(), "1", "error-alpha"); f.panel.render();
+  const source = f.latest();
+  const area = f.nodes["pane-output-text"];
+  area.scrollTop = 25;
+  area.setSelectionRange(0, 5);
+  // A frame can arrive before the browser dispatches its select event.
+  delta(source, "2", "more-output"); f.panel.render();
+  assert.equal(f.output.snapshot().text, "more-output");
+  assert.equal(f.output.snapshot().cursor, "2");
+  assert.equal(f.output.snapshot().discardedChars, 11);
+  assert.equal(area.value, "error-alpha");
+  assert.equal(area.value.slice(area.selectionStart, area.selectionEnd), "error");
+  assert.equal(area.scrollTop, 25);
+  assert.equal(source.closed, true);
+  assert.equal(f.output.snapshot().paused, true);
+  assert.match(f.nodes["pane-output-warnings"].textContent, /selected text stable/);
+});
+
+test("clearing copied selection reveals buffered text and explicit resume uses the last received cursor", () => {
+  const f = panelFixture({ maxChars: 11 }); f.panel.openSelected();
+  delta(f.latest(), "1", "error-alpha"); f.panel.render();
+  const area = f.nodes["pane-output-text"];
+  area.setSelectionRange(0, 5);
+  delta(f.latest(), "2", "more-output"); f.panel.render();
+  area.setSelectionRange(5, 5); area.emit("select");
+  assert.equal(area.value, "more-output");
+  assert.equal(f.output.snapshot().paused, true);
+  assert.equal(f.sources.length, 1);
+  assert.doesNotMatch(f.nodes["pane-output-warnings"].textContent, /selected text stable/);
+  area.setSelectionRange(0, 4); area.emit("select");
+  f.nodes["pane-output-pause"].emit("click");
+  assert.equal(area.selectionStart, area.selectionEnd);
+  assert.equal(f.output.snapshot().paused, false);
+  assert.equal(f.latest().url.searchParams.get("since_id"), "2");
+  delta(f.latest(), "3", "-next"); f.panel.render();
+  assert.equal(area.value, "output-next");
+});
+
+test("switching or closing a selected transcript cannot carry old selected text into another pane", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "1", "private seven"); f.panel.render();
+  const area = f.nodes["pane-output-text"];
+  area.setSelectionRange(0, 7); area.emit("select");
+  const first = f.latest();
+  f.selectRow("8"); f.panel.openSelected();
+  assert.equal(first.closed, true);
+  assert.equal(area.value, "");
+  assert.equal(area.selectionStart, area.selectionEnd);
+  assert.equal(f.output.snapshot().paused, false);
+  delta(f.latest(), "2", "private eight", "8"); f.panel.render();
+  assert.equal(area.value, "private eight");
+  area.setSelectionRange(0, 7); area.emit("select");
+  f.panel.close();
+  assert.equal(area.value, "");
+  assert.equal(f.nodes["pane-output"].hidden, true);
+  assert.equal(f.output.snapshot().paneId, null);
+  assert.equal(f.latest().closed, true);
+});
+
+test("native copy pause remains explicit across page suspension", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "1", "held diagnostic"); f.panel.render();
+  const area = f.nodes["pane-output-text"];
+  area.setSelectionRange(0, 4); area.emit("select");
+  f.panel.suspend(); f.panel.restore();
+  assert.equal(area.value, "held diagnostic");
+  assert.equal(area.value.slice(area.selectionStart, area.selectionEnd), "held");
+  assert.equal(f.sources.length, 1);
+  assert.equal(f.output.snapshot().paused, true);
+  f.nodes["pane-output-pause"].emit("click");
+  assert.equal(f.output.snapshot().paused, false);
+  assert.equal(f.latest().url.searchParams.get("since_id"), "1");
+});
+
 test("close and Escape clear sensitive retained output and restore canvas focus", () => {
   const f = panelFixture(); f.panel.openSelected(); delta(f.latest(), "1", "private"); f.panel.render();
   assert.equal(f.nodes["pane-output"].emit("keydown", { key: "Escape" }).prevented, true);
