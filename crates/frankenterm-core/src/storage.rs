@@ -8027,6 +8027,44 @@ impl StorageHandle {
         .await
     }
 
+    /// [`Self::get_segment_capture_identity_with_cx`] for a bounded batch of
+    /// segments, in one blocking read. A segment without provenance is absent
+    /// from the map. So is one whose provenance cannot be read or fails
+    /// validation: it is logged and stays unknown, never attributed.
+    pub async fn get_segment_capture_identities_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        segment_ids: Vec<i64>,
+    ) -> Result<HashMap<i64, PaneCaptureIdentity>> {
+        Self::checkpoint_storage_operation(cx, "get_segment_capture_identities")?;
+        if segment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                let mut identities = HashMap::with_capacity(segment_ids.len());
+                for segment_id in segment_ids {
+                    match capture_identity::query_segment_capture_identity_backend(
+                        backend, segment_id,
+                    ) {
+                        Ok(Some(identity)) => {
+                            identities.insert(segment_id, identity);
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            segment_id,
+                            error = %error,
+                            "segment capture provenance unreadable; leaving it unattributed"
+                        ),
+                    }
+                }
+                Ok(identities)
+            })
+        })
+        .await
+    }
+
     /// Upsert a workflow execution record
     pub async fn upsert_workflow(&self, workflow: WorkflowRecord) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);

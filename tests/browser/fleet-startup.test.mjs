@@ -670,6 +670,21 @@ test("notification clicks cannot resolve a reused pane or outlive session retire
   assert.match(reused.get("fleet-notifications-status").textContent, /identity changed/);
 });
 
+test("notification click refuses a detection the server could not attribute to a pane lifetime", async (t) => {
+  // ft-ddxotx: durable frames carry pane_uuid null when the detection's
+  // segment has no capture provenance (older events, or no segment at all).
+  const f = fixture(t, { notifications: true, verifyNotificationSession: async () => true,
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  emitNotificationDetection(feed, "1", null);
+  assert.equal(f.notifications.length, 1, "an unattributed detection still alerts");
+  f.notifications[0].onclick(); await flush();
+  assert.equal(f.get("pane-output-id").value, "");
+  assert.match(f.get("fleet-notifications-status").textContent, /identity changed/);
+});
+
 test("hidden notification click waits for foreground session admission and pagehide closes it", async (t) => {
   let verified = 0;
   const f = fixture(t, { notifications: true, verifyNotificationSession: async () => { verified += 1; return true; },

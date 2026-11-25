@@ -12,12 +12,14 @@ use crate::policy::Redactor;
 use crate::runtime_async::stream::Stream;
 use crate::runtime_async::{mpsc, sleep, task};
 use crate::storage::{
-    EventRetentionCheck, EventRetentionStatus, EventStreamPage, EventStreamQuery, StorageHandle,
+    EventRetentionCheck, EventRetentionStatus, EventStreamPage, EventStreamQuery,
+    PaneCaptureIdentity, StorageHandle, StoredEvent,
 };
 use crate::web_framework::{
     QueryString, Request, Response, StatusCode, WebStreamLifecycle, sse_stream_response,
 };
 use serde_json::json;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -622,6 +624,8 @@ impl EventReplayCursor {
 struct CheckedEventPage {
     page: EventStreamPage,
     check: EventRetentionCheck,
+    /// Event id to the capture UUID its pane had at detection.
+    pane_uuids: HashMap<i64, String>,
 }
 
 fn event_page_checked_through(page: &EventStreamPage) -> i64 {
@@ -646,7 +650,40 @@ async fn read_event_replay_page(
     let check = storage
         .check_event_retention_in_epoch_with_cx(cx, after_id, through_id, epoch)
         .await?;
-    Ok(CheckedEventPage { page, check })
+    let segment_ids = page
+        .events
+        .iter()
+        .filter_map(|event| event.segment_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let identities = storage
+        .get_segment_capture_identities_with_cx(cx, segment_ids)
+        .await?;
+    let pane_uuids = detection_pane_uuids(&page.events, &identities);
+    Ok(CheckedEventPage {
+        page,
+        check,
+        pane_uuids,
+    })
+}
+
+/// The UUID each event's pane had when the event was detected (ft-ddxotx):
+/// the immutable capture provenance of the segment the detection came from.
+/// The `panes` row cannot supply it, because a reused numeric pane ID keeps
+/// only the newest UUID. An event without a segment, or whose segment has no
+/// provenance or belongs to another pane, stays unattributed.
+fn detection_pane_uuids(
+    events: &[StoredEvent],
+    identities: &HashMap<i64, PaneCaptureIdentity>,
+) -> HashMap<i64, String> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let identity = identities.get(&event.segment_id?)?;
+            (identity.pane_id == event.pane_id).then(|| (event.id, identity.capture_uuid.clone()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -786,7 +823,11 @@ where
             pane_id: pane_filter,
             ..EventStreamQuery::default()
         };
-        let CheckedEventPage { page, check } = match fetch(query).await {
+        let CheckedEventPage {
+            page,
+            check,
+            mut pane_uuids,
+        } = match fetch(query).await {
             Ok(page) => page,
             Err(_) => {
                 emit_event_replay_error(
@@ -852,7 +893,10 @@ where
         }
         for stored in page.events {
             let event_id = stored.id;
-            let event = super::server::stored_event_to_bus_event(stored);
+            let mut event = super::server::stored_event_to_bus_event(stored);
+            if let Event::PatternDetected { pane_uuid, .. } = &mut event {
+                *pane_uuid = pane_uuids.remove(&event_id);
+            }
             let Ok(mut event_json) = serde_json::to_value(&event) else {
                 emit_event_replay_error(
                     cx,
@@ -1683,6 +1727,7 @@ mod tests {
                 snapshot,
                 status: crate::storage::EventRetentionStatus::CompleteNoPruning,
             },
+            pane_uuids: std::collections::HashMap::new(),
         }
     }
 
@@ -1830,6 +1875,96 @@ mod tests {
             super::parse_event_resume(None, Some("9"), None, None),
             Err(super::INVALID_EVENT_CURSOR)
         );
+    }
+
+    #[test]
+    fn detection_pane_uuids_come_only_from_same_pane_segment_provenance() {
+        // ft-ddxotx: a reused pane ID keeps each detection's own lifetime.
+        let first_uuid = crate::ingest::generate_pane_uuid("local", 7, 1);
+        let second_uuid = crate::ingest::generate_pane_uuid("local", 7, 2);
+        let other_uuid = crate::ingest::generate_pane_uuid("local", 8, 1);
+        let identity = |capture_uuid: &str, pane_id| crate::storage::PaneCaptureIdentity {
+            capture_uuid: capture_uuid.to_owned(),
+            pane_id,
+            native_identity: None,
+        };
+        let identities = std::collections::HashMap::from([
+            (100, identity(first_uuid.as_str(), 7)),
+            (200, identity(second_uuid.as_str(), 7)),
+            (300, identity(other_uuid.as_str(), 8)),
+        ]);
+        let events = [
+            (1, Some(100)),
+            (2, Some(200)),
+            (3, None),
+            (4, Some(999)),
+            (5, Some(300)),
+        ]
+        .map(|(id, segment_id)| {
+            let mut event = replay_fixture(id);
+            event.segment_id = segment_id;
+            event
+        });
+        assert_eq!(
+            super::detection_pane_uuids(&events, &identities),
+            std::collections::HashMap::from([(1, first_uuid), (2, second_uuid)]),
+            "no segment, unknown provenance and another pane's capture stay unattributed"
+        );
+    }
+
+    #[test]
+    fn durable_event_frames_carry_the_detection_time_pane_uuid() {
+        // ft-ddxotx: the browser resolves alert click-through by this field.
+        run_async_test_isolated(|| async {
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(4);
+            let mut cursor = replay_cursor(10);
+            let mut seq = 0;
+            let mut next_emit_at = std::time::Instant::now();
+            let capture_uuid = crate::ingest::generate_pane_uuid("local", 7, 1);
+            let progress = super::replay_event_frames(
+                &cx,
+                |_query| {
+                    let mut page =
+                        checked_fixture_page(vec![replay_fixture(11), replay_fixture(12)], 10, 12);
+                    page.pane_uuids.insert(11, capture_uuid.clone());
+                    std::future::ready(Ok(page))
+                },
+                None,
+                &mut cursor,
+                &redactor,
+                &tx,
+                &mut seq,
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+            )
+            .await;
+            assert_eq!(progress, super::EventReplayProgress::CaughtUp);
+            drop(tx);
+            let events = drain_replay_frames(rx)
+                .into_iter()
+                .filter(|frame| frame.event_type.as_deref() == Some("event"))
+                .map(|frame| {
+                    serde_json::from_str::<serde_json::Value>(frame.data.as_deref().unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2);
+            for payload in &events {
+                assert_eq!(payload["data"]["delivery"], "durable");
+            }
+            let first = &events[0]["data"]["event"];
+            assert_eq!(first["event_id"], 11);
+            assert_eq!(
+                first["pane_uuid"].as_str(),
+                Some(capture_uuid.as_str()),
+                "web redaction must leave the capture UUID intact: {first}"
+            );
+            let second = &events[1]["data"]["event"];
+            assert_eq!(second["event_id"], 12);
+            assert!(second["pane_uuid"].is_null(), "{second}");
+        });
     }
 
     #[test]

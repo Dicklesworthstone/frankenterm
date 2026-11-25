@@ -503,6 +503,78 @@ fn storage_handle_get_panes_by_ids_filters_missing_rows_and_preserves_uuid() {
 }
 
 #[test]
+fn storage_handle_segment_capture_identities_keep_each_lifetime_of_a_reused_pane() {
+    // ft-ddxotx: the web server attributes a detection to the UUID its pane
+    // had when the detection's segment was captured, not to the pane row.
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        let cx = crate::cx::for_testing();
+        assert!(
+            handle
+                .get_segment_capture_identities_with_cx(&cx, Vec::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let first_uuid = crate::ingest::generate_pane_uuid("local", 7, 1);
+        let mut first_lifetime = test_pane(7);
+        first_lifetime.pane_uuid = Some(first_uuid.clone());
+        handle
+            .prepare_pane_capture_with_cx(&cx, first_lifetime, None, false)
+            .await
+            .unwrap();
+        let first = handle.append_segment(7, "first", None).await.unwrap();
+        let second_uuid = crate::ingest::generate_pane_uuid("local", 7, 2);
+        let mut second_lifetime = test_pane(7);
+        second_lifetime.pane_uuid = Some(second_uuid.clone());
+        handle
+            .prepare_pane_capture_with_cx(&cx, second_lifetime, None, false)
+            .await
+            .unwrap();
+        let second = handle.append_segment(7, "second", None).await.unwrap();
+        let unbound = handle.append_segment(7, "unbound", None).await.unwrap();
+        // Production stamps provenance inside the append transaction, which
+        // needs runtime capture authority. Bind the rows directly here.
+        let conn = Connection::open(&db_path).unwrap();
+        for (segment_id, capture_uuid) in [(first.id, &first_uuid), (second.id, &second_uuid)] {
+            conn.execute(
+                "INSERT INTO output_segment_captures (segment_id, capture_uuid) VALUES (?1, ?2)",
+                rusqlite::params![segment_id, capture_uuid],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let identities = handle
+            .get_segment_capture_identities_with_cx(
+                &cx,
+                vec![first.id, second.id, unbound.id, 9_999],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            identities.len(),
+            2,
+            "unbound and missing segments stay unknown"
+        );
+        assert_eq!(identities[&first.id].capture_uuid, first_uuid);
+        assert_eq!(identities[&first.id].pane_id, 7);
+        assert_eq!(identities[&second.id].capture_uuid, second_uuid);
+        let pane = handle.get_pane(7).await.unwrap().unwrap();
+        assert_eq!(
+            pane.pane_uuid.as_deref(),
+            Some(second_uuid.as_str()),
+            "the mutable pane row names only the newest lifetime"
+        );
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
 fn query_panes_by_ids_chunks_large_unsorted_duplicate_sets() {
     let backend = memory_pane_backend();
     let pane_count = u64::try_from(PANE_IDS_PER_QUERY).unwrap() + 1;
