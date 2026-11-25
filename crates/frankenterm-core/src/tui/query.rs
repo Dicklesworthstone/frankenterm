@@ -63,11 +63,10 @@ pub(super) fn redact_tui_text(redactor: &crate::redactor::Redactor, text: &str) 
     redactor.redact(&crate::output::normalize_terminal_text_for_redaction(text))
 }
 
-fn redact_tui_optional_text(
-    redactor: &crate::redactor::Redactor,
-    text: Option<String>,
-) -> Option<String> {
-    text.map(|value| redact_tui_text(redactor, &value))
+fn redact_tui_text_in_place(redactor: &crate::redactor::Redactor, text: &mut Option<String>) {
+    if let Some(value) = text.as_mut() {
+        *value = redact_tui_text(redactor, value);
+    }
 }
 
 /// IDs, saved queries, profile names, and suggested commands can become action
@@ -103,11 +102,8 @@ fn redact_tui_triage_items(
         item.section = redact_tui_text(redactor, &item.section);
         item.severity = redact_tui_text(redactor, &item.severity);
         item.title = redact_tui_text(redactor, &item.title);
-        item.detail = crate::output::truncate_bounded(
-            &redact_tui_text(redactor, &item.detail),
-            120,
-            480,
-        );
+        item.detail =
+            crate::output::truncate_bounded(&redact_tui_text(redactor, &item.detail), 120, 480);
         for action in &mut item.actions {
             require_visible_tui_identity(redactor, &action.command)?;
             action.label = redact_tui_text(redactor, &action.label);
@@ -549,21 +545,15 @@ impl QueryClient for ProductionQueryClient {
         // This avoids "cannot start a runtime from within a runtime" panics
         // because this runtime is separate from any parent async context.
         self.runtime.block_on(async {
-            let panes = wezterm
-                .list_panes()
-                .await
-                .map_err(|e| {
-                    QueryError::WeztermError(redact_tui_text(
-                        self.output_redactor(),
-                        &e.to_string(),
-                    ))
-                })?;
+            let panes = wezterm.list_panes().await.map_err(|e| {
+                QueryError::WeztermError(redact_tui_text(self.output_redactor(), &e.to_string()))
+            })?;
             let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();
             let redactor = self.output_redactor();
             for pane in &mut pane_views {
                 pane.title = redact_tui_text(redactor, &pane.title);
                 pane.domain = redact_tui_text(redactor, &pane.domain);
-                pane.cwd = redact_tui_optional_text(redactor, pane.cwd.take());
+                redact_tui_text_in_place(redactor, &mut pane.cwd);
             }
 
             if let Some(storage) = storage {
@@ -702,8 +692,7 @@ impl QueryClient for ProductionQueryClient {
         })?;
 
         let redactor = self.output_redactor();
-        rows
-            .into_iter()
+        rows.into_iter()
             .map(|(e, annotations)| {
                 require_visible_tui_identity(redactor, &e.rule_id)?;
                 Ok(EventView {
@@ -717,13 +706,17 @@ impl QueryClient for ProductionQueryClient {
                     ),
                     timestamp: e.detected_at,
                     handled: e.handled_at.is_some(),
-                    triage_state: redact_tui_optional_text(redactor, annotations.triage_state),
+                    triage_state: annotations
+                        .triage_state
+                        .map(|value| redact_tui_text(redactor, &value)),
                     labels: annotations
                         .labels
                         .iter()
                         .map(|label| redact_tui_text(redactor, label))
                         .collect(),
-                    note: redact_tui_optional_text(redactor, annotations.note),
+                    note: annotations
+                        .note
+                        .map(|value| redact_tui_text(redactor, &value)),
                 })
             })
             .collect()
@@ -1050,7 +1043,7 @@ impl QueryClient for ProductionQueryClient {
                     current_step: wf.current_step,
                     total_steps,
                     status: redact_tui_text(redactor, &wf.status),
-                    error: redact_tui_optional_text(redactor, wf.error),
+                    error: wf.error.map(|value| redact_tui_text(redactor, &value)),
                     started_at: wf.started_at,
                     updated_at: wf.updated_at,
                 })
@@ -1096,11 +1089,13 @@ impl QueryClient for ProductionQueryClient {
                     action_kind: redact_tui_text(redactor, &row.action_kind),
                     result: redact_tui_text(redactor, &row.result),
                     actor_kind: redact_tui_text(redactor, &row.actor_kind),
-                    step_name: redact_tui_optional_text(redactor, row.step_name),
+                    step_name: row.step_name.map(|value| redact_tui_text(redactor, &value)),
                     undoable: row.undoable.unwrap_or(false) && row.undone_at.is_none(),
                     undone: row.undone_at.is_some(),
-                    undo_strategy: redact_tui_optional_text(redactor, row.undo_strategy),
-                    undo_hint: redact_tui_optional_text(redactor, row.undo_hint),
+                    undo_strategy: row
+                        .undo_strategy
+                        .map(|value| redact_tui_text(redactor, &value)),
+                    undo_hint: row.undo_hint.map(|value| redact_tui_text(redactor, &value)),
                     rule_id: row.rule_id,
                     summary: redact_tui_text(redactor, &summary),
                 })
@@ -1124,7 +1119,7 @@ impl QueryClient for ProductionQueryClient {
             for tag in &mut bookmark.tags {
                 *tag = redact_tui_text(redactor, tag);
             }
-            bookmark.description = redact_tui_optional_text(redactor, bookmark.description.take());
+            redact_tui_text_in_place(redactor, &mut bookmark.description);
         }
         Ok(bookmarks)
     }
@@ -1146,7 +1141,7 @@ impl QueryClient for ProductionQueryClient {
             require_visible_tui_identity(redactor, &search.name)?;
             require_visible_tui_identity(redactor, &search.query)?;
             search.since_mode = redact_tui_text(redactor, &search.since_mode);
-            search.last_error = redact_tui_optional_text(redactor, search.last_error.take());
+            redact_tui_text_in_place(redactor, &mut search.last_error);
         }
         Ok(searches)
     }
@@ -1158,8 +1153,8 @@ impl QueryClient for ProductionQueryClient {
         require_visible_tui_identity(redactor, &state.active_profile)?;
         for profile in &mut state.profiles {
             require_visible_tui_identity(redactor, &profile.name)?;
-            profile.description = redact_tui_optional_text(redactor, profile.description.take());
-            profile.path = redact_tui_optional_text(redactor, profile.path.take());
+            redact_tui_text_in_place(redactor, &mut profile.description);
+            redact_tui_text_in_place(redactor, &mut profile.path);
         }
         Ok(state)
     }
@@ -1187,7 +1182,8 @@ impl QueryClient for ProductionQueryClient {
         let query = crate::storage::TimelineQuery::new()
             .with_range(start, now)
             .with_pagination(limit, 0);
-        let mut timeline = self.runtime
+        let mut timeline = self
+            .runtime
             .block_on(async {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI timeline read.
                 let timeline_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -1198,14 +1194,13 @@ impl QueryClient for ProductionQueryClient {
         for event in &mut timeline.events {
             require_visible_tui_identity(redactor, &event.rule_id)?;
             require_visible_tui_optional_identity(redactor, event.pane_info.pane_uuid.as_deref())?;
-            event.pane_info.agent_type =
-                redact_tui_optional_text(redactor, event.pane_info.agent_type.take());
+            redact_tui_text_in_place(redactor, &mut event.pane_info.agent_type);
             event.pane_info.domain = redact_tui_text(redactor, &event.pane_info.domain);
-            event.pane_info.cwd = redact_tui_optional_text(redactor, event.pane_info.cwd.take());
-            event.pane_info.title = redact_tui_optional_text(redactor, event.pane_info.title.take());
+            redact_tui_text_in_place(redactor, &mut event.pane_info.cwd);
+            redact_tui_text_in_place(redactor, &mut event.pane_info.title);
             event.event_type = redact_tui_text(redactor, &event.event_type);
             event.severity = redact_tui_text(redactor, &event.severity);
-            event.summary = redact_tui_optional_text(redactor, event.summary.take());
+            redact_tui_text_in_place(redactor, &mut event.summary);
             if let Some(handled) = &mut event.handled {
                 require_visible_tui_optional_identity(redactor, handled.workflow_id.as_deref())?;
                 handled.status = redact_tui_text(redactor, &handled.status);
@@ -1266,8 +1261,7 @@ impl ProductionQueryClient {
                 storage.get_segment_time_range_with_cx(&health_cx)
             );
             let event_count = event_count.map_err(|e| self.storage_error(&e))?;
-            let (_, last_capture_ts) =
-                segment_range.map_err(|e| self.storage_error(&e))?;
+            let (_, last_capture_ts) = segment_range.map_err(|e| self.storage_error(&e))?;
             Ok::<_, QueryError>((event_count, last_capture_ts))
         });
 
@@ -1409,7 +1403,10 @@ mod tests {
         assert!(require_visible_tui_identity(&redactor, "wf-42").is_ok());
         assert!(require_visible_tui_identity(&redactor, "ORBITCANARY867530").is_err());
         assert!(require_visible_tui_identity(&redactor, "wf-\x1b[31m42").is_err());
-        let oversized = format!("ORBITCANARY867530{}", "x".repeat(MAX_TUI_REDACTION_INPUT_BYTES));
+        let oversized = format!(
+            "ORBITCANARY867530{}",
+            "x".repeat(MAX_TUI_REDACTION_INPUT_BYTES)
+        );
         assert_eq!(
             redact_tui_text(&redactor, &oversized),
             "[content omitted: TUI display limit]"
@@ -1440,7 +1437,10 @@ mod tests {
         );
         result.segment.content = "safe needle context".to_string();
         result.snippet = Some("needle context".to_string());
-        assert_eq!(redact_tui_search_snippet(&redactor, &result), "needle context");
+        assert_eq!(
+            redact_tui_search_snippet(&redactor, &result),
+            "needle context"
+        );
     }
 
     #[test]
@@ -1463,102 +1463,137 @@ mod tests {
             // protected them. The production read boundary must do that work.
             let legacy = StorageHandle::new(&db_path).await.unwrap();
             let now = epoch_ms();
-            legacy.upsert_pane(crate::storage::PaneRecord {
-                pane_id: 42,
-                pane_uuid: None,
-                domain: secret.to_string(),
-                window_id: Some(0),
-                tab_id: Some(0),
-                title: Some(secret.to_string()),
-                cwd: Some(format!("/workspace/{secret}")),
-                tty_name: None,
-                first_seen_at: now,
-                last_seen_at: now,
-                observed: true,
-                ignore_reason: None,
-                last_decision_at: None,
-            }).await.unwrap();
-            let segment = legacy.append_segment(42, &format!("needle {secret}"), None)
-                .await.unwrap();
+            legacy
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 42,
+                    pane_uuid: None,
+                    domain: secret.to_string(),
+                    window_id: Some(0),
+                    tab_id: Some(0),
+                    title: Some(secret.to_string()),
+                    cwd: Some(format!("/workspace/{secret}")),
+                    tty_name: None,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let segment = legacy
+                .append_segment(42, &format!("needle {secret}"), None)
+                .await
+                .unwrap();
             assert!(segment.content.contains(secret));
-            let event_id = legacy.record_event(crate::storage::StoredEvent {
-                id: 0,
-                pane_id: 42,
-                rule_id: "safe.rule".to_string(),
-                agent_type: "codex".to_string(),
-                event_type: "usage".to_string(),
-                severity: "warning".to_string(),
-                confidence: 0.9,
-                extracted: None,
-                matched_text: Some(format!("{} {secret}", "context".repeat(20))),
-                segment_id: Some(segment.id),
-                detected_at: segment.captured_at,
-                dedupe_key: None,
-                handled_at: None,
-                handled_by_workflow_id: None,
-                handled_status: None,
-            }).await.unwrap();
-            legacy.set_event_note(event_id, Some(secret.to_string()), None).await.unwrap();
-            legacy.add_event_label(event_id, secret.to_string(), None).await.unwrap();
-            legacy.insert_pane_bookmark(crate::storage::PaneBookmarkRecord {
-                id: 0,
-                pane_id: 42,
-                alias: secret.to_string(),
-                tags: Some(vec![secret.to_string()]),
-                description: Some(secret.to_string()),
-                created_at: now,
-                updated_at: now,
-            }).await.unwrap();
+            let event_id = legacy
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 42,
+                    rule_id: "safe.rule".to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: "usage".to_string(),
+                    severity: "warning".to_string(),
+                    confidence: 0.9,
+                    extracted: None,
+                    matched_text: Some(format!("{} {secret}", "context".repeat(20))),
+                    segment_id: Some(segment.id),
+                    detected_at: segment.captured_at,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .unwrap();
+            legacy
+                .set_event_note(event_id, Some(secret.to_string()), None)
+                .await
+                .unwrap();
+            legacy
+                .add_event_label(event_id, secret.to_string(), None)
+                .await
+                .unwrap();
+            legacy
+                .insert_pane_bookmark(crate::storage::PaneBookmarkRecord {
+                    id: 0,
+                    pane_id: 42,
+                    alias: secret.to_string(),
+                    tags: Some(vec![secret.to_string()]),
+                    description: Some(secret.to_string()),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
             let mut search = crate::storage::SavedSearchRecord::new(
-                "safe-search".to_string(), "needle".to_string(), Some(42), 10,
-                "last_run".to_string(), None,
+                "safe-search".to_string(),
+                "needle".to_string(),
+                Some(42),
+                10,
+                "last_run".to_string(),
+                None,
             );
             search.last_error = Some(secret.to_string());
             legacy.insert_saved_search(search).await.unwrap();
-            legacy.upsert_workflow(crate::storage::WorkflowRecord {
-                id: "wf-safe".to_string(),
-                workflow_name: secret.to_string(),
-                pane_id: 42,
-                trigger_event_id: Some(event_id),
-                current_step: 0,
-                status: "running".to_string(),
-                wait_condition: None,
-                context: None,
-                result: None,
-                error: Some(secret.to_string()),
-                started_at: now,
-                updated_at: now,
-                completed_at: None,
-            }).await.unwrap();
+            legacy
+                .upsert_workflow(crate::storage::WorkflowRecord {
+                    id: "wf-safe".to_string(),
+                    workflow_name: secret.to_string(),
+                    pane_id: 42,
+                    trigger_event_id: Some(event_id),
+                    current_step: 0,
+                    status: "running".to_string(),
+                    wait_condition: None,
+                    context: None,
+                    result: None,
+                    error: Some(secret.to_string()),
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                })
+                .await
+                .unwrap();
             legacy.shutdown().await.unwrap();
             drop(legacy);
 
             let mut config = crate::config::Config::default();
             config.safety.redaction = tui_test_redaction_config();
-            let storage = StorageHandle::with_config(
-                &db_path, crate::storage::StorageConfig::from(&config),
-            ).await.unwrap();
+            let storage =
+                StorageHandle::with_config(&db_path, crate::storage::StorageConfig::from(&config))
+                    .await
+                    .unwrap();
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_pane(crate::wezterm::MockPane {
-                pane_id: 42, window_id: 0, tab_id: 0,
+                pane_id: 42,
+                window_id: 0,
+                tab_id: 0,
                 title: format!("{secret} sk-abcdefghijklmnopqrstuvwxyz012345"),
-                domain: secret.to_string(), cwd: format!("/workspace/{secret}"),
-                is_active: true, is_zoomed: false, cols: 80, rows: 24,
+                domain: secret.to_string(),
+                cwd: format!("/workspace/{secret}"),
+                is_active: true,
+                is_zoomed: false,
+                cols: 80,
+                rows: 24,
                 content: String::new(),
-            }).await;
+            })
+            .await;
             let wezterm: WeztermHandle = mock;
             (layout, storage, event_id, wezterm)
         });
-        let client = ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
+        let client =
+            ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
         let panes = client.list_panes().unwrap();
         assert_eq!(panes[0].pane_id, 42);
         assert_eq!(panes[0].title, "[PRIVATE] [PRIVATE]");
         assert_eq!(panes[0].domain, "[PRIVATE]");
         assert_eq!(panes[0].cwd.as_deref(), Some("/workspace/[PRIVATE]"));
-        let events = client.list_events(&EventFilters {
-            limit: 10,
-            ..Default::default()
-        }).unwrap();
+        let events = client
+            .list_events(&EventFilters {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(events[0].id, event_id);
         assert_eq!(events[0].rule_id, "safe.rule");
         assert!(events[0].message.contains("[PRIVATE]"));
@@ -1582,17 +1617,31 @@ mod tests {
         assert_eq!(workflows[0].error.as_deref(), Some("[PRIVATE]"));
         let triage = client.list_triage_items().unwrap();
         assert!(!format!("{triage:?}").contains(secret));
-        assert!(triage.iter().any(|item| item.actions.iter()
-            .any(|action| action.command == "ft workflow status wf-safe")));
+        assert!(triage.iter().any(|item| {
+            item.actions
+                .iter()
+                .any(|action| action.command == "ft workflow status wf-safe")
+        }));
         let timeline = client.get_timeline(60_000, 10).unwrap();
         assert_eq!(timeline.events.len(), 1);
         assert_eq!(timeline.events[0].id, event_id);
         assert!(!format!("{timeline:?}").contains(secret));
-        assert_eq!(timeline.events[0].pane_info.title.as_deref(), Some("[PRIVATE]"));
-        runtime.block_on(storage.insert_saved_search(crate::storage::SavedSearchRecord::new(
-            secret.to_string(), "needle".to_string(), Some(42), 10,
-            "last_run".to_string(), None,
-        ))).unwrap();
+        assert_eq!(
+            timeline.events[0].pane_info.title.as_deref(),
+            Some("[PRIVATE]")
+        );
+        runtime
+            .block_on(
+                storage.insert_saved_search(crate::storage::SavedSearchRecord::new(
+                    secret.to_string(),
+                    "needle".to_string(),
+                    Some(42),
+                    10,
+                    "last_run".to_string(),
+                    None,
+                )),
+            )
+            .unwrap();
         let error = client.list_saved_searches().unwrap_err();
         assert!(matches!(&error, QueryError::QueryFailed(_)));
         assert!(!error.to_string().contains(secret));

@@ -414,7 +414,10 @@ fn fail_closed(engine: &mut PolicyEngine, error: &KillSwitchStateError, now_ms: 
     // replacing EmergencyHalt with HardStop would reopen read-only actions.
     // Do not carry an old auto-disarm deadline into this failure state: only
     // a successfully validated refresh may restore timeout authority.
-    let level = engine.kill_switch_state().level.max(KillSwitchLevel::HardStop);
+    let level = engine
+        .kill_switch_state()
+        .level
+        .max(KillSwitchLevel::HardStop);
     let mut state = KillSwitch::disarmed();
     state.trip(
         level,
@@ -1454,7 +1457,10 @@ pub(crate) mod tests {
             let outcome = freshness.apply(&mut engine, failed_refresh, 4_000);
             assert!(matches!(outcome, KillSwitchRestore::FailedClosed { .. }));
             let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
-            assert_eq!(engine.authorize(&input).rule_id(), Some("policy.kill_switch"));
+            assert_eq!(
+                engine.authorize(&input).rule_id(),
+                Some("policy.kill_switch")
+            );
 
             let mut reset = PersistedKillSwitch::from(&KillSwitch::disarmed());
             reset.revision = 3;

@@ -464,8 +464,12 @@ fn run_redact_purge_transaction(
     let redactor = &config.redactor;
     let batch = i64::from(config.batch_size.clamp(1, DEFAULT_BACKFILL_BATCH_SIZE));
     let mut cursor = config.resume_after_id;
-    let mut receipt =
-        RedactPurgeReceipt::new(config.dry_run, &secret_hash, config.resume_after_id, redactor);
+    let mut receipt = RedactPurgeReceipt::new(
+        config.dry_run,
+        &secret_hash,
+        config.resume_after_id,
+        redactor,
+    );
     let mut rewritten_ids: Vec<i64> = Vec::new();
 
     if !config.dry_run {
@@ -905,7 +909,10 @@ mod tests {
         assert_eq!(dry_run.family_counts.get("custom_pattern"), Some(&1));
         assert_eq!(dry_run.catalog_version, cfg.redactor.policy_version());
         assert_ne!(dry_run.catalog_version, catalog_version());
-        assert_eq!(dry_run.patterns_checked, Redactor::new().pattern_count() + 1);
+        assert_eq!(
+            dry_run.patterns_checked,
+            Redactor::new().pattern_count() + 1
+        );
         let original: String = conn
             .query_row(
                 "SELECT content FROM output_segments WHERE id = 1",
@@ -944,7 +951,10 @@ mod tests {
         let serialized = serde_json::to_string(&receipt).unwrap();
         assert!(!serialized.contains(custom_secret));
         assert!(!serialized.contains(&configured.patterns[0]));
-        assert_eq!(run_redact_backfill(&conn, &cfg).unwrap().segments_rewritten, 0);
+        assert_eq!(
+            run_redact_backfill(&conn, &cfg).unwrap().segments_rewritten,
+            0
+        );
     }
 
     #[test]

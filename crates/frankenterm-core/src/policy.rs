@@ -8121,16 +8121,18 @@ impl DetachedInjectionFence {
         let fence = storage_path
             .as_deref()
             .map(|path| {
-                crate::policy_kill_switch_state::acquire_kill_switch_fence(std::path::Path::new(path))
+                crate::policy_kill_switch_state::acquire_kill_switch_fence(std::path::Path::new(
+                    path,
+                ))
             })
             .transpose();
-        Self { storage_path, fence }
+        Self {
+            storage_path,
+            fence,
+        }
     }
 
-    pub(crate) async fn acquire_with_cx(
-        cx: &crate::cx::Cx,
-        storage_path: Option<String>,
-    ) -> Self {
+    pub(crate) async fn acquire_with_cx(cx: &crate::cx::Cx, storage_path: Option<String>) -> Self {
         use crate::policy_kill_switch_state::{
             KILL_SWITCH_FENCE_WAIT, acquire_kill_switch_fence_within_with_cx,
         };
@@ -8145,7 +8147,10 @@ impl DetachedInjectionFence {
             .map(Some),
             None => Ok(None),
         };
-        Self { storage_path, fence }
+        Self {
+            storage_path,
+            fence,
+        }
     }
 
     fn into_guard(
@@ -11166,7 +11171,14 @@ mod tests {
                     match action {
                         ActionKind::SendText => {
                             injector
-                                .send_text(&cx, 42, "echo queued\n", ActorKind::Workflow, &caps, None)
+                                .send_text(
+                                    &cx,
+                                    42,
+                                    "echo queued\n",
+                                    ActorKind::Workflow,
+                                    &caps,
+                                    None,
+                                )
                                 .await
                         }
                         ActionKind::SendCtrlC => {
@@ -11256,7 +11268,10 @@ mod tests {
                 Poll::Ready(())
             })
             .await;
-            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("cancel waiting send"));
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel waiting send"),
+            );
             assert!(pending.await.is_err());
             assert!(mock.pane_state(42).await.unwrap().content.is_empty());
             assert!(
@@ -11331,18 +11346,17 @@ mod tests {
     fn detached_admission_rejects_fence_for_replaced_storage() {
         run_async_test(async {
             let (_directory, storage, direct) = persisted_stop_injector().await;
-            let (_other_directory, other_storage, _other_injector) = persisted_stop_injector().await;
+            let (_other_directory, other_storage, _other_injector) =
+                persisted_stop_injector().await;
             let mock = Arc::new(direct.client);
             let handle: crate::wezterm::WeztermHandle = mock.clone();
             let mut injector =
                 PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
             let cx = crate::cx::for_request();
             let caps = unreserved(PaneCapabilities::prompt());
-            let admission = DetachedInjectionFence::acquire_with_cx(
-                &cx,
-                Some(storage.db_path().to_string()),
-            )
-            .await;
+            let admission =
+                DetachedInjectionFence::acquire_with_cx(&cx, Some(storage.db_path().to_string()))
+                    .await;
             injector.set_storage(other_storage.clone());
             let result = injector
                 .inject_with_cx_detached(

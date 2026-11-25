@@ -306,7 +306,8 @@ impl SecretScanEngine {
         }
 
         let scope = SecretScanScope::from_options(&options);
-        let mut report = SecretScanReport::new(scope, resume_after_id, self.catalog_version.clone());
+        let mut report =
+            SecretScanReport::new(scope, resume_after_id, self.catalog_version.clone());
         let mut after_id = resume_after_id;
 
         loop {

@@ -215,7 +215,11 @@ pub fn adapt_triage(item: &TriageItemView) -> TriageRow {
         severity_label: redact_secrets(&item.severity),
         title: truncate(&redact_secrets(&item.title), 60),
         detail: truncate(&redact_secrets(&item.detail), 120),
-        action_labels: item.actions.iter().map(|a| redact_secrets(&a.label)).collect(),
+        action_labels: item
+            .actions
+            .iter()
+            .map(|a| redact_secrets(&a.label))
+            .collect(),
         action_commands: item
             .actions
             .iter()
@@ -1272,10 +1276,18 @@ mod tests {
         timeline.summary = Some(format!("{} {token}", "x".repeat(50)));
         let timeline_row = adapt_timeline_event(&timeline);
         for preview in [
-            &event_row.message, &event_row.note_preview, &history_row.summary,
-            &triage_row.detail, &triage_row.title, &pane_row.title, &timeline_row.summary,
+            &event_row.message,
+            &event_row.note_preview,
+            &history_row.summary,
+            &triage_row.detail,
+            &triage_row.title,
+            &pane_row.title,
+            &timeline_row.summary,
         ] {
-            assert!(!preview.contains("sk-"), "secret prefix survived clipping: {preview}");
+            assert!(
+                !preview.contains("sk-"),
+                "secret prefix survived clipping: {preview}"
+            );
             assert!(preview.ends_with("..."));
         }
         assert_eq!(event_row.id, "100");
@@ -1312,7 +1324,10 @@ mod tests {
     #[test]
     fn protected_triage_commands_are_suppressed_without_retargeting() {
         let mut item = sample_triage();
-        assert_eq!(adapt_triage(&item).action_commands[0], "ft why --recent --pane 42");
+        assert_eq!(
+            adapt_triage(&item).action_commands[0],
+            "ft why --recent --pane 42"
+        );
         item.actions[0].command =
             "ft workflow status sk-abcdefghijklmnopqrstuvwxyz012345".to_string();
         assert!(adapt_triage(&item).action_commands[0].is_empty());

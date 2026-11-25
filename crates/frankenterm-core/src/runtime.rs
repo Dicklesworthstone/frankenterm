@@ -9920,7 +9920,9 @@ impl ObservationRuntime {
                     Ok(receive.await)
                 };
                 match received {
-                    Ok(NativeWake::StateChanged) => continue,
+                    Ok(NativeWake::StateChanged) => {
+                        // The next loop iteration re-reads the changed state.
+                    }
                     Ok(NativeWake::WaitFailed(failure)) => {
                         record_runtime_wait_failure("native_event_state_wait", failure);
                         break;
