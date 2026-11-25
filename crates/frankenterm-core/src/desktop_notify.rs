@@ -9,7 +9,8 @@
 //! selects the appropriate command. If the tool is not available, the
 //! notifier returns a graceful fallback error instead of panicking.
 
-use std::process::Command;
+use std::process::Output;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +19,16 @@ use crate::notifications::{
     NotificationDelivery, NotificationFuture, NotificationPayload, NotificationSender,
 };
 use crate::patterns::Detection;
+use crate::runtime_async::process::{Command, CommandCancellation};
 
 const DESKTOP_NOTIFICATION_APP_NAME: &str = "FrankenTerm";
+
+/// A notification command waits on the platform notification service:
+/// notify-send on D-Bus, PowerShell start-up for a Windows toast. One that
+/// never returns must not hold back its caller or, in the notification
+/// pipeline, the other channels. Past this deadline the process group is
+/// terminated and the delivery reports the timeout.
+const DESKTOP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Urgency mapping
@@ -157,6 +166,46 @@ pub fn build_command(
         NotifyBackend::Linux => Some(build_linux_command(title, body, urgency)),
         NotifyBackend::Windows => Some(build_windows_command(title, body)),
         NotifyBackend::None => None,
+    }
+}
+
+fn notify_process(cmd: &NotifyCommand) -> Command {
+    let mut command = Command::new(&cmd.program);
+    command.args(&cmd.args).kill_on_drop(true);
+    command
+}
+
+/// Run a notification command on the blocking pool, never on the executor,
+/// under the caller's Cx and a deadline the process supervisor owns.
+async fn run_notify_command(
+    cx: &crate::cx::Cx,
+    cmd: &NotifyCommand,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    notify_process(cmd)
+        .output_with_cx_timeout(cx, timeout)
+        .await
+}
+
+/// Run a notification command from synchronous code under the same deadline.
+fn run_notify_command_blocking(cmd: &NotifyCommand) -> std::io::Result<Output> {
+    notify_process(cmd)
+        .output_blocking_with_cancellation(DESKTOP_NOTIFY_TIMEOUT, &CommandCancellation::new())
+}
+
+/// `None` when the command reported success, otherwise the delivery error.
+fn notify_command_error(result: &std::io::Result<Output>) -> Option<String> {
+    match result {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(format!(
+            "exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("command not found: {error}"))
+        }
+        Err(error) => Some(format!("notification command failed: {error}")),
     }
 }
 
@@ -326,49 +375,23 @@ impl DesktopNotifier {
             "sending desktop notification"
         );
 
-        match Command::new(&cmd.program).args(&cmd.args).output() {
-            Ok(output) if output.status.success() => {
-                tracing::info!(
-                    backend = %self.backend,
-                    rule_id = %detection.rule_id,
-                    "desktop notification sent"
-                );
-                DesktopDeliveryResult {
-                    backend: self.backend.to_string(),
-                    success: true,
-                    error: None,
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
-                    backend = %self.backend,
-                    status = ?output.status,
-                    stderr = %stderr,
-                    "desktop notification command failed"
-                );
-                DesktopDeliveryResult {
-                    backend: self.backend.to_string(),
-                    success: false,
-                    error: Some(format!(
-                        "exit {}: {}",
-                        output.status.code().unwrap_or(-1),
-                        stderr.trim()
-                    )),
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    backend = %self.backend,
-                    error = %e,
-                    "desktop notification command not found"
-                );
-                DesktopDeliveryResult {
-                    backend: self.backend.to_string(),
-                    success: false,
-                    error: Some(format!("command not found: {e}")),
-                }
-            }
+        let error = notify_command_error(&run_notify_command_blocking(&cmd));
+        match &error {
+            None => tracing::info!(
+                backend = %self.backend,
+                rule_id = %detection.rule_id,
+                "desktop notification sent"
+            ),
+            Some(error) => tracing::warn!(
+                backend = %self.backend,
+                error = %error,
+                "desktop notification failed"
+            ),
+        }
+        DesktopDeliveryResult {
+            backend: self.backend.to_string(),
+            success: error.is_none(),
+            error,
         }
     }
 
@@ -401,29 +424,70 @@ impl DesktopNotifier {
             "sending desktop notification"
         );
 
-        match Command::new(&cmd.program).args(&cmd.args).output() {
-            Ok(output) if output.status.success() => DesktopDeliveryResult {
-                backend: self.backend.to_string(),
-                success: true,
-                error: None,
-            },
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                DesktopDeliveryResult {
-                    backend: self.backend.to_string(),
-                    success: false,
-                    error: Some(format!(
-                        "exit {}: {}",
-                        output.status.code().unwrap_or(-1),
-                        stderr.trim()
-                    )),
+        let error = notify_command_error(&run_notify_command_blocking(&cmd));
+        DesktopDeliveryResult {
+            backend: self.backend.to_string(),
+            success: error.is_none(),
+            error,
+        }
+    }
+
+    async fn deliver(
+        &self,
+        cx: &crate::cx::Cx,
+        payload: &NotificationPayload,
+    ) -> NotificationDelivery {
+        let failed = |error: String| NotificationDelivery {
+            sender: self.name().to_string(),
+            success: false,
+            rate_limited: false,
+            error: Some(error),
+            records: Vec::new(),
+        };
+        if !self.config.enabled {
+            return failed("desktop notifications disabled".to_string());
+        }
+        if cx.is_cancel_requested() {
+            return failed("cancelled before desktop notification dispatch".to_string());
+        }
+
+        let urgency = urgency_from_str(&payload.severity);
+        let title = format!("{DESKTOP_NOTIFICATION_APP_NAME}: {}", payload.summary);
+        let mut body = format!(
+            "[{}] {} (pane {})",
+            payload.severity, payload.event_type, payload.pane_id
+        );
+        if payload.suppressed_since_last > 0 {
+            body.push_str(&format!(" (+{} suppressed)", payload.suppressed_since_last));
+        }
+
+        let Some(cmd) = build_command(self.backend, &title, &body, urgency, self.config.sound)
+        else {
+            return failed("no notification backend available".to_string());
+        };
+
+        tracing::debug!(
+            backend = %self.backend,
+            program = %cmd.program,
+            "sending desktop notification"
+        );
+
+        let result = run_notify_command(cx, &cmd, DESKTOP_NOTIFY_TIMEOUT).await;
+        match notify_command_error(&result) {
+            None => {
+                tracing::info!(backend = %self.backend, "desktop notification sent");
+                NotificationDelivery {
+                    sender: self.name().to_string(),
+                    success: true,
+                    rate_limited: false,
+                    error: None,
+                    records: Vec::new(),
                 }
             }
-            Err(e) => DesktopDeliveryResult {
-                backend: self.backend.to_string(),
-                success: false,
-                error: Some(format!("command not found: {e}")),
-            },
+            Some(error) => {
+                tracing::warn!(backend = %self.backend, error = %error, "desktop notification failed");
+                failed(error)
+            }
         }
     }
 }
@@ -435,108 +499,21 @@ impl NotificationSender for DesktopNotifier {
 
     fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
         Box::pin(async move {
-            if !self.config.enabled {
-                return NotificationDelivery {
-                    sender: self.name().to_string(),
-                    success: false,
-                    rate_limited: false,
-                    error: Some("desktop notifications disabled".to_string()),
-                    records: Vec::new(),
-                };
-            }
-
-            let urgency = urgency_from_str(&payload.severity);
-            let title = format!("{DESKTOP_NOTIFICATION_APP_NAME}: {}", payload.summary);
-            let mut body = format!(
-                "[{}] {} (pane {})",
-                payload.severity, payload.event_type, payload.pane_id
-            );
-            if payload.suppressed_since_last > 0 {
-                body.push_str(&format!(" (+{} suppressed)", payload.suppressed_since_last));
-            }
-
-            let Some(cmd) = build_command(self.backend, &title, &body, urgency, self.config.sound)
-            else {
-                return NotificationDelivery {
-                    sender: self.name().to_string(),
-                    success: false,
-                    rate_limited: false,
-                    error: Some("no notification backend available".to_string()),
-                    records: Vec::new(),
-                };
-            };
-
-            tracing::debug!(
-                backend = %self.backend,
-                program = %cmd.program,
-                "sending desktop notification"
-            );
-
-            let result = match Command::new(&cmd.program).args(&cmd.args).output() {
-                Ok(output) if output.status.success() => NotificationDelivery {
-                    sender: self.name().to_string(),
-                    success: true,
-                    rate_limited: false,
-                    error: None,
-                    records: Vec::new(),
-                },
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    NotificationDelivery {
-                        sender: self.name().to_string(),
-                        success: false,
-                        rate_limited: false,
-                        error: Some(format!(
-                            "exit {}: {}",
-                            output.status.code().unwrap_or(-1),
-                            stderr.trim()
-                        )),
-                        records: Vec::new(),
-                    }
-                }
-                Err(e) => NotificationDelivery {
-                    sender: self.name().to_string(),
-                    success: false,
-                    rate_limited: false,
-                    error: Some(format!("command not found: {e}")),
-                    records: Vec::new(),
-                },
-            };
-
-            if result.success {
-                tracing::info!(backend = %self.backend, "desktop notification sent");
-            } else if let Some(ref err) = result.error {
-                tracing::warn!(backend = %self.backend, error = %err, "desktop notification failed");
-            }
-
-            result
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.deliver(&cx, payload).await
         })
     }
 
-    /// ft-xbnl0.2.3 Cx-first override (tick 212). Adds a pre-flight
-    /// cx.checkpoint() so a cancelled caller skips the blocking
-    /// Command::output() entirely. The sync subprocess exec
-    /// itself can't observe cx, so this is pre-flight-only —
-    /// matches the scoping used for other sync-subprocess
-    /// boundaries (e.g. cass/caut clients before their
-    /// timeout_with_cx wrappers). Without this override the
-    /// trait default would delegate to `send()` which ignores cx.
+    /// The command runs on the blocking pool, so a notification service that
+    /// never answers holds back neither the executor nor the other channels.
+    /// A cancelled `cx` refuses the spawn; cancellation or the notification
+    /// deadline mid-flight terminates and reaps the process group.
     fn send_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
         payload: &'a NotificationPayload,
     ) -> NotificationFuture<'a> {
-        if cx.is_cancel_requested() {
-            let delivery = NotificationDelivery {
-                sender: self.name().to_string(),
-                success: false,
-                rate_limited: false,
-                error: Some("cancelled before desktop notification dispatch".to_string()),
-                records: Vec::new(),
-            };
-            return Box::pin(async move { delivery });
-        }
-        self.send(payload)
+        Box::pin(self.deliver(cx, payload))
     }
 }
 
@@ -721,6 +698,110 @@ sound = true
         let c: DesktopNotifyConfig = toml::from_str(toml_str).expect("parse");
         assert!(c.enabled);
         assert!(c.sound);
+    }
+
+    fn run_notify_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("desktop notification test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            crate::runtime_async::clear_runtime_handle,
+        ));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    // ---- Command execution ----
+
+    /// A notification service that never answers (notify-send with no
+    /// notification daemon on D-Bus) must not freeze the executor: the
+    /// pipeline delivers every channel concurrently on it. Past the deadline
+    /// the command is killed and reported as timed out.
+    #[cfg(unix)]
+    #[test]
+    fn a_notification_command_that_never_exits_neither_blocks_the_executor_nor_outlives_its_deadline()
+     {
+        run_notify_test(async {
+            let never_exits = NotifyCommand {
+                program: "sleep".to_string(),
+                args: vec!["30".to_string()],
+            };
+            let cx = crate::cx::for_request();
+            let started = std::time::Instant::now();
+            let mut timer_fired_at = None;
+            let timer = async {
+                crate::runtime_async::sleep(Duration::from_millis(50)).await;
+                timer_fired_at = Some(started.elapsed());
+            };
+            let (result, ()) = futures::future::join(
+                run_notify_command(&cx, &never_exits, Duration::from_millis(1_500)),
+                timer,
+            )
+            .await;
+            let settled_at = started.elapsed();
+
+            let timer_fired_at = timer_fired_at.expect("the executor timer ran");
+            assert!(
+                timer_fired_at < Duration::from_millis(1_000),
+                "the command blocked the executor for {timer_fired_at:?}"
+            );
+            assert!(
+                settled_at < Duration::from_secs(10),
+                "the deadline did not end the command: {settled_at:?}"
+            );
+            let error = result.as_ref().expect_err("a command that never exits");
+            assert!(
+                crate::runtime_async::process::CommandTimedOut::from_io_error(error).is_some(),
+                "{error}"
+            );
+            let message = notify_command_error(&result).expect("a timeout is a failure");
+            assert!(message.contains("timed out"), "{message}");
+        });
+    }
+
+    #[test]
+    fn a_missing_notification_program_reports_command_not_found() {
+        let missing = NotifyCommand {
+            program: "ft-desktop-notify-no-such-program".to_string(),
+            args: Vec::new(),
+        };
+        let message = notify_command_error(&run_notify_command_blocking(&missing))
+            .expect("a missing program is a failure");
+        assert!(message.starts_with("command not found"), "{message}");
+    }
+
+    #[test]
+    fn a_cancelled_caller_spawns_no_desktop_notification() {
+        run_notify_test(async {
+            let notifier = DesktopNotifier::with_backend(
+                NotifyBackend::Linux,
+                DesktopNotifyConfig {
+                    enabled: true,
+                    sound: false,
+                },
+            );
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::for_request();
+            cx.set_cancel_requested(true);
+            let delivery = notifier.send_with_cx(&cx, &payload).await;
+            assert!(!delivery.success);
+            assert_eq!(
+                delivery.error.as_deref(),
+                Some("cancelled before desktop notification dispatch")
+            );
+        });
     }
 
     // ---- Notifier ----
