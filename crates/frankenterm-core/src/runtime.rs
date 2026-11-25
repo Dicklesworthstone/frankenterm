@@ -23843,9 +23843,14 @@ mod tests {
     #[test]
     fn native_capture_arms_only_pending_output_and_honors_operator_window() {
         use crate::runtime_async::unix::AsyncWriteExt;
+        use std::os::unix::fs::PermissionsExt as _;
 
         run_async_test_isolated(|| async {
             let (dir, db_path) = temp_db_path();
+            // The listener refuses a socket parent that is not private
+            // (0700); tempfile creates the directory with the umask default.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make the socket directory private");
             let storage = StorageHandle::new(&db_path).await.unwrap();
             let mut tuning = crate::tuning_config::TuningConfig::default();
             tuning.runtime.output_coalesce_window_ms = 80;
