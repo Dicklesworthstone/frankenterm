@@ -871,6 +871,41 @@ test("clearing copied selection reveals buffered text and explicit resume uses t
   assert.equal(area.value, "output-next");
 });
 
+test("a click or key that clears a copied selection reveals buffered text without a select event", () => {
+  // Chromium 147, driven by real mouse input: a click that collapses a
+  // textarea selection fires pointerup and selectionchange, never select.
+  for (const clearedBy of ["pointerup", "selectionchange", "keyup"]) {
+    const f = panelFixture({ maxChars: 11 }); f.panel.openSelected();
+    delta(f.latest(), "1", "error-alpha"); f.panel.render();
+    const area = f.nodes["pane-output-text"];
+    // The frame is admitted before the selection pauses the stream, so it
+    // waits in the buffer while the selected text stays on screen.
+    area.setSelectionRange(0, 5);
+    delta(f.latest(), "2", "more-output"); f.panel.render();
+    assert.equal(area.value, "error-alpha", clearedBy);
+    assert.match(f.nodes["pane-output-warnings"].textContent, /selected text stable/, clearedBy);
+    area.setSelectionRange(9, 9); area.emit(clearedBy);
+    assert.equal(area.value, "more-output", clearedBy);
+    assert.doesNotMatch(f.nodes["pane-output-warnings"].textContent, /selected text stable/, clearedBy);
+    assert.equal(f.output.snapshot().paused, true, clearedBy);
+    // A later caret move with nothing held renders nothing new.
+    area.setSelectionRange(3, 3); area.emit(clearedBy);
+    assert.equal(area.value, "more-output", clearedBy);
+  }
+});
+
+test("a selection made without a select event still pauses on the next selection event", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "1", "first diagnostic"); f.panel.render();
+  const source = f.latest();
+  const area = f.nodes["pane-output-text"];
+  area.setSelectionRange(0, 5); area.emit("pointerup");
+  assert.equal(f.output.snapshot().paused, true);
+  assert.equal(source.closed, true);
+  delta(source, "2", "late private output"); f.panel.render();
+  assert.equal(area.value, "first diagnostic");
+});
+
 test("switching or closing a selected transcript cannot carry old selected text into another pane", () => {
   const f = panelFixture(); f.panel.openSelected();
   delta(f.latest(), "1", "private seven"); f.panel.render();

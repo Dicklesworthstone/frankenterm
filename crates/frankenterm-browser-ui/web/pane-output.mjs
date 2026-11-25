@@ -495,6 +495,8 @@ export function mountPaneOutput({
   let matchAt = -1;
   let matchQuery = "";
   let matchText = "";
+  // Whether the last render kept the displayed text for a selection.
+  let heldSelection = false;
   const setText = (node, value) => {
     // Avoid repeating live-region announcements on every output frame.
     if (node.textContent !== value) node.textContent = value;
@@ -507,6 +509,7 @@ export function mountPaneOutput({
     const historical = state.capture !== null;
     const holdingSelection = opened && !historical
       && transcript.selectionStart !== transcript.selectionEnd;
+    heldSelection = holdingSelection;
     if (holdingSelection) {
       // The displayed buffer can lag an admitted frame. Preserve the exact
       // selected text even if that frame already evicted its prefix; offsets
@@ -672,8 +675,17 @@ export function mountPaneOutput({
     }
   });
   // Native selection/copy owns the displayed text until the selection is
-  // cleared. Also check it in render() in case a frame precedes this event.
-  transcript.addEventListener("select", () => render(true));
+  // cleared. Also check it in render() in case a frame precedes these events.
+  // Browsers fire select only when text becomes selected: a click or key
+  // that clears the selection fires selectionchange, pointerup or keyup
+  // instead. Re-render on those only while a selection exists or was held,
+  // so caret moves during live following cost nothing.
+  const selectionMayHaveChanged = () => {
+    if (heldSelection || transcript.selectionStart !== transcript.selectionEnd) render(true);
+  };
+  for (const type of ["select", "selectionchange", "pointerup", "keyup"]) {
+    transcript.addEventListener(type, selectionMayHaveChanged);
+  }
   transcript.addEventListener("scroll", () => {
     if (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight > 8) follow.checked = false;
   });
