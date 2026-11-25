@@ -5,10 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::caut::{CautClient, CautService};
 use crate::error::RuntimeOperationSource;
 #[cfg(test)]
 use crate::storage::UsageMetricRecord;
 use crate::storage::{MetricType, StorageHandle};
+
+/// A watcher account_balance rule treats account data older than this as
+/// unavailable rather than as the current balance.
+const ACCOUNT_BALANCE_MAX_AGE_MS: i64 = 15 * 60 * 1000;
+
+/// The watcher asks caut again once a balance rule's account data is this old,
+/// and runs caut at most this often per service, whether or not the last run
+/// succeeded. Two more attempts fit before the data ages out.
+const ACCOUNT_REFRESH_AFTER_MS: i64 = 5 * 60 * 1000;
 
 fn alert_check_cancelled_error(detail: impl Into<String>) -> crate::Error {
     crate::Error::RuntimeOperation {
@@ -342,6 +352,20 @@ impl WatcherAlertConfig {
                         rule.id
                     ));
                 }
+                if rule
+                    .service
+                    .as_deref()
+                    .and_then(CautService::from_cli_input)
+                    .is_none()
+                {
+                    // Accounts are stored and refreshed under caut's service
+                    // names, so any other name could never match.
+                    return Err(format!(
+                        "alerts rule {} account_balance service must be one of: {}",
+                        rule.id,
+                        CautService::supported_cli_inputs().join(", ")
+                    ));
+                }
                 if rule.agent_type.is_some() {
                     return Err(format!(
                         "alerts rule {} account_balance does not accept agent_type",
@@ -647,8 +671,11 @@ impl AlertMonitor {
                     .await
             }
             AlertMetric::AccountBalance => {
+                // Accounts are stored under caut's canonical service name, so
+                // an alias such as "claude" must look up "anthropic".
                 let service = match rule.service.as_deref() {
-                    Some(s) => s.to_string(),
+                    Some(s) => CautService::from_cli_input(s)
+                        .map_or_else(|| s.to_string(), |service| service.as_str().to_string()),
                     None => return Ok(100.0),
                 };
                 if let Some(account_id) = rule.account_id.as_deref() {
@@ -660,7 +687,8 @@ impl AlertMonitor {
                             && (!account.percent_remaining.is_finite()
                                 || !(0.0..=100.0).contains(&account.percent_remaining)
                                 || account.last_refreshed_at > now
-                                || now.saturating_sub(account.last_refreshed_at) > 15 * 60 * 1000)
+                                || now.saturating_sub(account.last_refreshed_at)
+                                    > ACCOUNT_BALANCE_MAX_AGE_MS)
                         {
                             return Err(alert_evaluation_unavailable(
                                 "account evidence is stale or invalid",
@@ -736,10 +764,15 @@ fn alert_level_from_code(code: u8) -> crate::Result<AlertLevel> {
 /// recorded recovery permits an identical later alert to start a new episode.
 pub struct WatcherAlertMonitor {
     config: WatcherAlertConfig,
-    /// The unavailable reason last warned per rule ID. A persistent condition,
-    /// such as account data nobody has refreshed, warns once per change
-    /// instead of on every sweep.
+    /// The unavailable reason last warned per rule ID, or per account refresh
+    /// key (which contains a space, so it never collides with a rule ID). A
+    /// persistent condition, such as a caut that is not installed, warns once
+    /// per change instead of on every sweep.
     unavailable_warned: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Refreshes the accounts named by account_balance rules.
+    caut: CautClient,
+    /// When caut last ran, per canonical service name.
+    account_refresh_attempts: std::sync::Mutex<std::collections::HashMap<&'static str, i64>>,
 }
 
 impl WatcherAlertMonitor {
@@ -748,7 +781,124 @@ impl WatcherAlertMonitor {
         Ok(Self {
             config,
             unavailable_warned: std::sync::Mutex::new(std::collections::HashMap::new()),
+            caut: CautClient::new(),
+            account_refresh_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    #[cfg(test)]
+    fn with_caut_client(mut self, caut: CautClient) -> Self {
+        self.caut = caut;
+        self
+    }
+
+    /// Keeps the accounts named by enabled account_balance rules fresh.
+    ///
+    /// Nothing else in `ft watch` refreshes accounts, and data older than
+    /// [`ACCOUNT_BALANCE_MAX_AGE_MS`] is unavailable, so without this a balance
+    /// rule stopped working minutes after the last manual `ft accounts
+    /// refresh`. caut runs under the sweep's Cx (cancelling it kills caut) and
+    /// its own timeout, at most once per service per
+    /// [`ACCOUNT_REFRESH_AFTER_MS`]. A failed refresh leaves the stored record
+    /// to age out, so the rule reports unavailable instead of guessing.
+    async fn refresh_balance_accounts_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        now: i64,
+    ) -> crate::Result<()> {
+        let mut wanted: Vec<(CautService, Vec<&str>)> = Vec::new();
+        for rule in self
+            .config
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled && rule.metric == AlertMetric::AccountBalance)
+        {
+            let (Some(service), Some(account_id)) = (
+                rule.service
+                    .as_deref()
+                    .and_then(CautService::from_cli_input),
+                rule.account_id.as_deref(),
+            ) else {
+                continue;
+            };
+            match wanted.iter_mut().find(|(known, _)| *known == service) {
+                Some((_, account_ids)) => account_ids.push(account_id),
+                None => wanted.push((service, vec![account_id])),
+            }
+        }
+        for (service, account_ids) in wanted {
+            cx.checkpoint()
+                .map_err(|error| alert_check_cancelled_error(error.to_string()))?;
+            let mut stale = false;
+            for account_id in account_ids {
+                let refreshed_at = storage
+                    .get_account_with_cx(cx, service.as_str(), account_id)
+                    .await?
+                    .map_or(i64::MIN, |account| account.last_refreshed_at);
+                stale |= now.saturating_sub(refreshed_at) >= ACCOUNT_REFRESH_AFTER_MS;
+            }
+            if !stale {
+                continue;
+            }
+            {
+                let mut attempts = self
+                    .account_refresh_attempts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if attempts
+                    .get(service.as_str())
+                    .is_some_and(|at| now.saturating_sub(*at) < ACCOUNT_REFRESH_AFTER_MS)
+                {
+                    continue;
+                }
+                attempts.insert(service.as_str(), now);
+            }
+            let warn_key = format!("account refresh {}", service.as_str());
+            match self.caut.refresh_cx(cx, service).await {
+                Ok(refresh) => {
+                    let mut stored = 0_usize;
+                    for usage in &refresh.accounts {
+                        // An entry without a percentage (an expired login, for
+                        // example) is not evidence of an empty balance, and an
+                        // entry without an ID or name matches no rule.
+                        if usage.percent_remaining.is_none()
+                            || (usage.id.is_none() && usage.name.is_none())
+                        {
+                            continue;
+                        }
+                        let record = crate::accounts::AccountRecord::from_caut(usage, service, now);
+                        storage.upsert_account_with_cx(cx, record).await?;
+                        stored += 1;
+                    }
+                    if self.note_available(&warn_key) {
+                        tracing::info!(
+                            service = service.as_str(),
+                            "Usage alert account refresh available again"
+                        );
+                    }
+                    tracing::debug!(
+                        service = service.as_str(),
+                        reported = refresh.accounts.len(),
+                        stored,
+                        "Usage alert account refresh completed"
+                    );
+                }
+                Err(error) => {
+                    cx.checkpoint()
+                        .map_err(|error| alert_check_cancelled_error(error.to_string()))?;
+                    if self.note_unavailable(&warn_key, &error.to_string()) {
+                        tracing::warn!(service = service.as_str(), %error,
+                            "Usage alert account refresh failed; balance rules report \
+                             unavailable once their data is stale");
+                    } else {
+                        tracing::debug!(service = service.as_str(), %error,
+                            "Usage alert account refresh still failing");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Records an unavailable evaluation. Returns true when the reason is new
@@ -790,6 +940,23 @@ impl WatcherAlertMonitor {
         let mut sweep = WatcherAlertSweep::default();
         if !self.config.enabled {
             return Ok(sweep);
+        }
+        match self
+            .refresh_balance_accounts_with_cx(cx, storage, now)
+            .await
+        {
+            Ok(()) => {
+                self.note_available("account refresh");
+            }
+            Err(error) => {
+                // Each balance rule still evaluates, and reports unavailable
+                // if its data has aged out.
+                cx.checkpoint()
+                    .map_err(|error| alert_check_cancelled_error(error.to_string()))?;
+                if self.note_unavailable("account refresh", &error.to_string()) {
+                    tracing::warn!(%error, "Usage alert account refresh unavailable");
+                }
+            }
         }
         for rule in self.config.rules.iter().filter(|rule| rule.enabled) {
             cx.checkpoint()
@@ -1151,6 +1318,17 @@ period = "day"
         );
         invalid.rules[0].period = None;
         assert!(invalid.validate().is_ok());
+        invalid.rules[0].service = Some("claude".to_string());
+        assert!(invalid.validate().is_ok(), "caut's aliases are accepted");
+        invalid.rules[0].service = Some("anthropic-api".to_string());
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("service must be one of"),
+            "no stored or refreshed account could ever match another name"
+        );
+        invalid.rules[0].service = Some("anthropic".to_string());
         invalid.rules[0].account_id = None;
         assert!(invalid.validate().is_err(), "account ID must be explicit");
         // Pane usage rows carry no account, so this filter could never match.
@@ -1361,7 +1539,10 @@ account_id = "my-account"
             config.rules[0].agent_type = None;
             config.rules[0].service = Some("anthropic".to_string());
             config.rules[0].account_id = Some("build".to_string());
-            let monitor = WatcherAlertMonitor::new(config).unwrap();
+            // A caut that cannot run leaves only the evidence written below.
+            let monitor = WatcherAlertMonitor::new(config).unwrap().with_caut_client(
+                CautClient::new().with_binary("/ft-un0d6b/nonexistent-caut-binary"),
+            );
             assert_eq!(
                 monitor
                     .evaluate_at_with_cx(&cx, &storage, &bus, now)
@@ -1456,6 +1637,106 @@ account_id = "my-account"
                 1
             );
             drop(connection);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// ft-un0d6b item 1: the watcher refreshes the accounts its balance rules
+    /// name through a real caut process, with no manual `ft accounts refresh`.
+    /// It stores no invented 0% for an entry that reports no percentage, and
+    /// runs caut at most once per refresh interval per service, even while
+    /// caut fails.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_refreshes_balance_accounts_through_caut_without_inventing_balances() {
+        use crate::runtime_async::CompatRuntime;
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (directory, storage) = watcher_storage().await;
+            let calls = directory.path().join("caut-calls.log");
+            let fake = directory.path().join("caut");
+            let write_fake = |body: &str| {
+                let script = format!(
+                    "#!/bin/sh\necho \"$@\" >> '{}'\n{body}\n",
+                    calls.display()
+                );
+                std::fs::write(&fake, script).unwrap();
+                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            let call_count =
+                || std::fs::read_to_string(&calls).map_or(0, |log| log.lines().count());
+            write_fake(
+                r#"printf '%s' '{"accounts":[{"id":"build","percent_remaining":12.0},{"id":"expired"},{"percent_remaining":50.0}]}'"#,
+            );
+            let cx = crate::cx::Cx::for_testing();
+            let bus = crate::events::EventBus::new(16);
+            let now = 200_000_000;
+            let mut config = watcher_config();
+            config.rules[0].metric = AlertMetric::AccountBalance;
+            config.rules[0].threshold = 20.0;
+            config.rules[0].period = None;
+            config.rules[0].agent_type = None;
+            // An alias: caut stores the account under "anthropic".
+            config.rules[0].service = Some("claude".to_string());
+            config.rules[0].account_id = Some("build".to_string());
+            let monitor = WatcherAlertMonitor::new(config).unwrap().with_caut_client(
+                CautClient::new().with_binary(fake.to_string_lossy().into_owned()),
+            );
+
+            let sweep = monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, now)
+                .await
+                .unwrap();
+            assert_eq!((sweep.emitted, sweep.unavailable), (1, 0));
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap(),
+                "usage --provider claude --format json\n"
+            );
+            let accounts = storage.get_accounts_by_service("anthropic").await.unwrap();
+            assert_eq!(
+                accounts.len(),
+                1,
+                "only the entry that reported a percentage is stored: {accounts:?}"
+            );
+            assert_eq!(accounts[0].account_id, "build");
+            assert!((accounts[0].percent_remaining - 12.0).abs() < f64::EPSILON);
+            assert_eq!(accounts[0].last_refreshed_at, now);
+
+            // Fresh data needs no caut.
+            monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, now + 60_000)
+                .await
+                .unwrap();
+            assert_eq!(call_count(), 1);
+
+            // Once the data is old enough, caut runs again. Its failure leaves
+            // the last good record, which is still within its freshness window.
+            write_fake("exit 3");
+            let later = now + ACCOUNT_REFRESH_AFTER_MS;
+            let sweep = monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, later)
+                .await
+                .unwrap();
+            assert_eq!(call_count(), 2);
+            assert_eq!(sweep.unavailable, 0);
+            // A failing caut is not run again on every sweep.
+            monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, later + 60_000)
+                .await
+                .unwrap();
+            assert_eq!(call_count(), 2);
+            // When the last good data ages out, the rule reports unavailable
+            // instead of the old balance.
+            let sweep = monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, now + ACCOUNT_BALANCE_MAX_AGE_MS + 1)
+                .await
+                .unwrap();
+            assert_eq!(call_count(), 3);
+            assert_eq!(sweep.unavailable, 1);
             storage.shutdown().await.unwrap();
         });
     }

@@ -3111,7 +3111,11 @@ service = "anthropic"
 account_id = "my-account"
 ```
 
-Use `cost`, `token_usage`, or `rate_limit_frequency` for upper limits: levels start at 50%, 75%, 90%, and 100% of the configured threshold. `account_balance` monitors a minimum percentage, requires both `service` and `account_id`, takes no `period` (it checks the account's current remaining percentage), and uses the selected pane as its notification target. Missing account data, data older than 15 minutes, unobserved panes, and oversized metric windows are reported as unavailable; they never generate a false recovery. At most 64 rules are accepted, checks run every 5–3600 seconds, and an indexed evaluation refuses windows containing more than 100,000 rows of the selected metric type rather than returning a partial total.
+Use `cost`, `token_usage`, or `rate_limit_frequency` for upper limits: levels start at 50%, 75%, 90%, and 100% of the configured threshold. `account_balance` monitors a minimum percentage, requires both `service` and `account_id`, takes no `period` (it checks the account's current remaining percentage), and uses the selected pane as its notification target. `service` is a caut service: `anthropic` (or `claude`), `openai` (or `codex`), or `google` (or `gemini`).
+
+The watcher keeps balance rules supplied by running `caut usage` for each named service once the account's data is five minutes old, at most once per five minutes per service, whether or not the last run succeeded. An account that caut reports without a percentage (an expired login, for example) is not stored as an empty balance. Missing account data, data older than 15 minutes, unobserved panes, and oversized metric windows are reported as unavailable; they never generate a false recovery.
+
+At most 64 rules are accepted, and checks run every 5–3600 seconds. An indexed evaluation refuses windows containing more than 100,000 rows of the selected metric type rather than returning a partial total. That budget counts every row of the type in the window, from all panes and including the pane-less token rows that the account-selection workflow records, before the pane and agent filters apply.
 
 Transitions are recorded as `usage.alert` and `usage.recovered` events. A restart retains the reminder deadline; a recorded recovery lets an identical later threshold breach notify again. Changes to severity emit immediately, while an unchanged alert repeats after `repeat_after_secs` (up to one day). Rule or cadence changes require a watcher restart.
 
