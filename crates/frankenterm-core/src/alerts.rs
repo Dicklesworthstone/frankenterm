@@ -20,6 +20,11 @@ const ACCOUNT_BALANCE_MAX_AGE_MS: i64 = 15 * 60 * 1000;
 /// succeeded. Two more attempts fit before the data ages out.
 const ACCOUNT_REFRESH_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// The fraction of a rule's threshold a watcher alert's value must clear,
+/// beyond a level's boundary, before the alert falls back to a lower level or
+/// recovers. Escalation needs no margin.
+const ALERT_RECOVERY_MARGIN: f64 = 0.05;
+
 fn alert_check_cancelled_error(detail: impl Into<String>) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation: "alerts.check_alerts",
@@ -482,6 +487,24 @@ impl AlertRule {
                 let percent = current_value / self.threshold;
                 AlertLevel::from_percent(percent)
             }
+        }
+    }
+
+    /// The level `current_value` reaches when [`ALERT_RECOVERY_MARGIN`] of the
+    /// threshold is counted against it. A watcher alert falls back to a lower
+    /// level only when the value is below that level's boundary by more than
+    /// the margin, so a total hovering at a boundary does not alternate
+    /// between alert and recovery as rows age out and arrive.
+    fn check_with_recovery_margin(&self, current_value: f64) -> Option<AlertLevel> {
+        if !self.enabled || self.threshold <= 0.0 {
+            return None;
+        }
+        let ratio = current_value / self.threshold;
+        match self.metric {
+            AlertMetric::AccountBalance => {
+                AlertLevel::from_low_watermark_ratio(ratio - ALERT_RECOVERY_MARGIN)
+            }
+            _ => AlertLevel::from_percent(ratio + ALERT_RECOVERY_MARGIN),
         }
     }
 }
@@ -1052,7 +1075,18 @@ impl WatcherAlertMonitor {
             Some(configured.pane_id),
         )
         .await?;
-        let level = rule.check(current_value);
+        let mut level = rule.check(current_value);
+        if same_config
+            && let Some(previous) = previous_level
+            && level < Some(previous)
+        {
+            // Hysteresis: fall back only as far as the recovery margin
+            // allows, and never above the level already recorded.
+            level = rule
+                .check_with_recovery_margin(current_value)
+                .min(Some(previous))
+                .max(level);
+        }
         if level.is_none() && previous_level.is_none() {
             return Ok(false);
         }
@@ -1639,6 +1673,62 @@ account_id = "my-account"
             drop(connection);
             storage.shutdown().await.unwrap();
         });
+    }
+
+    /// ft-un0d6b item 3: a rolling total that slips just under a boundary as an
+    /// old row ages out keeps its alert instead of notifying a recovery, and
+    /// recovers once it is below the boundary by more than the margin.
+    #[test]
+    fn watcher_alert_holds_its_level_within_the_recovery_margin() {
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_directory, storage) = watcher_storage().await;
+            let cx = crate::cx::Cx::for_testing();
+            let bus = crate::events::EventBus::new(16);
+            let day = AlertPeriod::Day.duration_ms();
+            let now = day * 2;
+            storage
+                .record_usage_metrics_batch(vec![
+                    watcher_cost(now - day + 10, 4.0),
+                    watcher_cost(now - day + 20, 3.0),
+                    watcher_cost(now, 44.0),
+                ])
+                .await
+                .unwrap();
+            let monitor = WatcherAlertMonitor::new(watcher_config()).unwrap();
+            let sweep = |at| monitor.evaluate_at_with_cx(&cx, &storage, &bus, at);
+
+            // 51% of the threshold: Info.
+            assert_eq!(sweep(now).await.unwrap().emitted, 1);
+            // 47%: under the 50% boundary, but within the 5% margin.
+            assert_eq!(sweep(now + 11).await.unwrap().emitted, 0);
+            // 44%: more than the margin below it.
+            assert_eq!(sweep(now + 21).await.unwrap().emitted, 1);
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let types: Vec<_> = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect();
+            assert_eq!(types.len(), 2);
+            assert!(types.contains(&"usage.alert") && types.contains(&"usage.recovered"));
+            storage.shutdown().await.unwrap();
+        });
+
+        // A balance rule's margin runs the other way: it must rise clear of
+        // its minimum.
+        let balance = AlertRule::account_balance("low", 20.0, None);
+        assert_eq!(balance.check(20.5), None);
+        assert_eq!(
+            balance.check_with_recovery_margin(20.5),
+            Some(AlertLevel::Info)
+        );
+        assert_eq!(balance.check_with_recovery_margin(21.5), None);
     }
 
     /// ft-un0d6b item 1: the watcher refreshes the accounts its balance rules
