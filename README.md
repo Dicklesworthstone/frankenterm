@@ -2689,7 +2689,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v<!--count:storage_schema_version-->51<!--/count-->**. The authoritative source is
+The current version is **v<!--count:storage_schema_version-->52<!--/count-->**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -3113,7 +3113,7 @@ account_id = "my-account"
 
 Use `cost`, `token_usage`, or `rate_limit_frequency` for upper limits: levels start at 50%, 75%, 90%, and 100% of the configured threshold. `account_balance` monitors a minimum percentage, requires both `service` and `account_id`, takes no `period` (it checks the account's current remaining percentage), and uses the selected pane as its notification target. `service` is a caut service: `anthropic` (or `claude`), `openai` (or `codex`), or `google` (or `gemini`).
 
-The watcher keeps balance rules supplied by running `caut usage` for each named service once the account's data is five minutes old, at most once per five minutes per service, whether or not the last run succeeded. An account that caut reports without a percentage (an expired login, for example) is not stored as an empty balance. Missing account data, data older than 15 minutes, unobserved panes, and oversized metric windows are reported as unavailable; they never generate a false recovery.
+The watcher keeps balance rules supplied by running `caut usage` for each named service once the account's data is five minutes old, at most once per five minutes per service, whether or not the last run succeeded. An account that caut reports without a percentage (an expired login, for example) is stored as an unknown balance, never as 0%: balance rules report it as unavailable, account selection skips it, and `ft robot accounts list` shows `"percent_remaining": null`. Missing account data, data older than 15 minutes, unobserved panes, and oversized metric windows are reported as unavailable; they never generate a false recovery.
 
 At most 64 rules are accepted, and checks run every 5–3600 seconds. An indexed evaluation refuses windows containing more than 100,000 rows of the selected metric type rather than returning a partial total. That budget counts every row of the type in the window, from all panes and including the pane-less token rows that the account-selection workflow records, before the pane and agent filters apply.
 
@@ -4182,7 +4182,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->51<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->52<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?

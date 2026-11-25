@@ -47,10 +47,10 @@
           "description": "Human-readable account name"
         },
         "percent_remaining": {
-          "type": "number",
+          "type": ["number", "null"],
           "minimum": 0,
           "maximum": 100,
-          "description": "Percentage of quota remaining"
+          "description": "Percentage of quota remaining; null when caut reported no percentage (an unknown balance, not 0%)"
         },
         "reset_at": {
           "type": "string",

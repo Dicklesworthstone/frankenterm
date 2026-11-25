@@ -263,7 +263,7 @@ fn seed_db(db_path: &Path) {
             account_id: "acc-primary".to_string(),
             service: "openai".to_string(),
             name: Some("Primary".to_string()),
-            percent_remaining: 85.5,
+            percent_remaining: Some(85.5),
             reset_at: Some("2026-03-01T00:00:00Z".to_string()),
             tokens_used: Some(1_450),
             tokens_remaining: Some(8_550),

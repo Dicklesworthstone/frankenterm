@@ -705,10 +705,14 @@ impl AlertMonitor {
                     let account = storage
                         .get_account_with_cx(cx, &service, account_id)
                         .await?;
-                    if let Some(account) = account {
+                    // caut reports no percentage for some accounts (an auth
+                    // failure, for example). That is missing evidence, not 0%.
+                    if let Some(account) = account
+                        && let Some(percent) = account.percent_remaining
+                    {
                         if pane_id.is_some()
-                            && (!account.percent_remaining.is_finite()
-                                || !(0.0..=100.0).contains(&account.percent_remaining)
+                            && (!percent.is_finite()
+                                || !(0.0..=100.0).contains(&percent)
                                 || account.last_refreshed_at > now
                                 || now.saturating_sub(account.last_refreshed_at)
                                     > ACCOUNT_BALANCE_MAX_AGE_MS)
@@ -717,11 +721,11 @@ impl AlertMonitor {
                                 "account evidence is stale or invalid",
                             ));
                         }
-                        return Ok(account.percent_remaining);
+                        return Ok(percent);
                     }
                     return if pane_id.is_some() {
                         Err(alert_evaluation_unavailable(
-                            "configured account is unavailable",
+                            "configured account is unavailable or reports no balance",
                         ))
                     } else {
                         Ok(100.0)
@@ -730,11 +734,19 @@ impl AlertMonitor {
                 let accounts = storage
                     .get_accounts_by_service_with_cx(cx, &service)
                     .await?;
-                if accounts.is_empty() {
+                let known: Vec<f64> = accounts
+                    .iter()
+                    .filter_map(|a| a.percent_remaining)
+                    .collect();
+                if known.is_empty() {
+                    if pane_id.is_some() && !accounts.is_empty() {
+                        return Err(alert_evaluation_unavailable(
+                            "no account of the service reports a balance",
+                        ));
+                    }
                     Ok(100.0)
                 } else {
-                    let total: f64 = accounts.iter().map(|a| a.percent_remaining).sum();
-                    Ok(total / accounts.len() as f64)
+                    Ok(known.iter().sum::<f64>() / known.len() as f64)
                 }
             }
         }
@@ -882,12 +894,11 @@ impl WatcherAlertMonitor {
                 Ok(refresh) => {
                     let mut stored = 0_usize;
                     for usage in &refresh.accounts {
-                        // An entry without a percentage (an expired login, for
-                        // example) is not evidence of an empty balance, and an
-                        // entry without an ID or name matches no rule.
-                        if usage.percent_remaining.is_none()
-                            || (usage.id.is_none() && usage.name.is_none())
-                        {
+                        // An entry without an ID or name matches no rule. One
+                        // without a percentage (an expired login, for example)
+                        // is stored as an unknown balance, which no rule
+                        // reads as 0%.
+                        if usage.id.is_none() && usage.name.is_none() {
                             continue;
                         }
                         let record = crate::accounts::AccountRecord::from_caut(usage, service, now);
@@ -1590,7 +1601,7 @@ account_id = "my-account"
                 account_id: "build".to_string(),
                 service: "anthropic".to_string(),
                 name: None,
-                percent_remaining: 10.0,
+                percent_remaining: Some(10.0),
                 reset_at: None,
                 tokens_used: None,
                 tokens_remaining: None,
@@ -1628,7 +1639,7 @@ account_id = "my-account"
                 1,
                 "stale or regressed evidence must not clear or repeat an alert"
             );
-            account.percent_remaining = 100.0;
+            account.percent_remaining = Some(100.0);
             account.last_refreshed_at = now + 900_002;
             account.updated_at = now + 900_002;
             storage.upsert_account(account).await.unwrap();
@@ -1787,13 +1798,16 @@ account_id = "my-account"
                 "usage --provider claude --format json\n"
             );
             let accounts = storage.get_accounts_by_service("anthropic").await.unwrap();
+            let stored: Vec<(&str, Option<f64>)> = accounts
+                .iter()
+                .map(|a| (a.account_id.as_str(), a.percent_remaining))
+                .collect();
             assert_eq!(
-                accounts.len(),
-                1,
-                "only the entry that reported a percentage is stored: {accounts:?}"
+                stored,
+                vec![("build", Some(12.0)), ("expired", None)],
+                "an entry without an ID or name is not stored, and one without a \
+                 percentage is stored as unknown, not 0%"
             );
-            assert_eq!(accounts[0].account_id, "build");
-            assert!((accounts[0].percent_remaining - 12.0).abs() < f64::EPSILON);
             assert_eq!(accounts[0].last_refreshed_at, now);
 
             // Fresh data needs no caut.
@@ -1827,6 +1841,25 @@ account_id = "my-account"
                 .unwrap();
             assert_eq!(call_count(), 3);
             assert_eq!(sweep.unavailable, 1);
+
+            // The login expires: caut now reports the account without a
+            // percentage. That fresh record is an unknown balance. The rule
+            // reports unavailable; it neither alerts at 0% nor keeps 12%.
+            write_fake(r#"printf '%s' '{"accounts":[{"id":"build"}]}'"#);
+            let expired_at = now + ACCOUNT_BALANCE_MAX_AGE_MS + 1 + ACCOUNT_REFRESH_AFTER_MS;
+            let sweep = monitor
+                .evaluate_at_with_cx(&cx, &storage, &bus, expired_at)
+                .await
+                .unwrap();
+            assert_eq!(call_count(), 4);
+            assert_eq!((sweep.emitted, sweep.unavailable), (0, 1));
+            let build = storage
+                .get_account("anthropic", "build")
+                .await
+                .unwrap()
+                .expect("the expired account is still stored");
+            assert_eq!(build.percent_remaining, None);
+            assert_eq!(build.last_refreshed_at, expired_at);
             storage.shutdown().await.unwrap();
         });
     }

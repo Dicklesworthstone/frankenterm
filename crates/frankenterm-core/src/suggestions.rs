@@ -1242,28 +1242,26 @@ impl SuggestionRule for AccountLowRule {
     }
 
     fn applies(&self, ctx: &SuggestionContext) -> bool {
-        ctx.accounts
-            .iter()
-            .any(|a| a.percent_remaining < self.threshold_percent)
+        // An unknown balance (caut reported none) is not a low one.
+        ctx.accounts.iter().any(|a| {
+            a.percent_remaining
+                .is_some_and(|p| p < self.threshold_percent)
+        })
     }
 
     fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
-        let low_account = ctx
+        let (account, percent) = ctx
             .accounts
             .iter()
-            .filter(|a| a.percent_remaining < self.threshold_percent)
-            .min_by(|a, b| {
-                a.percent_remaining
-                    .partial_cmp(&b.percent_remaining)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            .filter_map(|a| a.percent_remaining.map(|p| (a, p)))
+            .filter(|(_, p)| *p < self.threshold_percent)
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
 
-        let account = low_account?;
         let name = account
             .name
             .as_deref()
             .unwrap_or(account.account_id.as_str());
-        let percent = account.percent_remaining.round() as i64;
+        let percent = percent.round() as i64;
 
         Some(
             Suggestion::new(
@@ -1718,7 +1716,7 @@ mod tests {
             account_id: account_id.to_string(),
             service: "openai".to_string(),
             name: Some(account_id.to_string()),
-            percent_remaining: percent,
+            percent_remaining: Some(percent),
             reset_at: None,
             tokens_used: None,
             tokens_remaining: None,
@@ -2294,6 +2292,25 @@ mod tests {
         assert_eq!(
             suggestion.action.expect("action").command,
             "ft accounts --service anthropic --pick"
+        );
+    }
+
+    #[test]
+    fn test_account_low_rule_ignores_unknown_balance() {
+        let rule = AccountLowRule::default();
+        let mut ctx = SuggestionContext::new();
+        let mut expired = make_account("expired", 0.0);
+        expired.percent_remaining = None;
+        ctx.add_account(expired);
+        assert!(!rule.applies(&ctx), "an unknown balance is not low");
+        assert!(rule.generate(&ctx).is_none());
+
+        ctx.add_account(make_account("low", 3.0));
+        let suggestion = rule.generate(&ctx).expect("the known low account");
+        assert!(
+            suggestion.message.contains("\"low\" is at 3%"),
+            "{}",
+            suggestion.message
         );
     }
 

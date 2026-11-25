@@ -60,13 +60,21 @@ fn arb_opt_tokens() -> impl Strategy<Value = Option<i64>> {
     ]
 }
 
+/// An account balance: mostly known, sometimes unknown (caut reported none).
+fn arb_opt_percent() -> impl Strategy<Value = Option<f64>> {
+    prop_oneof![
+        2 => Just(None),
+        8 => arb_percent().prop_map(Some),
+    ]
+}
+
 /// Generate a complete AccountRecord with controlled randomness.
 fn arb_account_record() -> impl Strategy<Value = AccountRecord> {
     (
         arb_safe_string(),   // account_id
         arb_safe_string(),   // service
         arb_opt_string(),    // name
-        arb_percent(),       // percent_remaining
+        arb_opt_percent(),   // percent_remaining
         arb_opt_string(),    // reset_at
         arb_opt_tokens(),    // tokens_used
         arb_opt_tokens(),    // tokens_remaining
@@ -125,7 +133,7 @@ fn arb_filtered_account() -> impl Strategy<Value = FilteredAccount> {
     (
         arb_safe_string(),
         arb_opt_string(),
-        arb_percent(),
+        arb_opt_percent(),
         arb_safe_string(),
     )
         .prop_map(
@@ -245,7 +253,7 @@ fn arb_account_with_epoch_reset() -> impl Strategy<Value = AccountRecord> {
         account_id,
         service: "openai".to_string(),
         name: None,
-        percent_remaining: 0.0,
+        percent_remaining: Some(0.0),
         reset_at: Some(reset_str),
         tokens_used: None,
         tokens_remaining: None,
@@ -264,7 +272,7 @@ fn make_record(id: &str, pct: f64, last_used: Option<i64>) -> AccountRecord {
         account_id: id.to_string(),
         service: "openai".to_string(),
         name: None,
-        percent_remaining: pct,
+        percent_remaining: Some(pct),
         reset_at: None,
         tokens_used: None,
         tokens_remaining: None,
@@ -291,10 +299,13 @@ proptest! {
         prop_assert_eq!(&parsed.account_id, &record.account_id, "account_id mismatch");
         prop_assert_eq!(&parsed.service, &record.service, "service mismatch");
         prop_assert_eq!(&parsed.name, &record.name, "name mismatch");
-        prop_assert!(
-            (parsed.percent_remaining - record.percent_remaining).abs() < 0.01,
-            "percent_remaining mismatch: {} vs {}", parsed.percent_remaining, record.percent_remaining
-        );
+        match (parsed.percent_remaining, record.percent_remaining) {
+            (Some(a), Some(b)) => prop_assert!(
+                (a - b).abs() < 0.01,
+                "percent_remaining mismatch: {} vs {}", a, b
+            ),
+            (a, b) => prop_assert_eq!(a, b, "percent_remaining known/unknown mismatch"),
+        }
         prop_assert_eq!(&parsed.reset_at, &record.reset_at, "reset_at mismatch");
         prop_assert_eq!(parsed.tokens_used, record.tokens_used, "tokens_used mismatch");
         prop_assert_eq!(parsed.tokens_remaining, record.tokens_remaining, "tokens_remaining mismatch");
@@ -495,10 +506,12 @@ proptest! {
     ) {
         let result = select_account(&accounts, &config);
         if let Some(ref selected) = result.selected {
+            // An unknown balance is never selected.
+            let pct = selected.percent_remaining;
             prop_assert!(
-                selected.percent_remaining >= config.threshold_percent,
-                "selected account pct {} below threshold {}",
-                selected.percent_remaining,
+                pct.is_some_and(|pct| pct >= config.threshold_percent),
+                "selected account pct {:?} unknown or below threshold {}",
+                pct,
                 config.threshold_percent
             );
         }
@@ -512,11 +525,12 @@ proptest! {
     ) {
         let result = select_account(&accounts, &config);
         if let Some(ref selected) = result.selected {
+            let selected_pct = selected.percent_remaining.expect("selected balance is known");
             for candidate in &result.explanation.candidates {
                 prop_assert!(
-                    selected.percent_remaining >= candidate.percent_remaining - 0.001,
+                    selected_pct >= candidate.percent_remaining - 0.001,
                     "selected pct {} less than candidate pct {}",
-                    selected.percent_remaining,
+                    selected_pct,
                     candidate.percent_remaining
                 );
             }
@@ -647,11 +661,22 @@ proptest! {
         let result = select_account(&accounts, &config);
         for filtered in &result.explanation.filtered_out {
             prop_assert!(
-                filtered.percent_remaining < config.threshold_percent,
-                "filtered account pct {} should be < threshold {}",
+                filtered.percent_remaining.is_none_or(|pct| pct < config.threshold_percent),
+                "filtered account pct {:?} should be unknown or < threshold {}",
                 filtered.percent_remaining, config.threshold_percent
             );
         }
+        let unknown = accounts.iter().filter(|a| a.percent_remaining.is_none()).count();
+        prop_assert_eq!(
+            result
+                .explanation
+                .filtered_out
+                .iter()
+                .filter(|f| f.percent_remaining.is_none())
+                .count(),
+            unknown,
+            "every account with an unknown balance is filtered out"
+        );
     }
 
     /// All candidate accounts have percent_remaining >= threshold.
@@ -670,21 +695,23 @@ proptest! {
         }
     }
 
-    /// With threshold=0.0, nothing gets filtered (all pcts are >= 0).
+    /// With threshold=0.0, only unknown balances are filtered (every known
+    /// pct is >= 0).
     #[test]
-    fn select_zero_threshold_no_filtering(
+    fn select_zero_threshold_filters_only_unknown(
         accounts in arb_account_vec(10),
     ) {
         let config = AccountSelectionConfig { threshold_percent: 0.0 };
         let result = select_account(&accounts, &config);
+        let known = accounts.iter().filter(|a| a.percent_remaining.is_some()).count();
         prop_assert_eq!(
-            result.explanation.filtered_out.len(), 0usize,
-            "zero threshold should filter nothing, but got {} filtered",
+            result.explanation.filtered_out.len(), accounts.len() - known,
+            "zero threshold should filter only unknown balances, but got {} filtered",
             result.explanation.filtered_out.len()
         );
         prop_assert_eq!(
-            result.explanation.candidates.len(), accounts.len(),
-            "zero threshold should keep all candidates"
+            result.explanation.candidates.len(), known,
+            "zero threshold should keep every known balance"
         );
     }
 }
@@ -952,9 +979,9 @@ proptest! {
         }
     }
 
-    /// from_caut percent_remaining defaults to 0.0 when None.
+    /// from_caut keeps a missing percentage unknown: it is not 0%.
     #[test]
-    fn from_caut_pct_default(now_ms in arb_timestamp()) {
+    fn from_caut_missing_pct_stays_unknown(now_ms in arb_timestamp()) {
         let usage = CautAccountUsage {
             id: Some("test".to_string()),
             percent_remaining: None,
@@ -962,10 +989,10 @@ proptest! {
         };
 
         let record = AccountRecord::from_caut(&usage, CautService::OpenAI, now_ms);
-        prop_assert!(
-            record.percent_remaining.abs() < 0.001,
-            "None percent should default to 0.0, got {}",
-            record.percent_remaining
+        prop_assert_eq!(
+            record.percent_remaining,
+            None,
+            "None percent must stay unknown"
         );
     }
 
@@ -979,10 +1006,10 @@ proptest! {
         };
 
         let record = AccountRecord::from_caut(&usage, CautService::OpenAI, now_ms);
-        prop_assert!(
-            (record.percent_remaining - pct).abs() < 0.001,
-            "percent should be preserved: expected {}, got {}",
-            pct, record.percent_remaining
+        prop_assert_eq!(
+            record.percent_remaining,
+            Some(pct),
+            "percent should be preserved"
         );
     }
 
@@ -1019,8 +1046,8 @@ proptest! {
         prop_assert_eq!(&record.account_id, &expected_id,
             "default usage should produce 'unknown-{}' id", now_ms);
         prop_assert!(record.name.is_none(), "default usage should have no name");
-        prop_assert!(record.percent_remaining.abs() < 0.001,
-            "default usage should have 0.0 pct");
+        prop_assert!(record.percent_remaining.is_none(),
+            "default usage should have an unknown pct");
         prop_assert!(record.tokens_used.is_none(), "default usage should have no tokens_used");
         prop_assert!(record.tokens_remaining.is_none(), "default usage should have no tokens_remaining");
         prop_assert!(record.tokens_limit.is_none(), "default usage should have no tokens_limit");
@@ -1041,11 +1068,13 @@ proptest! {
 
         prop_assert_eq!(&parsed.account_id, &fa.account_id, "account_id mismatch");
         prop_assert_eq!(&parsed.name, &fa.name, "name mismatch");
-        prop_assert!(
-            (parsed.percent_remaining - fa.percent_remaining).abs() < 0.01,
-            "percent_remaining mismatch: {} vs {}",
-            parsed.percent_remaining, fa.percent_remaining
-        );
+        match (parsed.percent_remaining, fa.percent_remaining) {
+            (Some(a), Some(b)) => prop_assert!(
+                (a - b).abs() < 0.01,
+                "percent_remaining mismatch: {} vs {}", a, b
+            ),
+            (a, b) => prop_assert_eq!(a, b, "percent_remaining known/unknown mismatch"),
+        }
         prop_assert_eq!(&parsed.reason, &fa.reason, "reason mismatch");
     }
 
@@ -1147,17 +1176,17 @@ proptest! {
     ) {
         let result = select_account(&accounts, &config);
         if let Some(ref selected) = result.selected {
-            // The selected account must be at or above threshold
+            // The selected account must have a known balance at or above threshold
             prop_assert!(
-                selected.percent_remaining >= config.threshold_percent,
-                "selected account '{}' has {:.2}% but threshold is {:.2}%",
+                selected.percent_remaining.is_some_and(|pct| pct >= config.threshold_percent),
+                "selected account '{}' has {:?}% but threshold is {:.2}%",
                 selected.account_id, selected.percent_remaining, config.threshold_percent
             );
-            // Every filtered account must be below threshold
+            // Every filtered account must be unknown or below threshold
             for f in &result.explanation.filtered_out {
                 prop_assert!(
-                    f.percent_remaining < config.threshold_percent,
-                    "filtered account '{}' has {:.2}% which is at or above threshold {:.2}%",
+                    f.percent_remaining.is_none_or(|pct| pct < config.threshold_percent),
+                    "filtered account '{}' has {:?}% which is at or above threshold {:.2}%",
                     f.account_id, f.percent_remaining, config.threshold_percent
                 );
             }
@@ -1189,15 +1218,20 @@ proptest! {
                 prop_assert!(advisory.warning.is_some());
                 prop_assert!(advisory.is_blocking());
             }
-            Some(selected) if selected.percent_remaining < low_quota_threshold_percent => {
+            Some(selected)
+                if selected
+                    .percent_remaining
+                    .is_some_and(|pct| pct < low_quota_threshold_percent) =>
+            {
                 prop_assert_eq!(advisory.availability, QuotaAvailability::Low);
-                prop_assert_eq!(advisory.selected_percent_remaining, Some(selected.percent_remaining));
+                prop_assert_eq!(advisory.selected_percent_remaining, selected.percent_remaining);
                 prop_assert!(advisory.warning.is_some());
                 prop_assert!(!advisory.is_blocking());
             }
             Some(selected) => {
+                prop_assert!(selected.percent_remaining.is_some(), "selected balance is known");
                 prop_assert_eq!(advisory.availability, QuotaAvailability::Available);
-                prop_assert_eq!(advisory.selected_percent_remaining, Some(selected.percent_remaining));
+                prop_assert_eq!(advisory.selected_percent_remaining, selected.percent_remaining);
                 prop_assert!(advisory.warning.is_none());
                 prop_assert!(!advisory.is_blocking());
             }

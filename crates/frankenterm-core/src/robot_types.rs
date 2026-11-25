@@ -2961,7 +2961,8 @@ pub struct AccountInfo {
     pub service: String,
     #[serde(default)]
     pub name: Option<String>,
-    pub percent_remaining: f64,
+    /// `null` when caut reported no percentage (an unknown balance, not 0%).
+    pub percent_remaining: Option<f64>,
     #[serde(default)]
     pub reset_at: Option<String>,
     #[serde(default)]
@@ -4602,7 +4603,7 @@ mod tests {
         });
         let resp: RobotResponse<AccountsListData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
-        assert!((data.accounts[0].percent_remaining - 85.5).abs() < f64::EPSILON);
+        assert_eq!(data.accounts[0].percent_remaining, Some(85.5));
         let pick = data.pick_preview.expect("pick preview should parse");
         let advisory = pick.quota_advisory.expect("quota advisory should parse");
         assert_eq!(advisory.availability, "available");

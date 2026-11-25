@@ -2657,7 +2657,9 @@ impl AccountListRenderer {
 
         for acct in accounts {
             let name = acct.name.as_deref().unwrap_or("-");
-            let remaining = format!("{:.1}%", acct.percent_remaining);
+            let remaining = acct
+                .percent_remaining
+                .map_or_else(|| "unknown".to_string(), |pct| format!("{pct:.1}%"));
             let used = acct
                 .tokens_used
                 .map_or_else(|| "-".to_string(), format_token_count);
@@ -2689,9 +2691,13 @@ impl AccountListRenderer {
                 let display_name = selected.name.as_deref().unwrap_or(&selected.account_id);
                 output.push_str(&style.bold("Pick: "));
                 output.push_str(&style.green(display_name));
+                // select_account picks only accounts with a known balance.
+                let percent = selected
+                    .percent_remaining
+                    .map_or_else(|| "unknown".to_string(), |pct| format!("{pct:.1}%"));
                 output.push_str(&format!(
-                    " ({:.1}%) - {}\n",
-                    selected.percent_remaining, pick_result.explanation.selection_reason
+                    " ({percent}) - {}\n",
+                    pick_result.explanation.selection_reason
                 ));
             } else {
                 output.push_str(&style.yellow(&format!(
@@ -5436,7 +5442,7 @@ mod tests {
                 account_id: "acct-alpha".to_string(),
                 service: "openai".to_string(),
                 name: Some("Alpha".to_string()),
-                percent_remaining: 82.5,
+                percent_remaining: Some(82.5),
                 reset_at: None,
                 tokens_used: Some(175_000),
                 tokens_remaining: Some(825_000),
@@ -5451,7 +5457,7 @@ mod tests {
                 account_id: "acct-beta".to_string(),
                 service: "openai".to_string(),
                 name: Some("Beta".to_string()),
-                percent_remaining: 45.0,
+                percent_remaining: Some(45.0),
                 reset_at: None,
                 tokens_used: Some(550_000),
                 tokens_remaining: Some(450_000),
@@ -5536,7 +5542,7 @@ mod tests {
             account_id: "acct-low".to_string(),
             service: "openai".to_string(),
             name: Some("Low".to_string()),
-            percent_remaining: 2.0,
+            percent_remaining: Some(2.0),
             reset_at: None,
             tokens_used: Some(980_000),
             tokens_remaining: Some(20_000),

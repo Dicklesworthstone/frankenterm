@@ -42,7 +42,7 @@ fn synthetic_accounts(count: usize) -> Vec<AccountRecord> {
             account_id: format!("acct-{i:03}"),
             service: "openai".to_string(),
             name: Some(format!("Account {i}")),
-            percent_remaining,
+            percent_remaining: Some(percent_remaining),
             reset_at: None,
             tokens_used: Some(10_000 + i64::try_from(i).unwrap_or(0)),
             tokens_remaining: Some(5_000 - i64::try_from(i % 500).unwrap_or(0)),

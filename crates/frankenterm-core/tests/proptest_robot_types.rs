@@ -789,7 +789,7 @@ fn arb_account_info() -> impl Strategy<Value = AccountInfo> {
             Just("google".to_string()),
         ],
         proptest::option::of("[A-Za-z ]{3,20}"), // name
-        0.0_f64..100.0,                          // percent_remaining
+        proptest::option::of(0.0_f64..100.0),    // percent_remaining
         proptest::option::of("[0-9T:-]{10,25}"), // reset_at
         proptest::option::of(any::<i64>()),      // tokens_used
         proptest::option::of(any::<i64>()),      // tokens_remaining
@@ -956,7 +956,10 @@ proptest! {
         prop_assert_eq!(&back.account_id, &info.account_id);
         prop_assert_eq!(&back.service, &info.service);
         prop_assert_eq!(back.name, info.name);
-        prop_assert!((back.percent_remaining - info.percent_remaining).abs() < 1e-10);
+        match (back.percent_remaining, info.percent_remaining) {
+            (Some(a), Some(b)) => prop_assert!((a - b).abs() < 1e-10),
+            (a, b) => prop_assert_eq!(a, b, "an unknown balance must round-trip as unknown"),
+        }
         prop_assert_eq!(back.last_refreshed_at, info.last_refreshed_at);
     }
 

@@ -114,7 +114,11 @@
 /// Legacy receipts deliberately receive no inferred request binding.
 /// Bumped 50 -> 51 to preserve immutable native capture identity and exact
 /// segment provenance. Historical segments remain explicitly unattributed.
-pub const SCHEMA_VERSION: i32 = 51;
+/// Bumped 51 -> 52 to make `accounts.percent_remaining` nullable. caut reports
+/// no percentage for some accounts (an auth failure, for example); storing
+/// that as 0.0 raised false "balance 0%" alerts. Existing rows keep their
+/// stored value: a historical 0.0 cannot be told apart from a real one.
+pub const SCHEMA_VERSION: i32 = 52;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -953,7 +957,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_id TEXT NOT NULL,          -- stable identifier (from caut or hash)
     service TEXT NOT NULL,             -- openai, anthropic, google, etc.
     name TEXT,                         -- display name
-    percent_remaining REAL NOT NULL,   -- 0.0-100.0
+    percent_remaining REAL,            -- 0.0-100.0; NULL when caut reported none
     reset_at TEXT,                     -- ISO8601 or epoch string
     tokens_used INTEGER,
     tokens_remaining INTEGER,

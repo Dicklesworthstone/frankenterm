@@ -9244,7 +9244,7 @@ Try again at 3:00 PM UTC.
             account_id: "acc-123".to_string(),
             service: "openai".to_string(),
             name: Some("Test Account".to_string()),
-            percent_remaining: 75.0,
+            percent_remaining: Some(75.0),
             reset_at: None,
             tokens_used: Some(1000),
             tokens_remaining: Some(3000),

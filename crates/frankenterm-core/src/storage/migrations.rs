@@ -2283,6 +2283,18 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // binding from the mutable pane row or erase established provenance.
         down_sql: None,
     },
+    Migration {
+        version: 52,
+        description: "Store an account balance caut did not report as unknown, not 0%",
+        // Applied by ensure_accounts_nullable_percent_v52, which rebuilds the
+        // table because SQLite cannot drop NOT NULL in place. The rebuild
+        // drops the table limit_windows references, so apply_migration_step
+        // runs it with foreign keys suspended, as for v38.
+        up_sql: "",
+        // Restoring NOT NULL would have to invent 0.0 for every unknown
+        // balance, which is the false "balance 0%" this migration removes.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -4509,6 +4521,153 @@ fn ensure_no_foreign_key_violations(conn: &Connection, context: &str) -> Result<
     Ok(())
 }
 
+/// The v52 `accounts` table under its staging name. Identical to the
+/// `SCHEMA_SQL` definition apart from the name.
+const ACCOUNTS_V52_TABLE_SQL: &str = "CREATE TABLE accounts_v52 (
+    id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    service TEXT NOT NULL,
+    name TEXT,
+    percent_remaining REAL,
+    reset_at TEXT,
+    tokens_used INTEGER,
+    tokens_remaining INTEGER,
+    tokens_limit INTEGER,
+    last_refreshed_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);";
+
+/// The `accounts` indexes, as `SCHEMA_SQL` defines them.
+const ACCOUNTS_INDEXES_SQL: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_service_account ON accounts(service, account_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service);
+CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
+CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);";
+
+const ACCOUNTS_COLUMNS_SQL: &str = "id, account_id, service, name, percent_remaining, reset_at, \
+     tokens_used, tokens_remaining, tokens_limit, last_refreshed_at, last_used_at, created_at, \
+     updated_at";
+
+fn limit_window_account_links(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, account_db_id FROM limit_windows
+             WHERE account_db_id IS NOT NULL ORDER BY id",
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let links = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| StorageError::Database(error.to_string()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    Ok(links)
+}
+
+/// Migration v52: make `accounts.percent_remaining` nullable, so a balance
+/// caut did not report is stored as unknown rather than as 0.0.
+///
+/// SQLite cannot drop NOT NULL in place, so the table is rebuilt under a
+/// staging name, keeping every row and id, and renamed. Existing values are
+/// kept: a stored 0.0 cannot be told apart from a real 0%.
+///
+/// `limit_windows.account_db_id` references `accounts(id) ON DELETE SET
+/// NULL`. Dropping the old table with foreign keys enforced would null those
+/// links. The versioned path suspends enforcement first (see
+/// `apply_migration_step`); the v0 repair path runs inside one outer
+/// transaction, where SQLite ignores `PRAGMA foreign_keys`. So the links are
+/// saved before the rebuild, restored after it, and must come out unchanged.
+fn ensure_accounts_nullable_percent_v52(conn: &Connection) -> Result<()> {
+    let column =
+        load_column_descriptor(conn, "accounts", "percent_remaining")?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: "migration v52: accounts.percent_remaining is missing".to_string(),
+            }
+        })?;
+    if !column.not_null {
+        // A fresh SCHEMA_SQL database, or one already migrated.
+        return Ok(());
+    }
+    if table_exists(conn, "accounts_v52")? {
+        return Err(StorageError::Corruption {
+            details: "migration v52: staging table accounts_v52 already exists".to_string(),
+        }
+        .into());
+    }
+
+    let links_before = limit_window_account_links(conn)?;
+    let source_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let copy = format!(
+        "{ACCOUNTS_V52_TABLE_SQL}
+         INSERT INTO accounts_v52 ({ACCOUNTS_COLUMNS_SQL})
+             SELECT {ACCOUNTS_COLUMNS_SQL} FROM accounts ORDER BY id;"
+    );
+    conn.execute_batch(&copy).map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "migration v52: failed to create and populate the accounts table: {error}"
+        ))
+    })?;
+    let mismatched: bool = conn
+        .query_row(
+            &format!(
+                "SELECT (SELECT COUNT(*) FROM accounts_v52) != ?1
+                     OR EXISTS (SELECT {ACCOUNTS_COLUMNS_SQL} FROM accounts
+                                EXCEPT SELECT {ACCOUNTS_COLUMNS_SQL} FROM accounts_v52)
+                     OR EXISTS (SELECT {ACCOUNTS_COLUMNS_SQL} FROM accounts_v52
+                                EXCEPT SELECT {ACCOUNTS_COLUMNS_SQL} FROM accounts)"
+            ),
+            [source_count],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if mismatched {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "migration v52: accounts copy differs from its source ({source_count} source rows)"
+            ),
+        }
+        .into());
+    }
+
+    conn.execute_batch(&format!(
+        "DROP TABLE accounts;
+         ALTER TABLE accounts_v52 RENAME TO accounts;
+         {ACCOUNTS_INDEXES_SQL}"
+    ))
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "migration v52: failed the accounts table cutover: {error}"
+        ))
+    })?;
+
+    let mut restore = conn
+        .prepare(
+            "UPDATE limit_windows SET account_db_id = ?2
+             WHERE id = ?1 AND account_db_id IS NOT ?2",
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    for (window_id, account_db_id) in &links_before {
+        restore
+            .execute(params![window_id, account_db_id])
+            .map_err(|error| {
+                StorageError::MigrationFailed(format!(
+                    "migration v52: failed to restore limit window {window_id}'s account link: {error}"
+                ))
+            })?;
+    }
+    if limit_window_account_links(conn)? != links_before {
+        return Err(StorageError::Corruption {
+            details: "migration v52: limit_windows account links changed across the rebuild"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_restore_attempt_lifecycle_v38_schema(conn: &Connection) -> Result<()> {
     require_exact_table_column_count(
         conn,
@@ -6492,6 +6651,10 @@ fn apply_migration_mutation(
                     ensure_audit_actions_target_pane(conn)?;
                     apply_raw_up_sql = false;
                 }
+                52 => {
+                    ensure_accounts_nullable_percent_v52(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -6576,10 +6739,15 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
         .into());
     };
 
-    if step.direction == MigrationDirection::Up && migration.version == 38 {
+    if step.direction == MigrationDirection::Up && matches!(migration.version, 38 | 52) {
+        let context = if migration.version == 38 {
+            "migration v38"
+        } else {
+            "migration v52"
+        };
         return run_owned_migration_transaction_with_foreign_keys_suspended(
             conn,
-            "migration v38",
+            context,
             |transaction| apply_migration_mutation(transaction, step, migration),
         );
     }
@@ -7102,6 +7270,189 @@ mod tests {
         );
         initialize_schema(&conn).expect("reopen migrated capture schema");
         assert!(build_migration_plan(51, 50).is_err());
+    }
+
+    /// Turn a current-schema connection into a populated v51 database: the
+    /// accounts table with NOT NULL percent_remaining, two accounts, and a
+    /// limit window linked to account 7.
+    fn accounts_v51_fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("open accounts v51 fixture");
+        initialize_schema(&conn).expect("initialize fresh schema");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE accounts;
+             CREATE TABLE accounts (
+                 id INTEGER PRIMARY KEY,
+                 account_id TEXT NOT NULL,
+                 service TEXT NOT NULL,
+                 name TEXT,
+                 percent_remaining REAL NOT NULL,
+                 reset_at TEXT,
+                 tokens_used INTEGER,
+                 tokens_remaining INTEGER,
+                 tokens_limit INTEGER,
+                 last_refreshed_at INTEGER NOT NULL,
+                 last_used_at INTEGER,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE UNIQUE INDEX idx_accounts_service_account ON accounts(service, account_id);
+             CREATE INDEX idx_accounts_service ON accounts(service);
+             CREATE INDEX idx_accounts_percent ON accounts(service, percent_remaining DESC);
+             CREATE INDEX idx_accounts_last_used ON accounts(service, last_used_at);
+             PRAGMA foreign_keys = ON;
+             INSERT INTO accounts
+                 (id, account_id, service, name, percent_remaining, tokens_used,
+                  last_refreshed_at, last_used_at, created_at, updated_at)
+                 VALUES (7, 'acct-a', 'openai', 'A', 42.5, 10, 1, 5, 1, 1),
+                        (9, 'acct-b', 'anthropic', NULL, 0.0, NULL, 2, NULL, 2, 2);
+             INSERT INTO panes
+                 (pane_id, pane_uuid, domain, first_seen_at, last_seen_at, observed)
+                 VALUES (3, 'accounts-v52', 'local', 1, 2, 1);
+             INSERT INTO limit_windows
+                 (pane_id, service, account_id, account_db_id, account_known, rule_id,
+                  event_type, limited_at, reset_source, conservative_ttl_ms, last_seen_at,
+                  created_at, updated_at)
+                 VALUES (3, 'openai', 'acct-a', 7, 1, 'rule', 'usage', 1, 'unknown_ttl',
+                         1000, 1, 1, 1);
+             DELETE FROM schema_version WHERE version >= 52;
+             PRAGMA user_version = 51;",
+        )
+        .expect("prepare populated v51 accounts fixture");
+        ensure_ft_meta(&conn, 51).unwrap();
+        assert!(
+            load_column_descriptor(&conn, "accounts", "percent_remaining")
+                .unwrap()
+                .unwrap()
+                .not_null
+        );
+        conn
+    }
+
+    /// `(id, account_id, percent_remaining)` rows, and limit window 3's link.
+    type AccountsRowsAndLink = (Vec<(i64, String, Option<f64>)>, Option<i64>);
+
+    fn accounts_rows_and_link(conn: &Connection) -> AccountsRowsAndLink {
+        let mut statement = conn
+            .prepare("SELECT id, account_id, percent_remaining FROM accounts ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let link = conn
+            .query_row(
+                "SELECT account_db_id FROM limit_windows WHERE pane_id = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (rows, link)
+    }
+
+    #[test]
+    fn accounts_v52_stores_unknown_balance_as_null_and_keeps_rows_and_links() {
+        let expected_rows = vec![
+            (7, "acct-a".to_string(), Some(42.5)),
+            (9, "acct-b".to_string(), Some(0.0)),
+        ];
+        let column_contract = |conn: &Connection| -> Vec<(String, String, bool, bool)> {
+            [
+                "id",
+                "account_id",
+                "service",
+                "name",
+                "percent_remaining",
+                "reset_at",
+                "tokens_used",
+                "tokens_remaining",
+                "tokens_limit",
+                "last_refreshed_at",
+                "last_used_at",
+                "created_at",
+                "updated_at",
+            ]
+            .iter()
+            .map(|column| {
+                let descriptor = load_column_descriptor(conn, "accounts", column)
+                    .unwrap()
+                    .unwrap();
+                (
+                    descriptor.name,
+                    descriptor.declared_type,
+                    descriptor.not_null,
+                    descriptor.primary_key,
+                )
+            })
+            .collect()
+        };
+        let index_names = |conn: &Connection| -> Vec<String> {
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'accounts' AND name LIKE 'idx_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+        assert!(
+            !load_column_descriptor(&fresh, "accounts", "percent_remaining")
+                .unwrap()
+                .unwrap()
+                .not_null,
+            "a fresh schema stores an unknown balance as NULL"
+        );
+
+        // Versioned upgrade: foreign keys are suspended around the rebuild.
+        let upgraded = accounts_v51_fixture();
+        initialize_schema(&upgraded).expect("upgrade v51 accounts");
+        assert_eq!(get_user_version(&upgraded).unwrap(), SCHEMA_VERSION);
+        assert_eq!(column_contract(&upgraded), column_contract(&fresh));
+        assert_eq!(index_names(&upgraded), index_names(&fresh));
+        assert_eq!(index_names(&upgraded).len(), 4);
+        assert_eq!(
+            accounts_rows_and_link(&upgraded),
+            (expected_rows.clone(), Some(7)),
+            "rows, ids and the limit window link survive; a stored 0.0 stays 0.0"
+        );
+        upgraded
+            .execute(
+                "INSERT INTO accounts
+                     (account_id, service, percent_remaining, last_refreshed_at, created_at,
+                      updated_at)
+                     VALUES ('expired', 'openai', NULL, 3, 3, 3)",
+                [],
+            )
+            .expect("an unknown balance is storable after v52");
+        ensure_no_foreign_key_violations(&upgraded, "accounts v52 test").unwrap();
+        initialize_schema(&upgraded).expect("reopen migrated accounts schema");
+        assert!(build_migration_plan(52, 51).is_err());
+
+        // The v0 repair path runs migrations inside one outer transaction,
+        // where SQLite ignores PRAGMA foreign_keys. With enforcement on,
+        // dropping the old table nulls the link; the rebuild restores it.
+        let in_transaction = accounts_v51_fixture();
+        in_transaction
+            .execute_batch("PRAGMA foreign_keys = ON; BEGIN;")
+            .unwrap();
+        ensure_accounts_nullable_percent_v52(&in_transaction).expect("rebuild in a transaction");
+        in_transaction.execute_batch("COMMIT;").unwrap();
+        assert_eq!(
+            accounts_rows_and_link(&in_transaction),
+            (expected_rows, Some(7))
+        );
+        assert_eq!(column_contract(&in_transaction), column_contract(&fresh));
+        // Running it again is a no-op.
+        ensure_accounts_nullable_percent_v52(&in_transaction).unwrap();
     }
 
     #[test]

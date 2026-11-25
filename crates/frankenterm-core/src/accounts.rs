@@ -33,8 +33,10 @@ pub struct AccountRecord {
     pub service: String,
     /// Display name for the account
     pub name: Option<String>,
-    /// Percentage of usage remaining (0.0-100.0)
-    pub percent_remaining: f64,
+    /// Percentage of usage remaining (0.0-100.0). `None` when caut reported
+    /// no percentage for the account, for example after an auth failure:
+    /// an unknown balance is neither 0% nor eligible for selection.
+    pub percent_remaining: Option<f64>,
     /// When the usage quota resets (ISO8601 or epoch ms as string)
     pub reset_at: Option<String>,
     /// Tokens used in current period
@@ -68,7 +70,7 @@ impl AccountRecord {
             account_id,
             service: service.as_str().to_string(),
             name: usage.name.clone(),
-            percent_remaining: usage.percent_remaining.unwrap_or(0.0),
+            percent_remaining: usage.percent_remaining,
             reset_at: usage.reset_at.clone(),
             tokens_used: usage.tokens_used.and_then(|v| i64::try_from(v).ok()),
             tokens_remaining: usage.tokens_remaining.and_then(|v| i64::try_from(v).ok()),
@@ -80,10 +82,11 @@ impl AccountRecord {
         }
     }
 
-    /// Returns true if the account is above the given threshold.
+    /// Returns true if the account's known balance is at or above the given
+    /// threshold. An unknown balance is never above it.
     #[must_use]
     pub fn is_above_threshold(&self, threshold: f64) -> bool {
-        self.percent_remaining >= threshold
+        self.percent_remaining.is_some_and(|pct| pct >= threshold)
     }
 }
 
@@ -167,8 +170,8 @@ pub struct FilteredAccount {
     pub account_id: String,
     /// Display name
     pub name: Option<String>,
-    /// Percent remaining when filtered
-    pub percent_remaining: f64,
+    /// Percent remaining when filtered (`None` when caut reported none)
+    pub percent_remaining: Option<f64>,
     /// Why it was filtered
     pub reason: String,
 }
@@ -190,7 +193,8 @@ pub struct CandidateAccount {
 ///
 /// # Policy
 ///
-/// 1. Filter: exclude accounts below `config.threshold_percent`
+/// 1. Filter: exclude accounts below `config.threshold_percent`, and accounts
+///    whose balance caut did not report
 /// 2. Primary: highest `percent_remaining`
 /// 3. Tie-breaker: least-recently-used (`last_used_at` oldest wins, None = never used = oldest)
 ///
@@ -206,62 +210,72 @@ pub fn select_account(
 
     // Filter out accounts below threshold
     let mut filtered_out = Vec::new();
-    let mut candidates: Vec<&AccountRecord> = Vec::new();
+    let mut candidates: Vec<(&AccountRecord, f64)> = Vec::new();
 
     for account in accounts {
-        if account.percent_remaining < config.threshold_percent {
-            filtered_out.push(FilteredAccount {
+        match account.percent_remaining {
+            Some(pct) if pct >= config.threshold_percent => candidates.push((account, pct)),
+            Some(pct) => filtered_out.push(FilteredAccount {
                 account_id: account.account_id.clone(),
                 name: account.name.clone(),
-                percent_remaining: account.percent_remaining,
+                percent_remaining: Some(pct),
                 reason: format!(
-                    "Below threshold ({:.1}% < {:.1}%)",
-                    account.percent_remaining, config.threshold_percent
+                    "Below threshold ({pct:.1}% < {:.1}%)",
+                    config.threshold_percent
                 ),
-            });
-        } else {
-            candidates.push(account);
+            }),
+            None => filtered_out.push(FilteredAccount {
+                account_id: account.account_id.clone(),
+                name: account.name.clone(),
+                percent_remaining: None,
+                reason: "Balance unknown (caut reported no percentage)".to_string(),
+            }),
         }
     }
 
     // Build candidate list for explanation
     let candidate_explanations: Vec<CandidateAccount> = candidates
         .iter()
-        .map(|a| CandidateAccount {
+        .map(|(a, pct)| CandidateAccount {
             account_id: a.account_id.clone(),
             name: a.name.clone(),
-            percent_remaining: a.percent_remaining,
+            percent_remaining: *pct,
             last_used_at: a.last_used_at,
         })
         .collect();
 
     // No eligible candidates
     if candidates.is_empty() {
+        let selection_reason = if total_considered == 0 {
+            "No accounts available".to_string()
+        } else if filtered_out.iter().all(|f| f.percent_remaining.is_some()) {
+            format!(
+                "All {} accounts below threshold ({:.1}%)",
+                total_considered, config.threshold_percent
+            )
+        } else {
+            format!(
+                "All {} accounts below threshold ({:.1}%) or with an unknown balance",
+                total_considered, config.threshold_percent
+            )
+        };
         return AccountSelectionResult {
             selected: None,
             explanation: SelectionExplanation {
                 total_considered,
                 filtered_out,
                 candidates: candidate_explanations,
-                selection_reason: if total_considered == 0 {
-                    "No accounts available".to_string()
-                } else {
-                    format!(
-                        "All {} accounts below threshold ({:.1}%)",
-                        total_considered, config.threshold_percent
-                    )
-                },
+                selection_reason,
             },
         };
     }
 
     // Sort candidates: highest percent_remaining first, then oldest last_used_at
     // For last_used_at: None (never used) is treated as epoch 0 (oldest)
-    candidates.sort_by(|a, b| {
+    candidates.sort_by(|(a, a_pct), (b, b_pct)| {
         // Primary: highest percent_remaining first
-        let pct_cmp = b
-            .percent_remaining
-            .partial_cmp(&a.percent_remaining)
+        let pct_cmp = b_pct
+            .partial_cmp(a_pct)
             .unwrap_or(std::cmp::Ordering::Equal);
 
         if pct_cmp != std::cmp::Ordering::Equal {
@@ -274,15 +288,16 @@ pub fn select_account(
         a_used.cmp(&b_used)
     });
 
-    let selected = candidates[0].clone();
+    let (selected, selected_pct) = candidates[0];
+    let selected = selected.clone();
 
     // Determine selection reason
     let selection_reason = if candidates.len() == 1 {
         "Only eligible account".to_string()
     } else {
         let runner_up = candidates.get(1);
-        if let Some(runner) = runner_up {
-            if (selected.percent_remaining - runner.percent_remaining).abs() < 0.001 {
+        if let Some(&(runner, runner_pct)) = runner_up {
+            if (selected_pct - runner_pct).abs() < 0.001 {
                 // Tie-break applied
                 let selected_used = selected.last_used_at.unwrap_or(0);
                 let runner_used = runner.last_used_at.unwrap_or(0);
@@ -300,16 +315,10 @@ pub fn select_account(
                     }
                 )
             } else {
-                format!(
-                    "Highest percent_remaining ({:.1}% vs {:.1}%)",
-                    selected.percent_remaining, runner.percent_remaining
-                )
+                format!("Highest percent_remaining ({selected_pct:.1}% vs {runner_pct:.1}%)")
             }
         } else {
-            format!(
-                "Highest percent_remaining ({:.1}%)",
-                selected.percent_remaining
-            )
+            format!("Highest percent_remaining ({selected_pct:.1}%)")
         }
     };
 
@@ -335,7 +344,11 @@ pub fn build_quota_advisory(
     selection: &AccountSelectionResult,
     low_quota_threshold_percent: f64,
 ) -> AccountQuotaAdvisory {
-    let selected_percent_remaining = selection.selected.as_ref().map(|a| a.percent_remaining);
+    // select_account selects only accounts with a known balance.
+    let selected_percent_remaining = selection
+        .selected
+        .as_ref()
+        .and_then(|a| a.percent_remaining);
 
     match selected_percent_remaining {
         None => AccountQuotaAdvisory {
@@ -532,7 +545,7 @@ mod tests {
             account_id: id.to_string(),
             service: "openai".to_string(),
             name: Some(id.to_string()),
-            percent_remaining: pct,
+            percent_remaining: Some(pct),
             reset_at: None,
             tokens_used: None,
             tokens_remaining: None,
@@ -755,7 +768,7 @@ mod tests {
         assert_eq!(record.account_id, "acc-123");
         assert_eq!(record.service, "openai");
         assert_eq!(record.name.as_deref(), Some("Test Account"));
-        assert!((record.percent_remaining - 75.5).abs() < 0.001);
+        assert!((record.percent_remaining.unwrap() - 75.5).abs() < 0.001);
         assert_eq!(record.tokens_used, Some(1000));
     }
 
@@ -790,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn from_caut_missing_percent_defaults_to_zero() {
+    fn from_caut_missing_percent_is_unknown_not_zero() {
         let caut_usage = CautAccountUsage {
             id: Some("acc-1".to_string()),
             percent_remaining: None,
@@ -798,7 +811,44 @@ mod tests {
         };
 
         let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1000);
-        assert!((record.percent_remaining).abs() < 0.001);
+        assert_eq!(record.percent_remaining, None);
+        assert!(!record.is_above_threshold(0.0));
+    }
+
+    #[test]
+    fn select_excludes_unknown_balance_and_says_why() {
+        let mut unknown = make_account("expired", 0.0, None);
+        unknown.percent_remaining = None;
+        let known = make_account("known", 40.0, Some(5));
+
+        let result = select_account(
+            &[unknown.clone(), known],
+            &AccountSelectionConfig::default(),
+        );
+        assert_eq!(result.selected.unwrap().account_id, "known");
+        let filtered = &result.explanation.filtered_out;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].account_id, "expired");
+        assert_eq!(filtered[0].percent_remaining, None);
+        assert!(
+            filtered[0].reason.contains("unknown"),
+            "{}",
+            filtered[0].reason
+        );
+
+        let only_unknown = select_account(&[unknown], &AccountSelectionConfig::default());
+        assert!(only_unknown.selected.is_none());
+        assert!(
+            only_unknown
+                .explanation
+                .selection_reason
+                .contains("unknown balance"),
+            "{}",
+            only_unknown.explanation.selection_reason
+        );
+        let advisory = build_quota_advisory(&only_unknown, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+        assert_eq!(advisory.availability, QuotaAvailability::Exhausted);
+        assert_eq!(advisory.selected_percent_remaining, None);
     }
 
     #[test]
@@ -821,7 +871,7 @@ mod tests {
         assert_eq!(record.account_id, "acc-full");
         assert_eq!(record.service, "openai");
         assert_eq!(record.name.as_deref(), Some("Full Account"));
-        assert!((record.percent_remaining - 88.8).abs() < 0.001);
+        assert!((record.percent_remaining.unwrap() - 88.8).abs() < 0.001);
         assert_eq!(record.reset_at.as_deref(), Some("2026-03-01T00:00:00Z"));
         assert_eq!(record.tokens_used, Some(1120));
         assert_eq!(record.tokens_remaining, Some(8880));
@@ -989,7 +1039,7 @@ mod tests {
             account_id: id.to_string(),
             service: "openai".to_string(),
             name: Some(id.to_string()),
-            percent_remaining: pct,
+            percent_remaining: Some(pct),
             reset_at: reset_at.map(ToString::to_string),
             tokens_used: None,
             tokens_remaining: None,
@@ -1171,9 +1221,9 @@ mod tests {
     fn account_record_clone_independence() {
         let acct = make_account("orig", 75.0, Some(2000));
         let mut cloned = acct.clone();
-        cloned.percent_remaining = 10.0;
+        cloned.percent_remaining = Some(10.0);
         cloned.account_id = "cloned".to_string();
-        assert!((acct.percent_remaining - 75.0).abs() < 0.001);
+        assert_eq!(acct.percent_remaining, Some(75.0));
         assert_eq!(acct.account_id, "orig");
     }
 
@@ -1183,8 +1233,15 @@ mod tests {
         let json = serde_json::to_string(&acct).unwrap();
         let parsed: AccountRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.account_id, "serde-test");
-        assert!((parsed.percent_remaining - 42.5).abs() < 0.001);
+        assert_eq!(parsed.percent_remaining, Some(42.5));
         assert_eq!(parsed.last_used_at, Some(9999));
+
+        let mut unknown = acct;
+        unknown.percent_remaining = None;
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json["percent_remaining"].is_null());
+        let parsed: AccountRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.percent_remaining, None);
     }
 
     #[test]
@@ -1372,7 +1429,7 @@ mod tests {
             filtered_out: vec![FilteredAccount {
                 account_id: "f1".to_string(),
                 name: None,
-                percent_remaining: 1.0,
+                percent_remaining: Some(1.0),
                 reason: "below".to_string(),
             }],
             candidates: vec![CandidateAccount {
@@ -1397,7 +1454,7 @@ mod tests {
         let fa = FilteredAccount {
             account_id: "fa-1".to_string(),
             name: Some("FA".to_string()),
-            percent_remaining: 2.5,
+            percent_remaining: Some(2.5),
             reason: "Below threshold".to_string(),
         };
         let dbg = format!("{:?}", fa);

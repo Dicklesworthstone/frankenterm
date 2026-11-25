@@ -17,7 +17,7 @@ fn arb_account_record() -> impl Strategy<Value = AccountRecord> {
             "[a-z0-9_-]{3,20}",
             "[a-z_]{3,12}",
             prop::option::of("[a-z ]{3,20}"),
-            0.0f64..100.0,
+            prop::option::of(0.0f64..100.0),
             prop::option::of("[0-9T: -]{8,24}"),
             prop::option::of(0i64..1_000_000),
         ),
@@ -66,7 +66,7 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
             (
                 "[a-z0-9_-]{3,20}",
                 prop::option::of("[a-z ]{3,20}"),
-                0.0f64..100.0,
+                prop::option::of(0.0f64..100.0),
                 "[A-Za-z0-9 %.()_-]{3,40}",
             )
                 .prop_map(|(account_id, name, percent_remaining, reason)| {

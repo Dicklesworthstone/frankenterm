@@ -986,7 +986,8 @@ pub(super) struct McpAccountInfo {
     pub service: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub percent_remaining: f64,
+    /// `null` when caut reported no percentage (an unknown balance, not 0%).
+    pub percent_remaining: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2829,7 +2830,7 @@ mod tests {
             account_id in arb_string(),
             service in arb_string(),
             name in arb_opt_string(),
-            percent_remaining in arb_finite_f64(),
+            percent_remaining in proptest::option::of(arb_finite_f64()),
             reset_at in arb_opt_string(),
             tokens_used in proptest::option::of(any::<i64>()),
             tokens_remaining in proptest::option::of(any::<i64>()),
@@ -2853,6 +2854,10 @@ mod tests {
             prop_assert_eq!(v["account_id"].as_str().unwrap(), account_id.as_str());
             prop_assert_eq!(v["service"].as_str().unwrap(), service.as_str());
             prop_assert_eq!(v["last_refreshed_at"].as_i64().unwrap(), last_refreshed_at);
+            // An unknown balance is an explicit null, never omitted or 0.
+            let object = v.as_object().unwrap();
+            prop_assert!(object.contains_key("percent_remaining"));
+            prop_assert_eq!(v["percent_remaining"].as_f64(), percent_remaining);
         }
 
         // 51. McpPaneState

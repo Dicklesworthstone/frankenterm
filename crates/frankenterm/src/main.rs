@@ -15531,7 +15531,8 @@ struct RobotAccountInfo {
     service: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    percent_remaining: f64,
+    /// `null` when caut reported no percentage (an unknown balance, not 0%).
+    percent_remaining: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reset_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133393,7 +133394,7 @@ printf x > "$MINISIGN_MARKER"
             account_id: id.to_string(),
             service: "openai".to_string(),
             name: Some(format!("{id}-name")),
-            percent_remaining: pct,
+            percent_remaining: Some(pct),
             reset_at: None,
             tokens_used: Some(1000),
             tokens_remaining: Some(9000),
@@ -133452,7 +133453,7 @@ printf x > "$MINISIGN_MARKER"
             account_id: "acc-1".to_string(),
             service: "openai".to_string(),
             name: None,
-            percent_remaining: 50.0,
+            percent_remaining: None,
             reset_at: None,
             tokens_used: None,
             tokens_remaining: None,
@@ -133461,6 +133462,9 @@ printf x > "$MINISIGN_MARKER"
             last_used_at: None,
         };
         let json = serde_json::to_value(&info).unwrap();
+
+        // An unknown balance is an explicit null, not omitted and not 0.
+        assert!(json["percent_remaining"].is_null());
 
         // None fields should not appear
         assert!(json.get("name").is_none());
@@ -133591,7 +133595,7 @@ printf x > "$MINISIGN_MARKER"
             account_id: "acc-test".to_string(),
             service: "openai".to_string(),
             name: Some("Test Account".to_string()),
-            percent_remaining: 65.5,
+            percent_remaining: Some(65.5),
             reset_at: Some("2026-02-01T00:00:00Z".to_string()),
             tokens_used: Some(3450),
             tokens_remaining: Some(6550),
@@ -133619,7 +133623,7 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(info.account_id, "acc-test");
         assert_eq!(info.service, "openai");
         assert_eq!(info.name.as_deref(), Some("Test Account"));
-        assert!((info.percent_remaining - 65.5).abs() < 0.001);
+        assert_eq!(info.percent_remaining, Some(65.5));
         assert_eq!(info.reset_at.as_deref(), Some("2026-02-01T00:00:00Z"));
         assert_eq!(info.tokens_used, Some(3450));
 
@@ -133641,7 +133645,7 @@ printf x > "$MINISIGN_MARKER"
                 account_id: "depleted".to_string(),
                 service: "openai".to_string(),
                 name: Some("Depleted".to_string()),
-                percent_remaining: 2.0,
+                percent_remaining: Some(2.0),
                 reset_at: None,
                 tokens_used: None,
                 tokens_remaining: None,
@@ -133656,7 +133660,7 @@ printf x > "$MINISIGN_MARKER"
                 account_id: "best".to_string(),
                 service: "openai".to_string(),
                 name: Some("Best".to_string()),
-                percent_remaining: 90.0,
+                percent_remaining: Some(90.0),
                 reset_at: None,
                 tokens_used: None,
                 tokens_remaining: None,
@@ -133671,7 +133675,7 @@ printf x > "$MINISIGN_MARKER"
                 account_id: "mid".to_string(),
                 service: "openai".to_string(),
                 name: Some("Mid".to_string()),
-                percent_remaining: 50.0,
+                percent_remaining: Some(50.0),
                 reset_at: None,
                 tokens_used: None,
                 tokens_remaining: None,
@@ -133799,7 +133803,7 @@ printf x > "$MINISIGN_MARKER"
                 account_id: "test-acc".to_string(),
                 service: "openai".to_string(),
                 name: Some("Test".to_string()),
-                percent_remaining: 75.0,
+                percent_remaining: Some(75.0),
                 reset_at: None,
                 tokens_used: Some(2500),
                 tokens_remaining: Some(7500),
@@ -134022,9 +134026,9 @@ printf x > "$MINISIGN_MARKER"
             assert_eq!(db_accounts.len(), 2);
             // Sorted by percent_remaining DESC
             assert_eq!(db_accounts[0].account_id, "acc-1");
-            assert!((db_accounts[0].percent_remaining - 85.0).abs() < 0.001);
+            assert_eq!(db_accounts[0].percent_remaining, Some(85.0));
             assert_eq!(db_accounts[1].account_id, "acc-2");
-            assert!((db_accounts[1].percent_remaining - 20.0).abs() < 0.001);
+            assert_eq!(db_accounts[1].percent_remaining, Some(20.0));
 
             // Verify DB mirror is idempotent (refresh again with same data)
             for usage in &fixture.accounts {
@@ -134056,7 +134060,7 @@ printf x > "$MINISIGN_MARKER"
                 account_id: "acc-1".to_string(),
                 service: "openai".to_string(),
                 name: Some("Test".to_string()),
-                percent_remaining: 90.0,
+                percent_remaining: Some(90.0),
                 reset_at: None,
                 tokens_used: Some(1000),
                 tokens_remaining: Some(9000),
@@ -134088,7 +134092,7 @@ printf x > "$MINISIGN_MARKER"
 
             let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
             assert_eq!(db_accounts.len(), 1);
-            assert!((db_accounts[0].percent_remaining - 50.0).abs() < 0.001);
+            assert_eq!(db_accounts[0].percent_remaining, Some(50.0));
             assert_eq!(db_accounts[0].tokens_used, Some(5000));
             assert_eq!(db_accounts[0].last_refreshed_at, now + 60_000);
 

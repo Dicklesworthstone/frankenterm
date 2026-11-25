@@ -238,6 +238,14 @@ impl<'a> RowReader<'a> {
         })
     }
 
+    /// Optional `f64`: NULL / empty → None.
+    pub fn optional_f64(&self, idx: usize) -> Result<Option<f64>, BackendError> {
+        if row_cell(self.row, idx)?.is_empty() {
+            return Ok(None);
+        }
+        row_f64(self.row, idx).map(Some)
+    }
+
     /// See [`row_bool`].
     pub fn bool(&self, idx: usize) -> Result<bool, BackendError> {
         row_bool(self.row, idx)

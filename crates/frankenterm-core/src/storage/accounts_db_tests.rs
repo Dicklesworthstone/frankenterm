@@ -169,7 +169,7 @@ fn make_db_account(id: &str, service: &str, pct: f64, now: i64) -> AccountRecord
         account_id: id.to_string(),
         service: service.to_string(),
         name: Some(format!("{id}-name")),
-        percent_remaining: pct,
+        percent_remaining: Some(pct),
         reset_at: None,
         tokens_used: Some(1000),
         tokens_remaining: Some(9000),
@@ -194,7 +194,7 @@ fn db_upsert_account_inserts_new() {
     let f = fetched.unwrap();
     assert_eq!(f.account_id, "acc-1");
     assert_eq!(f.service, "openai");
-    assert!((f.percent_remaining - 80.0).abs() < 0.001);
+    assert_eq!(f.percent_remaining, Some(80.0));
     assert_eq!(f.tokens_used, Some(1000));
 }
 
@@ -206,7 +206,7 @@ fn db_upsert_account_updates_existing() {
 
     // Update with new percent_remaining
     let updated = AccountRecord {
-        percent_remaining: 50.0,
+        percent_remaining: Some(50.0),
         last_refreshed_at: 2000,
         updated_at: 2000,
         tokens_used: Some(5000),
@@ -216,7 +216,7 @@ fn db_upsert_account_updates_existing() {
     upsert_account_sync(&conn, &updated).unwrap();
 
     let fetched = get_account_sync(&conn, "openai", "acc-1").unwrap().unwrap();
-    assert!((fetched.percent_remaining - 50.0).abs() < 0.001);
+    assert_eq!(fetched.percent_remaining, Some(50.0));
     assert_eq!(fetched.tokens_used, Some(5000));
     assert_eq!(fetched.last_refreshed_at, 2000);
 }
@@ -247,7 +247,7 @@ fn db_upsert_preserves_last_used_at() {
     // Now upsert with new data — should NOT overwrite last_used_at
     // because ON CONFLICT doesn't include last_used_at in the UPDATE
     let updated = AccountRecord {
-        percent_remaining: 60.0,
+        percent_remaining: Some(60.0),
         last_refreshed_at: 2000,
         updated_at: 2000,
         ..make_db_account("acc-1", "openai", 60.0, 2000)
@@ -258,7 +258,7 @@ fn db_upsert_preserves_last_used_at() {
     // last_used_at should still be 5000 (set by update_account_last_used_sync)
     assert_eq!(fetched.last_used_at, Some(5000));
     // But percent_remaining should be updated
-    assert!((fetched.percent_remaining - 60.0).abs() < 0.001);
+    assert_eq!(fetched.percent_remaining, Some(60.0));
 }
 
 #[test]
@@ -407,7 +407,7 @@ fn db_upsert_updates_only_specified_fields() {
         account_id: "acc-1".to_string(),
         service: "openai".to_string(),
         name: Some("Original Name".to_string()),
-        percent_remaining: 80.0,
+        percent_remaining: Some(80.0),
         reset_at: Some("2026-02-01T00:00:00Z".to_string()),
         tokens_used: Some(2000),
         tokens_remaining: Some(8000),
@@ -422,7 +422,7 @@ fn db_upsert_updates_only_specified_fields() {
     // Update with changed name and percent
     let updated = AccountRecord {
         name: Some("Updated Name".to_string()),
-        percent_remaining: 50.0,
+        percent_remaining: Some(50.0),
         last_refreshed_at: 2000,
         updated_at: 2000,
         ..acct
@@ -431,6 +431,6 @@ fn db_upsert_updates_only_specified_fields() {
 
     let fetched = get_account_sync(&conn, "openai", "acc-1").unwrap().unwrap();
     assert_eq!(fetched.name.as_deref(), Some("Updated Name"));
-    assert!((fetched.percent_remaining - 50.0).abs() < 0.001);
+    assert_eq!(fetched.percent_remaining, Some(50.0));
     assert_eq!(fetched.reset_at.as_deref(), Some("2026-02-01T00:00:00Z"));
 }

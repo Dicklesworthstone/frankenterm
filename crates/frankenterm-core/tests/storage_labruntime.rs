@@ -164,7 +164,7 @@ fn account_writer_cluster_roundtrip_backend_path() {
             account_id: "acc-backend".to_string(),
             service: "openai".to_string(),
             name: Some("Backend Path".to_string()),
-            percent_remaining: 77.5,
+            percent_remaining: Some(77.5),
             reset_at: Some("2026-03-01T00:00:00Z".to_string()),
             tokens_used: Some(2250),
             tokens_remaining: Some(7750),
@@ -188,7 +188,7 @@ fn account_writer_cluster_roundtrip_backend_path() {
             .unwrap()
             .expect("account should exist after upsert");
         assert_eq!(fetched.last_used_at, Some(1_700_000_001_000));
-        assert!((fetched.percent_remaining - 77.5).abs() < f64::EPSILON);
+        assert_eq!(fetched.percent_remaining, Some(77.5));
 
         assert!(
             handle

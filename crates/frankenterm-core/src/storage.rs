@@ -30574,7 +30574,9 @@ fn upsert_account_backend(
                 ToSqlValue::Text(&account.account_id),
                 ToSqlValue::Text(&account.service),
                 ToSqlValue::optional_text(account.name.as_deref()),
-                ToSqlValue::Real(account.percent_remaining),
+                account
+                    .percent_remaining
+                    .map_or(ToSqlValue::Null, ToSqlValue::Real),
                 ToSqlValue::optional_text(account.reset_at.as_deref()),
                 ToSqlValue::optional_i64(account.tokens_used),
                 ToSqlValue::optional_i64(account.tokens_remaining),
@@ -30656,7 +30658,7 @@ fn account_record_from_backend_row(row: &[String]) -> Result<crate::accounts::Ac
             .optional_string(3)
             .map_err(|err| storage_backend_error("Account name", err))?,
         percent_remaining: reader
-            .f64(4)
+            .optional_f64(4)
             .map_err(|err| storage_backend_error("Account percent_remaining", err))?,
         reset_at: reader
             .optional_string(5)
@@ -44033,7 +44035,7 @@ fn storage_tick144_account_cluster_roundtrip() {
             account_id: "acct-hi".to_string(),
             service: "openai".to_string(),
             name: Some("primary".to_string()),
-            percent_remaining: 80.0,
+            percent_remaining: Some(80.0),
             reset_at: None,
             tokens_used: None,
             tokens_remaining: None,
@@ -44051,7 +44053,7 @@ fn storage_tick144_account_cluster_roundtrip() {
             account_id: "acct-lo".to_string(),
             service: "openai".to_string(),
             name: Some("secondary".to_string()),
-            percent_remaining: 20.0,
+            percent_remaining: Some(20.0),
             reset_at: None,
             tokens_used: None,
             tokens_remaining: None,
@@ -44061,8 +44063,46 @@ fn storage_tick144_account_cluster_roundtrip() {
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         };
-        let id_lo = storage.upsert_account_with_cx(&cx, acct_lo).await.unwrap();
+        let id_lo = storage
+            .upsert_account_with_cx(&cx, acct_lo.clone())
+            .await
+            .unwrap();
         assert!(id_lo > 0 && id_lo != id_hi);
+
+        // An account caut reported no percentage for stores NULL, reads back
+        // as unknown, and sorts after every known balance.
+        let acct_unknown = crate::accounts::AccountRecord {
+            account_id: "acct-unknown".to_string(),
+            name: Some("expired login".to_string()),
+            percent_remaining: None,
+            ..acct_lo
+        };
+        storage
+            .upsert_account_with_cx(&cx, acct_unknown)
+            .await
+            .unwrap();
+        let listed = storage
+            .get_accounts_by_service_with_cx(&cx, "openai")
+            .await
+            .unwrap();
+        let order: Vec<(&str, Option<f64>)> = listed
+            .iter()
+            .map(|a| (a.account_id.as_str(), a.percent_remaining))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("acct-hi", Some(80.0)),
+                ("acct-lo", Some(20.0)),
+                ("acct-unknown", None)
+            ]
+        );
+        assert!(
+            storage
+                .delete_account_with_cx(&cx, "openai", "acct-unknown")
+                .await
+                .unwrap()
+        );
 
         // 2. get_account_with_cx
         let fetched = storage
@@ -44070,7 +44110,7 @@ fn storage_tick144_account_cluster_roundtrip() {
             .await
             .unwrap()
             .expect("acct-hi should exist");
-        assert!((fetched.percent_remaining - 80.0).abs() < 1e-9);
+        assert_eq!(fetched.percent_remaining, Some(80.0));
 
         // 3. select_account_with_cx — composite; with the default 5% threshold
         //    and quota-ranked ordering, acct-hi (80%) should win over
@@ -44167,7 +44207,7 @@ fn limit_window_upsert_is_idempotent_by_pane_service_account() {
                     account_id: "acct-openai".to_string(),
                     service: "openai".to_string(),
                     name: Some("OpenAI team".to_string()),
-                    percent_remaining: 0.0,
+                    percent_remaining: Some(0.0),
                     reset_at: Some("2026-06-09T00:00:00Z".to_string()),
                     tokens_used: None,
                     tokens_remaining: None,

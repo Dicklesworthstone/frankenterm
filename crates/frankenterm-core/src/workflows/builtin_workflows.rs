@@ -2694,7 +2694,7 @@ mod tests {
                         account_id: account_id.to_string(),
                         service: "openai".to_string(),
                         name: Some("ledger account".to_string()),
-                        percent_remaining: 0.0,
+                        percent_remaining: Some(0.0),
                         reset_at: None,
                         tokens_used: None,
                         tokens_remaining: None,
