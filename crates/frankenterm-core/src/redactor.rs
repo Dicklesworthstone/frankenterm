@@ -867,6 +867,50 @@ pub struct Redactor {
     placeholder: Option<String>,
 }
 
+/// Apply one literal replacement pass after measuring its exact output size.
+/// The input is returned without another allocation when there are no matches.
+fn replace_all_bounded_literal(
+    regex: &Regex,
+    input: String,
+    replacement: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if input.len() > max_bytes {
+        return None;
+    }
+    let mut output_len = 0usize;
+    let mut cursor = 0usize;
+    let mut matched = false;
+    for found in regex.find_iter(&input) {
+        matched = true;
+        output_len = output_len
+            .checked_add(found.start().checked_sub(cursor)?)?
+            .checked_add(replacement.len())?;
+        if output_len > max_bytes {
+            return None;
+        }
+        cursor = found.end();
+    }
+    if !matched {
+        return Some(input);
+    }
+    output_len = output_len.checked_add(input.len().checked_sub(cursor)?)?;
+    if output_len > max_bytes {
+        return None;
+    }
+
+    let mut output = String::new();
+    output.try_reserve_exact(output_len).ok()?;
+    cursor = 0;
+    for found in regex.find_iter(&input) {
+        output.push_str(&input[cursor..found.start()]);
+        output.push_str(replacement);
+        cursor = found.end();
+    }
+    output.push_str(&input[cursor..]);
+    Some(output)
+}
+
 impl Redactor {
     /// Create a new redactor with default settings.
     #[must_use]
@@ -966,6 +1010,61 @@ impl Redactor {
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
         self.redact_observed(text, |_, _, _, _| {})
+    }
+
+    /// Redact with the same literal, sequential policy as redact while bounding
+    /// the input and every intermediate replacement pass by max_bytes.
+    ///
+    /// Returns None before allocating an oversized replacement result, including
+    /// when a later pass could shrink it again. Configured markers are borrowed,
+    /// and nonmatching patterns never allocate a replacement. Successful output
+    /// is identical to redact; allocation failure also returns None.
+    #[must_use]
+    pub fn redact_bounded(&self, text: &str, max_bytes: usize) -> Option<String> {
+        if text.len() > max_bytes {
+            return None;
+        }
+        // Preserve the original-input gate: custom replacements must not
+        // silently enable a second pass through the built-in catalog.
+        let builtin_matched = SECRET_PATTERN_SET.is_match(text);
+        let mut result = String::new();
+        result.try_reserve_exact(text.len()).ok()?;
+        result.push_str(text);
+        let default_marker = self.marker();
+
+        if builtin_matched {
+            for pattern in SECRET_PATTERNS {
+                if !pattern.regex.is_match(&result) {
+                    continue;
+                }
+                let replacement = if self.include_pattern_names {
+                    if pattern.name.len().checked_add("[REDACTED:]".len())? > max_bytes {
+                        return None;
+                    }
+                    std::borrow::Cow::Owned(format!("[REDACTED:{}]", pattern.name))
+                } else {
+                    std::borrow::Cow::Borrowed(default_marker)
+                };
+                result = replace_all_bounded_literal(
+                    pattern.regex,
+                    result,
+                    replacement.as_ref(),
+                    max_bytes,
+                )?;
+            }
+        }
+        for custom in &self.custom_patterns {
+            if !custom.is_match(&result) {
+                continue;
+            }
+            let replacement = if self.include_pattern_names {
+                "[REDACTED:custom_pattern]"
+            } else {
+                default_marker
+            };
+            result = replace_all_bounded_literal(custom, result, replacement, max_bytes)?;
+        }
+        Some(result)
     }
 
     /// Retain source-byte provenance from the actual sequential replacement
@@ -2186,6 +2285,138 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn bounded_redaction_matches_catalog_and_debug_markers() {
+        for vector in crate::redactor_coverage_matrix::synthesized_corpus() {
+            for redactor in [Redactor::new(), Redactor::with_debug_markers()] {
+                let max_bytes = vector.input.len().saturating_mul(64).saturating_add(1024);
+                assert_eq!(
+                    redactor.redact_bounded(&vector.input, max_bytes),
+                    Some(redactor.redact(&vector.input))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_redaction_preserves_literal_and_sequential_custom_passes() {
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &["private".to_string(), r"\$0\$0".to_string()],
+            Some("$0"),
+        )
+        .unwrap();
+        assert_eq!(redactor.redact("privateprivate"), "$0");
+        assert_eq!(
+            redactor.redact_bounded("privateprivate", 32),
+            Some("$0".to_string())
+        );
+
+        let mut debug = Redactor::with_debug_markers();
+        debug.custom_patterns = vec![
+            Regex::new("hidden").unwrap(),
+            Regex::new("custom_pattern").unwrap(),
+        ];
+        assert_eq!(
+            debug.redact_bounded("hidden", 128),
+            Some(debug.redact("hidden"))
+        );
+    }
+
+    #[test]
+    fn bounded_redaction_preserves_original_input_builtin_gate() {
+        let marker = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &["seed".to_string()],
+            Some(marker),
+        )
+        .unwrap();
+        // A configured marker is literal policy text; custom passes do not
+        // cause the built-in catalog to run a second time over their output.
+        assert_eq!(redactor.redact("seed"), marker);
+        assert_eq!(
+            redactor.redact_bounded("seed", marker.len()),
+            Some(marker.to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_redaction_rejects_zero_width_and_intermediate_expansion() {
+        let zero_width = Redactor::with_custom_patterns_and_placeholder(
+            &["(?:)".to_string()],
+            Some("*"),
+        )
+        .unwrap();
+        assert_eq!(zero_width.redact_bounded("xy", 4), None);
+        assert_eq!(
+            zero_width.redact_bounded("xy", 5),
+            Some(zero_width.redact("xy"))
+        );
+        assert_eq!(zero_width.redact_bounded("", 0), None);
+
+        let sequential = Redactor::with_custom_patterns_and_placeholder(
+            &["x".to_string(), "LLLLLLLL".to_string()],
+            Some("LL"),
+        )
+        .unwrap();
+        assert_eq!(sequential.redact("xxxx"), "LL");
+        assert_eq!(sequential.redact_bounded("xxxx", 4), None);
+        assert_eq!(
+            sequential.redact_bounded("xxxx", 8),
+            Some("LL".to_string())
+        );
+
+        // Count emitted prefixes, not a pessimistic running sum over the
+        // unreplaced input: a later long match can offset an earlier growth.
+        let mixed = Redactor::with_custom_patterns_and_placeholder(
+            &[r"x|L{8}".to_string()],
+            Some("1234"),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.redact_bounded("xLLLLLLLL", 9),
+            Some("12341234".to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_redaction_borrows_large_markers_and_refuses_matching_growth() {
+        let marker = "x".repeat(128 * 1024);
+        let custom = Redactor::with_custom_patterns_and_placeholder(
+            &["hidden".to_string()],
+            Some(&marker),
+        )
+        .unwrap();
+        assert_eq!(
+            custom.redact_bounded("ordinary", 8),
+            Some("ordinary".to_string())
+        );
+        assert_eq!(custom.redact_bounded("hidden", 64), None);
+
+        let builtin =
+            Redactor::with_custom_patterns_and_placeholder(&[], Some(&marker)).unwrap();
+        assert_eq!(
+            builtin.redact_bounded("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 64),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_redaction_uses_utf8_byte_limits_without_truncation() {
+        let default = Redactor::new();
+        assert_eq!(default.redact_bounded("", 0), Some(String::new()));
+        assert_eq!(default.redact_bounded("é", 1), None);
+        assert_eq!(default.redact_bounded("é", 2), Some("é".to_string()));
+
+        let redactor =
+            Redactor::with_custom_patterns_and_placeholder(&["é".to_string()], Some("界"))
+                .unwrap();
+        assert_eq!(redactor.redact_bounded("éé", 5), None);
+        assert_eq!(
+            redactor.redact_bounded("éé", 6),
+            Some("界界".to_string())
+        );
+    }
 
     #[test]
     fn configured_policy_identity_covers_patterns_order_and_literal_marker() {
