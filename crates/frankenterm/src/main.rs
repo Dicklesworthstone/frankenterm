@@ -80196,12 +80196,43 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         self.inner.evaluate_gates(contract, now_ms)
     }
 
+    fn claim_prepare_approvals(
+        &self,
+        gate_inputs: &mut [frankenterm_core::plan::TxPrepareGateInput],
+        now_ms: i64,
+    ) {
+        self.inner.claim_prepare_approvals(gate_inputs, now_ms);
+    }
+
     fn execute_steps(
         &self,
         contract: &frankenterm_core::plan::MissionTxContract,
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+        self.execute_steps_with_outcome(contract, fail_step, now_ms)
+            .into_iter()
+            .map(|outcome| match outcome {
+                frankenterm_core::tx_execution::StepDispatchOutcome::Settled(input)
+                | frankenterm_core::tx_execution::StepDispatchOutcome::Indeterminate(input) => {
+                    input
+                }
+            })
+            .collect()
+    }
+
+    fn execute_steps_with_outcome(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<
+        frankenterm_core::tx_execution::StepDispatchOutcome<
+            frankenterm_core::plan::TxCommitStepInput,
+        >,
+    > {
+        use frankenterm_core::tx_execution::StepDispatchOutcome;
+
         // Every dispatch is an effect boundary (ft-7h5da.6.8): the receipt is
         // checked against the clock and the mission file as they are now, not
         // as they were when the run started, so a receipt that expires or a
@@ -80223,17 +80254,25 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
                 .plan
                 .steps
                 .iter()
-                .map(|step| frankenterm_core::plan::TxCommitStepInput {
-                    step_id: step.step_id.clone(),
-                    success: false,
-                    reason_code: "steering_receipt_revalidation_failed".to_string(),
-                    error_code: Some(error_code.to_string()),
-                    completed_at_ms: now_ms,
+                .map(|step| {
+                    // Revalidation refused before the inner executor could
+                    // admit an effect, so this failure is known to be settled.
+                    StepDispatchOutcome::Settled(frankenterm_core::plan::TxCommitStepInput {
+                        step_id: step.step_id.clone(),
+                        success: false,
+                        reason_code: "steering_receipt_revalidation_failed".to_string(),
+                        error_code: Some(error_code.to_string()),
+                        completed_at_ms: now_ms,
+                    })
                 })
                 .collect();
         }
 
-        self.inner.execute_steps(contract, fail_step, now_ms)
+        // A lost acknowledgement may follow a successful pane mutation. Keep
+        // that uncertainty so durable execution retains Pending and refuses
+        // both replay and compensation until the effect is reconciled.
+        self.inner
+            .execute_steps_with_outcome(contract, fail_step, now_ms)
     }
 
     fn execute_compensations(
@@ -80245,6 +80284,25 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
     ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
         self.inner
             .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+    }
+
+    fn execute_compensations_with_outcome(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        commit_report: &frankenterm_core::plan::TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<
+        frankenterm_core::tx_execution::StepDispatchOutcome<
+            frankenterm_core::plan::TxCompensationStepInput,
+        >,
+    > {
+        self.inner.execute_compensations_with_outcome(
+            contract,
+            commit_report,
+            fail_for_step,
+            now_ms,
+        )
     }
 }
 
@@ -83207,12 +83265,10 @@ async fn execute_mission_assignment_transaction(
         )
         .await,
     );
-    let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
-        Some(&storage),
-    );
+    let approvals =
+        frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
     let resolved_capabilities = resolve_tx_contract_capabilities(
-        &frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request),
+        &frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request),
         contract,
         &storage,
         Some(layout.ipc_socket_path.as_path()),
@@ -108011,10 +108067,9 @@ mod tests {
         run_async_test(async {
             let (_dir, layout, path) = mission_lifecycle_fixture();
             let mission = load_mission_from_path(&path).expect("load mission fixture");
-            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
-                &mission,
-            )
-            .expect("exact revision token");
+            let token =
+                frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+                    .expect("exact revision token");
             let token = serde_json::to_string(&token).expect("serialize token");
             let before = std::fs::read(&path).expect("read original mission");
             let (data, lines) = run_mission_assignment_dispatch(
@@ -108051,10 +108106,9 @@ mod tests {
         run_async_test(async {
             let (_dir, layout, path) = mission_lifecycle_fixture();
             let mission = load_mission_from_path(&path).expect("load mission fixture");
-            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
-                &mission,
-            )
-            .expect("exact revision token");
+            let token =
+                frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+                    .expect("exact revision token");
             let token = serde_json::to_string(&token).expect("serialize token");
             run_mission_lifecycle(
                 &layout,
@@ -108100,10 +108154,8 @@ mod tests {
 
             let (_dir, layout, path) = mission_lifecycle_fixture();
             let before = load_mission_from_path(&path).expect("load mission fixture");
-            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
-                &before,
-            )
-            .expect("exact revision token");
+            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&before)
+                .expect("exact revision token");
             let token = serde_json::to_string(&token).expect("serialize token");
             let mutation =
                 acquire_mission_mutation(&layout, &path, Some(&token)).expect("lock mission");
@@ -108164,8 +108216,7 @@ mod tests {
                     if reason_code == "mission.assignment_action_committed"
             ));
             assert_eq!(
-                mission.assignments[1].outcome,
-                before.assignments[1].outcome,
+                mission.assignments[1].outcome, before.assignments[1].outcome,
                 "dispatch must not alter another assignment"
             );
             drop(contract_lock);
@@ -110913,6 +110964,8 @@ reason = "overly conservative pending threshold"
         calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         execute_contract_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         uncertain_commit_step: Option<&'static str>,
+        uncertain_compensation_step: Option<&'static str>,
+        approval_tokens: Option<std::sync::Arc<std::sync::Mutex<usize>>>,
     }
 
     impl RecordingStepExecutor {
@@ -110939,7 +110992,33 @@ reason = "overly conservative pending threshold"
                 .lock()
                 .expect("recorded calls lock")
                 .push("evaluate_gates");
-            build_robot_tx_prepare_gate_inputs(contract)
+            let mut gates = build_robot_tx_prepare_gate_inputs(contract);
+            if let Some(tokens) = &self.approval_tokens {
+                let available = *tokens.lock().expect("approval token lock") > 0;
+                for gate in &mut gates {
+                    gate.approval_satisfied = available;
+                }
+            }
+            gates
+        }
+
+        fn claim_prepare_approvals(
+            &self,
+            gate_inputs: &mut [frankenterm_core::plan::TxPrepareGateInput],
+            _now_ms: i64,
+        ) {
+            if let Some(tokens) = &self.approval_tokens {
+                let mut tokens = tokens.lock().expect("approval token lock");
+                for gate in gate_inputs {
+                    if *tokens == 0 {
+                        gate.approval_satisfied = false;
+                        gate.approval_reason_code =
+                            Some("tx.prepare.approval_already_consumed".to_string());
+                    } else {
+                        *tokens -= 1;
+                    }
+                }
+            }
         }
 
         fn execute_steps(
@@ -110990,6 +111069,32 @@ reason = "overly conservative pending threshold"
                     if self.uncertain_commit_step == Some(input.step_id.0.as_str()) {
                         input.success = false;
                         input.reason_code = "test_lost_commit_reply".to_owned();
+                        StepDispatchOutcome::Indeterminate(input)
+                    } else {
+                        StepDispatchOutcome::Settled(input)
+                    }
+                })
+                .collect()
+        }
+
+        fn execute_compensations_with_outcome(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            commit_report: &frankenterm_core::plan::TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<
+            frankenterm_core::tx_execution::StepDispatchOutcome<
+                frankenterm_core::plan::TxCompensationStepInput,
+            >,
+        > {
+            use frankenterm_core::tx_execution::StepDispatchOutcome;
+            self.execute_compensations(contract, commit_report, fail_for_step, now_ms)
+                .into_iter()
+                .map(|mut input| {
+                    if self.uncertain_compensation_step == Some(input.for_step_id.0.as_str()) {
+                        input.success = false;
+                        input.reason_code = "test_lost_compensation_reply".to_string();
                         StepDispatchOutcome::Indeterminate(input)
                     } else {
                         StepDispatchOutcome::Settled(input)
@@ -111453,6 +111558,226 @@ reason = "overly conservative pending threshold"
         assert_eq!(
             data.final_state,
             frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    #[test]
+    fn steering_receipt_preserves_pending_commit_across_durable_retry() {
+        let mut contract = sample_robot_tx_contract();
+        let live_hash = steering_tx_contract_hash(&contract);
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            None,
+            Vec::new(),
+            5_000,
+            None,
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let executor = RecordingStepExecutor {
+            uncertain_commit_step: Some("tx-step:1"),
+            ..Default::default()
+        };
+
+        let error = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(
+                executor.clone(),
+                receipt.clone(),
+                None,
+                live_hash.clone(),
+            )
+            .with_clock(|| 5_151),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect_err("a lost send acknowledgement must remain pending");
+        assert!(matches!(
+            error,
+            TxCommandExecutionError::PendingEffect { ref step_id, .. } if step_id == "tx-step:1"
+        ));
+        assert_eq!(
+            executor.recorded_calls(),
+            vec!["evaluate_gates", "execute_steps"],
+            "neither a later send nor compensation may follow an uncertain effect"
+        );
+
+        // Reload the saved contract and reopen the on-disk ledger through the
+        // same production helper. A healthy retry must not resend the command.
+        let mut recovered = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let retry = RecordingStepExecutor::default();
+        let error = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(retry.clone(), receipt, None, live_hash)
+                .with_clock(|| 9_000_000),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut recovered,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            9_000_000,
+        )
+        .expect_err("even an old pending effect requires explicit reconciliation");
+        assert!(matches!(
+            error,
+            TxCommandExecutionError::PendingEffect { ref step_id, .. } if step_id == "tx-step:1"
+        ));
+        assert!(!retry.recorded_calls().contains(&"execute_steps"));
+        assert!(!retry.recorded_calls().contains(&"execute_compensations"));
+    }
+
+    #[test]
+    fn steering_receipt_preserves_pending_compensation_across_durable_rollback() {
+        let mut contract = sample_robot_tx_contract();
+        let live_hash = steering_tx_contract_hash(&contract);
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            None,
+            Vec::new(),
+            5_000,
+            None,
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let executor = RecordingStepExecutor {
+            uncertain_compensation_step: Some("tx-step:1"),
+            ..Default::default()
+        };
+
+        let error = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(|| 5_151),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            Some("tx-step:2".to_string()),
+            false,
+            5_151,
+        )
+        .expect_err("a lost undo acknowledgement must remain pending");
+        assert!(matches!(
+            error,
+            TxCommandExecutionError::PendingEffect { ref step_id, .. } if step_id == "tx-step:1"
+        ));
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_compensations")
+                .count(),
+            1
+        );
+
+        let mut recovered = load_mission_tx_contract_from_guard(&contract_lock).unwrap();
+        let retry = RecordingStepExecutor::default();
+        execute_tx_rollback_with_executor(
+            retry.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut recovered,
+            None,
+            9_000_000,
+        )
+        .expect_err("a pending compensation must never be repeated on rollback");
+        assert!(!retry.recorded_calls().contains(&"execute_compensations"));
+    }
+
+    #[test]
+    fn steering_receipt_spends_allow_once_approval_only_on_live_execution() {
+        let mut template = sample_robot_tx_contract();
+        template.plan.steps.truncate(1);
+        template.plan.compensations.truncate(1);
+        let live_hash = steering_tx_contract_hash(&template);
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            None,
+            Vec::new(),
+            5_000,
+            None,
+        );
+        let tokens = Arc::new(std::sync::Mutex::new(1));
+        let executor = RecordingStepExecutor {
+            approval_tokens: Some(tokens.clone()),
+            ..Default::default()
+        };
+        let wrapped =
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(|| 5_151);
+
+        execute_tx_run_with_executor(
+            wrapped.clone(),
+            Path::new("/unused-dry-run-contract.json"),
+            None,
+            &mut template.clone(),
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            true,
+            5_151,
+        )
+        .expect("dry run only evaluates approval availability");
+        assert_eq!(*tokens.lock().unwrap(), 1);
+        assert!(!executor.recorded_calls().contains(&"execute_steps"));
+
+        for should_commit in [true, false] {
+            // Separate durable stores force independent execution attempts;
+            // an idempotent replay would not exercise approval consumption.
+            let mut contract = template.clone();
+            let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+            let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+            let result = execute_tx_run_with_executor(
+                wrapped.clone(),
+                contract_lock.authoritative_path(),
+                Some(&contract_lock),
+                &mut contract,
+                frankenterm_core::plan::MissionKillSwitchLevel::Off,
+                false,
+                None,
+                false,
+                5_151,
+            )
+            .expect("approval denial produces a prepare report");
+            assert_eq!(
+                result.final_state == frankenterm_core::plan::MissionTxState::Committed,
+                should_commit
+            );
+            if !should_commit {
+                assert_eq!(
+                    result.prepare_report.outcome,
+                    frankenterm_core::plan::TxPrepareOutcome::RequireApproval
+                );
+                assert!(result.commit_report.is_none());
+            }
+        }
+        assert_eq!(*tokens.lock().unwrap(), 0);
+        assert_eq!(
+            executor
+                .recorded_calls()
+                .iter()
+                .filter(|call| **call == "execute_steps")
+                .count(),
+            1,
+            "one allow-once approval cannot authorize two steering executions"
         );
     }
 
