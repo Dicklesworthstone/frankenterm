@@ -220,6 +220,17 @@ pub(super) fn parse_pane_filter(
     Ok(pane_id)
 }
 
+/// The value of a text query parameter, percent-decoded.
+///
+/// `QueryString::get` returns values still encoded. Browsers build query
+/// strings with `URLSearchParams`, which encodes a space as `+` and `:` as
+/// `%3A`, so a cursor such as `delta-v2:<epoch>:pane:7:9` or a search for two
+/// words arrives encoded. Callers validate the decoded value: decoding is
+/// lossy for invalid UTF-8, and the result is never longer than the raw value.
+pub(super) fn query_text<'a>(qs: &QueryString<'a>, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    qs.get(key).map(percent_decode)
+}
+
 /// Parse an `i64` query parameter by key.
 pub(super) fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
     qs.get(key).and_then(|v: &str| v.parse::<i64>().ok())

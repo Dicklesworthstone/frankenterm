@@ -6,7 +6,7 @@
 
 use super::super::error::json_err;
 use super::super::extractors::{
-    parse_pane_filter, request_runtime_limits, require_storage_and_event_bus,
+    parse_pane_filter, query_text, request_runtime_limits, require_storage_and_event_bus,
 };
 use super::super::{STREAM_CHANNEL_BUFFER, WebRuntimeLimits};
 use super::{
@@ -359,9 +359,11 @@ pub fn handle_stream_deltas(
         Ok(pane_id) => pane_id,
         Err(response) => return Box::pin(async move { response }),
     };
+    // Browser reconnects send the cursor through URLSearchParams, encoded.
+    let cursor = query_text(&qs, "cursor");
     let resume_after = match parse_delta_resume(
         req.headers().get("last-event-id"),
-        qs.get("cursor"),
+        cursor.as_deref(),
         qs.get("since_id"),
         pane_filter,
     ) {

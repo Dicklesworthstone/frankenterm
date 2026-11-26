@@ -3832,6 +3832,15 @@ mod web_tests {
                         &ahead_cursor,
                         "cursor_ahead_of_high_water",
                     ),
+                    // A browser reconnect: URLSearchParams encodes `:`.
+                    (
+                        format!(
+                            "GET /stream/deltas?pane_id=7&cursor={} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                            old_cursor.replace(':', "%3A")
+                        ),
+                        &old_cursor,
+                        "cursor_epoch_mismatch",
+                    ),
                 ];
                 for (request, cursor, reason) in requests {
                     // Reading through EOF proves the terminal response closes
@@ -4167,6 +4176,245 @@ mod web_tests {
         }
     }
 
+    /// Bind segments to capture lifetimes the way the ingest transaction does.
+    /// Production stamps provenance inside the append, which needs runtime
+    /// capture authority this fixture does not have.
+    fn bind_segment_captures(
+        storage: &StorageHandle,
+        bindings: &[(i64, &str, u64)],
+    ) -> anyhow::Result<()> {
+        use frankenterm_core::storage_backend_helpers::execute_typed;
+        use frankenterm_core::storage_backend_trait::{
+            OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+        };
+
+        let database = RusqliteBackend::open(
+            storage.db_path(),
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )?;
+        database.set_busy_timeout(Duration::from_secs(1))?;
+        for &(segment_id, capture_uuid, pane_id) in bindings {
+            execute_typed(
+                &database,
+                "INSERT OR IGNORE INTO pane_capture_bindings
+                     (capture_uuid, pane_id, native_identity_json, created_at)
+                 VALUES (?1, ?2, NULL, ?3)",
+                &[
+                    ToSqlValue::Text(capture_uuid),
+                    ToSqlValue::Integer(i64::try_from(pane_id)?),
+                    ToSqlValue::Integer(epoch_ms_now()),
+                ],
+            )?;
+            execute_typed(
+                &database,
+                "INSERT INTO output_segment_captures (segment_id, capture_uuid) VALUES (?1, ?2)",
+                &[
+                    ToSqlValue::Integer(segment_id),
+                    ToSqlValue::Text(capture_uuid),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn events_attribute_each_detection_to_its_capture_lifetime_and_decode_filters() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            storage
+                .upsert_pane(PaneRecord {
+                    pane_id: 9,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("other-pane".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    tty_name: None,
+                    first_seen_at: epoch_ms_now(),
+                    last_seen_at: epoch_ms_now(),
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: Some(epoch_ms_now()),
+                })
+                .await
+                .unwrap();
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(12), async {
+                // Pane 7 is reused: each segment keeps the lifetime that
+                // captured it, whatever the pane row says later.
+                let first_lifetime = "0123456789abcdef0123456789abcdef";
+                let second_lifetime = "fedcba9876543210fedcba9876543210";
+                let other_pane_lifetime = "00112233445566778899aabbccddeeff";
+                let first = storage.append_segment(7, "first lifetime", None).await?;
+                let second = storage.append_segment(7, "second lifetime", None).await?;
+                let unbound = storage.append_segment(7, "no provenance", None).await?;
+                let other = storage.append_segment(9, "other pane", None).await?;
+                bind_segment_captures(
+                    &storage,
+                    &[
+                        (first.id, first_lifetime, 7),
+                        (second.id, second_lifetime, 7),
+                        (other.id, other_pane_lifetime, 9),
+                    ],
+                )?;
+                let record = |segment_id: Option<i64>, event_type: &str, at: i64| {
+                    let mut event = durable_stream_fixture("detected", at);
+                    event.segment_id = segment_id;
+                    event.event_type = event_type.to_owned();
+                    let storage = storage.clone();
+                    async move { storage.record_event(event).await }
+                };
+                let in_first = record(Some(first.id), "usage reached", 10).await?;
+                let in_second = record(Some(second.id), "usage", 11).await?;
+                let in_unbound = record(Some(unbound.id), "usage", 12).await?;
+                let without_segment = record(None, "usage", 13).await?;
+                // A detection may not borrow another pane's capture identity.
+                let foreign = record(Some(other.id), "usage", 14).await?;
+
+                let raw = fetch_path(addr, "/events?pane_id=7&limit=50").await?;
+                ensure!(extract_status(&raw) == 200, "event read succeeds: {raw}");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                let events = body["data"]["events"].as_array().context("events")?;
+                ensure!(events.len() == 5, "every pane 7 event is listed: {raw}");
+                let uuid_of = |id: i64| {
+                    events
+                        .iter()
+                        .find(|event| event["id"] == id)
+                        .map(|event| event.get("pane_uuid").cloned())
+                };
+                ensure!(
+                    uuid_of(in_first) == Some(Some(first_lifetime.into())),
+                    "first lifetime: {raw}"
+                );
+                ensure!(
+                    uuid_of(in_second) == Some(Some(second_lifetime.into())),
+                    "second lifetime: {raw}"
+                );
+                for unattributed in [in_unbound, without_segment, foreign] {
+                    ensure!(
+                        uuid_of(unattributed) == Some(None),
+                        "event {unattributed} stays unattributed: {raw}"
+                    );
+                }
+
+                // URLSearchParams sends a space as `+`.
+                let raw = fetch_path(addr, "/events?pane_id=7&event_type=usage+reached").await?;
+                ensure!(extract_status(&raw) == 200, "filtered read succeeds: {raw}");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(
+                    body["data"]["total"] == 1 && body["data"]["events"][0]["id"] == in_first,
+                    "the decoded event_type selects its one event: {raw}"
+                );
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("events teardown deadline")
+                .expect("events teardown");
+            scenario
+                .expect("events scenario deadline")
+                .expect("events assertions");
+        });
+    }
+
+    #[test]
+    fn search_decodes_browser_queries_and_caps_configured_limits() {
+        use anyhow::ensure;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            // An operator may raise web.max_list_limit past what one capture
+            // search returns.
+            let limits = WebRuntimeLimits {
+                max_list_limit: 5_000,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(12), async {
+                let both = storage
+                    .append_segment(7, "alpha in between omega", None)
+                    .await?;
+                storage.append_segment(7, "alpha alone", None).await?;
+                let result_ids = |raw: &str| -> anyhow::Result<Vec<i64>> {
+                    let body: serde_json::Value = serde_json::from_str(extract_body(raw))?;
+                    Ok(body["data"]["results"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|result| result["segment_id"].as_i64())
+                        .collect())
+                };
+                // URLSearchParams encodes `alpha omega` as `alpha+omega`. Read
+                // raw, FTS5 would take `+` as a phrase join and need adjacency.
+                let raw = fetch_path(addr, "/search?q=alpha+omega&pane_id=7").await?;
+                ensure!(extract_status(&raw) == 200, "search succeeds: {raw}");
+                ensure!(
+                    result_ids(&raw)? == [both.id],
+                    "both words, not a phrase: {raw}"
+                );
+                let raw = fetch_path(addr, "/search?q=%22alpha%20alone%22&pane_id=7").await?;
+                ensure!(extract_status(&raw) == 200, "phrase search succeeds: {raw}");
+                ensure!(
+                    result_ids(&raw)?.len() == 1,
+                    "the decoded phrase matches: {raw}"
+                );
+
+                let raw = fetch_path(addr, "/search?q=alpha&pane_id=7&limit=5000").await?;
+                ensure!(
+                    extract_status(&raw) == 200,
+                    "an over-maximum limit is capped: {raw}"
+                );
+                ensure!(
+                    result_ids(&raw)?.len() == 2,
+                    "capped search still answers: {raw}"
+                );
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("search teardown deadline")
+                .expect("search teardown");
+            scenario
+                .expect("search scenario deadline")
+                .expect("search assertions");
+        });
+    }
+
     #[test]
     fn stream_events_uses_storage_for_fresh_ordered_recoverable_delivery() {
         use anyhow::{Context, ensure};
@@ -4361,6 +4609,17 @@ mod web_tests {
                 ),
                 (
                     format!("channel=detections&pane_id=7&cursor={token}"),
+                    "",
+                    400,
+                    "event_cursor_scope_mismatch",
+                ),
+                // URLSearchParams encodes `:`. The decoded cursor parses, so
+                // the scope check runs instead of the syntax refusal.
+                (
+                    format!(
+                        "channel=detections&pane_id=7&cursor={}",
+                        token.replace(':', "%3A")
+                    ),
                     "",
                     400,
                     "event_cursor_scope_mismatch",

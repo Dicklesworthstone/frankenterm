@@ -319,6 +319,8 @@ pub use schema_ddl::{SCHEMA_SQL, SCHEMA_VERSION};
 mod capture_identity;
 mod capture_search;
 pub use capture_identity::PaneCaptureIdentity;
+#[cfg(feature = "web")]
+pub(crate) use capture_search::CAPTURE_SEARCH_MAX_RESULTS;
 
 // [ft-nsb8c / ft-dn2tu Phase 5] Export query helpers — read-only,
 // no writer-thread interaction. Internal-only (not re-exported); called

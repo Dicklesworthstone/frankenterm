@@ -5,7 +5,7 @@
 
 use super::error::{json_err, json_ok};
 use super::extractors::{
-    parse_bool, parse_i64, parse_limit, parse_pane_filter, redact_json_value,
+    parse_bool, parse_i64, parse_limit, parse_pane_filter, query_text, redact_json_value,
     request_runtime_limits, require_storage,
 };
 use super::middleware::AppState;
@@ -15,6 +15,7 @@ use crate::storage::{CaptureSearchResult, EventQuery, PaneRecord, SearchOptions}
 use crate::ui_query;
 use crate::web_framework::{QueryString, Request, Response, StatusCode};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 // =============================================================================
@@ -128,6 +129,12 @@ pub(super) struct EventsResponse {
 pub(super) struct EventView {
     pub(super) id: i64,
     pub(super) pane_id: u64,
+    /// The capture UUID the pane had when the event was detected, from the
+    /// segment it was detected in, as stream frames carry it
+    /// (`sse::detection_pane_uuids`). Absent without segment provenance. The
+    /// browser binds an event selection to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pane_uuid: Option<String>,
     pub(super) rule_id: String,
     pub(super) event_type: String,
     pub(super) severity: String,
@@ -180,6 +187,7 @@ impl EventView {
         Self {
             id: e.id,
             pane_id: e.pane_id,
+            pane_uuid: None,
             rule_id: e.rule_id,
             event_type: e.event_type,
             severity: e.severity,
@@ -207,10 +215,10 @@ pub(super) fn handle_events(
     let query = EventQuery {
         limit: Some(parse_limit(&qs, runtime_limits)),
         pane_id,
-        rule_id: qs.get("rule_id").map(String::from),
-        event_type: qs.get("event_type").map(String::from),
-        triage_state: qs.get("triage_state").map(String::from),
-        label: qs.get("label").map(String::from),
+        rule_id: query_text(&qs, "rule_id").map(Cow::into_owned),
+        event_type: query_text(&qs, "event_type").map(Cow::into_owned),
+        triage_state: query_text(&qs, "triage_state").map(Cow::into_owned),
+        label: query_text(&qs, "label").map(Cow::into_owned),
         unhandled_only: parse_bool(&qs, "unhandled"),
         since: parse_i64(&qs, "since"),
         until: parse_i64(&qs, "until"),
@@ -226,6 +234,28 @@ pub(super) fn handle_events(
         match storage.get_events_with_cx(&events_cx, query).await {
             Ok(events) => {
                 let total = events.len();
+                let segment_ids = events
+                    .iter()
+                    .filter_map(|event| event.segment_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                // An unreadable provenance leaves the events unattributed,
+                // which the browser treats as no capture identity.
+                let pane_uuids = match storage
+                    .get_segment_capture_identities_with_cx(&events_cx, segment_ids)
+                    .await
+                {
+                    Ok(identities) => super::sse::detection_pane_uuids(&events, &identities),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "wa.web",
+                            error = %err,
+                            "failed to load event capture identities"
+                        );
+                        std::collections::HashMap::new()
+                    }
+                };
                 let mut views: Vec<EventView> = Vec::with_capacity(total);
                 for event in events {
                     let annotations = match storage
@@ -246,7 +276,10 @@ pub(super) fn handle_events(
                             None
                         }
                     };
-                    views.push(EventView::from_stored(event, &redactor, annotations));
+                    let event_id = event.id;
+                    let mut view = EventView::from_stored(event, &redactor, annotations);
+                    view.pane_uuid = pane_uuids.get(&event_id).cloned();
+                    views.push(view);
                 }
                 json_ok(EventsResponse {
                     events: views,
@@ -333,9 +366,15 @@ pub(super) fn handle_search(
         Ok(pane_id) => pane_id,
         Err(response) => return Box::pin(async move { response }),
     };
-    let query_str = qs.get("q").map(String::from);
+    // The history panel builds this with URLSearchParams, so a space arrives
+    // as `+` and most punctuation percent-encoded.
+    let query_str = query_text(&qs, "q").map(Cow::into_owned);
     let options = SearchOptions {
-        limit: Some(parse_limit(&qs, runtime_limits)),
+        // web.max_list_limit may be configured above what one capture search
+        // returns, and a larger limit fails the search instead of capping it.
+        limit: Some(
+            parse_limit(&qs, runtime_limits).min(crate::storage::CAPTURE_SEARCH_MAX_RESULTS),
+        ),
         pane_id,
         pane_ids: None,
         zone_type: None,

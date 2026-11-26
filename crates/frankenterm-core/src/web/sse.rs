@@ -2,7 +2,7 @@
 
 use super::error::json_err;
 use super::extractors::{
-    parse_pane_filter, redact_json_value, request_runtime_limits, require_event_bus,
+    parse_pane_filter, query_text, redact_json_value, request_runtime_limits, require_event_bus,
 };
 use super::{
     STREAM_CHANNEL_BUFFER, STREAM_MAX_CONSECUTIVE_DROPS, STREAM_SCHEMA_VERSION, WebRuntimeLimits,
@@ -672,8 +672,9 @@ async fn read_event_replay_page(
 /// the immutable capture provenance of the segment the detection came from.
 /// The `panes` row cannot supply it, because a reused numeric pane ID keeps
 /// only the newest UUID. An event without a segment, or whose segment has no
-/// provenance or belongs to another pane, stays unattributed.
-fn detection_pane_uuids(
+/// provenance or belongs to another pane, stays unattributed. `/events`
+/// attributes its rows the same way.
+pub(super) fn detection_pane_uuids(
     events: &[StoredEvent],
     identities: &HashMap<i64, PaneCaptureIdentity>,
 ) -> HashMap<i64, String> {
@@ -1050,9 +1051,11 @@ pub(super) fn handle_stream_events(
     let result = require_event_bus(req);
     let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
     let session = req.get_extension::<super::auth::SessionGrant>().cloned();
+    // The browser sends the cursor through URLSearchParams, encoded.
+    let cursor = query_text(&qs, "cursor");
     let resume = match parse_event_resume(
         req.headers().get("last-event-id"),
-        qs.get("cursor"),
+        cursor.as_deref(),
         qs.get("since_id"),
         pane_filter,
     ) {

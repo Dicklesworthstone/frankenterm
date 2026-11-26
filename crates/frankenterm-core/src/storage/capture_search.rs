@@ -18,7 +18,9 @@ use crate::error::{Result, StorageError};
 use crate::storage_backend_row_helpers::CellRowReader;
 use crate::storage_backend_trait::{SqlCell, StorageBackend, ToSqlValue};
 
-const CAPTURE_SEARCH_MAX_RESULTS: usize = 1_000;
+/// The most results one capture search returns. A larger limit is an error
+/// here, so callers that take a limit from a request clamp it to this.
+pub const CAPTURE_SEARCH_MAX_RESULTS: usize = 1_000;
 const CAPTURE_AUTHORITY_COLUMNS: &str =
     "(SELECT cursor_epoch FROM segment_stream_state WHERE singleton = 1),
      (SELECT max_segment_id FROM segment_stream_state WHERE singleton = 1)";
