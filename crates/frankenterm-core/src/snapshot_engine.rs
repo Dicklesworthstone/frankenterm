@@ -10218,6 +10218,16 @@ fn cleanup_authoritatively_sync(
              FROM temp.cleanup_candidates GROUP BY session_id",
             [],
         )?;
+        // SQLite permits arbitrary bytes in a TEXT cell. Preserve the session
+        // identity decoder's UTF-8 check before deleting any durable rows,
+        // retaining at most one bounded identity in Rust.
+        {
+            let mut stmt = tx.prepare("SELECT session_id FROM temp.cleanup_sessions")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let _: String = row.get(0)?;
+            }
+        }
         for start in (0..candidates).step_by(CHECKPOINT_CLEANUP_BATCH_SIZE) {
             let end = start
                 .saturating_add(CHECKPOINT_CLEANUP_BATCH_SIZE)
@@ -15881,6 +15891,27 @@ mod tests {
                 "corrupt {corrupt_field} must leave the checkpoint intact"
             );
         }
+    }
+
+    #[test]
+    fn cleanup_rejects_non_utf8_text_identity_before_delete() {
+        let (_tmp, db_path) = setup_test_db();
+        let conn = open_conn(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO mux_sessions(session_id, created_at, topology_json, ft_version)
+             VALUES ('valid', 1000, '{}', 'test'), (CAST(x'ff' AS TEXT), 1000, '{}', 'test');
+             INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+             SELECT session_id, 2000, 'event', 'fixture', 0, 0 FROM mux_sessions;",
+        )
+        .unwrap();
+
+        let error = cleanup_sync(db_path.as_str(), 0, 365).unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, _)
+        ));
+        assert_eq!(checkpoint_count(db_path.as_str()), 2);
     }
 
     #[test]
