@@ -71610,7 +71610,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     println!("Dry run: no files were changed.");
                                     println!("{}", preview.message);
                                     if let Some(block) = preview.block {
-                                        println!("\nBlock that would be appended:\n{block}");
+                                        println!("\nProposed managed block:\n{block}");
                                     }
                                 }
                                 Err(e) => {
@@ -96436,7 +96436,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
                 } else {
                     String::new()
                 };
-                if setup::has_shell_ft_block(&content) {
+                if setup::shell_ft_block_is_current(&content, shell_type)? {
                     println!("✓ shell rc already patched ({})", shell_type.name());
                 } else if apply_changes {
                     let result = setup::patch_shell_rc_at(&rc_path, shell_type)?;
@@ -96445,8 +96445,8 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
                         println!("  Backup: {}", backup.display());
                     }
                 } else {
-                    println!("⚠ shell rc missing OSC 133 markers ({})", shell_type.name());
-                    println!("  Run: ft setup shell");
+                    println!("⚠ shell rc needs updated OSC 133 markers ({})", shell_type.name());
+                    println!("  Run: ft setup shell --apply");
                 }
             }
             Err(err) => {

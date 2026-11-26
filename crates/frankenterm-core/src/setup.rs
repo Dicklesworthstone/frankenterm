@@ -135,12 +135,13 @@ impl ShellType {
 ///
 /// Emits markers at prompt start (A), input/output boundary (B/C), command end
 /// (D with exit code), and current working directory (OSC 7).
-const BASH_OSC133_SNIPPET: &str = r#"# ft: OSC 133 prompt markers for deterministic state detection
+const BASH_OSC133_SNIPPET: &str = concat!(
+    include_str!("shell_integration/osc7.sh"),
+    r#"# ft: OSC 133 prompt markers for deterministic state detection
 # These markers help ft detect prompt boundaries and command execution.
 __ft_prompt_start() { printf '\e]133;A\e\\'; }
 __ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
 __ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
-__ft_current_dir() { printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }
 __ft_preexec() {
     __ft_command_start
 }
@@ -161,15 +162,17 @@ if [[ ! "${BASH_PREEXEC_FUNCTIONS:-}" =~ __ft_preexec ]]; then
     else
         trap '__ft_preexec' DEBUG
     fi
-fi"#;
+fi"#
+);
 
 /// OSC 133 integration snippet for Zsh
-const ZSH_OSC133_SNIPPET: &str = r#"# ft: OSC 133 prompt markers for deterministic state detection
+const ZSH_OSC133_SNIPPET: &str = concat!(
+    include_str!("shell_integration/osc7.sh"),
+    r#"# ft: OSC 133 prompt markers for deterministic state detection
 # These markers help ft detect prompt boundaries and command execution.
 __ft_prompt_start() { printf '\e]133;A\e\\'; }
 __ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
 __ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
-__ft_current_dir() { printf '\e]7;file://%s%s\e\\' "${HOST:-${HOSTNAME:-localhost}}" "$PWD"; }
 
 # Hook functions
 __ft_precmd() {
@@ -188,25 +191,11 @@ if [[ ! "${precmd_functions:-}" =~ __ft_precmd ]]; then
 fi
 if [[ ! "${preexec_functions:-}" =~ __ft_preexec ]]; then
     preexec_functions+=(__ft_preexec)
-fi"#;
+fi"#
+);
 
 /// OSC 133 integration snippet for Fish
-const FISH_OSC133_SNIPPET: &str = r"# ft: OSC 133 prompt markers for deterministic state detection
-# These markers help ft detect prompt boundaries and command execution.
-
-function __ft_prompt_start --on-event fish_prompt
-    printf '\e]7;file://%s%s\e\\' (hostname) $PWD
-    printf '\e]133;A\e\\'
-end
-
-function __ft_command_start --on-event fish_preexec
-    printf '\e]133;B\e\\'
-    printf '\e]133;C\e\\'
-end
-
-function __ft_command_end --on-event fish_postexec
-    printf '\e]133;D;%d\e\\' $status
-end";
+const FISH_OSC133_SNIPPET: &str = include_str!("shell_integration/prompt.fish");
 
 impl ShellType {
     /// Get the OSC 133 snippet for this shell
@@ -277,12 +266,37 @@ pub fn has_shell_ft_block(content: &str) -> bool {
 }
 
 fn validated_shell_ft_block_bounds(content: &str) -> Result<Option<(usize, usize)>> {
-    validated_ft_block_bounds(
+    let bounds = validated_ft_block_bounds(
         content,
         FT_BEGIN_MARKER_SHELL,
         FT_END_MARKER_SHELL,
         "Shell config",
-    )
+    )?;
+    if let Some((start, end)) = bounds {
+        let block = &content[start..end];
+        if (start > 0 && !content[..start].ends_with('\n'))
+            || block.lines().next() != Some(FT_BEGIN_MARKER_SHELL)
+            || block.lines().last() != Some(FT_END_MARKER_SHELL)
+        {
+            return Err(Error::SetupError(
+                "Shell config contains FT markers outside standalone comment lines".to_string(),
+            ));
+        }
+    }
+    Ok(bounds)
+}
+
+fn current_shell_block(content: &str, bounds: Option<(usize, usize)>, expected: &str) -> bool {
+    bounds.is_some_and(|(start, end)| content[start..end].trim_end_matches('\n') == expected)
+}
+
+/// Whether the managed block contains this version's integration for the selected shell.
+pub fn shell_ft_block_is_current(content: &str, shell: ShellType) -> Result<bool> {
+    Ok(current_shell_block(
+        content,
+        validated_shell_ft_block_bounds(content)?,
+        &create_shell_ft_block(shell),
+    ))
 }
 
 /// Create the full ft-managed block for shell rc files
@@ -309,7 +323,7 @@ pub fn locate_shell_rc(shell: ShellType) -> Result<PathBuf> {
 ///
 /// # Behavior
 ///
-/// - If the ft-managed block is already present, returns without modification
+/// - Leaves current integration unchanged and replaces an outdated managed block in place
 /// - If the block is missing, creates a backup and appends the block
 /// - Creates the rc file if it doesn't exist
 ///
@@ -336,7 +350,9 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
     };
 
     // Check if already patched. Malformed marker pairs must fail before any write.
-    if validated_shell_ft_block_bounds(&content)?.is_some() {
+    let bounds = validated_shell_ft_block_bounds(&content)?;
+    let ft_block = create_shell_ft_block(shell);
+    if current_shell_block(&content, bounds, &ft_block) {
         return Ok(PatchResult {
             config_path: rc_path.to_path_buf(),
             backup_path: None,
@@ -367,9 +383,14 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
         None
     };
 
-    // Append the ft-managed block.
-    let ft_block = create_shell_ft_block(shell);
-    let new_content = if content.is_empty() {
+    let new_content = if let Some((start, end)) = bounds {
+        let newline = if content[..end].ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        format!("{}{ft_block}{newline}{}", &content[..start], &content[end..])
+    } else if content.is_empty() {
         format!("{ft_block}\n")
     } else if content.ends_with('\n') {
         format!("{content}\n{ft_block}\n")
@@ -381,9 +402,10 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
     fs::write(rc_path, &new_content)
         .map_err(|e| Error::SetupError(format!("Failed to write {}: {}", rc_path.display(), e)))?;
 
+    let action = if bounds.is_some() { "Updated" } else { "Added" };
     let message = match &backup_path {
         Some(bp) => format!(
-            "Added FrankenTerm OSC 133 integration to {}. Backup saved to {}",
+            "{action} FrankenTerm OSC 133 integration in {}. Backup saved to {}",
             rc_path.display(),
             bp.display()
         ),
@@ -414,7 +436,7 @@ pub struct SetupFilePreview {
     pub would_modify: bool,
     /// Human-readable description of the outcome.
     pub message: String,
-    /// The ft-managed block that would be appended (install only).
+    /// The ft-managed block that would be installed or updated.
     pub block: Option<String>,
 }
 
@@ -431,8 +453,17 @@ pub fn preview_shell_rc_at(
     } else {
         String::new()
     };
-    let present = validated_shell_ft_block_bounds(&content)?.is_some();
-    let (would_modify, message, block) = match (remove, present) {
+    let bounds = validated_shell_ft_block_bounds(&content)?;
+    let ft_block = create_shell_ft_block(shell);
+    let (would_modify, message, block) = match (remove, bounds.is_some()) {
+        (false, true) if !current_shell_block(&content, bounds, &ft_block) => (
+            true,
+            format!(
+                "Would update the outdated FrankenTerm OSC 133 integration in {} (a backup would be saved first)",
+                rc_path.display()
+            ),
+            Some(ft_block),
+        ),
         (false, true) => (
             false,
             format!(
@@ -452,7 +483,7 @@ pub fn preview_shell_rc_at(
                     " (the file would be created)"
                 }
             ),
-            Some(create_shell_ft_block(shell)),
+            Some(ft_block),
         ),
         (true, true) => (
             true,
@@ -2481,27 +2512,15 @@ export PATH=$HOME/bin:$PATH
 
     #[test]
     fn test_shell_patch_is_idempotent() {
-        let original = r"# ~/.bashrc
-export PATH=$HOME/bin:$PATH
-
-# FT-BEGIN (do not edit this block)
-# ft: OSC 133 prompt markers for deterministic state detection
-__ft_prompt_start() { printf '\e]133;A\e\\'; }
-__ft_command_start() { printf '\e]133;C\e\\'; }
-# FT-END
-
-alias ll='ls -la'
-";
-        let file = create_temp_config(original);
-
+        let original = format!(
+            "export EDITOR=vi\n{}\n",
+            create_shell_ft_block(ShellType::Bash)
+        );
+        let file = create_temp_config(&original);
         let result = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap();
-
         assert!(!result.modified);
         assert!(result.backup_path.is_none());
-
-        // Content should be unchanged
-        let content_after = fs::read_to_string(file.path()).unwrap();
-        assert_eq!(original, content_after);
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
     }
 
     #[test]
@@ -2520,17 +2539,30 @@ alias ll='ls -la'
     }
 
     #[test]
-    fn test_shell_patch_fixture_present_is_idempotent() {
+    fn shell_patch_upgrades_only_the_old_block_and_preserves_a_backup() {
         let original = setup_fixture("shell_present.bashrc");
         let file = create_temp_config(original);
-
-        let result = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap();
-
-        assert!(!result.modified);
-        assert!(result.backup_path.is_none());
-
-        let content_after = fs::read_to_string(file.path()).unwrap();
-        assert_eq!(original, content_after);
+        let shell = ShellType::Bash;
+        let preview = preview_shell_rc_at(file.path(), shell, false).unwrap();
+        assert!(preview.would_modify);
+        assert_eq!(preview.block.unwrap(), create_shell_ft_block(shell));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
+        let result = patch_shell_rc_at(file.path(), shell).unwrap();
+        assert!(result.modified);
+        assert_eq!(
+            fs::read_to_string(result.backup_path.unwrap()).unwrap(),
+            original
+        );
+        let (start, end) = validated_shell_ft_block_bounds(original).unwrap().unwrap();
+        let expected = format!(
+            "{}{}\n{}",
+            &original[..start],
+            create_shell_ft_block(shell),
+            &original[end..]
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), expected);
+        assert!(shell_ft_block_is_current(&expected, shell).unwrap());
+        assert!(!patch_shell_rc_at(file.path(), shell).unwrap().modified);
     }
 
     #[test]
