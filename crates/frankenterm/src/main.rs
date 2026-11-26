@@ -33750,7 +33750,7 @@ const WATCH_EVENTS_CLAIM_OUTPUT_TIMEOUT: std::time::Duration = std::time::Durati
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 #[cfg(test)]
@@ -113986,12 +113986,16 @@ reason = "overly conservative pending threshold"
         }
     }
 
+    // The namespace substitution executor serves only the unix shared-front
+    // substitution tests.
+    #[cfg(unix)]
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NamespaceSubstitutionPhase {
         Commit,
         Compensate,
     }
 
+    #[cfg(unix)]
     #[derive(Clone)]
     struct NamespaceSubstitutingExecutor {
         inner: RecordingStepExecutor,
@@ -114002,6 +114006,7 @@ reason = "overly conservative pending threshold"
         substituted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
+    #[cfg(unix)]
     impl NamespaceSubstitutingExecutor {
         fn new(
             phase: NamespaceSubstitutionPhase,
@@ -114037,6 +114042,7 @@ reason = "overly conservative pending threshold"
         }
     }
 
+    #[cfg(unix)]
     impl frankenterm_core::tx_execution::StepExecutor for NamespaceSubstitutingExecutor {
         fn evaluate_gates(
             &self,

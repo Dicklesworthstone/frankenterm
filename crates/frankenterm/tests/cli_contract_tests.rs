@@ -2144,6 +2144,8 @@ fn assert_ft_0rlfq_persisted_tx(
     persisted
 }
 
+// These three helpers serve only the unix tx persistence tests.
+#[cfg(unix)]
 fn tx_report_receipts(report: &serde_json::Value, report_name: &str) -> Vec<serde_json::Value> {
     report["receipts"]
         .as_array()
@@ -2151,6 +2153,7 @@ fn tx_report_receipts(report: &serde_json::Value, report_name: &str) -> Vec<serd
         .clone()
 }
 
+#[cfg(unix)]
 fn assert_tx_receipt_partition(
     persisted: &serde_json::Value,
     emitted_commit_receipts: &[serde_json::Value],
@@ -2176,6 +2179,7 @@ fn assert_tx_receipt_partition(
     );
 }
 
+#[cfg(unix)]
 fn assert_tx_show_matches_persisted_contract(
     show_payload: &serde_json::Value,
     contract_path: &std::path::Path,

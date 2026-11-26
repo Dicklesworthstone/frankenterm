@@ -155,5 +155,6 @@ wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
 frankenterm-core = { workspace = true, default-features = false, features = ["mcp-client", "vendored"] }
 memchr.workspace = true
 predicates = "3.1.4"
-# The unix-only runtime dependency above does not reach tests on Windows.
+# tempfile is a runtime dependency only on unix (see above), so Windows test
+# targets need it here.
 tempfile.workspace = true

@@ -2016,7 +2016,8 @@ mod tests {
         let remediation = Remediation::new("Package not found");
         let enhanced = enhance_with_platform_commands(remediation, "wezterm", &ctx);
 
-        // Should have a platform-specific install command (brew, apt or winget)
+        // Should have a platform-specific install command: brew, the Linux
+        // distro's package manager, or winget.
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             assert!(!enhanced.commands.is_empty());
