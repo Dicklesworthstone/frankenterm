@@ -1973,6 +1973,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,

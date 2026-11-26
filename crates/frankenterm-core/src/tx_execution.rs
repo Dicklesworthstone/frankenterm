@@ -9480,6 +9480,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
     fn stored_mission_fixture(path: &Path) -> Mission {
         let mut mission = Mission::new(
             crate::plan::MissionId("mission:durability-test".to_string()),

@@ -1,9 +1,10 @@
+// The helper under test is a Bash script, so the suite is Unix-only.
+#![cfg(unix)]
+
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -13,7 +14,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-#[cfg(unix)]
 fn install_fake_br(bin_dir: &Path) -> PathBuf {
     let path = bin_dir.join("br");
     fs::write(
@@ -42,7 +42,6 @@ esac
     path
 }
 
-#[cfg(unix)]
 #[test]
 fn safe_br_update_notes_preserves_existing_notes() {
     let repo = repo_root();
@@ -97,10 +96,4 @@ fn safe_br_update_notes_preserves_existing_notes() {
         updated.find("Prior section") < updated.find("New section"),
         "prior notes should remain before appended notes:\n{updated}"
     );
-}
-
-#[cfg(not(unix))]
-#[test]
-fn safe_br_update_notes_preserves_existing_notes() {
-    // The helper is a Bash script and is exercised on Unix CI lanes.
 }

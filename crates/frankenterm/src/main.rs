@@ -19449,6 +19449,10 @@ fn finalize_agent_config_candidate(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "keeps the linux and macOS signature the shared caller uses"
+)]
 fn finalize_agent_config_candidate(
     _parent: &AgentConfigParentDirectory,
     candidate: &mut StagedAgentConfig,
@@ -20432,9 +20436,9 @@ where
         ),
         backup_created: _backup_created,
     })?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let transaction_receipt = unreachable!();
 
+    // Other platforms were refused before any publication, so only linux and
+    // macOS have a receipt to add.
     Ok(AppliedAgentConfig {
         result: frankenterm_core::robot_types::AgentConfigureResultItem {
             slug: prepared.slug.clone(),
@@ -20445,6 +20449,7 @@ where
             error: None,
         },
         transactions: {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             reconciled_transactions.push(transaction_receipt);
             reconciled_transactions
         },
@@ -95998,6 +96003,7 @@ impl DiagnosticFileSnapshot {
 
     #[cfg(test)]
     fn synthetic(byte_len: u64, version: u64) -> Self {
+        #[cfg(unix)]
         let seconds = i64::try_from(version).unwrap_or(i64::MAX);
         Self {
             byte_len,

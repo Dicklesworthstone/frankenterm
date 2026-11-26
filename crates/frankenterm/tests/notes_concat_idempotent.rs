@@ -1,9 +1,10 @@
+// The helper under test is a Bash script, so the suite is Unix-only.
+#![cfg(unix)]
+
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -13,7 +14,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-#[cfg(unix)]
 fn install_fake_br(bin_dir: &Path) {
     let path = bin_dir.join("br");
     fs::write(
@@ -39,7 +39,6 @@ esac
     fs::set_permissions(&path, perms).expect("chmod fake br");
 }
 
-#[cfg(unix)]
 #[test]
 fn notes_concat_is_idempotent_for_existing_section() {
     let repo = repo_root();
@@ -94,10 +93,4 @@ fn notes_concat_is_idempotent_for_existing_section() {
         !updated_notes.exists(),
         "idempotent run should not call br update"
     );
-}
-
-#[cfg(not(unix))]
-#[test]
-fn notes_concat_is_idempotent_for_existing_section() {
-    // The helper is a Bash script and is exercised on Unix CI lanes.
 }

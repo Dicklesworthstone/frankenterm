@@ -2069,7 +2069,7 @@ impl IpcServer {
     }
 }
 
-#[cfg(all(any(unix, windows), test))]
+#[cfg(all(unix, test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
@@ -2080,7 +2080,7 @@ async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
 /// Polls the receive exactly once. A 1 ms timeout used to bound it, but the
 /// runtime checks that deadline before the first poll, so a slow scheduler
 /// turned an already closed channel into "not pending" (about 1 run in 5).
-#[cfg(all(any(unix, windows), test))]
+#[cfg(all(unix, test))]
 async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,

@@ -1855,7 +1855,7 @@ impl DurableKeyLease {
     }
 
     /// Whether this lease owns the exact requested key.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     #[must_use]
     pub(crate) fn authorizes(&self, idem_key: &IdempotencyKey) -> bool {
         &self.idem_key == idem_key
@@ -1886,20 +1886,20 @@ impl DurableKeyLeaseSet {
     }
 
     /// Number of logical key leases currently retained by the set.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.leases.len()
     }
 
     /// Whether every acquired key lease has been consumed or released.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.leases.is_empty()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     fn key_lock_count(&self) -> usize {
         self.leases
             .values()
@@ -1907,7 +1907,7 @@ impl DurableKeyLeaseSet {
             .count()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     fn uses_one_exclusive_barrier(&self) -> bool {
         self.proof_barrier.mode == ProofBarrierMode::Exclusive
             && self.leases.values().all(|lease| {
@@ -2856,10 +2856,10 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct LedgerPreReplaceTestHookGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for LedgerPreReplaceTestHookGuard {
     fn drop(&mut self) {
         LEDGER_PRE_REPLACE_TEST_HOOK.with(|slot| {
@@ -2868,7 +2868,7 @@ impl Drop for LedgerPreReplaceTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_ledger_pre_replace_test_hook(
     hook: impl FnOnce() + 'static,
 ) -> LedgerPreReplaceTestHookGuard {
@@ -5854,6 +5854,7 @@ mod tests {
         artifacts
     }
 
+    #[cfg(not(windows))]
     fn record_durable_outcome(
         store: &mut IdempotencyStore,
         execution_id: &str,

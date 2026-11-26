@@ -16250,10 +16250,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn install_tx_contract_post_lock_test_hook(hook: impl FnOnce() + 'static) {
         super::set_tx_contract_post_lock_test_hook(Some(Box::new(hook)));
     }
 
+    #[cfg(unix)]
     fn install_tx_contract_post_auth_test_hook(hook: impl FnOnce() + 'static) {
         super::set_tx_contract_post_auth_test_hook(Some(Box::new(hook)));
     }
@@ -16357,6 +16359,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn refresh_tx_run_target_liveness(db_path: &Path) {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {

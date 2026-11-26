@@ -4187,7 +4187,7 @@ pub mod process {
     /// test that fills or counts the limit holds this exclusively; other tests
     /// that run controlled supervisors hold it shared, so neither sees the
     /// other's permits.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) static CONTROLLED_SUPERVISOR_TEST_GATE: std::sync::RwLock<()> =
         std::sync::RwLock::new(());
     // A forcibly dropped caller cannot join asynchronously in Drop. Retain

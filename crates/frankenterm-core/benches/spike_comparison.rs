@@ -18,6 +18,7 @@ use asupersync::{Budget, CancelKind, Cx, LabConfig, LabRuntime};
 use criterion::{Criterion, criterion_group, criterion_main};
 mod bench_common;
 
+#[cfg(unix)]
 const PAYLOAD: &[u8] = b"ft-asupersync-spike-payload";
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
