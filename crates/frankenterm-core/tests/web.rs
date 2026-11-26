@@ -3425,11 +3425,17 @@ mod web_tests {
             let addr = server.bound_addr();
 
             let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            let fetch_task = task::spawn(async move {
-                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 1).await
-            });
-
-            sleep(Duration::from_millis(80)).await;
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(req).await.unwrap();
+            let mut received = Vec::new();
+            let ready = timeout(
+                Duration::from_secs(3),
+                read_event_stream_until(&mut stream, &mut received, "ready", 1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(extract_status(&ready), 200);
             let secret = "sk-abc123456789012345678901234567890123456789012345678901";
             let content = format!("auth {secret} ! done");
             let seg = storage.append_segment(7, &content, None).await.unwrap();
@@ -3439,7 +3445,14 @@ mod web_tests {
                 content_len: seg.content_len,
             });
 
-            let response = fetch_task.await.unwrap().unwrap();
+            let response = timeout(
+                Duration::from_secs(3),
+                read_event_stream_until(&mut stream, &mut received, "delta", 1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(stream);
             server.shutdown().await.unwrap();
 
             assert!(
@@ -3500,11 +3513,17 @@ mod web_tests {
             let addr = server.bound_addr();
 
             let req = b"GET /stream/deltas?pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            let fetch_task = task::spawn(async move {
-                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 5).await
-            });
-
-            sleep(Duration::from_millis(80)).await;
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(req).await.unwrap();
+            let mut received = Vec::new();
+            let ready = timeout(
+                Duration::from_secs(3),
+                read_event_stream_until(&mut stream, &mut received, "ready", 1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(extract_status(&ready), 200);
             let mut expected_segment_ids = Vec::new();
             let mut last_seq = 0_u64;
             let mut last_content_len = 0_usize;
@@ -3521,7 +3540,14 @@ mod web_tests {
                 content_len: last_content_len,
             });
 
-            let response = fetch_task.await.unwrap().unwrap();
+            let response = timeout(
+                Duration::from_secs(3),
+                read_event_stream_until(&mut stream, &mut received, "delta", 5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(stream);
             server.shutdown().await.unwrap();
 
             let delta_segment_ids: Vec<i64> = response
@@ -3540,6 +3566,185 @@ mod web_tests {
                 delta_segment_ids, expected_segment_ids,
                 "SSE delta stream should drain all stored backlog pages: {response}"
             );
+        });
+    }
+
+    /// Insert one committed row with an exact timestamp in an owned test DB.
+    /// Setting the timestamp in the INSERT avoids racing a stream scan with
+    /// an append-then-update fixture, and needs no host clock manipulation.
+    fn seed_delta_stream_segment(
+        storage: &StorageHandle,
+        id: i64,
+        captured_at: i64,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        use frankenterm_core::storage_backend_helpers::execute_typed;
+        use frankenterm_core::storage_backend_trait::{
+            OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+        };
+
+        let database = RusqliteBackend::open(
+            storage.db_path(),
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )?;
+        database.set_busy_timeout(Duration::from_secs(1))?;
+        execute_typed(
+            &database,
+            "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at)
+             VALUES (?1, 7, ?1, ?2, ?3, ?4)",
+            &[
+                ToSqlValue::Integer(id),
+                ToSqlValue::Text(content),
+                ToSqlValue::Integer(i64::try_from(content.len())?),
+                ToSqlValue::Integer(captured_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn delta_stream_ids(raw: &str) -> Vec<i64> {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame["kind"] == "delta")
+            .map(|frame| frame["data"]["segment_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn stream_deltas_preserves_fresh_tail_across_clock_rollback_and_ready_only_reconnect() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            // Cover both an empty tail and retained history whose future
+            // timestamp must not cause a fresh connection to replay it.
+            for baseline in [0_i64, 10] {
+                let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+                if baseline != 0 {
+                    seed_delta_stream_segment(
+                        &storage,
+                        baseline,
+                        i64::MAX,
+                        "retained_before_connect",
+                    )
+                    .unwrap();
+                }
+                let event_bus = Arc::new(EventBus::new(64));
+                let limits = WebRuntimeLimits {
+                    stream_keepalive_secs: 1,
+                    stream_max_max_hz: 1000,
+                    stream_scan_limit: 2,
+                    stream_scan_max_pages: 1,
+                    ..frankenterm_core::web::resolve_runtime_limits(None)
+                };
+                let server = start_web_server(
+                    WebServerConfig::default()
+                        .with_port(0)
+                        .with_storage(storage.clone())
+                        .with_event_bus(Arc::clone(&event_bus))
+                        .with_storage_event_tail(false)
+                        .with_runtime_limits(limits),
+                )
+                .await
+                .unwrap();
+                let addr = server.bound_addr();
+                let scenario = Box::pin(timeout(Duration::from_secs(12), async {
+                    let request = b"GET /stream/deltas?pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                    let mut stream = TcpStream::connect(addr).await?;
+                    stream.write_all(request).await?;
+                    let mut response = Vec::new();
+                    let ready_raw =
+                        read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                    ensure!(extract_status(&ready_raw) == 200, "fresh delta stream starts");
+                    let ready = ready_raw
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|frame| frame["kind"] == "ready")
+                        .context("delta ready frame")?;
+                    let cursor = format!("delta-v1:pane:7:{baseline}");
+                    ensure!(ready["data"]["cursor"] == cursor, "scoped tail checkpoint");
+                    ensure!(ready["data"]["resume_after_id"] == baseline, "ID baseline");
+                    ensure!(
+                        ready_raw.lines().any(|line| line == format!("id: {cursor}")),
+                        "ready must establish Last-Event-ID"
+                    );
+                    ensure!(delta_stream_ids(&ready_raw).is_empty(), "no retained history");
+                    drop(stream);
+
+                    // The first connection received no delta. Only its ready
+                    // cursor can recover output committed while disconnected.
+                    seed_delta_stream_segment(&storage, 20, 0, "during_disconnect")?;
+                    let resume = format!(
+                        "GET /stream/deltas?pane_id=7&since_id=999&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: {cursor}\r\nConnection: close\r\n\r\n"
+                    );
+                    let replay = fetch_stream_until_delta_count(
+                        addr,
+                        resume.as_bytes(),
+                        Duration::from_secs(3),
+                        1,
+                    )
+                    .await?;
+                    ensure!(delta_stream_ids(&replay) == [20], "ready-only reconnect");
+                    ensure!(replay.contains("during_disconnect"), "recovered output");
+                    ensure!(
+                        !replay.contains("retained_before_connect"),
+                        "resume does not replay the retained prefix"
+                    );
+
+                    // A new fresh stream now starts after ID 20. A subsequent
+                    // clock rollback must not hide rows with increasing IDs.
+                    let mut stream = TcpStream::connect(addr).await?;
+                    stream.write_all(request).await?;
+                    let mut response = Vec::new();
+                    let ready_raw =
+                        read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                    ensure!(
+                        ready_raw.lines().any(|line| line == "id: delta-v1:pane:7:20"),
+                        "a new fresh stream captures the current tail"
+                    );
+                    seed_delta_stream_segment(&storage, 30, i64::MIN, "after_clock_rollback")?;
+                    let _ = event_bus.publish(Event::SegmentCaptured {
+                        pane_id: 7,
+                        seq: 30,
+                        content_len: "after_clock_rollback".len(),
+                    });
+                    let raw =
+                        read_event_stream_until(&mut stream, &mut response, "delta", 1).await?;
+                    ensure!(delta_stream_ids(&raw) == [30], "backdated fresh output arrives");
+
+                    // No bus notification: the periodic repair scan must use
+                    // the same ID boundary without a wall-clock cutoff.
+                    seed_delta_stream_segment(&storage, 40, -1, "without_notification")?;
+                    let raw =
+                        read_event_stream_until(&mut stream, &mut response, "delta", 2).await?;
+                    ensure!(delta_stream_ids(&raw) == [30, 40], "lost wakeup repaired once");
+                    ensure!(raw.contains("without_notification"), "periodic storage read");
+                    ensure!(
+                        !raw.contains("retained_before_connect") && !raw.contains("during_disconnect"),
+                        "fresh output excludes the complete pre-connection prefix"
+                    );
+                    drop(stream);
+                    Ok::<_, anyhow::Error>(())
+                }))
+                .await;
+                let teardown = timeout(Duration::from_secs(5), async {
+                    server.shutdown().await?;
+                    storage.shutdown().await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+                teardown
+                    .expect("delta cursor teardown deadline")
+                    .expect("delta cursor teardown");
+                scenario
+                    .expect("delta cursor scenario deadline")
+                    .expect("delta cursor assertions");
+                assert_eq!(event_bus.subscriber_count(), 0);
+            }
         });
     }
 

@@ -1,7 +1,8 @@
 //! Storage-backed terminal-output streaming. The response owns every wait;
 //! cursor advancement means a frame was accepted, never merely attempted.
-//! Reconnect uses a namespaced, pane-scoped persisted segment id; control
-//! frames never overwrite the client's last received segment cursor.
+//! Reconnect uses a namespaced, pane-scoped persisted segment id. The ready
+//! frame establishes the initial tail boundary; later control frames never
+//! overwrite the client's last received segment cursor.
 
 use super::super::error::json_err;
 use super::super::extractors::{
@@ -9,7 +10,7 @@ use super::super::extractors::{
 };
 use super::super::{STREAM_CHANNEL_BUFFER, WebRuntimeLimits};
 use super::{
-    SseByteStream, SseEvent, SseResponse, advance_stream_sequence, epoch_ms_now, frame_to_sse,
+    SseByteStream, SseEvent, SseResponse, advance_stream_sequence, frame_to_sse,
     make_stream_frame, parse_stream_max_hz, send_rate_limited_sse, send_replay_sse,
     stream_min_interval,
 };
@@ -105,8 +106,7 @@ fn delta_frame_to_sse(
 
 struct DeltaStreamState {
     pane_filter: Option<u64>,
-    since_ms: Option<i64>,
-    after_id: Option<i64>,
+    after_id: i64,
     scan_limit: usize,
     pages_per_yield: usize,
     seq: u64,
@@ -117,17 +117,15 @@ struct DeltaStreamState {
 impl DeltaStreamState {
     fn new(
         pane_filter: Option<u64>,
-        started_at_ms: i64,
-        resume_after: Option<i64>,
+        after_id: i64,
         limits: WebRuntimeLimits,
         max_hz: u64,
     ) -> Self {
         Self {
             pane_filter,
-            // Replayed rows predate this connection. Keeping the fresh-stream
-            // timestamp filter during resume would silently discard them.
-            since_ms: resume_after.is_none().then_some(started_at_ms),
-            after_id: resume_after,
+            // Both fresh and resumed streams use a committed ID boundary.
+            // Capture timestamps can move backwards while IDs advance.
+            after_id,
             // Defend direct/internal construction as well as validated config.
             scan_limit: limits.stream_scan_limit.max(1),
             pages_per_yield: limits.stream_scan_max_pages.max(1),
@@ -180,9 +178,9 @@ impl DeltaStreamState {
                 return false;
             }
             let query = SegmentScanQuery {
-                after_id: self.after_id,
+                after_id: Some(self.after_id),
                 pane_id: self.pane_filter,
-                since: self.since_ms,
+                since: None,
                 until: None,
                 limit: self.scan_limit,
             };
@@ -196,17 +194,14 @@ impl DeltaStreamState {
                 }
             };
             let page_len = segments.len();
-            let mut previous = self.after_id.unwrap_or(0);
+            let mut previous = self.after_id;
             // Reject a broken query contract before any row in the page is
             // admitted. In particular, never skip unseen rows by accepting
             // an out-of-order, duplicate, or wrong-pane result.
             let valid = page_len <= self.scan_limit
                 && segments.iter().all(|segment| {
                     let valid = segment.id > previous
-                        && self.pane_filter.is_none_or(|pane| segment.pane_id == pane)
-                        && self
-                            .since_ms
-                            .is_none_or(|since| segment.captured_at >= since);
+                        && self.pane_filter.is_none_or(|pane| segment.pane_id == pane);
                     previous = segment.id;
                     valid
                 });
@@ -245,7 +240,7 @@ impl DeltaStreamState {
                 // send_replay_sse waits for capacity; it never reports a
                 // channel-full drop as success. Only admitted frames move
                 // this connection's cursor. Socket delivery is not implied.
-                self.after_id = Some(segment.id);
+                self.after_id = segment.id;
             }
             if page_len < self.scan_limit {
                 return true;
@@ -322,13 +317,31 @@ pub fn handle_stream_deltas(
             &stream_cx,
         );
         let recv_cx = stream_cx.clone();
-        let started_at_ms = epoch_ms_now();
+        // Subscribe before capturing the tail boundary so a committed row
+        // after that read cannot fall between the snapshot and subscription.
+        // The scoped scalar query reads no terminal content or other panes'
+        // metadata. Periodic ID scans also recover missing bus notifications.
         let mut subscriber = event_bus.subscribe_deltas();
+        let after_id = match resume_after {
+            Some(id) => id,
+            None => match storage
+                .get_segment_high_water_id_with_cx(&stream_cx, pane_filter)
+                .await
+            {
+                Ok(id) => id,
+                Err(_) => {
+                    return json_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "storage_error",
+                        "Unable to establish the terminal output stream boundary",
+                    );
+                }
+            },
+        };
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let producer = async move {
             let child_cx = stream_cx;
-            let mut state =
-                DeltaStreamState::new(pane_filter, started_at_ms, resume_after, limits, max_hz);
+            let mut state = DeltaStreamState::new(pane_filter, after_id, limits, max_hz);
             if !advance_stream_sequence(&mut state.seq) {
                 return;
             }
@@ -339,12 +352,17 @@ pub fn handle_stream_deltas(
                 json!({
                     "max_hz": max_hz,
                     "pane_id": pane_filter,
-                    "resume_after_id": resume_after,
+                    "resume_after_id": after_id,
+                    "cursor": encode_delta_cursor(pane_filter, after_id),
                     "cursor_format": "delta-v1",
                     "recovery": "retained_segments_only",
                 }),
             );
-            let Some(ready) = delta_frame_to_sse("ready", state.seq, pane_filter, None, ready)
+            // Even a client that disconnects before its first delta must
+            // retain this boundary. Otherwise reconnect silently adopts a
+            // later tail and loses output captured during the disconnect.
+            let Some(ready) =
+                delta_frame_to_sse("ready", state.seq, pane_filter, Some(after_id), ready)
             else {
                 return;
             };
@@ -542,7 +560,7 @@ mod tests {
         let mut limits = super::super::super::resolve_runtime_limits(None);
         limits.stream_scan_limit = 2;
         limits.stream_scan_max_pages = 1;
-        let mut state = DeltaStreamState::new(Some(7), 123, None, limits, 50);
+        let mut state = DeltaStreamState::new(Some(7), 0, limits, 50);
         state.min_interval = Duration::ZERO;
         state
     }
@@ -593,7 +611,7 @@ mod tests {
                         |query| {
                             assert_eq!(query.limit, 2);
                             assert_eq!(query.pane_id, Some(7));
-                            assert_eq!(query.since, Some(123));
+                            assert_eq!(query.since, None);
                             queries.push(query.after_id);
                             std::future::ready(Ok([2, 4, 9, 11, 20]
                                 .into_iter()
@@ -607,8 +625,8 @@ mod tests {
                     )
                     .await
             );
-            assert_eq!(queries, [None, Some(4), Some(11)]);
-            assert_eq!(state.after_id, Some(20));
+            assert_eq!(queries, [Some(0), Some(4), Some(11)]);
+            assert_eq!(state.after_id, 20);
             drop(tx);
             let frames = drain(rx);
             assert_eq!(
@@ -645,7 +663,7 @@ mod tests {
                     )
                     .await
             );
-            assert_eq!(state.after_id, Some(2));
+            assert_eq!(state.after_id, 2);
             drop(tx);
             let frames = drain(rx);
             assert_eq!(frames.len(), 3);
@@ -688,7 +706,7 @@ mod tests {
                         )
                         .await
                 );
-                assert_eq!(state.after_id, None);
+                assert_eq!(state.after_id, 0);
                 drop(tx);
                 let frames = drain(rx);
                 assert_eq!(frames.len(), 1);
@@ -720,7 +738,7 @@ mod tests {
                     )
                     .await
             );
-            assert_eq!(closed.after_id, None);
+            assert_eq!(closed.after_id, 0);
 
             let mut exhausted = state();
             exhausted.seq = u64::MAX;
@@ -735,7 +753,7 @@ mod tests {
                     )
                     .await
             );
-            assert_eq!(exhausted.after_id, None);
+            assert_eq!(exhausted.after_id, 0);
             drop(tx);
             assert!(drain(rx).is_empty());
         });
@@ -772,7 +790,7 @@ mod tests {
                         )
                         .await
                 );
-                producer_cursor.store(state.after_id.unwrap(), Ordering::SeqCst);
+                producer_cursor.store(state.after_id, Ordering::SeqCst);
             });
             let mut stream = SseByteStream::new(
                 cx.clone(),
@@ -1003,12 +1021,14 @@ mod tests {
     }
 
     #[test]
-    fn delta_data_uses_persisted_ids_and_control_frames_never_reset_them() {
+    fn delta_ready_and_data_use_persisted_ids_and_other_frames_never_reset_them() {
+        let ready = delta_frame_to_sse("ready", 1, Some(7), Some(9000), json!({})).unwrap();
+        assert_eq!(ready.id.as_deref(), Some("delta-v1:pane:7:9000"));
         let delta = delta_frame_to_sse("delta", 2, Some(7), Some(9001), json!({"seq": 2})).unwrap();
         let bytes = String::from_utf8(delta.to_bytes()).unwrap();
         assert!(bytes.lines().any(|line| line == "id: delta-v1:pane:7:9001"));
         assert!(!bytes.lines().any(|line| line == "id: 2"));
-        for kind in ["ready", "gap", "lag", "error"] {
+        for kind in ["gap", "lag", "error"] {
             let control = delta_frame_to_sse(kind, 9002, Some(7), None, json!({})).unwrap();
             assert_eq!(control.id, None, "{kind}");
             let text = String::from_utf8(control.to_bytes()).unwrap();
@@ -1023,7 +1043,7 @@ mod tests {
             let mut limits = super::super::super::resolve_runtime_limits(None);
             limits.stream_scan_limit = 2;
             limits.stream_scan_max_pages = 1;
-            let mut resumed = DeltaStreamState::new(Some(7), 10_000, Some(4), limits, 50);
+            let mut resumed = DeltaStreamState::new(Some(7), 4, limits, 50);
             resumed.min_interval = Duration::ZERO;
             let (tx, rx) = mpsc::channel(8);
             let mut queries = Vec::new();
@@ -1074,35 +1094,47 @@ mod tests {
             );
             assert_eq!(frames[0].id.as_deref(), Some("delta-v1:pane:7:9"));
             assert_eq!(frames[1].id.as_deref(), Some("delta-v1:pane:7:11"));
-            assert_eq!(resumed.after_id, Some(11));
+            assert_eq!(resumed.after_id, 11);
         });
     }
 
     #[test]
-    fn delta_fresh_connection_keeps_its_no_history_timestamp_filter() {
+    fn delta_fresh_tail_uses_ids_and_keeps_new_rows_with_old_timestamps() {
         run_async(|| async {
             let cx = crate::cx::for_request();
             let limits = super::super::super::resolve_runtime_limits(None);
-            let mut fresh = DeltaStreamState::new(Some(7), 10_000, None, limits, 50);
-            let (tx, rx) = mpsc::channel(1);
+            let mut fresh = DeltaStreamState::new(Some(7), 4, limits, 50);
+            fresh.min_interval = Duration::ZERO;
+            let (tx, rx) = mpsc::channel(2);
             assert!(
                 fresh
                     .catch_up(
                         &cx,
                         |query| {
-                            assert_eq!(query.after_id, None);
-                            assert_eq!(query.since, Some(10_000));
+                            assert_eq!(query.after_id, Some(4));
+                            assert_eq!(query.since, None);
                             assert_eq!(query.pane_id, Some(7));
-                            std::future::ready(Ok(Vec::new()))
+                            std::future::ready(Ok([1, 4, 9, 11]
+                                .into_iter()
+                                .filter(|id| *id > query.after_id.unwrap())
+                                .map(|id| {
+                                    let mut row = segment(id);
+                                    row.captured_at = if id == 9 { i64::MIN } else { 0 };
+                                    row
+                                })
+                                .collect()))
                         },
                         &Redactor::new(),
                         &tx
                     )
                     .await
             );
-            assert_eq!(fresh.after_id, None);
+            assert_eq!(fresh.after_id, 11);
             drop(tx);
-            assert!(drain(rx).is_empty());
+            assert_eq!(
+                drain(rx).iter().map(frame_segment_id).collect::<Vec<_>>(),
+                [9, 11]
+            );
         });
     }
 
@@ -1122,7 +1154,7 @@ mod tests {
             limits.stream_scan_limit = 8;
             let (tx, rx) = mpsc::channel(8);
             let producer = Box::pin(async move {
-                let mut initial = DeltaStreamState::new(Some(7), 123, Some(0), limits, 50);
+                let mut initial = DeltaStreamState::new(Some(7), 0, limits, 50);
                 initial.min_interval = Duration::ZERO;
                 assert!(
                     initial
@@ -1134,7 +1166,7 @@ mod tests {
                         )
                         .await
                 );
-                producer_admitted.store(initial.after_id.unwrap(), Ordering::SeqCst);
+                producer_admitted.store(initial.after_id, Ordering::SeqCst);
             });
             let mut stream = SseByteStream::new(
                 cx.clone(),
@@ -1166,7 +1198,7 @@ mod tests {
             drop(stream); // The unread frames 2 and 3 disappear with this body.
 
             let resume = parse_delta_resume(Some(received_id.as_bytes()), None, Some(7)).unwrap();
-            let mut resumed = DeltaStreamState::new(Some(7), 10_000, resume, limits, 50);
+            let mut resumed = DeltaStreamState::new(Some(7), resume.unwrap(), limits, 50);
             resumed.min_interval = Duration::ZERO;
             let (tx, rx) = mpsc::channel(8);
             assert!(
@@ -1200,7 +1232,7 @@ mod tests {
         run_async(|| async {
             let cx = crate::cx::for_request();
             let limits = super::super::super::resolve_runtime_limits(None);
-            let mut resumed = DeltaStreamState::new(None, 10_000, Some(91), limits, 50);
+            let mut resumed = DeltaStreamState::new(None, 91, limits, 50);
             resumed.min_interval = Duration::ZERO;
             let (tx, rx) = mpsc::channel(1);
             assert!(
@@ -1220,7 +1252,7 @@ mod tests {
                     )
                     .await
             );
-            assert_eq!(resumed.after_id, Some(91));
+            assert_eq!(resumed.after_id, 91);
             drop(tx);
             let frames = drain(rx);
             assert_eq!(frames.len(), 1);
