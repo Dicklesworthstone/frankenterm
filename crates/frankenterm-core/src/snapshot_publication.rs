@@ -1640,7 +1640,7 @@ impl SnapshotPublicationStore {
 
             let std_file = cap_file.into_std();
             fs2::FileExt::try_lock_exclusive(&std_file).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
+                if crate::lock::is_lock_contended(&e) {
                     PublicationError::PublicationBusy
                 } else {
                     PublicationError::io(&lock_path, e)

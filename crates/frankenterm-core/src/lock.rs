@@ -139,7 +139,10 @@ fn stable_io_failure(phase: &'static str, error: &io::Error) -> LockSidecarReadF
     LockSidecarReadFailure::new(phase, kind)
 }
 
-fn is_lock_contended(error: &io::Error) -> bool {
+/// Whether an fs2 `try_lock_*` error means another holder has the lock.
+/// Check this, not `ErrorKind::WouldBlock`: on Windows contention is
+/// `ERROR_LOCK_VIOLATION` (os error 33), whose kind is `Uncategorized`.
+pub(crate) fn is_lock_contended(error: &io::Error) -> bool {
     let expected = fs2::lock_contended_error();
     match (error.raw_os_error(), expected.raw_os_error()) {
         (Some(actual), Some(expected)) => actual == expected,
@@ -2536,6 +2539,22 @@ mod tests {
             .expect("the lock must be free while the shared copy is still open");
         FileExt::unlock(&contender).unwrap();
         drop(child_copy);
+    }
+
+    /// A held lock reads as contended on every platform. Windows reports it
+    /// as ERROR_LOCK_VIOLATION, whose kind is Uncategorized, not WouldBlock.
+    #[test]
+    fn a_held_lock_is_recognized_as_contended_on_every_platform() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("contended.lock");
+        let holder = File::create(&path).unwrap();
+        FileExt::try_lock_exclusive(&holder).unwrap();
+        let contender = File::open(&path).unwrap();
+        let error = FileExt::try_lock_exclusive(&contender).unwrap_err();
+        assert!(is_lock_contended(&error), "{error:?}");
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        assert!(!is_lock_contended(&not_found));
+        FileExt::unlock(&holder).unwrap();
     }
 
     /// ft-nd1c0: the shared-name opener creates an absent file, opens an

@@ -442,7 +442,7 @@ impl MmapScrollback {
         let lock_file = opened_lock.file;
         match lock_file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(source) if crate::lock::is_lock_contended(&source) => {
                 return Err(MmapScrollbackError::WriterBusy {
                     path: lock_path.clone(),
                 });
@@ -488,7 +488,7 @@ impl MmapScrollback {
         // process onto the same ring inode.
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(source) if crate::lock::is_lock_contended(&source) => {
                 return Err(MmapScrollbackError::WriterBusy { path: path.clone() });
             }
             Err(source) => {

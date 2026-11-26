@@ -2621,7 +2621,7 @@ impl BrowserProfile {
                         storage_account: self.storage_account.clone(),
                     });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if crate::lock::is_lock_contended(&error) => {
                     let elapsed = started.elapsed();
                     if elapsed >= timeout {
                         return Err(StorageError::Database(
@@ -5399,7 +5399,10 @@ mod tests {
             .expect("profile lock acquisition boundary");
         let body = &tail[..end];
         assert!(body.contains("try_lock_exclusive"));
-        assert!(body.contains("ErrorKind::WouldBlock"));
+        // Contention is the portable check: on Windows it is os error 33,
+        // whose kind is not WouldBlock.
+        assert!(body.contains("crate::lock::is_lock_contended(&error)"));
+        assert!(!body.contains("ErrorKind::WouldBlock"));
         assert!(body.contains("elapsed >= timeout"));
         assert!(body.contains("timeout.saturating_sub(elapsed)"));
         assert!(body.contains("PROFILE_LOCK_POLL_INTERVAL.min"));

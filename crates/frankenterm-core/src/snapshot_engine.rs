@@ -13047,12 +13047,12 @@ fn acquire_checkpoint_artifact_publication_lock(
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => break,
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
+                if crate::lock::is_lock_contended(&error)
                     && started.elapsed() < CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_TIMEOUT =>
             {
                 std::thread::sleep(CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK_POLL);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if crate::lock::is_lock_contended(&error) => {
                 return Err(CheckpointScrollbackArtifactError::PublicationBusy);
             }
             Err(error) => return Err(error.into()),

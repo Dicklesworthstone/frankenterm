@@ -250,7 +250,7 @@ pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, Kill
         .open(PathBuf::from(lock_path))
         .map_err(|_| KillSwitchStateError::FenceFailed)?;
     fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        if crate::lock::is_lock_contended(&error) {
             KillSwitchStateError::FencePending
         } else {
             KillSwitchStateError::FenceFailed

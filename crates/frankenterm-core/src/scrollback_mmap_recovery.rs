@@ -1619,7 +1619,7 @@ fn acquire_recovery_lease(lock_path: &Path) -> std::io::Result<LockProbeOutcome>
                 },
             )))
         }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(LockProbeOutcome::Locked),
+        Err(error) if crate::lock::is_lock_contended(&error) => Ok(LockProbeOutcome::Locked),
         Err(_) => Ok(LockProbeOutcome::Unsafe),
     }
 }

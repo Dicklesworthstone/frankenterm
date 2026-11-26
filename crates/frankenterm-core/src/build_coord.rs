@@ -190,7 +190,7 @@ impl BuildLock {
                 );
                 Ok(lock)
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(e) if crate::lock::is_lock_contended(&e) => {
                 let meta = read_build_metadata(&meta_path);
                 match meta {
                     Some(m) => Err(BuildCoordError::BuildInProgress {
@@ -370,7 +370,7 @@ pub fn check_build_running(
             drop(probe);
             None
         }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+        Err(e) if crate::lock::is_lock_contended(&e) => {
             // Lock is held
             read_build_metadata(&meta_path)
         }
