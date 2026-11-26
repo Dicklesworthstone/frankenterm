@@ -10499,6 +10499,17 @@ mod tests {
         .unwrap();
     }
 
+    /// An absolute cwd for tests that run a restore, whose layout preflight
+    /// refuses a cwd that is not absolute here: `/restore` has no drive, so
+    /// on Windows it is `C:\restore`.
+    fn restore_cwd(leaf: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{leaf}")
+        } else {
+            format!("/{leaf}")
+        }
+    }
+
     fn set_single_pane_topology(conn: &Connection, session_id: &str, pane_id: u64, cwd: &str) {
         let topology = TopologySnapshot {
             schema_version: 1,
@@ -11678,7 +11689,7 @@ mod tests {
                                     pane_id: 1,
                                     rows: 24,
                                     cols: 80,
-                                    cwd: Some("/left".to_string()),
+                                    cwd: Some(restore_cwd("left")),
                                     title: None,
                                     is_active: true,
                                 },
@@ -11689,7 +11700,7 @@ mod tests {
                                     pane_id: 2,
                                     rows: 24,
                                     cols: 80,
-                                    cwd: Some("/right".to_string()),
+                                    cwd: Some(restore_cwd("right")),
                                     title: None,
                                     is_active: false,
                                 },
@@ -11710,8 +11721,20 @@ mod tests {
         .unwrap();
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-partial", 5000, 2);
-        insert_pane_state(&conn, checkpoint_id, 1, Some("/left"), Some("bash"));
-        insert_pane_state(&conn, checkpoint_id, 2, Some("/right"), Some("vim"));
+        insert_pane_state(
+            &conn,
+            checkpoint_id,
+            1,
+            Some(&restore_cwd("left")),
+            Some("bash"),
+        );
+        insert_pane_state(
+            &conn,
+            checkpoint_id,
+            2,
+            Some(&restore_cwd("right")),
+            Some("vim"),
+        );
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-partial'",
             [],
@@ -11794,9 +11817,10 @@ mod tests {
     fn mapped_activation_failure_persists_failure_only_reconciliation_receipt() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-mapped-activation-failure", false);
-        set_single_pane_topology(&conn, "sess-mapped-activation-failure", 7, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-mapped-activation-failure", 7, &cwd);
         let checkpoint_id = insert_checkpoint(&conn, "sess-mapped-activation-failure", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 7, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000
              WHERE session_id = 'sess-mapped-activation-failure'",
@@ -11888,9 +11912,10 @@ mod tests {
     fn authoritative_partial_restore_is_a_typed_error_with_durable_receipt() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-authoritative-partial", false);
-        set_single_pane_topology(&conn, "sess-authoritative-partial", 7, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-authoritative-partial", 7, &cwd);
         let checkpoint_id = insert_checkpoint(&conn, "sess-authoritative-partial", 5_000, 1);
-        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 7, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000
              WHERE session_id = 'sess-authoritative-partial'",
@@ -11957,7 +11982,7 @@ mod tests {
                             pane_id: 1,
                             rows: 24,
                             cols: 80,
-                            cwd: Some("/ok".to_string()),
+                            cwd: Some(restore_cwd("ok")),
                             title: None,
                             is_active: true,
                         },
@@ -11970,7 +11995,7 @@ mod tests {
                             pane_id: 2,
                             rows: 24,
                             cols: 80,
-                            cwd: Some("/fails".to_string()),
+                            cwd: Some(restore_cwd("fails")),
                             title: None,
                             is_active: false,
                         },
@@ -11991,8 +12016,20 @@ mod tests {
         .unwrap();
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-tab-fail", 5000, 2);
-        insert_pane_state(&conn, checkpoint_id, 1, Some("/ok"), Some("bash"));
-        insert_pane_state(&conn, checkpoint_id, 2, Some("/fails"), Some("python"));
+        insert_pane_state(
+            &conn,
+            checkpoint_id,
+            1,
+            Some(&restore_cwd("ok")),
+            Some("bash"),
+        );
+        insert_pane_state(
+            &conn,
+            checkpoint_id,
+            2,
+            Some(&restore_cwd("fails")),
+            Some("python"),
+        );
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-tab-fail'",
             [],
@@ -12070,10 +12107,11 @@ mod tests {
     fn session_restorer_successful_restore_marks_clean_and_keeps_capture_checkpoint_usable() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-success", false);
-        set_single_pane_topology(&conn, "sess-success", 7, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-success", 7, &cwd);
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-success", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 7, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-success'",
             [],
@@ -12159,7 +12197,8 @@ mod tests {
     fn session_restorer_agent_is_manual_without_any_launch_configuration() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-agent-launch", false);
-        set_single_pane_topology(&conn, "sess-agent-launch", 7, "/agents");
+        let cwd = restore_cwd("agents");
+        set_single_pane_topology(&conn, "sess-agent-launch", 7, &cwd);
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-agent-launch", 5000, 1);
         let terminal_json = r#"{"rows":24,"cols":80,"cursor_row":0,"cursor_col":0,"is_alt_screen":false,"title":"agent"}"#;
@@ -12168,14 +12207,7 @@ mod tests {
             "INSERT INTO mux_pane_state
              (checkpoint_id, pane_id, cwd, command, terminal_state_json, agent_metadata_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                checkpoint_id,
-                7i64,
-                "/agents",
-                "codex",
-                terminal_json,
-                agent_json
-            ],
+            params![checkpoint_id, 7i64, cwd, "codex", terminal_json, agent_json],
         )
         .unwrap();
         recompute_checkpoint_total_bytes(&conn, checkpoint_id);
@@ -12215,9 +12247,10 @@ mod tests {
     fn session_restorer_manual_process_disposition_completes_layout_restore() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-agent-manual", false);
-        set_single_pane_topology(&conn, "sess-agent-manual", 7, "/agents");
+        let cwd = restore_cwd("agents");
+        set_single_pane_topology(&conn, "sess-agent-manual", 7, &cwd);
         let checkpoint_id = insert_checkpoint(&conn, "sess-agent-manual", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 7, Some("/agents"), Some("codex"));
+        insert_pane_state(&conn, checkpoint_id, 7, Some(&cwd), Some("codex"));
         conn.execute(
             "UPDATE mux_pane_state
              SET agent_metadata_json = ?2
@@ -12271,10 +12304,11 @@ mod tests {
     fn session_restorer_rejects_unaudited_authority_trigger_before_mux_effects() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-bookkeeping-fail", false);
-        set_single_pane_topology(&conn, "sess-bookkeeping-fail", 9, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-bookkeeping-fail", 9, &cwd);
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-bookkeeping-fail", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 9, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 9, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-bookkeeping-fail'",
             [],
@@ -12386,9 +12420,10 @@ mod tests {
     fn clean_session_race_rejects_stale_restore_before_mux_effects() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-clean-race", false);
-        set_single_pane_topology(&conn, "sess-clean-race", 23, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-clean-race", 23, &cwd);
         let checkpoint_id = insert_checkpoint(&conn, "sess-clean-race", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 23, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 23, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE session_checkpoints SET checkpoint_type = 'shutdown' WHERE id = ?1",
             [checkpoint_id],
@@ -12429,9 +12464,10 @@ mod tests {
     fn restore_reloads_checkpoint_authority_instead_of_using_mutated_caller_data() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-reload-authority", false);
-        set_single_pane_topology(&conn, "sess-reload-authority", 31, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-reload-authority", 31, &cwd);
         let checkpoint_id = insert_checkpoint(&conn, "sess-reload-authority", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 31, Some("/restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 31, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000
              WHERE session_id = 'sess-reload-authority'",
@@ -12618,14 +12654,15 @@ mod tests {
     fn session_restorer_restore_layout_only_skips_scrollback_replay() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-layout-only", false);
-        set_single_pane_topology(&conn, "sess-layout-only", 7, "/restore");
+        let cwd = restore_cwd("restore");
+        set_single_pane_topology(&conn, "sess-layout-only", 7, &cwd);
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-layout-only", 5000, 1);
         insert_pane_state_with_scrollback(
             &conn,
             checkpoint_id,
             7,
-            Some("/restore"),
+            Some(&cwd),
             Some("bash"),
             Some(1),
             Some(5_200),
@@ -14349,10 +14386,11 @@ mod tests {
     fn session_restorer_restore_with_cx_matches_legacy() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-cx-success", false);
-        set_single_pane_topology(&conn, "sess-cx-success", 9, "/cx-restore");
+        let cwd = restore_cwd("cx-restore");
+        set_single_pane_topology(&conn, "sess-cx-success", 9, &cwd);
 
         let checkpoint_id = insert_checkpoint(&conn, "sess-cx-success", 5000, 1);
-        insert_pane_state(&conn, checkpoint_id, 9, Some("/cx-restore"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 9, Some(&cwd), Some("bash"));
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-cx-success'",
             [],
