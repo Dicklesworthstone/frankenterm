@@ -89,6 +89,12 @@ impl FleetViewer {
             .map(|id| id.to_string())
     }
 
+    /// Capture identity only when the selected row still matches inventory.
+    #[wasm_bindgen(js_name = selectedPaneUuid)]
+    pub fn selected_pane_uuid(&self) -> Option<String> {
+        self.inner.model().selected_pane_uuid().map(str::to_owned)
+    }
+
     #[wasm_bindgen(js_name = takeFlatPatches)]
     pub fn take_flat_patches(&mut self) -> JsValue {
         self.inner.prepare_flat_patches();

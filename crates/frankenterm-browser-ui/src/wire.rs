@@ -79,6 +79,8 @@ pub struct Detection {
     /// Persisted event id; `None` for a live event the watcher did not store.
     pub id: Option<i64>,
     pub pane_id: u64,
+    /// Capture identity recorded with this event, never inferred from a newer pane.
+    pub pane_uuid: Option<String>,
     pub rule_id: String,
     pub severity: String,
     pub detected_at_ms: i64,
@@ -88,6 +90,8 @@ pub struct Detection {
 struct StoredEvent {
     id: i64,
     pane_id: u64,
+    #[serde(default)]
+    pane_uuid: Option<String>,
     rule_id: String,
     severity: String,
     detected_at: i64,
@@ -106,6 +110,7 @@ pub fn decode_events(body: &str) -> Result<Vec<Detection>, WireError> {
             .map(|e| Detection {
                 id: Some(e.id),
                 pane_id: e.pane_id,
+                pane_uuid: e.pane_uuid,
                 rule_id: e.rule_id,
                 severity: e.severity,
                 detected_at_ms: e.detected_at,
@@ -155,6 +160,8 @@ pub const STREAM_SCHEMA: &str = "ft.stream.v1";
 enum BusEvent {
     PatternDetected {
         pane_id: u64,
+        #[serde(default)]
+        pane_uuid: Option<String>,
         detection: BusDetection,
         #[serde(default)]
         event_id: Option<i64>,
@@ -209,11 +216,13 @@ pub fn decode_stream_frame(payload: &str) -> Result<StreamUpdate, WireError> {
             Ok(match event {
                 BusEvent::PatternDetected {
                     pane_id,
+                    pane_uuid,
                     detection,
                     event_id,
                 } => StreamUpdate::Detection(Detection {
                     id: event_id,
                     pane_id,
+                    pane_uuid,
                     rule_id: detection.rule_id,
                     severity: detection.severity,
                     detected_at_ms: frame.ts_ms,
@@ -268,7 +277,7 @@ mod tests {
     #[test]
     fn events_keep_server_order_and_ids() {
         let body = r#"{"ok":true,"version":"x","data":{"total":2,"events":[
-            {"id":12,"pane_id":3,"rule_id":"codex.usage.reached","event_type":"usage","severity":"warning","confidence":0.9,"detected_at":200},
+            {"id":12,"pane_id":3,"pane_uuid":"capture-a","rule_id":"codex.usage.reached","event_type":"usage","severity":"warning","confidence":0.9,"detected_at":200},
             {"id":11,"pane_id":4,"rule_id":"claude_code.approval_needed","event_type":"prompt","severity":"info","confidence":1.0,"detected_at":100}]}}"#;
         let events = decode_events(body).expect("events");
         assert_eq!(
@@ -276,18 +285,21 @@ mod tests {
             [Some(12), Some(11)]
         );
         assert_eq!(events[0].rule_id, "codex.usage.reached");
+        assert_eq!(events[0].pane_uuid.as_deref(), Some("capture-a"));
+        assert_eq!(events[1].pane_uuid, None);
     }
 
     #[test]
     fn stream_frames_map_to_updates() {
         let detection = r#"{"schema":"ft.stream.v1","stream":"events","kind":"event","seq":2,"ts_ms":777,
-            "data":{"replayed":false,"event":{"type":"pattern_detected","pane_id":3,"pane_uuid":null,"event_id":41,
+            "data":{"replayed":false,"event":{"type":"pattern_detected","pane_id":3,"pane_uuid":"capture-a","event_id":41,
             "detection":{"rule_id":"codex.usage.reached","agent_type":"codex","event_type":"usage","severity":"critical","confidence":0.95,"extracted":{},"matched_text":"x"}}}}"#;
         assert_eq!(
             decode_stream_frame(detection),
             Ok(StreamUpdate::Detection(Detection {
                 id: Some(41),
                 pane_id: 3,
+                pane_uuid: Some("capture-a".to_string()),
                 rule_id: "codex.usage.reached".to_string(),
                 severity: "critical".to_string(),
                 detected_at_ms: 777,

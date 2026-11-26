@@ -64,6 +64,7 @@ enum SelectionAnchor {
     PersistedDetection {
         id: i64,
         pane_id: u64,
+        pane_uuid: Option<String>,
     },
     UnstoredDetection(Detection),
 }
@@ -284,6 +285,31 @@ impl FleetModel {
         }
     }
 
+    /// Capture identity of the selected row, if it still names a listed pane.
+    ///
+    /// Events without a recorded identity, or from a replaced pane, cannot
+    /// borrow the current inventory's identity just because its numeric ID
+    /// matches. This is a capture binding for the server to verify, not native
+    /// mux authority or permission to read raw terminal state.
+    #[must_use]
+    pub fn selected_pane_uuid(&self) -> Option<&str> {
+        let index = self.selected()?;
+        match self.view {
+            View::Panes => self
+                .panes
+                .get(index)?
+                .pane_uuid
+                .as_deref()
+                .filter(|uuid| !uuid.is_empty()),
+            View::Events => {
+                let event = self.events.get(index)?;
+                let uuid = event.pane_uuid.as_deref().filter(|uuid| !uuid.is_empty())?;
+                let pane = self.panes.iter().find(|pane| pane.pane_id == event.pane_id)?;
+                (pane.pane_uuid.as_deref() == Some(uuid)).then_some(uuid)
+            }
+        }
+    }
+
     fn selection_anchor(&self) -> Option<SelectionAnchor> {
         let index = self.selected()?;
         match self.view {
@@ -296,6 +322,7 @@ impl FleetModel {
                 Some(id) => SelectionAnchor::PersistedDetection {
                     id,
                     pane_id: event.pane_id,
+                    pane_uuid: event.pane_uuid.clone(),
                 },
                 None => SelectionAnchor::UnstoredDetection(event.clone()),
             }),
@@ -327,10 +354,15 @@ impl FleetModel {
             }) => self.panes.iter().position(|pane| {
                 pane.pane_id == id && pane.pane_uuid == uuid && pane.first_seen_at == first_seen_at
             }),
-            Some(SelectionAnchor::PersistedDetection { id, pane_id }) => self
-                .events
-                .iter()
-                .position(|event| event.id == Some(id) && event.pane_id == pane_id),
+            Some(SelectionAnchor::PersistedDetection {
+                id,
+                pane_id,
+                pane_uuid,
+            }) => self.events.iter().position(|event| {
+                event.id == Some(id)
+                    && event.pane_id == pane_id
+                    && event.pane_uuid == pane_uuid
+            }),
             Some(SelectionAnchor::UnstoredDetection(selected)) => {
                 self.events.iter().position(|event| event == &selected)
             }
@@ -1001,6 +1033,7 @@ mod tests {
             let initial = serde_json::json!({"ok": true, "data": {"panes": [&pane]}});
             model.ingest_panes(&initial.to_string()).unwrap();
             assert_eq!(model.selected_pane_id(), Some(7));
+            assert_eq!(model.selected_pane_uuid(), Some("registration-a"));
             if field == "pane_uuid" {
                 pane[field] = serde_json::json!("registration-b");
             } else {
@@ -1009,9 +1042,84 @@ mod tests {
             let replacement = serde_json::json!({"ok": true, "data": {"panes": [&pane]}});
             model.ingest_panes(&replacement.to_string()).unwrap();
             assert_eq!(model.selected_pane_id(), None, "changed {field}");
+            assert_eq!(model.selected_pane_uuid(), None, "changed {field}");
             model.update(key(KeyCode::Home));
             assert_eq!(model.selected_pane_id(), Some(7));
+            assert_eq!(model.selected_pane_uuid(), pane["pane_uuid"].as_str());
         }
+    }
+
+    #[test]
+    fn selected_event_requires_its_own_capture_identity() {
+        for event_uuid in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("old-capture"),
+        ] {
+            let mut model = FleetModel::new();
+            model
+                .ingest_panes(
+                    r#"{"ok":true,"data":{"panes":[{"pane_id":7,"pane_uuid":"current-capture","domain":"local","last_seen_at":10000}]}}"#,
+                )
+                .unwrap();
+            assert_eq!(model.selected_pane_uuid(), Some("current-capture"));
+            let history = serde_json::json!({"ok": true, "data": {"events": [{
+                "id": 5, "pane_id": 7, "pane_uuid": event_uuid,
+                "rule_id": "test.rule", "severity": "warning", "detected_at": 9500
+            }]}});
+            model.ingest_events(&history.to_string()).unwrap();
+            model.update(key(KeyCode::Char('2')));
+            assert_eq!(model.selected_pane_id(), Some(7));
+            assert_eq!(
+                model.selected_pane_uuid(),
+                None,
+                "a numeric pane match cannot replace the event's capture identity"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_live_event_uuid_is_fenced_by_current_inventory() {
+        let mut model = FleetModel::new();
+        let inventory = r#"{"ok":true,"data":{"panes":[{"pane_id":7,"pane_uuid":"capture-a","domain":"local","last_seen_at":10000}]}}"#;
+        model.ingest_panes(inventory).unwrap();
+        model
+            .ingest_stream_frame(
+                r#"{"schema":"ft.stream.v1","kind":"event","ts_ms":9500,"data":{"event":{"type":"pattern_detected","pane_id":7,"pane_uuid":"capture-a","event_id":5,"detection":{"rule_id":"test.rule","severity":"warning"}}}}"#,
+            )
+            .unwrap();
+        model.update(key(KeyCode::Char('2')));
+        assert_eq!(model.selected_pane_uuid(), Some("capture-a"));
+        model
+            .ingest_panes(&inventory.replace("capture-a", "capture-b"))
+            .unwrap();
+        assert_eq!(model.selected_pane_id(), Some(7));
+        assert_eq!(model.selected_pane_uuid(), None);
+        model.ingest_panes(&panes_body(&[])).unwrap();
+        assert_eq!(model.selected_pane_uuid(), None);
+    }
+
+    #[test]
+    fn changed_event_capture_identity_requires_explicit_reselection() {
+        let mut model = FleetModel::new();
+        model
+            .ingest_panes(
+                r#"{"ok":true,"data":{"panes":[{"pane_id":7,"pane_uuid":"capture-b","domain":"local","last_seen_at":10000}]}}"#,
+            )
+            .unwrap();
+        let history = r#"{"ok":true,"data":{"events":[{"id":5,"pane_id":7,"pane_uuid":"capture-a","rule_id":"test.rule","severity":"warning","detected_at":9500}]}}"#;
+        model.ingest_events(history).unwrap();
+        model.update(key(KeyCode::Char('2')));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        assert_eq!(model.selected_pane_uuid(), None);
+        model
+            .ingest_events(&history.replace("capture-a", "capture-b"))
+            .unwrap();
+        assert_eq!(model.selected_pane_id(), None);
+        assert_eq!(model.selected_pane_uuid(), None);
+        model.update(key(KeyCode::Home));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        assert_eq!(model.selected_pane_uuid(), Some("capture-b"));
     }
 
     #[test]
