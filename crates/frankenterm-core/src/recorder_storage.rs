@@ -1514,12 +1514,10 @@ impl AppendLogRecorderStorage {
         mut config: AppendLogStorageConfig,
     ) -> std::result::Result<Self, RecorderStorageError> {
         config.validate()?;
-        config.data_path = resolve_recorder_path(&config.data_path)?;
-        config.state_path = resolve_recorder_path(&config.state_path)?;
-        validate_recorder_paths(&config)?;
         // Path leases, the writer lock and directory sync are qualified only
-        // on Unix (see RecorderBackendKind::platform_default). Refuse here,
-        // after read-only admission and before creating any directory.
+        // on Unix (see RecorderBackendKind::platform_default). Refuse before
+        // touching the filesystem: on Windows the path admission below failed
+        // first, with "Incorrect function", so this refusal was never seen.
         if !cfg!(unix) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1527,6 +1525,9 @@ impl AppendLogRecorderStorage {
             )
             .into());
         }
+        config.data_path = resolve_recorder_path(&config.data_path)?;
+        config.state_path = resolve_recorder_path(&config.state_path)?;
+        validate_recorder_paths(&config)?;
         ensure_durable_parent_chain(&config.data_path)?;
         ensure_durable_parent_chain(&config.state_path)?;
         validate_recorder_paths(&config)?;
@@ -6068,6 +6069,30 @@ mod tests {
 
         let storage = bootstrap_recorder_storage(config).unwrap();
         assert_eq!(storage.backend_kind(), RecorderBackendKind::Rusqlite);
+    }
+
+    // An explicit append-log setting off Unix gets the refusal that names the
+    // rusqlite setting, before any filesystem work: path admission used to run
+    // first and failed natively on Windows with "Incorrect function".
+    #[cfg(not(unix))]
+    #[test]
+    fn append_log_refuses_off_unix_before_touching_the_filesystem() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        let Err(error) = AppendLogRecorderStorage::open(test_config(&nested)) else {
+            panic!("the append log must not open off Unix");
+        };
+        let RecorderStorageError::Io(io) = &error else {
+            panic!("expected the platform refusal, got {error}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::Unsupported, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("set storage.recorder_backend = \"rusqlite\""),
+            "{error}"
+        );
+        assert!(!nested.exists(), "the refusal must not create directories");
     }
 
     // `ft watch` bootstraps the configured backend and stops if it cannot open,
@@ -10882,6 +10907,10 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    // Lease admission runs only where the append log can open. Off Unix the
+    // open refuses before any path work (see
+    // append_log_refuses_off_unix_before_touching_the_filesystem).
+    #[cfg(unix)]
     #[test]
     fn path_leases_reject_unicode_aliases_of_reserved_ancestors() {
         let root = tempdir().unwrap();
