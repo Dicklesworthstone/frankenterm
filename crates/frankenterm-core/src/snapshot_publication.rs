@@ -838,59 +838,63 @@ thread_local! {
     static DIRECTORY_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Flush an adopted file, which `path` names inside `parent`, and its entry.
-/// Windows flushes only through a writable handle ("Access is denied" on the
-/// read handle adoption uses), so there the file is reopened for writing,
-/// without create or truncate, through `parent`.
-fn sync_adopted_file(file: &File, parent: &Dir, path: &Path) -> Result<(), PublicationError> {
+/// Flush `file`, which `name` names inside `parent`, even when `file` is only
+/// open for reading. Windows flushes only through a writable handle
+/// (`FlushFileBuffers` on a read handle is "Access is denied"), so there
+/// `name` is reopened for writing, without create or truncate, and flushed
+/// only while it still names `file`. Both metadata come from open handles, so
+/// dev and ino are the volume serial number and file index. The index is 64
+/// bits, which ReFS's 128-bit IDs truncate (ft-8r43i.16), so length and
+/// modification time must match as well. `Ok(false)` means the name no longer
+/// names `file` and nothing was flushed.
+pub(crate) fn sync_file_named_in(file: &File, parent: &Dir, name: &Path) -> std::io::Result<bool> {
     #[cfg(not(windows))]
     {
-        file.sync_all()
-            .map_err(|error| PublicationError::io(path, error))?;
+        let _ = (parent, name);
+        file.sync_all()?;
     }
     #[cfg(windows)]
     {
         use cap_fs_ext::MetadataExt as _;
 
-        let name = path.file_name().ok_or_else(|| {
-            PublicationError::io(
-                path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "adopted file path has no file name",
-                ),
-            )
-        })?;
         let mut options = OpenOptions::new();
         options.write(true).follow(FollowSymlinks::No);
-        let writer = parent
-            .open_with(name, &options)
-            .map_err(|error| PublicationError::io(path, error))?;
-        // The name must still be the adopted file. Both metadata come from
-        // open handles, so dev and ino are the volume serial number and file
-        // index, as snapshot_engine compares them. The index is 64 bits, which
-        // ReFS's 128-bit IDs truncate (ft-8r43i.16), so length and
-        // modification time must match as well.
-        let adopted = file
-            .metadata()
-            .map_err(|error| PublicationError::io(path, error))?;
-        let reopened = writer
-            .metadata()
-            .map_err(|error| PublicationError::io(path, error))?;
+        let writer = parent.open_with(name, &options)?;
+        let held = file.metadata()?;
+        let reopened = writer.metadata()?;
         if !reopened.is_file()
-            || adopted.dev() != reopened.dev()
-            || adopted.ino() != reopened.ino()
-            || adopted.len() != reopened.len()
-            || adopted.modified().ok() != reopened.modified().ok()
+            || held.dev() != reopened.dev()
+            || held.ino() != reopened.ino()
+            || held.len() != reopened.len()
+            || held.modified().ok() != reopened.modified().ok()
         {
-            return Err(PublicationError::InsecurePermissions {
-                path: path.to_path_buf(),
-                reason: "adopted file was replaced before its flush".to_string(),
-            });
+            return Ok(false);
         }
-        writer
-            .sync_all()
-            .map_err(|error| PublicationError::io(path, error))?;
+        writer.sync_all()?;
+    }
+    Ok(true)
+}
+
+/// Flush an adopted file, which `path` names inside `parent`, and its entry.
+fn sync_adopted_file(file: &File, parent: &Dir, path: &Path) -> Result<(), PublicationError> {
+    #[cfg(windows)]
+    let name = Path::new(path.file_name().ok_or_else(|| {
+        PublicationError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "adopted file path has no file name",
+            ),
+        )
+    })?);
+    // Unused off Windows, where the open handle is flushed directly.
+    #[cfg(not(windows))]
+    let name = path;
+    if !sync_file_named_in(file, parent, name).map_err(|error| PublicationError::io(path, error))? {
+        return Err(PublicationError::InsecurePermissions {
+            path: path.to_path_buf(),
+            reason: "adopted file was replaced before its flush".to_string(),
+        });
     }
     sync_directory(parent, path.parent().unwrap_or_else(|| Path::new(".")))
 }

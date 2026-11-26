@@ -13200,8 +13200,11 @@ fn read_checkpoint_artifact_from_parent_bounded_with_hook(
         ));
     }
     after_read();
-    if synchronize_file {
-        file.sync_all()?;
+    // A read-only handle, which Windows cannot flush; see sync_file_named_in.
+    if synchronize_file && !crate::snapshot_publication::sync_file_named_in(&file, parent, leaf)? {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact was replaced before its flush".to_string(),
+        ));
     }
     let after = validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(leaf)?,
@@ -13654,8 +13657,12 @@ fn checkpoint_artifact_open_file_matches_expected_with_hook(
         offset = end;
     }
     after_read();
-    if synchronize_file {
-        file.sync_all()?;
+    // The handle may be read-only (the existing-target check), which Windows
+    // cannot flush; see sync_file_named_in.
+    if synchronize_file && !crate::snapshot_publication::sync_file_named_in(file, parent, leaf)? {
+        return Err(CheckpointScrollbackArtifactError::InvalidArtifact(
+            "artifact was replaced before its flush".to_string(),
+        ));
     }
     let after = validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(leaf)?,
