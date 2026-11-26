@@ -70194,6 +70194,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             all_checks.push(recorder_storage_diagnostic_check(
                 &layout.ft_dir.join("recorder-log"),
             ));
+            all_checks.push(disk_space_diagnostic_check(&layout.ft_dir));
 
             let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
             let swarm_capacity_summary = runtime_snapshot
@@ -101862,6 +101863,71 @@ fn session_persistence_is_healthy(
         && !report.cleanup_attempt.blocks_cleanup()
 }
 
+/// Free space on the volume holding `.ft` below which the `ft doctor` row says
+/// writes under `.ft` (the recorder log, and ft.db unless `storage.db_path`
+/// moves it) are about to fail. It stays a warning, never an error: doctor's
+/// `ok` is the installer's activation readiness gate (install.sh
+/// `probe_activated_process_family`), and free space says nothing about
+/// whether the installed binaries work.
+const DISK_FREE_URGENT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Free space below which `ft doctor` warns on a volume of 50 GiB or more.
+/// Absolute bytes, not a usage percentage: a large volume can be 90% used and
+/// still hold hundreds of GiB. See [`disk_free_warn_bytes`] for small volumes.
+const DISK_FREE_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The warning threshold for a volume of `total` bytes: a fifth of it, so a
+/// small, mostly empty volume (a VM, a container) does not warn on every run;
+/// at least [`RECORDER_STORAGE_WARN_BYTES`], the recorder's own retention
+/// budget plus a margin; at most [`DISK_FREE_WARN_BYTES`]. A volume smaller
+/// than that floor always warns, correctly: it cannot hold what the recorder
+/// may write.
+fn disk_free_warn_bytes(total: u64) -> u64 {
+    (total / 5).clamp(RECORDER_STORAGE_WARN_BYTES, DISK_FREE_WARN_BYTES)
+}
+
+/// `ft doctor` row for free space on the volume holding `.ft`, probed at its
+/// nearest existing ancestor so it also works before `.ft` is created.
+fn disk_space_diagnostic_check(ft_dir: &Path) -> DiagnosticCheck {
+    let probe = ft_dir
+        .ancestors()
+        .find(|path| path.exists())
+        .unwrap_or(ft_dir);
+    disk_space_diagnostic_check_from(
+        probe,
+        frankenterm_core::disk_pressure::disk_space_for_path(probe),
+    )
+}
+
+/// The disk-space row for one `(available_bytes, total_bytes)` reading.
+fn disk_space_diagnostic_check_from(probe: &Path, space: Option<(u64, u64)>) -> DiagnosticCheck {
+    let Some((available, total)) = space.filter(|&(_, total)| total > 0) else {
+        return DiagnosticCheck::warning(
+            "disk space",
+            format!(
+                "free space unreadable at {}",
+                diagnostic_path_for_output(probe)
+            ),
+            "ft could not read this volume's free space; check it by hand before relying on .ft writes",
+        );
+    };
+    let available = available.min(total);
+    let used_percent =
+        u64::try_from(u128::from(total - available) * 100 / u128::from(total)).unwrap_or(100);
+    let detail = format!(
+        "{used_percent}% used ({} available of {})",
+        format_bytes_human(available),
+        format_bytes_human(total)
+    );
+    let recommendation = if available < DISK_FREE_URGENT_BYTES {
+        "Writes under .ft (the recorder log, and ft.db by default) will start failing; free space on this volume now"
+    } else if available < disk_free_warn_bytes(total) {
+        "Free space on the volume holding .ft; the recorder log, and ft.db by default, grow there"
+    } else {
+        return DiagnosticCheck::ok_with_detail("disk space", detail);
+    };
+    DiagnosticCheck::warning("disk space", detail, recommendation)
+}
+
 /// Recorder files larger than this get a doctor warning (ft-w1nas).
 /// Past the append-log budget plus an active segment and a margin.
 const RECORDER_STORAGE_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
@@ -109180,6 +109246,84 @@ mod tests {
         assert!(matches!(large.status, DiagnosticStatus::Warning));
         assert_eq!(format_bytes_human(1536), "1.5 KiB");
         assert_eq!(format_bytes_human(12), "12 B");
+    }
+
+    #[test]
+    fn disk_space_row_classifies_by_free_bytes_scaled_down_for_small_volumes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let probe = Path::new("/vol");
+
+        // 50 GiB and up: 10 GiB. Below: a fifth of the volume, floored at 3 GiB.
+        assert_eq!(disk_free_warn_bytes(4096 * GIB), 10 * GIB);
+        assert_eq!(disk_free_warn_bytes(50 * GIB), 10 * GIB);
+        assert_eq!(disk_free_warn_bytes(30 * GIB), 6 * GIB);
+        assert_eq!(disk_free_warn_bytes(8 * GIB), RECORDER_STORAGE_WARN_BYTES);
+        assert_eq!(disk_free_warn_bytes(0), RECORDER_STORAGE_WARN_BYTES);
+
+        // A mostly empty 8 GiB volume is fine; one below the recorder budget warns.
+        let small_empty = disk_space_diagnostic_check_from(probe, Some((7 * GIB, 8 * GIB)));
+        assert!(matches!(small_empty.status, DiagnosticStatus::Ok));
+        let small_low = disk_space_diagnostic_check_from(probe, Some((2 * GIB, 8 * GIB)));
+        assert!(matches!(small_low.status, DiagnosticStatus::Warning));
+
+        let roomy = disk_space_diagnostic_check_from(probe, Some((450 * GIB, 4096 * GIB)));
+        assert!(matches!(roomy.status, DiagnosticStatus::Ok));
+        assert_eq!(
+            roomy.detail.as_deref(),
+            Some("89% used (450.0 GiB available of 4.0 TiB)")
+        );
+
+        let low = disk_space_diagnostic_check_from(probe, Some((5 * GIB, 100 * GIB)));
+        assert!(matches!(low.status, DiagnosticStatus::Warning));
+        assert_eq!(
+            low.detail.as_deref(),
+            Some("95% used (5.0 GiB available of 100.0 GiB)")
+        );
+
+        // Under 1 GiB is urgent but still a warning: doctor's ok gates the
+        // installer's activation, which free space must not roll back.
+        let urgent = |check: &DiagnosticCheck| {
+            check
+                .recommendation
+                .as_deref()
+                .is_some_and(|text| text.contains("will start failing"))
+        };
+        let full = disk_space_diagnostic_check_from(probe, Some((GIB / 2, 100 * GIB)));
+        assert!(matches!(full.status, DiagnosticStatus::Warning));
+        assert!(urgent(&full));
+        assert!(!urgent(&low));
+
+        // Both thresholds are exclusive: on 100 GiB, exactly 1 GiB is a plain
+        // warning and exactly 10 GiB is ok.
+        let at_urgent = disk_space_diagnostic_check_from(probe, Some((GIB, 100 * GIB)));
+        assert!(matches!(at_urgent.status, DiagnosticStatus::Warning));
+        assert!(!urgent(&at_urgent));
+        let at_warn = disk_space_diagnostic_check_from(probe, Some((10 * GIB, 100 * GIB)));
+        assert!(matches!(at_warn.status, DiagnosticStatus::Ok));
+
+        // An available count above the total is clamped, never underflows.
+        let odd = disk_space_diagnostic_check_from(probe, Some((200 * GIB, 100 * GIB)));
+        assert!(matches!(odd.status, DiagnosticStatus::Ok));
+        assert!(odd.detail.unwrap_or_default().starts_with("0% used"));
+
+        for unreadable in [None, Some((0, 0))] {
+            let check = disk_space_diagnostic_check_from(probe, unreadable);
+            assert!(matches!(check.status, DiagnosticStatus::Warning));
+            assert_eq!(
+                check.detail.as_deref(),
+                Some("free space unreadable at /vol")
+            );
+        }
+    }
+
+    #[test]
+    fn disk_space_row_probes_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let check = disk_space_diagnostic_check(&dir.path().join("not-yet").join(".ft"));
+        assert_eq!(check.name, "disk space");
+        let detail = check.detail.unwrap_or_default();
+        assert!(detail.contains("% used ("), "{detail}");
+        assert!(!detail.contains("unreadable"), "{detail}");
     }
 
     #[test]

@@ -149,8 +149,8 @@ pub struct DiskPressureConfig {
 /// Default disk-pressure sampling root. Unix keeps `/` (root filesystem,
 /// behavior unchanged); Windows uses the OS temp dir, which lives on the system
 /// drive, so the longest-prefix volume match in `read_windows_disk_space`
-/// resolves to that drive. (`/` matches no Windows volume mount point and would
-/// otherwise leave Windows disk pressure permanently Green.) ft-plp3c.
+/// resolves to that drive. ft-plp3c. (A configured `/` also works there: it
+/// canonicalizes to the current drive's root.)
 fn default_disk_root_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -530,11 +530,7 @@ impl DiskPressureMonitor {
     /// Take a disk-space sample.
     #[must_use]
     pub fn sample(&self) -> DiskSample {
-        #[cfg(windows)]
-        let disk_space = read_windows_disk_space(&self.config.root_path);
-        #[cfg(not(windows))]
-        let disk_space = read_disk_space_statvfs(&self.config.root_path)
-            .or_else(|| read_disk_space_df(&self.config.root_path));
+        let disk_space = disk_space_for_path(&self.config.root_path);
 
         let (available_bytes, total_bytes, usage_fraction) = derive_disk_sample_fields(disk_space);
 
@@ -669,6 +665,24 @@ fn now_epoch_ms() -> u64 {
     crate::clock_anomaly::epoch_ms_u64("ft.disk_pressure.clock")
 }
 
+/// `(available_bytes, total_bytes)` for the filesystem holding `path`: statvfs,
+/// then `df`, off Windows; on Windows the volume holding the path once
+/// canonicalized (see `read_windows_disk_space`). `None` when the probe cannot
+/// read it, including a Windows path that does not exist or matches no local
+/// volume (a network share); it never reports another volume's numbers. [`DiskPressureMonitor::sample`] and
+/// `ft doctor` use it.
+#[must_use]
+pub fn disk_space_for_path(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        read_windows_disk_space(path)
+    }
+    #[cfg(not(windows))]
+    {
+        read_disk_space_statvfs(path).or_else(|| read_disk_space_df(path))
+    }
+}
+
 /// Map a raw `(available_bytes, total_bytes)` reading into the
 /// `(available, total, usage_fraction)` triple stored on a `DiskSample`.
 ///
@@ -737,13 +751,22 @@ fn read_disk_space_statvfs(path: &Path) -> Option<(u64, u64)> {
 
 /// Windows: `(available_bytes, total_bytes)` for the volume containing `path`,
 /// via `sysinfo` (safe; zero unsafe, see docs/proposals/windows-unsafe-policy.md).
-/// Picks the disk whose mount point is the longest prefix of `path` (e.g.
-/// `C:\` for `C:\Users\...`), mirroring the statvfs `(available.min(total),
-/// total)` contract. If `path` is the default `/` or otherwise cannot be
-/// matched to a mount point, returns the first usable disk instead of falling
-/// back to an unavailable Unix `df` command on Windows.
+/// The path is canonicalized first, so a junction, symlink or `subst` drive
+/// counts against the volume that really holds it, and `/` against the current
+/// drive's root. Then the disk whose mount point is the longest prefix of the
+/// result wins (e.g. `C:\` for `\\?\C:\Users\...`), mirroring the statvfs
+/// `(available.min(total), total)` contract. A path that does not exist or
+/// matches no local volume (a network share) is `None`, so an unreadable root
+/// fails closed rather than borrowing another volume's numbers. A path that
+/// exists but cannot be canonicalized (some volumes without a drive letter
+/// refuse it) is matched as written.
 #[cfg(windows)]
 fn read_windows_disk_space(path: &Path) -> Option<(u64, u64)> {
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => path.to_path_buf(),
+    };
     let disks = match sysinfo::Disks::new_with_refreshed_list() {
         Ok(disks) => disks,
         Err(error) => {
@@ -753,7 +776,7 @@ fn read_windows_disk_space(path: &Path) -> Option<(u64, u64)> {
     };
     // sysinfo 0.40 dropped Disks::list(); Disks derefs to [Disk].
     select_disk_space_for_path(
-        path,
+        &resolved,
         disks.iter().map(|disk| DiskSpaceCandidate {
             mount_point: disk.mount_point().to_path_buf(),
             available_bytes: disk.available_space(),
@@ -775,7 +798,6 @@ fn select_disk_space_for_path(
     path: &Path,
     candidates: impl IntoIterator<Item = DiskSpaceCandidate>,
 ) -> Option<(u64, u64)> {
-    let mut first_usable = None;
     let mut best_match: Option<(usize, u64, u64)> = None;
 
     for candidate in candidates {
@@ -783,20 +805,16 @@ fn select_disk_space_for_path(
             continue;
         }
 
-        let available = candidate.available_bytes.min(candidate.total_bytes);
-        first_usable.get_or_insert((available, candidate.total_bytes));
-
         if disk_path_has_mount_prefix(path, &candidate.mount_point) {
             let mount_len = candidate.mount_point.as_os_str().len();
             if best_match.is_none_or(|(best_len, _, _)| mount_len > best_len) {
+                let available = candidate.available_bytes.min(candidate.total_bytes);
                 best_match = Some((mount_len, available, candidate.total_bytes));
             }
         }
     }
 
-    best_match
-        .map(|(_, available, total)| (available, total))
-        .or(first_usable)
+    best_match.map(|(_, available, total)| (available, total))
 }
 
 #[cfg(any(windows, test))]
@@ -821,10 +839,16 @@ fn disk_path_has_mount_prefix(path: &Path, mount: &Path) -> bool {
 
 #[cfg(any(windows, test))]
 fn normalize_mount_prefix(path: &Path) -> String {
-    path.as_os_str()
+    let normalized = path
+        .as_os_str()
         .to_string_lossy()
         .replace('/', "\\")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    // A verbatim `\\?\C:\...` path names the same volume as `C:\...`.
+    if let Some(rest) = normalized.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    normalized
 }
 
 #[cfg(not(windows))]
@@ -870,10 +894,11 @@ mod tests {
     use super::{
         DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, DiskSample, EwmaEstimator,
         PidController, PressureThresholds, classify_tier, derive_disk_sample_fields,
+        disk_space_for_path,
     };
     #[cfg(not(windows))]
     use super::{parse_df_data_line, parse_df_output_kib};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     fn assert_f64_close(actual: f64, expected: f64) {
@@ -974,21 +999,60 @@ mod tests {
     }
 
     #[test]
-    fn ft_d61gw_windows_disk_selection_falls_back_to_first_usable_disk() {
+    fn windows_disk_selection_matches_a_verbatim_path_to_its_drive() {
         let selected = super::select_disk_space_for_path(
-            PathBuf::from("/").as_path(),
+            PathBuf::from(r"\\?\D:\work\.ft").as_path(),
             [
                 super::DiskSpaceCandidate {
                     mount_point: PathBuf::from(r"C:\"),
-                    available_bytes: 120,
+                    available_bytes: 90,
                     total_bytes: 100,
                 },
                 super::DiskSpaceCandidate {
                     mount_point: PathBuf::from(r"D:\"),
-                    available_bytes: 40,
+                    available_bytes: 30,
                     total_bytes: 100,
                 },
             ],
+        );
+
+        assert_eq!(selected, Some((30, 100)));
+    }
+
+    // A path that matches no volume (a network share, or `/` before
+    // read_windows_disk_space canonicalizes it) is unreadable: it must fail
+    // closed, never borrow the first volume's numbers.
+    #[test]
+    fn windows_disk_selection_reports_no_other_volume_for_an_unmatched_path() {
+        for unmatched in [r"\\server\share\work", "/"] {
+            let selected = super::select_disk_space_for_path(
+                PathBuf::from(unmatched).as_path(),
+                [
+                    super::DiskSpaceCandidate {
+                        mount_point: PathBuf::from(r"C:\"),
+                        available_bytes: 90,
+                        total_bytes: 100,
+                    },
+                    super::DiskSpaceCandidate {
+                        mount_point: PathBuf::from(r"D:\"),
+                        available_bytes: 40,
+                        total_bytes: 100,
+                    },
+                ],
+            );
+            assert_eq!(selected, None, "{unmatched}");
+        }
+    }
+
+    #[test]
+    fn windows_disk_selection_clamps_available_to_total() {
+        let selected = super::select_disk_space_for_path(
+            PathBuf::from(r"\\?\C:\work").as_path(),
+            [super::DiskSpaceCandidate {
+                mount_point: PathBuf::from(r"C:\"),
+                available_bytes: 120,
+                total_bytes: 100,
+            }],
         );
 
         assert_eq!(selected, Some((100, 100)));
@@ -1278,6 +1342,26 @@ mod tests {
         assert_eq!(sample.available_bytes, 0);
         assert_eq!(sample.total_bytes, 0);
         assert!(sample.usage_fraction.is_nan());
+    }
+
+    #[test]
+    fn disk_space_for_path_reads_the_volume_holding_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (available, total) =
+            disk_space_for_path(dir.path()).expect("a temp directory's volume is readable");
+        assert!(total > 0);
+        assert!(available <= total);
+    }
+
+    // Unix: statvfs and df both fail. Windows: the path matches no volume.
+    #[test]
+    fn disk_space_for_path_is_none_for_a_missing_path() {
+        assert_eq!(
+            disk_space_for_path(Path::new(
+                "/definitely/not/a/frankenterm/disk-pressure/root"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1589,6 +1673,16 @@ mod windows_initialization_tests {
         let path = std::env::current_dir().unwrap();
         let (available, total) =
             read_windows_disk_space(&path).expect("the current Windows volume must be visible");
+        assert!(total > 0);
+        assert!(available <= total);
+    }
+
+    // `/` canonicalizes to the current drive's root, so a monitor configured
+    // with a Unix-style root still reads a real volume (ft-plp3c, ft-d61gw).
+    #[test]
+    fn slash_root_resolves_to_the_current_drive() {
+        let (available, total) =
+            read_windows_disk_space(Path::new("/")).expect("`/` names the current drive's root");
         assert!(total > 0);
         assert!(available <= total);
     }

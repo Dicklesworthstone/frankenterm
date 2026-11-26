@@ -32,7 +32,9 @@ tar.workspace = true
 [dependencies]
 frankenterm-build-identity.workspace = true
 uuid = { workspace = true, features = ["v4", "rng"] }
-frankenterm-core = { workspace = true, default-features = false }
+# disk-pressure: `ft doctor` reads free space through core's cross-platform
+# probe (statvfs/df, or the matching Windows volume).
+frankenterm-core = { workspace = true, default-features = false, features = ["disk-pressure"] }
 # GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling; `ft list | head`
 # must not unwind through or crash the shipped process.
 frankenterm-sigpipe = { workspace = true }
