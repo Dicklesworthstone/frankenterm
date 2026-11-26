@@ -67,6 +67,7 @@ export function createPaneOutput({
   let readyGeneration = 0;
   let captureTimer = null;
   let capture = null;
+  let followFromSegment = null;
   let capturePending = false;
   let generation = 0;
   let retryMs = 1000;
@@ -305,6 +306,10 @@ export function createPaneOutput({
             const previous = BigInt(receivedSequence);
             const current = BigInt(sequence);
             if (current !== previous + 1n) {
+              if (followFromSegment !== null) {
+                halt("capture sequence changed after the selected segment");
+                return;
+              }
               sequenceDiscontinuities = Math.min(Number.MAX_SAFE_INTEGER, sequenceDiscontinuities + 1);
               if (current <= previous) sequenceRestarted = true;
             }
@@ -401,7 +406,7 @@ export function createPaneOutput({
     return {
       paneId: pane, status, paused, suspended, history, cursor: received,
       resumeCursor: receivedCursor?.token ?? null, terminal,
-      text, discardedChars, gapNotifications: gaps, unanchored, error, capture,
+      text, discardedChars, gapNotifications: gaps, unanchored, error, capture, followFromSegment,
       sequence: receivedSequence, sequenceDiscontinuities, sequenceRestarted, retainedPrefixMissing,
     };
   }
@@ -410,6 +415,7 @@ export function createPaneOutput({
     retire();
     pane = selected;
     capture = target;
+    followFromSegment = null;
     capturePending = target !== null;
     history = Boolean(retainedHistory);
     paused = false;
@@ -460,6 +466,17 @@ export function createPaneOutput({
       target.captureCursor = boundary.token;
       startSelection(target.paneId, true, Object.freeze(target));
     },
+    // An explicit new action turns a completed one-segment read into a
+    // read-only stream. Keep its admitted epoch, segment and per-pane sequence
+    // together: opening by numeric pane alone would skip intervening output.
+    followCapture() {
+      if (status !== "historical" || capture === null || suspended
+          || receivedCursor?.segment !== capture.segmentId || receivedSequence === null) return false;
+      followFromSegment = capture.segmentId;
+      capture = null;
+      open();
+      return true;
+    },
     pause() {
       if (pane === null || terminal || paused || capture !== null) return;
       retire();
@@ -495,6 +512,7 @@ export function createPaneOutput({
       retire();
       pane = null;
       capture = null;
+      followFromSegment = null;
       capturePending = false;
       received = null;
       receivedCursor = null;
@@ -590,9 +608,17 @@ export function mountPaneOutput({
       : opened ? `Pane ${state.paneId} — captured output` : "Captured output");
     const captureStatus = state.status === "historical" ? "Historical capture loaded"
       : state.status === "loading" ? "Loading historical capture" : "Historical capture unavailable";
+    const streamStart = state.followFromSegment !== null ? `from captured segment ${state.followFromSegment}`
+      : state.history ? "following retained history" : "new output since opening";
     setText(statusLine, historical ? `${captureStatus} · read-only · not following a current pane`
-      : opened ? `${state.status} · read-only · ${state.history ? "following retained history" : "new output since opening"}` : "");
-    historyButton.disabled = follow.disabled = historical;
+      : opened ? `${state.status} · read-only · ${streamStart}` : "");
+    setText(historyButton, historical ? "Follow captured output from here" : "Load retained history");
+    const historyTitle = historical
+      ? "Read subsequent captures for this pane, starting after the displayed segment."
+      : "Replace this view by replaying retained history from the beginning; large histories may take time.";
+    if (historyButton.title !== historyTitle) historyButton.title = historyTitle;
+    historyButton.disabled = historical && (state.status !== "historical" || state.suspended);
+    follow.disabled = historical;
     pause.disabled = historical || state.terminal;
     setText(pause, state.paused ? "Resume" : "Pause");
     pause.setAttribute("aria-pressed", String(state.paused));
@@ -655,7 +681,7 @@ export function mountPaneOutput({
       hint.textContent = "The search result has an invalid capture identity. Search again.";
       return;
     }
-    presentSelection("Historical capture only. Current output requires a separate explicit Open action.", false);
+    presentSelection("Showing one historical capture. Use Follow captured output from here to read subsequent captures.", false);
   }
 
   function openSelected() {
@@ -731,7 +757,13 @@ export function mountPaneOutput({
   });
   historyButton.addEventListener("click", () => {
     const state = output.snapshot();
-    if (state.paneId !== null && state.capture === null) show(state.paneId, true);
+    if (state.capture !== null) {
+      if (!output.followCapture()) return;
+      transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
+      follow.checked = true;
+      hint.textContent = "Following captured output after the selected segment.";
+      render();
+    } else if (state.paneId !== null) show(state.paneId, true);
   });
   closeButton.addEventListener("click", close);
   follow.addEventListener("change", () => {

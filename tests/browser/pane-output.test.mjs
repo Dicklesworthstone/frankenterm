@@ -1619,3 +1619,55 @@ test("historical panel exposes unavailable and truncated states without substitu
   assert.equal(f.output.snapshot().text, "def");
   assert.match(f.nodes["pane-output-hint"].textContent, /invalid capture identity/);
 });
+
+test("following a confirmed search hit resumes its exact stream and keeps the displayed capture", () => {
+  const f = panelFixture();
+  const hit = captureHit({ segmentId: "9007199254740993" });
+  f.panel.openCapture(hit);
+  const historical = f.latest();
+  assert.equal(f.output.followCapture(), false, "pending capture has no continuation authority");
+  capturedDelta(historical, hit, "found\n", { sequence: "72" });
+  f.panel.render();
+  const button = f.nodes["pane-output-history"];
+  assert.equal(button.textContent, "Follow captured output from here");
+  assert.equal(button.disabled, false);
+  assert.equal(f.sources.length, 1, "displaying the match alone stays finite");
+  f.selectRow("99");
+  button.emit("click");
+  const continuation = f.latest();
+  assertResume(continuation, hit.segmentId);
+  assert.equal(continuation.url.searchParams.get("pane_id"), hit.paneId);
+  delta(continuation, hit.segmentId, "discard duplicate", hit.paneId, { sequence: "72" });
+  delta(continuation, "9007199254740997", "next\n", hit.paneId, { sequence: "73" });
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "found\nnext\n");
+  assert.match(f.nodes["pane-output-status"].textContent, /from captured segment 9007199254740993/);
+  assert.equal(button.textContent, "Load retained history");
+  f.output.pause();
+  f.output.resume();
+  assertResume(f.latest(), "9007199254740997");
+  capturedDelta(historical, hit, "stale");
+  assert.equal(f.output.snapshot().text, "found\nnext\n");
+});
+
+test("following a search hit stops before showing another epoch or a discontinuous pane sequence", () => {
+  for (const reason of ["epoch", "reset", "missing"]) {
+    const f = fixture();
+    const hit = captureHit();
+    f.output.selectCapture(hit);
+    capturedDelta(f.latest(), hit, "verified", { sequence: "48" });
+    f.output.suspend();
+    assert.equal(f.output.followCapture(), false);
+    f.output.restore();
+    assert.equal(f.output.followCapture(), true);
+    assert.equal(f.output.followCapture(), false, "one action owns one continuation");
+    const next = f.latest();
+    if (reason === "epoch") next.emit("ready", readyPayload(hit.paneId, hit.segmentId, OTHER_OUTPUT_EPOCH));
+    else delta(next, "19", "other capture", hit.paneId, { sequence: reason === "reset" ? "0" : "50" });
+    assert.equal(next.closed, true);
+    assert.equal(f.output.snapshot().text, "verified");
+    assert.equal(f.output.snapshot().resumeCursor, deltaCursor(hit.segmentId));
+    assert.equal(f.output.snapshot().terminal, true);
+    assert.equal(f.timers.size, 0);
+  }
+});
