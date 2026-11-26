@@ -2295,6 +2295,14 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // balance, which is the false "balance 0%" this migration removes.
         down_sql: None,
     },
+    Migration {
+        version: 53,
+        description: "Persist output-stream identity and never reuse deleted segment IDs",
+        up_sql: super::schema_ddl::SEGMENT_STREAM_SCHEMA_SQL,
+        // Removing allocation authority could reuse a cursor's ID after
+        // retention. An upgrade starts a new epoch for legacy databases.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2377,6 +2385,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_session_recovery_usability_schema(conn)?;
         validate_fleet_mutation_claims_schema(conn)?;
         validate_capture_identity_schema(conn)?;
+        validate_segment_stream_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2451,6 +2460,65 @@ fn validate_fleet_mutation_claims_schema(conn: &Connection) -> Result<()> {
         return Err(StorageError::Corruption {
             details: "schema v50 fleet_mutation_claims has non-canonical execution authority"
                 .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_segment_stream_schema(conn: &Connection) -> Result<()> {
+    let schema = super::schema_ddl::SEGMENT_STREAM_SCHEMA_SQL;
+    for (kind, name) in [
+        ("TABLE", "segment_stream_state"),
+        ("INDEX", "idx_segments_pane_id"),
+        ("TRIGGER", "segment_stream_state_insert_guard"),
+        ("TRIGGER", "segment_stream_state_delete_guard"),
+        ("TRIGGER", "segment_stream_state_update_guard"),
+        ("TRIGGER", "output_segments_monotonic_id_ai"),
+        ("TRIGGER", "output_segments_id_update_guard"),
+    ] {
+        let actual = load_schema_object_sql(conn, &kind.to_ascii_lowercase(), name)?
+            .ok_or_else(|| StorageError::Corruption {
+                details: format!("schema v53 is missing output-stream authority {name}"),
+            })?;
+        let declaration = format!("CREATE {kind} IF NOT EXISTS {name}");
+        let start = schema.find(&declaration).ok_or_else(|| StorageError::Corruption {
+            details: format!("schema v53 has no canonical definition for {name}"),
+        })?;
+        let tail = &schema[start..];
+        let terminator = if kind == "TRIGGER" { "\nEND;" } else { ";" };
+        let end = tail.find(terminator).ok_or_else(|| StorageError::Corruption {
+            details: format!("schema v53 has an unterminated definition for {name}"),
+        })? + terminator.len();
+        if compact_schema_sql(&actual) != compact_schema_sql(&tail[..end]) {
+            return Err(StorageError::Corruption {
+                details: format!("schema v53 has non-canonical output-stream authority {name}"),
+            }
+            .into());
+        }
+    }
+    let valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) = 1
+                    AND MIN(singleton) = 1
+                    AND MIN(typeof(cursor_epoch) = 'text'
+                            AND length(cursor_epoch) = 32
+                            AND cursor_epoch NOT GLOB '*[^0-9a-f]*')
+                    AND MIN(typeof(max_segment_id) = 'integer'
+                            AND max_segment_id >= 0
+                            AND max_segment_id >= (
+                                SELECT COALESCE(MAX(id), 0) FROM output_segments
+                            ))
+             FROM segment_stream_state",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Corruption {
+            details: format!("cannot validate output-stream authority: {error}"),
+        })?;
+    if !valid {
+        return Err(StorageError::Corruption {
+            details: "schema v53 output-stream authority is missing or inconsistent".to_string(),
         }
         .into());
     }
@@ -6699,6 +6767,9 @@ fn apply_migration_mutation(
             if migration.version == 51 {
                 validate_capture_identity_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v51")?;
+            }
+            if migration.version == 53 {
+                validate_segment_stream_schema(conn)?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;

@@ -2891,6 +2891,16 @@ trait StorageBackendProvider: Send + Sync {
 
     fn lend_read_backend<'a>(&'a self, db_path: &str) -> Result<Box<dyn StorageBackendLoan + 'a>>;
 
+    /// Lend a current database view for identity-sensitive cursor reads.
+    /// Custom providers own their read identity and may reuse their normal
+    /// loan; providers caching path-backed connections must override this.
+    fn lend_fresh_read_backend<'a>(
+        &'a self,
+        db_path: &str,
+    ) -> Result<Box<dyn StorageBackendLoan + 'a>> {
+        self.lend_read_backend(db_path)
+    }
+
     fn provider_name(&self) -> &'static str;
 }
 
@@ -3072,6 +3082,33 @@ impl StorageBackendProvider for RusqliteStorageBackendProvider {
     fn provider_name(&self) -> &'static str {
         "rusqlite"
     }
+
+    fn lend_fresh_read_backend<'a>(
+        &'a self,
+        db_path: &str,
+    ) -> Result<Box<dyn StorageBackendLoan + 'a>> {
+        let config = crate::storage_backend_trait::OpenConfig {
+            read_only: true,
+            wal_mode: false,
+            ..crate::storage_backend_trait::OpenConfig::default()
+        };
+        let backend = RusqliteBackend::open(db_path, &config)
+            .map_err(|err| storage_backend_error("Open current stream read connection", err))?;
+        backend
+            .set_busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| storage_backend_error("Set stream reader busy timeout", err))?;
+        Ok(Box::new(FreshStorageReadBackendLoan { backend }))
+    }
+}
+
+struct FreshStorageReadBackendLoan {
+    backend: RusqliteBackend,
+}
+
+impl StorageBackendLoan for FreshStorageReadBackendLoan {
+    fn backend(&self) -> &dyn StorageBackend {
+        &self.backend
+    }
 }
 
 struct RusqliteReadBackendLoan {
@@ -3218,6 +3255,22 @@ where
     F: FnOnce(&dyn StorageBackend) -> Result<R>,
 {
     let mut loan = provider.lend_read_backend(db_path)?;
+    let result = f(loan.backend());
+    if !result.as_ref().err().is_some_and(is_backend_epoch_poisoned) {
+        loan.mark_successful_use();
+    }
+    result
+}
+
+fn with_provider_fresh_read_backend<F, R>(
+    provider: &dyn StorageBackendProvider,
+    db_path: &str,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce(&dyn StorageBackend) -> Result<R>,
+{
+    let mut loan = provider.lend_fresh_read_backend(db_path)?;
     let result = f(loan.backend());
     if !result.as_ref().err().is_some_and(is_backend_epoch_poisoned) {
         loan.mark_successful_use();
@@ -10122,6 +10175,46 @@ impl StorageHandle {
         .await
     }
 
+    /// Read output-stream identity, its durable allocation high-water mark,
+    /// and the retained tail in the requested pane scope in one statement.
+    /// The global high-water mark is validation authority, not a pane cursor.
+    pub async fn get_segment_stream_snapshot_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: Option<u64>,
+    ) -> Result<SegmentStreamSnapshot> {
+        Self::checkpoint_storage_operation(cx, "get_segment_stream_snapshot")?;
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            // Do not recycle a connection to an unlinked database at this
+            // path. This detects a visible replacement; it does not make
+            // replacing a live writer's database safe.
+            with_provider_fresh_read_backend(provider.as_ref(), db_path.as_str(), |backend| {
+                query_segment_stream_snapshot_backend(backend, pane_id)
+            })
+        })
+        .await
+    }
+
+    /// Read at most 1,000 ordered segments and output-stream authority in one
+    /// SQLite statement, including a snapshot when the page is empty.
+    pub async fn get_segments_stream_page_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: SegmentScanQuery,
+    ) -> Result<SegmentStreamPage> {
+        Self::checkpoint_storage_operation(cx, "get_segments_stream_page")?;
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            with_provider_fresh_read_backend(provider.as_ref(), db_path.as_str(), |backend| {
+                query_segments_stream_page_backend(backend, &query)
+            })
+        })
+        .await
+    }
+
     /// Fetch the most recent secret scan report for a scope hash.
     pub async fn latest_secret_scan_report(
         &self,
@@ -12240,6 +12333,26 @@ impl Default for SegmentScanQuery {
         }
     }
 }
+
+/// Independent output-stream identity and one-statement cursor bounds.
+/// `max_segment_id` survives retention and must never be exposed as the tail
+/// of a pane-scoped stream. `tail_segment_id` is retained and scope-specific.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentStreamSnapshot {
+    pub cursor_epoch: String,
+    pub max_segment_id: i64,
+    pub tail_segment_id: i64,
+}
+
+/// Ordered cursor page and its authority from the same SQLite statement.
+#[derive(Debug, Clone)]
+pub struct SegmentStreamPage {
+    pub segments: Vec<Segment>,
+    pub snapshot: SegmentStreamSnapshot,
+}
+
+/// Maximum number of retained rows in one authoritative output-stream page.
+pub const SEGMENT_STREAM_PAGE_MAX: usize = 1_000;
 
 // =============================================================================
 // Writer Thread Implementation
@@ -22332,8 +22445,11 @@ fn insert_output_segment_with_seq_backend(
         //
         // ft-7h5da.2.3: stamp best-effort semantic zone metadata when the
         // runtime can infer it; NULL means historical/unavailable/untyped.
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at, redaction_catalog_version, zone_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO output_segments (id, pane_id, seq, content, content_len, content_hash, captured_at, redaction_catalog_version, zone_type)
+         SELECT max_segment_id + 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         FROM segment_stream_state
+         WHERE singleton = 1 AND typeof(max_segment_id) = 'integer'
+           AND max_segment_id >= 0 AND max_segment_id < 9223372036854775807
          RETURNING id",
         &[
             ToSqlValue::Integer(pane_id_i64),
@@ -22347,7 +22463,12 @@ fn insert_output_segment_with_seq_backend(
         ],
     )
     .map_err(|e| storage_backend_error("Failed to insert segment", e))?
-    .ok_or_else(|| StorageError::Database("Failed to insert segment: no id returned".to_string()))?;
+    .ok_or_else(|| {
+        StorageError::Database(
+            "segment stream allocator is missing, invalid, or exhausted; refusing ID reuse"
+                .to_string(),
+        )
+    })?;
     let id = RowReader::new(&row)
         .i64(0)
         .map_err(|e| storage_backend_error("Failed to parse inserted segment id", e))?;
@@ -36232,6 +36353,145 @@ fn query_incomplete_workflow_page_backend(
 // Segment Scan Query Functions
 // =============================================================================
 
+fn segment_stream_snapshot_select(
+    pane_id: Option<u64>,
+    params: &mut Vec<ToSqlValue<'static>>,
+) -> Result<String> {
+    let scope = match pane_id {
+        Some(pane_id) => {
+            params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+            format!(" WHERE pane_id = ?{}", params.len())
+        }
+        None => String::new(),
+    };
+    Ok(format!(
+        "SELECT cursor_epoch, max_segment_id,
+                (SELECT COALESCE(MAX(id), 0) FROM output_segments{scope}) AS tail_segment_id
+         FROM segment_stream_state WHERE singleton = 1"
+    ))
+}
+
+fn segment_stream_snapshot_from_cells(
+    row: &[SqlCell],
+    start: usize,
+) -> Result<SegmentStreamSnapshot> {
+    let reader = CellRowReader::new(row);
+    let snapshot = SegmentStreamSnapshot {
+        cursor_epoch: reader
+            .string(start)
+            .map_err(|err| storage_backend_error("Read segment stream epoch", err))?,
+        max_segment_id: reader
+            .i64(start + 1)
+            .map_err(|err| storage_backend_error("Read segment stream high-water mark", err))?,
+        tail_segment_id: reader
+            .i64(start + 2)
+            .map_err(|err| storage_backend_error("Read segment stream retained tail", err))?,
+    };
+    if snapshot.cursor_epoch.len() != 32
+        || !snapshot
+            .cursor_epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || snapshot.max_segment_id < 0
+        || snapshot.tail_segment_id < 0
+        || snapshot.tail_segment_id > snapshot.max_segment_id
+    {
+        return Err(StorageError::Database("invalid segment stream authority".to_string()).into());
+    }
+    Ok(snapshot)
+}
+
+fn query_segment_stream_snapshot_backend(
+    backend: &dyn StorageBackend,
+    pane_id: Option<u64>,
+) -> Result<SegmentStreamSnapshot> {
+    let mut params = Vec::new();
+    let sql = segment_stream_snapshot_select(pane_id, &mut params)?;
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query segment stream snapshot", err))?;
+    if rows.len() != 1 {
+        return Err(StorageError::Database("missing segment stream authority".to_string()).into());
+    }
+    segment_stream_snapshot_from_cells(&rows[0], 0)
+}
+
+fn query_segments_stream_page_backend(
+    backend: &dyn StorageBackend,
+    query: &SegmentScanQuery,
+) -> Result<SegmentStreamPage> {
+    let limit = if query.limit == 0 {
+        SEGMENT_STREAM_PAGE_MAX
+    } else {
+        query.limit
+    };
+    if limit > SEGMENT_STREAM_PAGE_MAX || query.after_id.is_some_and(|after_id| after_id < 0) {
+        return Err(StorageError::Database("invalid segment stream page bounds".to_string()).into());
+    }
+    let (where_clause, mut params) = build_segment_scan_backend_where(query, "captured_at")?;
+    params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
+    let limit_param = params.len();
+    let snapshot_sql = segment_stream_snapshot_select(query.pane_id, &mut params)?;
+    let sql = format!(
+        "WITH segment_page AS (
+             SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments{where_clause} ORDER BY id ASC LIMIT ?{limit_param}
+         ), stream_snapshot AS ({snapshot_sql})
+         SELECT 0 AS row_kind, id, pane_id, seq, content, content_len, content_hash, captured_at,
+                NULL AS cursor_epoch, NULL AS max_segment_id, NULL AS tail_segment_id
+         FROM segment_page
+         UNION ALL
+         SELECT 1 AS row_kind, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                cursor_epoch, max_segment_id, tail_segment_id
+         FROM stream_snapshot
+         ORDER BY row_kind ASC, id ASC"
+    );
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query segment stream page", err))?;
+    let mut segments = Vec::new();
+    let mut snapshot = None;
+    for row in &rows {
+        let kind = CellRowReader::new(row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Read segment stream row kind", err))?;
+        match kind {
+            0 => {
+                let cells = row.get(1..8).ok_or_else(|| {
+                    StorageError::Database("invalid segment stream row".to_string())
+                })?;
+                segments.push(segment_from_backend_cells(cells)?);
+            }
+            1 if snapshot.is_none() => {
+                snapshot = Some(segment_stream_snapshot_from_cells(row, 8)?);
+            }
+            _ => {
+                return Err(StorageError::Database("invalid segment stream page".to_string()).into());
+            }
+        }
+    }
+    let snapshot = snapshot.ok_or_else(|| {
+        StorageError::Database("missing segment stream authority".to_string())
+    })?;
+    let mut previous_id = query.after_id.unwrap_or(0);
+    if segments.len() > limit {
+        return Err(StorageError::Database("oversized segment stream page".to_string()).into());
+    }
+    for segment in &segments {
+        if segment.id <= previous_id
+            || segment.id > snapshot.max_segment_id
+            || segment.id > snapshot.tail_segment_id
+            || query.pane_id.is_some_and(|pane_id| segment.pane_id != pane_id)
+            || query.since.is_some_and(|since| segment.captured_at < since)
+            || query.until.is_some_and(|until| segment.captured_at > until)
+        {
+            return Err(StorageError::Database("inconsistent segment stream page".to_string()).into());
+        }
+        previous_id = segment.id;
+    }
+    Ok(SegmentStreamPage { segments, snapshot })
+}
+
 fn query_segment_high_water_id_backend(
     backend: &dyn StorageBackend,
     pane_id: Option<u64>,
@@ -36377,6 +36637,9 @@ fn query_latest_secret_scan_report_backend(
 
 #[cfg(test)]
 mod policy_decision_tests;
+
+#[cfg(test)]
+mod segment_stream_tests;
 
 // =========================================================================
 // wa-4vx.3.4: FTS Search API Tests
@@ -39559,8 +39822,9 @@ fn seed_segment_with_zone_backend(
     let content_len = i64::try_from(content.len()).unwrap();
     let row = backend
         .query_row_typed(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at, zone_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at, zone_type)
+             SELECT max_segment_id + 1, ?1, ?2, ?3, ?4, ?5, ?6
+             FROM segment_stream_state WHERE singleton = 1 AND max_segment_id < 9223372036854775807
              RETURNING id",
             &[
                 ToSqlValue::Integer(pane_id),
@@ -41281,8 +41545,8 @@ fn v35_performance_campaign_segment_retention_writer_yields_and_preserves_fts() 
             .await
             .expect("append reset-chain segment");
         assert_eq!(
-            reset_segment.id, 1,
-            "a fully pruned INTEGER PRIMARY KEY table reuses rowid 1; stale FTS postings must already be gone"
+            reset_segment.id, i64::try_from(segment_count).unwrap() + 1,
+            "a full prune preserves the durable segment allocation high-water mark"
         );
         assert_eq!(reset_segment.seq, 0);
         storage
@@ -41303,7 +41567,7 @@ fn v35_performance_campaign_segment_retention_writer_yields_and_preserves_fts() 
                 .await
                 .expect("search deleted unique term")
                 .is_empty(),
-            "exact deferred-FTS delete commands must prevent stale terms after rowid reuse"
+            "exact deferred-FTS deletes must remove stale terms after the pane sequence resets"
         );
         let fresh_hits = storage
             .search("freshindextoken")
@@ -41368,6 +41632,22 @@ fn v35_fts_version_upgrade_repairs_historical_stale_rowid_postings() {
         // reused for different content, and the legacy index-version marker
         // still claims the stale posting set is authoritative.
         let connection = rusqlite::Connection::open(&db_path).expect("open historical corrupter");
+        // Model a pre-v53 database explicitly: modern writers refuse this
+        // rowid reuse, and reopening must install new stream authority.
+        connection
+            .execute_batch(
+                "DROP TRIGGER output_segments_monotonic_id_ai;
+                 DROP TRIGGER output_segments_id_update_guard;
+                 DROP TRIGGER segment_stream_state_insert_guard;
+                 DROP TRIGGER segment_stream_state_delete_guard;
+                 DROP TRIGGER segment_stream_state_update_guard;
+                 DROP TABLE segment_stream_state;
+                 DROP INDEX idx_segments_pane_id;
+                 PRAGMA user_version = 52;
+                 UPDATE ft_meta SET schema_version = 52 WHERE id = 1;
+                 DELETE FROM schema_version WHERE version = 53;",
+            )
+            .expect("restore historical pre-v53 allocation behavior");
         connection
             .execute("DELETE FROM output_segments WHERE id = ?1", [old_segment.id])
             .expect("simulate historical base-row-only prune");

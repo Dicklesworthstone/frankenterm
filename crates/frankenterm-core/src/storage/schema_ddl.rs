@@ -118,7 +118,11 @@
 /// no percentage for some accounts (an auth failure, for example); storing
 /// that as 0.0 raised false "balance 0%" alerts. Existing rows keep their
 /// stored value: a historical 0.0 cannot be told apart from a real one.
-pub const SCHEMA_VERSION: i32 = 52;
+/// Bumped 52 -> 53 to persist an independent output-stream epoch and allocation
+/// high-water mark. Segment IDs never reuse deleted rows within this epoch.
+pub const SCHEMA_VERSION: i32 = 53;
+
+pub(crate) const SEGMENT_STREAM_SCHEMA_SQL: &str = include_str!("segment_stream.sql");
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -152,7 +156,7 @@ END;
 /// - Timestamps: epoch milliseconds (i64) for hot-path queries.
 /// - JSON columns: TEXT containing JSON (v0 simplicity).
 /// - All tables use INTEGER PRIMARY KEY for rowid aliasing.
-pub const SCHEMA_SQL: &str = r#"
+pub const SCHEMA_SQL: &str = concat!(r#"
 -- Enable WAL mode for concurrent reads and single-writer semantics
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -2447,4 +2451,4 @@ SELECT a.*,
 FROM audit_actions a
 LEFT JOIN action_undo u ON u.audit_action_id = a.id
 LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
-"#;
+"#, include_str!("segment_stream.sql"));
