@@ -19938,13 +19938,35 @@ pub fn export_live_scrollback_transcript(
     })
 }
 
+/// The live scrollback store's root, shared by the mux, the GUI and `ft`.
 #[must_use]
 pub fn default_live_scrollback_dir() -> PathBuf {
-    if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+    live_scrollback_dir_from(
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        std::env::home_dir,
+    )
+}
+
+/// [`default_live_scrollback_dir`] from explicit inputs. Without HOME it
+/// uses the OS's home directory: a Windows GUI started from the Start menu
+/// has no HOME, and its user profile is where Git Bash points HOME by
+/// default, so the GUI and `ft` find one store. Only with no home at all
+/// does it fall back to the working directory.
+fn live_scrollback_dir_from(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    os_home_dir: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    if let Some(base) = xdg_data_home.filter(|value| !value.is_empty()) {
         return PathBuf::from(base).join("ft").join("scrollback-lines");
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| os_home_dir().filter(|home| !home.as_os_str().is_empty()));
+    if let Some(home) = home {
+        return home
             .join(".local")
             .join("share")
             .join("ft")
@@ -20348,6 +20370,44 @@ mod tests {
         )
         .unwrap();
         (dir, backing, deferred)
+    }
+
+    #[test]
+    fn live_scrollback_dir_falls_back_to_the_os_home_before_the_working_directory() {
+        let store = |root: &str| {
+            PathBuf::from(root)
+                .join(".local")
+                .join("share")
+                .join("ft")
+                .join("scrollback-lines")
+        };
+        let os_home = || Some(PathBuf::from("os-home"));
+        let no_os_home = || None;
+        assert_eq!(
+            live_scrollback_dir_from(Some("xdg".into()), Some("home".into()), os_home),
+            PathBuf::from("xdg").join("ft").join("scrollback-lines")
+        );
+        assert_eq!(
+            live_scrollback_dir_from(Some("".into()), Some("home".into()), os_home),
+            store("home")
+        );
+        // No HOME, as for a Windows GUI started from the Start menu.
+        assert_eq!(
+            live_scrollback_dir_from(None, None, os_home),
+            store("os-home")
+        );
+        assert_eq!(
+            live_scrollback_dir_from(None, Some("".into()), os_home),
+            store("os-home")
+        );
+        assert_eq!(
+            live_scrollback_dir_from(None, None, || Some(PathBuf::new())),
+            PathBuf::from(".").join(".ft").join("scrollback-lines")
+        );
+        assert_eq!(
+            live_scrollback_dir_from(None, None, no_os_home),
+            PathBuf::from(".").join(".ft").join("scrollback-lines")
+        );
     }
 
     #[cfg(unix)]
