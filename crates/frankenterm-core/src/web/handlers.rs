@@ -11,7 +11,7 @@ use super::extractors::{
 use super::middleware::AppState;
 use crate::VERSION;
 use crate::policy::Redactor;
-use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult};
+use crate::storage::{CaptureSearchResult, EventQuery, PaneRecord, SearchOptions};
 use crate::ui_query;
 use crate::web_framework::{QueryString, Request, Response, StatusCode};
 use serde::Serialize;
@@ -281,18 +281,43 @@ pub(super) struct SearchHit {
     pub(super) snippet: Option<String>,
     pub(super) captured_at: i64,
     pub(super) content_len: usize,
+    pub(super) capture_cursor: String,
 }
 
 impl SearchHit {
-    pub(super) fn from_result(r: SearchResult, redactor: &Redactor) -> Self {
-        Self {
+    pub(super) fn from_result(
+        hit: CaptureSearchResult,
+        redactor: &Redactor,
+    ) -> crate::error::Result<Self> {
+        let CaptureSearchResult {
+            result: r,
+            cursor_epoch,
+        } = hit;
+        if r.segment.id <= 0
+            || cursor_epoch.len() != 32
+            || !cursor_epoch
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(crate::error::StorageError::Database(
+                "invalid capture search identity".to_string(),
+            )
+            .into());
+        }
+        let capture_cursor = format!(
+            "delta-v2:{cursor_epoch}:pane:{}:{}",
+            r.segment.pane_id,
+            r.segment.id - 1
+        );
+        Ok(Self {
             segment_id: r.segment.id,
             pane_id: r.segment.pane_id,
             score: r.score,
             snippet: r.snippet.map(|s| redactor.redact(&s)),
             captured_at: r.segment.captured_at,
             content_len: r.segment.content_len,
-        }
+            capture_cursor,
+        })
     }
 }
 
@@ -340,16 +365,18 @@ pub(super) fn handle_search(
         };
         // ft-xbnl0.2.3 tick 257: cx-first web search handler.
         let search_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        match storage
-            .search_with_results_with_cx(&search_cx, &query, options)
+        let hits = storage
+            .search_captures_with_cx(&search_cx, &query, options)
             .await
-        {
-            Ok(results) => {
-                let total = results.len();
-                let hits: Vec<SearchHit> = results
+            .and_then(|results| {
+                results
                     .into_iter()
-                    .map(|r| SearchHit::from_result(r, &redactor))
-                    .collect();
+                    .map(|hit| SearchHit::from_result(hit, &redactor))
+                    .collect::<crate::error::Result<Vec<_>>>()
+            });
+        match hits {
+            Ok(hits) => {
+                let total = hits.len();
                 json_ok(SearchResponse {
                     results: hits,
                     total,
@@ -775,27 +802,65 @@ mod tests {
     #[test]
     fn search_hit_from_result_uses_segment_metadata() {
         let hit = SearchHit::from_result(
-            SearchResult {
-                segment: Segment {
-                    id: 9,
-                    pane_id: 4,
-                    seq: 2,
-                    content: "needle in haystack".to_string(),
-                    content_len: 18,
-                    content_hash: None,
-                    captured_at: 1_700_000_000_777,
+            CaptureSearchResult {
+                cursor_epoch: "0123456789abcdef0123456789abcdef".to_string(),
+                result: SearchResult {
+                    segment: Segment {
+                        id: 9,
+                        pane_id: 4,
+                        seq: 2,
+                        content: "needle in haystack".to_string(),
+                        content_len: 18,
+                        content_hash: None,
+                        captured_at: 1_700_000_000_777,
+                    },
+                    snippet: Some("needle".to_string()),
+                    highlight: None,
+                    score: 0.42,
                 },
-                snippet: Some("needle".to_string()),
-                highlight: None,
-                score: 0.42,
             },
             &Redactor::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(hit.segment_id, 9);
         assert_eq!(hit.pane_id, 4);
         assert_eq!(hit.snippet.as_deref(), Some("needle"));
         assert_eq!(hit.content_len, 18);
+        assert_eq!(
+            hit.capture_cursor,
+            "delta-v2:0123456789abcdef0123456789abcdef:pane:4:8"
+        );
         assert!((hit.score - 0.42).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn search_hit_refuses_unbound_or_nonpositive_capture_identity() {
+        for (id, epoch) in [
+            (i64::MIN, "0123456789abcdef0123456789abcdef"),
+            (0, "0123456789abcdef0123456789abcdef"),
+            (1, ""),
+            (1, "0123456789ABCDEF0123456789ABCDEF"),
+            (1, "0123456789abcdef0123456789abcdef\0"),
+        ] {
+            let hit = CaptureSearchResult {
+                cursor_epoch: epoch.to_string(),
+                result: SearchResult {
+                    segment: Segment {
+                        id,
+                        pane_id: 7,
+                        seq: 0,
+                        content: String::new(),
+                        content_len: 0,
+                        content_hash: None,
+                        captured_at: 1000,
+                    },
+                    snippet: None,
+                    highlight: None,
+                    score: 0.0,
+                },
+            };
+            assert!(SearchHit::from_result(hit, &Redactor::new()).is_err());
+        }
     }
 
     #[test]

@@ -191,12 +191,17 @@ Gap/lag notifications, retention truncation, server failures, and reconnection
 before the first checkpoint remain visible. The database-identity and
 retained-history limits above apply.
 
-Historical search selections currently carry a segment ID, pane ID, capture time
-and content length, but no epoch bound to the original search read. Their numeric
-bootstrap verifies those fields against the current database and does not prove
-that a replacement database is the one that produced the old search result.
-The stream epoch fences subsequent delivery and reconnects, not that earlier
-search selection. Epoch-bound search provenance is a separate requirement.
+Historical search results include a `capture_cursor` bound to the epoch read
+with the returned capture row and snippet. It names that pane and the segment's
+immediate predecessor. The browser carries this as `captureCursor`, requires it
+before replacing the current view, and opens the finite read with `?cursor`.
+The first ready checkpoint must match the selected epoch and exact predecessor;
+the delivered segment must still match its ID, pane, capture time and length.
+Missing, malformed or inconsistent search cursors have no numeric fallback.
+A result retained from a different database cannot silently open an identically
+numbered capture in today's database. Search again after a terminal identity
+failure to choose a current result. The same-epoch copy/restore limitation
+above still applies.
 
 Build and deploy a fresh browser package through the approved build lane;
 updating only HTML is insufficient because the viewer adds the `selectedPaneId`

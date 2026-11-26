@@ -128,6 +128,18 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Search hit paired with the output-stream epoch read alongside its text.
+///
+/// The epoch identifies capture lineage; redaction backfills may still change
+/// the retained text. Existing search callers keep using SearchResult.
+#[derive(Debug, Clone)]
+pub struct CaptureSearchResult {
+    /// Matching segment, snippet, and relevance score.
+    pub result: SearchResult,
+    /// Canonical database epoch selected in the same SQL statement.
+    pub cursor_epoch: String,
+}
+
 /// Semantic retrieval hit keyed by segment id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticSearchHit {

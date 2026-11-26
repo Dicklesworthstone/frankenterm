@@ -12,6 +12,14 @@ function decimal(value, maximum = I64_MAX) {
   return parsed <= maximum ? parsed.toString() : null;
 }
 
+function captureCursorFor(value, paneId, segmentId) {
+  if (typeof value !== "string" || value.length > 128) return null;
+  const match = /^delta-v2:([0-9a-f]{32}):pane:(0|[1-9][0-9]{0,19}):(0|[1-9][0-9]{0,18})$/.exec(value);
+  if (!match || match[2] !== paneId || decimal(match[2], U64_MAX) === null
+      || decimal(match[3]) === null || BigInt(match[3]) + 1n !== BigInt(segmentId)) return null;
+  return value;
+}
+
 function criteriaFor({ query, mode = "phrase", paneId = "", sinceMs = "", untilMs = "", limit = 50 } = {}) {
   if (typeof query !== "string" || !query.trim() || query.length > 2048 || query.includes("\0")) {
     throw new Error("Enter a query of 1–2048 characters.");
@@ -70,7 +78,10 @@ function decodeResults(body, criteria) {
     const paneId = integer("pane_id", U64_MAX);
     const capturedAt = integer("captured_at");
     const contentLength = integer("content_len", U64_MAX);
+    const captureCursor = segmentId === null || paneId === null
+      ? null : captureCursorFor(row.capture_cursor, paneId, segmentId);
     if (segmentId === null || segmentId === "0" || paneId === null || capturedAt === null || contentLength === null
+        || captureCursor === null
         || typeof row.score !== "number" || !Number.isFinite(row.score)
         || (row.snippet != null && (typeof row.snippet !== "string" || row.snippet.length > MAX_SNIPPET_CHARS))
         || seen.has(segmentId) || (criteria.paneId !== null && criteria.paneId !== paneId)
@@ -79,7 +90,8 @@ function decodeResults(body, criteria) {
       throw new Error("invalid hit");
     }
     seen.add(segmentId);
-    return Object.freeze({ segmentId, paneId, capturedAt, contentLength, score: row.score, snippet: row.snippet ?? "" });
+    return Object.freeze({ segmentId, paneId, capturedAt, contentLength, captureCursor,
+      score: row.score, snippet: row.snippet ?? "" });
   }));
 }
 

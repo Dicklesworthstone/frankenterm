@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHistoryLibrary, createHistorySearch } from "../../crates/frankenterm-browser-ui/web/history-search.mjs";
 
+const OUTPUT_EPOCH = "0123456789abcdef0123456789abcdef";
+const captureCursor = (id, pane = "7", epoch = OUTPUT_EPOCH) =>
+  `delta-v2:${epoch}:pane:${pane}:${BigInt(id) - 1n}`;
+
 const flush = async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); };
 const deferred = () => {
   let resolve, reject;
@@ -9,7 +13,8 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 function hit(segment_id = 3, overrides = {}) {
-  return { segment_id, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 24, snippet: "synthetic needle", ...overrides };
+  return { segment_id, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 24,
+    snippet: "synthetic needle", capture_cursor: captureCursor(segment_id, overrides.pane_id ?? 7), ...overrides };
 }
 const envelope = (rows = [hit()]) => JSON.stringify({ ok: true, data: { results: rows, total: rows.length } });
 function fixture() {
@@ -49,6 +54,7 @@ test("phrase search uses the real API filters and explicit FTS quoting", async (
   assert.equal(params.get("until"), "1100");
   assert.equal(params.get("limit"), "20");
   assert.equal(search.snapshot().hits[0].segmentId, "3");
+  assert.equal(search.snapshot().hits[0].captureCursor, captureCursor(3));
   assert.equal(search.snapshot().criteria.mode, "phrase");
 });
 
@@ -61,14 +67,41 @@ test("raw FTS is opt-in; empty filters are omitted, not coerced to zero", async 
 
 test("exact i64/u64 identities survive JSON numbers beyond 2^53", async () => {
   // Construct the wire text explicitly; JSON.stringify(Number) would round it.
-  const wire = `{"ok":true,"data":{"total":1,"results":[{"segment_id":9223372036854775807,"pane_id":18446744073709551615,"captured_at":9007199254740993,"content_len":9007199254740995,"score":0,"snippet":"literal 123"}]}}`;
+  const wire = `{"ok":true,"data":{"total":1,"results":[{"segment_id":9223372036854775807,"pane_id":18446744073709551615,"captured_at":9007199254740993,"content_len":9007199254740995,"score":0,"snippet":"literal 123","capture_cursor":"${captureCursor("9223372036854775807", "18446744073709551615")}"}]}}`;
   const { search, ok, calls } = await answer({ query: "literal", paneId: "18446744073709551615", sinceMs: "9007199254740993" }, wire);
   assert.equal(ok, true);
   assert.equal(calls[0].url.searchParams.get("pane_id"), "18446744073709551615");
   assert.deepEqual(search.snapshot().hits[0], {
     segmentId: "9223372036854775807", paneId: "18446744073709551615", capturedAt: "9007199254740993",
-    contentLength: "9007199254740995", score: 0, snippet: "literal 123",
+    contentLength: "9007199254740995",
+    captureCursor: captureCursor("9223372036854775807", "18446744073709551615"),
+    score: 0, snippet: "literal 123",
   });
+});
+
+test("capture provenance is required and cannot retarget a result or admit a partial prefix", async () => {
+  const invalid = [
+    undefined, null, "", 123, "delta-v1:pane:7:2",
+    `delta-v2:${OUTPUT_EPOCH}:all:2`,
+    captureCursor(3, 8), captureCursor(2), captureCursor(4),
+    captureCursor(3).replace(":pane:7:", ":pane:07:"),
+    captureCursor(3).replace(/:2$/, ":02"),
+    captureCursor(3, 7, OUTPUT_EPOCH.toUpperCase()),
+    captureCursor(3) + "\0", captureCursor(3) + "\r\n",
+    `delta-v2:${OUTPUT_EPOCH}:pane:7:9223372036854775808`,
+    "x".repeat(129),
+  ];
+  for (const cursor of invalid) {
+    const { search, ok } = await answer({ query: "needle" },
+      envelope([hit(4), hit(3, { capture_cursor: cursor })]));
+    assert.equal(ok, false);
+    assert.equal(search.snapshot().status, "error");
+    assert.equal(search.snapshot().hits.length, 0, "no actionable accepted prefix");
+  }
+  const { search, ok } = await answer({ query: "needle" }, envelope([hit(1)]));
+  assert.equal(ok, true);
+  assert.equal(search.snapshot().hits[0].captureCursor, captureCursor(1));
+  assert.throws(() => { search.snapshot().hits[0].captureCursor = captureCursor(2); }, TypeError);
 });
 
 test("invalid input cancels prior work and never reaches the reader", async () => {

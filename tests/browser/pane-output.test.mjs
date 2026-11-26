@@ -1236,7 +1236,10 @@ test("packaged page contains the required accessible controls and module", () =>
 
 
 function captureHit(overrides = {}) {
-  return { paneId: "7", segmentId: "12", capturedAt: "1000", contentLength: "90", ...overrides };
+  const hit = { paneId: "7", segmentId: "12", capturedAt: "1000", contentLength: "90", ...overrides };
+  const before = typeof hit.segmentId === "string" && /^(0|[1-9][0-9]*)$/.test(hit.segmentId)
+    ? (BigInt(hit.segmentId) - 1n).toString() : "invalid";
+  return { captureCursor: deltaCursor(before, hit.paneId), ...hit };
 }
 
 function capturedDelta(source, hit, content, overrides = {}) {
@@ -1249,11 +1252,87 @@ function capturedDelta(source, hit, content, overrides = {}) {
     overrides.cursor ?? deltaCursor(hit.segmentId, hit.paneId, overrides.epoch ?? OUTPUT_EPOCH));
 }
 
+test("historical selection requires an exact search-bound cursor before retiring the current view", () => {
+  const f = fixture(); f.output.select("7"); delta(f.latest(), "9", "keep live view");
+  const original = f.latest();
+  for (const captureCursor of [
+    undefined, null, "", 11, "11", "delta-v1:pane:7:11",
+    deltaCursor("11", "8"), deltaCursor("10"), deltaCursor("12"),
+    deltaCursor("011"), deltaCursor("11", "07"),
+    deltaCursor("11", "7", OUTPUT_EPOCH.toUpperCase()),
+    `${deltaCursor("11")}\n`, `${deltaCursor("11")}\r\n`,
+    `${deltaCursor("11")}\u2028`, `${deltaCursor("11")}\u2029`,
+    deltaCursor("9223372036854775808"), "x".repeat(129),
+  ]) {
+    assert.throws(() => f.output.selectCapture(captureHit({ captureCursor })), /invalid capture identity/);
+    assert.equal(f.latest(), original);
+    assert.equal(original.closed, false);
+    assert.equal(f.output.snapshot().text, "keep live view");
+    assert.equal(f.output.snapshot().resumeCursor, deltaCursor("9"));
+    assert.equal(f.output.snapshot().capture, null);
+  }
+});
+
+test("the first historical ready cannot replace the epoch that produced the search hit", () => {
+  const f = fixture();
+  const hit = captureHit();
+  f.output.selectCapture(hit);
+  const source = f.latest();
+  assert.equal(source.url.searchParams.get("cursor"), hit.captureCursor);
+  assert.equal(source.url.searchParams.has("since_id"), false);
+  // IDs, capture time and length all match; only the database differs.
+  source.emit("ready", readyPayload("7", "11", OTHER_OUTPUT_EPOCH));
+  capturedDelta(source, hit, "replacement database content", { epoch: OTHER_OUTPUT_EPOCH });
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.equal(f.output.snapshot().terminal, true);
+  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().resumeCursor, null);
+  assert.equal(f.output.snapshot().text, "");
+  assert.equal(f.output.snapshot().capture.captureCursor, hit.captureCursor);
+  assert.match(f.output.snapshot().error, /Search again/);
+  assert.equal(source.closed, true);
+  f.output.suspend(); f.output.restore(); f.output.resume();
+  assert.equal(f.sources.length, 1);
+  assert.equal(f.timers.size, 0);
+});
+
+test("a historical cursor from another valid search epoch opens only that exact retained capture", () => {
+  const f = fixture();
+  const hit = captureHit({ paneId: "18446744073709551615", segmentId: "9223372036854775807",
+    captureCursor: deltaCursor("9223372036854775806", "18446744073709551615", OTHER_OUTPUT_EPOCH) });
+  f.output.selectCapture(hit);
+  const source = f.latest();
+  assert.equal(source.url.searchParams.get("cursor"), hit.captureCursor);
+  source.emit("ready", readyPayload(hit.paneId, "9223372036854775806", OTHER_OUTPUT_EPOCH));
+  capturedDelta(source, hit, "exact searched capture", { epoch: OTHER_OUTPUT_EPOCH });
+  assert.equal(f.output.snapshot().status, "historical");
+  assert.equal(f.output.snapshot().text, "exact searched capture");
+  assert.equal(f.output.snapshot().resumeCursor, deltaCursor(hit.segmentId, hit.paneId, OTHER_OUTPUT_EPOCH));
+  assert.equal(source.closed, true);
+  assert.equal(f.timers.size, 0);
+});
+
+test("a pre-ready historical discontinuity is checked against its selected search cursor", () => {
+  for (const valid of [true, false]) {
+    const f = fixture(); const hit = captureHit(); f.output.selectCapture(hit);
+    control(f.latest(), "cursor_discontinuity", {
+      code: "delta_cursor_discontinuity", terminal: true, reason: "cursor_epoch_mismatch",
+      resume_cursor: valid ? hit.captureCursor : deltaCursor("11", "7", OTHER_OUTPUT_EPOCH),
+    });
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.output.snapshot().resumeCursor, null);
+    assert.match(f.output.snapshot().error, valid ? /history changed/ : /invalid capture history discontinuity/);
+    assert.equal(f.timers.size, 0);
+  }
+});
+
 test("a single historical capture refuses both older and later replay starts", () => {
   for (const resume of ["10", "12", "null"]) {
     const f = fixture(); f.output.selectCapture(captureHit());
     const source = f.latest();
-    assert.equal(source.url.searchParams.get("since_id"), "11");
+    assert.equal(source.url.searchParams.get("cursor"), captureHit().captureCursor);
+    assert.equal(source.url.searchParams.has("since_id"), false);
     source.emit("ready", readyPayload("7", resume));
     assert.equal(f.output.snapshot().status, "unavailable");
     assert.equal(source.closed, true);
@@ -1285,7 +1364,8 @@ test("historical inspection admits exactly one captured identity and never follo
   f.output.selectCapture(hit);
   const source = f.latest();
   assert.equal(source.url.searchParams.get("pane_id"), hit.paneId);
-  assert.equal(source.url.searchParams.get("since_id"), "9223372036854775806");
+  assert.equal(source.url.searchParams.get("cursor"), hit.captureCursor);
+  assert.equal(source.url.searchParams.has("since_id"), false);
   assert.equal(f.output.snapshot().status, "loading");
   assert.equal(f.timers.size, 1);
   control(source, "ready", { pane_id: 0 }, ""); // Wrong pane cannot establish a historical read.
@@ -1407,7 +1487,8 @@ test("historical requests have a finite deadline even when only ready frames arr
   const f = fixture({ captureTimeoutMs: 1234 });
   const hit = captureHit({ segmentId: "1" });
   f.output.selectCapture(hit);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  assert.equal(f.latest().url.searchParams.get("cursor"), hit.captureCursor);
+  assert.equal(f.latest().url.searchParams.has("since_id"), false);
   control(f.latest(), "ready");
   assert.equal(f.retry(), 1234); // Execute the owned deadline; it must not schedule a retry.
   assert.equal(f.sources.length, 1);

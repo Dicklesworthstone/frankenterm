@@ -53,7 +53,7 @@ use crate::VERSION;
 #[cfg(test)]
 use crate::events::Event;
 #[cfg(test)]
-use crate::storage::{PaneRecord, SearchResult};
+use crate::storage::{CaptureSearchResult, PaneRecord, SearchResult};
 #[cfg(test)]
 use crate::ui_query;
 #[cfg(test)]
@@ -1438,13 +1438,24 @@ mod tests {
             highlight: None,
             score: 1.5,
         };
-        let hit = SearchHit::from_result(result, &redactor);
+        let hit = SearchHit::from_result(
+            CaptureSearchResult {
+                result,
+                cursor_epoch: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            &redactor,
+        )
+        .unwrap();
         assert_eq!(hit.segment_id, 42);
         assert_eq!(hit.pane_id, 3);
         assert!((hit.score - 1.5).abs() < f64::EPSILON);
         assert_eq!(hit.snippet.as_deref(), Some("...test..."));
         assert_eq!(hit.captured_at, 9999);
         assert_eq!(hit.content_len, 12);
+        assert_eq!(
+            hit.capture_cursor,
+            "delta-v2:0123456789abcdef0123456789abcdef:pane:3:41"
+        );
     }
 
     #[test]
@@ -1464,7 +1475,14 @@ mod tests {
             highlight: None,
             score: 0.0,
         };
-        let hit = SearchHit::from_result(result, &redactor);
+        let hit = SearchHit::from_result(
+            CaptureSearchResult {
+                result,
+                cursor_epoch: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            &redactor,
+        )
+        .unwrap();
         assert!(hit.snippet.is_none());
     }
 
@@ -1485,9 +1503,20 @@ mod tests {
             highlight: None,
             score: 0.0,
         };
-        let hit = SearchHit::from_result(result, &redactor);
+        let hit = SearchHit::from_result(
+            CaptureSearchResult {
+                result,
+                cursor_epoch: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            &redactor,
+        )
+        .unwrap();
         let json = serde_json::to_value(&hit).unwrap();
         assert!(!json.as_object().unwrap().contains_key("snippet"));
+        assert_eq!(
+            json["capture_cursor"],
+            "delta-v2:0123456789abcdef0123456789abcdef:pane:0:0"
+        );
     }
 
     #[test]

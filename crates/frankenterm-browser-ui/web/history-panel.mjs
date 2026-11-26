@@ -230,7 +230,8 @@ export function mountHistorySearch({
         const selected = opened && viewVersion === renderedVersion && search.hit(index, state.version);
         if (!selected) return;
         const capture = { segmentId: selected.segmentId, paneId: selected.paneId,
-          capturedAt: selected.capturedAt, contentLength: selected.contentLength };
+          capturedAt: selected.capturedAt, contentLength: selected.contentLength,
+          captureCursor: selected.captureCursor };
         leaveForResult();
         inspectCapture(capture);
       });

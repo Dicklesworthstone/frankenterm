@@ -3,9 +3,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { mountHistorySearch } from "../../crates/frankenterm-browser-ui/web/history-panel.mjs";
 
+const OUTPUT_EPOCH = "0123456789abcdef0123456789abcdef";
+const captureCursor = (id, pane = "7") =>
+  `delta-v2:${OUTPUT_EPOCH}:pane:${pane}:${BigInt(id) - 1n}`;
+
 const flush = async () => { for (let n = 0; n < 20; n++) await Promise.resolve(); };
 const hit = (id = 3, pane = 7, snippet = "captured needle") => ({ segment_id: id, pane_id: pane,
-  score: -0.5, captured_at: 1000, content_len: 24, snippet });
+  score: -0.5, captured_at: 1000, content_len: 24, snippet, capture_cursor: captureCursor(id, pane) });
 const envelope = (rows = [hit()]) => JSON.stringify({ ok: true, data: { results: rows, total: rows.length } });
 class Node {
   constructor(tag = "div") { this.tag = tag; this.listeners = new Map(); this.children = []; this.attrs = {}; this.value = ""; this.textContent = ""; this.open = false; this.disabled = false; }
@@ -65,7 +69,9 @@ test("captured markup is inert text; live inspection binds exact large IDs", asy
   const f = fixture();
   await f.submit();
   const text = '<img src=x onerror=alert(1)> & <b>hit</b>';
-  const wire = envelope([hit(3, 7, text)]).replace('"pane_id":7', '"pane_id":18446744073709551615');
+  const wire = envelope([hit(3, 7, text)])
+    .replace('"pane_id":7', '"pane_id":18446744073709551615')
+    .replace(captureCursor(3), captureCursor(3, "18446744073709551615"));
   f.calls[0].resolve(wire); await flush();
   const item = f.get("history-results").children[0];
   assert.equal(item.children[1].textContent, text);
@@ -173,7 +179,8 @@ test("historical inspection keeps exact segment, pane, time and stored length wi
     .replace('"segment_id":3', '"segment_id":9223372036854775807')
     .replace('"pane_id":7', '"pane_id":18446744073709551615')
     .replace('"captured_at":1000', '"captured_at":9007199254740993')
-    .replace('"content_len":24', '"content_len":9007199254740993');
+    .replace('"content_len":24', '"content_len":9007199254740993')
+    .replace(captureCursor(3), captureCursor("9223372036854775807", "18446744073709551615"));
   f.calls[0].resolve(wire); await flush();
   const item = f.get("history-results").children[0];
   assert.equal(item.children[2].textContent, "Open captured segment");
@@ -182,10 +189,24 @@ test("historical inspection keeps exact segment, pane, time and stored length wi
   assert.deepEqual(f.captures, [{
     segmentId: "9223372036854775807", paneId: "18446744073709551615",
     capturedAt: "9007199254740993", contentLength: "9007199254740993",
+    captureCursor: captureCursor("9223372036854775807", "18446744073709551615"),
   }]);
   assert.deepEqual(f.inspected, []);
   assert.equal(f.get("history-search").open, false);
   assert.equal(f.get("history-results").children.length, 0);
+});
+
+test("missing or mismatched capture provenance exposes no historical navigation action", async () => {
+  for (const cursor of [undefined, captureCursor(3, 8), captureCursor(4)]) {
+    const f = fixture(); await f.submit();
+    f.calls[0].resolve(envelope([{ ...hit(), capture_cursor: cursor }]));
+    await flush();
+    assert.equal(f.get("history-results").children.length, 0);
+    assert.match(f.get("history-status").textContent, /Search failed/);
+    assert.deepEqual(f.captures, []);
+    assert.deepEqual(f.inspected, []);
+    f.panel.close();
+  }
 });
 
 test("historical actions from prior queries or closed dialogs cannot open another capture", async () => {
@@ -198,7 +219,7 @@ test("historical actions from prior queries or closed dialogs cannot open anothe
   old.emit("click"); assert.deepEqual(f.captures, []);
   const current = f.get("history-results").children[0].children[2];
   current.emit("click");
-  assert.deepEqual(f.captures, [{ segmentId: "5", paneId: "8", capturedAt: "1000", contentLength: "24" }]);
+  assert.deepEqual(f.captures, [{ segmentId: "5", paneId: "8", capturedAt: "1000", contentLength: "24", captureCursor: captureCursor(5, 8) }]);
   current.emit("click"); old.emit("click");
   assert.equal(f.captures.length, 1);
   assert.deepEqual(f.inspected, []);
@@ -212,7 +233,7 @@ test("opening a capture preserves the search for returning to another ranked res
   f.calls[0].resolve(envelope([hit(8), hit(3)])); await flush();
   const firstAction = f.get("history-results").children[0].children[2];
   firstAction.emit("click");
-  assert.deepEqual(f.captures, [{ segmentId: "8", paneId: "7", capturedAt: "1000", contentLength: "24" }]);
+  assert.deepEqual(f.captures, [{ segmentId: "8", paneId: "7", capturedAt: "1000", contentLength: "24", captureCursor: captureCursor(8) }]);
   assert.equal(f.get("history-search").open, false);
   assert.equal(f.get("history-results").children.length, 0, "hide the rendered capture text during navigation");
   assert.equal(f.get("history-search-open").textContent, "Return to search results");
@@ -228,7 +249,7 @@ test("opening a capture preserves the search for returning to another ranked res
   firstAction.emit("click");
   assert.equal(f.captures.length, 1, "a previous dialog view cannot reuse a detached result action");
   f.get("history-results").children[1].children[2].emit("click");
-  assert.deepEqual(f.captures[1], { segmentId: "3", paneId: "7", capturedAt: "1000", contentLength: "24" });
+  assert.deepEqual(f.captures[1], { segmentId: "3", paneId: "7", capturedAt: "1000", contentLength: "24", captureCursor: captureCursor(3) });
   f.panel.close();
 });
 

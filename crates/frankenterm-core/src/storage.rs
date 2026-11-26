@@ -317,6 +317,7 @@ pub mod schema_ddl;
 pub use schema_ddl::{SCHEMA_SQL, SCHEMA_VERSION};
 
 mod capture_identity;
+mod capture_search;
 pub use capture_identity::PaneCaptureIdentity;
 
 // [ft-nsb8c / ft-dn2tu Phase 5] Export query helpers — read-only,
@@ -502,7 +503,8 @@ impl AuxiliaryRetentionTable {
 // `storage/types.rs`. All pure-data with serde derives, no
 // private-helper deps from this module.
 pub use self::types::{
-    EmbeddingStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, HybridSearchBundle,
+    CaptureSearchResult, EmbeddingStats, FtsIndexState, FtsPaneProgress, FtsSyncResult,
+    HybridSearchBundle,
     HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult, SemanticSearchHit,
 };
 

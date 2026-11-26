@@ -29,7 +29,7 @@ export function decodeFrame(payload) {
 function cursorFor(id, pane, allowZero = false) {
   if (typeof id !== "string" || id.length > 128) return null;
   const match = /^delta-v2:([0-9a-f]{32}):pane:(0|[1-9][0-9]{0,19}):(0|[1-9][0-9]{0,18})$/.exec(id);
-  if (!match || unsigned(match[2], U64_MAX) !== pane) return null;
+  if (!match || match[0] !== id || unsigned(match[2], U64_MAX) !== pane) return null;
   const segment = unsigned(match[3], I64_MAX);
   return segment !== null && (allowZero || segment !== "0")
     ? { token: id, epoch: match[1], segment } : null;
@@ -185,7 +185,9 @@ export function createPaneOutput({
     terminal = true;
     capturePending = false;
     status = capture === null ? "discontinuous" : "unavailable";
-    error = `${reason}. Open a pane or load retained history to choose the current capture history.`;
+    error = capture === null
+      ? `${reason}. Open a pane or load retained history to choose the current capture history.`
+      : `${reason}. Search again to choose a capture from the current history.`;
     dirty = true;
   }
 
@@ -196,7 +198,7 @@ export function createPaneOutput({
     const url = new URL("stream/deltas", root);
     url.searchParams.set("pane_id", pane);
     url.searchParams.set("max_hz", "50");
-    if (capture !== null) url.searchParams.set("since_id", (BigInt(capture.segmentId) - 1n).toString());
+    if (capture !== null) url.searchParams.set("cursor", capture.captureCursor);
     else if (receivedCursor !== null) url.searchParams.set("cursor", receivedCursor.token);
     else if (history) url.searchParams.set("since_id", "0");
     let candidate;
@@ -210,6 +212,7 @@ export function createPaneOutput({
     let ready = false;
     const expected = generation;
     const selectedPane = pane;
+    const expectedCaptureCursor = capture === null ? null : cursorFor(capture.captureCursor, selectedPane, true);
     const current = () => eligible() && source === candidate && generation === expected;
     awaitReady(current);
     if (capture !== null) {
@@ -230,10 +233,12 @@ export function createPaneOutput({
         const data = value.data;
         if (message.type === "cursor_discontinuity") {
           const boundary = cursorFor(data.resume_cursor, selectedPane, true);
+          const accepted = receivedCursor ?? expectedCaptureCursor;
           const valid = data.code === "delta_cursor_discontinuity" && data.terminal === true
             && ["cursor_epoch_mismatch", "cursor_ahead_of_high_water", "high_water_regressed"].includes(data.reason)
-            && boundary !== null && (receivedCursor === null
-              || (boundary.epoch === receivedCursor.epoch && BigInt(boundary.segment) <= BigInt(receivedCursor.segment)));
+            && boundary !== null && (accepted === null
+              || (boundary.epoch === accepted.epoch && (capture !== null
+                ? boundary.segment === accepted.segment : BigInt(boundary.segment) <= BigInt(accepted.segment))));
           halt(valid ? `output history changed (${data.reason})` : "output: invalid capture history discontinuity");
           return;
         }
@@ -322,12 +327,13 @@ export function createPaneOutput({
           // Ready establishes the fresh tail even before the first delta.
           // Validate the scoped wire cursor as well as the exact JSON ID:
           // native reconnect may use Last-Event-ID from this checkpoint.
-          const expectedResume = receivedCursor?.segment ?? url.searchParams.get("since_id");
+          const expectedCursor = receivedCursor ?? expectedCaptureCursor;
+          const expectedResume = expectedCursor?.segment ?? url.searchParams.get("since_id");
           const resume = unsigned(exact.data.resume_after_id, I64_MAX);
           const checkpoint = cursorFor(message.lastEventId, selectedPane, true);
           const validCheckpoint = typeof data.resume_after_id === "number" && resume !== null
             && checkpoint?.segment === resume && data.cursor === message.lastEventId;
-          if (validCheckpoint && receivedCursor !== null && checkpoint.epoch !== receivedCursor.epoch) {
+          if (validCheckpoint && expectedCursor !== null && checkpoint.epoch !== expectedCursor.epoch) {
             halt("output capture database changed");
             return;
           }
@@ -446,9 +452,12 @@ export function createPaneOutput({
         capturedAt: unsigned(hit?.capturedAt, I64_MAX),
         contentLength: unsigned(hit?.contentLength, U64_MAX),
       };
-      if (Object.values(target).some((value) => value === null) || target.segmentId === "0") {
+      const boundary = cursorFor(hit?.captureCursor, target.paneId, true);
+      if (Object.values(target).some((value) => value === null) || target.segmentId === "0"
+          || boundary === null || BigInt(boundary.segment) !== BigInt(target.segmentId) - 1n) {
         throw new Error("invalid capture identity");
       }
+      target.captureCursor = boundary.token;
       startSelection(target.paneId, true, Object.freeze(target));
     },
     pause() {

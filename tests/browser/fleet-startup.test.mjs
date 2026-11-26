@@ -148,7 +148,7 @@ function fixture(t, options = {}) {
     const request = { url: new URL(url), ...init }; requests.push(request);
     if (request.url.pathname.endsWith("/search") && options.pendingSearch) return searchGate.promise;
     if (request.url.pathname.endsWith("/search")) return new Response(JSON.stringify({ ok: true, data: {
-      results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "needle" }], total: 1,
+      results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "needle", capture_cursor: deltaCursor("2") }], total: 1,
     } }));
     if (options.pendingSnapshots) return new Promise(() => {});
     if (request.url.pathname.endsWith("/panes") && options.paneSnapshot) return new Response(options.paneSnapshot);
@@ -226,6 +226,31 @@ test("manual output and real history search work before either WASM import settl
   assert.doesNotMatch(f.get("fleet-mode").textContent, /private|missing model/);
   f.get("pane-output-close").emit("click");
   assert.equal(f.doc.activeElement, f.get("pane-output-id"));
+});
+
+test("a ranked history result carries its epoch through the panel into one finite capture read", async (t) => {
+  const f = fixture(t); await f.app.ready; await flush();
+  f.get("history-search-open").emit("click");
+  f.get("history-query").value = "needle";
+  f.get("history-search-form").requestSubmit();
+  await flush();
+  const item = f.get("history-results").children[0];
+  assert.equal(item.children[2].textContent, "Open captured segment");
+  item.children[2].emit("click");
+  const source = f.sources.at(-1);
+  const cursor = deltaCursor("2");
+  assert.equal(source.url.pathname, "/prefix/stream/deltas");
+  assert.equal(source.url.searchParams.get("pane_id"), "7");
+  assert.equal(source.url.searchParams.get("cursor"), cursor);
+  assert.equal(source.url.searchParams.has("since_id"), false);
+  source.message("ready", { schema: "ft.stream.v1", stream: "deltas", kind: "ready",
+    data: { pane_id: 7, resume_after_id: 2, cursor } }, cursor);
+  source.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta",
+    data: { pane_id: 7, segment_id: 3, seq: 0, captured_at: 1000, content_len: 6, content: "needle" } }, deltaCursor("3"));
+  f.frame();
+  assert.equal(f.get("pane-output-text").value, "needle");
+  assert.match(f.get("pane-output-status").textContent, /Historical capture loaded/);
+  assert.equal(source.closed, true);
 });
 
 test("renderer import failure leaves one live fleet model with native exact-pane navigation", async (t) => {
@@ -502,7 +527,7 @@ test("hiding aborts snapshots and search, closes output and rejects late results
     pane_id: 7, segment_id: 10, seq: 3, content: "late content must not be accepted",
   } }, deltaCursor("10"));
   f.resolveSearch(new Response(JSON.stringify({ ok: true, data: {
-    results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "late needle" }], total: 1,
+    results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "late needle", capture_cursor: deltaCursor("2") }], total: 1,
   } }))); await flush();
   assert.equal(f.get("pane-output-text").value, "retained before hiding");
   assert.equal(f.get("history-results").children.length, 0);

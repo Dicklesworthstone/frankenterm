@@ -4010,6 +4010,114 @@ mod web_tests {
         });
     }
 
+    #[test]
+    fn search_capture_cursor_rejects_replacement_with_matching_segment_metadata() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (original, _original_tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let (replacement, _replacement_tmp) = create_test_storage_with_pane(7).await.unwrap();
+            // A numeric ID, pane, timestamp and length all collide. Only the
+            // database identity can distinguish these two selected captures.
+            seed_delta_stream_segment(&original, 10, 123, "needle original").unwrap();
+            seed_delta_stream_segment(&replacement, 10, 123, "needle replaced").unwrap();
+            let original_bus = Arc::new(EventBus::new(64));
+            let replacement_bus = Arc::new(EventBus::new(64));
+            let original_server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(original.clone())
+                    .with_event_bus(Arc::clone(&original_bus))
+                    .with_storage_event_tail(false),
+            )
+            .await
+            .unwrap();
+            let replacement_server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(replacement.clone())
+                    .with_event_bus(Arc::clone(&replacement_bus))
+                    .with_storage_event_tail(false),
+            )
+            .await
+            .unwrap();
+            let scenario = Box::pin(timeout(Duration::from_secs(15), async {
+                let raw = fetch_path(
+                    original_server.bound_addr(),
+                    "/search?q=needle&pane_id=7",
+                )
+                .await?;
+                ensure!(extract_status(&raw) == 200, "capture search succeeds");
+                let body: serde_json::Value = serde_json::from_str(extract_body(&raw))?;
+                ensure!(body["data"]["total"] == 1, "one selected capture");
+                let hit = &body["data"]["results"][0];
+                ensure!(hit["segment_id"] == 10 && hit["pane_id"] == 7, "capture identity");
+                ensure!(hit["captured_at"] == 123 && hit["content_len"] == 15, "capture metadata");
+                let cursor = hit["capture_cursor"]
+                    .as_str()
+                    .context("search hit carries a full capture cursor")?;
+                let snapshot = original
+                    .get_segment_stream_snapshot_with_cx(
+                        &frankenterm_core::cx::for_request(),
+                        Some(7),
+                    )
+                    .await?;
+                ensure!(
+                    cursor == format!("delta-v2:{}:pane:7:9", snapshot.cursor_epoch),
+                    "search supplies a boundary immediately before its exact segment"
+                );
+                let request = format!(
+                    "GET /stream/deltas?pane_id=7&cursor={cursor} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                );
+                let captured = fetch_stream_until_delta_count(
+                    original_server.bound_addr(),
+                    request.as_bytes(),
+                    Duration::from_secs(3),
+                    1,
+                )
+                .await?;
+                ensure!(
+                    delta_stream_ids(&captured) == [10] && captured.contains("needle original"),
+                    "the current database can serve the selected capture"
+                );
+                let rejected = fetch_raw(
+                    replacement_server.bound_addr(),
+                    request.as_bytes(),
+                )
+                .await?;
+                ensure!(
+                    stream_frame_kind_count(&rejected, "cursor_discontinuity") == 1,
+                    "a different database refuses the selected capture"
+                );
+                ensure!(
+                    rejected.contains("cursor_epoch_mismatch")
+                        && stream_frame_kind_count(&rejected, "ready") == 0
+                        && delta_stream_ids(&rejected).is_empty()
+                        && !rejected.contains("needle replaced"),
+                    "matching legacy metadata cannot retarget historical content"
+                );
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                original_server.shutdown().await?;
+                replacement_server.shutdown().await?;
+                original.shutdown().await?;
+                replacement.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("search capture teardown deadline")
+                .expect("search capture teardown");
+            scenario
+                .expect("search capture scenario deadline")
+                .expect("search capture assertions");
+            assert_eq!(original_bus.subscriber_count(), 0);
+            assert_eq!(replacement_bus.subscriber_count(), 0);
+        });
+    }
+
     fn durable_stream_fixture(text: &str, detected_at: i64) -> StoredEvent {
         StoredEvent {
             id: 0,
